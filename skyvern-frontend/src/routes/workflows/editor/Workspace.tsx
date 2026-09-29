@@ -3451,14 +3451,7 @@ function Workspace({
               );
             const currentVersion: WorkflowVersion = {
               ...baseVersion,
-              title: "Current",
               workflow_definition: baseConversion.data.workflow_definition,
-            };
-
-            // Construct fake WorkflowVersion for pending copilot suggestion
-            const pendingVersion: WorkflowVersion = {
-              ...pendingWorkflow,
-              title: "Copilot Suggestion",
             };
 
             // Approve / Reject settle through the chat so the server-side
@@ -3496,7 +3489,7 @@ function Workspace({
               content: "history",
               data: {
                 version1: currentVersion,
-                version2: pendingVersion,
+                version2: pendingWorkflow,
                 showComparison: true,
                 mode: "copilot",
                 onCopilotReviewClose: handleCopilotReviewClose,

@@ -143,7 +143,12 @@ import {
   resolveSendAction,
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
-import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
+import {
+  AnchoredTurnItem,
+  InstantAckPlaceholder,
+  NarrativeView,
+} from "./NarrativeView";
+import { credentialAnchorToolCallId } from "./turnCardPlacement";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { FeedbackThumbs } from "@/components/feedback/FeedbackThumbs";
 import {
@@ -8822,6 +8827,90 @@ export function WorkflowCopilotChat({
     return -1;
   }, [messages]);
 
+  // Each turn's closing plan, so a revision renders in the turn that wrote it and the one it
+  // replaced stays where it was, folded.
+  const turnPlans = useMemo(
+    () =>
+      messages.map((message) =>
+        message.sender === "ai" ? (message.narrative?.workPlan ?? null) : null,
+      ),
+    [messages],
+  );
+  const liveTurnPlan =
+    narrative.turnId !== null && narrative.terminal === null
+      ? (narrative.workPlan ?? null)
+      : null;
+  let lastTurnPlanIndex = -1;
+  turnPlans.forEach((plan, index) => {
+    if (plan) lastTurnPlanIndex = index;
+  });
+  const planBefore = (index: number): string[] | null => {
+    for (let i = index - 1; i >= 0; i--) {
+      const plan = turnPlans[i];
+      if (plan) return plan.items;
+    }
+    return null;
+  };
+
+  // The live turn places its plan and its credential card exactly where the finished turn will, so
+  // nothing moves when the turn ends.
+  const liveAnchored: AnchoredTurnItem[] = [];
+  if (liveTurnPlan) {
+    liveAnchored.push({
+      key: `plan-${liveTurnPlan.toolCallId}`,
+      toolCallId: liveTurnPlan.toolCallId,
+      node: (
+        <WorkPlanCard
+          items={liveTurnPlan.items}
+          previous={planBefore(messages.length)}
+        />
+      ),
+    });
+  }
+  if (
+    !isLoadingHistory &&
+    livePauseFrame &&
+    livePauseFrame.turn_id === narrative.turnId
+  ) {
+    liveAnchored.push({
+      key: "credential",
+      toolCallId: credentialAnchorToolCallId(
+        narrative,
+        livePauseFrame.anchor_tool_call_id,
+      ),
+      node: (
+        <CredentialCard
+          key={livePauseFrame.resume_token}
+          frame={liveFrameToCardFrame(livePauseFrame)}
+          mode="inline-pause"
+          reloadKey={credentialsReloadKey}
+          resolvedOutcome={pauseCardResolutions[livePauseFrame.resume_token]}
+          onUpdateCredential={(credential) =>
+            openCredentialModal(
+              livePauseFrame,
+              livePauseFrame.turn_id,
+              false,
+              credential,
+            )
+          }
+          // A picked credential (id + name from the fetched list) answers through the typed
+          // resume POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
+          onConnect={(credentialId, name) =>
+            credentialId
+              ? void respondToCredentialPause(
+                  livePauseFrame,
+                  "connected",
+                  credentialId,
+                  name,
+                )
+              : openCredentialModal(livePauseFrame, livePauseFrame.turn_id)
+          }
+          onSkip={() => void respondToCredentialPause(livePauseFrame, "skip")}
+        />
+      ),
+    });
+  }
+
   const autoBoundReceiptIndexes = useMemo(
     () =>
       selectAutoBoundReceiptIndexes(
@@ -9442,6 +9531,142 @@ export function WorkflowCopilotChat({
                   const showReviewGate =
                     shouldShowDiffCard(message.narrative) ||
                     (turnId !== null && turnId === pendingProposalTurnId);
+                  const credentialCard = (() => {
+                    if (isLoadingHistory || turnId === null) return null;
+                    const credFrame = credentialCardFrameFor(message.narrative);
+                    if (!credFrame) return null;
+                    const localResolution = credentialResolutions[turnId];
+                    // The persisted pause verdict outranks the optimistic click, so a pick the server
+                    // did not admit never reads as connected; the click's name survives via pauseCardResolutions.
+                    const resolvedOutcome =
+                      historicalCredentialOutcome(
+                        message.narrative,
+                        pauseCardResolutions,
+                      ) ?? localResolution;
+                    // The actionable ask is only live on the tail message; a resolved receipt still
+                    // renders on any message so a scrolled-back turn keeps its outcome. Without this,
+                    // picking on a stale card would show a receipt with no backend call or continue.
+                    // A stranded ask (its auto-continue failed) stays actionable off-tail for a retry.
+                    if (
+                      !resolvedOutcome &&
+                      !isLastMessage &&
+                      !strandedTerminalContinuations.has(turnId)
+                    )
+                      return null;
+                    return (
+                      <CredentialCard
+                        frame={credFrame}
+                        mode="terminal"
+                        reloadKey={credentialsReloadKey}
+                        resolvedOutcome={resolvedOutcome}
+                        continued={Boolean(localResolution?.continued)}
+                        // A picked credential (id + name from the fetched list) auto-continues by
+                        // id; the Add-credential CTA (no id) opens the modal instead. A stranded ask
+                        // (its prior continue failed) may continue too, though it is no longer the tail.
+                        onConnect={(credentialId, name) => {
+                          const canContinue =
+                            isLastMessage ||
+                            strandedTerminalContinuations.has(turnId);
+                          return credentialId
+                            ? continueAfterTerminalConnect(
+                                turnId,
+                                credentialId,
+                                name ?? localResolution?.name,
+                                canContinue,
+                              )
+                            : openCredentialModal(null, turnId, canContinue);
+                        }}
+                        onSkip={() => resolveTerminalCredential(turnId, "skip")}
+                      />
+                    );
+                  })();
+                  const autoBoundCard = (() => {
+                    if (isLoadingHistory || turnId === null) return null;
+                    const autoBound = autoBoundReceiptFor(message);
+                    if (!autoBound || !autoBoundReceiptIndexes.has(index))
+                      return null;
+                    // The receipt renders on any message (scrollback-safe). Before a Change it shows
+                    // the auto-bound credential with a Change picker; after one, the local resolution
+                    // routes into CredentialCard's existing "Continuing with 'X'…" receipt.
+                    const localResolution = credentialResolutions[turnId];
+                    const canContinue =
+                      isLastMessage ||
+                      strandedTerminalContinuations.has(turnId);
+                    return (
+                      <CredentialCard
+                        frame={{
+                          type: "credential_required",
+                          reason: "workflow_credential_inputs_unbound",
+                        }}
+                        mode="auto-bound"
+                        autoBound={autoBound}
+                        // Not while a turn is in flight: the shared continue path would still record
+                        // an optimistic "connected" even though it suppresses the actual send.
+                        canChange={canContinue && !isLoading}
+                        reloadKey={credentialsReloadKey}
+                        resolvedOutcome={localResolution}
+                        continued={Boolean(localResolution?.continued)}
+                        // Change re-enters the same terminal-continue path a terminal ask pick uses
+                        // (send "Use the credential <id> — continue", or open the add modal). A silent
+                        // bind never has a live pause, so never the typed credential-response path.
+                        onConnect={(credentialId, name) =>
+                          credentialId
+                            ? continueAfterTerminalConnect(
+                                turnId,
+                                credentialId,
+                                name ?? localResolution?.name,
+                                canContinue,
+                              )
+                            : openCredentialModal(null, turnId, canContinue)
+                        }
+                        onSkip={() => {}}
+                      />
+                    );
+                  })();
+                  const credentialPause = message.narrative.credentialPause;
+                  // A pause resolved mid-turn renders where it was raised. A terminal ask ended the
+                  // turn, so it stays last and actionable.
+                  const credentialCardMidTurn =
+                    credentialPause !== null &&
+                    credentialPause.outcome !== "declined";
+                  const turnPlan = turnPlans[index];
+                  const anchored: AnchoredTurnItem[] = [];
+                  if (turnPlan) {
+                    anchored.push({
+                      key: `plan-${turnPlan.toolCallId}`,
+                      toolCallId: turnPlan.toolCallId,
+                      node: (
+                        <WorkPlanCard
+                          items={turnPlan.items}
+                          previous={planBefore(index)}
+                          current={
+                            liveTurnPlan === null &&
+                            index === lastTurnPlanIndex &&
+                            !messages
+                              .slice(index + 1)
+                              .some((later) => later.sender === "user")
+                          }
+                        />
+                      ),
+                    });
+                  }
+                  if (credentialCard && credentialCardMidTurn) {
+                    anchored.push({
+                      key: "credential",
+                      toolCallId: credentialAnchorToolCallId(
+                        message.narrative,
+                        credentialPause.anchorToolCallId,
+                      ),
+                      node: credentialCard,
+                    });
+                  }
+                  if (autoBoundCard) {
+                    anchored.push({
+                      key: "credential-auto-bound",
+                      toolCallId: credentialAnchorToolCallId(message.narrative),
+                      node: autoBoundCard,
+                    });
+                  }
                   return (
                     <div
                       key={message.id}
@@ -9456,6 +9681,7 @@ export function WorkflowCopilotChat({
                         beforeProse={
                           turnQuestions.length > 0 ? turnQuestions : undefined
                         }
+                        anchored={anchored}
                       />
                       {message.narrative.outputFiles.length > 0 ? (
                         <div className="flex flex-wrap gap-2">
@@ -9588,106 +9814,7 @@ export function WorkflowCopilotChat({
                           }}
                         />
                       ) : null}
-                      {(() => {
-                        if (isLoadingHistory || turnId === null) return null;
-                        const credFrame = credentialCardFrameFor(
-                          message.narrative,
-                        );
-                        if (!credFrame) return null;
-                        const localResolution = credentialResolutions[turnId];
-                        // The persisted pause verdict outranks the optimistic click, so a pick the server
-                        // did not admit never reads as connected; the click's name survives via pauseCardResolutions.
-                        const resolvedOutcome =
-                          historicalCredentialOutcome(
-                            message.narrative,
-                            pauseCardResolutions,
-                          ) ?? localResolution;
-                        // The actionable ask is only live on the tail message; a resolved receipt still
-                        // renders on any message so a scrolled-back turn keeps its outcome. Without this,
-                        // picking on a stale card would show a receipt with no backend call or continue.
-                        // A stranded ask (its auto-continue failed) stays actionable off-tail for a retry.
-                        if (
-                          !resolvedOutcome &&
-                          !isLastMessage &&
-                          !strandedTerminalContinuations.has(turnId)
-                        )
-                          return null;
-                        return (
-                          <CredentialCard
-                            frame={credFrame}
-                            mode="terminal"
-                            reloadKey={credentialsReloadKey}
-                            resolvedOutcome={resolvedOutcome}
-                            continued={Boolean(localResolution?.continued)}
-                            // A picked credential (id + name from the fetched list) auto-continues by
-                            // id; the Add-credential CTA (no id) opens the modal instead. A stranded ask
-                            // (its prior continue failed) may continue too, though it is no longer the tail.
-                            onConnect={(credentialId, name) => {
-                              const canContinue =
-                                isLastMessage ||
-                                strandedTerminalContinuations.has(turnId);
-                              return credentialId
-                                ? continueAfterTerminalConnect(
-                                    turnId,
-                                    credentialId,
-                                    name ?? localResolution?.name,
-                                    canContinue,
-                                  )
-                                : openCredentialModal(
-                                    null,
-                                    turnId,
-                                    canContinue,
-                                  );
-                            }}
-                            onSkip={() =>
-                              resolveTerminalCredential(turnId, "skip")
-                            }
-                          />
-                        );
-                      })()}
-                      {(() => {
-                        if (isLoadingHistory || turnId === null) return null;
-                        const autoBound = autoBoundReceiptFor(message);
-                        if (!autoBound || !autoBoundReceiptIndexes.has(index))
-                          return null;
-                        // The receipt renders on any message (scrollback-safe). Before a Change it shows
-                        // the auto-bound credential with a Change picker; after one, the local resolution
-                        // routes into CredentialCard's existing "Continuing with 'X'…" receipt.
-                        const localResolution = credentialResolutions[turnId];
-                        const canContinue =
-                          isLastMessage ||
-                          strandedTerminalContinuations.has(turnId);
-                        return (
-                          <CredentialCard
-                            frame={{
-                              type: "credential_required",
-                              reason: "workflow_credential_inputs_unbound",
-                            }}
-                            mode="auto-bound"
-                            autoBound={autoBound}
-                            // Not while a turn is in flight: the shared continue path would still record
-                            // an optimistic "connected" even though it suppresses the actual send.
-                            canChange={canContinue && !isLoading}
-                            reloadKey={credentialsReloadKey}
-                            resolvedOutcome={localResolution}
-                            continued={Boolean(localResolution?.continued)}
-                            // Change re-enters the same terminal-continue path a terminal ask pick uses
-                            // (send "Use the credential <id> — continue", or open the add modal). A silent
-                            // bind never has a live pause, so never the typed credential-response path.
-                            onConnect={(credentialId, name) =>
-                              credentialId
-                                ? continueAfterTerminalConnect(
-                                    turnId,
-                                    credentialId,
-                                    name ?? localResolution?.name,
-                                    canContinue,
-                                  )
-                                : openCredentialModal(null, turnId, canContinue)
-                            }
-                            onSkip={() => {}}
-                          />
-                        );
-                      })()}
+                      {credentialCardMidTurn ? null : credentialCard}
                       {message.narrative.terminal ? feedbackControl : null}
                     </div>
                   );
@@ -9883,46 +10010,8 @@ export function WorkflowCopilotChat({
                   turn={narrative}
                   onBlockSelect={onBlockSelect}
                   workingRowActive={showWorkingRow}
+                  anchored={liveAnchored}
                 />
-                {!isLoadingHistory &&
-                livePauseFrame &&
-                livePauseFrame.turn_id === narrative.turnId ? (
-                  <CredentialCard
-                    key={livePauseFrame.resume_token}
-                    frame={liveFrameToCardFrame(livePauseFrame)}
-                    mode="inline-pause"
-                    reloadKey={credentialsReloadKey}
-                    resolvedOutcome={
-                      pauseCardResolutions[livePauseFrame.resume_token]
-                    }
-                    onUpdateCredential={(credential) =>
-                      openCredentialModal(
-                        livePauseFrame,
-                        livePauseFrame.turn_id,
-                        false,
-                        credential,
-                      )
-                    }
-                    // A picked credential (id + name from the fetched list) answers through the typed
-                    // resume POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
-                    onConnect={(credentialId, name) =>
-                      credentialId
-                        ? void respondToCredentialPause(
-                            livePauseFrame,
-                            "connected",
-                            credentialId,
-                            name,
-                          )
-                        : openCredentialModal(
-                            livePauseFrame,
-                            livePauseFrame.turn_id,
-                          )
-                    }
-                    onSkip={() =>
-                      void respondToCredentialPause(livePauseFrame, "skip")
-                    }
-                  />
-                ) : null}
               </div>
             )}
             {questionInteractions
@@ -9933,7 +10022,10 @@ export function WorkflowCopilotChat({
                   ),
               )
               .map(renderQuestionReceipt)}
-            <WorkPlanCard items={workPlan} />
+            {/* Turns recorded before plans rode their own tool call carry only the chat's latest plan. */}
+            {lastTurnPlanIndex === -1 && liveTurnPlan === null ? (
+              <WorkPlanCard items={workPlan} />
+            ) : null}
             {recordingSuggestionHost}
           </div>
         </div>

@@ -423,10 +423,16 @@ export interface TurnNarrativeState {
   credentialPause: {
     outcome: "connected" | "skipped" | "timeout" | "declined";
     credentialId: string | null;
+    // The tool call whose row was newest when the card was raised. Absent on
+    // turns recorded before it was stamped.
+    anchorToolCallId?: string;
   } | null;
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
+  // The last plan a successful set_work_plan stored this turn, kept apart from the activity rows
+  // because their cap can trim the call's row in a long turn.
+  workPlan?: TurnWorkPlan | null;
   connectedAccountChoices: ConnectedAccountChoice[];
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
@@ -519,9 +525,13 @@ export function parseCredentialPause(
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
   const outcome = o.outcome;
+  const anchorToolCallId =
+    typeof o.anchorToolCallId === "string" && o.anchorToolCallId
+      ? o.anchorToolCallId
+      : undefined;
   // The user answered but nothing was bound, which the card already renders as a skip.
   if (outcome === "not_admitted") {
-    return { outcome: "skipped", credentialId: null };
+    return { outcome: "skipped", credentialId: null, anchorToolCallId };
   }
   if (
     outcome !== "connected" &&
@@ -534,7 +544,28 @@ export function parseCredentialPause(
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+    anchorToolCallId,
   };
+}
+
+export interface TurnWorkPlan {
+  toolCallId: string;
+  items: string[];
+}
+
+function parseWorkPlanItems(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? [...value]
+    : null;
+}
+
+function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const items = parseWorkPlanItems(o.items);
+  return typeof o.toolCallId === "string" && o.toolCallId && items
+    ? { toolCallId: o.toolCallId, items }
+    : null;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -1350,8 +1381,12 @@ export function applyNarrativeEvent(
     }
 
     case "tool_result": {
+      const planItems = parseWorkPlanItems(event.work_plan);
+      const workPlan = planItems
+        ? { toolCallId: event.tool_call_id, items: planItems }
+        : prev.workPlan;
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return { ...prev };
+      if (!entry) return { ...prev, workPlan };
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1361,6 +1396,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
+        workPlan,
       };
     }
 
@@ -1791,6 +1827,7 @@ export function hydrateNarrativeFromPayload(
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
+    workPlan: parseTurnWorkPlan(payload.workPlan),
     connectedAccountChoices: parseConnectedAccountChoices(
       payload.connectedAccountChoices,
     ),

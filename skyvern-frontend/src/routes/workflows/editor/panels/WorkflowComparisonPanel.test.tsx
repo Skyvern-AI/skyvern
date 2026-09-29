@@ -11,12 +11,13 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { WorkflowVersion } from "../../hooks/useWorkflowVersionsQuery";
 
-// The panel mounts two read-only canvases; the review-action contract under
-// test lives entirely in the footer, so the canvas stack is stubbed out.
+// The review contract under test lives in the header, so the canvas stack is
+// stubbed out; the diff still runs on the real chain helpers.
 vi.mock("../FlowRenderer", () => ({
   FlowRenderer: () => <div data-testid="flow" />,
 }));
-vi.mock("../workflowEditorUtils", () => ({
+vi.mock("../workflowEditorUtils", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../workflowEditorUtils")>()),
   getElements: () => ({ nodes: [], edges: [] }),
 }));
 vi.mock("../nodes", () => ({}));
@@ -34,7 +35,7 @@ afterEach(() => {
 });
 
 describe("WorkflowComparisonPanel diff summary", () => {
-  test("a first proposal against an empty Current reads as added, not identical", () => {
+  test("a first proposal against an empty Current reads as a new workflow", () => {
     const block = {
       label: "open_target",
       block_type: "goto_url",
@@ -49,9 +50,10 @@ describe("WorkflowComparisonPanel diff summary", () => {
       />,
     );
 
-    expect(screen.getByText("Added (1)")).toBeTruthy();
-    expect(screen.getByText("Identical (0)")).toBeTruthy();
-    expect(screen.getByText("Modified (0)")).toBeTruthy();
+    expect(screen.getByText("New workflow")).toBeTruthy();
+    expect(screen.getByText("1 block")).toBeTruthy();
+    expect(screen.getByText(/This is a new workflow/)).toBeTruthy();
+    expect(screen.queryByText(/unchanged/)).toBeNull();
   });
 });
 
@@ -74,7 +76,7 @@ describe("WorkflowComparisonPanel copilot review actions", () => {
       />,
     );
 
-    const accept = screen.getByRole("button", { name: "Accept" });
+    const accept = screen.getByRole("button", { name: "Accept changes" });
     const reject = screen.getByRole("button", { name: "Reject" });
 
     await act(async () => {

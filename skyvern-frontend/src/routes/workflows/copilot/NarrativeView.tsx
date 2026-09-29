@@ -10,10 +10,12 @@ import { CopilotMarkdown } from "./CopilotMarkdown";
 import {
   ACTIVITY_KIND_GLYPH,
   ACTIVITY_KIND_WORD,
+  ActivityLog,
   ActivityRow as ActivityRowModel,
   deriveActivityLog,
+  rowIndexOfToolCall,
 } from "./copilotActivityLog";
-import { TURN_ROW_INSET } from "./cards/cardLayout";
+import { TURN_ROW_INSET, TURN_ROW_OUTSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
 import { CodeWriteDiff } from "./workflowCopilotTypes";
 import {
@@ -1058,9 +1060,11 @@ export function InstantAckPlaceholder() {
 
 interface FActivityLogProps {
   turn: TurnNarrativeState;
+  log: ActivityLog;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
   interactionRef?: { current: string | null };
+  anchoredAfterRow?: ReadonlyMap<string, AnchoredTurnItem[]>;
 }
 
 // The kind gutter sits to the left of ActivityRow's own status column, so a
@@ -1461,13 +1465,15 @@ function FActivityLogRow({
 
 function FActivityLog({
   turn,
+  log,
   turnEnded,
   onBlockSelect,
   interactionRef,
+  anchoredAfterRow,
 }: FActivityLogProps) {
   const outcomeReasonFallback = notConfirmedDisplayReason(turn);
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
-  const { rows, focusIndex } = useMemo(() => deriveActivityLog(turn), [turn]);
+  const { rows, focusIndex } = log;
   // Signed, not a bare id set: a click on the live row has to be able to mean
   // "closed", or folding the active row would silently pin it open instead.
   const [override, setOverride] = useState<ReadonlyMap<string, boolean>>(
@@ -1533,7 +1539,7 @@ function FActivityLog({
             (candidate) =>
               candidate.label === label && candidate.patch !== undefined,
           );
-        return (
+        return [
           <div
             key={row.id}
             data-activity-row-id={row.id}
@@ -1555,10 +1561,33 @@ function FActivityLog({
               outcomeReasonFallback={outcomeReasonFallback}
               outcomeOwnerKey={outcomeOwnerKey}
             />
-          </div>
-        );
+          </div>,
+          ...(anchoredAfterRow?.get(row.id) ?? []).map((item) => (
+            <div key={item.key} className={`${TURN_ROW_OUTSET} py-0.5`}>
+              {item.node}
+            </div>
+          )),
+        ];
       })}
     </div>
+  );
+}
+
+// Something that happened during a turn and renders where it happened: after the activity row
+// holding its tool call, or above the turn's reply when that row is not on screen.
+export interface AnchoredTurnItem {
+  key: string;
+  toolCallId: string | null;
+  node: React.ReactNode;
+}
+
+function AnchoredFallback({ items }: { items: AnchoredTurnItem[] }) {
+  return (
+    <>
+      {items.map((item) => (
+        <div key={item.key}>{item.node}</div>
+      ))}
+    </>
   );
 }
 
@@ -1568,6 +1597,7 @@ interface DetailViewProps {
   workingRowActive?: boolean;
   activityInteractionRef?: { current: string | null };
   beforeProse?: React.ReactNode;
+  anchored: AnchoredTurnItem[];
 }
 
 function DetailView({
@@ -1576,6 +1606,7 @@ function DetailView({
   workingRowActive,
   activityInteractionRef,
   beforeProse,
+  anchored,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
@@ -1593,18 +1624,44 @@ function DetailView({
   const preBlockNarration = turn.designActivity.filter(
     (e) => e.kind === "narration",
   );
+  const log = useMemo(
+    () => (showChecklist ? deriveActivityLog(turn) : null),
+    [showChecklist, turn],
+  );
+  const { anchoredAfterRow, unanchored } = useMemo(() => {
+    const byRow = new Map<string, AnchoredTurnItem[]>();
+    const rest: AnchoredTurnItem[] = [];
+    // The log shows a placeholder instead of rows until a live turn has one.
+    const rows =
+      log && (turn.terminal !== null || log.rows.length > 0) ? log.rows : [];
+    for (const item of anchored) {
+      const index =
+        item.toolCallId === null
+          ? -1
+          : rowIndexOfToolCall(rows, item.toolCallId);
+      const row = rows[index];
+      if (row === undefined) {
+        rest.push(item);
+      } else {
+        byRow.set(row.id, [...(byRow.get(row.id) ?? []), item]);
+      }
+    }
+    return { anchoredAfterRow: byRow, unanchored: rest };
+  }, [anchored, log, turn.terminal]);
 
   return (
     <div className="flex flex-col gap-2.5">
       <div className="flex flex-col gap-2.5">
-        {showChecklist ? (
+        {log ? (
           <div className={TURN_ROW_INSET}>
             <FActivityLog
               key={turn.turnId ?? ""}
               turn={turn}
+              log={log}
               turnEnded={turn.terminal !== null}
               onBlockSelect={onBlockSelect}
               interactionRef={activityInteractionRef}
+              anchoredAfterRow={anchoredAfterRow}
             />
           </div>
         ) : showDesign ? (
@@ -1665,6 +1722,8 @@ function DetailView({
           </div>
         ) : null}
 
+        <AnchoredFallback items={unanchored} />
+
         {beforeProse}
 
         {/* terminalProseTone's question branch without its evidence gate: an
@@ -1701,7 +1760,10 @@ interface NarrativeViewProps {
   // What the user did mid-turn (answered a question). It happened after the turn's activity and
   // before the reply, so it renders between them to keep the transcript chronological.
   beforeProse?: React.ReactNode;
+  anchored?: AnchoredTurnItem[];
 }
+
+const NO_ANCHORED_ITEMS: AnchoredTurnItem[] = [];
 
 type TerminalProseTone = "answer" | "question";
 
@@ -1835,6 +1897,7 @@ export function NarrativeView({
   onBlockSelect,
   workingRowActive,
   beforeProse,
+  anchored = NO_ANCHORED_ITEMS,
 }: NarrativeViewProps) {
   const proseTone = terminalProseTone(turn);
   const proseText = humanizeJudgeText(terminalNarrativeText(turn));
@@ -1848,8 +1911,9 @@ export function NarrativeView({
         arrivedAt={turn.endedAt}
       />
     );
-    return beforeProse ? (
+    return beforeProse || anchored.length > 0 ? (
       <div className="flex flex-col gap-2.5">
+        <AnchoredFallback items={anchored} />
         {beforeProse}
         {prose}
       </div>
@@ -1865,6 +1929,7 @@ export function NarrativeView({
       workingRowActive={workingRowActive}
       activityInteractionRef={activityInteractionRef}
       beforeProse={beforeProse}
+      anchored={anchored}
     />
   );
 }

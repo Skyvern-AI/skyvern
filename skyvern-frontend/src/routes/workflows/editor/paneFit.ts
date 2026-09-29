@@ -183,6 +183,27 @@ export function centeredNodeViewport({
   };
 }
 
+const REVEAL_TOP_MARGIN_PX = 48;
+
+// Like centeredNodeViewport, but a node taller than the pane is pinned by its
+// top so its header, where the review status sits, stays in view.
+export function revealNodeViewport({
+  pane,
+  bounds,
+}: {
+  pane: Size;
+  bounds: Rect;
+}): Viewport | null {
+  const centered = centeredNodeViewport({ pane, bounds });
+  if (centered === null) {
+    return null;
+  }
+  if (bounds.height + REVEAL_TOP_MARGIN_PX * 2 <= pane.height) {
+    return centered;
+  }
+  return { ...centered, y: REVEAL_TOP_MARGIN_PX - bounds.y };
+}
+
 export const END_ANCHOR_BOTTOM_PX = 24;
 
 /**

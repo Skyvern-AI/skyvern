@@ -422,6 +422,9 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   credential_refs: string[];
   timeout_seconds: number;
   expires_at: string;
+  // The tool call whose activity row was newest when the pause was raised, so
+  // the card renders there. Absent against a backend that predates it.
+  anchor_tool_call_id?: string | null;
   timestamp: string;
 }
 
@@ -465,6 +468,8 @@ export interface WorkflowCopilotToolResultUpdate {
   iteration: number;
   tool_call_id: string;
   code_diffs?: CodeWriteDiff[] | null;
+  // The plan a successful set_work_plan stored. Absent on every other tool.
+  work_plan?: string[] | null;
   detail?: string | null;
   timestamp?: string | null;
 }

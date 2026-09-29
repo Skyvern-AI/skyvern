@@ -287,6 +287,20 @@ function rowContainsNarrationTime(
   return narrationMs >= startedMs && narrationMs <= endedMs;
 }
 
+// The row holding a tool call's activity, as a row entry or on a block the row ran. -1 when the call
+// has no row: it aged out past the activity cap, or its frames never reached this turn.
+export function rowIndexOfToolCall(
+  rows: ActivityRow[],
+  toolCallId: string,
+): number {
+  const ofCall = (entry: ActivityEntry) => toolCallIdOf(entry) === toolCallId;
+  return rows.findIndex(
+    (row) =>
+      row.entries.some(ofCall) ||
+      row.blocks.some((block) => block.activity.some(ofCall)),
+  );
+}
+
 export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
   const rows: ActivityRow[] = [];
   const narrations: { entry: ActivityEntry; precedingRow: number }[] = [];

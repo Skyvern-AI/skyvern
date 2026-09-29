@@ -145,7 +145,6 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         <div
           className={cn(
             "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
-            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -188,7 +187,6 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
             className={cn(
               "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
               open ? "shadow-md" : "shadow-sm",
-              data.comparisonColor,
             )}
           >
             <NodeHeader

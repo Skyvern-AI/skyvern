@@ -3,6 +3,10 @@ import {
   type WorkflowModel,
 } from "../../types/workflowTypes";
 import type { CodeBlockTitleSource } from "../../types/scriptTypes";
+import type {
+  BlockReviewAnnotation,
+  FoldReviewAnnotation,
+} from "../review/reviewAnnotation";
 
 export type NodeBaseData = {
   debuggable: boolean;
@@ -12,7 +16,7 @@ export type NodeBaseData = {
   editable: boolean;
   model: WorkflowModel | null;
   showCode?: boolean;
-  comparisonColor?: string;
+  review?: BlockReviewAnnotation | FoldReviewAnnotation;
   ignoreWorkflowSystemPrompt?: boolean;
   /**
    * Optional metadata used for conditional branches.

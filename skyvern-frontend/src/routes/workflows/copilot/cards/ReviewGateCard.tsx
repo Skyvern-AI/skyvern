@@ -23,6 +23,7 @@ import {
   ranCleanOnCurrentSource,
 } from "../narrativeState";
 import {
+  AppliedCheck,
   CardBody,
   CardFooter,
   CardHeader,
@@ -423,12 +424,7 @@ function ResolvedReviewCard({
                 ↺
               </span>
             ) : applied ? (
-              <span
-                aria-hidden="true"
-                className="text-xs font-bold text-emerald-600 dark:text-emerald-400"
-              >
-                ✓
-              </span>
+              <AppliedCheck />
             ) : (
               <MagicWandIcon
                 aria-hidden="true"
@@ -498,6 +494,7 @@ export function ReviewGateCard({
   const runTestRef = useRef<HTMLButtonElement>(null);
   const moreTriggerRef = useRef<HTMLButtonElement>(null);
   const bodyTestRef = useRef<HTMLButtonElement>(null);
+  const retryRef = useRef<HTMLButtonElement>(null);
   // The confirmation replaces the row that opened it, so focus is placed by hand both ways.
   const restoreFocusRef = useRef(false);
   const selectingTestRef = useRef(false);
@@ -506,7 +503,14 @@ export function ReviewGateCard({
       runTestRef.current?.focus();
     } else if (restoreFocusRef.current) {
       restoreFocusRef.current = false;
-      (moreTriggerRef.current ?? bodyTestRef.current)?.focus();
+      // Only when focus went down with the confirmation; a lock may land while it is elsewhere.
+      if (document.activeElement && document.activeElement !== document.body) {
+        return;
+      }
+      // Under a lock the row that opened the confirmation is disabled, so Try again takes focus.
+      [moreTriggerRef.current, bodyTestRef.current, retryRef.current]
+        .find((el) => el && !el.matches(":disabled"))
+        ?.focus();
     }
   }, [confirmingTest]);
   const closeConfirmation = () => {
@@ -566,6 +570,7 @@ export function ReviewGateCard({
     failure === "saved";
   // A lock that lands mid-confirmation would strand it behind the disabled fieldset.
   if (confirmingTest && actionsLocked) {
+    restoreFocusRef.current = true;
     setConfirmingTest(false);
   }
   const showTestInBody = showActions && offerTestInBody && !confirmingTest;
@@ -728,6 +733,7 @@ export function ReviewGateCard({
                   size="sm"
                   variant="outline"
                   disabled={accepting}
+                  ref={retryRef}
                   onClick={onRetry}
                   className="shrink-0"
                 >

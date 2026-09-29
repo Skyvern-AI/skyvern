@@ -71,6 +71,7 @@ import { DataExportNode as DataExportNodeComponent } from "./DataExportNode/Data
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
+import { withReviewAnnotation } from "../review/withReviewAnnotation";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -120,6 +121,8 @@ export type AppNode = UtilityNode | WorkflowBlockNode;
 
 // Composition order is load-bearing:
 //   memo (outermost)    - stable identity per node type for RF reconciliation
+//   withReviewAnnotation - review canvases only; its outline sits outside
+//                         the selected ring
 //   withSortableBlock   - registers `useSortable({ id })`; the inner tree
 //                         must mount in both open and collapsed states so
 //                         drag pickup works on either
@@ -128,7 +131,9 @@ export type AppNode = UtilityNode | WorkflowBlockNode;
 //   withCollapsible     - leaf wrapper for body chrome
 function wrapBlock<P extends NodeProps>(Component: ComponentType<P>) {
   return memo(
-    withSortableBlock(withSelectableBlock(withCollapsible(Component))),
+    withReviewAnnotation(
+      withSortableBlock(withSelectableBlock(withCollapsible(Component))),
+    ),
   );
 }
 
@@ -136,7 +141,9 @@ function wrapBlock<P extends NodeProps>(Component: ComponentType<P>) {
 // child nodes, so collapsing the parent to a header-only card would leave
 // children visually overflowing the card and break edge layout.
 function wrapContainerBlock<P extends NodeProps>(Component: ComponentType<P>) {
-  return memo(withSortableBlock(withSelectableBlock(Component)));
+  return memo(
+    withReviewAnnotation(withSortableBlock(withSelectableBlock(Component))),
+  );
 }
 
 export const nodeTypes = {
@@ -151,7 +158,7 @@ export const nodeTypes = {
   fileUpload: wrapBlock(FileUploadNodeComponent),
   download: wrapBlock(DownloadNodeComponent),
   nodeAdder: memo(NodeAdderNodeComponent),
-  start: memo(StartNodeComponent),
+  start: memo(withReviewAnnotation(StartNodeComponent)),
   validation: wrapBlock(ValidationNodeComponent),
   action: wrapBlock(ActionNodeComponent),
   navigation: wrapBlock(NavigationNodeComponent),
