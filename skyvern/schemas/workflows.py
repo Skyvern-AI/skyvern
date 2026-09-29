@@ -1097,6 +1097,14 @@ class CodeBlockYAML(BlockYAML):
         default=None,
         description="JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing",
     )
+    user_owned_goal: bool | None = Field(
+        default=None,
+        description="True when a person wrote this block's Goal, so copilot regenerations keep their text. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
+    goal_needs_regeneration: bool | None = Field(
+        default=None,
+        description="True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
 
     @model_validator(mode="before")
     @classmethod

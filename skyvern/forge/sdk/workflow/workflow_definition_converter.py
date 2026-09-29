@@ -546,6 +546,8 @@ def block_yaml_to_block(
             prompt=block_yaml.prompt,
             steps=[CodeBlockStep(**step) for step in derive_code_block_steps(block_yaml.code)] or None,
             data_schema=block_yaml.data_schema,
+            user_owned_goal=block_yaml.user_owned_goal,
+            goal_needs_regeneration=block_yaml.goal_needs_regeneration,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(

@@ -81,6 +81,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
     derive_code_block_steps_in_yaml,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
@@ -1537,6 +1538,7 @@ def _build_user_context(
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
     runnable_draft_summary: str = "",
+    user_goal_summary: str = "",
     untrusted_evidence: str = "",
     attached_files_summary: str = "",
 ) -> str:
@@ -1561,6 +1563,7 @@ def _build_user_context(
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
         runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
+        user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
         untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
     )
@@ -2741,6 +2744,31 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
+
+
+def _user_owned_goal_notes(kept: list[str], dropped: list[str]) -> list[str]:
+    """Person-facing notes for a staged write that kept or lost a Goal the person wrote; a label the
+    leak heuristic would flag is left out rather than letting the note become a reject sentence."""
+    notes: list[str] = []
+    if kept:
+        note = f"I kept the Goal you wrote for {', '.join(kept)}."
+        notes.append(note if not contains_internal_machinery_leak(note) else "I kept the Goal you wrote.")
+    if dropped:
+        many = len(dropped) > 1
+        note = (
+            f"{', '.join(dropped)} carried {'Goals' if many else 'a Goal'} you wrote and "
+            f"{'are' if many else 'is'} no longer in the workflow, so "
+            f"{'those Goals are' if many else 'that Goal is'} gone."
+        )
+        notes.append(
+            note
+            if not contains_internal_machinery_leak(note)
+            else f"{'Blocks' if many else 'A block'} carrying a Goal you wrote {'are' if many else 'is'} no longer "
+            f"in the workflow, so {'those Goals are' if many else 'that Goal is'} gone."
+        )
+    return notes
+
+
 _INLINE_REJECT_NOTE_FALLBACK = (
     "This draft didn't pass validation against the live page, so I haven't saved it. "
     "I'll revise it before proposing again."
@@ -3846,6 +3874,14 @@ async def _translate_to_agent_result(
             workflow_yaml = default_data_write_continue_on_failure(
                 workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml
             )
+            # Runs ahead of redaction so the stored Goal bytes it copies in pass the scrub seam; the
+            # inline action carries no artifact metadata, so nothing here can attribute a rebuild.
+            goal_carry = carry_user_owned_goals_in_yaml(
+                workflow_yaml, prior_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml, rebuilt_labels=()
+            )
+            workflow_yaml = goal_carry.workflow_yaml
+            for goal_note in _user_owned_goal_notes(goal_carry.kept, goal_carry.dropped):
+                user_response = f"{user_response}\n\n(Note: {goal_note})"
             # Same seam as the update_workflow tool: redact before the row is written and before
             # the draft becomes the anchor, so both are the same string.
             workflow_yaml = redact_credentials_in_workflow_yaml(
@@ -5624,12 +5660,15 @@ async def _run_copilot_turn_impl(
 
     user_workflow_change_summary = ""
     runnable_draft_summary = ""
+    user_goal_summary = ""
     attached_files_summary = ""
     if isinstance(ctx.turn_context_packet, TurnContextPacket):
         if ctx.turn_context_packet.workflow_change_context is not None:
             user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
         if ctx.turn_context_packet.runnable_draft_context is not None:
             runnable_draft_summary = ctx.turn_context_packet.runnable_draft_context.rendered_summary
+        if ctx.turn_context_packet.user_goal_context is not None:
+            user_goal_summary = ctx.turn_context_packet.user_goal_context.rendered_summary
         if ctx.turn_context_packet.attached_file_context is not None:
             attached_files_summary = ctx.turn_context_packet.attached_file_context.render_prompt_block()
 
@@ -5673,6 +5712,7 @@ async def _run_copilot_turn_impl(
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
         runnable_draft_summary=runnable_draft_summary,
+        user_goal_summary=user_goal_summary,
         untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
     )

@@ -413,6 +413,7 @@ async def _persist_block_scoped_edit(
     originating_call_id: str | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     block_observation_refs: list[BlockObservationRef] | None = None,
+    rebuilt_block_labels: list[str] | None = None,
 ) -> str:
     """Send a server-composed workflow through the normal persistence path.
 
@@ -427,6 +428,8 @@ async def _persist_block_scoped_edit(
     if block_observation_refs is not None:
         params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
         params["raw_block_observation_refs"] = block_observation_refs
+    if rebuilt_block_labels:
+        params["_rebuilt_block_labels"] = rebuilt_block_labels
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(params, copilot_ctx, originating_call_id=originating_call_id)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
@@ -501,7 +504,12 @@ async def edit_block_tool(
         )
         return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
     return await _persist_block_scoped_edit(
-        copilot_ctx, "edit_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+        copilot_ctx,
+        "edit_block",
+        workflow_yaml,
+        arguments,
+        originating_call_id=_originating_call_id(ctx),
+        rebuilt_block_labels=[label] if replacement_code is not None or "code" in (fields or {}) else None,
     )
 
 
@@ -649,6 +657,7 @@ async def edit_block_and_run_tool(
                             "workflow_yaml": workflow_yaml,
                             "_preserve_code_block_associations": True,
                             "_expected_exact_code_by_label": {label: resolution.source},
+                            "_rebuilt_block_labels": [label],
                         },
                         copilot_ctx,
                         allow_missing_credentials=skip_run_after_update,
@@ -665,7 +674,11 @@ async def edit_block_and_run_tool(
             prior_definition = await _get_prior_workflow_definition(copilot_ctx)
             with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
                 update_result = await _update_workflow(
-                    {"workflow_yaml": workflow_yaml, "_preserve_code_block_associations": True},
+                    {
+                        "workflow_yaml": workflow_yaml,
+                        "_preserve_code_block_associations": True,
+                        "_rebuilt_block_labels": [label],
+                    },
                     copilot_ctx,
                     allow_missing_credentials=skip_run_after_update,
                     originating_call_id=_originating_call_id(ctx),
@@ -1346,6 +1359,7 @@ def _promote_executed_sources(
         promoted[label] = resolution.source
     update_params["workflow_yaml"] = workflow_yaml
     update_params["_expected_exact_code_by_label"] = promoted
+    update_params["_rebuilt_block_labels"] = sorted(promoted)
     return None
 
 

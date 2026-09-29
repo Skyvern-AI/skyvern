@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block
 from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
     derive_code_block_steps_in_yaml,
+    is_code_block_type,
 )
 from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     WorkflowBlockLocation,
@@ -242,7 +243,7 @@ def runner_code_block_associations(
     for location in workflow_block_locations(parsed):
         block = location.block
         label = block.get("label")
-        if block.get("block_type") == "code" and isinstance(label, str) and label:
+        if is_code_block_type(block.get("block_type")) and isinstance(label, str) and label:
             associations[label] = (
                 prior_associations[label] if preserve_existing and label in prior_associations else f"cba_{uuid4().hex}"
             )

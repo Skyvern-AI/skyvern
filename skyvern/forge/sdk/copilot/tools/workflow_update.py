@@ -47,7 +47,11 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     scanner_advisory_diagnostics,
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
-from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    user_owned_goal_carry_disclosure,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
@@ -1783,6 +1787,20 @@ def _path_segments(path: str) -> list[tuple[str, bool]]:
         if name:
             segments.append((name, is_array))
     return segments
+
+
+def code_artifact_metadata_block_labels(raw_metadata: object) -> set[str]:
+    """Block labels the submission claims to have authored a code artifact for, read from the raw rows:
+    a row normalization later drops for an unrelated field still names the block the model rebuilt."""
+    labels: set[str] = set()
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if label:
+            labels.add(label)
+    return labels
 
 
 def _metadata_item_for_block_label(raw_metadata: object, block_label: str) -> Mapping[str, Any] | None:
@@ -3878,6 +3896,11 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_code_rewritten",
             "dropped_prior_blocks",
             "block_type_changes",
+            "stored_goal_kept",
+            "stored_goal_kept_message",
+            "stored_goal_dropped",
+            "stored_goal_dropped_message",
+            "google_connection_resolution",
             "persistence",
             "persistence_message",
             "google_sheet_tab_resolution",
@@ -4499,6 +4522,15 @@ async def _update_workflow(
         # reach the resolver already replaced by the placeholder.
         workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
         workflow_yaml, google_sheet_tab_resolution = await resolve_google_sheet_tabs_from_gid(workflow_yaml, ctx)
+        # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
+        # pass the scrub seam like any other submitted text.
+        goal_carry = carry_user_owned_goals_in_yaml(
+            workflow_yaml,
+            prior_yaml=prior_yaml,
+            rebuilt_labels=code_artifact_metadata_block_labels(ctx.submitted_code_artifact_metadata_snapshot)
+            | set(params.get("_rebuilt_block_labels") or ()),
+        )
+        workflow_yaml = goal_carry.workflow_yaml
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4741,6 +4773,7 @@ async def _update_workflow(
             data["dropped_prior_blocks"] = dropped_prior_blocks
         if block_type_changes:
             data["block_type_changes"] = block_type_changes
+        data.update(user_owned_goal_carry_disclosure(goal_carry))
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",
