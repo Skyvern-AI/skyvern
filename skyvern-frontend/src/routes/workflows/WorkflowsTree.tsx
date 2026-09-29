@@ -1103,9 +1103,7 @@ function WorkflowsTree() {
           }}
         />
 
-        <div data-hint="start-template">
-          <WorkflowTemplates />
-        </div>
+        <WorkflowTemplates />
       </div>
     </div>
   );

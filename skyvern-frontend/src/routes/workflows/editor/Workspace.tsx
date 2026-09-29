@@ -31,6 +31,7 @@ import {
   useRef,
   useState,
   MutableRefObject,
+  type ReactNode,
 } from "react";
 import { nanoid } from "nanoid";
 import { parse as parseYAML, stringify as convertToYAML } from "yaml";
@@ -114,6 +115,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
+import { PaneErrorBoundary } from "@/components/PaneErrorBoundary";
+import { useLogging } from "@/hooks/useLogging";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
@@ -444,6 +447,7 @@ export function useWorkspaceCopilotUpdate({
     options: WorkflowUpdateOptions & { userDriven: boolean },
   ) => boolean | void;
 }) {
+  const logging = useLogging();
   return (workflowData: WorkflowVersion, options?: WorkflowUpdateOptions) => {
     try {
       // All Copilot-driven applies are user edits (mid-turn draft, accept,
@@ -456,6 +460,10 @@ export function useWorkspaceCopilotUpdate({
         throw new Error("The editor refused the Copilot update");
     } catch (error) {
       console.error("Failed to parse and apply agent", error, workflowData);
+      logging.error("Copilot agent apply failed", {
+        workflow_permanent_id: workflowData.workflow_permanent_id,
+        error,
+      });
       toast({
         title: "Update failed",
         description: "Failed to apply agent update. Please try again.",
@@ -485,6 +493,7 @@ function Workspace({
     acceptedWorkflow.version > loadedWorkflow.version
       ? acceptedWorkflow
       : loadedWorkflow;
+  const logging = useLogging();
   const { blockLabel } = useParams();
   const workflowPermanentId = useWorkflowPermanentId();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
@@ -630,6 +639,11 @@ function Workspace({
   // "Make a Copy"), so the YAML editor must not open or commit for them.
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const postHog = usePostHog();
+  const captureProductEvent = useCallback(
+    (event: string, properties: Record<string, unknown>) =>
+      postHog.capture(event, properties),
+    [postHog],
+  );
   const { getNodes, getEdges } = useReactFlow();
   const {
     nodes,
@@ -2134,6 +2148,41 @@ function Workspace({
   const handleCopilotWorkflowUpdate = useWorkspaceCopilotUpdate({
     applyWorkflowUpdate,
   });
+  const reportStudioPaneCrash = (
+    pane: string,
+    error: unknown,
+    componentStack?: string | null,
+  ) => {
+    logging.error("Studio pane crashed", {
+      error_source: "studio_pane",
+      pane,
+      component_stack: componentStack,
+      workflow_permanent_id: workflow.workflow_permanent_id,
+      error,
+    });
+    if (typeof postHog?.captureException === "function") {
+      postHog.captureException(error, { error_source: "studio_pane", pane });
+    }
+  };
+  const withStudioPaneBoundary = (
+    pane: string,
+    children: ReactNode,
+    fallbackContainer?: HTMLElement | null,
+  ) =>
+    embedded ? (
+      <PaneErrorBoundary
+        key={`${workflow.workflow_permanent_id}:${pane}`}
+        pane={pane}
+        fallbackContainer={fallbackContainer}
+        onError={(error, componentStack) =>
+          reportStudioPaneCrash(pane, error, componentStack)
+        }
+      >
+        {children}
+      </PaneErrorBoundary>
+    ) : (
+      children
+    );
 
   const enterYamlMode = () => {
     if (isGlobalWorkflow) {
@@ -2614,31 +2663,34 @@ function Workspace({
       embedded ? (
         // Studio: a flex row so Agent History docks beside the comparison; the
         // legacy absolute layout below assumes the old full-width editor.
-        <div className="flex h-full w-full gap-3 overflow-hidden p-3">
-          <div className="min-w-0 flex-1">
-            <WorkflowComparisonPanel
-              key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
-              version1={workflowPanelState.data.version1}
-              version2={workflowPanelState.data.version2}
-              onSelectState={handleSelectState}
-              mode={workflowPanelState.data.mode}
-              onCopilotReviewClose={
-                workflowPanelState.data.onCopilotReviewClose
-              }
-              onExit={embedded ? exitVersionHistory : undefined}
-            />
-          </div>
-          {workflowPanelState.active &&
-            workflowPanelState.content === "history" && (
-              <div className="shrink-0">
-                <WorkflowHistoryPanel
-                  workflowPermanentId={workflowPermanentId!}
-                  onCompare={handleCompareVersions}
-                  onClose={embedded ? exitVersionHistory : undefined}
-                />
-              </div>
-            )}
-        </div>
+        withStudioPaneBoundary(
+          "comparison",
+          <div className="flex h-full w-full gap-3 overflow-hidden p-3">
+            <div className="min-w-0 flex-1">
+              <WorkflowComparisonPanel
+                key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
+                version1={workflowPanelState.data.version1}
+                version2={workflowPanelState.data.version2}
+                onSelectState={handleSelectState}
+                mode={workflowPanelState.data.mode}
+                onCopilotReviewClose={
+                  workflowPanelState.data.onCopilotReviewClose
+                }
+                onExit={embedded ? exitVersionHistory : undefined}
+              />
+            </div>
+            {workflowPanelState.active &&
+              workflowPanelState.content === "history" && (
+                <div className="shrink-0">
+                  <WorkflowHistoryPanel
+                    workflowPermanentId={workflowPermanentId!}
+                    onCompare={handleCompareVersions}
+                    onClose={embedded ? exitVersionHistory : undefined}
+                  />
+                </div>
+              )}
+          </div>,
+        )
       ) : workflowPanelState.data?.showComparison &&
         workflowPanelState.data?.version1 &&
         workflowPanelState.data?.version2 ? (
@@ -2746,30 +2798,35 @@ function Workspace({
               {...(yamlEditorActive ? { inert: "" } : {})}
             >
               {/* infinite canvas */}
-              <FlowRenderer
-                nodes={nodes}
-                edges={edges}
-                setNodes={setNodes}
-                setEdges={setEdges}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                initialTitle={initialTitle}
-                workflow={workflow}
-                parameterBaseline={
-                  parameterBaselines[workflow.workflow_permanent_id]
-                }
-                embedded={embedded}
-                paneEntryKey={embedded ? studioEntryId : undefined}
-                paneLayoutKey={
-                  embedded
-                    ? `${studioPanes.join(",")}|${paneWidthsKey(studioPaneWidths)}`
-                    : undefined
-                }
-                onRequestDeleteNode={handleRequestDeleteNode}
-                captureHistoryImmediately={captureWorkflowEditImmediately}
-                onAddNode={addNode}
-                historyApplyTrigger={historyApplyTrigger + restoreApplyTrigger}
-              />
+              {withStudioPaneBoundary(
+                "editor",
+                <FlowRenderer
+                  nodes={nodes}
+                  edges={edges}
+                  setNodes={setNodes}
+                  setEdges={setEdges}
+                  onNodesChange={onNodesChange}
+                  onEdgesChange={onEdgesChange}
+                  initialTitle={initialTitle}
+                  workflow={workflow}
+                  parameterBaseline={
+                    parameterBaselines[workflow.workflow_permanent_id]
+                  }
+                  embedded={embedded}
+                  paneEntryKey={embedded ? studioEntryId : undefined}
+                  paneLayoutKey={
+                    embedded
+                      ? `${studioPanes.join(",")}|${paneWidthsKey(studioPaneWidths)}`
+                      : undefined
+                  }
+                  onRequestDeleteNode={handleRequestDeleteNode}
+                  captureHistoryImmediately={captureWorkflowEditImmediately}
+                  onAddNode={addNode}
+                  historyApplyTrigger={
+                    historyApplyTrigger + restoreApplyTrigger
+                  }
+                />,
+              )}
 
               {/* Studio hosts the toggle in the Editor pane header; legacy
                   anchors it under the header on /edit only (the debugger
@@ -3345,172 +3402,178 @@ function Workspace({
         </div>
       )}
 
-      <WorkflowCopilotChat
-        captureEditorState={captureLiveEditorState}
-        restoreEditorState={restoreLiveEditorState}
-        onWorkflowPersisted={(workflowPermanentId) =>
-          useWorkflowHasChangesStore
-            .getState()
-            .recordPersistedSave(workflowPermanentId)
-        }
-        isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
-        docked={embedded}
-        chromeless={embedded}
-        portalTarget={embedded ? studioCopilotPortalEl : undefined}
-        onClose={() => setIsCopilotOpen(false)}
-        onMessageCountChange={setCopilotMessageCount}
-        buttonRef={copilotButtonRef}
-        liveBrowserSessionId={
-          copilotLiveBrowserReady ? debugBrowserSessionId : null
-        }
-        onTurnActivityChange={setIsCopilotTurnActive}
-        workflowRunId={copilotRunId({ embedded, studioRunId })}
-        requiresLiveBrowser={copilotRequiresLiveBrowser}
-        isLiveBrowserReady={copilotLiveBrowserReady}
-        initialMessage={initialCopilotMessage ?? undefined}
-        initialAttachments={routeInitialCopilotAttachments}
-        initialAction={initialCopilotAction ?? undefined}
-        onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
-        onUploadSOP={uploadSOPAtEnd}
-        canUploadSOP={authoringActionAvailability.canUploadSOP}
-        isUploadingSOP={sopToBlocksMutation.isPending}
-        onRecordTask={startRecordingAtEnd}
-        canRecordTask={authoringActionAvailability.canRecordTask}
-        authoringUnavailableReason={
-          authoringActionAvailability.unavailableReason
-        }
-        onBlockSelect={highlightBlock}
-        onReviewWorkflow={async (pendingWorkflow, settle, baseline) => {
-          const saveData = workflowChangesStore.getSaveData?.();
-          if (!saveData) return;
+      {withStudioPaneBoundary(
+        "copilot",
+        <WorkflowCopilotChat
+          organizationId={workflow.organization_id}
+          captureProductEvent={captureProductEvent}
+          captureEditorState={captureLiveEditorState}
+          restoreEditorState={restoreLiveEditorState}
+          onWorkflowPersisted={(workflowPermanentId) =>
+            useWorkflowHasChangesStore
+              .getState()
+              .recordPersistedSave(workflowPermanentId)
+          }
+          isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
+          docked={embedded}
+          chromeless={embedded}
+          portalTarget={embedded ? studioCopilotPortalEl : undefined}
+          onClose={() => setIsCopilotOpen(false)}
+          onMessageCountChange={setCopilotMessageCount}
+          buttonRef={copilotButtonRef}
+          liveBrowserSessionId={
+            copilotLiveBrowserReady ? debugBrowserSessionId : null
+          }
+          onTurnActivityChange={setIsCopilotTurnActive}
+          workflowRunId={copilotRunId({ embedded, studioRunId })}
+          requiresLiveBrowser={copilotRequiresLiveBrowser}
+          isLiveBrowserReady={copilotLiveBrowserReady}
+          initialMessage={initialCopilotMessage ?? undefined}
+          initialAttachments={routeInitialCopilotAttachments}
+          initialAction={initialCopilotAction ?? undefined}
+          onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
+          onUploadSOP={uploadSOPAtEnd}
+          canUploadSOP={authoringActionAvailability.canUploadSOP}
+          isUploadingSOP={sopToBlocksMutation.isPending}
+          onRecordTask={startRecordingAtEnd}
+          canRecordTask={authoringActionAvailability.canRecordTask}
+          authoringUnavailableReason={
+            authoringActionAvailability.unavailableReason
+          }
+          onBlockSelect={highlightBlock}
+          onReviewWorkflow={async (pendingWorkflow, settle, baseline) => {
+            const saveData = workflowChangesStore.getSaveData?.();
+            if (!saveData) return;
 
-          try {
-            // While a turn streams, the draft is staged on the canvas, so the
-            // live save data would compare the proposal against itself; the
-            // chat's pre-submit snapshot is "Current" then. Without a snapshot
-            // (reload, chat switch) nothing was staged, so the live canvas —
-            // including unsaved edits — is the right baseline.
-            const parseHeaders = (
-              value: string | null,
-              label: string,
-            ): Record<string, string> | null | undefined => {
-              try {
-                return value ? parseHeaderJson(value) : null;
-              } catch (error) {
-                toast({
-                  title: "Error",
-                  description: `Invalid JSON format in ${label}: ${getJsonParseErrorDetail(
-                    value ?? "",
-                    error,
-                  )}`,
-                  variant: "destructive",
+            try {
+              // While a turn streams, the draft is staged on the canvas, so the
+              // live save data would compare the proposal against itself; the
+              // chat's pre-submit snapshot is "Current" then. Without a snapshot
+              // (reload, chat switch) nothing was staged, so the live canvas —
+              // including unsaved edits — is the right baseline.
+              const parseHeaders = (
+                value: string | null,
+                label: string,
+              ): Record<string, string> | null | undefined => {
+                try {
+                  return value ? parseHeaderJson(value) : null;
+                } catch (error) {
+                  toast({
+                    title: "Error",
+                    description: `Invalid JSON format in ${label}: ${getJsonParseErrorDetail(
+                      value ?? "",
+                      error,
+                    )}`,
+                    variant: "destructive",
+                  });
+                  return undefined;
+                }
+              };
+              let baseVersion: WorkflowVersion;
+              if (baseline) {
+                baseVersion = baseline;
+              } else {
+                const extraHttpHeaders = parseHeaders(
+                  saveData.settings.extraHttpHeaders,
+                  "extra http headers",
+                );
+                if (extraHttpHeaders === undefined) return;
+                const cdpConnectHeaders = parseHeaders(
+                  saveData.settings.cdpConnectHeaders,
+                  "cdp connect headers",
+                );
+                if (cdpConnectHeaders === undefined) return;
+                baseVersion = canvasWorkflowVersionFromSaveData(saveData, {
+                  extraHttpHeaders,
+                  cdpConnectHeaders,
                 });
-                return undefined;
               }
-            };
-            let baseVersion: WorkflowVersion;
-            if (baseline) {
-              baseVersion = baseline;
-            } else {
-              const extraHttpHeaders = parseHeaders(
-                saveData.settings.extraHttpHeaders,
-                "extra http headers",
-              );
-              if (extraHttpHeaders === undefined) return;
-              const cdpConnectHeaders = parseHeaders(
-                saveData.settings.cdpConnectHeaders,
-                "cdp connect headers",
-              );
-              if (cdpConnectHeaders === undefined) return;
-              baseVersion = canvasWorkflowVersionFromSaveData(saveData, {
-                extraHttpHeaders,
-                cdpConnectHeaders,
-              });
-            }
-            // Both hold canvas (YAML-shaped) blocks; round-trip them through
-            // the converter so they match the proposal's shape.
-            const client = await getClient(credentialGetter, "sans-api-v1");
-            const baseConversion =
-              await client.post<WorkflowYAMLConversionResponse>(
-                "/workflow/copilot/convert-yaml-to-blocks",
-                {
-                  workflow_definition_yaml: convertToYAML({
-                    version: saveData.workflowDefinitionVersion,
-                    parameters: baseVersion.workflow_definition.parameters,
-                    blocks: baseVersion.workflow_definition.blocks,
-                    finally_block_label:
-                      baseVersion.workflow_definition.finally_block_label ??
-                      undefined,
-                    workflow_system_prompt:
-                      baseVersion.workflow_definition.workflow_system_prompt ??
-                      undefined,
-                    error_code_mapping:
-                      baseVersion.workflow_definition.error_code_mapping ??
-                      undefined,
-                    retry_policy:
-                      baseVersion.workflow_definition.retry_policy ?? null,
-                  }),
-                  workflow_id: saveData.workflow.workflow_id,
+              // Both hold canvas (YAML-shaped) blocks; round-trip them through
+              // the converter so they match the proposal's shape.
+              const client = await getClient(credentialGetter, "sans-api-v1");
+              const baseConversion =
+                await client.post<WorkflowYAMLConversionResponse>(
+                  "/workflow/copilot/convert-yaml-to-blocks",
+                  {
+                    workflow_definition_yaml: convertToYAML({
+                      version: saveData.workflowDefinitionVersion,
+                      parameters: baseVersion.workflow_definition.parameters,
+                      blocks: baseVersion.workflow_definition.blocks,
+                      finally_block_label:
+                        baseVersion.workflow_definition.finally_block_label ??
+                        undefined,
+                      workflow_system_prompt:
+                        baseVersion.workflow_definition
+                          .workflow_system_prompt ?? undefined,
+                      error_code_mapping:
+                        baseVersion.workflow_definition.error_code_mapping ??
+                        undefined,
+                      retry_policy:
+                        baseVersion.workflow_definition.retry_policy ?? null,
+                    }),
+                    workflow_id: saveData.workflow.workflow_id,
+                  },
+                );
+              const currentVersion: WorkflowVersion = {
+                ...baseVersion,
+                workflow_definition: baseConversion.data.workflow_definition,
+              };
+
+              // Approve / Reject settle through the chat so the server-side
+              // proposal is cleared (revision-checked) and the canvas updated
+              // exactly as the chat's own buttons do. A refused decision keeps the
+              // panel open; an Accept failure renders on the chat's review gate,
+              // so the panel closes to reveal it.
+              const handleCopilotReviewClose = bindCopilotReviewClose(
+                () => settle("reject"),
+                async (status) => {
+                  if (status === "approve" && !(await settle("approve"))) {
+                    return;
+                  }
+                  setWorkflowPanelState({
+                    active: false,
+                    content: "history",
+                    data: {
+                      showComparison: false,
+                      version1: undefined,
+                      version2: undefined,
+                    },
+                  });
+                  setIsCopilotOpen(true);
                 },
               );
-            const currentVersion: WorkflowVersion = {
-              ...baseVersion,
-              workflow_definition: baseConversion.data.workflow_definition,
-            };
 
-            // Approve / Reject settle through the chat so the server-side
-            // proposal is cleared (revision-checked) and the canvas updated
-            // exactly as the chat's own buttons do. A refused decision keeps the
-            // panel open; an Accept failure renders on the chat's review gate,
-            // so the panel closes to reveal it.
-            const handleCopilotReviewClose = bindCopilotReviewClose(
-              () => settle("reject"),
-              async (status) => {
-                if (status === "approve" && !(await settle("approve"))) {
-                  return;
-                }
-                setWorkflowPanelState({
-                  active: false,
-                  content: "history",
-                  data: {
-                    showComparison: false,
-                    version1: undefined,
-                    version2: undefined,
-                  },
-                });
-                setIsCopilotOpen(true);
-              },
-            );
-
-            // Hide chat and show comparison. The comparison renders on the
-            // editor canvas, so surface the Editor pane when docked in the studio.
-            setIsCopilotOpen(false);
-            if (embedded) {
-              openStudioPane("editor");
+              // Hide chat and show comparison. The comparison renders on the
+              // editor canvas, so surface the Editor pane when docked in the studio.
+              setIsCopilotOpen(false);
+              if (embedded) {
+                openStudioPane("editor");
+              }
+              setWorkflowPanelState({
+                active: false,
+                content: "history",
+                data: {
+                  version1: currentVersion,
+                  version2: pendingWorkflow,
+                  showComparison: true,
+                  mode: "copilot",
+                  onCopilotReviewClose: handleCopilotReviewClose,
+                },
+              });
+            } catch (error) {
+              console.error("Failed to prepare agent comparison", error);
+              toast({
+                title: "Comparison failed",
+                description:
+                  "Failed to prepare agent for comparison. Please try again.",
+                variant: "destructive",
+              });
             }
-            setWorkflowPanelState({
-              active: false,
-              content: "history",
-              data: {
-                version1: currentVersion,
-                version2: pendingWorkflow,
-                showComparison: true,
-                mode: "copilot",
-                onCopilotReviewClose: handleCopilotReviewClose,
-              },
-            });
-          } catch (error) {
-            console.error("Failed to prepare agent comparison", error);
-            toast({
-              title: "Comparison failed",
-              description:
-                "Failed to prepare agent for comparison. Please try again.",
-              variant: "destructive",
-            });
-          }
-        }}
-        onWorkflowUpdate={handleCopilotWorkflowUpdate}
-      />
+          }}
+          onWorkflowUpdate={handleCopilotWorkflowUpdate}
+        />,
+        studioCopilotPortalEl,
+      )}
       <ConfirmDialog
         open={deleteBlockDialogState.open}
         onOpenChange={(open) => {
@@ -3579,12 +3642,15 @@ function Workspace({
       ) : null}
       {/* Studio: Code mode swaps the Editor pane's content (sibling panes stay
           usable); legacy keeps the original full-screen modal overlay. */}
-      {yamlEditorActive ? (
-        <WorkflowYamlEditor
-          workflowId={workflow.workflow_permanent_id}
-          variant={embedded ? "pane" : "fullscreen"}
-        />
-      ) : null}
+      {yamlEditorActive
+        ? withStudioPaneBoundary(
+            "yaml",
+            <WorkflowYamlEditor
+              workflowId={workflow.workflow_permanent_id}
+              variant={embedded ? "pane" : "fullscreen"}
+            />,
+          )
+        : null}
     </div>
   );
 }

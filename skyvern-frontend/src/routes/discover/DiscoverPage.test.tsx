@@ -87,8 +87,8 @@ vi.mock("@/routes/tasks/create/PromptBox", async () => {
   return {
     PromptBox: React.forwardRef<
       { focusAndPrefillExample: (key: string) => void },
-      Record<string, never>
-    >(function PromptBoxMock(_, ref) {
+      { secondaryAction?: React.ReactNode }
+    >(function PromptBoxMock({ secondaryAction }, ref) {
       const [value, setValue] = React.useState("");
       const textareaRef = React.useRef<HTMLTextAreaElement>(null);
       React.useImperativeHandle(ref, () => ({
@@ -107,6 +107,7 @@ vi.mock("@/routes/tasks/create/PromptBox", async () => {
             value={value}
             onChange={(event) => setValue(event.target.value)}
           />
+          {secondaryAction}
         </div>
       );
     }),
@@ -460,9 +461,10 @@ describe("DiscoverPage onboarding mount", () => {
 
   it("preserves content order and mounts over seeded template data", async () => {
     renderDiscover(baseState);
-    const content = screen.getByTestId("discover-templates").parentElement;
+    const content =
+      screen.getByTestId("discover-templates").parentElement?.parentElement;
     expect(content?.textContent).toBe(
-      "Create an agentpromptSkip — start with blank canvas →templates",
+      "Create an agentpromptStart with a blank canvastemplates",
     );
     expect(screen.queryByText("Build your first agent")).toBeNull();
     expect(screen.queryByText(/Keep going/)).toBeNull();
@@ -478,7 +480,7 @@ describe("DiscoverPage onboarding mount", () => {
     );
 
     fireEvent.click(
-      screen.getByRole("button", { name: /start with blank canvas/i }),
+      screen.getByRole("button", { name: /start with a blank canvas/i }),
     );
 
     const submitted = mocks.capture.mock.calls.find(
@@ -515,7 +517,7 @@ describe("DiscoverPage onboarding mount", () => {
     expect(mocks.telemetry.modalOpened).not.toHaveBeenCalled();
     expect(mocks.telemetry.questionnaireShown).not.toHaveBeenCalled();
     const blankCanvas = screen.getByRole("button", {
-      name: /start with blank canvas/i,
+      name: /start with a blank canvas/i,
       hidden: true,
     });
 
@@ -552,7 +554,7 @@ describe("DiscoverPage onboarding mount", () => {
     await waitFor(() => expect(mocks.confirmed).toHaveBeenCalledOnce());
     const dialog = screen.getByRole("dialog");
     const blankCanvas = screen.getByRole("button", {
-      name: /start with blank canvas/i,
+      name: /start with a blank canvas/i,
       hidden: true,
     });
     expect(

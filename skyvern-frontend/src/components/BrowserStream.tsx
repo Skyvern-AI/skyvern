@@ -19,6 +19,7 @@ import { RecordingPill } from "@/components/RecordingPill";
 import { Tip } from "@/components/Tip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
@@ -250,12 +251,16 @@ function BrowserStream({
   const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
+  const gaveUpLoggedRef = useRef(false);
+  const streamLogFieldsRef = useRef({ browserSessionId, entity, runId });
+  streamLogFieldsRef.current = { browserSessionId, entity, runId };
   const isRecording = useRecordingStore((state) => state.isRecording);
   const workflowPermanentId = useRecordingStore(
     (state) => state.workflowPermanentId,
   );
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const getWebSocketParams = useWebSocketParams();
   const isBrowserSessionAvailable =
     entity !== "browserSession" || hasBrowserSession;
@@ -326,6 +331,7 @@ function BrowserStream({
     setIsBrowserSessionEnded(false);
     setHasGivenUp(false);
     setTerminalDiagnostic(null);
+    gaveUpLoggedRef.current = false;
     messageReconnectAttemptsRef.current = 0;
     if (messageReconnectTimerRef.current) {
       clearTimeout(messageReconnectTimerRef.current);
@@ -433,6 +439,20 @@ function BrowserStream({
     if (messageReconnectAttemptsRef.current >= MESSAGE_MAX_RECONNECT_ATTEMPTS) {
       setTerminalDiagnostic((prev) => prev ?? STREAM_GAVE_UP_DIAGNOSTIC);
       setHasGivenUp(true);
+      if (!gaveUpLoggedRef.current) {
+        gaveUpLoggedRef.current = true;
+        logging.warn("Stream gave up", {
+          stream: "vnc",
+          browser_session_id:
+            streamLogFieldsRef.current.browserSessionId ?? null,
+          workflow_run_id:
+            streamLogFieldsRef.current.entity === "workflow"
+              ? streamLogFieldsRef.current.runId
+              : null,
+          reason: "message_reconnect_exhausted",
+          reconnect_attempts: messageReconnectAttemptsRef.current,
+        });
+      }
       return;
     }
 
@@ -444,7 +464,7 @@ function BrowserStream({
       messageReconnectTimerRef.current = null;
       setMessagesDisconnectedTrigger((x) => x + 1);
     }, MESSAGE_RECONNECT_DELAY_MS);
-  }, [isMessageConnected, isVncConnected]);
+  }, [isMessageConnected, isVncConnected, logging]);
 
   useEffect(() => {
     return () => {
@@ -585,6 +605,20 @@ function BrowserStream({
             );
           } else {
             setHasGivenUp(true);
+            if (!gaveUpLoggedRef.current) {
+              gaveUpLoggedRef.current = true;
+              logging.warn("Stream gave up", {
+                stream: "vnc",
+                browser_session_id:
+                  streamLogFieldsRef.current.browserSessionId ?? null,
+                workflow_run_id:
+                  streamLogFieldsRef.current.entity === "workflow"
+                    ? streamLogFieldsRef.current.runId
+                    : null,
+                reason: "reconnect_exhausted",
+                reconnect_attempts: vncReconnectAttemptsRef.current,
+              });
+            }
           }
           onClose?.();
           const clean = Boolean(e.detail?.clean);
@@ -636,6 +670,7 @@ function BrowserStream({
       runId,
       showStream,
       vncDisconnectedTrigger, // will re-run on disconnects
+      logging,
     ],
   );
 

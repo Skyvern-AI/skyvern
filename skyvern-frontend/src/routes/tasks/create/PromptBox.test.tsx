@@ -156,11 +156,13 @@ vi.mock("./ExampleCasePill", () => ({
   ExampleCasePill: ({
     label,
     onClick,
+    selected,
   }: {
     label: string;
     onClick: () => void;
+    selected?: boolean;
   }) => (
-    <button type="button" onClick={onClick}>
+    <button type="button" aria-pressed={selected} onClick={onClick}>
       {label}
     </button>
   ),
@@ -400,9 +402,9 @@ describe("PromptBox", () => {
     const textarea = screen.getByPlaceholderText("Enter your prompt...");
     textarea.scrollIntoView = vi.fn();
 
-    act(() => ref.current?.focusAndPrefillExample("hackernews"));
-    expect((textarea as HTMLTextAreaElement).value).toBe(
-      "Navigate to the Hacker News homepage and get the top 3 posts.",
+    act(() => ref.current?.focusAndPrefillExample("AAPLStockPrice"));
+    expect((textarea as HTMLTextAreaElement).value).toContain(
+      'find the "AAPL" stock price',
     );
     expect(document.activeElement).toBe(textarea);
     expect(textarea.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
@@ -512,7 +514,7 @@ describe("PromptBox", () => {
     expect(submitted[1]?.[1].attempt_id).not.toBe(submitted[0]?.[1].attempt_id);
   });
 
-  test("attributes a submitted example without capturing its prompt", async () => {
+  test("loads a clicked example for review and attributes it on submit without capturing its prompt", async () => {
     mockPost.mockResolvedValue({
       data: {
         workflow_permanent_id: "wpid_example",
@@ -521,9 +523,11 @@ describe("PromptBox", () => {
     });
 
     renderPromptBox();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Add a product to cart" }),
-    );
+    const card = screen.getByRole("button", { name: "Add a product to cart" });
+    fireEvent.click(card);
+    expect(mockPost).not.toHaveBeenCalled();
+    expect(card.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
 
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
     const submitted = mockPostHogCapture.mock.calls.find(
@@ -532,11 +536,34 @@ describe("PromptBox", () => {
     expect(submitted).toMatchObject({
       source: "example",
       example: "finditparts",
+      example_edited: false,
       variant: "legacy",
     });
     expect(JSON.stringify(mockPostHogCapture.mock.calls)).not.toContain(
       "W01-377-8537",
     );
+  });
+
+  test("hides run settings on the legacy home when the Copilot handoff is on", () => {
+    renderPromptBox(true);
+    expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
+    cleanup();
+
+    renderPromptBox(false);
+    expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
+  });
+
+  test("clears the selected legacy example once its prompt is edited", () => {
+    renderPromptBox();
+    const card = screen.getByRole("button", { name: "Apply for a job" });
+    fireEvent.click(card);
+    expect(card.getAttribute("aria-pressed")).toBe("true");
+
+    const textarea = screen.getByPlaceholderText(
+      "Enter your prompt...",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: `${textarea.value} now` } });
+    expect(card.getAttribute("aria-pressed")).toBe("false");
   });
 
   test("preserves an unedited redesign example through creation outcomes", async () => {
@@ -666,7 +693,7 @@ describe("PromptBox", () => {
     const cases = [
       ["finditparts", "finditparts.com"],
       ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
-      ["hackernews", "Hacker News homepage"],
+      ["extractIntegrationsFromGong", "Gong integrations page"],
       ["AAPLStockPrice", "google finance"],
     ] as const;
 

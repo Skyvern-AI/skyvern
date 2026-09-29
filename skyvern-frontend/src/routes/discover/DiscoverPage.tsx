@@ -14,7 +14,7 @@ import { WorkflowTemplates } from "./WorkflowTemplates";
 import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
 import { useSearchParams } from "react-router-dom";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { FilePlusIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
 
 function getIntentExampleKey(
@@ -24,7 +24,7 @@ function getIntentExampleKey(
     case "fill_forms":
       return "contact_us_forms";
     case "extract_data":
-      return "hackernews";
+      return "extractIntegrationsFromGong";
     case "monitor_website":
       return "AAPLStockPrice";
     default:
@@ -161,16 +161,14 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   return (
     <div className="space-y-10">
       <h1 className="sr-only">Create an agent</h1>
-      <div className="space-y-3">
-        <PromptBox
-          ref={promptBoxRef}
-          enableCopilotHandoff={enableCopilotHandoff}
-        />
-        <div className="flex justify-end">
+      <PromptBox
+        ref={promptBoxRef}
+        enableCopilotHandoff={enableCopilotHandoff}
+        secondaryAction={
           <Button
             variant="ghost"
             size="sm"
-            className="h-11 touch-manipulation text-muted-foreground hover:text-foreground"
+            className="h-11 w-full touch-manipulation gap-2 border border-border/70 text-muted-foreground hover:text-foreground md:h-10 md:w-auto md:border-0"
             disabled={createWorkflowMutation.isPending}
             onClick={() => {
               createWorkflow({
@@ -179,17 +177,21 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
               });
             }}
           >
-            {createWorkflowMutation.isPending && (
+            {createWorkflowMutation.isPending ? (
               <ReloadIcon
                 aria-hidden="true"
-                className="mr-2 h-3 w-3 motion-safe:animate-spin motion-reduce:animate-none"
+                className="h-3 w-3 motion-safe:animate-spin motion-reduce:animate-none"
               />
+            ) : (
+              <FilePlusIcon aria-hidden="true" className="size-4" />
             )}
-            Skip — start with blank canvas →
+            Start with a blank canvas
           </Button>
-        </div>
+        }
+      />
+      <div className="mx-auto w-full max-w-[60rem] pb-8">
+        <WorkflowTemplates />
       </div>
-      <WorkflowTemplates />
       {onboardingModal}
     </div>
   );
