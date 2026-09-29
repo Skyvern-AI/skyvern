@@ -108,7 +108,7 @@ import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
 import type { AppNode } from "..";
 import {
-  getWorkflowErrors,
+  blockRunErrors,
   isMissingRequiredStartUrl,
 } from "../../workflowEditorUtils";
 import { getNodeBrowserUrlError } from "../../browserBlockUrl";
@@ -412,9 +412,7 @@ function NodeHeader({
       // one. Filter relies on the implicit contract that every validator
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
-      const allErrors = getWorkflowErrors(reactFlow.getNodes());
-      const labelPrefix = `${blockLabel}:`;
-      const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      const blockErrors = blockRunErrors(reactFlow.getNodes(), blockLabel);
       if (
         isMissingRequiredStartUrl(
           reactFlow.getNodes(),

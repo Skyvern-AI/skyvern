@@ -1459,8 +1459,8 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "version",
         "model",
     ]
-    # `steps` is a plain-language annotation, not execution input, so editing it must not bust the cached script.
-    code_block_annotation_fields = ("steps",)
+    # Plain-language annotations, not execution input, so editing them must not bust the cached script.
+    code_block_annotation_fields = ("steps", "user_owned_goal", "goal_needs_regeneration")
 
     # Use BFS to recursively remove fields from all nested objects
 

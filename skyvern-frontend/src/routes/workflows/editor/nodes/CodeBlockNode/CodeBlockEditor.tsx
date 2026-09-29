@@ -15,6 +15,10 @@ import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappi
 import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLinter";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
+import {
+  goalChangeIsPending,
+  goalChangeUndoPatch,
+} from "@/routes/workflows/editor/workflowEditorUtils";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import {
@@ -116,6 +120,12 @@ function CodeBlockEditorBody({
     !scopeReadOnly &&
     !mutationLocked;
   const hasGenerated = steps.length > 0;
+  const isQueued = useCopilotActionStore((state) =>
+    state.queuedBuilds.some((queued) => queued.blockLabel === data.label),
+  );
+  const goalChangePending = goalChangeIsPending(data);
+  const canEditGoalChange = editable && !scopeReadOnly && !mutationLocked;
+  const undoPatch = goalChangeUndoPatch(data);
   const workflowStartNode = nodes
     .filter(isStartNode)
     .find((candidate) => "errorCodeMapping" in candidate.data);
@@ -153,33 +163,71 @@ function CodeBlockEditorBody({
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <Label className="text-xs text-tertiary-foreground">Goal</Label>
-        <button
-          type="button"
-          disabled={!canGenerate}
-          aria-label={hasGenerated ? "Regenerate block" : "Generate block"}
-          onClick={() =>
-            requestBuild({ blockLabel: data.label, prompt: data.prompt ?? "" })
-          }
-          className={cn(
-            "nodrag nopan flex items-center gap-1 rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground dark:text-slate-200",
-            canGenerate
-              ? "hover:bg-slate-elevation2"
-              : "cursor-not-allowed opacity-50",
-          )}
-        >
-          <MagicWandIcon className="size-3" />
-          {isGenerating
-            ? "Generating…"
-            : hasGenerated
-              ? "Regenerate"
-              : "Generate"}
-        </button>
+        {goalChangePending ? null : (
+          <button
+            type="button"
+            disabled={!canGenerate}
+            aria-label={hasGenerated ? "Regenerate block" : "Generate block"}
+            onClick={() =>
+              requestBuild({
+                blockLabel: data.label,
+                prompt: data.prompt ?? "",
+              })
+            }
+            className={cn(
+              "nodrag nopan flex items-center gap-1 rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground dark:text-slate-200",
+              canGenerate
+                ? "hover:bg-slate-elevation2"
+                : "cursor-not-allowed opacity-50",
+            )}
+          >
+            <MagicWandIcon className="size-3" />
+            {isGenerating
+              ? "Generating…"
+              : hasGenerated
+                ? "Regenerate"
+                : "Generate"}
+          </button>
+        )}
       </div>
       <WorkflowBlockInputTextarea
         name="prompt"
         nodeId={blockId}
-        onChange={(value) => update({ prompt: value })}
+        onChange={(value) => {
+          if (value === (data.prompt ?? "")) {
+            return;
+          }
+          if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
+            update(undoPatch);
+            return;
+          }
+          if (value.trim().length > 0) {
+            update({
+              prompt: value,
+              userOwnedGoal: true,
+              goalNeedsRegeneration: true,
+              ...(!goalChangePending && {
+                goalBeforeEdit: {
+                  prompt: data.prompt,
+                  userOwnedGoal: data.userOwnedGoal,
+                  goalNeedsRegeneration: data.goalNeedsRegeneration,
+                },
+              }),
+            });
+            return;
+          }
+          update({
+            prompt: value,
+            ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
+            ...(goalChangePending && {
+              goalNeedsRegeneration: false,
+              goalBeforeEdit: null,
+            }),
+          });
+        }}
         value={data.prompt ?? ""}
+        // The build in flight carries the Goal it was started with; a later edit would be lost to it.
+        disabled={isGenerating || isQueued}
         className="nopan text-xs"
       />
     </div>
@@ -209,7 +257,16 @@ function CodeBlockEditorBody({
       value={data.code}
       readOnly={scopeReadOnly}
       onChange={(value) => {
-        update({ code: value });
+        if (value === data.code) {
+          return;
+        }
+        update({
+          code: value,
+          ...(goalChangePending && {
+            goalNeedsRegeneration: false,
+            goalBeforeEdit: null,
+          }),
+        });
       }}
       className="nopan"
       fontSize={10}
@@ -396,26 +453,86 @@ function CodeBlockEditorBody({
       </div>
     ) : null;
 
+  const goalChangeBanner = goalChangePending ? (
+    <div
+      role="status"
+      data-testid="goal-change-banner"
+      className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs"
+    >
+      <p className="font-medium text-foreground">
+        {isGenerating
+          ? "Applying the new Goal…"
+          : isQueued
+            ? "Waiting to apply the new Goal…"
+            : "Goal changed — not applied yet"}
+      </p>
+      {isGenerating || isQueued ? null : (
+        <>
+          <p className="text-muted-foreground">
+            This block still does what its old Goal said.
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={!canEditGoalChange}
+              onClick={() =>
+                requestBuild({
+                  blockLabel: data.label,
+                  prompt: data.prompt ?? "",
+                  applyingGoalChange: true,
+                })
+              }
+              className="nodrag nopan rounded-md bg-primary px-2 py-0.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Apply new Goal
+            </button>
+            {undoPatch ? (
+              <button
+                type="button"
+                disabled={!canEditGoalChange}
+                onClick={() => update(undoPatch)}
+                className="nodrag nopan rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground hover:bg-slate-elevation2 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-200"
+              >
+                Undo
+              </button>
+            ) : null}
+          </div>
+        </>
+      )}
+    </div>
+  ) : null;
+
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
       <div className="flex items-center justify-between gap-2">
         <Label className="text-xs text-tertiary-foreground">View</Label>
         <CodeBlockViewToggle value={view} onChange={setView} />
       </div>
+      {goalChangeBanner}
       {view === "plain" ? (
         <>
           {goalField}
           {dataSchemaField}
-          <CodeBlockPlainCard
-            steps={steps}
-            generating={isGenerating}
-            onStop={requestCancel}
-          />
+          <div
+            className={cn(goalChangePending && !isGenerating && "opacity-50")}
+          >
+            <CodeBlockPlainCard
+              steps={steps}
+              generating={isGenerating}
+              onStop={requestCancel}
+            />
+          </div>
           {errorCodeMappingField}
         </>
       ) : (
         <>
-          {stepLineList}
+          {stepLineList && (
+            <div
+              className={cn(goalChangePending && !isGenerating && "opacity-50")}
+            >
+              {stepLineList}
+            </div>
+          )}
           {inputsField}
           <div className="space-y-2">
             <Label className="text-xs text-tertiary-foreground">

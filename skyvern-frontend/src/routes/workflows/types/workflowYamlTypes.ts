@@ -386,6 +386,8 @@ export type CodeBlockYAML = BlockYAMLBase & {
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
   data_schema?: CodeBlockDataSchema;
+  user_owned_goal?: boolean | null;
+  goal_needs_regeneration?: boolean | null;
 };
 
 export type TextPromptBlockYAML = BlockYAMLBase & {

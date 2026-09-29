@@ -23,6 +23,7 @@ import {
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -540,6 +541,97 @@ describe("SaveButton confirmation gating", () => {
     expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Save anyway" })).toBeNull();
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("SaveButton with a new Goal that isn't applied yet", () => {
+  const clean = () => saveData([block("a", { url: "x" })]);
+
+  beforeEach(() => {
+    const data = clean();
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => data,
+      saveIsPending: false,
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(data),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+  });
+
+  afterEach(() => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => null,
+      saveIsPending: false,
+    });
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [],
+      pendingBuild: null,
+      generatingBlockLabel: null,
+      queuedBuilds: [],
+      undoGoalChange: () => {},
+    });
+  });
+
+  test("asks instead of saving, and Apply asks the copilot to follow the new Goal", () => {
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.getByText("New Goal not applied")).toBeTruthy();
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
+
+    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+      blockLabel: "a",
+      prompt: "New",
+      applyingGoalChange: true,
+    });
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+
+  test("Undo and save saves the draft as the undo left it", () => {
+    const afterUndo = useWorkflowHasChangesStore.getState().getSaveData;
+    const edited = saveData([block("a", { url: "edited" })]);
+    useWorkflowHasChangesStore.setState({ getSaveData: () => edited });
+    const undoGoalChange = vi.fn(() => {
+      useWorkflowHasChangesStore.setState({ getSaveData: afterUndo });
+      useCopilotActionStore.getState().setPendingGoalChanges([]);
+    });
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
+      undoGoalChange,
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Undo Goal change and save" }),
+    );
+
+    expect(undoGoalChange).toHaveBeenCalledWith("a");
+    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Saving Changes")).toBeNull();
+  });
+
+  test("offers no undo when the old Goal is unknown", () => {
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: null }],
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.getByRole("button", { name: "Apply new Goal" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Undo Goal change and save" }),
+    ).toBeNull();
   });
 });
 

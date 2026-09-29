@@ -17,6 +17,7 @@ from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot import workflow_yaml as workflow_yaml_module
+from skyvern.forge.sdk.copilot.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
@@ -357,6 +358,25 @@ def test_combined_tool_result_carries_sheet_tab_resolution() -> None:
     carried = carry_author_time_findings(update_result, {"ok": True, "data": {"message": "Ran 1 block."}})
 
     assert carried["data"]["google_sheet_tab_resolution"] == [fact]
+
+
+def test_combined_tool_result_carries_every_submission_rewrite_disclosure() -> None:
+    goal_disclosure = user_owned_goal_carry_disclosure(UserOwnedGoalCarry("", ["get_invoice"], ["old_label"]))
+    assert set(goal_disclosure) >= {"stored_goal_kept", "stored_goal_dropped"}
+    update_result: dict[str, Any] = {
+        "ok": True,
+        "data": {
+            "stored_code_rewritten": ["login"],
+            **goal_disclosure,
+            "google_connection_resolution": [{"label": "write_row", "resolved_to": "cred_1"}],
+        },
+    }
+    run_result: dict[str, Any] = {"ok": True, "data": {"message": "Ran 1 block."}}
+
+    carried = carry_author_time_findings(update_result, run_result)["data"]
+
+    for key, value in update_result["data"].items():
+        assert carried[key] == value
 
 
 _SAVE_CLAIM_PHRASES = ("updated successfully", "has been saved", "saved the workflow", "workflow was saved")

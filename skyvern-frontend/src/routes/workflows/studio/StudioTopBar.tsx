@@ -57,6 +57,8 @@ import {
   summarizeWorkflowChanges,
 } from "../editor/workflowChangesSummary";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
+import { PendingGoalChangesDialog } from "../editor/PendingGoalChangesDialog";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { useDeferredTitleEdit } from "../hooks/useDeferredTitleEdit";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
@@ -133,6 +135,42 @@ export function SaveButton() {
   const isRecording = useRecordingStore((s) => s.isRecording);
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const pendingGoalChangeCount = useCopilotActionStore(
+    (state) => state.pendingGoalChanges.length,
+  );
+  const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const saveOrConfirm = () => {
+    // Recompute dirtiness synchronously from the same source as the
+    // summary (incl. the YAML draft). contentDirty is debounced and
+    // canvas-only, so gating the confirmation on it would skip it for a
+    // YAML edit or an edit-then-save inside the debounce window.
+    // Read the stores, not this render's values: the Goal dialog undoes and saves in one click.
+    let dirty = false;
+    try {
+      const saveData = useWorkflowHasChangesStore.getState().getSaveData();
+      dirty = saveData
+        ? isDraftDirty(saveData, useWorkflowSnapshotStore.getState().snapshot)
+        : false;
+    } catch (error) {
+      console.error("Failed to check workflow changes", error);
+    }
+    // onSave rejects on a failed save (already toasted by its onError);
+    // swallow so it isn't an unhandled rejection.
+    // A hold means the baseline itself may be stale, so even a draft that matches it
+    // goes through the confirmation rather than saving straight over the newer change.
+    if (dirty || saveBlockedReason) {
+      setConfirmOpen(true);
+    } else {
+      void onSave().catch((error: unknown) => {
+        if (
+          error instanceof SaveRefusedError ||
+          error instanceof SaveStaleError
+        ) {
+          setConfirmOpen(false);
+        }
+      });
+    }
+  };
 
   // Compute once when the confirm dialog opens; the canvas is behind the modal
   // and can't be edited while it's up, so the summary stays valid.
@@ -167,33 +205,11 @@ export function SaveButton() {
           className="relative h-8 w-8 text-muted-foreground"
           disabled={isRecording}
           onClick={() => {
-            // Recompute dirtiness synchronously from the same source as the
-            // summary (incl. the YAML draft). contentDirty is debounced and
-            // canvas-only, so gating the confirmation on it would skip it for a
-            // YAML edit or an edit-then-save inside the debounce window.
-            let dirty = false;
-            try {
-              const saveData = getSaveData();
-              dirty = saveData ? isDraftDirty(saveData, snapshot) : false;
-            } catch (error) {
-              console.error("Failed to check workflow changes", error);
+            if (pendingGoalChangeCount > 0) {
+              setGoalDialogOpen(true);
+              return;
             }
-            // onSave rejects on a failed save (already toasted by its onError);
-            // swallow so it isn't an unhandled rejection.
-            // A hold means the baseline itself may be stale, so even a draft that matches it
-            // goes through the confirmation rather than saving straight over the newer change.
-            if (dirty || saveBlockedReason) {
-              setConfirmOpen(true);
-            } else {
-              void onSave().catch((error: unknown) => {
-                if (
-                  error instanceof SaveRefusedError ||
-                  error instanceof SaveStaleError
-                ) {
-                  setConfirmOpen(false);
-                }
-              });
-            }
+            saveOrConfirm();
           }}
           aria-label={
             saveBlockedReason
@@ -216,6 +232,11 @@ export function SaveButton() {
           )}
         </Button>
       </ControlTooltip>
+      <PendingGoalChangesDialog
+        open={goalDialogOpen}
+        onOpenChange={setGoalDialogOpen}
+        onSave={saveOrConfirm}
+      />
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent>
           <DialogHeader>

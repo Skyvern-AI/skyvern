@@ -807,7 +807,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel question" }));
     });
 
-    expect(screen.getByText(prompt)).toBeTruthy();
+    expect(await screen.findByText(prompt)).toBeTruthy();
     saveData.workflow.workflow_id = workflowId;
   });
 
@@ -2674,6 +2674,27 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     });
     await waitFor(() =>
       expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull(),
+    );
+  });
+
+  it("a build still running when the chat unmounts does not hold up the next one", async () => {
+    const view = await renderChat();
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    view.unmount();
+    useCopilotActionStore.getState().requestBuild({
+      blockLabel: "read_account",
+      prompt: "Return the balance",
+      applyingGoalChange: true,
+    });
+
+    expect(useCopilotActionStore.getState().pendingBuild?.blockLabel).toBe(
+      "read_account",
     );
   });
 

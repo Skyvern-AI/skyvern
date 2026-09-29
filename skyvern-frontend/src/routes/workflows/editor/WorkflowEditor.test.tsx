@@ -37,6 +37,7 @@ import { summarizeWorkflowChanges, snapshotOf } from "./workflowChangesSummary";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TitleSection } from "../studio/StudioTopBar";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import type { WorkflowCopilotChatHistoryResponse } from "../copilot/workflowCopilotTypes";
 import { Status } from "@/api/types";
@@ -2017,7 +2018,7 @@ describe("save failures stop navigation and block runs", () => {
     cleanup();
     client.clear();
   });
-  test("saves a corrected required prompt through the navigation blocker before its debounce fires", async () => {
+  function renderEmptyPromptNavigationWorkspace() {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -2110,6 +2111,38 @@ describe("save failures stop navigation and block runs", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    return { view, client };
+  }
+
+  test("a first text edit after load lights the unsaved-changes dot", () => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
+    try {
+      const prompt = view.container.querySelector<HTMLTextAreaElement>(
+        'textarea[name="navigationGoal"]',
+      );
+      vi.useFakeTimers();
+      fireEvent.keyDown(prompt!, { key: "O" });
+      fireEvent.change(prompt!, {
+        target: { value: "Open the dashboard" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
+    } finally {
+      view.unmount();
+      client.clear();
+      vi.useRealTimers();
+      clearDeferredEdits();
+    }
+  });
+
+  test("saves a corrected required prompt through the navigation blocker before its debounce fires", async () => {
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
     try {
       const prompt = view.container.querySelector<HTMLTextAreaElement>(
         'textarea[name="navigationGoal"]',
@@ -2211,6 +2244,91 @@ describe("save failures stop navigation and block runs", () => {
       client.clear();
     },
   );
+  test("Run asks about a saved Goal that is not applied yet; leaving the editor does not", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [
+        { label: "read_account", goal: "New", previousGoal: null },
+      ],
+    });
+    integration.realNavigation = true;
+    const workflow = {
+      ...(liveWorkflow as WorkflowApiResponse),
+      workflow_permanent_id: "wpid_live",
+    };
+    workflowQueryMock.mockReturnValue({ data: workflow, isLoading: false });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/agents/wpid_live/edit",
+          element: (
+            <ReactFlowProvider>
+              <DebugStoreContext.Provider
+                value={{ isDebugMode: false, blockRunsEnabled: false }}
+              >
+                <Link to="/agents/wpid_live/run">Run</Link>
+                <Link to="/away">Leave editor</Link>
+                <FlowRenderer
+                  nodes={[]}
+                  edges={[]}
+                  setNodes={vi.fn()}
+                  setEdges={vi.fn()}
+                  onNodesChange={vi.fn()}
+                  onEdgesChange={vi.fn()}
+                  initialTitle="Live agent"
+                  workflow={workflow}
+                />
+              </DebugStoreContext.Provider>
+            </ReactFlowProvider>
+          ),
+        },
+        { path: "/agents/wpid_live/run", element: <p>Run page</p> },
+        { path: "/away", element: <p>Away</p> },
+      ],
+      { initialEntries: ["/agents/wpid_live/edit"] },
+    );
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("link", { name: "Run" }));
+      expect(await screen.findByText("New Goal not applied")).toBeTruthy();
+      expect(router.state.location.pathname).toBe("/agents/wpid_live/edit");
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue without saving" }),
+      );
+      expect(await screen.findByText("Run page")).toBeTruthy();
+
+      await act(() => router.navigate("/agents/wpid_live/edit"));
+      fireEvent.click(screen.getByRole("link", { name: "Leave editor" }));
+      expect(await screen.findByText("Away")).toBeTruthy();
+    } finally {
+      cleanup();
+      client.clear();
+      integration.realNavigation = false;
+      useCopilotActionStore.setState({ pendingGoalChanges: [] });
+    }
+  });
   test.each([new SaveRefusedError(), new SaveStaleError()])(
     "does not start a block run after %s",
     async (error) => {

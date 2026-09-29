@@ -87,7 +87,11 @@ import {
 import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
-import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
+import {
+  codeBlockNodeDefaultData,
+  type CodeBlockNodeData,
+} from "./nodes/CodeBlockNode/types";
+import type { PendingGoalChange } from "@/store/useCopilotActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -1027,6 +1031,8 @@ function convertToNode(
               : typeof block.data_schema === "string"
                 ? block.data_schema
                 : JSON.stringify(block.data_schema, null, 2),
+          userOwnedGoal: block.user_owned_goal ?? null,
+          goalNeedsRegeneration: block.goal_needs_regeneration ?? null,
         },
       };
     }
@@ -3438,6 +3444,8 @@ function getWorkflowBlock(
         prompt: node.data.prompt,
         steps: node.data.steps,
         data_schema: JSONSafeOrStringAllowArrays(node.data.dataSchema),
+        user_owned_goal: node.data.userOwnedGoal,
+        goal_needs_regeneration: node.data.goalNeedsRegeneration,
       };
     }
     case "dataExport": {
@@ -4983,6 +4991,8 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           steps: block.steps,
           data_schema: block.data_schema,
+          user_owned_goal: block.user_owned_goal,
+          goal_needs_regeneration: block.goal_needs_regeneration,
         };
         return blockYaml;
       }
@@ -5294,8 +5304,99 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
   };
 }
 
+// The backend counts the flag only on a Goal a person owns, so the editor must too.
+function goalChangeIsPending(data: CodeBlockNodeData): boolean {
+  return data.userOwnedGoal === true && data.goalNeedsRegeneration === true;
+}
+
+function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
+  const changes: Array<PendingGoalChange> = [];
+  for (const node of nodes) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      goalChangeIsPending(node.data)
+    ) {
+      changes.push({
+        label: node.data.label,
+        goal: node.data.prompt ?? "",
+        previousGoal: node.data.goalBeforeEdit
+          ? (node.data.goalBeforeEdit.prompt ?? "")
+          : null,
+      });
+    }
+  }
+  return changes;
+}
+
+function goalChangeUndoPatch(
+  data: CodeBlockNodeData,
+): Partial<CodeBlockNodeData> | null {
+  if (!goalChangeIsPending(data) || !data.goalBeforeEdit) {
+    return null;
+  }
+  return { ...data.goalBeforeEdit, goalBeforeEdit: null };
+}
+
+// The undo record is editor-only, so a graph rebuilt from saved form drops it; keep it on a block
+// that still holds the same unapplied Goal.
+function withGoalUndoRecordsFrom(
+  previous: Array<AppNode>,
+  next: Array<AppNode>,
+): Array<AppNode> {
+  const records = new Map<string, CodeBlockNodeData>();
+  for (const node of previous) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      node.data.goalBeforeEdit
+    ) {
+      records.set(node.data.label, node.data);
+    }
+  }
+  if (records.size === 0) {
+    return next;
+  }
+  return next.map((node) => {
+    if (!isWorkflowBlockNode(node) || node.type !== "codeBlock") {
+      return node;
+    }
+    const before = records.get(node.data.label);
+    if (
+      !before ||
+      !goalChangeIsPending(node.data) ||
+      node.data.prompt !== before.prompt
+    ) {
+      return node;
+    }
+    return {
+      ...node,
+      data: { ...node.data, goalBeforeEdit: before.goalBeforeEdit },
+    };
+  });
+}
+
+function pendingGoalErrors(nodes: Array<AppNode>): Array<string> {
+  return pendingGoalChangesOf(nodes).map(
+    ({ label }) =>
+      `${label}: its new Goal isn't applied yet. Apply it or undo the change before saving.`,
+  );
+}
+
+// A block run saves the whole workflow first, so a pending Goal on any block stops it; every other
+// error stops only the block it names.
+function blockRunErrors(
+  nodes: Array<AppNode>,
+  blockLabel: string,
+): Array<string> {
+  const pendingGoals = new Set(pendingGoalErrors(nodes));
+  return getWorkflowErrors(nodes).filter(
+    (error) => error.startsWith(`${blockLabel}:`) || pendingGoals.has(error),
+  );
+}
+
 function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
-  const errors: Array<string> = [];
+  const errors: Array<string> = [...pendingGoalErrors(nodes)];
 
   const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
   if (
@@ -5744,6 +5845,11 @@ export {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
+  goalChangeIsPending,
+  goalChangeUndoPatch,
+  blockRunErrors,
+  withGoalUndoRecordsFrom,
+  pendingGoalChangesOf,
   getWorkflowErrors,
   isNodeInsideForLoop,
   getParentLoopSkipsOnFail,

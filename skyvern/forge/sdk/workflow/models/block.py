@@ -6505,6 +6505,8 @@ class CodeBlock(Block):
     prompt: str | None = None
     steps: list[CodeBlockStep] | None = None
     data_schema: dict[str, Any] | list | str | None = None
+    user_owned_goal: bool | None = None
+    goal_needs_regeneration: bool | None = None
 
     BLOCKED_ATTRS: ClassVar[frozenset[str]] = CODE_BLOCK_BLOCKED_ATTRS
 
