@@ -1141,6 +1141,10 @@ class AgentFunction:
         """
         return None
 
+    def get_standard_tier_twin_llm_key(self, llm_key: str | None) -> str | None:
+        """Like get_non_flex_llm_key, but also covers flex routers the manual-run handler swap must leave alone."""
+        return None
+
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
         """Return a provider-fallback router twin for the given LLM key, or None if none exists.
 
