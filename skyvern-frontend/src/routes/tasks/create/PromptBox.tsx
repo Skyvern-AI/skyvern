@@ -14,6 +14,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
 import {
+  ArrowUpIcon,
   CheckIcon,
   ChevronDownIcon,
   Cross2Icon,
@@ -21,13 +22,18 @@ import {
   FileTextIcon,
   GlobeIcon,
   GearIcon,
-  PaperPlaneIcon,
   PlusIcon,
   ReloadIcon,
   TextAlignLeftIcon,
   UploadIcon,
   VideoIcon,
 } from "@radix-ui/react-icons";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -130,6 +136,8 @@ type ExampleAttribution = { id: string; edited: boolean };
 const UPLOAD_RETENTION_DAYS = 30;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
 const MAX_HOME_ATTACHMENTS = 20;
+// A failed /customer load leaves the flag unknown for the whole session, so stop waiting and show the flag-off controls.
+const HANDOFF_FLAG_WAIT_MS = 3000;
 
 const HOW_IT_WORKS = [
   {
@@ -151,6 +159,8 @@ const HOW_IT_WORKS = [
 
 type PromptBoxProps = {
   enableCopilotHandoff?: boolean;
+  /** Hides the toolbar controls until `enableCopilotHandoff` is known (at most HANDOFF_FLAG_WAIT_MS), so they don't swap on load. */
+  handoffFlagLoading?: boolean;
   /** Home-screen variant: no prompt improver and no advanced settings. */
   minimal?: boolean;
   /** Fires once an agent has been created from this prompt box. */
@@ -249,6 +259,7 @@ function showCreateErrorToast(title: string, error: unknown) {
 function PromptBoxImpl(
   {
     enableCopilotHandoff = false,
+    handoffFlagLoading = false,
     minimal = false,
     onAgentCreated,
     secondaryAction,
@@ -279,6 +290,16 @@ function PromptBoxImpl(
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [promptTouched, setPromptTouched] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
+  const [handoffFlagWaitExpired, setHandoffFlagWaitExpired] = useState(false);
+  useEffect(() => {
+    if (!handoffFlagLoading) return;
+    const timer = window.setTimeout(
+      () => setHandoffFlagWaitExpired(true),
+      HANDOFF_FLAG_WAIT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [handoffFlagLoading]);
+  const hideFlagControls = handoffFlagLoading && !handoffFlagWaitExpired;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { setAutoplay } = useAutoplayStore();
   // react-query isPending only flips on the next render, so a same-frame
@@ -686,26 +707,37 @@ function PromptBoxImpl(
     />
   );
 
-  const addMenu = (
+  const renderAddMenu = (sizeClassName: string) => (
     <DropdownMenu
       onOpenChange={(open) => {
         if (open) HomeTelemetry.addMenuOpened();
       }}
     >
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label="Add to prompt"
-          disabled={isSubmitting}
-          className="flex size-8 items-center justify-center rounded-lg border border-input text-foreground transition-colors hover:bg-muted disabled:opacity-50"
-        >
-          {uploadDocumentMutation.isPending || recordTaskMutation.isPending ? (
-            <ReloadIcon className="size-4 animate-spin" />
-          ) : (
-            <PlusIcon aria-hidden="true" className="size-4" />
-          )}
-        </button>
-      </DropdownMenuTrigger>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Add files and more"
+                disabled={isSubmitting}
+                className={cn(
+                  "flex shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50",
+                  sizeClassName,
+                )}
+              >
+                {uploadDocumentMutation.isPending ||
+                recordTaskMutation.isPending ? (
+                  <ReloadIcon className="size-4 animate-spin" />
+                ) : (
+                  <PlusIcon aria-hidden="true" className="size-[18px]" />
+                )}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>Add files and more</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
       <DropdownMenuContent align="start">
         {enableCopilotHandoff ? (
           <DropdownMenuItem
@@ -766,26 +798,28 @@ function PromptBoxImpl(
             {enableCopilotHandoff ? (
               <div className="px-5">{attachmentChips}</div>
             ) : null}
-            <div className="flex items-center gap-1 px-2.5 pb-2.5 pt-2">
-              {enableCopilotHandoff ? (
+            <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
+              {!hideFlagControls && enableCopilotHandoff ? (
                 <>
-                  {addMenu}
+                  {renderAddMenu("size-11 md:size-9")}
                   {fileInput}
                 </>
               ) : null}
-              <SpeechInputButton
-                isSupported={isSpeechSupported}
-                isListening={isSpeechListening}
-                isHearingSpeech={isSpeechHearing}
-                disabled={isSubmitting}
-                onToggle={() => {
-                  HomeTelemetry.voiceToggled();
-                  toggleSpeech();
-                }}
-                className="size-11 border-0 bg-transparent shadow-none hover:bg-muted md:size-9"
-                iconClassName="h-[18px] w-[18px]"
-              />
-              {!enableCopilotHandoff ? (
+              {!hideFlagControls ? (
+                <SpeechInputButton
+                  isSupported={isSpeechSupported}
+                  isListening={isSpeechListening}
+                  isHearingSpeech={isSpeechHearing}
+                  disabled={isSubmitting}
+                  onToggle={() => {
+                    HomeTelemetry.voiceToggled();
+                    toggleSpeech();
+                  }}
+                  className="size-11 rounded-full border-0 bg-transparent md:size-9"
+                  iconClassName="h-[18px] w-[18px]"
+                />
+              ) : null}
+              {!hideFlagControls && !enableCopilotHandoff ? (
                 <AdvancedSettingsPopover
                   settings={taskRunSettings}
                   onChange={setTaskRunSettings}
@@ -796,14 +830,14 @@ function PromptBoxImpl(
                   }}
                   tab={advancedSettingsTab}
                   onTabChange={setAdvancedSettingsTab}
-                  triggerClassName="size-11 rounded-[10px] md:size-9"
+                  triggerClassName="size-11 rounded-full md:size-9"
                 />
               ) : null}
               <button
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="ml-auto flex size-11 items-center justify-center rounded-[10px] bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none md:size-9"
+                className="ml-auto flex size-11 shrink-0 items-center justify-center rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:opacity-50 md:size-9"
                 onClick={() => {
                   submitPrompt({ prompt, attribution: exampleAttribution });
                 }}
@@ -811,10 +845,7 @@ function PromptBoxImpl(
                 {isSubmitting ? (
                   <ReloadIcon className="size-4 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    aria-hidden="true"
-                    className="size-4 shrink-0"
-                  />
+                  <ArrowUpIcon aria-hidden="true" className="size-4" />
                 )}
               </button>
             </div>
@@ -919,9 +950,9 @@ function PromptBoxImpl(
           />
           {attachmentChips}
           <div className="flex items-center gap-1 pt-2">
-            {addMenu}
+            {renderAddMenu("size-8")}
             {fileInput}
-            <div className="ml-auto flex items-center gap-1">
+            <div className="ml-auto flex items-center gap-1.5">
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
@@ -931,14 +962,14 @@ function PromptBoxImpl(
                   HomeTelemetry.voiceToggled();
                   toggleSpeech();
                 }}
-                className="h-8 w-8 border-0 bg-transparent shadow-none hover:bg-muted"
+                className="h-8 w-8 rounded-full border-0 bg-transparent"
                 iconClassName="h-4 w-4"
               />
               <button
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="flex size-8 items-center justify-center rounded-lg bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
+                className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:opacity-50"
                 onClick={() => {
                   submitPrompt({ prompt, attribution: exampleAttribution });
                 }}
@@ -946,10 +977,7 @@ function PromptBoxImpl(
                 {isSubmitting ? (
                   <ReloadIcon className="size-4 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    aria-hidden="true"
-                    className="size-4 shrink-0"
-                  />
+                  <ArrowUpIcon aria-hidden="true" className="size-4" />
                 )}
               </button>
             </div>
