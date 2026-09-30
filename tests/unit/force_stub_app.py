@@ -69,6 +69,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.task_v3_required_field_answers_text = (
         base_agent_function.task_v3_required_field_answers_text
     )
+    fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
     fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
         base_agent_function.redact_codeblock_parameter_values

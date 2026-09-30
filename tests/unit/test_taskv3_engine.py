@@ -1511,6 +1511,34 @@ async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None
 
 
 @pytest.mark.asyncio
+async def test_age_default_rides_the_task_message_only_and_leaves_the_system_prompt_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run(hook_result: tuple[str | None, str] | None) -> tuple[str, str, dict[str, Any]]:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: hook_result)
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+                goal="Apply.",
+                parameters={"resume": "text"},
+            )
+        by_role = {m["role"]: m["content"] for m in outcome.messages if m.get("role") in ("system", "user")}
+        terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+        return by_role["system"], by_role["user"], terminal
+
+    base_system, base_user, base_log = await run(None)
+    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"))
+    rendered_system, rendered_user, rendered_log = await run(("AGE DEFAULT TEXT", "rendered"))
+
+    assert base_system.startswith(SYSTEM_PROMPT) and base_system == withheld_system == rendered_system
+    assert base_user == withheld_user and rendered_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert (base_log["age_default_rendered"], base_log["age_default_reason"]) == (False, None)
+    assert (withheld_log["age_default_rendered"], withheld_log["age_default_reason"]) == (False, "age_field_present")
+    assert (rendered_log["age_default_rendered"], rendered_log["age_default_reason"]) == (True, "rendered")
+
+
+@pytest.mark.asyncio
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).
