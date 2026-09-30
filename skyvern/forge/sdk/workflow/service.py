@@ -217,6 +217,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     is_adaptive_caching,
     resolve_reuse_browser_session,
     should_acquire_reused_session,
+    start_hold_reason,
 )
 from skyvern.forge.sdk.workflow.private_settings import (
     resolve_cdp_connect_headers,
@@ -1103,14 +1104,6 @@ def _request_to_start_seconds(workflow_run: WorkflowRun) -> float | None:
     if workflow_run.started_at is None:
         return None
     return (workflow_run.started_at.replace(tzinfo=UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
-
-
-def _start_hold(workflow_run: WorkflowRun) -> str:
-    if workflow_run.sequential_key:
-        return "sequential"
-    if workflow_run.depends_on_workflow_run_id:
-        return "dependency"
-    return "none"
 
 
 def _failure_attribution_log_fields(workflow_run: WorkflowRun, status: WorkflowRunStatus) -> dict[str, str | None]:
@@ -12908,7 +12901,10 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 debug_session_id=workflow_run.debug_session_id,
                 copilot_session_id=workflow_run.copilot_session_id,
-                start_hold=_start_hold(workflow_run),
+                start_hold=start_hold_reason(
+                    sequential_key=workflow_run.sequential_key,
+                    depends_on_workflow_run_id=workflow_run.depends_on_workflow_run_id,
+                ),
                 backup_queue=app.AGENT_FUNCTION.is_backup_queue_organization(workflow_run.organization_id),
                 run_with=workflow_run.run_with,
                 ai_fallback=workflow_run.ai_fallback,
