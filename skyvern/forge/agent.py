@@ -192,6 +192,7 @@ from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
     goal_check_eligible,
 )
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
@@ -2216,6 +2217,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_code_progress: CodeProgressRecord | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -2437,6 +2439,7 @@ class ForgeAgent:
                     framing=framing,
                     block_context_section=block_context_section,
                     page_data_note=page_data_note,
+                    code_progress=recovery_code_progress,
                 ),
             )
 
@@ -3652,6 +3655,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_code_progress: CodeProgressRecord | None = None,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
@@ -3873,6 +3877,7 @@ class ForgeAgent:
                         workflow_owned_recovery=workflow_owned_recovery,
                         recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                         recovery_release_parameter_keys=recovery_release_parameter_keys,
+                        recovery_code_progress=recovery_code_progress,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)

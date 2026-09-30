@@ -1728,6 +1728,9 @@ async def _finalise_normal_turn(
                     getattr(agent_result, "clear_persisted_completion_contract", False)
                 ),
             )
+            marker = _STAGED_COMMIT_LANDED.get()
+            if marker is not None:
+                marker[0] = True
         except Exception:
             # Undo any mid-turn degraded write so a failed commit fails the turn
             # atomically instead of leaving canonical on a partial intermediate.
@@ -1749,6 +1752,10 @@ async def _finalise_normal_turn(
     # candidate's token.
     updated_workflow = agent_result.updated_workflow
     proposal_disposition = _proposal_disposition(agent_result)
+    # Deliberately not the commit latch: this asks whether the change was applied by ANY means, and
+    # an ordinary auto-accept turn applies directly with has_staged_proposal False. It can diverge
+    # from the commit above when a candidate supersedes mid-commit, which is a receipt question of
+    # its own rather than this latch's.
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         agent_result.narrative_payload,
@@ -1940,6 +1947,21 @@ _CANONICAL_ROLLED_BACK: contextvars.ContextVar[list[bool] | None] = contextvars.
     "copilot_canonical_rolled_back",
     default=None,
 )
+
+# Whether this turn's staged commit actually reached canonical. ``asyncio.shield`` copies the
+# context, so a ``ContextVar.set`` inside the finalizer is invisible to the handler cleaning up
+# after it raises; mutating a list both contexts already hold is what survives that copy.
+_STAGED_COMMIT_LANDED: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "copilot_staged_commit_landed",
+    default=None,
+)
+
+
+def _staged_commit_landed() -> bool:
+    """Did this turn's staged commit overwrite canonical? Answers the question the error paths
+    used to infer from ``auto_accept``, which is the setting, not the event."""
+    marker = _STAGED_COMMIT_LANDED.get()
+    return bool(marker and marker[0])
 
 
 async def _restore_workflow_definition(original_workflow: Workflow | None, organization_id: str) -> None:
@@ -2228,6 +2250,10 @@ async def _new_copilot_chat_post(
         # than that some finalizer tried one.
         canonical_rolled_back: list[bool] = [False]
         _CANONICAL_ROLLED_BACK.set(canonical_rolled_back)
+        # Set by the finalizer once ``_commit_staged_workflow`` returns, so it means the commit
+        # landed rather than that auto-accept was on when the turn started.
+        staged_commit_landed: list[bool] = [False]
+        _STAGED_COMMIT_LANDED.set(staged_commit_landed)
         cancel_watcher: asyncio.Task[None] | None = None
         current_code_available = False
         turn_index = 0
@@ -2305,11 +2331,7 @@ async def _new_copilot_chat_post(
                 # finalizer's alone, and a staged turn leaves ``workflow_was_persisted`` false even
                 # after committing, so it has to be read separately or the reply denies a change the
                 # user can see.
-                committed_staged = (
-                    finalise_started
-                    and chat is not None
-                    and _should_commit_staged_workflow(chat.auto_accept, agent_result)
-                )
+                committed_staged = _staged_commit_landed()
                 rolled_back = canonical_rolled_back[0]
                 persisted_directly = (
                     agent_result is not None and agent_result.workflow_was_persisted and not rolled_back
@@ -2340,7 +2362,12 @@ async def _new_copilot_chat_post(
                     )
                     restore_failed = True
             if chat is not None:
-                workflow_modified = agent_result is not None and agent_result.workflow_was_persisted and not restored
+                # A landed staged commit modified the workflow even though it leaves
+                # workflow_was_persisted False; the receipt below and the stale-card clear both
+                # depend on that.
+                workflow_modified = (
+                    agent_result is not None and agent_result.workflow_was_persisted and not restored
+                ) or _staged_commit_landed()
                 # Pre-bake restored here: the recovered AgentResult has workflow_was_persisted=False,
                 # so _persist_proposed_workflow_state's own restored check would always read False.
                 recovered_result, failure = _build_recoverable_route_agent_result(
@@ -2353,9 +2380,6 @@ async def _new_copilot_chat_post(
                         (restored and not chat_request.keep_pending_proposal)
                         or workflow_modified
                         or getattr(agent_result, "clear_proposed_workflow", False)
-                        # A staged commit that already succeeded before this exception fired
-                        # still invalidates a stale kept proposal, same as the non-recovery path.
-                        or _should_commit_staged_workflow(chat.auto_accept, agent_result)
                         # A failed rollback leaves canonical's true state unverified — don't
                         # honor keep_pending_proposal against an assumption that didn't hold.
                         or restore_failed

@@ -933,6 +933,7 @@ async def _handle_script_termination(
             label=cache_key,
             failure_reason=str(e),
             user_defined_errors=e.user_defined_errors,
+            error_codes=[error.error_code for error in e.user_defined_errors or []],
         )
 
 
@@ -949,6 +950,7 @@ async def _update_workflow_block(
     output: dict[str, Any] | list | str | None = None,
     ai_fallback_triggered: bool | None = None,
     user_defined_errors: list[UserDefinedError] | None = None,
+    error_codes: list[str] | None = None,
 ) -> None:
     """Update workflow_run_block status, optionally setting `script_run`.
 
@@ -1070,14 +1072,26 @@ async def _update_workflow_block(
             # final_output is already set to `output` at line 596.
             pass
 
-        await app.DATABASE.observer.update_workflow_run_block(
+        updated_block = await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=context.organization_id if context else None,
             status=status,
             failure_reason=failure_reason,
             output=final_output,
             ai_fallback_triggered=ai_fallback_triggered,
+            error_codes=error_codes,
         )
+
+        # The row carries the block label even when the caller passed none (a cached wait block).
+        if updated_block.label:
+            try:
+                app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id).record_block_outcome(
+                    updated_block.label, status, updated_block.error_codes or [], failure_reason
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record cached block outcome", workflow_run_block_id=workflow_run_block_id, exc_info=True
+                )
 
         recorded_output_parameter = await _record_output_parameter_value(
             context.workflow_run_id,
@@ -1557,8 +1571,8 @@ async def _fallback_to_ai_run(
 
             # Update workflow block with failure reason (include detected errors if any)
             task_failure_reason = str(error)
-            if detected_errors:
-                error_codes = [e.error_code for e in detected_errors]
+            error_codes = [e.error_code for e in detected_errors]
+            if error_codes:
                 task_failure_reason = f"{task_failure_reason}. Detected errors: {', '.join(error_codes)}"
 
             if workflow_run_block_id:
@@ -1573,6 +1587,7 @@ async def _fallback_to_ai_run(
                     step_id=script_step_id,
                     step_status=StepStatus.failed,
                     label=cache_key,
+                    error_codes=error_codes,
                 )
             return
 
@@ -1751,6 +1766,11 @@ async def _fallback_to_ai_run(
                 task = refreshed_task
             if task.status in [TaskStatus.terminated, TaskStatus.failed]:
                 failure_reason = task.failure_reason
+            error_codes = [
+                error["error_code"]
+                for error in task.errors or []
+                if isinstance(error, dict) and isinstance(error.get("error_code"), str)
+            ]
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus(task.status.value),
@@ -1758,6 +1778,7 @@ async def _fallback_to_ai_run(
                 failure_reason=failure_reason,
                 label=cache_key,
                 ai_fallback_triggered=True,
+                error_codes=error_codes,
             )
 
         # 5. After successful AI execution, regenerate the script block and create new version
@@ -4099,7 +4120,7 @@ async def loop(
         await loop_block.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
         # step 4. build response (success/failure) given the complete_if_empty value
         if complete_if_empty:
-            await loop_block.build_block_result(
+            empty_result = await loop_block.build_block_result(
                 success=True,
                 failure_reason=None,
                 output_parameter_value=[],
@@ -4107,16 +4128,18 @@ async def loop(
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-            return
         else:
-            await loop_block.build_block_result(
+            empty_result = await loop_block.build_block_result(
                 success=False,
                 failure_reason="No iterable value found for the loop block",
                 status=BlockStatus.terminated,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        loop_block.record_result_outcome(workflow_run_id, empty_result)
+        if not complete_if_empty:
             raise Exception("No iterable value found for the loop block")
+        return
 
     # register the loop in the global context
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id

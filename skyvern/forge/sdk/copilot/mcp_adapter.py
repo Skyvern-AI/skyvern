@@ -508,13 +508,17 @@ class SchemaOverlay:
     # stripped before the call, so the underlying tool never sees an argument it cannot accept.
     copilot_params: dict[str, Any] = field(default_factory=dict)
     requires_browser: bool = False
-    # Dispatch overwrites workflow_permanent_id with the chat's own, so the model cannot aim the
-    # call at any other workflow. Pair it with hiding that param from the schema.
+    # Dispatch overwrites binds_chat_workflow_param with the chat's own workflow, so the model cannot
+    # aim the call at any other workflow. Pair it with hiding that param from the schema.
     binds_chat_workflow: bool = False
+    binds_chat_workflow_param: str = "workflow_permanent_id"
     # Creates or changes future runs, so a turn without browser authority, which may not start a
     # run either, does not see it.
     requires_run_authority: bool = False
     redacts_sensitive_origin_structured_result: bool = False
+    # Set when the post-hook is what keeps stored values from the model: a crash then withholds the
+    # result instead of falling back to the unfiltered one.
+    post_hook_fails_closed: bool = False
     timeout: int | None = None
     pre_hook: PreHook | None = None
     post_hook: PostHook | None = None
@@ -1759,7 +1763,7 @@ class SkyvernOverlayMCPServer(MCPServer):
 
         mcp_args = _transform_args(arguments, overlay)
         if overlay.binds_chat_workflow:
-            mcp_args["workflow_permanent_id"] = copilot_ctx.workflow_permanent_id
+            mcp_args[overlay.binds_chat_workflow_param] = copilot_ctx.workflow_permanent_id
 
         if overlay.requires_browser:
             phases.enter("session_prepare")
@@ -1950,10 +1954,24 @@ class SkyvernOverlayMCPServer(MCPServer):
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
                         raise
                     except Exception:
-                        # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                        # An enrichment hook's crash must not fail the action or keep partial credit.
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                        LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
-                        copilot_result = base_copilot_result
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
+                        )
+                        if overlay.post_hook_fails_closed:
+                            server_outcome = ", which reported an error" if failed else ", which reported success"
+                            copilot_result = {
+                                "ok": False,
+                                "error": (
+                                    f"{tool_name} reached the server{server_outcome}, but its result could not "
+                                    "be prepared for display and is withheld."
+                                ),
+                            }
+                        else:
+                            copilot_result = base_copilot_result
                     # The last disclosure boundary, so it also runs after a crashed post-hook. It fails
                     # closed when an unexpected producer marks the exact session while an enrichment awaits.
                     sensitive_result_is_scrubbable = (

@@ -8626,11 +8626,14 @@ class WorkflowService:
                 # This fires both when the block requires_agent (first run) and when
                 # cached code failed and agent fallback re-ran the conditional
                 # (fallback_episode_id is set when the script path failed).
+                # A block that routed despite a failed branch evaluation is still
+                # `completed`, but that branch has no result for the reviewer to learn.
                 if (
                     is_script_run
                     and (block_requires_agent or attempt.fallback_episode_id)
                     and workflow_run_block_result.status == BlockStatus.completed
                     and branch_metadata
+                    and not branch_metadata.get("evaluation_error")
                     and is_adaptive_caching(workflow, workflow_run)
                 ):
                     await self._record_conditional_agent_episode(

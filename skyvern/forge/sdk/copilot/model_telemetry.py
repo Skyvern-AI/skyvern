@@ -630,7 +630,7 @@ class CopilotLitellmModel(LitellmModel):
             )
         else:
             result = await super()._fetch_response(
-                system_instructions,
+                str(system_instructions) if system_instructions is not None else None,
                 input,
                 model_settings,
                 tools,

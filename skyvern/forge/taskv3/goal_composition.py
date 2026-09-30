@@ -89,6 +89,26 @@ def present_page_derived(field: str, row_value: str, render: PageDerivedRender |
 
 
 @dataclass(frozen=True)
+class CodeProgressRecord:
+    """A failed code block's step outline split at the step whose lines raised.
+
+    Steps are in source order, so a loop or branch means ``before`` is not proof those steps ran.
+    """
+
+    before: tuple[str, ...]
+    failed_step: str
+    failed_line: int
+    after: tuple[str, ...]
+
+
+def render_code_progress_section(record: CodeProgressRecord) -> str:
+    lines = [f"- Earlier in the code: {step}" for step in record.before]
+    lines.append(f"- Raised an error at line {record.failed_line}: {record.failed_step}")
+    lines.extend(f"- Later in the code: {step}" for step in record.after)
+    return "Code outline (a record of this block's code in source order, not steps to perform):\n" + "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class GoalDirectives:
     """Everything that shapes a Task V3 block's goal beyond the navigation goal itself.
 
@@ -110,13 +130,14 @@ class GoalDirectives:
     block_context_section: str = ""
     # Set when a field above carries a ⟦"…"⟧ page-value span.
     page_data_note: bool = False
+    code_progress: CodeProgressRecord | None = None
 
 
 def compose_goal(navigation_goal: str, directives: GoalDirectives) -> str:
     """Build the goal the model is given, appending each directive in a fixed order.
 
     Order is part of the contract: the model reads the extraction instruction before the schema it
-    must conform to, and the framing and block-context sections land last so run-shaped context
+    must conform to, and the framing, block-context and code-outline sections land last so run-shaped context
     never separates a criterion from the goal it qualifies.
     """
     goal = navigation_goal
@@ -171,6 +192,8 @@ def compose_goal(navigation_goal: str, directives: GoalDirectives) -> str:
         goal = f"{goal}\n\n{directives.framing}".strip()
     if directives.block_context_section:
         goal = f"{goal}\n\n{directives.block_context_section}".strip()
+    if directives.code_progress is not None:
+        goal = f"{goal}\n\n{render_code_progress_section(directives.code_progress)}".strip()
     return goal
 
 

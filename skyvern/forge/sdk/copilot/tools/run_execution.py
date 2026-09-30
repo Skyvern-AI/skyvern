@@ -333,6 +333,7 @@ RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 
 COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
+COPILOT_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Copilot test-run snapshot; execution was not started."
 
 # Block types that can reach exec() in the API process, so a run containing one may
 # only proceed on the sandboxed worker. CODE compiles user code directly;
@@ -3724,14 +3725,14 @@ async def _run_blocks_and_collect_debug(
                 snapshot_provenance=snapshot.provenance,
                 exc_info=True,
             )
-            if dispatch_to_worker:
-                return _copilot_sandbox_unavailable_result(
-                    organization_id=ctx.organization_id,
-                    workflow_permanent_id=ctx.workflow_permanent_id,
-                )
             return {
                 "ok": False,
-                "error": "Unable to prepare the Copilot test-run snapshot; execution was not started.",
+                "error": COPILOT_SNAPSHOT_PREPARATION_ERROR,
+                "data": {
+                    "workflow_run_id": None,
+                    "failure_reason": COPILOT_SNAPSHOT_PREPARATION_ERROR,
+                    "blocks": [],
+                },
             }
 
     if dispatch_workflow is not None:
@@ -5504,6 +5505,7 @@ def _record_run_blocks_result(
     # the unattended page-observation self-heal verifier remains a separate lane.
     copilot_ctx.completion_verification_result = None
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
+    copilot_ctx.last_test_run_started = bool(run_id) or (isinstance(data, dict) and bool(data.get("blocks")))
     run_browser_session_id = data.get("browser_session_id") if isinstance(data, dict) else None
     copilot_ctx.last_run_blocks_browser_session_id = (
         run_browser_session_id if isinstance(run_browser_session_id, str) and run_browser_session_id else None

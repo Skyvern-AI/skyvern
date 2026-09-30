@@ -159,7 +159,6 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
-from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
 from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -288,6 +287,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.emails import EmailBodyFormat
@@ -1663,6 +1663,43 @@ class Block(BaseModel, abc.ABC):
 
     @traced(name="skyvern.block.execute", role="wrapper")
     async def execute_safe(
+        self,
+        workflow_run_id: str,
+        parent_workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        result = await self._execute_to_block_result(
+            workflow_run_id,
+            parent_workflow_run_block_id,
+            organization_id,
+            browser_session_id,
+            current_value,
+            current_index,
+            **kwargs,
+        )
+        self.record_result_outcome(workflow_run_id, result)
+        return result
+
+    def record_result_outcome(self, workflow_run_id: str, result: BlockResult) -> None:
+        if result.status is None:
+            return
+        try:
+            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        except WorkflowRunContextNotInitialized:
+            # The run was torn down while this block finished; nothing is left to read the record.
+            return
+        try:
+            workflow_run_context.record_block_outcome(
+                self.label, result.status, result.error_codes, result.failure_reason
+            )
+        except Exception:
+            LOG.warning("Failed to record block outcome", block_label=self.label, exc_info=True)
+
+    async def _execute_to_block_result(
         self,
         workflow_run_id: str,
         parent_workflow_run_block_id: str | None = None,
@@ -7493,25 +7530,33 @@ async def wrapper({default_args}):
                 return idx
         return None
 
-    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
-        safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
-        # Steps are a code-derived outline, not an authored goal, so they may only narrow one.
-        if not self.prompt:
-            return safe_main
-        matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
-        if matched_step is None or not matched_step.description:
-            return safe_main
+    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
+        return workflow_run_context.mask_secrets_in_data(self.prompt or "")
+
+    def _code_progress_record(
+        self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None
+    ) -> CodeProgressRecord | None:
+        if failing_line is None:
+            return None
+        index = self._matched_step_index_for_failing_line(failing_line)
+        if index is None:
+            return None
         steps = self.steps or []
-        matched_index = next((idx for idx, step in enumerate(steps) if step is matched_step), None)
-        if matched_index is None:
-            matched_index = len(steps) - 1
-        descriptions = [matched_step.description] + [
-            step.description for step in steps[matched_index + 1 :] if step.description
-        ]
-        safe_mini = "\nThen: ".join(
-            workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+        failed = steps[index]
+        if not failed.description:
+            return None
+
+        def masked(chunk: list[CodeBlockStep]) -> tuple[str, ...]:
+            return tuple(
+                workflow_run_context.mask_secrets_in_data(step.description) for step in chunk if step.description
+            )
+
+        return CodeProgressRecord(
+            before=masked(steps[:index]),
+            failed_step=workflow_run_context.mask_secrets_in_data(failed.description),
+            failed_line=failing_line,
+            after=masked(steps[index + 1 :]),
         )
-        return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
 
     async def _record_unregistered_download_intent(
         self,
@@ -7706,10 +7751,7 @@ async def wrapper({default_args}):
         escalation_step: Step | None = None
         recovery_block_id: str | None = None
         try:
-            navigation_goal = self._compose_heal_goal(
-                workflow_run_context=workflow_run_context,
-                failing_line=failing_line,
-            )
+            navigation_goal = self._compose_heal_goal(workflow_run_context=workflow_run_context)
             navigation_payload = {
                 parameter.key: workflow_run_context.get_value_or_none(parameter.key) for parameter in self.parameters
             }
@@ -7899,6 +7941,9 @@ async def wrapper({default_args}):
                     workflow_owned_recovery=True,
                     recovery_credential_parameter_keys=login_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_code_progress=self._code_progress_record(
+                        workflow_run_context=workflow_run_context, failing_line=failing_line
+                    ),
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -16860,6 +16905,9 @@ def _neutralize_jinja_delimiters(value: Any) -> Any:
     return value
 
 
+CONDITIONAL_DEBUG_OUTPUT_FIELDS = frozenset({"llm_prompt", "llm_response", "evaluations"})
+
+
 class BranchEvaluationContext:
     """Collection of runtime data that BranchCriteria evaluators can consume."""
 
@@ -16903,10 +16951,28 @@ class BranchEvaluationContext:
             "workflow_run_id",
         }
 
+        # Block references registered as a copy of `<label>_output`, this run's and carried in.
+        block_aliases = ctx.workflow_run_outputs.keys() | ctx.carried_block_labels
+        workflow_definition = ctx.workflow.workflow_definition if ctx.workflow else None
+        conditional_output_keys: set[str] = set()
+        for block in get_all_blocks(workflow_definition.blocks if workflow_definition else []):
+            if block.block_type != BlockType.CONDITIONAL:
+                continue
+            conditional_output_keys.add(block.output_parameter.key)
+            # A parameter may share the label; only a registered alias is the block's own output.
+            alias = block.output_parameter.key.removesuffix("_output")
+            if alias in block_aliases:
+                conditional_output_keys.add(alias)
+
         snapshot: dict[str, Any] = {}
         for key, value in raw_values.items():
             # Skip noisy keys
             if key in keys_to_skip:
+                continue
+
+            # A synthetic branch-evaluation block records its raw response under a generated label; a key the
+            # author declared, or a block produced, under that prefix is theirs and stays.
+            if key.startswith("prompt_branch_eval_") and key not in ctx.parameters and key not in block_aliases:
                 continue
 
             # For block outputs (dicts with extracted_information), only include extracted_information
@@ -16914,9 +16980,22 @@ class BranchEvaluationContext:
                 extracted = value.get("extracted_information")
                 if extracted is not None:
                     snapshot[key] = extracted
+            elif key in conditional_output_keys and isinstance(value, dict):
+                # An earlier conditional's stored prompt embedded this same snapshot; re-sending it, its raw
+                # response and its per-branch detail grows every later evaluation. The routing fields stay.
+                snapshot[key] = {
+                    field: item for field, item in value.items() if field not in CONDITIONAL_DEBUG_OUTPUT_FIELDS
+                }
             else:
                 # Include parameter values directly
                 snapshot[key] = value
+
+        # `<label>` is registered as a copy of `<label>_output`. Keep one; a copy that differs (keys merged
+        # across loop iterations) holds something the output does not, so it stays.
+        for label in block_aliases:
+            output_key = f"{label}_output"
+            if label in snapshot and output_key in snapshot and snapshot[label] == snapshot[output_key]:
+                del snapshot[label]
 
         # Copy loop variables (current_value, current_index, current_item) to top level
         # Required for pure NatLang expressions like "current_value['date']" to work
@@ -17973,12 +18052,14 @@ class ConditionalBlock(Block):
         """
         Evaluate natural language branch conditions in batch.
 
-        All prompt-based conditions are batched into ONE LLM call for performance.
+        Prompt-based conditions are batched into a synthetic ExtractionBlock per evaluation attempt.
         Jinja parts ({{ }}) are pre-rendered before sending to LLM.
 
         Evaluation strategy:
-        - If any condition is pure natural language, use ExtractionBlock for browser/page context.
-        - If all conditions contain Jinja and are pre-rendered, use direct LLM call (no browser context).
+        - Every batch runs through the ExtractionBlock with the run's browser session, including
+          batches whose conditions are all pre-rendered Jinja.
+        - The workflow context snapshot is added to the prompt only when a condition is pure natural
+          language or its Jinja fails to render.
 
         Returns:
             A tuple of (results, rendered_expressions, extraction_goal, llm_response):

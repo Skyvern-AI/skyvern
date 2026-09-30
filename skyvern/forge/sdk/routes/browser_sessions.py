@@ -493,6 +493,7 @@ async def get_browser_session(
         app.STORAGE,
         fail_download_lookup=True,
         include_stream_transport=True,
+        concurrent_listings=True,
     )
 
 

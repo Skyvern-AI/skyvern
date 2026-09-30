@@ -111,10 +111,10 @@ MIN_ACTION_STEPS = 24
 # at or below MIN_ACTION_STEPS keeps exactly DEFAULT_MAX_TOKENS; only larger budgets rise, so a long
 # block's raised step cap isn't silently nullified by the flat token ceiling.
 MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
-# The scaling clamps here: the token guard is a runaway backstop, not a budget, and a caller's step
-# cap is not bounded at the route layer, so an extreme value must not carry the ceiling away with
-# it. 4x covers every observed legitimate long-block need (~2x) with margin. Deliberately asymmetric:
-# turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
+# The scaling clamps here: tokens are the direct-spend guard, and a caller's step cap is not bounded at the
+# route layer, so an extreme value must not carry the ceiling away with it. Because the transcript grows each
+# turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
+# may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
@@ -179,8 +179,9 @@ This task cannot finish as completed until a file download has finished. Trigger
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
     """Return (max_turns, max_tool_calls, max_tokens) anti-runaway guards for an action-step budget.
 
-    Generous enough that a productive run is bounded by max_action_steps, not by these guards; with
-    no action-step budget, fall back to the engine's fixed defaults."""
+    Turns and tool calls are generous enough that a productive run is bounded by max_action_steps; the token
+    guard can bind first on a long form, where the loop's progress-gated token grant applies. With no
+    action-step budget, fall back to the engine's fixed defaults."""
     if not max_action_steps:
         return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOKENS
     return (
