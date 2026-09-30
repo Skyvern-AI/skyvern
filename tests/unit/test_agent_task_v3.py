@@ -119,6 +119,10 @@ async def _run_execute_task_v3(
     provider_probe_calls: int = 0,
     get_working_page_side_effect: list[Any] | None = None,
     must_get_working_page_side_effect: BaseException | list[Any] | None = None,
+    # Both page accessors return this page, for tests that probe what the run's closures read.
+    working_page: Any = None,
+    # A real browser state whose accessors stand in for the mocked ones.
+    real_browser_state: Any = None,
     loop_raises: BaseException | None = None,
     update_task_side_effect: BaseException | None = None,
     completion_gate_vetoes: bool = False,
@@ -132,14 +136,12 @@ async def _run_execute_task_v3(
     page_url_after_settle: str | None = None,
     # Where the page is once the loop returns -- the loop itself can leave the tab somewhere else.
     page_url_after_loop: str | None = None,
-    # A tab the run opened that is newer than the page the tools act on, at this URL once the loop returns.
-    newest_tab_url_after_loop: str | None = None,
-    pinned_page_open: bool = False,
     # The block's own (url, navigation_goal) as the AUTHOR typed them, pinned through the real block
     # seam before the render that produced the task fields above.
     unrendered_block_fields: tuple[str | None, str | None] | None = None,
     # Called with the loop's kwargs before the loop returns, to drive state the loop's tools own.
     on_loop: Callable[[dict[str, Any]], None] | None = None,
+    on_loop_async: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     # A prompt the fake loop hands the goal judge, the way the finish gate would, when one was built.
     goal_judge_prompt: str | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
@@ -153,8 +155,6 @@ async def _run_execute_task_v3(
     step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
 
     browser_state, _, page = make_browser_state()
-    if pinned_page_open:
-        page.is_closed = MagicMock(return_value=False)
     # What setup's navigation RECORDED: the response's own URL beside the status it came back with,
     # which after a redirect is not the URL it asked for.
     browser_state.last_navigation_status = navigation_status
@@ -167,6 +167,12 @@ async def _run_execute_task_v3(
         browser_state.get_working_page = AsyncMock(side_effect=get_working_page_side_effect)
     else:
         browser_state.get_working_page = AsyncMock(return_value=page)
+    if working_page is not None:
+        browser_state.must_get_working_page = AsyncMock(return_value=working_page)
+        browser_state.get_working_page = AsyncMock(return_value=working_page)
+    if real_browser_state is not None:
+        browser_state.must_get_working_page = AsyncMock(side_effect=real_browser_state.must_get_working_page)
+        browser_state.get_working_page = AsyncMock(side_effect=real_browser_state.get_working_page)
     browser_state.take_post_action_screenshot = AsyncMock(
         return_value=b"png-bytes",
         side_effect=RuntimeError("screenshot boom") if screenshot_raises else None,
@@ -187,6 +193,8 @@ async def _run_execute_task_v3(
                 await cb(round_actions, turn_text)
         if on_loop is not None:
             on_loop(kwargs)
+        if on_loop_async is not None:
+            await on_loop_async(kwargs)
         if goal_judge_prompt is not None and kwargs.get("goal_judge") is not None:
             page.is_closed = MagicMock(return_value=False)
             loop_mock.goal_judge_response = await kwargs["goal_judge"](goal_judge_prompt)
@@ -197,10 +205,6 @@ async def _run_execute_task_v3(
             raise loop_raises
         if page_url_after_loop is not None:
             page.url = page_url_after_loop
-        if newest_tab_url_after_loop is not None:
-            newest_tab = MagicMock(url=newest_tab_url_after_loop)
-            newest_tab.main_frame.child_frames = []
-            browser_state.get_working_page = AsyncMock(return_value=newest_tab)
         return outcome
 
     loop_mock = AsyncMock(side_effect=_loop)
@@ -3137,27 +3141,8 @@ async def test_execute_task_v3_should_cancel_skips_workflow_read_for_bare_task(
 
 
 # ---------------------------------------------------------------------------
-# P4: the page provider (live re-resolution for workflow blocks, once for bare tasks)
+# P4: the page provider (live re-resolution on every tool call)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_bare_task_provider_resolves_page_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A bare task must preserve today's exact semantics: must_get_working_page grabs the page once
-    # up front, and every later provider call returns that same object, not a re-resolved one.
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        provider_probe_calls=3,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert loop_mock.resolved_pages == [loop_mock.resolved_pages[0]] * 3
-    loop_mock.browser_state.must_get_working_page.assert_awaited_once()
-    # The completion gate reads the page once on a completed outcome; the PROVIDER itself never
-    # consults get_working_page for a bare task.
-    assert loop_mock.browser_state.get_working_page.await_count <= 1
 
 
 @pytest.mark.asyncio
@@ -3944,36 +3929,6 @@ async def test_execute_task_v3_completed_on_a_page_still_loading_completes(monke
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_bare_task_judges_its_pinned_page_not_the_newest_tab(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A bare task's tools act on one pinned page; a blank popup it opened along the way is not that page.
-    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    _step, task, _loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        pinned_page_open=True,
-        newest_tab_url_after_loop="about:blank",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert task.status == TaskStatus.completed
-
-    _step, task, _loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        pinned_page_open=True,
-        page_url_after_loop="about:blank",
-        newest_tab_url_after_loop="https://example.com/results",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert task.status == TaskStatus.failed
-    assert "blank page" in (task.failure_reason or "")
 
 
 @pytest.mark.asyncio
@@ -5092,44 +5047,6 @@ async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_bare_task_fingerprint_samples_the_pinned_page(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A bare task pins one page for the run, so its fingerprint must sample THAT page. Going through
-    # browser_state.get_working_page() would return the newest tab after any popup — sampling a page
-    # the model never acted on — and would repoint the working page as a side effect, which is a
-    # behaviour change to the live bare-task arm rather than the scoped one this gate intends.
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    pinned = MagicMock()
-    pinned.is_closed = MagicMock(return_value=False)
-    pinned.evaluate = AsyncMock(return_value="pinned-hash:100:10")
-    popup = MagicMock()
-    popup.is_closed = MagicMock(return_value=False)
-    popup.evaluate = AsyncMock(return_value="popup-hash:1:1")
-
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        must_get_working_page_side_effect=[pinned],
-        get_working_page_side_effect=[popup, popup, popup],
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
-    before = loop_mock.browser_state.get_working_page.await_count
-    assert await fingerprint() == "pinned-hash:100:10"
-    # The sampler probed the pinned page and never the popup, and did not consult (or repoint) the
-    # browser's working page to do it. Counting the delta rather than asserting never-awaited: the
-    # post-loop completion-veto gate legitimately calls get_working_page once, before this point.
-    popup.evaluate.assert_not_awaited()
-    assert loop_mock.browser_state.get_working_page.await_count == before
-
-    # A closed pinned page yields None rather than silently falling back to another tab.
-    pinned.is_closed = MagicMock(return_value=True)
-    assert await fingerprint() is None
-
-
-@pytest.mark.asyncio
 async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch: pytest.MonkeyPatch) -> None:
     # The settle deferral is a live gate: a main-frame-only fingerprint reads a page whose child frame
     # is still rendering as settled. So a change inside the frame alone must move the fingerprint.
@@ -5152,7 +5069,7 @@ async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned],
+        working_page=pinned,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -5200,7 +5117,7 @@ async def test_execute_task_v3_document_identity_changes_with_an_acted_in_frame_
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned],
+        working_page=pinned,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -5279,7 +5196,7 @@ async def test_execute_task_v3_document_identity_raises_when_a_realm_is_unidenti
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned],
+        working_page=pinned,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -5302,7 +5219,7 @@ async def test_execute_task_v3_document_identity_raises_when_a_realm_is_unidenti
     _step, _task, loop_mock2, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned2],
+        working_page=pinned2,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
