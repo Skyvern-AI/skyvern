@@ -3076,6 +3076,90 @@ async def test_schedule_tools_always_target_the_chat_workflow(tool_name: str, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("browser_tools_available", [True, False])
+async def test_run_list_is_offered_without_a_workflow_id_and_with_a_status_filter(
+    browser_tools_available: bool,
+) -> None:
+    tools, _ = await _listed_tools(browser_tools_available=browser_tools_available)
+
+    properties = tools["list_workflow_runs"].inputSchema["properties"]
+    assert "workflow_id" not in properties
+    assert "search_key" not in properties
+    assert "error_code" not in properties
+    assert "status" in properties
+    assert "workflow_id" not in tools["list_workflow_runs"].inputSchema.get("required", [])
+
+
+@pytest.mark.asyncio
+async def test_run_list_always_targets_the_chat_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"runs": []}})
+
+    await server.call_tool("list_workflow_runs", {"workflow_id": "wpid_foreign", "status": ["terminated"]})
+
+    assert server._client.calls == [
+        ("skyvern_workflow_run_list", {"workflow_id": "wpid_chat", "status": ["terminated"]}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_list_shows_the_model_only_the_fields_that_pick_a_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    run = {
+        "run_id": "wr_1",
+        "status": "terminated",
+        "created_at": "2026-09-24T19:30:00Z",
+        "trigger_type": "scheduled",
+        "copilot_session_id": None,
+        "run_type": "workflow_run",
+        "failure_reason": "Login rejected for password hunter2-unseen",
+        "output_summary": {"present": True, "scalar_preview": {"api_token": "hunter2-unseen"}},
+        "artifact_summary": {"downloaded_file_names": ["hunter2-unseen.pdf"]},
+        "run_with": "agent",
+    }
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"runs": [run], "count": 1, "has_more": False}})
+
+    result = await server.call_tool("list_workflow_runs", {"status": ["terminated"]})
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["data"]["runs"] == [
+        {"run_id": "wr_1", "status": "terminated", "created_at": "2026-09-24T19:30:00Z", "trigger_type": "scheduled"}
+    ]
+    assert "hunter2-unseen" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args", "data"),
+    [
+        (
+            "list_workflow_runs",
+            {"status": ["terminated"]},
+            {"runs": [{"run_id": "wr_1", "failure_reason": "password hunter2-unseen"}]},
+        ),
+        (
+            "get_workflow_schedule",
+            {"workflow_schedule_id": "wfs_1"},
+            {"workflow_schedule_id": "wfs_1", "parameters": {"password": "hunter2-unseen"}},
+        ),
+    ],
+)
+async def test_a_crashed_stored_value_filter_withholds_the_result(
+    tool_name: str, args: dict[str, Any], data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": data})
+    server._overlays[tool_name] = replace(server._overlays[tool_name], post_hook=_crash)
+
+    result = await server.call_tool(tool_name, args)
+
+    assert result.isError is True
+    text = " ".join(content.text for content in result.content)
+    assert "withheld" in text
+    assert "hunter2-unseen" not in text
+
+
+@pytest.mark.asyncio
 async def test_schedule_create_is_refused_while_the_turn_holds_an_unsaved_proposal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

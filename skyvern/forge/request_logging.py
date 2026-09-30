@@ -30,6 +30,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from starlette.requests import Request
     from starlette.types import Message, Receive, Scope, Send
 
+    from skyvern.forge.sdk.services.request_principal import RequestPrincipal
+
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
@@ -89,6 +91,7 @@ class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
     org_age: int | None = None
+    principal: RequestPrincipal | None = None
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
@@ -116,17 +119,29 @@ def set_request_organization(
         identity.org_age = org_age
 
 
-def _organization_log_fields() -> dict[str, str | int]:
+def set_request_principal(principal: RequestPrincipal) -> None:
+    identity = _request_identity.get()
+    if identity is not None:
+        identity.principal = principal
+
+
+def _identity_log_fields() -> dict[str, str | int | None]:
     identity = _request_identity.get()
     if identity is None:
         return {}
-    fields: dict[str, str | int] = {}
+    fields: dict[str, str | int | None] = {}
     if identity.organization_id:
         fields["organization_id"] = identity.organization_id
     if identity.organization_name:
         fields["organization_name"] = identity.organization_name
     if identity.org_age is not None:
         fields["org_age"] = identity.org_age
+    if identity.principal is not None:
+        # Explicit nulls: "resolved, no user" must stay distinguishable from an unauthenticated request.
+        fields["auth_kind"] = identity.principal.auth_kind.value
+        fields["user_id"] = identity.principal.user_id
+        fields["org_role"] = identity.principal.org_role
+        fields["org_role_claim"] = identity.principal.org_role_claim
     return fields
 
 
@@ -250,7 +265,7 @@ def _log_unhandled_request(
             headers=headers,
             duration_seconds=time.monotonic() - start_time,
             **(exception_log_fields(exc) if exc is not None else {}),
-            **_organization_log_fields(),
+            **_identity_log_fields(),
         )
     except Exception:
         pass
@@ -287,7 +302,7 @@ def _log_request(
             # backwards-compat: keep error_body for existing Datadog queries
             error_body=response_body if status_code >= 400 else None,
             duration_seconds=time.monotonic() - start_time,
-            **_organization_log_fields(),
+            **_identity_log_fields(),
         )
     except Exception:
         pass

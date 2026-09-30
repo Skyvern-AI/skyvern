@@ -2617,16 +2617,35 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
         cancelled=False,
     )
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    commits: list[object] = []
+
+    async def record_commit(*args: object, **kwargs: object) -> None:
+        del args
+        commits.append(kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", record_commit)
+
+    # Fail the step that runs immediately AFTER the commit, so this turn genuinely reaches canonical
+    # before finalisation breaks. The name says "after staged commit"; this makes the harness mean it.
+    persist_calls: list[int] = []
+    original_persist = workflow_copilot_route._persist_proposed_workflow_state
+
+    async def flaky_persist(*args: object, **kwargs: object) -> object:
+        persist_calls.append(1)
+        if len(persist_calls) == 1:
+            raise raised_error
+        return await original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_persist_proposed_workflow_state", flaky_persist)
+
     finalise_results: list[object] = []
     original_finalise = workflow_copilot_route._finalise_normal_turn
 
-    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+    async def counting_finalise(*args: object, **kwargs: object) -> object:
         finalise_results.append(kwargs["agent_result"])
-        if len(finalise_results) == 1:
-            raise raised_error
         return await original_finalise(*args, **kwargs)
 
-    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", counting_finalise)
 
     response = await workflow_copilot_chat_post(
         api_key_request, _make_chat_request(keep_pending_proposal=True), organization
@@ -2638,6 +2657,7 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
     await handler(copilot_stream)
 
     restore_mock.assert_not_awaited()
+    assert commits, "the turn must actually commit, or this is not the scenario the name describes"
     assert len(finalise_results) == 2
     recovered_result = finalise_results[1]
     assert recovered_result.clear_proposed_workflow is True
@@ -2645,6 +2665,287 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert clear_calls, (
         f"staged-commit-eligible turn must clear a stale proposal even with keep_pending_proposal, got {update_calls!r}"
+    )
+
+
+def _staged_auto_accept_result() -> AgentResult:
+    return AgentResult(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        authoring_barred=False,
+        resolved_model=None,
+        has_staged_proposal=True,
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
+        cancelled=False,
+    )
+
+
+def _staged_chat_and_workflow() -> tuple[SimpleNamespace, SimpleNamespace]:
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "pending-review"},
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    return chat, original_workflow
+
+
+@pytest.mark.asyncio
+async def test_route_error_when_the_commit_itself_raises_keeps_the_pending_review(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The commit was eligible and then failed, so canonical never moved and the card the user has
+    not answered is not stale. Nothing about Turn off here: being eligible to commit was enough to
+    discard it."""
+    captured = install_fake_create(monkeypatch)
+    chat, original_workflow = _staged_chat_and_workflow()
+    agent_result = _staged_auto_accept_result()
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    async def failing_commit(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("commit blew up")
+
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", failing_commit)
+
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
+    assert response is captured["sentinel"]
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert not clear_calls, f"a commit that raised moved nothing, so the card must survive, got {update_calls!r}"
+
+
+@pytest.mark.asyncio
+async def test_route_error_after_a_landed_commit_does_not_tell_the_user_nothing_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The commit reached canonical and the reply write then failed. The receipt must not say the
+    workflow was untouched: it was, and the user can see it on the canvas."""
+    captured = install_fake_create(monkeypatch)
+    chat, original_workflow = _staged_chat_and_workflow()
+    agent_result = _staged_auto_accept_result()
+    _restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    commits: list[object] = []
+
+    async def record_commit(*args: object, **kwargs: object) -> None:
+        del args
+        commits.append(kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", record_commit)
+    workflow_params.create_workflow_copilot_chat_message = AsyncMock(
+        side_effect=RuntimeError("assistant row write failed after the commit")
+    )
+
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assert commits, "the commit must land, or this is not the scenario"
+    # Positive first: a negative-only assertion would also hold if no frame were ever sent.
+    sent = " ".join(str(c) for c in copilot_stream.send.await_args_list)
+    assert copilot_stream.send.await_args_list, "the user must get a reply at all"
+    assert "The workflow was preserved" in sent, f"the reply must say the commit survived, got {sent!r}"
+    assert "The workflow was not modified" not in sent, (
+        f"the commit reached canonical, so this receipt is false: {sent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_error_after_a_landed_commit_clears_the_stale_card_even_if_auto_accept_went_off(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The commit reached canonical, then finalisation broke and the user turned auto-accept off.
+    The toggle now says off, but canonical has already moved: the old card is stale and accepting it
+    would overwrite the committed workflow. Only the latch can tell these apart."""
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        authoring_barred=False,
+        resolved_model=None,
+        has_staged_proposal=True,
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
+        cancelled=False,
+    )
+    _restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    commits: list[object] = []
+
+    async def record_commit(*args: object, **kwargs: object) -> None:
+        del args
+        commits.append(kwargs)
+        # The user clicks Turn off after canonical has already been overwritten.
+        chat.auto_accept = False
+
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", record_commit)
+
+    # The row still reads on until the commit lands; the Turn off is only visible after it.
+    async def read_chat(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(**{**vars(chat), "auto_accept": bool(not commits)})
+
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(side_effect=read_chat)
+
+    persist_calls: list[int] = []
+    original_persist = workflow_copilot_route._persist_proposed_workflow_state
+
+    async def flaky_persist(*args: object, **kwargs: object) -> object:
+        persist_calls.append(1)
+        if len(persist_calls) == 1:
+            raise RuntimeError("clearing the card blew up after the commit landed")
+        return await original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_persist_proposed_workflow_state", flaky_persist)
+
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
+    assert response is captured["sentinel"]
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assert commits, "the commit must land, or this is not the scenario"
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert clear_calls, f"a landed commit makes the old card stale whatever the toggle says now, got {update_calls!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_error",
+    [RuntimeError("post-agent route boom"), LLMProviderError("OPENAI_GPT5_5")],
+    ids=["generic-exception-handler", "llm-provider-error-handler"],
+)
+async def test_route_error_after_turn_off_keeps_the_review_the_user_has_not_answered(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: BaseException,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    """The recovery finalizer infers whether the staged commit happened from the turn-start snapshot.
+    If the user turned auto-accept off mid-turn, no commit happened, so inferring one clears a
+    proposal they never answered."""
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "pending-review"},
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        authoring_barred=False,
+        resolved_model=None,
+        has_staged_proposal=True,
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
+        cancelled=False,
+    )
+    _restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    # The turn reads the row once at its start; the user clicks Turn off while it runs, so every
+    # read after that one sees auto_accept off.
+    disabled_row = SimpleNamespace(**{**vars(chat), "auto_accept": False})
+    reads: list[int] = []
+
+    async def read_chat(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        reads.append(1)
+        return chat if len(reads) == 1 else disabled_row
+
+    workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(side_effect=read_chat)
+
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            # Fires before the normal finalizer re-reads the row, so nothing has been committed.
+            raise raised_error
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
+    assert response is captured["sentinel"]
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert recovered_result.clear_proposed_workflow is False
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert not clear_calls, (
+        f"a turn the user switched off staged nothing, so the pending review must survive, got {update_calls!r}"
     )
 
 

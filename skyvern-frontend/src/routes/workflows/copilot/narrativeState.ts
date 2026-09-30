@@ -802,6 +802,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   search_web: "other",
   list_org_workflows: "other",
   get_org_workflow: "other",
+  list_workflow_runs: "other",
   list_workflow_schedules: "other",
   get_workflow_schedule: "other",
   create_workflow_schedule: "other",

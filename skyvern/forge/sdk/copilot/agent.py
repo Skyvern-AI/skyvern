@@ -1735,10 +1735,15 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             )
 
         # No run row means nothing executed, so claiming the draft was tested is false.
-        if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and not ctx.dispatched_run_ids_this_turn:
+        if (
+            ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and not ctx.dispatched_run_ids_this_turn
+        ) or ctx.last_test_run_started is False:
+            not_started_reason = _normalize_failure_reason(ctx.last_test_failure_reason)
+            if not not_started_reason.endswith("..."):
+                not_started_reason = not_started_reason.rstrip(".")
             return (
                 f"I created {draft_phrase}, but I couldn't start a test run: "
-                f"{_normalize_failure_reason(ctx.last_test_failure_reason)}. "
+                f"{not_started_reason}. "
                 f"Nothing was executed, so the draft is unverified.{keep_draft_affordance}"
             )
 
@@ -3173,7 +3178,7 @@ def _recorded_failure_reply(
     # overall_status="failed" even though execution never started.
     run_created = bool(getattr(diagnosis_input, "workflow_run_id", None))
     if getattr(ctx, "last_workflow", None) is not None:
-        if unrecoverable_stop and not run_created:
+        if (unrecoverable_stop and not run_created) or ctx.last_test_run_started is False:
             return f"I built {block_phrase}, but I couldn't start a test run: {reason}.{status_sentence}"
         if test_attempted and test_failed and not unrecoverable_stop:
             return f"I built {block_phrase} and tested it, but the test failed: {reason}.{status_sentence}"

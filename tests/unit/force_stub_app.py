@@ -139,6 +139,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
     fake_app_module.STORAGE = _LazyNamespace()
     fake_app_module.CACHE = _LazyNamespace()
+    # The real app starts with no bearer authentication; without the attributes a bearer raises AttributeError.
+    fake_app_module.authentication_function = None
+    fake_app_module.authenticate_user_function = None
 
     return fake_app_module
 

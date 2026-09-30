@@ -722,6 +722,11 @@ UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+# The token backstop trips first on long forms (each turn re-sends the transcript), so the gate may raise it alone.
+# What binds is page-change evidence after a never-made billable action, plus the 3x/pool/ceiling bound.
+TOKEN_BUDGET_EXTENDED_EVENT = "taskv3 loop token budget extended"
+TOKEN_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop token budget extension refused"
+TOKEN_EXTENSION_FUNDED_ROUNDS = 2
 BATCH_SKIP_TOGGLE_EXEMPT_EVENT = "taskv3 loop batch skip exempted toggle click"
 CREDENTIAL_RESUBMIT_REFUSED_EVENT = "taskv3 loop credential resubmit refused"
 EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
@@ -3112,7 +3117,7 @@ class LoopState:
     # The action round of the latest positive page-change evidence (SKY-15264, SKY-15666); the
     # budget-extension gate reads it, so what counts as evidence is load-bearing, not cosmetic.
     last_change_evidence_step: int | None = None
-    # Budget caps. The four are re-derived and applied ATOMICALLY on an extension grant: a partial
+    # Budget caps. The four are re-derived and applied ATOMICALLY on a step-budget grant: a partial
     # update converts a step-cap death into a token-cap death, so they move together or not at all.
     max_turns: int
     max_tool_calls: int
@@ -3132,6 +3137,20 @@ class LoopState:
     # stays linear. The evidence input is last_change_evidence_step above.
     budget_extensions_granted: int = 0
     original_action_steps: int | None = None
+    # The step cap the token guard is currently sized for; a token-only grant moves it past max_action_steps.
+    token_extension_basis: int = 0
+    # Evidence recency is counted in action rounds, which a turn without an action does not advance, so a
+    # token grant instead spends the evidence it was granted on and the next grant needs new evidence.
+    token_extension_evidence_spent: bool = False
+    token_extensions_granted: int = 0
+    token_grant_action_steps: int | None = None
+    # Billable (tool, args) keys that have succeeded, and the dispatch of the first never-seen one since the last
+    # token grant: a repeated action (a hover, an identical submit retry) does not re-arm a token grant. Ordered
+    # against evidence by a per-event sequence, since a batch's action and its evidence share one step.
+    succeeded_action_keys: set[tuple[str, str]] = field(default_factory=set)
+    event_seq: int = 0
+    novel_action_seq: int | None = None
+    last_change_evidence_seq: int = 0
     token_clamp_reported: bool = False
     # Final-turn grant (budget-exhaustion final turn): mirrors budget_extension_granted's shape. A
     # budget-cap trip anywhere in the loop sets this and buys one more unconstrained model turn. One
@@ -3279,6 +3298,9 @@ async def run_agent_tool_loop(
 
     def _note_page_change_evidence() -> None:
         st.last_change_evidence_step = st.action_steps
+        st.token_extension_evidence_spent = False
+        st.event_seq += 1
+        st.last_change_evidence_seq = st.event_seq
 
     async def _consume_refresh_signal(
         ctx: SkyvernContext, tool_name: str, remaining: list[Any], round_actions: list[Any], *, drop: bool
@@ -3608,6 +3630,103 @@ async def run_agent_tool_loop(
     started_at = time.monotonic()
     deadline_at = started_at + deadline_seconds if deadline_seconds is not None else None
 
+    def _extension_gate(extension: int, headroom_gain: tuple[int, int, int]) -> tuple[bool, str]:
+        refresh_ctx = skyvern_context.current()
+        if refresh_ctx is not None and refresh_ctx.refresh_working_page:
+            # A pending refresh voids the next action and re-baselines the page: a grant must not race
+            # it and spend the extension on pre-reload evidence.
+            return False, "refresh_pending"
+        return _budget_extension_gate(
+            st.action_steps,
+            st.last_change_evidence_step,
+            st.action_warned,
+            # CURRENT confirmed stalled-ness by the ledger's own rules: form_armed (the latest look
+            # showed a form) plus a window of fruitless actions. Not the one-shot telemetry latch, and
+            # never a bare counter — a form-less page increments the counter but must not be judged
+            # stuck by it.
+            st.progress is not None
+            and st.progress.form_armed
+            and st.progress.actions_since_progress >= st.progress.window,
+            activity,
+            deadline_at,
+            extension,
+            seconds_per_step=(time.monotonic() - started_at) / max(st.action_steps, 1),
+            headroom_gain=headroom_gain,
+        )
+
+    def _token_budget_extended() -> bool:
+        if (
+            backstops_for_cap is None
+            or st.max_tokens is None
+            or st.max_action_steps is None
+            or st.action_steps >= st.max_action_steps
+        ):
+            return False
+        base_cap = st.original_action_steps or st.max_action_steps
+        basis = max(st.token_extension_basis, st.max_action_steps)
+        extension_limit = base_cap * ACTION_BUDGET_EXTENSION_MAX_FACTOR
+        if max_action_steps_ceiling is not None:
+            extension_limit = min(extension_limit, max_action_steps_ceiling)
+        extension = min(base_cap // 2, extension_limit - basis)
+        grant_max_tokens = st.max_tokens
+        if extension > 0:
+            grant_max_tokens = max(st.max_tokens, backstops_for_cap(basis + extension)[2])
+        if extension <= 0:
+            allowed, gate_reason = False, "extension_limit_reached"
+        elif st.total_tokens >= grant_max_tokens - final_turn_token_reserve:
+            allowed, gate_reason = False, "token_ceiling_reached"
+        elif st.token_extension_evidence_spent:
+            allowed, gate_reason = False, "no_recent_page_change_evidence"
+        elif st.token_grant_action_steps is not None and st.novel_action_seq is None:
+            # Perception alone re-earns evidence on a page whose content keeps changing (a clock, rotating
+            # text), so a renewal needs a new action, and page-change evidence stamped after it.
+            allowed, gate_reason = False, "no_new_action_since_last_token_grant"
+        elif st.token_grant_action_steps is not None and st.last_change_evidence_seq <= (st.novel_action_seq or 0):
+            allowed, gate_reason = False, "no_page_change_after_the_new_action"
+        else:
+            # Funding 2 rounds at the last turn's cost rarely binds here; the checks above and the gate's evidence
+            # check refuse a spiral, and its stall vetoes bind only on a form page or identical re-reads.
+            allowed, gate_reason = _extension_gate(
+                TOKEN_EXTENSION_FUNDED_ROUNDS, (0, 0, grant_max_tokens - st.max_tokens)
+            )
+        if not allowed:
+            LOG.info(
+                TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
+                guard="max_tokens",
+                gate_reason=gate_reason,
+                max_tokens=st.max_tokens,
+                total_tokens=st.total_tokens,
+                action_steps=st.action_steps,
+                max_action_steps=st.max_action_steps,
+                token_extensions_granted=st.token_extensions_granted,
+                base_cap=base_cap,
+                turn=st.turns,
+            )
+            return False
+        original_max_tokens = st.max_tokens
+        st.token_extensions_granted += 1
+        st.token_extension_basis = basis + extension
+        st.token_extension_evidence_spent = True
+        st.token_grant_action_steps = st.action_steps
+        st.novel_action_seq = None
+        st.max_tokens = grant_max_tokens
+        if activity is not None:
+            activity.tokens_remaining = st.max_tokens - st.total_tokens
+        LOG.info(
+            TOKEN_BUDGET_EXTENDED_EVENT,
+            guard="max_tokens",
+            original_max_tokens=original_max_tokens,
+            max_tokens=st.max_tokens,
+            token_extension_basis=st.token_extension_basis,
+            total_tokens=st.total_tokens,
+            action_steps=st.action_steps,
+            max_action_steps=st.max_action_steps,
+            token_extensions_granted=st.token_extensions_granted,
+            base_cap=base_cap,
+            turn=st.turns,
+        )
+        return True
+
     # The task's starting URL is navigated during browser setup, before this loop runs, so a dead/removed
     # starting posting never routes through the in-loop `navigate` tool — the model just observes the dead
     # page and finishes (defaulting to failed). Classify that pre-loop navigation here so the dominant
@@ -3660,7 +3779,11 @@ async def run_agent_tool_loop(
         if not st.final_turn_granted:
             if deadline_seconds is not None and time.monotonic() - started_at > deadline_seconds:
                 top_of_turn_trip = f"deadline ({deadline_seconds:.0f}s) reached"
-            elif st.max_tokens is not None and st.total_tokens >= max(0, st.max_tokens - final_turn_token_reserve):
+            elif (
+                st.max_tokens is not None
+                and st.total_tokens >= max(0, st.max_tokens - final_turn_token_reserve)
+                and not _token_budget_extended()
+            ):
                 top_of_turn_trip = f"max_tokens ({st.max_tokens}) reached"
             elif st.turns >= st.max_turns:
                 top_of_turn_trip = f"max_turns ({st.max_turns}) reached"
@@ -4038,36 +4161,21 @@ async def run_agent_tool_loop(
                     # Reported from the grant branch below, never here — a refused extension leaves
                     # the cap where it was, so reporting on it would name a cap never in effect and
                     # would spend the once-per-run latch on a non-event.
-                    token_clamped = st.max_tokens is not None and token_gain == 0 and grant_max_turns > st.max_turns
-                refresh_ctx = skyvern_context.current()
+                    # Judged on the sizing function, not the live guard: a token-only grant may already have
+                    # raised max_tokens to this cap's value, which is no ceiling.
+                    token_clamped = (
+                        st.max_tokens is not None
+                        and next_tokens <= backstops_for_cap(st.max_action_steps)[2]
+                        and grant_max_turns > st.max_turns
+                    )
                 if st.max_action_steps >= extension_limit:
                     allowed, gate_reason = False, "extension_limit_reached"
                 elif raw_extension <= 0:
                     allowed, gate_reason = False, "cap_too_small"
                 elif extension <= 0:
                     allowed, gate_reason = False, "hard_step_ceiling"
-                elif refresh_ctx is not None and refresh_ctx.refresh_working_page:
-                    # A pending refresh voids this very action and re-baselines the page: the grant
-                    # must not race it and spend the extension on pre-reload evidence.
-                    allowed, gate_reason = False, "refresh_pending"
                 else:
-                    allowed, gate_reason = _budget_extension_gate(
-                        st.action_steps,
-                        st.last_change_evidence_step,
-                        st.action_warned,
-                        # CURRENT confirmed stalled-ness by the ledger's own rules: form_armed
-                        # (the latest look showed a form) plus a window of fruitless actions. Not
-                        # the one-shot telemetry latch, and never a bare counter — a form-less page
-                        # increments the counter but must not be judged stuck by it.
-                        st.progress is not None
-                        and st.progress.form_armed
-                        and st.progress.actions_since_progress >= st.progress.window,
-                        activity,
-                        deadline_at,
-                        extension,
-                        seconds_per_step=(time.monotonic() - started_at) / max(st.action_steps, 1),
-                        headroom_gain=headroom_gain,
-                    )
+                    allowed, gate_reason = _extension_gate(extension, headroom_gain)
                 # This read cannot see unabsorbed in-batch movement: action_steps is frozen during
                 # a batch, so the cap check trips on the batch's FIRST billable call — before any
                 # page action dispatches — and between-batch movement was absorbed when
@@ -4285,6 +4393,8 @@ async def run_agent_tool_loop(
             if spec is not None and spec.touches_page and dispatch_ctx is not None and dispatch_ctx.task_id:
                 clear_task_nav_error_code(dispatch_ctx.task_id)
             tool_started_at = time.monotonic()
+            st.event_seq += 1
+            dispatch_seq = st.event_seq
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             else:
@@ -4627,6 +4737,10 @@ async def run_agent_tool_loop(
                     _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "perception stalled")
                     break
             if spec is not None and spec.billable:
+                if result.status == "ok" and action_key not in st.succeeded_action_keys:
+                    st.succeeded_action_keys.add(action_key)
+                    if st.novel_action_seq is None:
+                        st.novel_action_seq = dispatch_seq
                 if st.progress is not None:
                     st.progress.on_billable()
                 # Errored and refused dispatches count too: a repeat-failing action is the same

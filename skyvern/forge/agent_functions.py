@@ -74,6 +74,7 @@ from skyvern.forge.sdk.services import (
     sftp_service,
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
+from skyvern.forge.sdk.services.request_principal import BearerIdentity
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
@@ -2962,6 +2963,10 @@ class AgentFunction:
         bearer_token: str | None = None,
     ) -> bool | None:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
+        return None
+
+    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentity | None:
+        """Return the user the bearer proves for this organization, or None without an identity provider or proof."""
         return None
 
     async def on_workflow_saved(

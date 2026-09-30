@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.config import settings
+from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import (
@@ -144,6 +145,63 @@ async def test_fallback_keeps_default_engine_when_block_missing_from_definition(
     app = await _run_fallback("my_block", workflow)
 
     assert _fallback_task_block(app).engine == RunEngine.skyvern_v1
+
+
+@pytest.mark.asyncio
+async def test_failed_cached_task_carries_detected_codes_to_block_update() -> None:
+    workflow = _make_workflow([_make_task_block("my_block")])
+    app = _make_app(workflow)
+    app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=SimpleNamespace(ai_fallback=False))
+    app.DATABASE.tasks.get_task = AsyncMock(return_value=SimpleNamespace(errors=[]))
+    app.DATABASE.tasks.update_task = AsyncMock()
+    error = UserDefinedError(error_code="blocked", reasoning="Blocked", confidence_float=1.0)
+    update_block = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._detect_user_defined_errors", new=AsyncMock(return_value=[error])),
+        patch(f"{MODULE}._update_workflow_block", update_block),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            error_code_mapping={"blocked": "Blocked"},
+            error=RuntimeError("Script failed"),
+            workflow_run_block_id="wrb_test",
+        )
+
+    assert update_block.await_args.kwargs["error_codes"] == ["blocked"]
+
+
+@pytest.mark.asyncio
+async def test_ai_fallback_carries_refreshed_task_codes_to_block_update() -> None:
+    workflow = _make_workflow([_make_task_block("my_block")])
+    app = _make_app(workflow)
+    app.DATABASE.tasks.get_task = AsyncMock(
+        side_effect=[
+            SimpleNamespace(url="https://example.com", errors=[]),
+            SimpleNamespace(
+                status=TaskStatus.failed,
+                failure_reason="Fallback identified the failure",
+                errors=[{"error_code": "picked", "reasoning": "Matched"}],
+            ),
+        ]
+    )
+    update_block = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._update_workflow_block", update_block),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            workflow_run_block_id="wrb_test",
+        )
+
+    assert update_block.await_args.kwargs["error_codes"] == ["picked"]
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,8 @@ keywords:
 - **Downloadable Copilot-Generated Files** — Secure CodeBlocks and Copilot can now publish generated XLSX, PDF, CSV, and ZIP files as run downloads and chat download buttons. ([#8693](https://github.com/Skyvern-AI/skyvern/pull/8693))
 - **Clipboard Paste in Live Browser Control** — You can now paste your clipboard while in control of a live browser, from one control bar shared by CDP and VNC sessions. ([#8699](https://github.com/Skyvern-AI/skyvern/pull/8699))
 - **Redesigned Discover Home** — The Discover page's prompt, examples, and templates have been redesigned.
+- **Guided Full-Page Welcome for New Sign-Ups** — New accounts now land on a full-page walkthrough covering goals, expected volume, and role, replacing the old setup modal.
+- **Guided Template Walkthrough** — Using a home page template now copies it, opens Copilot with a numbered summary of what it does, and shows an inputs card for the credentials and values it needs. ([#8730](https://github.com/Skyvern-AI/skyvern/pull/8730))
 
 ## Improvements
 
@@ -79,6 +81,13 @@ keywords:
 - **Clearer Billing Errors** — Skyvern now shows the reason when a billing plan change fails.
 - **Faster Credential Failures** — A login block now fails fast with a clear reason when it isn't bound to any of the workflow's credentials, instead of opening a browser first.
 - **Copilot Test Results as Cards** — Each block Copilot tests now shows as one card with its status, code change, and failing line.
+- **Copilot Run History by Status** — Copilot can now list a workflow's recent runs filtered by status, such as failed or terminated, instead of only seeing the most recent run.
+- **Longer Task Runs on Long Forms** — Task runs now get more time to finish long forms that are still making visible progress, instead of stopping once the token budget runs out.
+- **Unsubscribe from Skyvern Emails** — You can now unsubscribe from categories of email Skyvern sends, like the analytics digest, with a one-click link.
+- **Default Engine Option in Workflow Editor** — The block engine picker now has a "Default" option separate from Skyvern 1.0 and 2.0, which are now labeled Legacy. ([#8735](https://github.com/Skyvern-AI/skyvern/pull/8735))
+- **Docked Copilot Sign-In Requests** — Copilot's sign-in and Google account requests now dock above the chat input instead of scrolling out of view with the transcript.
+- **More Reliable Copilot Repairs on SSL Errors** — Copilot no longer gives up early on ambiguous SSL connection errors during automatic repairs; it now attempts a fix. ([#8731](https://github.com/Skyvern-AI/skyvern/pull/8731))
+- **Upstream Output Reuse in Copilot Repair Tests** — Testing a repaired block that reads an earlier block's output no longer fails with a template error; the test now reuses that output automatically. ([#8737](https://github.com/Skyvern-AI/skyvern/pull/8737))
 
 ## Bug fixes
 
@@ -114,6 +123,12 @@ keywords:
 - Fixed one-shot downloads not recovering correctly after a server error.
 - Fixed the organizations page showing a blank state instead of a full-page retry option when it failed to load.
 - Fixed Workflow Studio showing replay pills before there was anything to replay.
+- Fixed a Cloudflare Turnstile checkbox being reported as solved after it silently reset, instead of being re-clicked.
+- Fixed browser pages hanging for other users sharing a browser session after one person disconnected mid-interaction. ([#8736](https://github.com/Skyvern-AI/skyvern/pull/8736))
+- Fixed Copilot failing before sending any request when using certain GPT-6 models.
+- Fixed task runs refusing to click a checkbox that sits on top of its own styled replacement, reporting it as not rendered. ([#8734](https://github.com/Skyvern-AI/skyvern/pull/8734))
+- Fixed task runs losing track of a page after a click opened a new tab, causing the run to stall. ([#8733](https://github.com/Skyvern-AI/skyvern/pull/8733))
+- Fixed a dark-mode flash of a white screen on sign-in, refresh, and other full page loads.
 
 </Update>
 

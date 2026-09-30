@@ -255,7 +255,35 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
         app_mock.STORAGE,
         fail_download_lookup=True,
         include_stream_transport=True,
+        concurrent_listings=True,
     )
+
+
+@pytest.mark.parametrize("endpoint", ["history", "active"])
+@pytest.mark.asyncio
+async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(endpoint: str) -> None:
+    """These endpoints already gather across sessions, so overlapping a session's two listings would
+    only raise the request's peak pool checkouts from N to 2N."""
+    sessions = [MagicMock(), MagicMock()]
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_sessions_history = AsyncMock(return_value=sessions)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_active_sessions = AsyncMock(return_value=sessions)
+    from_browser_session = AsyncMock(return_value=MagicMock())
+
+    with (
+        patch.object(browser_sessions_mod, "app", app_mock),
+        patch.object(browser_sessions_mod.BrowserSessionResponse, "from_browser_session", from_browser_session),
+    ):
+        if endpoint == "history":
+            await browser_sessions_mod.get_browser_sessions_all(
+                current_org=SimpleNamespace(organization_id="org_1"), page=1, page_size=100
+            )
+        else:
+            await browser_sessions_mod.get_browser_sessions(current_org=SimpleNamespace(organization_id="org_1"))
+
+    assert from_browser_session.await_count == len(sessions)
+    for call in from_browser_session.await_args_list:
+        assert call.kwargs.get("concurrent_listings", False) is False
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import itertools
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.workflow.page_derived_templates import OPEN, PageDerivedR
 from skyvern.forge.taskv3.goal_composition import (
     MAX_HANDOFF_LABEL_CHARS,
     PAGE_DATA_NOTE,
+    CodeProgressRecord,
     GoalDirectives,
     compose_goal,
     present_page_derived,
@@ -335,6 +337,28 @@ def test_the_page_data_note_sits_between_the_criteria_and_the_framing_only_when_
 
     assert goal.index("the form is sent") < goal.index(PAGE_DATA_NOTE) < goal.index("FRAMING")
     assert PAGE_DATA_NOTE not in compose_goal("Apply", GoalDirectives(framing="FRAMING"))
+
+
+def test_the_code_outline_is_one_labelled_section_after_everything_else_and_only_when_given() -> None:
+    record = CodeProgressRecord(before=("open", "search"), failed_step="click row", failed_line=4, after=("save",))
+    directives = GoalDirectives(complete_criterion="the form is sent", framing="FRAMING", block_context_section="CTX")
+
+    goal = compose_goal("Apply", replace(directives, code_progress=record))
+    lines = goal.split("\n")
+
+    assert goal.startswith(compose_goal("Apply", directives) + "\n\n")
+    assert goal.count("Code outline") == 1
+    assert "not steps to perform" in goal
+    assert [line for line in lines if line.startswith("- Earlier in the code: ")] == [
+        "- Earlier in the code: open",
+        "- Earlier in the code: search",
+    ]
+    assert [line for line in lines if line.startswith("- Raised an error at line ")] == [
+        "- Raised an error at line 4: click row"
+    ]
+    assert [line for line in lines if line.startswith("- Later in the code: ")] == ["- Later in the code: save"]
+    assert lines[-1] == "- Later in the code: save"
+    assert "Code outline" not in compose_goal("Apply", directives)
 
 
 @pytest.mark.parametrize(

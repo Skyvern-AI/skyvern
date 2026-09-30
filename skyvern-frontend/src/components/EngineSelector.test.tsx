@@ -102,13 +102,10 @@ describe("RunEngineSelector", () => {
     expect(onChange.mock.calls).toEqual([[RunEngine.SkyvernV3], [null]]);
   });
 
-  test.each([
-    [null, /follows engine routing/],
-    [RunEngine.SkyvernV3, /runs on Skyvern 3\.0/],
-  ])(
-    "Default on a workflow whose effective default is %s says %s",
-    (effectiveDefaultEngine, hint) => {
-      render(
+  test.each([null, RunEngine.SkyvernV3])(
+    "labels Default with no hint when the effective default is %s",
+    (effectiveDefaultEngine) => {
+      const { container } = render(
         <RunEngineSelector
           value={null}
           onChange={() => {}}
@@ -116,8 +113,14 @@ describe("RunEngineSelector", () => {
         />,
       );
 
-      expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
-      expect(screen.getAllByText(hint).length).toBeGreaterThan(0);
+      const defaultItem = screen
+        .getAllByRole("button")
+        .filter((button) => button.textContent?.includes("Default"));
+      expect(defaultItem.map((button) => button.textContent)).toEqual([
+        "Default",
+        "Default",
+      ]);
+      expect(container.textContent).not.toMatch(/routing|runs on/i);
     },
   );
 

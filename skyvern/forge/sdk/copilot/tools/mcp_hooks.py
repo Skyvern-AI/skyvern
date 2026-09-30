@@ -2079,6 +2079,7 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "disable_workflow_schedule": "skyvern_schedule_disable",
         "cancel_workflow_schedule": "skyvern_schedule_cancel",
         "delete_workflow_schedule": "skyvern_schedule_delete",
+        "list_workflow_runs": "skyvern_workflow_run_list",
     }
 
 
@@ -2092,6 +2093,10 @@ _SCHEDULE_HINT_REWRITES = (
     ("Use skyvern_schedule_list to", "Use list_workflow_schedules to"),
     (
         "Use skyvern_workflow_list to find valid workflow IDs.",
+        "The workflow open in this chat was not found in this organization.",
+    ),
+    (
+        "Verify the workflow ID with skyvern_workflow_list",
         "The workflow open in this chat was not found in this organization.",
     ),
     (", or set exact=true to do a full replace", ""),
@@ -2210,6 +2215,25 @@ def _mask_schedule_parameter_values(value: object) -> None:
             _mask_schedule_parameter_values(item)
 
 
+_RUN_LIST_FIELDS = ("run_id", "status", "created_at", "trigger_type", "parent_run_id")
+
+
+async def _workflow_run_list_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    result = await _workflow_schedule_post_hook(result, raw, ctx)
+    data = result.get("data")
+    if isinstance(data, dict) and isinstance(data.get("runs"), list):
+        # A past run's outputs and failure reason can hold secrets this chat never saw, and the scrubber
+        # only knows values it has seen, so a bulk listing leaves them out.
+        data["runs"] = [
+            {key: run[key] for key in _RUN_LIST_FIELDS if key in run} for run in data["runs"] if isinstance(run, dict)
+        ]
+    return result
+
+
 def _workflow_schedule_overlay(
     description: str,
     *,
@@ -2224,6 +2248,7 @@ def _workflow_schedule_overlay(
         requires_run_authority=mutates,
         pre_hook=pre_hook,
         post_hook=_workflow_schedule_post_hook,
+        post_hook_fails_closed=True,
     )
 
 
@@ -2536,6 +2561,20 @@ def _build_skyvern_mcp_overlays(
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_tab_close_pre_hook,
+        ),
+        "list_workflow_runs": SchemaOverlay(
+            description=(
+                "List the saved runs of the workflow open in this chat, newest first. Copilot chat runs are "
+                "left out, and so are child runs unless include_child_runs=true. Filter by status, e.g. "
+                'status=["terminated"]. Each run carries run_id, status, created_at and trigger_type. Read '
+                "one run's blocks and failure with get_run_results(workflow_run_id=<run_id>)."
+            ),
+            # search_key and error_code match stored run values, so matching run IDs would confirm guessed secrets.
+            hide_params=frozenset({"workflow_id", "search_key", "error_code"}),
+            binds_chat_workflow=True,
+            binds_chat_workflow_param="workflow_id",
+            post_hook=_workflow_run_list_post_hook,
+            post_hook_fails_closed=True,
         ),
         "list_workflow_schedules": _workflow_schedule_overlay(
             "List the schedules of the workflow open in this chat, with each wfs_ ID. Check it before creating "

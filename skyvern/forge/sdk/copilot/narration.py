@@ -127,6 +127,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "skyvern_tab_switch": "Switching tabs",
     "skyvern_tab_close": "Closing a tab",
     "list_workflow_schedules": "Checking this workflow's schedules",
+    "list_workflow_runs": "Listing this workflow's runs",
     "get_workflow_schedule": "Reading a schedule",
     "create_workflow_schedule": "Creating a schedule",
     "update_workflow_schedule": "Updating a schedule",

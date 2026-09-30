@@ -737,6 +737,39 @@ describe("PromptBox", () => {
     expect(body.request.url).toBe("https://google.com");
   });
 
+  test.each([
+    { minimal: false, coarsePointer: false, submits: true },
+    { minimal: false, coarsePointer: true, submits: false },
+    { minimal: true, coarsePointer: false, submits: true },
+    { minimal: true, coarsePointer: true, submits: false },
+  ])(
+    "Enter submits unless on a touch keyboard; Shift+Enter never does (minimal=$minimal, coarse=$coarsePointer)",
+    async ({ minimal, coarsePointer, submits }) => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query === "(any-pointer: fine)" ? !coarsePointer : true,
+      }));
+      mockPost.mockResolvedValue({
+        data: {
+          workflow_permanent_id: "wpid_1",
+          workflow_definition: { blocks: [] },
+        },
+      });
+      renderPromptBox(false, undefined, minimal);
+      const textarea = document.getElementById("discover-prompt-input")!;
+      fireEvent.change(textarea, { target: { value: "Visit the docs" } });
+
+      fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+      fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+
+      if (submits) {
+        await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+      } else {
+        expect(mockPost).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   test("sends settings changed in the gear popover and lists them under the prompt", async () => {
     mockPost.mockResolvedValue({
       data: {

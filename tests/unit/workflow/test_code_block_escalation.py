@@ -25,6 +25,7 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
+from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.copilot.nav_attribution import (
     block_nav_error_codes,
     proxy_owns_nav_codes,
@@ -55,6 +56,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, GoalDirectives, compose_goal
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus
 from skyvern.webeye.actions.action_types import ActionType
@@ -1376,12 +1378,12 @@ async def test_prompt_only_heal_fires_without_a_matched_step(
 
     assert result is not None and result.success is True
     assert state["execute_step_calls"] == 1
-    # No step narrows the goal, so it is the bare block prompt (no MINI_GOAL wrapper).
     assert state["create_task_kwargs"]["navigation_goal"] == DEFAULT_PROMPT
+    assert state["execute_step_kwargs"]["recovery_code_progress"] is None
 
 
 @pytest.mark.asyncio
-async def test_matched_step_narrows_the_goal(
+async def test_matched_step_is_a_record_beside_the_goal_not_part_of_it(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
 ) -> None:
     ai_fallback_flag("o_test")
@@ -1393,10 +1395,10 @@ async def test_matched_step_narrows_the_goal(
     result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
 
     assert result is not None and result.success is True
-    goal = state["create_task_kwargs"]["navigation_goal"]
-    assert goal != DEFAULT_PROMPT
-    assert "click the export button" in goal
-    assert DEFAULT_PROMPT in goal
+    assert state["create_task_kwargs"]["navigation_goal"] == DEFAULT_PROMPT
+    assert state["execute_step_kwargs"]["recovery_code_progress"] == CodeProgressRecord(
+        before=(), failed_step="click the export button", failed_line=1, after=()
+    )
 
 
 @pytest.mark.parametrize("prompt", [None, ""], ids=["absent_goal", "empty_goal"])
@@ -1411,7 +1413,7 @@ def test_steps_alone_never_manufacture_a_heal_goal(prompt: str | None) -> None:
     )
     context = _make_context()
 
-    assert block._compose_heal_goal(workflow_run_context=context, failing_line=1) == ""
+    assert block._compose_heal_goal(workflow_run_context=context) == ""
 
 
 def test_failing_goto_heals_toward_its_own_url_not_an_address_in_the_step_outline() -> None:
@@ -1424,18 +1426,6 @@ def test_failing_goto_heals_toward_its_own_url_not_an_address_in_the_step_outlin
     )
 
     assert block._derive_escalation_navigation_url(2, _recording_page(None)) == "https://example.com/b"
-
-
-def test_an_authored_goal_is_still_narrowed_by_its_matched_step() -> None:
-    block = _make_code_block(
-        steps=[CodeBlockStep(description="click the export button", line_start=1, line_end=1)],
-    )
-    context = _make_context()
-
-    goal = block._compose_heal_goal(workflow_run_context=context, failing_line=1)
-
-    assert "click the export button" in goal
-    assert DEFAULT_PROMPT in goal
 
 
 @pytest.mark.asyncio
@@ -2803,6 +2793,7 @@ async def test_secret_value_never_leaks_into_goal_or_task(
     goal = state["create_task_kwargs"]["navigation_goal"]
     assert SECRET_VALUE not in goal
     assert "*****" in goal
+    assert state["execute_step_kwargs"]["recovery_code_progress"].failed_step == "submit token *****"
     assert _string_values(state["create_task_kwargs"]["extracted_information_schema"])
     assert "receipt_*****" in state["create_task_kwargs"]["data_extraction_goal"]
     for value in state["create_task_kwargs"].values():
@@ -2940,7 +2931,7 @@ async def test_lone_line_start_step_is_matched(
 
     assert result is not None
     assert state["execute_step_calls"] == 1
-    assert "open the menu" in state["create_task_kwargs"]["navigation_goal"]
+    assert state["execute_step_kwargs"]["recovery_code_progress"].failed_step == "open the menu"
 
 
 def test_match_step_picks_largest_preceding_start() -> None:
@@ -3045,7 +3036,7 @@ async def test_recovery_block_finalized_to_non_completed_status(
 
 
 @pytest.mark.asyncio
-async def test_mid_block_failure_composes_remaining_steps(
+async def test_mid_block_failure_keeps_the_goal_verbatim_and_records_the_outline(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
 ) -> None:
     ai_fallback_flag("o_test")
@@ -3064,11 +3055,70 @@ async def test_mid_block_failure_composes_remaining_steps(
 
     assert result is not None and result.success is True
     goal = state["create_task_kwargs"]["navigation_goal"]
-    assert "click the invoices tab" in goal
-    assert "Then: download the latest invoice" in goal
-    # steps before the failure already ran as code — they must not be re-demanded.
-    assert "open the portal" not in goal
-    assert DEFAULT_PROMPT in goal
+    assert goal == DEFAULT_PROMPT
+    assert "mini goal" not in goal
+    assert "Then:" not in goal
+    record = state["execute_step_kwargs"]["recovery_code_progress"]
+    assert record == CodeProgressRecord(
+        before=("open the portal",),
+        failed_step="click the invoices tab",
+        failed_line=2,
+        after=("download the latest invoice",),
+    )
+    message = compose_goal(goal, GoalDirectives(code_progress=record))
+    assert message.startswith(DEFAULT_PROMPT + "\n\n")
+    assert message.count("Code outline") == 1
+    assert "- Earlier in the code: open the portal" in message
+    assert "- Raised an error at line 2: click the invoices tab" in message
+    assert "- Later in the code: download the latest invoice" in message
+
+
+@pytest.mark.parametrize(
+    ("failing_line", "expected"),
+    [
+        pytest.param(
+            3,
+            CodeProgressRecord(
+                before=("Open https://example.com/list",),
+                failed_step='Click "Open row"',
+                failed_line=3,
+                after=('Click "Dismiss"', 'Click "Skip"', 'Click "Export"'),
+            ),
+            id="inside_loop",
+        ),
+        pytest.param(
+            7,
+            CodeProgressRecord(
+                before=("Open https://example.com/list", 'Click "Open row"', 'Click "Dismiss"'),
+                failed_step='Click "Skip"',
+                failed_line=7,
+                after=('Click "Export"',),
+            ),
+            id="else_branch",
+        ),
+    ],
+)
+def test_outline_is_source_order_and_never_claims_what_ran(failing_line: int, expected: CodeProgressRecord) -> None:
+    code = (
+        'await page.goto("https://example.com/list")\n'
+        "for row in rows:\n"
+        '    await page.get_by_role("button", name="Open row").click()\n'
+        "if banner:\n"
+        '    await page.get_by_role("button", name="Dismiss").click()\n'
+        "else:\n"
+        '    await page.get_by_role("button", name="Skip").click()\n'
+        'await page.get_by_role("button", name="Export").click()\n'
+    )
+    block = _make_code_block(
+        code=code, steps=[CodeBlockStep.model_validate(step) for step in derive_code_block_steps(code)]
+    )
+
+    record = block._code_progress_record(workflow_run_context=_make_context(), failing_line=failing_line)
+
+    assert record == expected
+    section = compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record)).removeprefix(DEFAULT_PROMPT).lower()
+    for claim in ("completed", "not run", " ran", "already", "done"):
+        assert claim not in section
 
 
 @pytest.mark.asyncio
@@ -3089,9 +3139,10 @@ async def test_last_step_failure_keeps_single_step_goal(
     result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
 
     assert result is not None and result.success is True
-    goal = state["create_task_kwargs"]["navigation_goal"]
-    assert "download the latest invoice" in goal
-    assert "Then:" not in goal
+    assert state["create_task_kwargs"]["navigation_goal"] == DEFAULT_PROMPT
+    assert state["execute_step_kwargs"]["recovery_code_progress"] == CodeProgressRecord(
+        before=("open the portal",), failed_step="download the latest invoice", failed_line=2, after=()
+    )
 
 
 @pytest.mark.asyncio
@@ -3112,9 +3163,9 @@ async def test_remaining_steps_without_descriptions_are_skipped(
     result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
 
     assert result is not None and result.success is True
-    goal = state["create_task_kwargs"]["navigation_goal"]
-    assert "click the invoices tab" in goal
-    assert "Then:" not in goal
+    assert state["execute_step_kwargs"]["recovery_code_progress"] == CodeProgressRecord(
+        before=(), failed_step="click the invoices tab", failed_line=1, after=()
+    )
 
 
 @pytest.mark.asyncio
@@ -3135,10 +3186,10 @@ async def test_remaining_step_descriptions_are_masked(
     result = await _heal(block, _make_context(with_secret=True), exc, _recording_page(exc), failing_line=1)
 
     assert result is not None and result.success is True
-    goal = state["create_task_kwargs"]["navigation_goal"]
-    assert "open the portal" in goal
-    assert "Then:" in goal
-    assert SECRET_VALUE not in goal
+    record = state["execute_step_kwargs"]["recovery_code_progress"]
+    assert record.after == ("submit token *****",)
+    message = compose_goal(state["create_task_kwargs"]["navigation_goal"], GoalDirectives(code_progress=record))
+    assert SECRET_VALUE not in message
 
 
 @pytest.mark.asyncio

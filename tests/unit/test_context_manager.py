@@ -35,11 +35,12 @@ from skyvern.forge.sdk.services.credential.custom_credential_vault_service impor
     CustomCredentialNotConfiguredError,
 )
 from skyvern.forge.sdk.workflow import context_manager as cm
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import (
     RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE,
     classify_credential_fetch_failure,
 )
+from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, WaitBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AzureVaultCredentialParameter,
     BitwardenLoginCredentialParameter,
@@ -47,6 +48,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunParameter
+from skyvern.schemas.workflows import BlockStatus
+from tests.unit.conftest import make_block_output_parameter
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -524,3 +527,56 @@ class TestRunCredentialFetchOutcome:
         self, error: BaseException, customer_owned: bool, outcome: str
     ) -> None:
         assert classify_credential_fetch_failure(error, customer_owned=customer_owned)[0] == outcome
+
+
+def _outcome_context() -> WorkflowRunContext:
+    return WorkflowRunContext(
+        workflow_title="Outcome test",
+        workflow_id="workflow-id",
+        workflow_permanent_id="wpid",
+        workflow_run_id="run-id",
+        aws_client=AsyncMock(),
+    )
+
+
+def test_block_outcome_masks_secrets_before_bounding_the_reason() -> None:
+    context = _outcome_context()
+    context.secrets["placeholder_pw"] = "hunter2secret"
+    # The secret straddles the bound: cutting first would leave its head in the stored reason.
+    reason = "a" * (cm.BLOCK_OUTCOME_FAILURE_REASON_MAX_CHARS - 5) + "hunter2secret" + "b" * 100
+
+    context.record_block_outcome("login", BlockStatus.failed, ["AUTH_FAILURE"], reason)
+
+    outcome = context.get_block_outcome("login")
+    assert outcome is not None
+    assert outcome.status is BlockStatus.failed
+    assert outcome.error_codes == ["AUTH_FAILURE"]
+    assert outcome.failure_reason is not None
+    assert len(outcome.failure_reason) == cm.BLOCK_OUTCOME_FAILURE_REASON_MAX_CHARS
+    assert "hunte" not in outcome.failure_reason
+    assert context.get_block_outcome("never_ran") is None
+
+
+@pytest.mark.asyncio
+async def test_block_outcome_is_invisible_to_templates_and_the_branch_snapshot() -> None:
+    context = _outcome_context()
+    login_output = make_block_output_parameter("login_output")
+    await context.register_output_parameter_value_post_execution(
+        login_output, {"status": "completed", "extracted_information": {"user": "ada"}}
+    )
+    block = WaitBlock(label="login", output_parameter=login_output, wait_sec=1)
+    template = "{{ login }} | {{ login_output }} | {{ workflow_run_outputs }}"
+    branch_context = BranchEvaluationContext(workflow_run_context=context, block_label="login")
+
+    def observe() -> tuple[str, str]:
+        rendered = block.format_block_parameter_template_from_workflow_run_context(template, context)
+        snapshot = json.dumps(branch_context.build_llm_safe_context_snapshot(), sort_keys=True, default=str)
+        return rendered, snapshot
+
+    before = observe()
+    context.record_block_outcome("login", BlockStatus.failed, ["AUTH_FAILURE"], "wrong password")
+
+    assert observe() == before
+    assert context.get_block_outcome("login") == BlockOutcome(
+        status=BlockStatus.failed, error_codes=["AUTH_FAILURE"], failure_reason="wrong password"
+    )
