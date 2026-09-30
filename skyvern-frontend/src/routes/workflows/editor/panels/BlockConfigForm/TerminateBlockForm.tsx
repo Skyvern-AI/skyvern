@@ -29,8 +29,8 @@ function TerminateBlockFormBody({
   node: TerminateNode;
 }) {
   const debounceValue = useMemo(
-    () => ({ reason: node.data.reason }),
-    [node.data.reason],
+    () => ({ reason: node.data.reason, errorCode: node.data.errorCode }),
+    [node.data.reason, node.data.errorCode],
   );
   const { commit } = useDebouncedSidebarSave({
     blockId,

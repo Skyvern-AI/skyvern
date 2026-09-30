@@ -180,17 +180,8 @@ type PromptBoxHandle = {
   focusAndPrefillPrompt: (text: string) => void;
 };
 
-const HANDOFF_TITLE_MAX_LEN = 80;
-
 function blankToNull(value: string | null): string | null {
   return value?.trim() || null;
-}
-
-function deriveHandoffTitle(prompt: string): string {
-  const collapsed = prompt.replace(/\s+/g, " ").trim();
-  if (!collapsed) return "New Agent";
-  if (collapsed.length <= HANDOFF_TITLE_MAX_LEN) return collapsed;
-  return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
 }
 
 function buildBlankWorkflowRequest(
@@ -574,7 +565,8 @@ function PromptBoxImpl(
     }) => {
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(
-        buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
+        // A default title lets Copilot name the agent from this prompt on its first turn.
+        buildBlankWorkflowRequest("New Agent", runWith),
       );
       const result = await client.post<string, AxiosResponse<unknown>>(
         "/workflows",

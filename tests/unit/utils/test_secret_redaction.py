@@ -102,6 +102,19 @@ def test_redact_secrets_from_text_anchors_short_secret_variants() -> None:
     )
 
 
+def test_redact_secrets_from_text_can_match_embedded_short_secret_variants() -> None:
+    assert redact_secrets_from_text("AUTH&lt;ab", {"<ab"}) == "AUTH&lt;ab"
+    assert redact_secrets_from_text("AUTH&lt;ab", {"<ab"}, match_inside_words=True) == (
+        f"AUTH{REDACTED_SECRET_PLACEHOLDER}"
+    )
+    assert redact_secrets_from_text("ERR1234", {"1234"}, match_inside_words=True) == (
+        f"ERR{REDACTED_SECRET_PLACEHOLDER}"
+    )
+    assert redact_secrets_from_text("placeholder_1234", {"1234"}, match_inside_words=True) == (
+        f"placeholder_{REDACTED_SECRET_PLACEHOLDER}"
+    )
+
+
 def test_redact_secrets_from_text_replaces_long_secret_inside_alphanumeric_run() -> None:
     result = redact_secrets_from_text("prefixlongword9suffix", {"longword9"})
 

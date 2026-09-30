@@ -975,6 +975,7 @@ function convertToNode(
         data: {
           ...commonData,
           reason: block.reason,
+          errorCode: block.error_code ?? "",
         },
       };
     }
@@ -3351,6 +3352,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "terminate",
         reason: node.data.reason,
+        error_code: node.data.errorCode.trim() || null,
       };
     }
     case "fileDownload": {
@@ -4912,6 +4914,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "terminate",
           reason: block.reason,
+          error_code: block.error_code ?? null,
         };
         return blockYaml;
       }
@@ -5678,6 +5681,26 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes.filter(isTerminateNode).forEach((node) => {
     if (node.data.reason.trim() === "") {
       errors.push(`${node.data.label}: Reason is required.`);
+    }
+    const errorCode = node.data.errorCode.trim();
+    const hasJinjaOpener = /\{[{%#]/.test(errorCode);
+    if (!hasJinjaOpener && Array.from(errorCode).length > 128) {
+      errors.push(
+        `${node.data.label}: Error Code must be at most 128 characters.`,
+      );
+    }
+    if (/\p{C}/u.test(errorCode)) {
+      errors.push(
+        `${node.data.label}: Error Code must not contain Unicode category-C characters.`,
+      );
+    } else if (
+      errorCode &&
+      !hasJinjaOpener &&
+      !/^[A-Za-z0-9_.:-]+$/.test(errorCode)
+    ) {
+      errors.push(
+        `${node.data.label}: Error Code may contain only ASCII letters, digits, underscores, periods, colons, and hyphens.`,
+      );
     }
   });
 

@@ -11657,6 +11657,10 @@ def build_browser_tools(
     # navigation every handle in it is dead, and re-querying a remembered selector would resolve it
     # against a page the model never saw.
     _observe_document: list[str] = []
+    # The page (tab) the last successful observe/get_html/look read, and the one refs were read from, so an
+    # act on a different tab can say so.
+    _read_page: list[Any] = []
+    _observed_page: list[Any] = []
     _look_count = [0]  # per-run look() invocations, capped at _LOOK_MAX_PER_RUN
     # The (canonical URL, filled-field count) of the last same-URL reload the destructive-nav guard
     # refused. A repeat to that URL confirms intent and is allowed — but only if the at-risk state has
@@ -11729,6 +11733,9 @@ def build_browser_tools(
             return page.url
         except Exception:
             return ""
+
+    async def _other_tab_url(page: Any, read: list[Any]) -> str | None:
+        return None if not read or read[0] is page else _mask_refs(await _url(page))
 
     async def _realm_url(page: Any, realm: Any) -> str:
         """The URL of the document a realm is currently showing; `None` means the page's main frame."""
@@ -11942,6 +11949,7 @@ def build_browser_tools(
                 pass
         _observe_manifest.clear()
         _observe_document[:] = [canonical_url(await _url(page))]
+        _observed_page[:] = [page]
         # Per realm, the document each reading came from. A CHILD FRAME can navigate while the parent
         # does not, and a page-wide URL check cannot see that: every ref minted into the old frame
         # document would stay "valid" and re-resolve against a document the model never saw. A ref that
@@ -12741,6 +12749,17 @@ def build_browser_tools(
                 finally:
                     _prefetched_page.clear()
                 page = _current_page()
+                if spec_name in ("observe", "get_html", "look"):
+                    if result.status == "ok" and page is not None:
+                        _read_page[:] = [page]
+                # A stale ref/mark already names the tab it was read from.
+                elif page is not None and result.error_class not in ("stale_ref", "stale_mark"):
+                    if (other_tab := await _other_tab_url(page, _read_page)) is not None:
+                        result = dataclasses.replace(
+                            result,
+                            content=f"{result.content} (on {other_tab}, a different tab than your last "
+                            "observe/get_html/look read)",
+                        )
                 if _reports and _seeds:
                     last_action[:] = [(spec_name, key, page, browser_calls[0])] if page is not None else []
                 if not _reports or result.status != "ok" or page is None:
@@ -18707,6 +18726,7 @@ def build_browser_tools(
                 "handle": handle,
                 "tag": e.get("tag", ""),
                 "label": e.get("label", ""),
+                "page": page,
             }
         await _clear_look_tags(page)
         # Draw ONLY the marks we retained a handle for, so every number on the image is one the model
@@ -18838,8 +18858,12 @@ def build_browser_tools(
                 error_class="mark_not_in_latest",
             )
         handle = entry.get("handle")
+        other_tab = await _other_tab_url(page, [entry.get("page", page)])
         stale = ToolResult.error(
-            f"mark {mark} no longer points to an element on the page — it moved or the page "
+            f"mark {mark} was read from a different tab than the working page, which is now {other_tab}; marks "
+            "from that tab do not apply here. Call look() again and act on a fresh number."
+            if other_tab is not None
+            else f"mark {mark} no longer points to an element on the page — it moved or the page "
             "re-rendered since look(). Call look() again and act on a fresh number.",
             data={"page_state_changed": True},
             error_class="stale_mark",
@@ -18980,8 +19004,12 @@ def build_browser_tools(
                 f"ref={ref} is not a ref from the latest observe — re-observe and use a ref from the new observation",
                 error_class="ref_not_in_latest",
             )
+        other_tab = await _other_tab_url(page, _observed_page)
         stale = ToolResult.error(
-            f"ref={ref} no longer points to an element on the page — it moved or the page re-rendered "
+            f"ref={ref} was read from a different tab than the working page, which is now {other_tab}; refs "
+            "from that tab do not apply here. Call observe() again and act on a fresh ref."
+            if other_tab is not None
+            else f"ref={ref} no longer points to an element on the page — it moved or the page re-rendered "
             "since observe(). Call observe() again and act on a fresh ref.",
             data={"page_state_changed": True},
             error_class="stale_ref",

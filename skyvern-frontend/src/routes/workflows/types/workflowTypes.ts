@@ -606,6 +606,7 @@ export type WaitBlock = WorkflowBlockBase & {
 export type TerminateBlock = WorkflowBlockBase & {
   block_type: "terminate";
   reason: string;
+  error_code?: string | null;
 };
 
 export type FileDownloadBlock = WorkflowBlockBase & {

@@ -26444,6 +26444,17 @@
           "reason": {
             "type": "string",
             "title": "Reason"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
           }
         },
         "type": "object",
@@ -26511,6 +26522,18 @@
             "minLength": 1,
             "title": "Reason",
             "description": "Why the run ends here; supports Jinja templating."
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code",
+            "description": "Optional error code added to the run's error codes; supports Jinja templating. A literal code must be at most 128 characters. The rendered code must be at most 128 characters and may contain only ASCII letters, digits, underscores, periods, colons, and hyphens."
           }
         },
         "type": "object",

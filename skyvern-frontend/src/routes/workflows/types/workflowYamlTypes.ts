@@ -337,6 +337,7 @@ export type WaitBlockYAML = BlockYAMLBase & {
 export type TerminateBlockYAML = BlockYAMLBase & {
   block_type: "terminate";
   reason: string;
+  error_code: string | null;
 };
 
 export type FileDownloadBlockYAML = BlockYAMLBase & {

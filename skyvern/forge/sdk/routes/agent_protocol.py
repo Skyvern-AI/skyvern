@@ -5044,18 +5044,30 @@ async def get_workflow_run_with_workflow_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await run_service.coalesce_in_flight(
+        _build_workflow_run_with_workflow_id,
+        current_org.organization_id,
+        workflow_id,
+        workflow_run_id,
+        caps_run_response_values(x_user_agent),
+    )
+
+
+async def _build_workflow_run_with_workflow_id(
+    organization_id: str, workflow_id: str, workflow_run_id: str, cap_output_values: bool
+) -> dict[str, Any]:
     workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_permanent_id=workflow_id,
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         include_cost=True,
-        cap_output_values=caps_run_response_values(x_user_agent),
+        cap_output_values=cap_output_values,
     )
     return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
     )
 
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
@@ -5079,25 +5091,36 @@ async def get_workflow_and_run_from_workflow_run_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await run_service.coalesce_in_flight(
+        _build_workflow_and_run_from_workflow_run_id,
+        current_org.organization_id,
+        workflow_run_id,
+        caps_run_response_values(x_user_agent),
+    )
+
+
+async def _build_workflow_and_run_from_workflow_run_id(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool
+) -> WorkflowRunWithWorkflowResponse:
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         filter_deleted=False,
     )
 
     workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         include_cost=True,
         allow_deleted=True,
-        cap_output_values=caps_run_response_values(x_user_agent),
+        cap_output_values=cap_output_values,
     )
     workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
 
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
     )
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
     workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
@@ -5153,10 +5176,21 @@ async def get_workflow_run(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunResponseBase:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await run_service.coalesce_in_flight(
+        _build_workflow_run,
+        current_org.organization_id,
+        workflow_run_id,
+        caps_run_response_values(x_user_agent),
+    )
+
+
+async def _build_workflow_run(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool
+) -> WorkflowRunResponseBase:
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
-        cap_output_values=caps_run_response_values(x_user_agent),
+        organization_id=organization_id,
+        cap_output_values=cap_output_values,
     )
 
 
