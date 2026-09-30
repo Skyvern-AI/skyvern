@@ -4357,8 +4357,20 @@ async def test_in_process_retry_reacquires_serialized_lane(
         waiting.set()
         await release.wait()
 
+    # The gate reads its budget and opens asyncio.timeout with no await between, so the next timeout is the gate's.
+    gate_timeouts: list[asyncio.Timeout] = []
+    budget_read = False
+
+    def timeout(delay: float | None) -> asyncio.Timeout:
+        nonlocal budget_read
+        cm = asyncio.timeout(delay)
+        if budget_read:
+            budget_read = False
+            gate_timeouts.append(cm)
+        return cm
+
     monkeypatch.setattr(svc, "execute_workflow", execute)
-    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep, timeout=timeout))
     clearance_query = sqlite_db.workflow_runs.get_blocking_sequential_workflow_run
     query_failed = False
 
@@ -4374,9 +4386,11 @@ async def test_in_process_retry_reacquires_serialized_lane(
     remaining_budget = service_module._get_workflow_run_max_elapsed_timeout_seconds
 
     def budget(run: WorkflowRun) -> float:
+        nonlocal budget_read
         remaining = remaining_budget(run)
         assert 55 < remaining <= 60, "gate must use the prepared attempt's fresh runtime budget"
-        return 0.05 if outcome == "timeout" else remaining
+        budget_read = True
+        return remaining
 
     monkeypatch.setattr(service_module, "_get_workflow_run_max_elapsed_timeout_seconds", budget)
     recovering = entrance != "in_process"
@@ -4407,11 +4421,15 @@ async def test_in_process_retry_reacquires_serialized_lane(
             assert not waiting.is_set()
             return
 
-        # A generous bound: the assertion is about ordering, and a loaded CI shard can take seconds to get here.
+        # The full budget cannot lapse here, so the retry either parks in the gate or finishes without waiting.
         done, _pending = await asyncio.wait({task, wait_task}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
         if task in done:
             await task
-        assert wait_task in done, "retry did not wait for the occupied lane"
+        assert wait_task in done, (
+            "retry did not wait for the occupied lane"
+            if task in done
+            else "retry neither parked in the lane gate nor finished within 30s"
+        )
         attempts = await sqlite_db.workflow_run_attempts.get_attempts("wr_retry")
         assert attempts[-1].attempt_number == 2
         assert (attempts[-1].started_at is not None) == (entrance == "recovery_prepared")
@@ -4426,6 +4444,9 @@ async def test_in_process_retry_reacquires_serialized_lane(
             release.set()
         elif outcome == "task_cancel":
             task.cancel()
+        elif outcome == "timeout":
+            # Expire the budget only once the gate is parked, so the timeout can never beat the first lane check.
+            gate_timeouts[-1].reschedule(asyncio.get_running_loop().time())
 
         if outcome == "task_cancel":
             with pytest.raises(asyncio.CancelledError):
