@@ -1,4 +1,9 @@
 import {
+  TEMPLATE_VIA,
+  buildTemplateGuidanceMessage,
+  withoutTemplateViaParam,
+} from "../templateGuidance";
+import {
   bindCopilotReviewClose,
   captureEditorState,
   restoreEditorState,
@@ -532,6 +537,19 @@ function Workspace({
     () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
+  const templateGuidance = useMemo(
+    () =>
+      embedded && searchParams.get("via") === TEMPLATE_VIA
+        ? buildTemplateGuidanceMessage(workflow)
+        : undefined,
+    [embedded, searchParams, workflow],
+  );
+  const handleTemplateGuidanceShown = useCallback(() => {
+    navigate(location.pathname + withoutTemplateViaParam(location.search), {
+      replace: true,
+      state: location.state,
+    });
+  }, [location.pathname, location.search, location.state, navigate]);
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage && !initialCopilotAction) return;
     clearStoredInitialCopilotMessage();
@@ -558,7 +576,8 @@ function Workspace({
     if (
       shouldOpenCopilotPaneForHandoff({
         embedded,
-        hasInitialCopilotMessage: Boolean(initialCopilotMessage),
+        hasInitialCopilotMessage:
+          Boolean(initialCopilotMessage) || Boolean(templateGuidance),
         copilotPaneOpen: studioCopilotOpen,
       })
     ) {
@@ -3414,6 +3433,8 @@ function Workspace({
       {withStudioPaneBoundary(
         "copilot",
         <WorkflowCopilotChat
+          templateGuidance={templateGuidance}
+          onTemplateGuidanceShown={handleTemplateGuidanceShown}
           organizationId={workflow.organization_id}
           captureProductEvent={captureProductEvent}
           captureEditorState={captureLiveEditorState}
