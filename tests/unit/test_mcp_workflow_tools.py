@@ -198,6 +198,7 @@ def _known_drift_definition(block_type: str) -> dict[str, object]:
         }
     elif block_type == "terminate":
         block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        block["error_code"] = "ACCOUNT_NOT_FOUND"
     else:
         raise ValueError(f"Unsupported known drift block type: {block_type}")
 
@@ -284,6 +285,7 @@ async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     elif block_type == "terminate":
         assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
@@ -329,6 +331,7 @@ async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     elif block_type == "terminate":
         assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 

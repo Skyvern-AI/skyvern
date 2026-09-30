@@ -58,6 +58,7 @@ def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step
         block["navigation_goal"] = "do the thing"
     elif block_type == "terminate":
         block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        block["error_code"] = "ACCOUNT_NOT_FOUND"
     return {
         "workflow_permanent_id": workflow_id,
         "workflow_id": f"wf_{workflow_id.split('_', 1)[-1]}",
