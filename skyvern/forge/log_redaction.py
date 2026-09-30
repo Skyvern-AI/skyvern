@@ -39,6 +39,7 @@ SENSITIVE_HEADERS = {
     "cookie",
     "set-cookie",
     "x-api-key",
+    "x-marketplace-api-key",
     "x-posthog-attribution",
     "x-copilot-credential-recovery-token",
 }
