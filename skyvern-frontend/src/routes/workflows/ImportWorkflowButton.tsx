@@ -16,6 +16,7 @@ import {
   ArchiveEntry,
   expandFileToWorkflowYamls,
   extractTitleFromYaml,
+  stripLegacyEngineFromYaml,
   unzipArchive,
 } from "./importWorkflowYaml";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -85,7 +86,7 @@ function ImportWorkflowButton({
       }
       await client.post<string, { data: WorkflowApiResponse }>(
         "/workflows",
-        yaml,
+        stripLegacyEngineFromYaml(yaml),
         {
           headers: {
             "Content-Type": "text/plain",

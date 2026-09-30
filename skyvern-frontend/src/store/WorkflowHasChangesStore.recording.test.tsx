@@ -716,63 +716,67 @@ describe("workflow recording attachment", () => {
     },
   );
 
-  it("A46 keeps the cached effective_default_engine when a disposed-owner PUT hydrates the active editor", async () => {
-    const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { staleTime: 5 * 60 * 1000, retry: false } },
-    });
-    const queryKey = ["workflow", "wpid-1"];
-    queryClient.setQueryData(queryKey, {
-      ...saveData.workflow,
-      effective_default_engine: "skyvern-3.0",
-    });
-    function cacheWrapper({ children }: { children: ReactNode }) {
-      return (
-        <QueryClientProvider client={queryClient}>
-          {children}
-        </QueryClientProvider>
+  it.each(["skyvern-3.0", null])(
+    "A46 keeps the cached effective_default_engine %s when a disposed-owner PUT without it hydrates the active editor",
+    async (cachedEngine) => {
+      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { staleTime: 5 * 60 * 1000, retry: false } },
+      });
+      const queryKey = ["workflow", "wpid-1"];
+      queryClient.setQueryData(queryKey, {
+        ...saveData.workflow,
+        effective_default_engine: cachedEngine,
+      });
+      function cacheWrapper({ children }: { children: ReactNode }) {
+        return (
+          <QueryClientProvider client={queryClient}>
+            {children}
+          </QueryClientProvider>
+        );
+      }
+      let resolvePut!: (value: unknown) => void;
+      mocks.put.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePut = resolve;
+          }),
       );
-    }
-    let resolvePut!: (value: unknown) => void;
-    mocks.put.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolvePut = resolve;
-        }),
-    );
-    const hook = renderHook(() => useWorkflowSave(), { wrapper: cacheWrapper });
-    beginYamlCommit(owner);
-    let saving!: Promise<unknown>;
-    act(() => {
-      saving = hook.result.current.mutateAsync({
-        yamlCommit: {
-          owner,
-          revision: useWorkflowYamlEditorStore.getState().revision,
-        },
+      const hook = renderHook(() => useWorkflowSave(), {
+        wrapper: cacheWrapper,
       });
-    });
-    await waitFor(() => expect(mocks.put).toHaveBeenCalledOnce());
-    hook.unmount();
-    unregisterEditorOwner(owner);
-    registerEditorOwner(createYamlCommitOwner("wpid-1"));
-    const hydrate = vi.fn();
-    useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
-    await act(async () => {
-      resolvePut({
-        data: {
-          ...saveData.workflow,
-          title: "Original saved",
-          effective_default_engine: null,
-        },
+      beginYamlCommit(owner);
+      let saving!: Promise<unknown>;
+      act(() => {
+        saving = hook.result.current.mutateAsync({
+          yamlCommit: {
+            owner,
+            revision: useWorkflowYamlEditorStore.getState().revision,
+          },
+        });
       });
-      await saving;
-    });
-    expect(hydrate).toHaveBeenCalledOnce();
-    expect(queryClient.getQueryData(queryKey)).toMatchObject({
-      title: "Original saved",
-      effective_default_engine: "skyvern-3.0",
-    });
-  });
+      await waitFor(() => expect(mocks.put).toHaveBeenCalledOnce());
+      hook.unmount();
+      unregisterEditorOwner(owner);
+      registerEditorOwner(createYamlCommitOwner("wpid-1"));
+      const hydrate = vi.fn();
+      useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
+      await act(async () => {
+        resolvePut({
+          data: {
+            ...saveData.workflow,
+            title: "Original saved",
+          },
+        });
+        await saving;
+      });
+      expect(hydrate).toHaveBeenCalledOnce();
+      expect(queryClient.getQueryData(queryKey)).toMatchObject({
+        title: "Original saved",
+        effective_default_engine: cachedEngine,
+      });
+    },
+  );
 
   it("A46 clears an attached recording after disposed-owner success without deleting it", async () => {
     const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
