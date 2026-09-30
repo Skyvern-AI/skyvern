@@ -1426,6 +1426,10 @@ class ReusedSessionBelowLifetimeFloor(Exception):
         self.shortfall = shortfall
 
 
+def workflow_definitions_differ(previous: WorkflowDefinition, current: WorkflowDefinition) -> bool:
+    return _get_workflow_definition_core_data(previous) != _get_workflow_definition_core_data(current)
+
+
 def _get_workflow_definition_core_data(
     workflow_definition: WorkflowDefinition, *, unset_engine_is_v1: bool = True
 ) -> dict[str, Any]:

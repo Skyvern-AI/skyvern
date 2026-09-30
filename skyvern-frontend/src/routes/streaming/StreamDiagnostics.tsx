@@ -90,59 +90,81 @@ function StreamModeBadge({
 function StreamStatusPanel({
   diagnostic,
   children,
+  footer,
   className,
 }: {
   diagnostic: StreamDiagnostic;
   children?: ReactNode;
+  /** Interactive content shown under the status, outside its live region. */
+  footer?: ReactNode;
   className?: string;
 }) {
   const isSuccess = diagnostic.tone === "success";
+  const status = (
+    <div
+      role={footer ? "status" : undefined}
+      aria-live={footer ? "polite" : undefined}
+      className="flex max-w-md flex-col gap-2 text-sm"
+    >
+      <div className="flex items-center gap-2 font-medium text-neutral-900 dark:text-slate-100">
+        {isSuccess ? (
+          <CheckCircledIcon className="h-4 w-4 flex-shrink-0 text-success" />
+        ) : (
+          <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-neutral-500 dark:text-slate-400" />
+        )}
+        <span>{diagnostic.title}</span>
+      </div>
+      {diagnostic.detail && (
+        <div className="text-neutral-600 dark:text-slate-400">
+          {diagnostic.detail}
+        </div>
+      )}
+      {diagnostic.hint && (
+        <div className="text-xs text-neutral-500 dark:text-slate-500">
+          {diagnostic.hint}
+        </div>
+      )}
+      {diagnostic.pending && (
+        // Decorative and on a 7s rotation: inside the live region it would
+        // interrupt a screen reader again every time it cycles.
+        <div
+          aria-hidden="true"
+          className="mt-1 flex flex-col gap-1 text-neutral-600 dark:text-slate-400"
+        >
+          <RotateThrough interval={7 * 1000}>
+            {WHIMSICAL_LOADING_MESSAGES.map((message) => (
+              <span key={message}>{message}</span>
+            ))}
+          </RotateThrough>
+          <AnimatedWave text={WHIMSICAL_SPARKLE} />
+        </div>
+      )}
+      {children}
+    </div>
+  );
+  const panelClassName = cn(
+    "flex h-full w-full rounded-md bg-white p-6 text-neutral-600 dark:bg-slate-900 dark:text-slate-300",
+    isSuccess && "border border-success/30",
+    className,
+  );
+  if (footer) {
+    // m-auto centers the column while still letting a tall footer scroll from the top.
+    return (
+      <div className={cn(panelClassName, "overflow-y-auto")}>
+        <div className="m-auto flex w-full max-w-md flex-col">
+          {status}
+          {footer}
+        </div>
+      </div>
+    );
+  }
   return (
     <div
       role="status"
       aria-live="polite"
-      className={cn(
-        "flex h-full w-full items-center justify-center rounded-md bg-white p-6 text-neutral-600 dark:bg-slate-900 dark:text-slate-300",
-        isSuccess && "border border-success/30",
-        className,
-      )}
+      className={cn(panelClassName, "items-center justify-center")}
     >
-      <div className="flex max-w-md flex-col gap-2 text-sm">
-        <div className="flex items-center gap-2 font-medium text-neutral-900 dark:text-slate-100">
-          {isSuccess ? (
-            <CheckCircledIcon className="h-4 w-4 flex-shrink-0 text-success" />
-          ) : (
-            <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-neutral-500 dark:text-slate-400" />
-          )}
-          <span>{diagnostic.title}</span>
-        </div>
-        {diagnostic.detail && (
-          <div className="text-neutral-600 dark:text-slate-400">
-            {diagnostic.detail}
-          </div>
-        )}
-        {diagnostic.hint && (
-          <div className="text-xs text-neutral-500 dark:text-slate-500">
-            {diagnostic.hint}
-          </div>
-        )}
-        {diagnostic.pending && (
-          // Decorative and on a 7s rotation: inside the live region it would
-          // interrupt a screen reader again every time it cycles.
-          <div
-            aria-hidden="true"
-            className="mt-1 flex flex-col gap-1 text-neutral-600 dark:text-slate-400"
-          >
-            <RotateThrough interval={7 * 1000}>
-              {WHIMSICAL_LOADING_MESSAGES.map((message) => (
-                <span key={message}>{message}</span>
-              ))}
-            </RotateThrough>
-            <AnimatedWave text={WHIMSICAL_SPARKLE} />
-          </div>
-        )}
-        {children}
-      </div>
+      {status}
     </div>
   );
 }

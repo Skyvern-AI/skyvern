@@ -48,7 +48,11 @@ function isAuthoritativeConfirmedResponse(
   response: OnboardingStateResponse,
 ): boolean {
   const status = response.questionnaire_prompt_result?.status;
-  return status !== "flag_disabled" && status !== "ineligible";
+  return (
+    status !== "flag_disabled" &&
+    status !== "flag_unavailable" &&
+    status !== "ineligible"
+  );
 }
 
 function mergeConfirmedResponse(
@@ -174,25 +178,26 @@ function OnboardingProvider({ children }: Readonly<Props>) {
     },
     [credentialGetter, isCurrent],
   );
-  const { data, isLoading } = useQuery<OnboardingStateResponse>({
-    queryKey,
-    queryFn: async () => {
-      const { client, headers } = await requestClient(generation);
-      const response = await client.get<OnboardingStateResponse>(
-        "/users/me/onboarding",
-        { headers },
-      );
-      if (!isCurrent(generation)) throw new CancelledError();
-      const legacyFields = legacyFieldsToReplay(
-        legacyWritesRef.current,
-        legacyWriteVersionRef.current + 1,
-      );
-      return Object.keys(legacyFields).length === 0
-        ? response.data
-        : mergeNewerLegacyFields(response.data, legacyFields);
-    },
-    enabled: !!credentialGetter && !!userId,
-  });
+  const { data, isLoading, isError, isFetching, refetch } =
+    useQuery<OnboardingStateResponse>({
+      queryKey,
+      queryFn: async () => {
+        const { client, headers } = await requestClient(generation);
+        const response = await client.get<OnboardingStateResponse>(
+          "/users/me/onboarding",
+          { headers },
+        );
+        if (!isCurrent(generation)) throw new CancelledError();
+        const legacyFields = legacyFieldsToReplay(
+          legacyWritesRef.current,
+          legacyWriteVersionRef.current + 1,
+        );
+        return Object.keys(legacyFields).length === 0
+          ? response.data
+          : mergeNewerLegacyFields(response.data, legacyFields);
+      },
+      enabled: !!credentialGetter && !!userId,
+    });
 
   useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
@@ -454,11 +459,14 @@ function OnboardingProvider({ children }: Readonly<Props>) {
       value={{
         state: data?.onboarding_state ?? null,
         isLoading,
+        loadFailed: isError && !isFetching,
+        retryLoad: () => void refetch(),
         updateState,
         updateStateConfirmed,
         isNewUser,
         abVariant,
         recoveryGuidanceAssignment: data?.recovery_guidance_assignment ?? null,
+        organizationId: data?.organization_id ?? null,
       }}
     >
       {children}

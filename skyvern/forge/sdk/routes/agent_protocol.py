@@ -1382,7 +1382,7 @@ async def update_workflow_legacy(
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
@@ -1407,6 +1407,8 @@ async def update_workflow_legacy(
             organization_id=current_org.organization_id,
         )
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
+    await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+    return workflow
 
 
 @base_router.post(
@@ -1468,7 +1470,7 @@ async def update_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
             workflow_permanent_id=workflow_id,
@@ -1490,6 +1492,8 @@ async def update_workflow(
             workflow_permanent_id=workflow_id,
         )
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
+    await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+    return workflow
 
 
 @legacy_base_router.delete(

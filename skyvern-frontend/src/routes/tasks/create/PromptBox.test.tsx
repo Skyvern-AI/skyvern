@@ -402,7 +402,9 @@ describe("PromptBox", () => {
     const textarea = screen.getByPlaceholderText("Enter your prompt...");
     textarea.scrollIntoView = vi.fn();
 
-    act(() => ref.current?.focusAndPrefillExample("AAPLStockPrice"));
+    act(() =>
+      ref.current?.focusAndPrefillExample("AAPLStockPrice", "finditparts"),
+    );
     expect((textarea as HTMLTextAreaElement).value).toContain(
       'find the "AAPL" stock price',
     );
@@ -416,7 +418,9 @@ describe("PromptBox", () => {
     );
 
     fireEvent.change(textarea, { target: { value: "Keep my agent prompt" } });
-    act(() => ref.current?.focusAndPrefillExample("contact_us_forms"));
+    act(() =>
+      ref.current?.focusAndPrefillExample("contact_us_forms", "finditparts"),
+    );
     expect((textarea as HTMLTextAreaElement).value).toBe(
       "Keep my agent prompt",
     );
@@ -699,7 +703,7 @@ describe("PromptBox", () => {
 
     for (const [key, expected] of cases) {
       fireEvent.change(textarea, { target: { value: "" } });
-      act(() => ref.current?.focusAndPrefillExample(key));
+      act(() => ref.current?.focusAndPrefillExample(key, "finditparts"));
       expect(textarea.value).toContain(expected);
     }
     expect(mockPost).not.toHaveBeenCalled();

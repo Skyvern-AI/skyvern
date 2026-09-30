@@ -2979,6 +2979,15 @@ class AgentFunction:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
         return
 
+    async def on_workflow_updated_by_user(
+        self,
+        organization_id: str,
+        user_id: str | None,
+        workflow: Workflow,
+    ) -> None:
+        """Fired after the update-agent routes save a new version. Overrides must be best-effort and never raise."""
+        return
+
     async def on_workflow_run_completed(
         self,
         organization_id: str,
