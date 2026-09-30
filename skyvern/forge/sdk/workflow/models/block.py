@@ -18692,6 +18692,7 @@ class WorkflowTriggerBlock(Block):
                             # workflow's engine, so persist that engine on the child run for fidelity even
                             # though it carries a browser_session_id. None for caller-supplied/parent-shared.
                             server_owned_browser_type=child_effective_browser_type if created_fresh_session else None,
+                            reject_empty_workflow=True,
                         )
                     except Exception as e:
                         error_msg = get_user_facing_exception_message(e)

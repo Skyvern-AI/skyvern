@@ -71,6 +71,7 @@ from skyvern.exceptions import (
     SkyvernHTTPException,
     UnrecognizedWorkflowParameters,
     WorkflowAttemptDispatchSuperseded,
+    WorkflowHasNoBlocks,
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRetryAttemptLookupError,
@@ -3315,6 +3316,7 @@ class WorkflowService:
         shares_parent_browser: bool = False,
         server_owned_browser_type: str | None = None,
         created_by: str | None = None,
+        reject_empty_workflow: bool = False,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3345,6 +3347,8 @@ class WorkflowService:
             if workflow is None:
                 LOG.warning(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
                 raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
+            if reject_empty_workflow and not workflow.workflow_definition.blocks:
+                raise WorkflowHasNoBlocks(workflow_permanent_id=workflow_permanent_id)
             workflow_id = workflow.workflow_id
             if workflow_request.proxy_location is None and workflow.proxy_location is not None:
                 workflow_request.proxy_location = workflow.proxy_location
