@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     WORKFLOW_TASK_V3_AB_FLAG,
     WorkflowBlockEngineRouteReason,
     _as_utc,
+    effective_default_engine,
     resolve_workflow_block_engine_arm,
     workflow_block_engine_override,
 )
@@ -52,12 +54,14 @@ from skyvern.forge.sdk.workflow.models.block import (
     _evaluate_prompt_branch_conditions_batch,
     get_all_blocks,
     run_is_eligible_for_v3_ab,
+    takes_default_engine,
     v3_ab_ineligibility_reason,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.taskv3.goal_composition import render_block_context
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.schemas.workflows import BlockResult, BlockType, WorkflowStatus
+from skyvern.schemas.workflows import BlockResult, BlockType, NavigationBlockYAML, WorkflowStatus
 from skyvern.services import script_service
 from tests.unit._workflow_block_engine_fakes import (
     WORKFLOW_BLOCK_ENGINE_APP_TARGET,
@@ -92,6 +96,7 @@ def _no_ambient_v3_default_cutoff(monkeypatch: pytest.MonkeyPatch) -> None:
     # Settings reads .env at import: without pinning it, every test here answers to whatever the
     # machine happens to export.
     monkeypatch.setattr(settings, "TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", None)
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", None)
 
 
 @pytest.fixture
@@ -375,6 +380,7 @@ async def test_noop_provider_never_queried_and_leaves_engine_unchanged(scoped_co
             workflow_status=WorkflowStatus.published,
             trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=None,
+            takes_default_engine=True,
         )
 
     spy.assert_not_called()
@@ -804,6 +810,7 @@ async def test_resolver_logs_the_ineligibility_reason(scoped_context: SkyvernCon
             workflow_status=WorkflowStatus.published,
             trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=V3AbIneligibleReason.pinned_engine,
+            takes_default_engine=True,
         )
 
     assert scoped_context.workflow_block_engine_override is None
@@ -1010,6 +1017,7 @@ async def test_arm_offers_the_billing_tier_to_the_ab_flag_but_not_the_kill_switc
             workflow_status=WorkflowStatus.published,
             trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=None,
+            takes_default_engine=True,
         )
 
     by_flag = {flag: properties or {} for flag, _distinct_id, properties in provider.calls}
@@ -1042,6 +1050,7 @@ async def test_a_run_that_never_reaches_the_ab_pays_for_no_tier_lookup(scoped_co
                 workflow_status=WorkflowStatus.published,
                 trigger_type=WorkflowRunTriggerType.api,
                 ineligibility_reason=reason,
+                takes_default_engine=True,
             )
         tier.assert_not_awaited()
         assert mock_log.info.call_args.kwargs["billing_tier"] is None
@@ -1065,6 +1074,7 @@ async def test_a_failing_billing_tier_lookup_cannot_decide_the_arm(scoped_contex
             workflow_status=WorkflowStatus.published,
             trigger_type=WorkflowRunTriggerType.api,
             ineligibility_reason=None,
+            takes_default_engine=True,
         )
 
     assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
@@ -1395,3 +1405,235 @@ async def test_a_missing_first_version_falls_back_to_the_flag_path(
 
     assert scoped_context.workflow_block_engine_override is None
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
+
+
+CHOSEN_ENGINE_CUTOFF = datetime(2026, 10, 1, tzinfo=UTC)
+
+
+async def _resolve_chosen_engine_run(
+    context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    blocks: list[BaseTaskBlock],
+    *,
+    run_id: str,
+    cutoff: datetime | None,
+    born_at: datetime,
+    flags: dict[str, bool] | None = None,
+    workflow_status: WorkflowStatus = WorkflowStatus.published,
+) -> tuple[FakeExperimentationProvider, Any]:
+    # Eligibility and the unset-engine fact are computed from the blocks by the same helpers the
+    # workflow service calls, so a block-level regression in either reaches these assertions.
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
+    provider = FakeExperimentationProvider(flags if flags is not None else {WORKFLOW_TASK_V3_AB_FLAG: True})
+    resolution = await resolve_arm(
+        context,
+        provider,
+        workflow_run_id=run_id,
+        ineligibility_reason=v3_ab_ineligibility_reason(blocks, is_script_run=False),
+        takes_default_engine=takes_default_engine(blocks),
+        billing_tier=BillingTier.ENTERPRISE,
+        first_version_created_at=born_at,
+        workflow_status=workflow_status,
+    )
+    return provider, resolution
+
+
+_AFTER = CHOSEN_ENGINE_CUTOFF.replace(tzinfo=None) + timedelta(seconds=1)
+_BEFORE = CHOSEN_ENGINE_CUTOFF.replace(tzinfo=None) - timedelta(days=30)
+_R = WorkflowBlockEngineRouteReason
+
+
+@pytest.mark.parametrize(
+    ("cutoff", "born_at", "chosen", "expected_engine", "expected_reason"),
+    [
+        # Cutoff unset or workflow born before it: today's routing. The A/B is at 100% treatment, so an
+        # unset or skyvern_v1 block is rerouted and a v2/v3 pin makes the run ineligible.
+        (None, _AFTER, None, RunEngine.skyvern_v3, _R.flag_bucket_treatment),
+        (None, _AFTER, RunEngine.skyvern_v1, RunEngine.skyvern_v3, _R.flag_bucket_treatment),
+        (None, _AFTER, RunEngine.skyvern_v2, RunEngine.skyvern_v2, _R.ineligible),
+        (None, _AFTER, RunEngine.skyvern_v3, RunEngine.skyvern_v3, _R.ineligible),
+        (CHOSEN_ENGINE_CUTOFF, _BEFORE, None, RunEngine.skyvern_v3, _R.flag_bucket_treatment),
+        (CHOSEN_ENGINE_CUTOFF, _BEFORE, RunEngine.skyvern_v1, RunEngine.skyvern_v3, _R.flag_bucket_treatment),
+        (CHOSEN_ENGINE_CUTOFF, _BEFORE, RunEngine.skyvern_v2, RunEngine.skyvern_v2, _R.ineligible),
+        (CHOSEN_ENGINE_CUTOFF, _BEFORE, RunEngine.skyvern_v3, RunEngine.skyvern_v3, _R.ineligible),
+        # Born at or after the cutoff: an unset engine runs on v3 and a chosen one runs as written.
+        (CHOSEN_ENGINE_CUTOFF, _AFTER, None, RunEngine.skyvern_v3, _R.new_workflow_v3_default),
+        (CHOSEN_ENGINE_CUTOFF, _AFTER, RunEngine.skyvern_v1, RunEngine.skyvern_v1, _R.chosen_engine),
+        (CHOSEN_ENGINE_CUTOFF, _AFTER, RunEngine.skyvern_v2, RunEngine.skyvern_v2, _R.chosen_engine),
+        (CHOSEN_ENGINE_CUTOFF, _AFTER, RunEngine.skyvern_v3, RunEngine.skyvern_v3, _R.chosen_engine),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chosen_engine_cutoff_matrix(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    cutoff: datetime | None,
+    born_at: datetime,
+    chosen: RunEngine | None,
+    expected_engine: RunEngine,
+    expected_reason: WorkflowBlockEngineRouteReason,
+) -> None:
+    block = _make_block(TaskBlock, label="only", engine=chosen)
+    provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context, monkeypatch, [block], run_id="wr_matrix", cutoff=cutoff, born_at=born_at
+    )
+
+    assert block.resolve_engine("wr_matrix") == expected_engine
+    assert resolution.log["route_reason"] == expected_reason
+    if expected_reason in (_R.new_workflow_v3_default, _R.chosen_engine):
+        # Every tier, with no A/B draw and no billing-tier lookup.
+        assert consulted_flags(provider) == [DISABLE_TASK_V3_FLAG]
+        assert resolution.log["billing_tier"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_post_cutoff_run_honors_each_block_on_its_own(
+    scoped_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The A/B keeps a run single-engine; a chosen-engine run does not, so a v3 pin (which makes the run
+    # A/B-ineligible) must not hold the unset blocks on v1, and a block v3 cannot run stays on v1.
+    unset = _make_block(NavigationBlock, label="unset", navigation_goal="Apply to the job")
+    chose_v1 = _make_block(TaskBlock, label="chose_v1", engine=RunEngine.skyvern_v1)
+    chose_v3 = _make_block(TaskBlock, label="chose_v3", engine=RunEngine.skyvern_v3)
+    unsupported = _make_block(ValidationBlock, label="unsupported", complete_on_download=True)
+    blocks: list[BaseTaskBlock] = [unset, chose_v1, chose_v3, unsupported]
+    _provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context, monkeypatch, blocks, run_id="wr_mixed", cutoff=CHOSEN_ENGINE_CUTOFF, born_at=_AFTER
+    )
+
+    assert [block.resolve_engine("wr_mixed") for block in blocks] == [
+        RunEngine.skyvern_v3,
+        RunEngine.skyvern_v1,
+        RunEngine.skyvern_v3,
+        RunEngine.skyvern_v1,
+    ]
+    assert resolution.log["route_reason"] == _R.new_workflow_v3_default
+
+
+@pytest.mark.parametrize("chosen", [None, RunEngine.skyvern_v3])
+@pytest.mark.asyncio
+async def test_kill_switch_wins_over_the_chosen_engine_cutoff(
+    scoped_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch, chosen: RunEngine | None
+) -> None:
+    block = _make_block(TaskBlock, label="only", engine=chosen)
+    _provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context,
+        monkeypatch,
+        [block],
+        run_id="wr_killed",
+        cutoff=CHOSEN_ENGINE_CUTOFF,
+        born_at=_AFTER,
+        flags={WORKFLOW_TASK_V3_AB_FLAG: True, DISABLE_TASK_V3_FLAG: True},
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    resolution.birth_reads.assert_not_awaited()
+    if chosen is None:
+        assert block.resolve_engine("wr_killed") == RunEngine.skyvern_v1
+        assert resolution.log["route_reason"] == _R.disabled
+    else:
+        # The pin is recorded as written and the dispatch gate stops it; its label predates this rule.
+        assert block.resolve_engine("wr_killed") == RunEngine.skyvern_v3
+        assert resolution.log["route_reason"] == _R.ineligible
+
+
+@pytest.mark.asyncio
+async def test_a_per_call_workflow_born_after_the_chosen_engine_cutoff_keeps_ab_routing(
+    scoped_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every per-call platform workflow is born after any cutoff; enrolling them would move standing
+    # API traffic, so their explicit skyvern_v1 stays routable.
+    block = _make_block(TaskBlock, label="only", engine=RunEngine.skyvern_v1)
+    _provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context,
+        monkeypatch,
+        [block],
+        run_id="wr_per_call",
+        cutoff=CHOSEN_ENGINE_CUTOFF,
+        born_at=_AFTER,
+        workflow_status=WorkflowStatus.auto_generated,
+    )
+
+    assert block.resolve_engine("wr_per_call") == RunEngine.skyvern_v3
+    assert resolution.log["route_reason"] == _R.flag_bucket_treatment
+    resolution.birth_reads.assert_not_awaited()
+
+
+def test_an_omitted_engine_is_unset_and_a_stored_one_is_kept() -> None:
+    omitted = NavigationBlockYAML(label="nav", url="https://example.com", navigation_goal="Go")
+    stored = NavigationBlockYAML.model_validate(
+        {"label": "nav", "url": "https://example.com", "navigation_goal": "Go", "engine": "skyvern-1.0"}
+    )
+
+    assert omitted.engine is None
+    assert stored.engine == RunEngine.skyvern_v1
+    block = _make_block(NavigationBlock, label="nav", navigation_goal="Go")
+    assert block.engine is None
+    assert type(block).model_validate(block.model_dump()).engine is None
+    # Unset routes like skyvern_v1 before the cutoff, so it never reads as a pin.
+    assert v3_ab_ineligibility_reason([block], is_script_run=False) is None
+    assert takes_default_engine([block]) is True
+
+
+def test_an_unset_engine_is_left_out_of_the_stored_definition_so_an_older_image_reads_it() -> None:
+    # The field as the image before SKY-17436 declares it: a stored null fails validation there, so a
+    # pod still on it during a rollout, or after a revert, could not load the workflow.
+    class OlderImageTaskBlock(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        engine: RunEngine = RunEngine.skyvern_v1
+
+    unset = _make_block(NavigationBlock, label="unset", navigation_goal="Go")
+    chosen = _make_block(TaskBlock, label="chosen", engine=RunEngine.skyvern_v3)
+    stored = WorkflowDefinition(parameters=[], blocks=[unset, chosen]).model_dump(mode="json")
+
+    assert "engine" not in stored["blocks"][0]
+    assert [OlderImageTaskBlock.model_validate(b).engine for b in stored["blocks"]] == [
+        RunEngine.skyvern_v1,
+        RunEngine.skyvern_v3,
+    ]
+    reloaded = WorkflowDefinition.model_validate(stored)
+    assert [b.engine for b in reloaded.blocks] == [None, RunEngine.skyvern_v3]
+    with pytest.raises(ValidationError):
+        OlderImageTaskBlock.model_validate({"engine": None})
+
+
+@pytest.mark.asyncio
+async def test_both_cutoff_rules_share_one_birth_read(
+    scoped_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch, v3_default_cutoff: datetime
+) -> None:
+    # Born between the two cutoffs: the chosen-engine rule reads the birth and declines, then the
+    # self-serve rule needs the same timestamp.
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", CHOSEN_ENGINE_CUTOFF)
+    resolution = await resolve_arm(
+        scoped_context,
+        FakeExperimentationProvider(),
+        workflow_run_id="wr_between",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.SELF_SERVE,
+        first_version_created_at=CHOSEN_ENGINE_CUTOFF - timedelta(days=1),
+    )
+
+    assert resolution.log["route_reason"] == _R.new_self_serve_workflow_default
+    assert resolution.birth_reads.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("cutoff", "born_at", "expected"),
+    [
+        (None, _AFTER, None),
+        (CHOSEN_ENGINE_CUTOFF, _BEFORE, None),
+        (CHOSEN_ENGINE_CUTOFF, _AFTER, RunEngine.skyvern_v3),
+    ],
+)
+@pytest.mark.asyncio
+async def test_effective_default_engine_follows_the_chosen_engine_cutoff(
+    monkeypatch: pytest.MonkeyPatch, cutoff: datetime | None, born_at: datetime, expected: RunEngine | None
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
+    with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER = FakeExperimentationProvider()
+        mock_app.DATABASE.workflows.get_workflow_permanent_id_created_at = AsyncMock(return_value=born_at)
+        assert await effective_default_engine("wpid_1", "org_1") == expected
+        # With no flag provider the resolver never applies the rule, so the editor must not claim it.
+        mock_app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
+        assert await effective_default_engine("wpid_1", "org_1") is None

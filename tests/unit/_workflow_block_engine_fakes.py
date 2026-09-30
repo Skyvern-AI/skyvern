@@ -118,6 +118,7 @@ async def resolve_arm(
     first_version_error: Exception | None = None,
     workflow_status: WorkflowStatus = WorkflowStatus.published,
     trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
+    takes_default_engine: bool | None = True,
 ) -> Resolution:
     async def read_birth_timestamp(workflow_permanent_id: str, organization_id: str) -> datetime | None:
         if first_version_error is not None:
@@ -161,6 +162,7 @@ async def resolve_arm(
             workflow_status=workflow_status,
             trigger_type=trigger_type,
             ineligibility_reason=ineligibility_reason,
+            takes_default_engine=takes_default_engine,
         )
     logged = dict(mock_log.info.call_args.kwargs) if mock_log.info.call_args else {}
     return Resolution(log=logged, birth_reads=birth_reads, warnings=list(mock_log.warning.call_args_list))
