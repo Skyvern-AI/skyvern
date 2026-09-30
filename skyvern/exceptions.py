@@ -598,6 +598,14 @@ class WorkflowNotFound(SkyvernHTTPException):
         )
 
 
+class WorkflowHasNoBlocks(SkyvernHTTPException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(
+            f"Workflow {workflow_permanent_id} has no blocks to run. Add at least one block before running it.",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
 class WorkflowNotFoundForWorkflowRun(SkyvernHTTPException):
     def __init__(
         self,

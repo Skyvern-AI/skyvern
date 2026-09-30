@@ -124,6 +124,7 @@ async def prepare_workflow(
         organization=organization,
         version=version,
         max_steps_override=max_steps,
+        reject_empty_workflow=True,
         is_template_workflow=template,
         debug_session_id=debug_session_id,
         code_gen=code_gen,

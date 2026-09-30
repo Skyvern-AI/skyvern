@@ -1030,7 +1030,24 @@ async def creator_harness(
                 workflow_permanent_id="wpid_creator",
                 organization_id=organization.organization_id,
                 title="Creator Workflow",
-                workflow_definition={"blocks": [], "parameters": []},
+                workflow_definition={
+                    "blocks": [
+                        {
+                            "block_type": "goto_url",
+                            "label": "navigate",
+                            "url": "https://example.com",
+                            "output_parameter": {
+                                "parameter_type": "output",
+                                "key": "navigate_output",
+                                "output_parameter_id": "op_creator",
+                                "workflow_id": "w_creator",
+                                "created_at": "2026-01-01T00:00:00",
+                                "modified_at": "2026-01-01T00:00:00",
+                            },
+                        }
+                    ],
+                    "parameters": [],
+                },
                 status="published",
                 version=1,
             )
