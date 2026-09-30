@@ -41,7 +41,7 @@ No captured response means the backend is down.
 ```
 skyvern_navigate(url="{{base_url}}/discover")
 skyvern_validate(prompt="The page does NOT show any error messages, error toasts, 'Something went wrong', a persistent loading spinner, a blank white screen, or a connection refused message")
-skyvern_validate(prompt="The page shows 'What task would you like to accomplish?' as a heading, a text input area with 'Enter your prompt...' placeholder, an engine version selector, and a send/submit button icon")
+skyvern_validate(prompt="The page shows 'What task would you like to accomplish?' as a heading, a prompt text input area, an engine version selector, and a send/submit button icon")
 skyvern_screenshot()
 skyvern_browser_session_close()
 ```
