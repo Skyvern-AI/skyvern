@@ -1599,7 +1599,7 @@ def test_a_driver_code_survives_the_code_block_result_scrub(
 ) -> None:
     """The heal path masks the whole block result before the run result is assembled."""
 
-    def redact(value: object, parameters: dict[str, object]) -> object:
+    def redact(value: object, parameters: dict[str, object], **_budget: object) -> object:
         secret = str(next(iter(parameters.values())))
 
         def walk(node: object) -> object:
@@ -1920,7 +1920,7 @@ def test_a_parameter_walk_that_runs_out_leaves_every_code_to_the_mask(monkeypatc
     for _ in range(block_module._PARAMETER_STRING_WALK_LIMIT):
         deep = {"next": deep}
 
-    def redact(value: object, parameters: dict[str, object]) -> object:
+    def redact(value: object, parameters: dict[str, object], **_budget: object) -> object:
         if isinstance(value, list):
             return ["[redacted]" for _ in value]
         return value

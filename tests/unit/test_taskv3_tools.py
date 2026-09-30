@@ -24698,6 +24698,35 @@ async def test_observe_marks_button_listbox_anchor_as_combobox() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_select_combobox_does_not_take_a_shared_lead_clause_the_walk_saw_as_the_committed_row() -> None:
+    # The walk passes "Riverton, South Province" before it finds "Riverton, Riverdale County" far down the list;
+    # the widget then commits the sibling and shows only "Riverton". That clause names two walked rows.
+    places = [(f"Place {i:02d}", f"+{i}") for i in range(30)]
+    places[2] = ("Riverton, South Province", "+2")
+    places[-1] = ("Riverton, Riverdale County", "+29")
+    misroute = """
+<script>
+(function () {
+  var btn = document.getElementById('cc');
+  new MutationObserver(function () {
+    var label = btn.getAttribute('aria-label') || '';
+    if (label.indexOf('Riverdale County') < 0) return;
+    btn.setAttribute('aria-label', 'Select country calling code: Riverton, South Province');
+    btn.textContent = 'Riverton';
+  }).observe(btn, { attributes: true, attributeFilter: ['aria-label'] });
+})();
+</script>
+</body>"""
+    async with _content_page(_cc_widget_html(places, 0).replace("</body>", misroute)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Riverton, Riverdale County"})
+        label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
+        assert label.endswith("South Province"), label
+        assert r.status != "ok", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_select_combobox_commits_in_window_row_of_virtualized_button_listbox() -> None:
     # RED-first (SKY-15216): "Iran" is the row immediately after the current selection, so it IS
     # rendered in the open-click's 5-row window -- unlike the off-window case above, the finder can
@@ -25870,6 +25899,561 @@ async def _run_generated_popup_shape(browser: Any, shape: dict[str, str]) -> lis
     return [f"{shape}: {f} -- {r.content[:300]}" for f in failures]
 
 
+_COMMIT_STATE_VOCAB = ["Canada", "Cape Verde", "Chile", "China", "Colombia", "Denmark", "France"]
+
+
+def _generated_commit_state_widget_html(shape: dict[str, str]) -> str:
+    # One field in a form beside an unrelated input, a SIBLING field with its own label, and an empty block
+    # below the field. `path` is a typeahead input or a click-to-open anchor; `surface` is where a commit shows
+    # (the input's value, a painted single-value node, a removable chip button, the label's own value line, or
+    # the anchor's text). `extra` pre-holds the value, writes the pick into the sibling instead, renders a
+    # dependent sub-form below the field on commit, answers an absent value with an echo row, starts with
+    # another chip, or multi-selects so the list stays open. `quickpick` puts inert suggestion buttons naming the
+    # options beside the field, `neighbour_chips` a sibling chip group with no field control of its own, and
+    # `filter_popup_dead` a list whose row click is dead and re-renders the list with its own filter box
+    # (`_split` also splits each row's text across a checkbox and highlight markup; `_inline` does that in a
+    # list laid out in the page's flow; `_div_inline` renders it as roleless divs with no checkbox). `mirror`
+    # copies each keystroke into a hidden input beside the field. `held_open` holds the value with the
+    # field's list already open, and `controlled_chip_popup` opens it before the call as a roleless list the field
+    # names in aria-controls (`_bare`: names nowhere), each row shaped like a chip with its own dismiss control.
+    # `disabled_exact` greys out the exact row beside a longer one, `toggle_async` deselects a held chip a beat after the click, and
+    # `short_open_text` / `short_misroute` show only a leading clause that several options share.
+    # The widget's committed truth is body[data-committed].
+    return f"""
+<!doctype html><html><body style="margin:0">
+<form id="f" onsubmit="return false" style="position:relative;padding:20px">
+  <input id="x-name" type="text" style="width:200px;height:24px">
+  <div id="grp" style="position:relative;margin-top:10px">
+    <label id="lbl" for="fld">Country<span id="lbl-val" style="display:block"></span></label>
+    <div id="ctl" style="display:flex;gap:4px;align-items:center;min-height:30px">
+      <span id="chips"></span><span id="sv" class="select__single-value"></span>
+      <span id="anchor-slot"></span>
+    </div>
+  </div>
+  <div id="dep"></div>
+  <div id="sib" style="margin-top:260px">
+    <label id="sib-lbl" for="sib-in">Other country<span id="sib-val" style="display:block"></span></label>
+    <span id="sib-chips"></span><input id="sib-in" type="text" style="width:200px;height:24px">
+  </div>
+</form>
+<script>
+(function () {{
+  var S = {json.dumps(shape)}, VOCAB = {json.dumps(_COMMIT_STATE_VOCAB)};
+  var TYPE = S.path === 'typeahead', DECL = S.declared === 'yes', EXP = S.aria === 'expanded';
+  var MULTI = S.surface === 'chip' || S.extra === 'left_open';
+  var OPEN_TEXT = '';
+  // The short_* extras show only the committed row's leading clause on the anchor ("Riverton").
+  var SHORT = S.extra.indexOf('short') === 0, shown = S.extra === 'short_unchanged' ? 'Riverton' : 'Make a selection';
+  if (SHORT) VOCAB = ['Riverdale, North Province', 'Riverton, Riverdale County', 'Rivers, South Province'];
+  if (S.extra.indexOf('short_open_text') === 0) VOCAB = ['Riverdale, North Province', 'Riverton, Riverdale County'];
+  if (S.extra === 'short_misroute') VOCAB = ['Riverton, Riverdale County', 'Riverton, South Province'];
+  if (S.extra.indexOf('disabled_exact') === 0) VOCAB = ['Canada', S.near, 'Chile'];
+  var DEAD_POPUP = S.extra.indexOf('filter_popup_dead') === 0;
+  var slot = document.getElementById('anchor-slot'), grp = document.getElementById('grp');
+  var chips = document.getElementById('chips'), sv = document.getElementById('sv');
+  var lblVal = document.getElementById('lbl-val'), list = null, field, cbLabel = null, truth = [];
+  window.__rowClicks = 0;
+  window.__escapes = 0;
+  if (TYPE) {{
+    field = document.createElement('input');
+    field.type = 'text';
+    field.autocomplete = 'off';
+    field.style.cssText = 'width:200px;height:24px';
+  }} else {{
+    field = document.createElement('div');
+    field.tabIndex = 0;
+    field.style.cssText = 'width:250px;height:30px;border:1px solid #999';
+    cbLabel = document.createElement('span');
+    cbLabel.textContent = 'Make a selection';
+    field.appendChild(cbLabel);
+  }}
+  field.id = 'fld';
+  field.setAttribute('role', 'combobox');
+  if (TYPE) field.setAttribute('aria-autocomplete', 'list');
+  var CHIP_ROWS = S.extra.indexOf('controlled_chip_popup') === 0;
+  if (DECL || S.extra === 'controlled_chip_popup') field.setAttribute('aria-controls', 'fld-list');
+  if (EXP) field.setAttribute('aria-expanded', 'false');
+  slot.appendChild(field);
+  function counted(el) {{
+    el.setAttribute('data-inputs', '0');
+    el.addEventListener('input', function () {{
+      el.setAttribute('data-inputs', String(Number(el.getAttribute('data-inputs')) + 1));
+    }});
+  }}
+  ['x-name', 'sib-in'].forEach(function (id) {{ counted(document.getElementById(id)); }});
+  if (TYPE) counted(field);
+  if (S.mirror === 'yes') {{
+    var mirror = document.createElement('input');
+    mirror.type = 'hidden';
+    document.getElementById('ctl').appendChild(mirror);
+    field.addEventListener('input', function () {{ mirror.value = field.value; }});
+  }}
+  function sync() {{ document.body.setAttribute('data-committed', truth.join('|')); }}
+  function chip(host, name) {{
+    if (S.extra === 'rs_held') {{
+      var mv = document.createElement('div');
+      mv.className = 'select__multi-value';
+      mv.innerHTML = '<div class="select__multi-value__label">' + name + '</div><div role="button" aria-label="Remove '
+        + name + '" class="select__multi-value__remove"><svg width="8" height="8"><rect width="8" height="8"></rect></svg></div>';
+      host.appendChild(mv);
+      return;
+    }}
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'tag-btn';
+    var words = S.extra === 'split_chip' ? name.split(' ') : [name];
+    b.appendChild(document.createTextNode(words[0]));
+    if (words.length > 1) {{ var rest = document.createElement('span'); rest.textContent = ' ' + words.slice(1).join(' '); b.appendChild(rest); }}
+    var sr = document.createElement('span');
+    sr.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)';
+    sr.textContent = 'Dismiss';
+    b.appendChild(sr);
+    host.appendChild(b);
+  }}
+  function paint() {{
+    if (S.surface === 'chip') {{ chips.innerHTML = ''; truth.forEach(function (n) {{ chip(chips, n); }}); }}
+    if (S.surface === 'single') sv.textContent = truth[0] || '';
+    if (S.surface === 'label') lblVal.textContent = truth[0] || '';
+    if (!TYPE) cbLabel.textContent = (MULTI ? truth.length + ' selected' : SHORT ? shown : (truth[0] || 'Make a selection')) + OPEN_TEXT;
+    sync();
+  }}
+  function close() {{
+    if (list) {{ list.remove(); list = null; }}
+    if (OPEN_TEXT || S.extra === 'preview_open') {{ OPEN_TEXT = ''; paint(); }}
+    if (EXP) field.setAttribute('aria-expanded', 'false');
+  }}
+  function commit(name) {{
+    window.__rowClicks++;
+    if (DEAD_POPUP) {{
+      setTimeout(function () {{ if (list) {{ list.remove(); list = null; render(field.value.trim().toLowerCase()); }} }}, 50);
+      return;
+    }}
+    if (S.extra.indexOf('short_open_text') === 0) {{ close(); return; }}
+    if (S.extra === 'short_misroute') {{ truth = ['Riverton, South Province']; shown = 'Riverton'; paint(); close(); return; }}
+    if (S.extra === 'toggle_async') {{
+      if (TYPE) field.value = '';
+      close();
+      setTimeout(function () {{ var at = truth.indexOf(name); if (at >= 0) truth.splice(at, 1); else truth.push(name); paint(); }}, 900);
+      return;
+    }}
+    if (SHORT) {{
+      if (S.extra === 'short') {{ truth = [name]; shown = name.split(',')[0]; }}
+      if (S.extra === 'short_wrong') shown = 'Riverdale';
+      if (S.extra === 'short_placeholder') shown = 'Select\u2026';
+      if (S.extra === 'short_sibling') document.getElementById('sib-cb').textContent = name.split(',')[0];
+      paint();
+      close();
+      return;
+    }}
+    if (S.extra === 'sibling') {{
+      document.getElementById('sib-val').textContent = name;
+      document.getElementById('sib-in').value = name;
+      chip(document.getElementById('sib-chips'), name);
+      if (TYPE) field.value = '';
+      close();
+      return;
+    }}
+    if (MULTI) {{
+      var at = truth.indexOf(name);
+      if (at >= 0) truth.splice(at, 1); else truth.push(name);
+    }} else {{
+      truth = [name];
+    }}
+    if (TYPE) field.value = S.surface !== 'value' ? '' : S.extra === 'decorated_open' ? name + ' (CA)' : name;
+    paint();
+    if (S.extra === 'dependent') {{
+      document.getElementById('dep').innerHTML =
+        '<div style="padding:4px"><label for="dep-in">Postal code</label><input id="dep-in" type="text"></div>';
+    }}
+    if (S.extra !== 'left_open' && S.extra !== 'decorated_open') close();
+    else if (list) render('');
+  }}
+  function row(name, echo) {{
+    var DIVS = DECL || S.extra === 'filter_popup_dead_div_inline';
+    var r = document.createElement(DIVS ? 'div' : 'li');
+    if (DECL) r.setAttribute('role', 'option');
+    if (DECL || S.extra === 'left_open') r.setAttribute('aria-selected', truth.indexOf(name) >= 0 ? 'true' : 'false');
+    r.style.cssText = 'height:24px;cursor:pointer';
+    if (echo === 'disabled') {{ r.setAttribute('aria-disabled', 'true'); r.textContent = 'No results for ' + name; }}
+    else if (echo) r.textContent = 'No results found for\\u00a0"' + name + '"';
+    else if (S.extra === 'filter_popup_dead_div_inline') r.innerHTML = '<b>' + name.slice(0, 3) + '</b>' + name.slice(3);
+    else if (CHIP_ROWS) {{
+      r.className = 'chip';
+      r.innerHTML = name + '<button type="button" aria-label="Dismiss" style="width:12px;height:12px"></button>';
+    }}
+    else if (S.extra.indexOf('filter_popup_dead_') === 0) {{
+      r.innerHTML = '<input type="checkbox"><span><b>' + name.slice(0, 3) + '</b>' + name.slice(3) + '</span>';
+    }} else r.textContent = name;
+    var greyed = S.extra.indexOf('disabled_exact') === 0 && name === S.target;
+    if (greyed) r.setAttribute('aria-disabled', 'true');
+    r.addEventListener('click', function () {{
+      if (greyed) return;
+      if (echo) {{ document.body.setAttribute('data-echo-clicked', '1'); return; }}
+      commit(name);
+    }});
+    return r;
+  }}
+  function render(q) {{
+    if (!list) {{
+      list = document.createElement(DECL || S.extra === 'filter_popup_dead_div_inline' ? 'div' : 'ul');
+      list.id = 'fld-list';
+      if (DECL) list.setAttribute('role', 'listbox');
+      if (S.extra === 'left_open') list.setAttribute('aria-multiselectable', 'true');
+      list.style.cssText = S.extra === 'filter_popup_dead_inline' || S.extra === 'filter_popup_dead_div_inline'
+        ? 'list-style:none;margin:0;padding:0;width:260px;background:#fff'
+        : 'list-style:none;margin:0;padding:0;position:absolute;left:0;top:64px;width:260px;background:#fff;z-index:5';
+      grp.appendChild(list);
+      if (EXP) field.setAttribute('aria-expanded', 'true');
+      if (S.extra.indexOf('short_open_text') === 0) {{ OPEN_TEXT = ' (choose below)'; paint(); }}
+      if (S.extra === 'preview_open') cbLabel.textContent = S.target;
+    }}
+    list.innerHTML = '';
+    if (DEAD_POPUP) {{
+      var filter = document.createElement('input');
+      filter.placeholder = 'Filter';
+      list.appendChild(filter);
+    }}
+    var hits = VOCAB.filter(function (n) {{ return (!q || n.toLowerCase().indexOf(q) === 0); }});
+    // A fuzzy search answers the query with every near spelling it knows.
+    if (q && S.near) hits = VOCAB.slice(0, 2);
+    if (q && !hits.length && S.extra === 'echo') list.appendChild(row(field.value.trim(), S.echo));
+    hits.forEach(function (n) {{ list.appendChild(row(n, '')); }});
+  }}
+  if (S.extra === 'held' || S.extra === 'held_open' || S.extra === 'left_open' || S.extra === 'toggle_async') {{
+    truth = [S.target];
+  }}
+  if (S.extra === 'disabled_exact_held' || S.extra === 'rs_held') truth = [S.target];
+  if (S.extra.indexOf('short_open_text') === 0) {{ truth = ['Riverton, South Province']; shown = 'Riverton'; }}
+  if (S.extra === 'split_chip') truth = ['Canada East'];
+  if (S.extra === 'preview_open') truth = ['Chile'];
+  if (S.extra === 'prior_chip') truth = ['Chile'];
+  if (S.extra === 'held_raw') field.value = S.target;
+  if (SHORT) {{
+    var sibCb = document.createElement('div');
+    sibCb.id = 'sib-cb';
+    sibCb.setAttribute('role', 'combobox');
+    sibCb.textContent = 'Make a selection';
+    document.getElementById('sib').appendChild(sibCb);
+  }}
+  if (S.extra === 'quickpick') {{
+    var picks = document.createElement('span');
+    VOCAB.slice(0, 2).forEach(function (n) {{
+      var q = document.createElement('button');
+      q.type = 'button';
+      q.setAttribute('aria-label', 'Choose ' + n);
+      q.textContent = n;
+      picks.appendChild(q);
+    }});
+    document.getElementById('ctl').appendChild(picks);
+  }}
+  if (S.extra === 'caption_chip' || S.extra === 'group_chip') {{
+    var removable = '<span class="chip">' + S.target + '<button type="button" aria-label="Remove"><svg width="8" height="8">'
+      + '<rect width="8" height="8"></rect></svg></button></span>';
+    var held = document.createElement(S.extra === 'caption_chip' ? 'span' : 'div');
+    if (S.extra === 'caption_chip') held.innerHTML = '<span>Countries lived in</span>' + removable;
+    else {{ held.setAttribute('role', 'group'); held.setAttribute('aria-label', 'Countries lived in'); held.innerHTML = removable; }}
+    var ctl = document.getElementById('ctl');
+    if (S.extra === 'caption_chip') while (held.firstChild) ctl.insertBefore(held.firstChild, slot);
+    else ctl.insertBefore(held, slot);
+  }}
+  if (S.extra === 'neighbour_chips') {{
+    var other = document.createElement('div');
+    other.innerHTML = '<span>Countries lived in</span><span class="chip">' + S.target
+      + '<button type="button" aria-label="Remove"><svg width="8" height="8"><rect width="8" height="8"></rect></svg>'
+      + '</button></span><button type="button">Add</button>';
+    grp.insertBefore(other, grp.firstChild);
+  }}
+  paint();
+  if (TYPE) {{
+    field.addEventListener('input', function () {{
+      var q = field.value.trim().toLowerCase();
+      if (!q) {{ close(); return; }}
+      render(q);
+    }});
+    field.addEventListener('keydown', function (e) {{
+      if ((e.key === 'Backspace' || e.key === 'Delete') && field.value === '' && MULTI && truth.length) {{
+        truth.pop();
+        paint();
+      }}
+    }});
+  }} else {{
+    field.addEventListener('click', function () {{ if (list) close(); else render(''); }});
+  }}
+  document.addEventListener('keydown', function (e) {{ if (e.key === 'Escape') {{ window.__escapes++; close(); }} }});
+  if (S.extra === 'label_hint') lblVal.innerHTML = 'e.g. <b>' + S.target + '</b>';
+  if (S.extra === 'held_open' || S.extra === 'short_open_text_open' || S.extra === 'preview_open' || CHIP_ROWS) render('');
+}})();
+</script>
+</body></html>
+"""
+
+
+def _generated_commit_state_shapes() -> list[dict[str, str]]:
+    def shape(
+        path: str,
+        surface: str,
+        aria: str,
+        declared: str,
+        extra: str,
+        echo: str = "",
+        tool: str = "select_combobox",
+        near: str = "",
+        mirror: str = "no",
+    ) -> dict[str, str]:
+        return {
+            "family": "commit_state",
+            "tool": tool,
+            "near": near,
+            "mirror": mirror,
+            "path": path,
+            "surface": surface,
+            "aria": aria,
+            "declared": declared,
+            "extra": extra,
+            "echo": echo,
+            # A quoted echo shares only its inner words with the query, so the target has one.
+            "target": "Riverton, Riverdale County"
+            if extra.startswith("short")
+            else {"quoted": "Lost City Atlantis", "disabled": "Atlantis"}.get(echo, "Canada"),
+        }
+
+    arias = ("expanded", "none")
+    typed = ("value", "single", "chip", "label")
+    shapes = [shape("typeahead", s, a, d, "none") for s in typed for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", s, a, "yes", "held") for s in ("single", "chip", "label") for a in arias]
+    shapes += [shape("typeahead", "value", a, d, "held_raw") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", s, "none", d, "sibling") for s in ("single", "chip", "label") for d in ("yes", "no")]
+    shapes += [shape("typeahead", s, a, "no", "dependent") for s in ("value", "single", "label") for a in arias]
+    shapes += [shape("typeahead", "value", a, "no", "echo", e) for a in arias for e in ("quoted", "disabled")]
+    shapes += [shape("typeahead", "chip", a, d, "prior_chip") for a in arias for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", a, "yes", x) for a in arias for x in ("none", "held", "left_open")]
+    shapes += [shape("click", "anchor", "none", "yes", x) for x in ("sibling", "dependent")]
+    shapes += [shape("click", "anchor", a, "no", "held") for a in arias]
+    shapes += [shape("typeahead", s, "none", d, "quickpick") for s in ("value", "single") for d in ("yes", "no")]
+    shapes += [shape("typeahead", "value", "none", d, "neighbour_chips") for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", "none", "yes", x) for x in ("quickpick", "neighbour_chips")]
+    # A removable chip beside the field that another field's caption or labelled group owns, and a held
+    # React-Select-style chip that is the field's own.
+    shapes += [
+        shape("typeahead", s, "none", d, x)
+        for x in ("caption_chip", "group_chip")
+        for s in ("value", "single")
+        for d in ("yes", "no")
+    ]
+    shapes += [shape("click", "anchor", "none", "yes", x) for x in ("caption_chip", "group_chip")]
+    shapes += [shape("typeahead", "chip", a, d, "rs_held") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", "value", a, d, "filter_popup_dead") for a in arias for d in ("yes", "no")]
+    shorts = ("short", "short_wrong", "short_unchanged", "short_sibling", "short_placeholder")
+    shapes += [shape("click", "anchor", a, "yes", x) for a in arias for x in shorts]
+    for tool in ("select_combobox", "type"):
+        for x in ("filter_popup_dead_split", "filter_popup_dead_inline"):
+            shapes += [shape("typeahead", "value", a, d, x, tool=tool) for a in arias for d in ("yes", "no")]
+        # The exact row is greyed out beside a row one prefix, stem or extra word away from it.
+        for near in ("Canada East", "Canadian", "Canad", "Upper Canada Region"):
+            shapes += [shape("typeahead", "value", a, "no", "disabled_exact", tool=tool, near=near) for a in arias]
+            shapes += [shape("typeahead", "chip", a, "no", "disabled_exact_held", tool=tool, near=near) for a in arias]
+    shapes += [shape("typeahead", "chip", a, d, "toggle_async", tool="type") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", "chip", a, d, "none", tool="type") for a in arias for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", a, "yes", x) for a in arias for x in ("short_open_text", "short_misroute")]
+    # A dead click that re-renders the popup, whatever its rows look like, with the typed query also copied
+    # into a hidden input; and the real commits beside them, with and without a dependent sub-form.
+    dead = ("filter_popup_dead", "filter_popup_dead_split", "filter_popup_dead_inline", "filter_popup_dead_div_inline")
+    for tool in ("select_combobox", "type"):
+        shapes += [
+            shape("typeahead", "value", a, d, "filter_popup_dead_div_inline", tool=tool)
+            for a in arias
+            for d in ("yes", "no")
+        ]
+        shapes += [
+            shape("typeahead", "value", a, d, x, tool=tool, mirror="yes")
+            for x in dead
+            for a in arias
+            for d in ("yes", "no")
+        ]
+        shapes += [
+            shape("typeahead", "value", a, "no", x, tool=tool, mirror="yes")
+            for x in ("none", "dependent")
+            for a in arias
+        ]
+    shapes += [
+        shape("typeahead", s, a, d, "held_open")
+        for s in ("chip", "label")
+        for a, d in (("expanded", "no"), ("none", "yes"), ("expanded", "yes"))
+    ]
+    shapes += [shape("click", "anchor", a, "yes", "held_open") for a in arias]
+    # A label hint naming the value beside an empty field, a held chip whose text only starts with it, and an
+    # already-open list whose open state nothing declares.
+    shapes += [
+        shape("typeahead", s, a, d, "label_hint") for s in ("value", "single") for a in arias for d in ("yes", "no")
+    ]
+    shapes += [shape("typeahead", "chip", a, d, "split_chip") for a in arias for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", "none", "no", "short_open_text_open")]
+    # An open list whose anchor previews the highlighted row, and a commit that writes the row's text plus a
+    # code while its list stays on screen.
+    shapes += [shape("click", "anchor", a, d, "preview_open") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", "value", a, "yes", "decorated_open") for a in arias]
+    shapes += [
+        shape("typeahead", "value", "none", "no", x) for x in ("controlled_chip_popup", "controlled_chip_popup_bare")
+    ]
+    return shapes
+
+
+async def _run_generated_commit_state_shape(browser: Any, shape: dict[str, str]) -> list[str]:
+    target = shape["target"]
+    context = await browser.new_context(viewport={"width": 1024, "height": 900})
+    try:
+        page = await context.new_page()
+        await page.set_content(_generated_commit_state_widget_html(shape))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        if shape["tool"] == "type":
+            r = await _tool(tools, "type").handler({"selector": "#fld", "text": target})
+            await asyncio.sleep(1.2)
+        else:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": target})
+        state = await page.evaluate(
+            """() => ({
+              committed: document.body.getAttribute('data-committed') || '',
+              rowClicks: window.__rowClicks,
+              escapes: window.__escapes,
+              fieldInputs: Number(document.getElementById('fld').getAttribute('data-inputs') || 0),
+              echoClicked: document.body.hasAttribute('data-echo-clicked'),
+              listShown: !!document.getElementById('fld-list'),
+              outside: ['x-name', 'sib-in'].map((id) => [id, document.getElementById(id).getAttribute('data-inputs')]),
+              xName: document.getElementById('x-name').value,
+            })"""
+        )
+    finally:
+        await context.close()
+    held = [v for v in state["committed"].split("|") if v]
+    before = {
+        "held": [target],
+        "held_open": [target],
+        "left_open": [target],
+        "prior_chip": ["Chile"],
+        "disabled_exact_held": [target],
+        "rs_held": [target],
+        "toggle_async": [target],
+        "short_open_text": ["Riverton, South Province"],
+        "short_open_text_open": ["Riverton, South Province"],
+        "split_chip": ["Canada East"],
+    }.get(shape["extra"], [])
+    failures = []
+    if r.status == "ok" and target not in held:
+        failures.append(f"(a) ok but the field holds {held!r}")
+    # `short_misroute` is the widget committing another row than the one clicked; only (a) judges it.
+    misroute = shape["extra"] == "short_misroute"
+    if not misroute and r.status != "ok" and held != before and not all(v in r.content for v in held):
+        failures.append(f"(b) field changed to {held!r} unnamed")
+    failures += [f"(c) outside #{i} inputs={n}" for i, n in state["outside"] if n != "0"]
+    if state["xName"]:
+        failures.append("(c) outside #x-name holds text")
+    # Only a toggle field (its values shown as removable chips) with its list known closed (aria-expanded="false")
+    # skips a held value. A single-value field re-picks it and may then be refused when the click changes nothing it
+    # shows; an anchor that already showed the value in an open list's preview cannot vouch for the click either. A
+    # held chip whose list is open or undeclared is clicked too, and the click that removes it is reported as not
+    # committed.
+    single_held = shape["extra"] in ("held", "held_open") and shape["surface"] != "chip"
+    open_toggle = shape["surface"] == "chip" and (
+        shape["extra"] == "held_open" or (shape["extra"] in ("held", "rs_held") and shape["aria"] != "expanded")
+    )
+    weak_held = single_held or shape["extra"] == "preview_open"
+    # A click-to-open list marks the held row aria-selected, which main already reads as selected.
+    if shape["extra"] == "held" and single_held and shape["path"] == "typeahead" and not state["rowClicks"]:
+        failures.append("(l) a single-value field skipped the re-pick")
+    if open_toggle and not state["rowClicks"]:
+        failures.append("(l) a held chip with its list open or undeclared was not re-picked")
+    if (
+        shape["extra"] in ("held", "left_open", "rs_held")
+        and not single_held
+        and not open_toggle
+        and (state["rowClicks"] or state["fieldInputs"])
+    ):
+        failures.append(f"(f) re-pick acted: {state['rowClicks']} row clicks, {state['fieldInputs']} inputs")
+    if shape["extra"] == "held" and not single_held and not open_toggle and state["escapes"]:
+        failures.append(f"(k) pressed Escape {state['escapes']} times on a held field with no list open")
+    # A type() click on a held chip's row toggles it off; this row judges only what the tool reported.
+    if shape["extra"] != "toggle_async" and not open_toggle and any(v not in held for v in before):
+        failures.append(f"(g) a value the field held before was removed: {held!r}")
+    if not misroute and any(v not in before and v != target for v in held):
+        failures.append(f"(j) committed a row other than the target: {held!r}")
+    if state["echoClicked"]:
+        failures.append("(h) clicked the empty-state row that echoes the query")
+    if r.status == "ok" and state["listShown"]:
+        failures.append("(i) ok but the field's own list was left open")
+    # A plain input that shows only the text the tool typed has no committed state of its own, and once the
+    # page renders anything new beside it that cannot be told from a dead click, so it is refused.
+    echo_beside_new_content = shape["extra"] == "dependent" and shape["surface"] == "value"
+    expects_ok = shape["extra"] in ("short",) or not (
+        open_toggle
+        or shape["extra"] in ("sibling", "echo", "disabled_exact", "toggle_async", "disabled_exact_held")
+        or shape["extra"].startswith(("short", "filter_popup_dead"))
+        or echo_beside_new_content
+    )
+    if expects_ok and not weak_held and r.status != "ok":
+        failures.append("coverage: expected a commit")
+    if not expects_ok and r.status == "ok" and shape["extra"] not in ("toggle_async", "disabled_exact_held"):
+        failures.append("reported ok for a pick the field never took")
+    return [f"{shape}: {f} -- {r.content[:300]}" for f in failures]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_holds_nothing_on_a_label_hint_or_a_partial_chip() -> None:
+    """The pre-act "already holds" no-op applies only to a toggle field with its list known closed: a label hint, an
+    open list's anchor preview, a chip that only starts with the value, a held single value, or a chip-shaped row of
+    an open roleless popup, declared or not, does not skip the fill, while an exact chip on a closed field still does.
+    A list whose open state nothing declares never lends its anchor text as the pre-click baseline. A commit that
+    writes the chosen row plus a code counts with its list still open; the typed text left behind by a dead click
+    does not."""
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    shapes = [
+        s
+        for s in _generated_commit_state_shapes()
+        if s["extra"]
+        in (
+            "label_hint",
+            "split_chip",
+            "short_open_text_open",
+            "preview_open",
+            "decorated_open",
+            "controlled_chip_popup",
+            "controlled_chip_popup_bare",
+        )
+        or (s["extra"] == "held" and s["surface"] in ("single", "chip"))
+        or (s["extra"] == "filter_popup_dead" and s["tool"] == "select_combobox")
+    ]
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            results = await asyncio.gather(*(_run_generated_commit_state_shape(browser, s) for s in shapes))
+        finally:
+            await browser.close()
+    failures = [f for r in results for f in r]
+    assert len(shapes) == 33
+    assert not failures, "\n".join(failures)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_acts_past_a_chip_it_cannot_prove_is_its_own() -> None:
+    """A removable chip under another field's caption or labelled group, laid out in the field's own wrapper, does
+    not make a re-pick a no-op: the field is filled and verified. A React-Select-style chip the field owns still is
+    when the field declares its list closed."""
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    shapes = [s for s in _generated_commit_state_shapes() if s["extra"] in ("caption_chip", "group_chip", "rs_held")]
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            results = await asyncio.gather(*(_run_generated_commit_state_shape(browser, s) for s in shapes))
+        finally:
+            await browser.close()
+    failures = [f for r in results for f in r]
+    assert len(shapes) == 14
+    assert not failures, "\n".join(failures)
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_popup_filter_property_over_generated_widget_shapes() -> None:
@@ -25882,10 +26466,15 @@ async def test_select_combobox_popup_filter_property_over_generated_widget_shape
     received input; (d) a changed field is never called NOT filled; (e) the refusal claims the list's search
     box answered only when a filter box was typed into. A field behind a key sink that swallows keys must stay
     unchanged: the first typed character never lands there, so nothing more is typed.
+
+    The commit-state shapes judge a commit by what the field itself holds. Beyond (a)-(c): (f) re-picking a
+    chip a toggle field holds with its list known closed neither types nor clicks, while (l) a single-value field re-picks;
+    (g) nothing the field held before is removed; (h) an empty-state row echoing the query is never clicked; (i) an
+    ok leaves the field's own list closed.
     """
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    shapes = _generated_popup_shapes()
+    shapes = _generated_popup_shapes() + _generated_commit_state_shapes()
     gate = asyncio.Semaphore(6)
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
@@ -25893,13 +26482,15 @@ async def test_select_combobox_popup_filter_property_over_generated_widget_shape
 
             async def _one(shape: dict[str, str]) -> list[str]:
                 async with gate:
+                    if shape.get("family") == "commit_state":
+                        return await _run_generated_commit_state_shape(browser, shape)
                     return await _run_generated_popup_shape(browser, shape)
 
             results = await asyncio.gather(*(_one(s) for s in shapes))
         finally:
             await browser.close()
     failures = [f for r in results for f in r]
-    assert len(shapes) >= 101
+    assert len(shapes) >= 295
     assert not failures, "\n".join(failures)
 
 
@@ -29425,6 +30016,66 @@ async def test_select_combobox_does_not_toggle_off_an_already_selected_multi_sel
         assert still == "true", still
         label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
         assert label == "Countries: Germany", label
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed_by", ["aria_expanded_false", "hidden_declared_popup"])
+async def test_select_combobox_leaves_a_held_chip_only_when_its_list_is_known_closed(closed_by: str) -> None:
+    # A held chip is left as is only when the field's own list is known closed: aria-expanded="false" on the field,
+    # or the popup it declares exists and is hidden.
+    aria = "expanded" if closed_by == "aria_expanded_false" else "none"
+    shape = next(
+        s
+        for s in _generated_commit_state_shapes()
+        if (s["path"], s["extra"], s["surface"], s["aria"], s["declared"]) == ("typeahead", "held", "chip", aria, "yes")
+    )
+    html = _generated_commit_state_widget_html(shape)
+    if closed_by == "hidden_declared_popup":
+        html = html.replace('<div id="dep">', '<div id="fld-list" role="listbox" hidden></div><div id="dep">', 1)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": shape["target"]})
+        state = await page.evaluate(
+            "() => [document.body.getAttribute('data-committed'), window.__rowClicks,"
+            " Number(document.getElementById('fld').getAttribute('data-inputs'))]"
+        )
+    assert r.status == "ok" and "already selected" in r.content, r.content
+    assert state == [shape["target"], 0, 0], state
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_already_held_chip_inside_an_expanded_accordion() -> None:
+    # The held field sits in an expanded accordion that collapses on any Escape. Nothing declares the field's own list
+    # closed, so the re-pick acts as on main; it reports only what the field holds and leaves the accordion open.
+    shape = next(
+        s
+        for s in _generated_commit_state_shapes()
+        if (s["path"], s["extra"], s["surface"], s["aria"], s["declared"])
+        == ("typeahead", "held", "chip", "none", "yes")
+    )
+    html = _generated_commit_state_widget_html(shape)
+    html = html.replace('<div id="grp"', '<div id="acc" role="region" aria-expanded="true"><div id="grp"', 1)
+    html = html.replace('<div id="dep">', '</div><div id="dep">', 1)
+    html = html.replace(
+        "</body>",
+        "<script>window.__docEscapes = 0; document.addEventListener('keydown', function (e) { if (e.key === 'Escape') "
+        "{ window.__docEscapes++; document.getElementById('acc').setAttribute('aria-expanded', 'false'); } }, true);"
+        "</script></body>",
+        1,
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": shape["target"]})
+        state = await page.evaluate(
+            "() => [document.body.getAttribute('data-committed'), window.__docEscapes, window.__rowClicks,"
+            " document.getElementById('acc').getAttribute('aria-expanded')]"
+        )
+    committed, escapes, row_clicks, acc_expanded = state
+    assert "already selected" not in r.content and row_clicks == 1, (r.content, state)
+    assert r.status != "ok" or committed == shape["target"], (r.content, state)
+    assert escapes == 0 and acc_expanded == "true", state
 
 
 @_skip_no_browser
@@ -36480,6 +37131,8 @@ async def test_click_toggle_probe_matches_the_toggle_state_observe_prints() -> N
         assert await probe({"selector": "#loose"}) is True
 
 
+_CC_COUNTRIES_NO_EXACT_US = [c for c in _CC_COUNTRIES if c[0] != "United States"]
+
 _TEXT_DELTA_HEADER = "page newly shows (since your previous tool call): "
 _TEXT_DELTA_HEADER_RE = re.compile(
     r"page newly shows \((?:since your previous tool call|over your last \d+ tool calls)\): "
@@ -36678,6 +37331,45 @@ def _m4_generated_cases(seed: int, draws: int) -> list[tuple[str, str, str, str]
     rng = random.Random(seed)
     cases += [tuple(rng.choice(d) for d in dims) for _ in range(draws)]
     return cases  # type: ignore[return-value]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setsize_js", "commits"),
+    [
+        pytest.param("'-1'", False, id="unknown_every_row"),
+        pytest.param("(i < 38 || i > 42) ? '-1' : ''", False, id="unknown_off_open_window"),
+        pytest.param(f"'{len(_CC_COUNTRIES_NO_EXACT_US)}'", True, id="declared_total_equals_rows"),
+    ],
+)
+async def test_select_combobox_prefix_hit_after_a_full_walk_obeys_the_walked_rows_setsize(
+    setsize_js: str, commits: bool
+) -> None:
+    # aria-setsize="-1" on ANY walked row says the rows are not the whole list, so the lone prefix row
+    # "United States Minor Outlying Islands" must not commit for "United States" -- including when the open
+    # window (rows 38..42) declares no size. A declared total equal to the rows walked is complete: it commits.
+    html = _cc_widget_html(_CC_COUNTRIES_NO_EXACT_US, _CC_CURRENT_INDEX)
+    marked = html.replace(
+        "'\" id=\"item-' + i + '\"",
+        "'\"' + (("
+        + setsize_js
+        + ") ? ' aria-setsize=\"' + ("
+        + setsize_js
+        + ") + '\"' : '') + ' id=\"item-' + i + '\"",
+    )
+    assert marked != html
+    async with _content_page(marked) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        pre_label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
+        if commits:
+            assert r.status == "ok", r.content
+            assert label.endswith("United States Minor Outlying Islands"), label
+        else:
+            assert r.status == "error", r.content
+            assert label == pre_label, label
 
 
 @_skip_no_browser
@@ -37381,6 +38073,34 @@ async def test_child_frame_text_past_the_char_bound_is_refused_in_the_frame(monk
 
 @_skip_no_browser
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setsize", "commits"),
+    [
+        pytest.param(None, True, id="no_setsize_collapses"),
+        pytest.param("-1", False, id="total_unknown_refuses"),
+    ],
+)
+async def test_select_combobox_collapses_twice_rendered_suggestion_only_over_a_complete_list(
+    setsize: str | None, commits: bool
+) -> None:
+    # Two identical rows are one candidate rendered twice only when they are the whole list; rows declaring
+    # aria-setsize="-1" are never the whole list, so a same-label option may sit unrendered.
+    attrs = [{"aria-setsize": setsize}, {"aria-setsize": setsize}] if setsize else None
+    async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS, attrs=attrs)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        if commits:
+            assert r.status == "ok", r.content
+            assert clicked_index == 0, clicked_index
+        else:
+            assert r.status == "error", r.content
+            assert clicked_index is None, clicked_index
+            assert "declares its total unknown" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_refused_call_neither_reports_nor_reads_so_the_next_call_reports_across_it() -> None:
     # A refused call dispatched nothing, so it carries no section and does not move the baseline; the
     # next result reports what rendered and names both calls.
@@ -37909,6 +38629,22 @@ async def test_an_action_on_a_working_tab_reopened_after_loss_reports_what_it_sh
         result = await _tool(tools, "click").handler({"selector": "#go"})
         assert result.status == "ok", result.content
         assert _delta_lines(result) == ["Row loaded"], result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_names_exact_twins_the_walk_saw_and_routes_to_a_click() -> None:
+    # The walk sees two "Congo" rows at different positions; text alone cannot separate them, so the error
+    # must say so and route to a click rather than ask for a fuller text that does not exist.
+    items = [("Congo", "CG-1"), *_POPUP_SEARCH_STATES[:19], ("Congo", "CG-2"), *_POPUP_SEARCH_STATES[19:30]]
+    html = _popup_search_combobox_html(items=items, setsize=True, filtered_window=1, values=True)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Congo"})
+        assert r.status == "error", r.content
+        assert "2 options share the exact label 'Congo'" in r.content, r.content
+        assert "look()" in r.content and "data-tv3-menu" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
 
 
 @_skip_no_browser
