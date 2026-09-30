@@ -6052,6 +6052,7 @@ def _install_diagnose_run_lookup(
         browser_session_id="pbs-1",
         status=run_status,
         copilot_session_id=None,
+        is_debug_session=False,
     )
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)))
 

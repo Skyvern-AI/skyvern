@@ -57,7 +57,13 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowRun,
+    WorkflowRunOutputParameter,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
@@ -328,6 +334,7 @@ def install_get_run_results_harness(
         last_run_blocks_workflow_run_id=carried_run_id,
         proposal_workflow_run_id=None,
         dispatched_run_ids_this_turn=set(),
+        seeded_only_labels_by_run_id={},
     )
 
 
@@ -856,6 +863,126 @@ def origin_run_input(
         workflow_parameter_id=parameter.workflow_parameter_id,
         value=value,
         created_at=now,
+    )
+
+
+INERT_APPROVAL_WORKFLOW_YAML = """
+title: inert approval
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: request_id
+  blocks:
+    - block_type: extraction
+      label: approval
+      url: https://example.test/approval
+      data_extraction_goal: "Extract whether request {{ request_id }} is authorized."
+      parameter_keys:
+        - request_id
+    - block_type: extraction
+      label: source_status
+      data_extraction_goal: "Report the source status for authorization {{ approval.output.authorized }}."
+"""
+
+REPAIRED_APPROVAL_WORKFLOW_YAML = INERT_APPROVAL_WORKFLOW_YAML.replace(
+    "Report the source status for authorization {{ approval.output.authorized }}.",
+    "Report the repaired source status for authorization {{ approval.output.authorized }} "
+    "and {{ approval_output.extracted_information.authorized }}.",
+)
+
+ORIGIN_RUN_ID = "wr_origin"
+
+
+async def inert_approval_workflow(workflow_yaml: str, *, workflow_id: str) -> Workflow:
+    """A converted version mints its own parameter ids, as each persisted version does."""
+    return await process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_id=workflow_id,
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=workflow_yaml,
+    )
+
+
+ORIGIN_OUTPUT_SENTINEL = "origin-output-sentinel-7f3a"
+
+
+def origin_block_rows(
+    workflow: Workflow,
+    label: str,
+    *,
+    status: str = "completed",
+    registered: bool = True,
+    value: dict | list | str | None = None,
+    row_output: dict | list | str | None = None,
+    minute: int = 0,
+    parent: str | None = None,
+) -> tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]:
+    now = datetime(2026, 9, 1, 12, minute, tzinfo=UTC)
+    run_block = WorkflowRunBlock(
+        workflow_run_block_id=f"wrb_origin_{label}_{minute}",
+        workflow_run_id=ORIGIN_RUN_ID,
+        organization_id="org-1",
+        parent_workflow_run_block_id=parent,
+        block_type="extraction",
+        label=label,
+        status=status,
+        output=row_output,
+        created_at=now,
+        modified_at=now,
+    )
+    output_parameter = workflow.get_output_parameter(label)
+    if not registered or output_parameter is None:
+        return [run_block], []
+    return [run_block], [
+        WorkflowRunOutputParameter(
+            workflow_run_id=ORIGIN_RUN_ID,
+            output_parameter_id=output_parameter.output_parameter_id,
+            value=value,
+            created_at=now,
+        )
+    ]
+
+
+def merge_origin_rows(
+    *rows: tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]],
+) -> tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]:
+    return [block for blocks, _ in rows for block in blocks], [row for _, registered in rows for row in registered]
+
+
+ORIGIN_RUN_CREATED_AT = datetime.now(UTC) + timedelta(days=1)
+
+
+def origin_run_row(**overrides: object) -> WorkflowRun:
+    fields: dict[str, object] = {
+        "workflow_run_id": ORIGIN_RUN_ID,
+        "workflow_id": "w_origin",
+        "organization_id": "org-1",
+        "workflow_permanent_id": "wfp-1",
+        "browser_session_id": "pbs_origin",
+        "status": WorkflowRunStatus.completed,
+        # Later than any workflow version a test builds, as a real run starts after its version was saved.
+        "created_at": ORIGIN_RUN_CREATED_AT,
+        "modified_at": ORIGIN_RUN_CREATED_AT,
+    }
+    return WorkflowRun.model_validate({**fields, **overrides})
+
+
+def install_origin_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    origin_workflow: Workflow,
+    rows: tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]],
+    **run_overrides: object,
+) -> None:
+    run = origin_run_row(**{"workflow_id": origin_workflow.workflow_id, **run_overrides})
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(forge_app.DATABASE.workflow_runs, "get_workflow_run_parameters", AsyncMock(return_value=[]))
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=origin_workflow))
+    monkeypatch.setattr(forge_app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=rows[0]))
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs, "get_workflow_run_output_parameters", AsyncMock(return_value=rows[1])
     )
 
 

@@ -8,21 +8,27 @@ would look exactly like a real one.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, fields
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.repair_origin_run import (
+    OriginExecutionSettings,
+    OriginOutputRefusal,
+    OriginOutputSnapshot,
     RepairOriginRefusal,
+    origin_block_outputs_from_rows,
     resolve_repair_origin_binding,
     seed_repair_origin_run,
 )
@@ -32,12 +38,24 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowRun,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
+from skyvern.schemas.runs import ProxyLocation
 from tests.unit.copilot_test_helpers import (
     HARNESS_RUN_CREATED_AT,
+    INERT_APPROVAL_WORKFLOW_YAML,
+    ORIGIN_OUTPUT_SENTINEL,
     harness_run,
+    inert_approval_workflow,
     install_get_run_results_harness,
+    merge_origin_rows,
+    origin_block_rows,
     origin_run_input,
+    origin_run_row,
     run_result_block_row,
     stub_copilot_agent_loop,
 )
@@ -58,6 +76,8 @@ class _Ctx:
     last_run_binding_unavailable_reason: str | None = None
     repair_origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...] = field(default=())
     repair_origin_is_copilot_run: bool = False
+    repair_origin_outputs: OriginOutputSnapshot | OriginOutputRefusal | None = None
+    repair_origin_outputs_run_id: str | None = None
 
 
 ORIGIN_VALUES = [origin_run_input("resume", "resume_run_value")]
@@ -86,20 +106,19 @@ def _install_run(
 
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(get_workflow_run=get_workflow_run), raising=False)
     monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run_parameters", get_workflow_run_parameters)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=None))
     return loaded_run_ids
 
 
-def _run(**overrides: object) -> SimpleNamespace:
+def _run(**overrides: object) -> WorkflowRun:
     fields: dict[str, object] = {
         "workflow_run_id": RUN,
         "organization_id": ORG,
         "workflow_permanent_id": WPID,
         "browser_session_id": RUN_BROWSER,
         "status": WorkflowRunStatus.failed,
-        "copilot_session_id": None,
     }
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
+    return origin_run_row(**{**fields, **overrides})
 
 
 @pytest.mark.asyncio
@@ -160,7 +179,7 @@ async def test_a_run_it_cannot_vouch_for_leaves_the_target_unavailable(
 )
 @pytest.mark.asyncio
 async def test_origin_input_values_load_only_after_the_ownership_checks(
-    monkeypatch: pytest.MonkeyPatch, run: SimpleNamespace | Exception, loads_values: bool
+    monkeypatch: pytest.MonkeyPatch, run: WorkflowRun | Exception, loads_values: bool
 ) -> None:
     loaded_run_ids = _install_run(monkeypatch, run)
     ctx = _Ctx(repair_origin_input_values=STALE_VALUES)
@@ -833,3 +852,240 @@ def test_the_first_page_cursor_survives_a_head_cut_behind_a_large_run_field() ->
     page = run_execution.project_run_results_page(result, facts)
 
     assert '"next_block_cursor": "wr-1:20"' in json.dumps(page)[:50_000]
+
+
+@pytest.mark.asyncio
+async def test_origin_rows_are_valued_the_way_verified_recording_values_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+
+    row = {"row": ORIGIN_OUTPUT_SENTINEL}
+    snapshot = origin_block_outputs_from_rows(
+        workflow.workflow_definition,
+        *merge_origin_rows(
+            origin_block_rows(workflow, "approval", status="failed", minute=1, registered=False),
+            origin_block_rows(workflow, "approval", minute=2, row_output=row, value=None),
+            origin_block_rows(workflow, "approval", status="failed", minute=3, parent="wrb_loop", registered=False),
+            origin_block_rows(workflow, "source_status", minute=4, row_output=row, registered=False),
+        ),
+    )
+
+    approval = snapshot.outputs["approval"]
+    assert (approval.status, approval.has_value, approval.value) == ("completed", True, None)
+    source_status = snapshot.outputs["source_status"]
+    assert (source_status.has_value, source_status.value) == (True, {"row": ORIGIN_OUTPUT_SENTINEL})
+    assert ORIGIN_OUTPUT_SENTINEL not in repr(snapshot)
+    assert ORIGIN_OUTPUT_SENTINEL not in repr(source_status)
+
+
+@pytest.mark.parametrize(
+    ("run", "expected_refusal", "loads_rows"),
+    [
+        (_run(), None, True),
+        (_run(browser_session_id=None), None, True),
+        (_run(status=WorkflowRunStatus.running), OriginOutputRefusal.ORIGIN_UNSETTLED, False),
+        (WorkflowRunNotFound(RUN), OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN, False),
+        (_run(organization_id="o_other"), OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN, False),
+        (_run(workflow_permanent_id="wpid_other"), OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN, False),
+        (RuntimeError("the run store is unreachable"), OriginOutputRefusal.OUTPUT_UNAVAILABLE, False),
+    ],
+    ids=[
+        "usable",
+        "no_recorded_browser",
+        "still_running",
+        "run_not_found",
+        "foreign_organization",
+        "workflow_mismatch",
+        "lookup_failed",
+    ],
+)
+@pytest.mark.asyncio
+async def test_origin_outputs_load_only_from_an_owned_finished_run(
+    monkeypatch: pytest.MonkeyPatch,
+    run: WorkflowRun | Exception,
+    expected_refusal: OriginOutputRefusal | None,
+    loads_rows: bool,
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+    _install_run(monkeypatch, run)
+    get_workflow = AsyncMock(return_value=workflow)
+    get_rows = AsyncMock(return_value=origin_block_rows(workflow, "approval")[0])
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow", get_workflow)
+    monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_blocks", get_rows)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run_output_parameters",
+        AsyncMock(return_value=origin_block_rows(workflow, "approval", value={"secret": ORIGIN_OUTPUT_SENTINEL})[1]),
+    )
+    ctx = _Ctx()
+
+    with capture_logs() as logs:
+        await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    owned = expected_refusal in (None, OriginOutputRefusal.ORIGIN_UNSETTLED)
+    assert ctx.repair_origin_outputs_run_id == (RUN if owned else None)
+    assert isinstance(ctx.repair_origin_outputs, OriginOutputSnapshot) is loads_rows
+    if not loads_rows:
+        assert ctx.repair_origin_outputs is expected_refusal
+    # Rows of a foreign or unsettled run are never read, not merely discarded.
+    assert get_rows.await_count == (1 if loads_rows else 0)
+    if loads_rows:
+        get_workflow.assert_awaited_once_with(workflow_id="w_origin", organization_id=ORG)
+        assert isinstance(ctx.repair_origin_outputs, OriginOutputSnapshot)
+        assert ctx.repair_origin_outputs.outputs["approval"].value == {"secret": ORIGIN_OUTPUT_SENTINEL}
+    assert ORIGIN_OUTPUT_SENTINEL not in repr(logs)
+    assert ORIGIN_OUTPUT_SENTINEL not in repr(ctx)
+
+
+@pytest.mark.parametrize(
+    ("run_overrides", "parameters", "expected"),
+    [
+        ({"copilot_session_id": "cs_test_run"}, ORIGIN_VALUES, None),
+        ({"debug_session_id": "ds_debugger"}, ORIGIN_VALUES, None),
+        ({}, RuntimeError("the parameter store is unreachable"), OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"failure_reason": SCRUBBED_VALUE}, ORIGIN_VALUES, OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({}, [origin_run_input("resume", SCRUBBED_VALUE)], OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"created_at": datetime(2020, 1, 1, tzinfo=UTC)}, ORIGIN_VALUES, OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"script_run": {"script_id": "s_cached"}}, ORIGIN_VALUES, OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS),
+        ({"parent_workflow_run_id": "wr_parent"}, ORIGIN_VALUES, OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS),
+    ],
+    ids=[
+        "copilot_test_run_is_never_an_origin",
+        "debugger_block_run_is_never_an_origin",
+        "unreadable_inputs_never_reuse",
+        "retention_scrubbed_failure_reason",
+        "retention_scrubbed_input",
+        "version_overwritten_after_the_run_started",
+        "origin_ran_a_cached_script",
+        "child_run_inherited_ancestor_prompts",
+    ],
+)
+@pytest.mark.asyncio
+async def test_origin_outputs_need_a_real_run_and_its_recorded_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    run_overrides: dict[str, str | datetime],
+    parameters: list[tuple[WorkflowParameter, WorkflowRunParameter]] | Exception,
+    expected: OriginOutputRefusal | None,
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+    _install_run(monkeypatch, _run(**run_overrides), parameters)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=workflow))
+    rows = origin_block_rows(workflow, "approval", value={"authorized": True})
+    monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=rows[0]))
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs, "get_workflow_run_output_parameters", AsyncMock(return_value=rows[1])
+    )
+    ctx = _Ctx()
+
+    await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert ctx.repair_origin_outputs is expected
+    if expected is None:
+        assert ctx.repair_origin_outputs_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_no_headers_and_empty_headers_are_the_same_execution_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+
+    saved_by_copilot = OriginExecutionSettings.of(workflow.model_copy(update={"extra_http_headers": {}}))
+
+    assert saved_by_copilot == OriginExecutionSettings.of(
+        workflow.model_copy(update={"extra_http_headers": None}), _run()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_opened_about_no_run_loads_no_origin_outputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_run(monkeypatch, _run())
+    ctx = _Ctx(repair_origin_outputs_run_id="wr_stale")
+
+    await seed_repair_origin_run(ctx, workflow_run_id=None)
+
+    assert (ctx.repair_origin_outputs_run_id, ctx.repair_origin_outputs) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_the_origin_runs_own_setting_overrides_win_over_its_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+    version = workflow.model_copy(
+        update={"proxy_location": ProxyLocation.US_CA, "browser_profile_id": "bp_version", "model": {"name": "m"}}
+    )
+    _install_run(monkeypatch, _run(proxy_location=ProxyLocation.US_NY, extra_http_headers={"X-Run": "1"}))
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=version))
+    monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run_output_parameters", AsyncMock(return_value=[]))
+    ctx = _Ctx()
+
+    await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert isinstance(ctx.repair_origin_outputs, OriginOutputSnapshot)
+    assert ctx.repair_origin_outputs.settings == OriginExecutionSettings(
+        proxy_location=ProxyLocation.US_NY,
+        browser_profile_id="bp_version",
+        browser_profile_key=None,
+        model={"name": "m"},
+        extra_http_headers={"X-Run": "1"},
+    )
+
+
+# Every other Workflow field is classified here as not changing what a block run outputs.
+_WORKFLOW_FIELDS_NOT_COMPARED = frozenset(
+    {
+        "workflow_id",
+        "organization_id",
+        "title",
+        "workflow_permanent_id",
+        "version",
+        "is_saved_task",
+        "is_template",
+        "description",
+        "workflow_definition",
+        "webhook_callback_url",
+        "totp_verification_url",
+        "totp_identifier",
+        "persist_browser_session",
+        "reuse_browser_session",
+        "mask_secrets",
+        "pin_saved_session_ip",
+        "status",
+        "max_screenshot_scrolls",
+        "max_elapsed_time_minutes",
+        "cdp_connect_headers",
+        "run_with",
+        "browser_type",
+        "ai_fallback",
+        "cache_key",
+        "adaptive_caching",
+        "enable_self_healing",
+        "code_version",
+        "generate_script_on_terminal",
+        "run_sequentially",
+        "sequential_key",
+        "folder_id",
+        "import_error",
+        "created_by",
+        "edited_by",
+        "copilot_authored",
+        # Filled only by the workflow detail endpoint; never read at run time.
+        "effective_default_engine",
+        "original_created_by",
+        "original_created_at",
+        "created_at",
+        "modified_at",
+        "deleted_at",
+    }
+)
+
+
+def test_every_workflow_field_is_compared_across_origin_and_test_or_classified_as_not_shaping_output() -> None:
+    compared = {setting.name for setting in fields(OriginExecutionSettings)}
+
+    assert compared <= set(Workflow.model_fields)
+    assert set(Workflow.model_fields) - compared - _WORKFLOW_FIELDS_NOT_COMPARED == set()
