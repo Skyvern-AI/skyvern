@@ -112,6 +112,8 @@ def _router_fallback_models(config: LLMRouterConfig) -> list[dict[str, Any]]:
         entry = next((m for m in config.model_list if m.model_name == group), None)
         params = entry.litellm_params if entry is not None else {}
         hop = {field: params.get(field) for field in _PER_HOP_FIELDS}
+        # LiteLLM's Responses route calls .get on model_info, so None crashes the hop.
+        hop["model_info"] = params.get("model_info") or {}
         hop["model"] = str(params.get("model") or group)
         hop["base_url"] = params.get("api_base")
         hop["timeout"] = params.get("timeout", settings.LLM_CONFIG_TIMEOUT)
@@ -239,6 +241,9 @@ def resolve_model_config(
 
     if config.reasoning_effort:
         extra_args["reasoning_effort"] = config.reasoning_effort
+        # LiteLLM's chat parameter check rejects reasoning_effort for GPT-6 even on an explicit Responses route.
+        if config.model_name.startswith(("openai/responses/", "azure/responses/")):
+            extra_args["allowed_openai_params"] = ["reasoning_effort", "service_tier"]
 
     if isinstance(config, LLMConfig) and config.litellm_params:
         lp = config.litellm_params
