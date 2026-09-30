@@ -4,7 +4,6 @@ import { Createv2TaskRequest } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import img from "@/assets/promptBoxBg.png";
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
@@ -55,10 +54,11 @@ import {
 } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  generatePhoneNumber,
-  generateUniqueEmail,
-} from "../data/sampleTaskData";
-import { CapabilityExamples } from "./CapabilityExamples";
+  CapabilityExamples,
+  JOB_APPLICATION_PROMPT,
+  SAMPLE_RESUME_PATH,
+  SAMPLE_RESUME_PUBLIC_URL,
+} from "./CapabilityExamples";
 import { ExampleCasePill } from "./ExampleCasePill";
 import { CyclingPlaceholderTextarea } from "./CyclingPlaceholderTextarea";
 import {
@@ -87,7 +87,8 @@ const exampleCases = [
     key: "job_application",
     hint: "jobs.lever.co",
     label: "Apply for a job",
-    prompt: `Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply, fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully. Here's the user information: {"name":"John Doe","email":"${generateUniqueEmail()}","phone":"${generatePhoneNumber()}","resume_url":"https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf","cover_letter":"Generate a compelling cover letter for me"}`,
+    prompt: JOB_APPLICATION_PROMPT,
+    attachment: SAMPLE_RESUME_PATH,
     icon: <InboxIcon className="size-6" />,
   },
   {
@@ -323,7 +324,14 @@ function PromptBoxImpl(
         exampleCases[0];
       if (!prompt.trim()) {
         cancelSpeech();
-        setPrompt(selectedExample.prompt);
+        setPrompt(
+          withExampleAttachment(
+            selectedExample.prompt,
+            "attachment" in selectedExample
+              ? selectedExample.attachment
+              : undefined,
+          ),
+        );
         setExampleAttribution({ id: selectedExample.key, edited: false });
       }
       textareaRef.current?.scrollIntoView?.({ block: "center" });
@@ -340,7 +348,17 @@ function PromptBoxImpl(
   }));
 
   const uploadDocumentMutation = useMutation({
-    mutationFn: async (file: File) => {
+    mutationFn: async (source: File | string) => {
+      let file = source;
+      if (typeof file === "string") {
+        const response = await fetch(file);
+        if (!response.ok) {
+          throw new Error(`Failed to load ${file} (${response.status})`);
+        }
+        file = new File([await response.blob()], file.split("/").pop()!, {
+          type: "application/pdf",
+        });
+      }
       const client = await getClient(credentialGetter);
       const formData = new FormData();
       formData.append("file", file);
@@ -367,11 +385,35 @@ function PromptBoxImpl(
       );
       textareaRef.current?.focus();
     },
-    onError: (error: AxiosError) => {
+    onError: (error: unknown) => {
       HomeTelemetry.uploadDocumentFinished(false);
       showCreateErrorToast("Failed to upload file", error);
     },
   });
+
+  // Returns the prompt to load. Attachments only reach the copilot handoff path,
+  // so the plain task path gets the file's public URL in the prompt instead.
+  const withExampleAttachment = (prompt: string, path?: string) => {
+    const filename = path?.split("/").pop();
+    if (!path || !filename) return prompt;
+    if (!enableCopilotHandoff) {
+      return `${prompt} The attached resume is at ${SAMPLE_RESUME_PUBLIC_URL}; download it from there.`;
+    }
+    if (attachedFiles.length >= MAX_HOME_ATTACHMENTS) {
+      toast({
+        variant: "destructive",
+        title: "Too many attachments",
+        description: "Remove an attachment to add the example's resume.",
+      });
+      return prompt;
+    }
+    // Starting the upload here (not after a fetch) flips isPending before the next render,
+    // which disables submit and the example buttons until the resume is attached.
+    if (!attachedFiles.some((file) => file.filename === filename)) {
+      uploadDocumentMutation.mutate(path);
+    }
+    return prompt;
+  };
 
   const recordTaskMutation = useMutation({
     mutationFn: async () => {
@@ -786,14 +828,15 @@ function PromptBoxImpl(
         </div>
         <div className="mt-6 flex w-full max-w-[45rem] flex-col md:mt-9">
           <div className="flex w-full flex-col rounded-2xl border border-input bg-background text-muted-foreground shadow-[0_12px_32px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] focus-within:border-foreground/20 focus-within:shadow-[0_0_0_4px_rgba(79,70,229,0.10),0_12px_32px_rgba(0,0,0,0.06)] dark:bg-slate-elevation1 dark:shadow-[0_12px_32px_rgba(0,0,0,0.35)] dark:focus-within:shadow-[0_0_0_4px_rgba(165,180,252,0.14),0_12px_32px_rgba(0,0,0,0.35)]">
-            <AutoResizingTextarea
+            <CyclingPlaceholderTextarea
               ref={textareaRef}
               id="discover-prompt-input"
               className="max-h-[14rem] min-h-[6rem] resize-none overflow-y-auto border-0 bg-transparent px-5 pb-1.5 pt-[18px] text-base leading-6 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0 md:text-[15px]"
               value={prompt}
               onChange={(e) => updatePrompt(e.target.value)}
               onKeyDown={handlePromptKeyDown}
-              placeholder="Enter your prompt..."
+              onFocus={() => setPromptTouched(true)}
+              cycling={!promptTouched}
             />
             {enableCopilotHandoff ? (
               <div className="px-5">{attachmentChips}</div>
@@ -813,6 +856,7 @@ function PromptBoxImpl(
                   disabled={isSubmitting}
                   onToggle={() => {
                     HomeTelemetry.voiceToggled();
+                    setPromptTouched(true);
                     toggleSpeech();
                   }}
                   className="size-11 rounded-full border-0 bg-transparent md:size-9"
@@ -889,7 +933,12 @@ function PromptBoxImpl(
                     label: example.label,
                   });
                   cancelSpeech();
-                  setPrompt(example.prompt);
+                  setPrompt(
+                    withExampleAttachment(
+                      example.prompt,
+                      "attachment" in example ? example.attachment : undefined,
+                    ),
+                  );
                   setExampleAttribution({ id: example.key, edited: false });
                   textareaRef.current?.focus();
                 }}
@@ -960,6 +1009,7 @@ function PromptBoxImpl(
                 disabled={isSubmitting}
                 onToggle={() => {
                   HomeTelemetry.voiceToggled();
+                  setPromptTouched(true);
                   toggleSpeech();
                 }}
                 className="h-8 w-8 rounded-full border-0 bg-transparent"
@@ -995,7 +1045,9 @@ function PromptBoxImpl(
                 label: example.label,
               });
               cancelSpeech();
-              setPrompt(example.prompt);
+              setPrompt(
+                withExampleAttachment(example.prompt, example.attachment),
+              );
               setExampleAttribution({ id: example.id, edited: false });
               setPromptTouched(true);
               textareaRef.current?.focus();
