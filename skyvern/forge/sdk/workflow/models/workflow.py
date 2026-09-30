@@ -413,6 +413,15 @@ class WorkflowRun(BaseModel):
         return self.debug_session_id is not None
 
 
+def start_hold_reason(*, sequential_key: str | None, depends_on_workflow_run_id: str | None) -> str:
+    """Why a run may wait by design before it starts: a sequential lane, a dependency, or neither."""
+    if sequential_key:
+        return "sequential"
+    if depends_on_workflow_run_id:
+        return "dependency"
+    return "none"
+
+
 def resolve_reuse_browser_session(*, run_override: bool | None, workflow_default: bool) -> bool:
     """Resolve browser-session reuse with the run override taking precedence."""
     return workflow_default if run_override is None else run_override
