@@ -283,7 +283,8 @@ export type BranchEvaluation = {
   branch_index: number;
   criteria_type: "jinja2_template" | "prompt" | null;
   original_expression: string | null;
-  rendered_expression: string | null;
+  // The backend drops this key on every branch that did not match.
+  rendered_expression?: string | null;
   result: boolean | null;
   is_matched: boolean;
   is_default: boolean;
@@ -294,6 +295,7 @@ export type BranchEvaluation = {
 export type ConditionalBlockOutput = {
   evaluations?: Array<BranchEvaluation>;
   matched_branch_index?: number | null;
+  evaluation_error?: string | null;
 };
 
 export function hasEvaluations(

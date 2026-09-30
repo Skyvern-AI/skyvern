@@ -51,6 +51,7 @@ import {
 import { ThoughtCard } from "./ThoughtCard";
 import {
   aggregateIterationStatus,
+  getConditionalEvaluationError,
   type SkippedBranchMetadata,
   type UnexecutedDefinedBlock,
 } from "./workflowTimelineUtils";
@@ -1118,6 +1119,7 @@ function WorkflowRunTimelineBlockItem({
   const blockName = block.label ?? blockTypeTitle;
   const descriptor = getTimelineDescriptor(block);
   const resultSummary = getWebSearchResultSummary(block);
+  const evaluationError = getConditionalEvaluationError(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
@@ -1362,6 +1364,14 @@ function WorkflowRunTimelineBlockItem({
             {resultSummary && (
               <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
                 {TIMELINE_DESCRIPTOR_SEPARATOR} {resultSummary}
+              </span>
+            )}
+            {evaluationError && (
+              <span
+                className="shrink-0 rounded bg-warning/15 px-1 text-[10px] text-warning"
+                title={`${evaluationError.summary}\n${evaluationError.message}`}
+              >
+                evaluation error
               </span>
             )}
             {isFinallyBlock && (
