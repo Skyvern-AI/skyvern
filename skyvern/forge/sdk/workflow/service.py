@@ -6643,7 +6643,7 @@ class WorkflowService:
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             block_labels=block_labels,
-            block_outputs=block_outputs,
+            block_output_labels=list(block_outputs or ()),
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
 
@@ -8136,7 +8136,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 block_cnt=len(blocks),
                 block_labels=block_labels,
-                block_outputs=block_outputs,
+                block_output_labels=list(block_outputs or ()),
             )
 
         else:

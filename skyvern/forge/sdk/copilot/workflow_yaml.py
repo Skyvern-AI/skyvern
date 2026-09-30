@@ -29,7 +29,7 @@ from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     workflow_link_node_mappings,
 )
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.private_settings import (
     resolve_cdp_connect_headers,
 )
@@ -282,11 +282,8 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def workflow_to_copilot_yaml(workflow: Workflow) -> str:
-    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
-    strip_private_workflow_settings(workflow_data)
-    workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
-
+def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> dict[str, Any]:
+    workflow_definition = deepcopy(persisted_definition)
     parameters = workflow_definition.get("parameters")
     if isinstance(parameters, list):
         workflow_definition["parameters"] = [
@@ -300,6 +297,13 @@ def workflow_to_copilot_yaml(workflow: Workflow) -> str:
         workflow_definition["blocks"] = [
             _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
         ]
+    return workflow_definition
+
+
+def workflow_to_copilot_yaml(workflow: Workflow) -> str:
+    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
+    strip_private_workflow_settings(workflow_data)
+    workflow_definition = _copilot_yaml_workflow_definition(workflow_data.get("workflow_definition") or {})
 
     request_data = {
         key: workflow_data[key]
@@ -829,6 +833,34 @@ def redact_credentials_in_workflow_yaml(
     return workflow_yaml
 
 
+def _copilot_definition_from_yaml(
+    workflow_yaml: str, workflow_id: str
+) -> tuple[WorkflowCreateYAMLRequest, WorkflowDefinition]:
+    # Single seam every copilot YAML->Workflow conversion passes through, so code
+    # blocks get their plain-view steps regardless of which path produced the YAML
+    # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
+    # fallbacks would otherwise surface "No steps yet").
+    workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
+    # Same reasoning one field over: a block whose code names a declared parameter but omits it
+    # from parameter_keys gets no value at runtime and dies on NameError mid-login.
+    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
+    workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
+    return workflow_yaml_request, convert_workflow_definition(
+        workflow_definition_yaml=workflow_yaml_request.workflow_definition,
+        workflow_id=workflow_id,
+    )
+
+
+def copilot_round_trip_definition(definition: WorkflowDefinition, *, workflow_id: str) -> WorkflowDefinition:
+    """The definition as Copilot's own save path would persist it, whoever authored it."""
+    workflow_definition = _copilot_yaml_workflow_definition(definition.model_dump(mode="json", exclude_none=True))
+    # The save path stitches next_block_label after validating, so a version it persisted can carry
+    # version 1 beside explicit routing; letting validation derive the version again round-trips it.
+    workflow_definition.pop("version", None)
+    workflow_yaml = yaml.safe_dump({"title": "", "workflow_definition": workflow_definition}, sort_keys=False)
+    return _copilot_definition_from_yaml(workflow_yaml, workflow_id)[1]
+
+
 async def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
@@ -839,19 +871,7 @@ async def _process_workflow_yaml(
     private_workflow_settings: dict[str, Any] | None = None,
     prefer_live_title: bool = False,
 ) -> Workflow:
-    # Single seam every copilot YAML->Workflow conversion passes through, so code
-    # blocks get their plain-view steps regardless of which path produced the YAML
-    # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
-    # fallbacks would otherwise surface "No steps yet").
-    workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
-    # Same reasoning one field over: a block whose code names a declared parameter but omits it
-    # from parameter_keys gets no value at runtime and dies on NameError mid-login.
-    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
-    workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
-    updated_workflow_definition = convert_workflow_definition(
-        workflow_definition_yaml=workflow_yaml_request.workflow_definition,
-        workflow_id=workflow_id,
-    )
+    workflow_yaml_request, updated_workflow_definition = _copilot_definition_from_yaml(workflow_yaml, workflow_id)
 
     enable_self_healing = workflow_yaml_request.enable_self_healing
     if enable_self_healing is None:
