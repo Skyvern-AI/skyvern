@@ -792,6 +792,27 @@ function FlowRenderer({
     );
   });
   const blockerExit = useBlockerExit(blocker);
+  const unsavedResolutionCapturedRef = useRef(false);
+
+  useEffect(() => {
+    if (blocker.state === "blocked") {
+      unsavedResolutionCapturedRef.current = false;
+    }
+  }, [blocker.state]);
+
+  const captureUnsavedResolution = (
+    choice: "stay" | "discard" | "save" | "apply_goal",
+  ) => {
+    if (unsavedResolutionCapturedRef.current) {
+      return;
+    }
+    unsavedResolutionCapturedRef.current = true;
+    postHog.capture("builder.unsaved_changes.resolved", {
+      org_id: workflow.organization_id,
+      workflow_permanent_id: workflow.workflow_permanent_id,
+      choice,
+    });
+  };
   const applyPendingGoalChanges = useCopilotActionStore(
     (state) => state.applyPendingGoalChanges,
   );
@@ -1403,6 +1424,7 @@ function FlowRenderer({
       workflowChangesStore.setHasChanges(true);
       postHog.capture("builder.block.duplicated", {
         org_id: workflow.organization_id,
+        workflow_permanent_id: workflow.workflow_permanent_id,
         position: result.position,
         source_block_id: id,
       });
@@ -1418,6 +1440,7 @@ function FlowRenderer({
       workflowChangesStore,
       postHog,
       workflow.organization_id,
+      workflow.workflow_permanent_id,
     ],
   );
 
@@ -2419,6 +2442,7 @@ function FlowRenderer({
           open={blocker.state === "blocked"}
           onOpenChange={(open) => {
             if (!open) {
+              captureUnsavedResolution("stay");
               blockerExit.reset();
             }
           }}
@@ -2449,6 +2473,7 @@ function FlowRenderer({
               <Button
                 variant="secondary"
                 onClick={() => {
+                  captureUnsavedResolution("discard");
                   useWorkflowTitleStore
                     .getState()
                     .clearCopilotMetadata(workflow.workflow_permanent_id);
@@ -2460,6 +2485,7 @@ function FlowRenderer({
               {pendingGoalChanges.length > 0 ? (
                 <Button
                   onClick={() => {
+                    captureUnsavedResolution("apply_goal");
                     blockerExit.reset();
                     applyPendingGoalChanges();
                   }}
@@ -2473,6 +2499,7 @@ function FlowRenderer({
                   onClick={() => {
                     handleSave().then((ok) => {
                       if (ok) {
+                        captureUnsavedResolution("save");
                         blockerExit.proceed();
                       }
                     });

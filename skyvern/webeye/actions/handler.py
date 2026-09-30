@@ -395,6 +395,10 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
+# Fire the one-shot download-recovery retry this many seconds before the no-signal grace expires, so a
+# slow-but-real download has the whole grace to arrive on its own before we spend the single retry.
+# Clamped to the grace, so a short grace still fires the retry inside the existing wait.
+DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS = 15.0
 # Synchronous FileDownloadBlock false-click start-signal detection window: how long to wait for a first local
 # download signal (a new .crdownload/final file) before giving up, so a legitimate non-download popup is not
 # held for the whole download budget. Widened by an operator-set popup grace (up to its 60s setting cap); the
@@ -4443,6 +4447,12 @@ class ScopedXhrDownloadCapture:
 
     def resume_in_flight_requests(self) -> None:
         self._accept_new_requests = True
+        # Reopen the status-observation window for the one resumed retry so its own request (and the
+        # retry's exact 500/200-class response) is observable again. The window was sealed after the
+        # original action; without this the late retry's requests would start past the deadline and be
+        # dropped. The window is re-sealed by the caller's seal_in_flight_requests() after the retry
+        # click, still bounded by the original download-wait hard deadline.
+        self._status_observation_deadline = None
 
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
@@ -5387,6 +5397,10 @@ class ActionHandler:
                 download_wait_hard_timeout_seconds = no_signal_grace_seconds + DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS
             download_wait_started_at = time.monotonic()
             download_wait_deadline = download_wait_started_at + download_wait_hard_timeout_seconds
+            # Late-fire the one-shot recovery retry near the end of the no-signal grace (clamped to the
+            # grace so a short timeout still fires inside the existing wait), giving a slow real download
+            # the whole grace to land on its own before the single retry is spent.
+            recovery_fire_after_seconds = max(0.0, no_signal_grace_seconds - DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS)
 
             def _remaining_download_wait_seconds() -> float:
                 return max(0.0, download_wait_deadline - time.monotonic())
@@ -5601,37 +5615,105 @@ class ActionHandler:
                                 )
                                 download_event_fallback_failed = True
                                 break
-                            if recovery_hook is not None and xhr_capture.recovery_requested:
+                            recovery_elapsed_seconds = time.monotonic() - download_wait_started_at
+                            if (
+                                recovery_hook is not None
+                                and xhr_capture.recovery_requested
+                                and recovery_elapsed_seconds >= recovery_fire_after_seconds
+                            ):
+                                # Consume the one-shot only now that a real attempt is about to begin: an
+                                # earlier poll where the fire time had not arrived leaves the still-eligible
+                                # hook untouched. Every branch below emits exactly one structured
+                                # "Download recovery click" receipt with a bounded sub-outcome.
                                 hook, recovery_hook = recovery_hook, None
-                                if (
-                                    not download_event.done()
-                                    and not any(staging_dir.iterdir())
-                                    and _remaining_download_wait_seconds() > 0
-                                ):
+                                if download_event.done():
+                                    LOG.info(
+                                        "Download recovery click",
+                                        attempt=1,
+                                        result="not_attempted",
+                                        reason="event_done",
+                                        elapsed_seconds=recovery_elapsed_seconds,
+                                    )
+                                elif any(staging_dir.iterdir()):
+                                    LOG.info(
+                                        "Download recovery click",
+                                        attempt=1,
+                                        result="not_attempted",
+                                        reason="staging_nonempty",
+                                        elapsed_seconds=recovery_elapsed_seconds,
+                                    )
+                                elif _remaining_download_wait_seconds() <= 0:
+                                    LOG.info(
+                                        "Download recovery click",
+                                        attempt=1,
+                                        result="not_attempted",
+                                        reason="budget_exhausted",
+                                        elapsed_seconds=recovery_elapsed_seconds,
+                                    )
+                                else:
+                                    phase = "remap"
                                     try:
-                                        locator = await hook.remap(page)
-                                        files = await _list_download_signal_files()
-                                        if (
-                                            locator is not None
-                                            and not download_event.done()
-                                            and not any(staging_dir.iterdir())
-                                            and not (
-                                                {_download_signal_identity(file) for file in files}
-                                                - signal_file_identities_before
+                                        remap = await hook.remap(page)
+                                        if remap.locator is None:
+                                            LOG.info(
+                                                "Download recovery click",
+                                                attempt=1,
+                                                result="remap_none",
+                                                reason=remap.reason,
+                                                elapsed_seconds=recovery_elapsed_seconds,
                                             )
-                                        ):
-                                            remaining = _remaining_download_wait_seconds()
-                                            if remaining > 0:
+                                        else:
+                                            phase = "recheck"
+                                            files = await _list_download_signal_files()
+                                            if (
+                                                download_event.done()
+                                                or any(staging_dir.iterdir())
+                                                or (
+                                                    {_download_signal_identity(file) for file in files}
+                                                    - signal_file_identities_before
+                                                )
+                                            ):
+                                                LOG.info(
+                                                    "Download recovery click",
+                                                    attempt=1,
+                                                    result="stale_signal",
+                                                    resolution=remap.resolution,
+                                                    elapsed_seconds=recovery_elapsed_seconds,
+                                                )
+                                            elif _remaining_download_wait_seconds() <= 0:
+                                                LOG.info(
+                                                    "Download recovery click",
+                                                    attempt=1,
+                                                    result="no_budget_at_click",
+                                                    resolution=remap.resolution,
+                                                    elapsed_seconds=recovery_elapsed_seconds,
+                                                )
+                                            else:
+                                                phase = "click"
+                                                remaining = _remaining_download_wait_seconds()
                                                 xhr_capture.resume_in_flight_requests()
                                                 try:
-                                                    await locator.click(timeout=remaining * 1000)
-                                                    LOG.info("Download recovery click", attempt=1, result="clicked")
+                                                    await remap.locator.click(timeout=remaining * 1000)
+                                                    LOG.info(
+                                                        "Download recovery click",
+                                                        attempt=1,
+                                                        result="clicked",
+                                                        resolution=remap.resolution,
+                                                        elapsed_seconds=recovery_elapsed_seconds,
+                                                    )
                                                     await asyncio.sleep(0)
                                                 finally:
                                                     xhr_capture.seal_in_flight_requests()
                                                 continue
-                                    except Exception:
-                                        LOG.info("Download recovery click", attempt=1, result="failed")
+                                    except Exception as recovery_exc:
+                                        LOG.info(
+                                            "Download recovery click",
+                                            attempt=1,
+                                            result="failed",
+                                            phase=phase,
+                                            error_type=type(recovery_exc).__name__,
+                                            elapsed_seconds=recovery_elapsed_seconds,
+                                        )
 
                             elapsed_since_action = time.monotonic() - download_wait_started_at
                             if elapsed_since_action >= download_wait_hard_timeout_seconds:

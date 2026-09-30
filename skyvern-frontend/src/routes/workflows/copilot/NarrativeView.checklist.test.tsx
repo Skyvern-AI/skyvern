@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -214,18 +215,164 @@ describe("NarrativeView — activity log", () => {
     expect(screen.getByText(error).className).toContain("rose");
   });
 
-  it("a block inside a step wears the shared row treatment", () => {
-    render(<NarrativeView turn={repairLoopTurn()} />);
-    openFold();
-    fireEvent.click(stepLines()[1]!);
-    const blockRow = screen.getByTitle(/Highlight block_1/);
+  it("a live test reads as one card per block run, in place of its call", () => {
+    const turn = testActiveTurn();
+    turn.designActivity = [
+      activityEntry({
+        id: "tc-2",
+        kind: "tool_call",
+        toolName: "update_and_run_blocks",
+        displayLabel: 'Editing and testing block "block_1"',
+        timestamp: "2026-06-10T00:00:01Z",
+        codeDiffs: [
+          { label: "block_1", added: 3, removed: 2, patch: "-old\n+new" },
+        ],
+      }),
+    ];
+    turn.blocks = [
+      runningBlock({
+        recordedActions: [
+          {
+            actionId: "a1",
+            label: "Goto URL",
+            summary: "Open the sign-in page",
+            durationMs: 800,
+            failed: false,
+            codeLine: null,
+            response: null,
+          },
+        ],
+        recordedActionsAt: 0,
+      }),
+    ];
+    render(<NarrativeView turn={turn} />);
 
-    // The block used to lead with a 24px status puck and a bold label while
-    // the steps beside it led with a 16px glyph, so the column never lined up.
-    expect(blockRow.querySelector(".rounded-full")).toBeNull();
-    expect(blockRow.className).toContain("grid-cols-[18px_1fr_auto]");
-    expect(visibleText(blockRow)).not.toContain("code");
-    expect(visibleText(blockRow)).not.toContain("done");
+    const card = screen.getByTestId("copilot-test-card");
+    expect(card.dataset.tone).toBe("running");
+    expect(visibleText(card)).toContain("Testing Block 1");
+    expect(visibleText(card)).toContain("Open the sign-in page");
+    expect(visibleText(card)).toContain("0.8s");
+    // The card replaces the call row, the diff row and the flat block line.
+    expect(screen.queryByText(/Editing and testing block/)).toBeNull();
+    expect(screen.queryByText("Active in Live Browser")).toBeNull();
+    expect(screen.queryByText("Working…")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Expand code changes/ }),
+    ).toBeNull();
+    // Its spinner is the one loader; the step line above does not repeat it.
+    expect(screen.queryByText("in progress")).toBeNull();
+
+    expect(screen.queryByText("+new")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Code change/ }));
+    expect(screen.getByText("+new")).toBeTruthy();
+  });
+
+  it("a retried test reads one card per attempt, the fix in the attempt that ran it", () => {
+    const turn = repairLoopTurn();
+    const firstAttempt = activityEntry({
+      id: "tr-1",
+      kind: "tool_result",
+      toolName: "update_and_run_blocks",
+      text: "Failed: the page never loaded",
+      success: false,
+      timestamp: "2026-06-10T00:00:08Z",
+      codeDiffs: [{ label: "block_1", added: 4, removed: 0, patch: "+old" }],
+    });
+    const failedBlock = runningBlock({
+      workflowRunBlockId: "wrb_1",
+      state: "failed",
+      // First polled already failed, so it has no start of its own.
+      startedAt: null,
+      endedAt: "2026-06-10T00:00:07Z",
+    });
+
+    // Until the retry reaches the patched block, its new patch stays off the
+    // failed card, even while it runs another block first.
+    render(
+      <NarrativeView
+        turn={{
+          ...turn,
+          terminal: null,
+          blocks: [
+            failedBlock,
+            runningBlock({
+              workflowRunBlockId: "wrb_0",
+              label: "block_0",
+              startedAt: "2026-06-10T00:00:10Z",
+            }),
+          ],
+          designActivity: [
+            activityEntry({
+              id: "tc-2",
+              kind: "tool_call",
+              toolName: "update_and_run_blocks",
+              attempts: 2,
+              priorFailures: [firstAttempt],
+              timestamp: "2026-06-10T00:00:09Z",
+              codeDiffs: [
+                { label: "block_1", added: 2, removed: 0, patch: "+new" },
+              ],
+            }),
+          ],
+        }}
+      />,
+    );
+    const pendingCards = screen.getAllByTestId("copilot-test-card");
+    expect(pendingCards).toHaveLength(2);
+    for (const card of pendingCards) {
+      expect(within(card).queryByText("Code change")).toBeNull();
+    }
+    expect(
+      screen.getByRole("button", { name: /Expand code changes/ }),
+    ).toBeTruthy();
+    cleanup();
+
+    turn.designActivity = [
+      activityEntry({
+        id: "tr-2",
+        kind: "tool_result",
+        toolName: "update_and_run_blocks",
+        text: "Ran 1 block",
+        success: true,
+        attempts: 2,
+        priorFailures: [firstAttempt],
+        timestamp: "2026-06-10T00:00:23Z",
+        codeDiffs: [
+          { label: "block_1", added: 10, removed: 0, patchDropped: true },
+        ],
+      }),
+    ];
+    turn.blocks = [
+      failedBlock,
+      runningBlock({
+        workflowRunBlockId: "wrb_2",
+        state: "completed",
+        outcome: "demonstrated",
+        startedAt: "2026-06-10T00:00:10Z",
+        endedAt: "2026-06-10T00:00:22Z",
+      }),
+    ];
+    render(<NarrativeView turn={turn} />);
+    fireEvent.click(stepLines()[0]!);
+
+    const [failedCard, passedCard] = screen.getAllByTestId("copilot-test-card");
+    expect(failedCard!.getAttribute("data-tone")).toBe("failed");
+    expect(
+      within(failedCard!).getByText("Failed: the page never loaded"),
+    ).toBeTruthy();
+    expect(within(failedCard!).queryByText("Code change")).toBeNull();
+
+    const header = within(passedCard!).getByRole("button", {
+      name: /Passed Block 1/,
+    });
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    expect(visibleText(header)).not.toContain("attempts");
+    fireEvent.click(header);
+    // The patch was dropped, so the change reads as counts with nothing to open.
+    expect(within(passedCard!).getByText("Code change")).toBeTruthy();
+    expect(
+      within(passedCard!).queryByRole("button", { name: /Code change/ }),
+    ).toBeNull();
   });
 
   it("a run row still calling claims no result", () => {
@@ -806,6 +953,7 @@ describe("NarrativeView — activity log", () => {
         workflowRunBlockId: id,
         label,
         state: "completed",
+        outcome: "demonstrated",
         startedAt: null,
       });
     const turn: TurnNarrativeState = {
@@ -853,38 +1001,41 @@ describe("NarrativeView — activity log", () => {
     ]);
   });
 
-  it("does not call a run passed when a block went unevaluated", () => {
-    const turn: TurnNarrativeState = {
-      ...EMPTY_NARRATIVE,
-      turnId: "turn-1",
-      turnIndex: 0,
-      designStarted: true,
-      designEnded: true,
-      terminal: "response",
-      blocks: [
-        runningBlock({
-          workflowRunBlockId: "wrb_a",
-          label: "open_statement",
-          state: "completed",
-          startedAt: null,
-          outcome: "not_evaluated",
-        }),
-      ],
-      designActivity: [
-        activityEntry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "update_and_run_blocks",
-          text: "Ran the draft",
-          success: true,
-        }),
-      ],
-    };
-    render(<NarrativeView turn={turn} />);
+  it.each([["not_evaluated" as const], [undefined]])(
+    "does not call a run passed when its block's verdict is %s",
+    (outcome) => {
+      const turn: TurnNarrativeState = {
+        ...EMPTY_NARRATIVE,
+        turnId: "turn-1",
+        turnIndex: 0,
+        designStarted: true,
+        designEnded: true,
+        terminal: "response",
+        blocks: [
+          runningBlock({
+            workflowRunBlockId: "wrb_a",
+            label: "open_statement",
+            state: "completed",
+            startedAt: null,
+            outcome,
+          }),
+        ],
+        designActivity: [
+          activityEntry({
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "update_and_run_blocks",
+            text: "Ran the draft",
+            success: true,
+          }),
+        ],
+      };
+      render(<NarrativeView turn={turn} />);
 
-    const lines = stepLines().map(visibleText);
-    expect(lines).toEqual(["Tested the workflow"]);
-  });
+      const lines = stepLines().map(visibleText);
+      expect(lines).toEqual(["Tested the workflow"]);
+    },
+  );
 
   it("a block whose run row was evicted still renders inside a row at Done", () => {
     const turn: TurnNarrativeState = {
@@ -1243,7 +1394,7 @@ describe("NarrativeView — code write diffs", () => {
     ).not.toContain("opacity-50");
   });
 
-  it("shows an active repair's code before its tool result arrives", () => {
+  it("keeps an active repair's code in its block's card before its tool result arrives", () => {
     render(
       <NarrativeView
         turn={{
@@ -1278,11 +1429,7 @@ describe("NarrativeView — code write diffs", () => {
       />,
     );
 
-    expect(
-      screen.getByRole("button", {
-        name: "Expand code changes for add_to_cart",
-      }),
-    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Code change/ }));
     expect(screen.getByText("+new line")).toBeTruthy();
   });
 

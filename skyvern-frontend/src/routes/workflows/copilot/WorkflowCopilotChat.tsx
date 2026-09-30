@@ -38,8 +38,10 @@ import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
 import {
   ActionsApiResponse,
+  ActionTypes,
   type CredentialApiResponse,
   getReadableActionType,
+  Status,
 } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
@@ -445,26 +447,56 @@ type ArmedProductAction =
 // they land without hammering the timeline endpoint.
 const RECORDED_ACTIONS_POLL_INTERVAL_MS = 2500;
 
-function recordedActionDurationMs(action: ActionsApiResponse): number | null {
+function recordedActionOutput(
+  action: ActionsApiResponse,
+): Record<string, unknown> | null {
   const output = action.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return null;
   }
-  const durationMs = (output as Record<string, unknown>).duration_ms;
-  return typeof durationMs === "number" ? durationMs : null;
+  return output as Record<string, unknown>;
+}
+
+// A code block records an error raised outside any page call as a failed
+// null_action whose output carries `code_line`, even when the line is unknown.
+function isCodeErrorAction(action: ActionsApiResponse): boolean {
+  const output = recordedActionOutput(action);
+  return (
+    action.action_type === ActionTypes.NullAction &&
+    action.status === Status.Failed &&
+    output !== null &&
+    "code_line" in output
+  );
 }
 
 function toRecordedActionSummary(
   action: ActionsApiResponse,
 ): RecordedActionSummary {
+  const output = recordedActionOutput(action);
+  const codeError = isCodeErrorAction(action);
+  const codeLine = codeError ? output?.code_line : null;
+  const durationMs = output?.duration_ms;
+  const failed = action.status === Status.Failed;
   return {
     actionId: action.action_id,
-    label: getReadableActionType(action.action_type),
+    label: getReadableActionType(
+      action.action_type,
+      codeError ? { nullActionLabel: "Code error" } : {},
+    ),
     // The chat has no workflow definition in scope, so rows resolve from the action
     // itself; the run-view timeline additionally matches the definition's step text.
-    summary: describeRecordedAction(action, null),
-    durationMs: recordedActionDurationMs(action),
-    failed: action.status === "failed",
+    // A code error's description only restates its line, and a failure's
+    // response is shown in full under the row, so neither repeats as the summary.
+    summary: codeError
+      ? null
+      : describeRecordedAction(
+          failed ? { ...action, response: null } : action,
+          null,
+        ),
+    durationMs: typeof durationMs === "number" ? durationMs : null,
+    failed,
+    codeLine: typeof codeLine === "number" ? codeLine : null,
+    response: failed ? action.response?.trim() || null : null,
   };
 }
 

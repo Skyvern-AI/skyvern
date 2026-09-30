@@ -85,6 +85,11 @@ export interface RecordedActionSummary {
   summary: string | null;
   durationMs: number | null;
   failed: boolean;
+  // The failing line of a code error; null for every other action, and when
+  // the line is unknown.
+  codeLine: number | null;
+  // A failed action's full recorded failure text; the secure runner records none.
+  response: string | null;
 }
 
 // Client-synthesized event (never sent by the backend) that carries the
@@ -333,6 +338,9 @@ export interface ActivityEntry {
   activeLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
+  // A failed tool_result's sanitized failure text. Live-only: saved turns
+  // do not carry it.
+  detail?: string;
   // Server-computed line delta per code block this write changed. Absent on
   // every other row and on payloads from a backend that predates it.
   codeDiffs?: CodeWriteDiff[];
@@ -858,6 +866,7 @@ function buildActivityFromToolResult(
     toolName: event.tool_name,
     displayLabel,
     success: event.success,
+    detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
     id: `tr-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
@@ -1208,6 +1217,13 @@ export function isBlockOk(
     block.outcome === "demonstrated" ||
     block.outcome === "not_evaluated"
   );
+}
+
+// Stricter than isBlockOk: a block passed only when its run demonstrated it.
+export function blockPassed(
+  block: Pick<BlockState, "state" | "outcome">,
+): boolean {
+  return block.state === "completed" && block.outcome === "demonstrated";
 }
 
 // Labels that occur exactly once in the given set — the only labels safe to key

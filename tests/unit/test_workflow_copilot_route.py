@@ -22,6 +22,7 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -2056,7 +2057,12 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(copilot_stream)
+    with capture_logs() as logs:
+        await handler(copilot_stream)
+
+    outcome_logs = [log for log in logs if log["event"] == "Copilot turn outcome"]
+    assert len(outcome_logs) == 1
+    assert outcome_logs[0]["route_exit"] == "error"
 
     contents = [
         call.kwargs.get("content") for call in workflow_params.create_workflow_copilot_chat_message.await_args_list

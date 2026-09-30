@@ -1362,11 +1362,21 @@ async def update_workflow_legacy(
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
+
+    def log_save_rejected(error: Exception) -> None:
+        LOG.info(
+            "Workflow save rejected",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_id,
+            error_type=type(error).__name__,
+        )
+
     # validate the workflow
     raw_yaml = await request.body()
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
     except yaml.YAMLError as exc:
+        log_save_rejected(exc)
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     try:
@@ -1379,10 +1389,16 @@ async def update_workflow_legacy(
             edited_by=user_id,
         )
     except WorkflowDefinitionValidationException as e:
-        raise e
-    except (SkyvernHTTPException, ValidationError) as e:
+        log_save_rejected(e)
+        raise
+    except ValidationError as e:
+        log_save_rejected(e)
+        raise
+    except SkyvernHTTPException as e:
         # Bubble up well-formed client errors so they are not converted to 500s
-        raise e
+        if 400 <= e.status_code < 500:
+            log_save_rejected(e)
+        raise
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -3573,6 +3589,7 @@ async def run_block(
             organization=organization,
             user_id=user_id,
             browser_session_id=browser_session_id,
+            debug_session_id=block_run_request.debug_session_id,
             block_outputs=block_run_request.block_outputs,
         )
     except SkyvernHTTPException:
@@ -3582,6 +3599,8 @@ async def run_block(
             "Unexpected error running blocks",
             workflow_id=block_run_request.workflow_id,
             organization_id=organization.organization_id,
+            debug_session_id=block_run_request.debug_session_id,
+            block_label_count=len(block_run_request.block_labels),
         )
         raise
 

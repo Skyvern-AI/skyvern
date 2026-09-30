@@ -20,6 +20,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { usePostHog } from "posthog-js/react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
@@ -376,6 +377,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const runId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
   const {
@@ -406,6 +408,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   );
 
   const cancelRun = useMutation({
+    mutationKey: ["cancelRun"],
     mutationFn: async () => {
       const client = await getClient(credentialGetter);
       return client
@@ -413,6 +416,12 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         .then((response) => response.data);
     },
     onSuccess: () => {
+      if (!isBlockRun) {
+        postHog.capture("studio.run.cancelled", {
+          org_id: workflowRun?.workflow?.organization_id,
+          workflow_permanent_id: workflowPermanentId,
+        });
+      }
       queryClient.invalidateQueries({ queryKey: ["workflowRun", activeRunId] });
       queryClient.invalidateQueries({
         queryKey: ["workflowRun", workflowPermanentId, activeRunId],

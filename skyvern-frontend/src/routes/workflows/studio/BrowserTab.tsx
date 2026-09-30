@@ -49,6 +49,7 @@ export function BrowserTab() {
       }
       postHog.capture("run.recording.viewed", {
         org_id: workflowRun.workflow?.organization_id,
+        workflow_permanent_id: workflowRun.workflow?.workflow_permanent_id,
         run_id: workflowRun.workflow_run_id,
         recording_index: index,
         recording_count: recordingUrls.length,

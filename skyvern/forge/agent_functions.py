@@ -944,10 +944,26 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+@dataclass(frozen=True)
+class DownloadRecoveryRemap:
+    """Bounded outcome of a download-recovery ``remap``.
+
+    ``locator`` is the retry target on the pinned page, or ``None`` when recovery must not click.
+    ``resolution`` names how the locator was found (``cached_css`` or ``fresh_scrape``) and is set only
+    when ``locator`` is present. ``reason`` is a bounded, non-sensitive rejection code when ``locator``
+    is ``None`` so the single structured log line can distinguish sub-outcomes without leaking URLs,
+    query parameters, or customer data.
+    """
+
+    locator: Locator | None
+    resolution: str | None = None
+    reason: str | None = None
+
+
 class DownloadRecoveryHook(Protocol):
     def matches_failure(self, response: Response) -> bool: ...
 
-    async def remap(self, page: Page) -> Locator | None: ...
+    async def remap(self, page: Page) -> DownloadRecoveryRemap: ...
 
 
 class AgentFunction:
@@ -977,6 +993,11 @@ class AgentFunction:
     # (fill text, self-screen bullet) for the v3 required-field-answers arm's treatment prompt. OSS
     # supplies none, so a run in that arm's treatment renders the control prompt.
     def task_v3_required_field_answers_text(self) -> tuple[str, str] | None:
+        return None
+
+    # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
+    # the run's payload. OSS supplies no default.
+    def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
