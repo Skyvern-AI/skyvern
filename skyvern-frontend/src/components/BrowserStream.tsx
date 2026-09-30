@@ -77,8 +77,29 @@ interface BrowserSession {
   completed_at?: string | null;
 }
 
+type BrowserSessionLiveness = Pick<
+  BrowserSession,
+  "browser_address" | "started_at" | "completed_at"
+>;
+
+function getBrowserSessionState(browserSession: BrowserSessionLiveness | null) {
+  const hasBrowserSession = Boolean(
+    browserSession && !browserSession.completed_at,
+  );
+  return {
+    hasBrowserSession,
+    isBrowserSessionStarted:
+      hasBrowserSession &&
+      Boolean(browserSession?.started_at || browserSession?.browser_address),
+    isBrowserSessionEnded: !hasBrowserSession,
+  };
+}
+
 type Props = {
   browserSessionId?: string;
+  // The session behind browserSessionId, from a parent that already polls it.
+  // The stream then reads this instead of polling the session a second time.
+  browserSession?: BrowserSessionLiveness;
   exfiltrate?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
@@ -125,6 +146,7 @@ function applyVncStreamProfile(
 
 function BrowserStream({
   browserSessionId = undefined,
+  browserSession: parentBrowserSession = undefined,
   exfiltrate = false,
   interactive = true,
   showControlButtons = undefined,
@@ -163,6 +185,10 @@ function BrowserStream({
     runId = null;
   }
 
+  const parentSessionState = parentBrowserSession
+    ? getBrowserSessionState(parentBrowserSession)
+    : null;
+
   useQuery({
     queryKey: ["hasBrowserSession", browserSessionId],
     queryFn: async () => {
@@ -172,21 +198,12 @@ function BrowserStream({
         const response = await client.get<BrowserSession | null>(
           `/browser_sessions/${browserSessionId}`,
         );
-        const browserSession = response.data;
+        const sessionState = getBrowserSessionState(response.data);
 
-        if (!browserSession || browserSession.completed_at) {
-          setHasBrowserSession(false);
-          setIsBrowserSessionStarted(false);
-          setIsBrowserSessionEnded(true);
-          return false;
-        }
-
-        setHasBrowserSession(true);
-        const sessionStarted = Boolean(
-          browserSession.started_at || browserSession.browser_address,
-        );
-        setIsBrowserSessionStarted(sessionStarted);
-        return sessionStarted;
+        setHasBrowserSession(sessionState.hasBrowserSession);
+        setIsBrowserSessionStarted(sessionState.isBrowserSessionStarted);
+        setIsBrowserSessionEnded(sessionState.isBrowserSessionEnded);
+        return sessionState.isBrowserSessionStarted;
       } catch (error) {
         setHasBrowserSession(false);
         setIsBrowserSessionStarted(false);
@@ -200,7 +217,8 @@ function BrowserStream({
         return false;
       }
     },
-    enabled: entity === "browserSession" && !!browserSessionId,
+    enabled:
+      entity === "browserSession" && !!browserSessionId && !parentSessionState,
     refetchInterval: (query) =>
       query.state.status === "error" && isForbiddenError(query.state.error)
         ? false
@@ -209,9 +227,18 @@ function BrowserStream({
           : 1000,
   });
 
-  const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
-  const [isBrowserSessionStarted, setIsBrowserSessionStarted] = useState(false);
-  const [isBrowserSessionEnded, setIsBrowserSessionEnded] = useState(false);
+  const [polledHasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
+  const [polledIsBrowserSessionStarted, setIsBrowserSessionStarted] =
+    useState(false);
+  const [polledIsBrowserSessionEnded, setIsBrowserSessionEnded] =
+    useState(false);
+  const hasBrowserSession =
+    parentSessionState?.hasBrowserSession ?? polledHasBrowserSession;
+  const isBrowserSessionStarted =
+    parentSessionState?.isBrowserSessionStarted ??
+    polledIsBrowserSessionStarted;
+  const isBrowserSessionEnded =
+    parentSessionState?.isBrowserSessionEnded ?? polledIsBrowserSessionEnded;
   const [hasGivenUp, setHasGivenUp] = useState(false);
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);

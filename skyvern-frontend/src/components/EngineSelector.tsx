@@ -73,21 +73,10 @@ const defaultEngines: Array<RunEngine> = [
   RunEngine.AnthropicCua,
 ];
 
-function defaultOption(effectiveDefaultEngine: RunEngine | null): EngineOption {
-  return {
-    value: DEFAULT_ENGINE_VALUE,
-    label: (
-      <span className="flex items-center gap-1.5">
-        <span>Default</span>
-        <span className="text-xs text-muted-foreground">
-          {effectiveDefaultEngine === RunEngine.SkyvernV3
-            ? "runs on Skyvern 3.0"
-            : "follows engine routing"}
-        </span>
-      </span>
-    ),
-  };
-}
+const defaultOption: EngineOption = {
+  value: DEFAULT_ENGINE_VALUE,
+  label: "Default",
+};
 
 function RunEngineSelector({
   value,
@@ -103,7 +92,7 @@ function RunEngineSelector({
   const visibleEngines =
     value && !engines.includes(value) ? [...engines, value] : engines;
   const options: Array<EngineOption> = [
-    defaultOption(effectiveDefaultEngine),
+    defaultOption,
     ...engineOptions.filter((opt) => visibleEngines.includes(opt.value)),
   ];
   const selectValue = value ?? DEFAULT_ENGINE_VALUE;

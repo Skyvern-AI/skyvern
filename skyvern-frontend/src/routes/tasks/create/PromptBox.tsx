@@ -39,6 +39,7 @@ import { AxiosError, type AxiosResponse } from "axios";
 import {
   forwardRef,
   type ForwardedRef,
+  type KeyboardEvent,
   type ReactNode,
   useCallback,
   useEffect,
@@ -625,6 +626,112 @@ function PromptBoxImpl(
     generateWorkflowMutation.mutate({ prompt, attempt });
   };
 
+  const handlePromptKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // With no precise pointer (a phone) assume an on-screen keyboard, which has no Shift+Enter, so Return stays a
+    // newline and the send button submits. A tablet with a keyboard but no trackpad falls in this bucket too.
+    if (
+      e.key !== "Enter" ||
+      e.shiftKey ||
+      e.nativeEvent.isComposing ||
+      !window.matchMedia?.("(any-pointer: fine)").matches
+    ) {
+      return;
+    }
+    e.preventDefault();
+    if (prompt.trim()) {
+      submitPrompt({ prompt, attribution: exampleAttribution });
+    }
+  };
+
+  const attachmentChips =
+    attachedFiles.length > 0 ? (
+      <div className="flex flex-wrap gap-1.5 px-1 pt-2">
+        {attachedFiles.map((file) => (
+          <span
+            key={file.file_id}
+            className="inline-flex items-center gap-1.5 rounded-md border border-input bg-slate-elevation2 px-2 py-1 text-xs text-foreground"
+          >
+            <FileTextIcon aria-hidden="true" className="size-3.5" />
+            <span className="max-w-[16rem] truncate">{file.filename}</span>
+            <button
+              type="button"
+              aria-label={`Remove ${file.filename}`}
+              className="text-muted-foreground hover:text-foreground"
+              onClick={() =>
+                setAttachedFiles((current) =>
+                  current.filter((f) => f.file_id !== file.file_id),
+                )
+              }
+            >
+              <Cross2Icon aria-hidden="true" className="size-3" />
+            </button>
+          </span>
+        ))}
+      </div>
+    ) : null;
+
+  const fileInput = (
+    <input
+      ref={fileInputRef}
+      type="file"
+      className="hidden"
+      aria-label="Upload document"
+      onChange={(event) => {
+        const file = event.target.files?.[0];
+        if (file) {
+          uploadDocumentMutation.mutate(file);
+        }
+        event.target.value = "";
+      }}
+    />
+  );
+
+  const addMenu = (
+    <DropdownMenu
+      onOpenChange={(open) => {
+        if (open) HomeTelemetry.addMenuOpened();
+      }}
+    >
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="Add to prompt"
+          disabled={isSubmitting}
+          className="flex size-8 items-center justify-center rounded-lg border border-input text-foreground transition-colors hover:bg-muted disabled:opacity-50"
+        >
+          {uploadDocumentMutation.isPending || recordTaskMutation.isPending ? (
+            <ReloadIcon className="size-4 animate-spin" />
+          ) : (
+            <PlusIcon aria-hidden="true" className="size-4" />
+          )}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        {enableCopilotHandoff ? (
+          <DropdownMenuItem
+            disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
+            onSelect={() => {
+              HomeTelemetry.uploadDocumentSelected();
+              fileInputRef.current?.click();
+            }}
+          >
+            <UploadIcon className="mr-2 size-4" />
+            Upload document
+          </DropdownMenuItem>
+        ) : null}
+        <DropdownMenuItem
+          onSelect={() => {
+            HomeTelemetry.recordTaskSelected();
+            recordTaskMutation.mutate();
+          }}
+        >
+          <VideoIcon className="mr-2 size-4" />
+          Record task
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
   if (!minimal) {
     return (
       <div className="relative isolate flex flex-col items-center pb-4 pt-12 md:pt-24">
@@ -653,9 +760,19 @@ function PromptBoxImpl(
               className="max-h-[14rem] min-h-[6rem] resize-none overflow-y-auto border-0 bg-transparent px-5 pb-1.5 pt-[18px] text-base leading-6 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0 md:text-[15px]"
               value={prompt}
               onChange={(e) => updatePrompt(e.target.value)}
+              onKeyDown={handlePromptKeyDown}
               placeholder="Enter your prompt..."
             />
+            {enableCopilotHandoff ? (
+              <div className="px-5">{attachmentChips}</div>
+            ) : null}
             <div className="flex items-center gap-1 px-2.5 pb-2.5 pt-2">
+              {enableCopilotHandoff ? (
+                <>
+                  {addMenu}
+                  {fileInput}
+                </>
+              ) : null}
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
@@ -796,94 +913,14 @@ function PromptBoxImpl(
             className="max-h-[8rem] min-h-[4rem] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
             value={prompt}
             onChange={(e) => updatePrompt(e.target.value)}
+            onKeyDown={handlePromptKeyDown}
             onFocus={() => setPromptTouched(true)}
             cycling={!promptTouched}
           />
-          {attachedFiles.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5 px-1 pt-2">
-              {attachedFiles.map((file) => (
-                <span
-                  key={file.file_id}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-input bg-slate-elevation2 px-2 py-1 text-xs text-foreground"
-                >
-                  <FileTextIcon aria-hidden="true" className="size-3.5" />
-                  <span className="max-w-[16rem] truncate">
-                    {file.filename}
-                  </span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${file.filename}`}
-                    className="text-muted-foreground hover:text-foreground"
-                    onClick={() =>
-                      setAttachedFiles((current) =>
-                        current.filter((f) => f.file_id !== file.file_id),
-                      )
-                    }
-                  >
-                    <Cross2Icon aria-hidden="true" className="size-3" />
-                  </button>
-                </span>
-              ))}
-            </div>
-          ) : null}
+          {attachmentChips}
           <div className="flex items-center gap-1 pt-2">
-            <DropdownMenu
-              onOpenChange={(open) => {
-                if (open) HomeTelemetry.addMenuOpened();
-              }}
-            >
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Add to prompt"
-                  disabled={isSubmitting}
-                  className="flex size-8 items-center justify-center rounded-lg border border-input text-foreground transition-colors hover:bg-muted disabled:opacity-50"
-                >
-                  {uploadDocumentMutation.isPending ||
-                  recordTaskMutation.isPending ? (
-                    <ReloadIcon className="size-4 animate-spin" />
-                  ) : (
-                    <PlusIcon aria-hidden="true" className="size-4" />
-                  )}
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start">
-                {enableCopilotHandoff ? (
-                  <DropdownMenuItem
-                    disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
-                    onSelect={() => {
-                      HomeTelemetry.uploadDocumentSelected();
-                      fileInputRef.current?.click();
-                    }}
-                  >
-                    <UploadIcon className="mr-2 size-4" />
-                    Upload document
-                  </DropdownMenuItem>
-                ) : null}
-                <DropdownMenuItem
-                  onSelect={() => {
-                    HomeTelemetry.recordTaskSelected();
-                    recordTaskMutation.mutate();
-                  }}
-                >
-                  <VideoIcon className="mr-2 size-4" />
-                  Record task
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <input
-              ref={fileInputRef}
-              type="file"
-              className="hidden"
-              aria-label="Upload document"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) {
-                  uploadDocumentMutation.mutate(file);
-                }
-                event.target.value = "";
-              }}
-            />
+            {addMenu}
+            {fileInput}
             <div className="ml-auto flex items-center gap-1">
               <SpeechInputButton
                 isSupported={isSpeechSupported}

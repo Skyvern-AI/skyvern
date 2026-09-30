@@ -124,17 +124,34 @@ export function extractTitleFromYaml(yaml: string): string | null {
 
 type Span = [number, number];
 
+// The block types whose YAML carries an engine. The old editor wrote skyvern-1.0 on every one of them.
+const ENGINE_BLOCK_TYPES = new Set([
+  "task",
+  "navigation",
+  "action",
+  "extraction",
+  "login",
+  "file_download",
+  "validation",
+]);
+
 // Returns the byte span of each `engine: skyvern-1.0` line, or null when one sits where it cannot be cut
-// without rewriting its neighbours (flow style, or sharing a line with other content).
+// without rewriting its neighbours (flow style, or sharing a line with other content), or when an
+// engine-bearing block lacks skyvern-1.0, which marks a file from the new editor where 1.0 is a pin.
 function legacyEngineSpans(text: string, blocks: unknown): Span[] | null {
   if (!isSeq(blocks)) {
     return [];
   }
   const spans: Span[] = [];
   for (const block of blocks.items) {
-    if (!isMap(block)) {
-      continue;
+    // An aliased block or a merge key hides fields this pass would read, so such a file is left as written.
+    if (
+      !isMap(block) ||
+      block.items.some((pair) => isScalar(pair.key) && pair.key.value === "<<")
+    ) {
+      return null;
     }
+    const spansBefore = spans.length;
     for (const [index, pair] of block.items.entries()) {
       const { key, value } = pair;
       if (
@@ -174,6 +191,16 @@ function legacyEngineSpans(text: string, blocks: unknown): Span[] | null {
       }
       spans.push([key.range[0], next.range[0]]);
     }
+    const blockType = block.get("block_type");
+    if (
+      typeof blockType === "string" &&
+      ENGINE_BLOCK_TYPES.has(blockType) &&
+      // Validation blocks were exported without an engine key until #16538, so there an absent key is no evidence.
+      (block.has("engine") || blockType !== "validation") &&
+      spans.length === spansBefore
+    ) {
+      return null;
+    }
     const nested = legacyEngineSpans(text, block.get("loop_blocks", true));
     if (nested === null) {
       return null;
@@ -183,24 +210,28 @@ function legacyEngineSpans(text: string, blocks: unknown): Span[] | null {
   return spans;
 }
 
+export type StrippedYaml = { yaml: string; strippedLegacyEngines: boolean };
+
 // Cuts only the legacy engine lines out of the original text, so every other byte reaches the backend as written.
-export function stripLegacyEngineFromYaml(yaml: string): string {
+export function stripLegacyEngineFromYaml(yaml: string): StrippedYaml {
+  const unchanged = { yaml, strippedLegacyEngines: false };
   try {
     const document = parseDocument(yaml);
     if (document.errors.length > 0 || !isMap(document.contents)) {
-      return yaml;
+      return unchanged;
     }
     const definition = document.contents.get("workflow_definition", true);
     const spans = isMap(definition)
       ? legacyEngineSpans(yaml, definition.get("blocks", true))
       : null;
-    if (!spans) {
-      return yaml;
+    if (!spans || spans.length === 0) {
+      return unchanged;
     }
-    return spans
+    const stripped = spans
       .sort((a, b) => b[0] - a[0])
       .reduce((text, [from, to]) => text.slice(0, from) + text.slice(to), yaml);
+    return { yaml: stripped, strippedLegacyEngines: true };
   } catch {
-    return yaml;
+    return unchanged;
   }
 }
