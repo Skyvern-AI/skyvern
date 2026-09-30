@@ -1103,7 +1103,7 @@ function WorkflowsTree() {
           }}
         />
 
-        <WorkflowTemplates />
+        <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
   );

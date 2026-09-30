@@ -1383,7 +1383,7 @@ function WorkflowsFlat() {
           }}
         />
 
-        <WorkflowTemplates />
+        <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
   );

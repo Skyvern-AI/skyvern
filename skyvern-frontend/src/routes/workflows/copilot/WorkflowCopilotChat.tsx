@@ -135,6 +135,12 @@ import {
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { AutoAcceptChip } from "./AutoAcceptChip";
 import { PendingGoalChangesCard } from "./PendingGoalChangesCard";
+import {
+  TEMPLATE_GUIDANCE_MESSAGE_ID,
+  TEMPLATE_INPUTS_MESSAGE_ID,
+} from "../templateGuidance";
+import { TemplateInputsCard } from "./cards/TemplateInputsCard";
+import { useMountEffect } from "@/hooks/useMountEffect";
 import { SelectedBlockChip } from "./SelectedBlockChip";
 import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
@@ -657,6 +663,7 @@ export interface ChatMessage {
   kind?:
     | "run_lifecycle"
     | "status_notice"
+    | "template_inputs"
     | "recording_refinement"
     | "initial_handoff";
   recoveryTurnId?: string;
@@ -1286,6 +1293,9 @@ interface WorkflowCopilotChatProps {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
+  /** Assistant-authored first message shown when a template copy opens. */
+  templateGuidance?: string;
+  onTemplateGuidanceShown?: () => void;
   /** Files uploaded before the handoff; sent with the initial message. */
   initialAttachments?: Array<CopilotAttachedFile>;
   initialAction?: CopilotProductAction;
@@ -1520,6 +1530,8 @@ export function WorkflowCopilotChat({
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
+  templateGuidance,
+  onTemplateGuidanceShown,
   initialAttachments,
   initialAction,
   onInitialMessageConsumed,
@@ -1559,19 +1571,40 @@ export function WorkflowCopilotChat({
   // while the existing composer remains available for instructions and
   // clarifications. SOP upload and finishing a recording own it exclusively.
   const authoringInProgress = isUploadingSOP || recordingIsFinishing;
-  const [messages, setMessages] = useState<ChatMessage[]>(() =>
-    !initialAction && initialMessage
+  const [messages, setMessages] = useState<ChatMessage[]>(() => [
+    ...(templateGuidance
+      ? [
+          {
+            id: TEMPLATE_GUIDANCE_MESSAGE_ID,
+            sender: "ai" as const,
+            content: templateGuidance,
+            kind: "status_notice" as const,
+          },
+          {
+            id: TEMPLATE_INPUTS_MESSAGE_ID,
+            sender: "ai" as const,
+            content: "",
+            kind: "template_inputs" as const,
+          },
+        ]
+      : []),
+    ...(!initialAction && initialMessage
       ? [
           {
             id: initialHandoffMessageId,
-            sender: "user",
+            sender: "user" as const,
             content: initialMessage,
-            kind: "initial_handoff",
+            kind: "initial_handoff" as const,
             attachedFiles: initialAttachments,
           },
         ]
-      : [],
-  );
+      : []),
+  ]);
+  const templateGuidanceShownRef = useRef(onTemplateGuidanceShown);
+  templateGuidanceShownRef.current = onTemplateGuidanceShown;
+  useMountEffect(() => {
+    if (templateGuidance) templateGuidanceShownRef.current?.();
+  });
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -3083,6 +3116,13 @@ export function WorkflowCopilotChat({
               message.content === initialHandoff.content,
           );
         const nextMessages: ChatMessage[] = [
+          ...(carryForwardLifecycle
+            ? prev.filter(
+                (message) =>
+                  message.id === TEMPLATE_GUIDANCE_MESSAGE_ID ||
+                  message.id === TEMPLATE_INPUTS_MESSAGE_ID,
+              )
+            : []),
           ...(initialHandoff && !historyIncludesInitialHandoff
             ? [initialHandoff]
             : []),
@@ -9727,6 +9767,9 @@ export function WorkflowCopilotChat({
                       content={message.content}
                     />
                   );
+                }
+                if (message.kind === "template_inputs") {
+                  return <TemplateInputsCard key={message.id} />;
                 }
                 if (message.kind === "status_notice") {
                   return (
