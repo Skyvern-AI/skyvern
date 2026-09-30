@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { copyText } from "@/util/copyText";
 import { type ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { type StudioWorkspaceProps } from "./EditorTab";
 import { type StudioPaneId } from "./panes";
 import { paneAccessibleName } from "./paneMeta";
 import { paneExpansionKeyframes } from "./paneLayout";
@@ -13,7 +14,43 @@ import {
   advanceRecordingStopLifecycle,
   panesAfterRecordingTransition,
 } from "./recordingPaneLifecycle";
-import { EmbeddedBrowserOverlays, StudioPane } from "./StudioShell";
+import {
+  EmbeddedBrowserOverlays,
+  StudioPane,
+  StudioShell,
+} from "./StudioShell";
+
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: vi.fn(), captureException: vi.fn() }),
+}));
+vi.mock("@/hooks/useLogging", () => ({
+  useLogging: () => ({ error: vi.fn() }),
+}));
+vi.mock("./BrowserPaneHeader", () => ({
+  BrowserPaneActions: () => null,
+  BrowserPaneViewPills: () => null,
+}));
+vi.mock("./CopilotPaneHeader", () => ({
+  CopilotActiveDot: () => null,
+  CopilotPaneControls: () => null,
+  CopilotPaneStatus: () => null,
+}));
+vi.mock("./EditorPaneHeader", () => ({
+  EditorPaneBlockSearch: () => null,
+  EditorPaneModeToggle: () => null,
+}));
+vi.mock("./BrowserTab", () => ({ BrowserTab: () => null }));
+vi.mock("./EditorTab", () => ({ EditorTab: () => null }));
+vi.mock("./RunTab", () => ({ RunTab: () => null }));
+vi.mock("./runview/RunPaneHeader", () => ({
+  RunPaneActions: () => null,
+  RunPaneViewToggles: () => null,
+}));
+vi.mock("./StudioBrowserStream", () => ({ StudioBrowserStream: () => null }));
+vi.mock("./StudioCoachMark", () => ({ StudioCoachMark: () => null }));
+vi.mock("./StudioStageLauncher", () => ({ StudioStageLauncher: () => null }));
+vi.mock("./StudioTopBar", () => ({ StudioTopBar: () => null }));
+vi.mock("./StudioWorkflowPanels", () => ({ StudioWorkflowPanels: () => null }));
 
 vi.mock("./useRunVisuals", () => ({
   useRunVisuals: () => ({
@@ -37,6 +74,36 @@ describe("EmbeddedBrowserOverlays", () => {
 
     expect(screen.getByTestId("verification-form").textContent).toBe("wr_1");
     expect(screen.queryByText("Recording archived")).toBeNull();
+  });
+});
+
+describe("StudioShell inspected run header", () => {
+  test("keeps the run pane header plain when a run is inspected", () => {
+    const runId = "wr_synthetic_inspected_run";
+    const props = {
+      workflow: {
+        workflow_permanent_id: "wpid_synthetic",
+        organization_id: "org_synthetic",
+        deleted_at: null,
+        workflow_definition: { blocks: [] },
+      },
+      initialTitle: "Synthetic workflow",
+    } as unknown as StudioWorkspaceProps;
+
+    render(
+      <MemoryRouter
+        initialEntries={[`/workflows/wpid_synthetic/studio?wr=${runId}`]}
+      >
+        <StudioShell {...props} />
+      </MemoryRouter>,
+    );
+
+    const header = screen.getByRole("group", { name: "Run pane header" });
+    expect(within(header).getByText("Run", { exact: true })).toBeTruthy();
+    expect(header.textContent).toBe("Run");
+    expect(
+      within(header).queryByRole("button", { name: "Copy to clipboard" }),
+    ).toBeNull();
   });
 });
 
@@ -137,10 +204,6 @@ describe("paneExpansionKeyframes", () => {
   });
 });
 
-vi.mock("@/util/copyText", () => ({ copyText: vi.fn() }));
-
-const mockedCopyText = vi.mocked(copyText);
-
 // Chromium aborts a native drag when the DOM mutates inside the dragstart
 // task, so the reorder state (drop overlays, source dim) must engage on a
 // later task. These tests pin that timing contract; only a real mouse drag
@@ -150,7 +213,6 @@ describe("StudioPane header", () => {
 
   const renderPane = ({
     id = "copilot",
-    runId,
     headerActions,
     expanded = false,
     expansionTransitioning = false,
@@ -159,7 +221,6 @@ describe("StudioPane header", () => {
     onTransitionEnd,
   }: {
     id?: StudioPaneId;
-    runId?: string;
     headerActions?: ReactNode;
     expanded?: boolean;
     expansionTransitioning?: boolean;
@@ -184,7 +245,6 @@ describe("StudioPane header", () => {
       <TooltipProvider delayDuration={0}>
         <StudioPane
           id={id}
-          runId={runId}
           open
           order={0}
           flex={undefined}
@@ -388,36 +448,13 @@ describe("StudioPane header", () => {
     expect(reorder.onStart).not.toHaveBeenCalled();
   });
 
-  test("a drag starting on the run id copy control is prevented", () => {
-    const { reorder, header } = renderPane({
-      id: "overview",
-      runId: "wr_5574abcdef",
-    });
+  test("the run pane header stays plain and has no copy action", () => {
+    renderPane({ id: "overview" });
 
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: "Copy to clipboard" }),
-    );
-    const notPrevented = fireEvent.dragStart(header, {
-      dataTransfer: dataTransfer(),
-    });
-
-    expect(notPrevented).toBe(false);
-    vi.runAllTimers();
-    expect(reorder.onStart).not.toHaveBeenCalled();
-  });
-
-  test("shows the full run id on hover and copies it from the header control", () => {
-    const runId = "wr_5574abcdef";
-    renderPane({ id: "overview", runId });
-
-    expect(screen.getByText("Run: wr_5574…")).toBeTruthy();
-    const fullRunId = screen.getByText(`Run: ${runId}`);
-    expect(fullRunId.getAttribute("title")).toBe(`Run: ${runId}`);
-    expect(fullRunId.className).toContain("truncate");
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy to clipboard" }));
-
-    expect(mockedCopyText).toHaveBeenCalledWith(runId);
+    expect(screen.getByText("Run")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Copy to clipboard" }),
+    ).toBeNull();
   });
 
   test("groups pane utilities separately from close", () => {
