@@ -8,6 +8,7 @@ the model tries to narrate a completion. A failure inside Skyvern's own proxy ho
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import mock
@@ -45,7 +46,7 @@ from skyvern.forge.sdk.copilot.nav_attribution import (
     proxy_owns_nav_codes,
 )
 from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY
-from skyvern.forge.sdk.copilot.run_outcome import _DISPLAY_REASON_MAX_CHARS
+from skyvern.forge.sdk.copilot.run_outcome import _DISPLAY_REASON_MAX_CHARS, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime import mcp_to_copilot
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import _error_text_requires_stop
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
@@ -66,12 +67,13 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.navigation import driver_nav_error_code
-from tests.unit.copilot_test_helpers import install_run_blocks_harness, make_copilot_ctx
+from tests.unit.copilot_test_helpers import install_run_blocks_harness, make_copilot_ctx, stub_copilot_agent_loop
 from tests.unit.force_stub_app import admit_block_dispatch
 from tests.unit.test_missing_starter_url import _mock_block_execute_deps, _output_parameter
 
@@ -269,7 +271,6 @@ _TARGET_OWNED_ARMS = [
         "net::ERR_NAME_RESOLUTION_FAILED",
         id="name_resolution_mid_string",
     ),
-    pytest.param("SSL error: net::ERR_SSL_PROTOCOL_ERROR", "net::ERR_SSL_PROTOCOL_ERROR", id="ssl_prefixed"),
     pytest.param(_DNS_FAILURE_WITH_PROXY_TOKEN_IN_URL, "net::ERR_NAME_NOT_RESOLVED", id="dns_alongside_proxy_code"),
     pytest.param(
         "net::ERR_SOCKS_CONNECTION_FAILED then net::ERR_CERT_DATE_INVALID on retry",
@@ -624,6 +625,11 @@ def test_proxy_codes_are_subtracted_from_the_browser_skip_set() -> None:
             False,
             id="a_target_code_alongside_disqualifies",
         ),
+        pytest.param(
+            ["net::ERR_TUNNEL_CONNECTION_FAILED", "net::ERR_SSL_PROTOCOL_ERROR"],
+            False,
+            id="an_ssl_code_alongside_a_proxy_code_disqualifies",
+        ),
         pytest.param(["FILE_PARSER_ERROR"], False, id="an_unrelated_block_code"),
         pytest.param([], False, id="the_driver_reported_nothing"),
     ],
@@ -693,6 +699,97 @@ def test_proxy_transport_run_keeps_proposal_and_reaches_repair(reason: str, bloc
     error_code = reason.rsplit(" ", 1)[-1]
     assert error_code.startswith("net::ERR_")
     assert error_code in outcome.display_reason
+    assert "verify the URL" not in outcome.display_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "extra_codes"),
+    [
+        pytest.param("net::ERR_SSL_PROTOCOL_ERROR", [], id="protocol_error"),
+        pytest.param("net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH", [], id="version_or_cipher_mismatch"),
+        pytest.param("net::ERR_SSL_CLIENT_AUTH_CERT_NO_PRIVATE_KEY", [], id="client_certificate_problem"),
+        pytest.param(
+            "net::ERR_SSL_PROTOCOL_ERROR", ["net::ERR_TUNNEL_CONNECTION_FAILED"], id="ssl_alongside_a_tunnel_code"
+        ),
+    ],
+)
+async def test_unknown_owner_ssl_run_keeps_reply_and_draft_without_latching(
+    monkeypatch: pytest.MonkeyPatch, code: str, extra_codes: list[str]
+) -> None:
+    url = "https://localhost:8900/tls_repair/"
+    driver_message = f'Page.goto: {code} at {url}\nCall log:\n  - navigating to "{url}", waiting until "load"\n'
+    reason = str(FailedToNavigateToUrl(url, driver_message))
+    reply = "The page load failed with a TLS protocol error, so the draft is untested."
+    contexts: list[CopilotContext] = []
+    outcomes: list[RecordedRunOutcome | None] = []
+
+    # Ends the way run_with_enforcement does, so a latched stop reaches the agent's own exit handler.
+    async def ssl_turn(*, ctx: CopilotContext, **_kwargs: object) -> SimpleNamespace:
+        ctx.test_after_update_done = True
+        ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
+        ctx.has_staged_proposal = True
+        ctx.staged_workflow_yaml = "title: staged"
+        contexts.append(ctx)
+        outcomes.append(
+            _record_run_blocks_result(
+                ctx,
+                {
+                    "ok": False,
+                    "data": {
+                        "blocks": [
+                            {
+                                "label": "failed_navigation",
+                                "block_type": "navigation",
+                                "status": "failed",
+                                "failure_reason": reason,
+                                "error_codes": [*extra_codes, driver_nav_error_code(driver_message)],
+                            }
+                        ]
+                    },
+                },
+            )
+        )
+        _maybe_raise_non_retriable_nav(ctx)
+        return SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": reply}), new_items=[])
+
+    stub_copilot_agent_loop(monkeypatch, ssl_turn)
+    result = await agent_module.run_copilot_agent(
+        stream=mock.MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            workflow_permanent_id="wfp-1",
+            workflow_id="wf-1",
+            workflow_copilot_chat_id="chat-1",
+            message="run this workflow and tell me Monday's high tide",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+    )
+
+    assert result.user_response == reply
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason is None
+    assert result.staged_workflow_yaml == "title: staged"
+
+    (ctx,) = contexts
+    (outcome,) = outcomes
+    assert outcome is not None
+    assert ctx.last_test_non_retriable_nav_error is None
+    assert ctx.last_test_proxy_owned_failure is False
+    assert ctx.has_staged_proposal is True
+    assert ctx.last_test_ok is False
+    assert ctx.verified_terminal_proposal_ready is False
+    assert outcome.verdict == "not_demonstrated"
+    assert outcome.display_reason is not None
+    assert code in outcome.display_reason
+    assert not outcome.display_reason.startswith("Skyvern proxy hop failed")
     assert "verify the URL" not in outcome.display_reason
 
 
