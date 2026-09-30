@@ -371,6 +371,46 @@ async def test_explicit_cache_envelope_leaves_other_routes_unchanged(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["anthropic/claude-sonnet-5-5", "bedrock/global.anthropic.claude-sonnet-5-5"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_cacheable_system_instructions_survive_provider_message_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    stream: bool,
+) -> None:
+    prompt = CacheableSystemInstructions("stable instructions", "\ndynamic context", cache_namespace="wcc_test")
+    copied_messages: list[list[dict[str, Any]]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse | AsyncStream[ChatCompletionChunk]:
+        copied_messages.append(copy.deepcopy(kwargs["messages"]))
+        if kwargs.get("stream"):
+            return cast(AsyncStream[ChatCompletionChunk], _ChunkStream(_stream_chunks()))
+        return _completion()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    model = CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1)
+    if stream:
+        events = [
+            event
+            async for event in model.stream_response(
+                system_instructions=prompt,
+                input=[{"role": "user", "content": "Return 42"}],
+                model_settings=ModelSettings(include_usage=True),
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+            )
+        ]
+        response = events[-1].response
+    else:
+        response = await _get_response(model, system_instructions=prompt)
+
+    assert copied_messages[0][0] == {"role": "system", "content": str(prompt)}
+    assert ItemHelpers.extract_last_text(response.output[-1]) == "42"
+
+
+@pytest.mark.asyncio
 async def test_stream_capture_preserves_events_order_and_backpressure(monkeypatch: pytest.MonkeyPatch) -> None:
     requests: list[bytes] = []
     streams: list[_ChunkStream] = []

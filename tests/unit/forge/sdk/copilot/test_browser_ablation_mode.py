@@ -163,6 +163,7 @@ def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
         "get_org_workflow",
         "list_workflow_schedules",
         "get_workflow_schedule",
+        "list_workflow_runs",
     )
     assert withheld.alias_map == {name: aliases[name] for name in withheld.ordered_mcp_names}
     assert withheld.overlays == {name: overlays[name] for name in withheld.ordered_mcp_names}

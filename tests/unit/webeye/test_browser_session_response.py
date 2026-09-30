@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -149,6 +150,231 @@ async def test_browser_session_response_bounds_infrastructure_recording_selectio
 
     selector.assert_awaited_once()
     assert response.recordings == []
+
+
+class FakeListing:
+    """A storage listing that returns or raises its outcome once released, or never finishes when held."""
+
+    def __init__(self, outcome: list[FileInfo] | Exception, *, held: bool = False) -> None:
+        self.outcome = outcome
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        if not held:
+            self.release.set()
+        self.in_flight = False
+
+    async def __call__(self, **_kwargs: object) -> list[FileInfo]:
+        self.in_flight = True
+        self.started.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.in_flight = False
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+def storage_listing(downloads: FakeListing, recordings: FakeListing) -> MagicMock:
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = downloads
+    storage.get_shared_recordings_in_browser_session = recordings
+    return storage
+
+
+def completed_session() -> PersistentBrowserSession:
+    now = datetime.now(timezone.utc)
+    return PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="completed",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+DOWNLOAD = FileInfo(url="https://files.example/report.pdf", filename="report.pdf")
+RECORDING = FileInfo(url="https://recordings.example/session.webm", filename="session.webm")
+
+
+@pytest.fixture
+def base_agent_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stub app mocks the agent function; these tests need the hooks to pass values through."""
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+
+
+@pytest.mark.usefixtures("base_agent_function")
+@pytest.mark.asyncio
+async def test_browser_session_response_runs_the_downloads_and_recordings_listings_together() -> None:
+    downloads = FakeListing([DOWNLOAD])
+    recordings = FakeListing([RECORDING])
+    # Each listing finishes only once the other has started, so neither can finish unless they overlap.
+    downloads.release, recordings.release = recordings.started, downloads.started
+
+    response = await asyncio.wait_for(
+        BrowserSessionResponse.from_browser_session(
+            completed_session(), storage_listing(downloads, recordings), concurrent_listings=True
+        ),
+        timeout=1,
+    )
+
+    assert response.downloaded_files == [DOWNLOAD]
+    assert response.recordings == [RECORDING]
+
+
+@pytest.mark.usefixtures("base_agent_function")
+@pytest.mark.asyncio
+async def test_browser_session_response_lists_downloads_then_recordings_by_default() -> None:
+    """The fan-out endpoints gather across sessions already, so a session's two listings must not
+    overlap there: that would double the request's peak pool checkouts for no gain."""
+    downloads = FakeListing([DOWNLOAD], held=True)
+    recordings = FakeListing([RECORDING])
+    building = asyncio.create_task(
+        BrowserSessionResponse.from_browser_session(completed_session(), storage_listing(downloads, recordings))
+    )
+    await asyncio.wait_for(downloads.started.wait(), timeout=1)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert not recordings.started.is_set()
+
+    downloads.release.set()
+    response = await asyncio.wait_for(building, timeout=1)
+    assert response.downloaded_files == [DOWNLOAD]
+    assert response.recordings == [RECORDING]
+
+
+@pytest.mark.parametrize(
+    ("downloads_error", "raised"),
+    [(RuntimeError("storage unavailable"), RuntimeError), (TimeoutError(), HTTPException)],
+    ids=["error", "strict-timeout"],
+)
+@pytest.mark.asyncio
+async def test_browser_session_response_stops_the_recordings_listing_when_the_downloads_listing_fails(
+    downloads_error: Exception, raised: type[Exception]
+) -> None:
+    downloads = FakeListing(downloads_error)
+    recordings = FakeListing([RECORDING], held=True)
+    downloads.release = recordings.started
+
+    with pytest.raises(raised):
+        await asyncio.wait_for(
+            BrowserSessionResponse.from_browser_session(
+                completed_session(),
+                storage_listing(downloads, recordings),
+                fail_download_lookup=True,
+                concurrent_listings=True,
+            ),
+            timeout=1,
+        )
+
+    assert recordings.started.is_set()
+    assert not recordings.in_flight
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_answers_for_the_downloads_listing_when_both_listings_fail() -> None:
+    """A storage outage fails both listings; the strict lookup's retryable 503 must not lose to the recordings error."""
+    downloads = FakeListing(TimeoutError())
+    recordings = FakeListing(RuntimeError("storage unavailable"))
+    downloads.release = recordings.started
+
+    with pytest.raises(HTTPException) as exc_info:
+        await asyncio.wait_for(
+            BrowserSessionResponse.from_browser_session(
+                completed_session(),
+                storage_listing(downloads, recordings),
+                fail_download_lookup=True,
+                concurrent_listings=True,
+            ),
+            timeout=1,
+        )
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_stops_both_listings_when_the_request_is_cancelled() -> None:
+    downloads = FakeListing([DOWNLOAD], held=True)
+    recordings = FakeListing([RECORDING], held=True)
+    building = asyncio.create_task(
+        BrowserSessionResponse.from_browser_session(
+            completed_session(), storage_listing(downloads, recordings), concurrent_listings=True
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(downloads.started.wait(), recordings.started.wait()), timeout=1)
+
+    building.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await building
+
+    assert not downloads.in_flight
+    assert not recordings.in_flight
+
+
+@pytest.mark.usefixtures("base_agent_function")
+@pytest.mark.asyncio
+async def test_browser_session_response_keeps_downloads_when_the_recordings_listing_runs_out_of_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strict lookup answers 503 only for its own listing; a stalled recordings listing is not its failure."""
+    storage = storage_listing(downloads=FakeListing([DOWNLOAD]), recordings=FakeListing([RECORDING], held=True))
+    monkeypatch.setattr(browser_session_schemas, "GET_DOWNLOADED_FILES_TIMEOUT", 0.01)
+
+    response = await asyncio.wait_for(
+        BrowserSessionResponse.from_browser_session(completed_session(), storage, fail_download_lookup=True),
+        timeout=1,
+    )
+
+    assert response.downloaded_files == [DOWNLOAD]
+    assert response.recordings == []
+
+
+@pytest.mark.usefixtures("base_agent_function")
+@pytest.mark.asyncio
+async def test_browser_session_response_keeps_recordings_when_the_downloads_listing_runs_out_of_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = storage_listing(downloads=FakeListing([DOWNLOAD], held=True), recordings=FakeListing([RECORDING]))
+    monkeypatch.setattr(browser_session_schemas, "GET_DOWNLOADED_FILES_TIMEOUT", 0.01)
+
+    response = await asyncio.wait_for(
+        BrowserSessionResponse.from_browser_session(completed_session(), storage), timeout=1
+    )
+
+    assert response.downloaded_files == []
+    assert response.recordings == [RECORDING]
+
+
+@pytest.mark.parametrize("failing", ["downloads", "recordings"])
+@pytest.mark.asyncio
+async def test_browser_session_response_surfaces_a_listing_error_that_is_not_a_timeout(failing: str) -> None:
+    error = RuntimeError("storage unavailable")
+    storage = storage_listing(
+        downloads=FakeListing(error if failing == "downloads" else [DOWNLOAD]),
+        recordings=FakeListing(error if failing == "recordings" else [RECORDING]),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await BrowserSessionResponse.from_browser_session(completed_session(), storage)
+
+    assert exc_info.value is error
+
+
+@pytest.mark.usefixtures("base_agent_function")
+@pytest.mark.asyncio
+async def test_browser_session_response_lists_files_newest_first_with_undated_files_last() -> None:
+    older = FileInfo(url="https://files.example/older", modified_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    newer = FileInfo(url="https://files.example/newer", modified_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    undated = FileInfo(url="https://files.example/undated")
+    storage = storage_listing(
+        downloads=FakeListing([older, undated, newer]), recordings=FakeListing([undated, newer, older])
+    )
+
+    response = await BrowserSessionResponse.from_browser_session(completed_session(), storage)
+
+    assert response.downloaded_files == [newer, older, undated]
+    assert response.recordings == [newer, older, undated]
 
 
 def test_no_server_side_row_field_becomes_a_response_field() -> None:

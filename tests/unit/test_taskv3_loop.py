@@ -63,6 +63,8 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    TOKEN_BUDGET_EXTENDED_EVENT,
+    TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
     UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
     ActivityRecency,
@@ -104,8 +106,10 @@ class _ScriptedCaller:
         script: list[list[tuple[str, dict[str, Any]]]],
         texts: list[str] | None = None,
         reasoning_contents: list[str | None] | None = None,
+        turn_tokens: int = 15,
     ) -> None:
         self._script = script
+        self._turn_tokens = turn_tokens
         # Per-turn assistant text, indexed like `script`; falls back to a fixed placeholder so
         # existing callers that don't care about the text still get a non-empty one.
         self._texts = texts
@@ -167,7 +171,10 @@ class _ScriptedCaller:
                 {"id": f"call_{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
                 for i, (name, args) in enumerate(turn)
             ]
-        return {"choices": [{"message": message}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        return {
+            "choices": [{"message": message}],
+            "usage": {"prompt_tokens": self._turn_tokens - 5, "completion_tokens": 5},
+        }
 
 
 def _recording_tool(
@@ -240,9 +247,10 @@ async def _run(
     *,
     texts: list[str] | None = None,
     reasoning_contents: list[str | None] | None = None,
+    turn_tokens: int = 15,
     **kwargs: Any,
 ):
-    caller = _ScriptedCaller(script, texts=texts, reasoning_contents=reasoning_contents)
+    caller = _ScriptedCaller(script, texts=texts, reasoning_contents=reasoning_contents, turn_tokens=turn_tokens)
     defaults = {"max_turns": 20, "max_tool_calls": 100}
     defaults.update(kwargs)
     outcome = await run_agent_tool_loop(
@@ -3425,6 +3433,346 @@ async def test_extension_past_the_token_ceiling_reports_the_clamp() -> None:
     clamped = [entry for entry in logs if entry.get("log_code") == "taskv3_token_backstop_clamped"]
     assert len(clamped) == 1, "reported once per run, not once per grant"
     assert clamped[0]["step_cap"] == base_cap + base_cap // 2
+
+
+@pytest.mark.asyncio
+async def test_a_token_trip_without_page_change_evidence_is_not_extended() -> None:
+    # A perception spiral re-reading an unchanged page is what the token backstop exists for: with the
+    # step budget unspent, it must still trip exactly as before the token-side extension.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = [[("click", {"selector": "#a"})]] + [[("observe", {})] for _ in range(8)]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_perception_tool("observe", "the same page"), _recording_tool("click", clicks, billable=True)],
+            max_action_steps=24,
+            max_tokens=75,
+            backstops_for_cap=taskv3_runaway_backstops,
+        )
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tokens (75) reached"
+    assert not [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [(entry["guard"], entry["gate_reason"]) for entry in refused] == [
+        ("max_tokens", "no_recent_page_change_evidence")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_token_grant_must_be_re_earned_on_new_page_change_evidence() -> None:
+    # Evidence recency is counted in action rounds, and re-reading a page advances none, so without this a
+    # single page change would fund every later grant of a run that has stopped acting.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(3):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    script += [[("observe", {})] for _ in range(8)]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_perception_tool("observe", ["page 1", "page 2", "page 3", "page 4"]), _billable_tool("click", clicks)],
+            max_action_steps=24,
+            max_tokens=120,
+            backstops_for_cap=lambda cap: (1000, 1000, cap * 5),
+        )
+    assert [entry["max_tokens"] for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT] == [180]
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [entry["gate_reason"] for entry in refused] == ["no_recent_page_change_evidence"]
+    assert outcome.cap_trip == "max_tokens (180) reached"
+
+
+_AFTER_THE_FIRST_GRANT: dict[str, list[list[tuple[str, dict[str, Any]]]]] = {
+    "zero_actions": [[("observe", {})] for _ in range(8)],
+    "one_hover_per_six_rereads": ([[("hover", {"selector": "#logo"})]] + [[("observe", {})] for _ in range(6)]) * 2,
+    "identical_submit_retries": [[("click", {"selector": "#submit"}), ("observe", {})] for _ in range(8)],
+    # A new action, but the only fresh read came before it: the change was not the action's.
+    "new_action_after_the_read": [[("observe", {})], [("observe", {})], [("hover", {"selector": "#menu"})]]
+    + [[("wait", {})] for _ in range(6)],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pattern", "reason"),
+    [
+        ("zero_actions", "no_new_action_since_last_token_grant"),
+        ("one_hover_per_six_rereads", "no_new_action_since_last_token_grant"),
+        ("identical_submit_retries", "no_new_action_since_last_token_grant"),
+        ("new_action_after_the_read", "no_page_change_after_the_new_action"),
+    ],
+)
+async def test_a_spiral_on_ever_changing_content_gets_no_second_token_grant(pattern: str, reason: str) -> None:
+    # A clock or rotating text makes every re-read fresh evidence, so a renewal needs an action the run has not
+    # already made, followed by a page change. Repeating one action or reading before acting does not count.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    for action in (("click", "#a0"), ("hover", "#logo"), ("click", "#submit")):
+        script.append([(action[0], {"selector": action[1]})])
+        script.append([("observe", {})])
+    script += _AFTER_THE_FIRST_GRANT[pattern]
+    tools = [
+        _perception_tool("observe", [f"clock at 10:{i:02d}" for i in range(60)]),
+        _billable_tool("click", clicks),
+        _billable_tool("hover", clicks),
+        _recording_tool("wait", clicks),
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            tools,
+            max_action_steps=24,
+            max_turns=100,
+            max_tokens=120,
+            backstops_for_cap=lambda cap: (1000, 1000, cap * 5),
+        )
+    assert [entry["max_tokens"] for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT] == [180]
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [entry["gate_reason"] for entry in refused] == [reason]
+    assert outcome.cap_trip == "max_tokens (180) reached"
+
+
+@pytest.mark.asyncio
+async def test_an_action_that_failed_before_counts_as_new_when_it_first_succeeds() -> None:
+    # Only a successful action is "made": a field typed once, rejected, and typed again renews the grant.
+    typed: list[tuple[str, dict[str, Any]]] = []
+    attempts: dict[str, int] = {}
+
+    async def flaky_type(args: dict[str, Any]) -> ToolResult:
+        typed.append(("type", args))
+        attempts[args["selector"]] = attempts.get(args["selector"], 0) + 1
+        return ToolResult.error("field rejected") if attempts[args["selector"]] == 1 else ToolResult.ok("typed")
+
+    type_tool = ToolSpec(
+        name="type",
+        description="type",
+        parameters={"type": "object", "properties": {}},
+        handler=flaky_type,
+        billable=True,
+    )
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    for i in range(3):
+        script.append([("click", {"selector": f"#a{i}"})])
+        script.append([("observe", {})])
+    script += [[("type", {"selector": "#f"})], [("observe", {})], [("type", {"selector": "#f"})]]
+    script += [[("observe", {})] for _ in range(8)]
+    with capture_logs() as logs:
+        await _run(
+            script,
+            [_perception_tool("observe", [f"page {i}" for i in range(60)]), _billable_tool("click", clicks), type_tool],
+            max_action_steps=24,
+            max_turns=100,
+            max_tokens=120,
+            backstops_for_cap=lambda cap: (1000, 1000, cap * 5),
+        )
+    assert [entry["max_tokens"] for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT] == [180, 240]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("batch", "grants", "reasons"),
+    [
+        # The new action and the fresh read share one action round; the read still came after the action.
+        (
+            [("type", {"selector": "#new", "text": "x"}), ("observe", {})],
+            [180, 240],
+            ["no_recent_page_change_evidence"],
+        ),
+        ([("observe", {}), ("hover", {"selector": "#new"})], [180], ["no_page_change_after_the_new_action"]),
+        # The action's own result reports the page changed: that evidence is the action's, so it follows it.
+        ([("advance", {"selector": "#new"})], [180, 240], ["no_recent_page_change_evidence"]),
+    ],
+)
+async def test_a_batched_new_action_is_ordered_against_its_evidence_within_the_round(
+    batch: list[tuple[str, dict[str, Any]]], grants: list[int], reasons: list[str]
+) -> None:
+    sink: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    for action in (("click", "#a0"), ("hover", "#logo"), ("click", "#submit")):
+        script.append([(action[0], {"selector": action[1]})])
+        script.append([("observe", {})])
+    script += [[("wait", {})] for _ in range(4)] + [batch]
+    tools = [
+        _perception_tool("observe", [f"clock at 10:{i:02d}" for i in range(60)]),
+        _billable_tool("click", sink),
+        _billable_tool("hover", sink),
+        _billable_tool("type", sink),
+        _recording_tool("wait", sink),
+        _recording_tool("advance", sink, billable=True, ok_data={"page_state_changed": True}),
+    ]
+    with capture_logs() as logs:
+        await _run(
+            script,
+            tools,
+            max_action_steps=24,
+            max_turns=100,
+            max_tokens=120,
+            backstops_for_cap=lambda cap: (1000, 1000, cap * 5),
+        )
+    assert [entry["max_tokens"] for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT] == grants
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [entry["gate_reason"] for entry in refused] == reasons
+
+
+@pytest.mark.asyncio
+async def test_a_token_grant_is_clamped_to_the_pool_and_published_to_the_live_activity_record() -> None:
+    # The org's workflow-run pool bounds the token grant as it bounds a step grant: 30 steps left on a 24-step
+    # cap funds the 30-step token guard, not the 36-step one. The raised guard reaches ActivityRecency at once.
+    activity = ActivityRecency()
+    remaining_at_call: list[int | None] = []
+
+    class _ActivityReadingCaller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            remaining_at_call.append(activity.tokens_remaining)
+            return await super().call(**kwargs)
+
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(10):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    with capture_logs() as logs:
+        outcome = await run_agent_tool_loop(
+            llm_caller=_ActivityReadingCaller(script, turn_tokens=100_000),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=[_perception_tool("observe", [f"page {i}" for i in range(40)]), _billable_tool("click", clicks)],
+            max_turns=200,
+            max_tool_calls=500,
+            max_action_steps=24,
+            max_action_steps_ceiling=30,
+            max_tokens=1_500_000,
+            final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
+            backstops_for_cap=taskv3_runaway_backstops,
+            activity=activity,
+        )
+    granted = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
+    assert [(entry["max_tokens"], entry["token_extensions_granted"], entry["base_cap"]) for entry in granted] == [
+        (taskv3_runaway_backstops(30)[2], 1, 24)
+    ]
+    grant_turn = granted[0]["turn"]
+    assert remaining_at_call[grant_turn] == taskv3_runaway_backstops(30)[2] - 100_000 * grant_turn
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [entry["gate_reason"] for entry in refused] == ["extension_limit_reached"]
+    assert outcome.cap_trip == f"max_tokens ({taskv3_runaway_backstops(30)[2]}) reached"
+
+
+@pytest.mark.asyncio
+async def test_a_step_grant_after_a_token_grant_does_not_report_a_token_clamp() -> None:
+    # A token grant already raised max_tokens to the extended cap's value, so the later step grant buys no
+    # tokens; that is not the sizing function flattening at its ceiling and must not be reported as one.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(12):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    with capture_logs() as logs:
+        await _run(
+            script,
+            [_perception_tool("observe", [f"page {i}" for i in range(40)]), _billable_tool("click", clicks)],
+            max_action_steps=10,
+            max_turns=60,
+            max_tokens=100,
+            backstops_for_cap=lambda cap: (cap * 6, cap * 25, cap * 50),
+        )
+    token_grants = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
+    step_grants = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+    assert token_grants[0]["max_tokens"] == 750 and token_grants[0]["turn"] < step_grants[0]["turn"]
+    assert step_grants[0]["max_tokens"] == 750
+    assert not [entry for entry in logs if entry.get("log_code") == "taskv3_token_backstop_clamped"]
+
+
+@pytest.mark.asyncio
+async def test_a_token_trip_on_a_stalled_form_is_not_extended_despite_fresh_content() -> None:
+    # Fresh observe content is evidence, but a form whose invalid-field count has not fallen across a
+    # full progress window is stalled, and the stall veto binds on the token path as on the step path.
+    reads = {"n": 0}
+
+    async def observe_handler(args: dict[str, Any]) -> ToolResult:
+        reads["n"] += 1
+        return ToolResult.ok(f"form, look {reads['n']}", data={"summary": {"invalid_fields": 3}})
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe_handler,
+        compactable=True,
+    )
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(PROGRESS_LEDGER_WINDOW + 1):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, _recording_tool("click", clicks, billable=True)],
+            max_action_steps=24,
+            max_turns=100,
+            max_tokens=15 * len(script),
+            backstops_for_cap=taskv3_runaway_backstops,
+        )
+    assert outcome.cap_trip == f"max_tokens ({15 * len(script)}) reached"
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [entry["gate_reason"] for entry in refused] == ["no_net_progress_window"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_action_steps", "turn_tokens", "reserve", "backstops", "expected_caps", "stop_reason"),
+    [
+        # Each grant funds half the ORIGINAL step cap's worth of tokens, and growth stops where the
+        # step path's would: at ACTION_BUDGET_EXTENSION_MAX_FACTOR times the original cap.
+        (20, 15, 0, lambda cap: (1000, 1000, cap * 5), [150, 200, 250, 300], "extension_limit_reached"),
+        # The real sizing policy clamps at MAX_TOKENS_CEILING, and a grant with nothing left to buy stops.
+        (
+            64,
+            500_000,
+            MAX_TOKENS_PER_ACTION_STEP,
+            taskv3_runaway_backstops,
+            [MAX_TOKENS_CEILING],
+            "token_ceiling_reached",
+        ),
+    ],
+)
+async def test_token_budget_extension_repeats_but_stops_at_its_bounds(
+    max_action_steps: int,
+    turn_tokens: int,
+    reserve: int,
+    backstops: Callable[[int], tuple[int, int, int]],
+    expected_caps: list[int],
+    stop_reason: str,
+) -> None:
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 60)])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(30):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    initial_max_tokens = backstops(max_action_steps)[2]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, _recording_tool("click", clicks, billable=True)],
+            max_action_steps=max_action_steps,
+            max_turns=1000,
+            max_tool_calls=1000,
+            max_tokens=initial_max_tokens,
+            turn_tokens=turn_tokens,
+            final_turn_token_reserve=reserve,
+            backstops_for_cap=backstops,
+        )
+    granted = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
+    assert [entry["max_tokens"] for entry in granted] == expected_caps
+    assert max(entry["max_tokens"] for entry in granted) <= min(
+        MAX_TOKENS_CEILING, backstops(max_action_steps * ACTION_BUDGET_EXTENSION_MAX_FACTOR)[2]
+    )
+    refused = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert [entry["gate_reason"] for entry in refused] == [stop_reason]
+    assert outcome.cap_trip == f"max_tokens ({expected_caps[-1]}) reached"
+    assert len(clicks) < max_action_steps, "the step budget was never the binding cap"
 
 
 def test_budget_extension_gate_credits_the_headroom_the_grant_itself_creates() -> None:

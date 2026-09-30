@@ -67,11 +67,12 @@ from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
-from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
+from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE, CodeProgressRecord
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_GUARD,
     NAV_DEAD_END_GUARD,
+    TOKEN_BUDGET_EXTENDED_EVENT,
     LoopOutcome,
     RoundAction,
     ToolSpec,
@@ -103,6 +104,7 @@ from skyvern.webeye.actions.actions import (
 from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_engine import _fixed_read_tool, _ReaskAnsweringCaller
+from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
 
 
@@ -131,6 +133,7 @@ async def _run_execute_task_v3(
     own_block_row: WorkflowRunBlock | None = None,
     own_block_lookup_raises: BaseException | None = None,
     workflow_owned_recovery: bool = False,
+    recovery_code_progress: CodeProgressRecord | None = None,
     landed_url: str | None = None,
     navigation_status: int | None = None,
     page_url_after_settle: str | None = None,
@@ -142,6 +145,8 @@ async def _run_execute_task_v3(
     # Called with the loop's kwargs before the loop returns, to drive state the loop's tools own.
     on_loop: Callable[[dict[str, Any]], None] | None = None,
     on_loop_async: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    # Replaces the canned `outcome`: receives the kwargs agent.py built and returns the loop's outcome.
+    loop_body: Callable[[dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
     # A prompt the fake loop hands the goal judge, the way the finish gate would, when one was built.
     goal_judge_prompt: str | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
@@ -195,6 +200,8 @@ async def _run_execute_task_v3(
             on_loop(kwargs)
         if on_loop_async is not None:
             await on_loop_async(kwargs)
+        if loop_body is not None:
+            return await loop_body(kwargs)
         if goal_judge_prompt is not None and kwargs.get("goal_judge") is not None:
             page.is_closed = MagicMock(return_value=False)
             loop_mock.goal_judge_response = await kwargs["goal_judge"](goal_judge_prompt)
@@ -289,6 +296,7 @@ async def _run_execute_task_v3(
             task_block=task_block,
             workflow_owned_recovery=workflow_owned_recovery,
             recovery_credential_parameter_keys=recovery_credential_parameter_keys,
+            recovery_code_progress=recovery_code_progress,
         )
     finally:
         skyvern_context.reset()
@@ -2013,6 +2021,7 @@ async def _run_execute_step_gate(
     experimentation_provider: BaseExperimentationProvider | None = None,
     workflow_run: Any = None,
     workflow_owned_recovery: bool = False,
+    recovery_code_progress: CodeProgressRecord | None = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2068,6 +2077,7 @@ async def _run_execute_step_gate(
                     engine=engine,
                     task_block=task_block,
                     workflow_owned_recovery=workflow_owned_recovery,
+                    recovery_code_progress=recovery_code_progress,
                     download_baseline_files=[],
                 )
             except _StepEngineDispatched:
@@ -2210,6 +2220,22 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
     assert any(
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_step_hands_the_recovery_code_outline_to_the_v3_run() -> None:
+    record = CodeProgressRecord(before=(), failed_step="click export", failed_line=3, after=())
+
+    v3_mock, _step_engine_mock = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        workflow_owned_recovery=True,
+        recovery_code_progress=record,
+        workflow_run_id="wr_recovery_outline",
+    )
+
+    v3_mock.assert_awaited_once()
+    assert v3_mock.await_args.kwargs["recovery_code_progress"] is record
 
 
 @pytest.mark.asyncio
@@ -2970,6 +2996,70 @@ async def test_execute_task_v3_atomic_block_ceiling_pinned_to_its_own_cap(monkey
     assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 5
 
 
+class _AdvancingFormPage(_FakePage):
+    """Every action advances the form, so the next observe is fresh page-change evidence."""
+
+    async def evaluate(self, _js: str) -> str:
+        raw = await super().evaluate(_js)
+        if "document.readyState" in _js:
+            return raw
+        section = sum(1 for name, _args in self.calls if name in ("click", "fill", "type"))
+        data = json.loads(raw)
+        data["title"] = f"Apply, section {section}"
+        data["elements"][0]["label"] = f"Section {section} first name"
+        return json.dumps(data)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_navigation_block_token_trip_with_progress_is_extended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A long form resends a growing transcript, so the token backstop trips while most of the step budget is
+    # unspent. Driven through agent.py with the real engine and loop, so the step floor, ceilings and backstops
+    # agent.py configures are the ones the grant must survive. The form is filled one field per round, and each
+    # new field followed by a changed page renews the grant.
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(5):
+        script.append([("observe", {})])
+        script.append([("type", {"selector": f"#field-{i}", "text": f"answer {i}"})])
+    script.append([("observe", {})])
+    script.append([("click", {"selector": "#submit"})])
+    script.append([("finish", {"status": "completed", "reason": "submitted"})])
+    caller = _ScriptedCaller(script, turn_tokens=200_000)
+    page = _AdvancingFormPage()
+    loop_kwargs: dict[str, Any] = {}
+
+    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return await run_task_v3_agent_loop(
+            # The scripted caller takes no step-scoped call kwargs.
+            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
+        )
+
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=None))
+    with capture_logs() as logs:
+        _step, task, _loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
+            task_block=_make_block(NavigationBlock, navigation_goal="Fill and submit the application"),
+            workflow_run_id="wr_long_form",
+            max_steps_per_run=10,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            loop_body=_real_loop,
+            working_page=page,
+        )
+    assert loop_kwargs["max_action_steps"] == MIN_ACTION_STEPS
+    granted = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
+    assert [(entry["guard"], entry["original_max_tokens"]) for entry in granted] == [
+        ("max_tokens", loop_kwargs["max_tokens"]),
+        ("max_tokens", granted[0]["max_tokens"]),
+    ]
+    assert granted[0]["action_steps"] < MIN_ACTION_STEPS
+    assert caller.calls == len(script)
+    assert task.status == TaskStatus.completed
+
+
 @pytest.mark.asyncio
 async def test_execute_task_v3_no_workflow_ceiling_without_a_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     # No org pool -> no hard ceiling: the loop's extension is bounded only by its own gate.
@@ -3143,6 +3233,35 @@ async def test_execute_task_v3_should_cancel_skips_workflow_read_for_bare_task(
 # ---------------------------------------------------------------------------
 # P4: the page provider (live re-resolution on every tool call)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("customer_precedence", [False, True], ids=["one_compose_pass", "recompose_pass"])
+async def test_a_recovery_code_outline_reaches_the_model_goal_but_never_the_task_row(
+    monkeypatch: pytest.MonkeyPatch, customer_precedence: bool
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", customer_precedence)
+    record = CodeProgressRecord(
+        before=("open the portal",), failed_step="click the invoices tab", failed_line=2, after=("download",)
+    )
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        workflow_owned_recovery=True,
+        recovery_code_progress=record,
+        workflow_run_id="wr_recovery_outline",
+        navigation_goal="Download the latest invoice",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert goal.startswith("(This goal contains a value of unverified origin") is customer_precedence
+    assert goal.count("Code outline") == 1
+    assert goal.endswith("- Later in the code: download")
+    assert task.navigation_goal == "Download the latest invoice"
+    assert "Code outline" not in str(loop_mock.update_task_kwargs)
 
 
 @pytest.mark.asyncio
