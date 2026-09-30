@@ -76,6 +76,9 @@ SENSITIVE_FIELDS: set[str] = {
     "totp_identifier",
     "totp_url",
     "totp_secret",
+    "client_secret",
+    "access_token",
+    "refresh_token",
 } | SENSITIVE_HEADERS
 
 _PROXY_OBSERVABILITY_FIELDS = {field.value: field for field in ProxyObservabilityField}

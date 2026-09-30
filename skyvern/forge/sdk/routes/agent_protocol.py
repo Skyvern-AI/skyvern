@@ -5383,8 +5383,8 @@ async def get_workflow(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=current_org.organization_id,
         )
-        workflow.effective_default_engine = await effective_default_engine(
-            workflow_permanent_id, current_org.organization_id
+        workflow.set_effective_default_engine(
+            await effective_default_engine(workflow_permanent_id, current_org.organization_id)
         )
     return workflow
 

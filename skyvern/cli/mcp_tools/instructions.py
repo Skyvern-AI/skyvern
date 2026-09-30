@@ -135,10 +135,11 @@ GOOD (4 blocks, clear single responsibility):
 BAD: One giant block trying to do everything at once.
 
 ### Engine Selection
-- Known path (all fields/actions specified in prompt) -> skyvern-1.0 (default, omit engine field)
+- Known path (all fields/actions specified in prompt) -> omit the engine field (the default engine)
 - Dynamic planning (discover what to do at runtime) -> skyvern-2.0
+- User asks for 1.0 (or 2.0) -> set `engine: skyvern-1.0` (or `engine: skyvern-2.0`) explicitly
 - skyvern_run_task always uses 2.0 (cannot change)
-- When in doubt, split into multiple 1.0 blocks (cheaper, more observable)
+- When in doubt, split into multiple default-engine blocks (cheaper, more observable)
 
 ### Caching
 When omitted, MCP-created workflows default to run_with="agent" and code_version=2 for both JSON \

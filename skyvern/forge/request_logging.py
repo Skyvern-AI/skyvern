@@ -61,6 +61,10 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
     # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
     re.compile(r"^[^ ]+ /mcp(?:/.*)?$", re.DOTALL),
+    # OAuth grants carry form-encoded client secrets and codes, and their responses carry tokens.
+    re.compile(r"^POST /oauth/(?:token|consent|callback)$"),
+    # Marketplace service routes return freshly minted client secrets.
+    re.compile(r"^POST /(?:api/)?v1/marketplace(?:/.*)?$"),
 )
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

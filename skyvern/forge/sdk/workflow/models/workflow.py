@@ -5,10 +5,13 @@ from typing import Any, List
 from pydantic import (
     BaseModel,
     Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
     ValidationInfo,
     computed_field,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import Self, deprecated
@@ -266,6 +269,8 @@ class Workflow(BaseModel):
         description="The engine a task block with no `engine` set runs on in this agent, or null when "
         "engine routing decides it. Populated by the detail endpoint only.",
     )
+    # Set by the detail GET; elsewhere the key is omitted, since a null would claim routing decides the engine.
+    _effective_default_engine_computed: bool = PrivateAttr(default=False)
     original_created_by: str | None = Field(
         default=None,
         description="Who created the agent's first version. Populated by the list endpoint only.",
@@ -283,6 +288,18 @@ class Workflow(BaseModel):
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
+
+    # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
+    @model_serializer(mode="wrap")
+    def _omit_uncomputed_engine(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if not self._effective_default_engine_computed:
+            data.pop("effective_default_engine", None)
+        return data
+
+    def set_effective_default_engine(self, engine: RunEngine | None) -> None:
+        self.effective_default_engine = engine
+        self._effective_default_engine_computed = True
 
     created_at: datetime
     modified_at: datetime

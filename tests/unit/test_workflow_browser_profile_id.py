@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -41,6 +43,14 @@ def test_workflow_pydantic_defaults_to_none() -> None:
 def test_workflow_pydantic_accepts_browser_profile_id() -> None:
     workflow = _make_workflow(browser_profile_id="bp_abc123")
     assert workflow.browser_profile_id == "bp_abc123"
+
+
+def test_default_workflow_deep_copies_and_pickles() -> None:
+    # Copilot block runs deep-copy the stored workflow, so every field default must be copyable.
+    workflow = _make_workflow()
+    assert copy.deepcopy(workflow) == workflow
+    assert workflow.model_copy(deep=True) == workflow
+    assert pickle.loads(pickle.dumps(workflow)) == workflow
 
 
 def test_workflow_create_yaml_request_defaults_to_none() -> None:

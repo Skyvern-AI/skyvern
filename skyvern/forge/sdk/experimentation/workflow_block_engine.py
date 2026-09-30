@@ -419,6 +419,19 @@ async def effective_default_engine(workflow_permanent_id: str, organization_id: 
     return None
 
 
+async def unset_engine_routes_as_v1(workflow_permanent_id: str, organization_id: str) -> bool:
+    """Whether an unset block engine and skyvern-1.0 route alike in this workflow.
+
+    False when the workflow's birth cannot be read, although routing then still treats them alike: this errs
+    toward a caller comparing definitions seeing a change, so a cached script is regenerated, not reused stale.
+    """
+    cutoff = settings.TASK_V3_CHOSEN_ENGINE_CUTOFF
+    if cutoff is None or isinstance(app.EXPERIMENTATION_PROVIDER, NoOpExperimentationProvider):
+        return True
+    born_at = await _workflow_birth(workflow_permanent_id, organization_id)
+    return born_at is not None and not _born_at_or_after(born_at, cutoff)
+
+
 def resolved_workflow_block_engine_arm_attribution(workflow_run_id: str | None) -> WorkflowBlockEngineArmAttribution:
     """The arm and the routing facts finalize-time telemetry can attribute to this run.
 

@@ -5,6 +5,7 @@ import { parse as parseYAML, stringify as convertToYAML } from "yaml";
 import {
   expandFileToWorkflowYamls,
   extractTitleFromYaml,
+  stripLegacyEngineFromYaml,
   unzipArchive,
 } from "./importWorkflowYaml";
 
@@ -72,6 +73,24 @@ describe("expandFileToWorkflowYamls", () => {
     const bundle = `${convertToYAML(workflowA)}---\ntitle: Broken\nblocks: [1, 2\n`;
 
     expect(() => expandFileToWorkflowYamls(bundle)).toThrow();
+  });
+
+  it("converts JSON strings so the backend's YAML 1.1 parser keeps them strings", () => {
+    const [yaml] = expandFileToWorkflowYamls(
+      JSON.stringify({ title: "on", goal: "1_000" }),
+    );
+    expect(parseYAML(yaml!, { version: "1.1" })).toEqual({
+      title: "on",
+      goal: "1_000",
+    });
+  });
+
+  it("splits a bundle into each document's own text, so every value reaches the backend as written", () => {
+    const first =
+      "# first\ntitle: A\nflag: Y\nn: n\ncount: 1e3\nwhen: 2024-01-01 10:00:00-05:00\n";
+    const second = "---\ntitle: B # kept\nflag: 'on'\n";
+    const expanded = expandFileToWorkflowYamls(first + second);
+    expect(expanded).toEqual([first, second]);
   });
 
   it("returns a single JSON array element as one workflow", () => {
@@ -164,5 +183,105 @@ describe("extractTitleFromYaml", () => {
     expect(extractTitleFromYaml("foo: 1")).toBeNull();
     expect(extractTitleFromYaml("title: ''")).toBeNull();
     expect(extractTitleFromYaml(": : invalid : :")).toBeNull();
+  });
+});
+
+describe("stripLegacyEngineFromYaml", () => {
+  const workflow = {
+    title: "W",
+    workflow_definition: {
+      blocks: [
+        { block_type: "navigation", label: "a", engine: "skyvern-1.0" },
+        { block_type: "navigation", label: "b", engine: "skyvern-2.0" },
+        { block_type: "navigation", label: "c", engine: "skyvern-3.0" },
+        { block_type: "navigation", label: "d" },
+        {
+          block_type: "for_loop",
+          label: "e",
+          loop_blocks: [
+            { block_type: "navigation", label: "f", engine: "skyvern-1.0" },
+            { block_type: "navigation", label: "g", engine: "skyvern-3.0" },
+          ],
+        },
+      ],
+    },
+  };
+
+  it("unsets skyvern-1.0 at any depth and keeps every other engine", () => {
+    const out = parseYAML(stripLegacyEngineFromYaml(convertToYAML(workflow)))
+      .workflow_definition.blocks;
+    expect(out[0]).not.toHaveProperty("engine");
+    expect(out[1].engine).toBe("skyvern-2.0");
+    expect(out[2].engine).toBe("skyvern-3.0");
+    expect(out[3]).not.toHaveProperty("engine");
+    expect(out[4].loop_blocks[0]).not.toHaveProperty("engine");
+    expect(out[4].loop_blocks[1].engine).toBe("skyvern-3.0");
+  });
+
+  it("returns a file with no legacy engine byte-for-byte", () => {
+    const clean =
+      "# kept\ntitle: t\nworkflow_definition:\n  blocks:\n    - block_type: navigation\n      label: a\n      engine: skyvern-3.0\n";
+    expect(stripLegacyEngineFromYaml(clean)).toBe(clean);
+  });
+
+  const lines = [
+    "# exported",
+    "title: t",
+    "workflow_definition:",
+    "  parameters:",
+    "    - key: flag",
+    "      default_value: Y",
+    "    - key: other",
+    "      default_value: n",
+    "  blocks:",
+    "    - block_type: navigation",
+    "      label: a",
+    "      engine: skyvern-1.0  # legacy",
+    "      navigation_goal: 1e3",
+    "      complete_criterion: 2001-12-14 21:59:43.10 -05:00",
+    "    - engine: skyvern-1.0",
+    "      block_type: navigation",
+    "      label: b",
+    "    - block_type: for_loop",
+    "      label: c",
+    "      loop_blocks:",
+    "        - block_type: navigation",
+    "          label: d",
+    "          engine: 'skyvern-1.0'",
+    "        - block_type: navigation",
+    "          label: e",
+    "          engine: skyvern-3.0",
+    "    - block_type: navigation",
+    "      label: f",
+    "      engine: null",
+    "",
+  ];
+
+  const withoutLegacy = [...lines];
+  withoutLegacy.splice(22, 1);
+  withoutLegacy.splice(14, 2, "    - block_type: navigation");
+  withoutLegacy.splice(11, 1);
+
+  it("removes only the skyvern-1.0 lines, at any depth, and leaves every other byte", () => {
+    expect(stripLegacyEngineFromYaml(lines.join("\n"))).toBe(
+      withoutLegacy.join("\n"),
+    );
+  });
+
+  it("returns a file with no skyvern-1.0 byte-for-byte, values and comments included", () => {
+    const clean = withoutLegacy.join("\n");
+    expect(clean).toContain("engine: null");
+    expect(stripLegacyEngineFromYaml(clean)).toBe(clean);
+  });
+
+  it("leaves a flow-style block holding skyvern-1.0 unchanged rather than rewrite it", () => {
+    const flow =
+      "workflow_definition:\n  blocks:\n    - {label: a, engine: skyvern-1.0, goal: Y}\n";
+    expect(stripLegacyEngineFromYaml(flow)).toBe(flow);
+  });
+
+  it("returns unparseable text unchanged", () => {
+    const bad = "title: [unclosed\n  engine: skyvern-1.0";
+    expect(stripLegacyEngineFromYaml(bad)).toBe(bad);
   });
 });

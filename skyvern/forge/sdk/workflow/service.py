@@ -120,10 +120,10 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_trans
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     ARM_ATTRIBUTION_LOST,
     WorkflowBlockEngineArmAttribution,
-    effective_default_engine,
     engine_arm_log_value,
     resolve_workflow_block_engine_arm,
     resolved_workflow_block_engine_arm_attribution,
+    unset_engine_routes_as_v1,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -11157,7 +11157,7 @@ class WorkflowService:
         current_definition: dict[str, Any] = {}
         new_definition: dict[str, Any] = {}
         if previous_valid_workflow:
-            unset_engine_is_v1 = await effective_default_engine(workflow.workflow_permanent_id, organization_id) is None
+            unset_engine_is_v1 = await unset_engine_routes_as_v1(workflow.workflow_permanent_id, organization_id)
             current_definition = _get_workflow_definition_core_data(
                 previous_valid_workflow.workflow_definition, unset_engine_is_v1=unset_engine_is_v1
             )
