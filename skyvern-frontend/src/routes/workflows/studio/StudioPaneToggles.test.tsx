@@ -526,12 +526,12 @@ describe("StudioPaneToggles browser activity", () => {
 });
 
 describe("StudioPaneToggles Copilot question", () => {
-  afterEach(() => useCopilotHeaderStore.getState().setAwaitingAnswer(false));
+  afterEach(() => useCopilotHeaderStore.getState().setAttention(null));
 
   test.each(["copilot", "browser"])(
     "flags the Copilot tab while a question waits (panes=%s)",
     (panes) => {
-      useCopilotHeaderStore.getState().setAwaitingAnswer(true);
+      useCopilotHeaderStore.getState().setAttention("question");
       renderAt(`/workflows/wpid_abc/studio?panes=${panes}`);
       expect(
         screen.getByRole("button", {
@@ -541,10 +541,18 @@ describe("StudioPaneToggles Copilot question", () => {
     },
   );
 
+  test("names a sign-in request instead of a question", () => {
+    useCopilotHeaderStore.getState().setAttention("credential");
+    renderAt("/workflows/wpid_abc/studio?panes=browser");
+    expect(
+      screen.getByRole("button", { name: "Copilot, needs to sign in" }),
+    ).toBeTruthy();
+  });
+
   test("drops the flag once the question is answered", () => {
-    useCopilotHeaderStore.getState().setAwaitingAnswer(true);
+    useCopilotHeaderStore.getState().setAttention("question");
     renderAt("/workflows/wpid_abc/studio?panes=copilot");
-    act(() => useCopilotHeaderStore.getState().setAwaitingAnswer(false));
+    act(() => useCopilotHeaderStore.getState().setAttention(null));
     expect(
       screen.queryByRole("button", {
         name: "Copilot, waiting for your answer",

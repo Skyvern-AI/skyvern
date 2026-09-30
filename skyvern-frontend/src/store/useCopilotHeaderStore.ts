@@ -13,6 +13,21 @@ export type CopilotHeaderControls = {
   navigationLockedReason: string | null;
 };
 
+// What the docked Copilot chat is waiting on the user for.
+export type CopilotAttention = "question" | "credential" | "account";
+
+export const COPILOT_ATTENTION_LABEL: Record<CopilotAttention, string> = {
+  question: "waiting for your answer",
+  credential: "needs to sign in",
+  account: "needs a Google account",
+};
+
+export const COPILOT_ATTENTION_CHIP: Record<CopilotAttention, string> = {
+  question: "Needs your answer",
+  credential: "Needs sign-in",
+  account: "Choose an account",
+};
+
 /**
  * Bridges the docked copilot chat and the studio's Copilot pane header: the
  * chat registers its History/New-chat controls here so the header (rendered
@@ -22,15 +37,14 @@ export type CopilotHeaderControls = {
 type CopilotHeaderState = {
   controls: CopilotHeaderControls | null;
   setControls: (controls: CopilotHeaderControls | null) => void;
-  // A Copilot question is waiting on the user. The chat stays mounted while its pane is closed,
-  // so the studio's pane toggle can flag it.
-  awaitingAnswer: boolean;
-  setAwaitingAnswer: (awaitingAnswer: boolean) => void;
+  // The chat stays mounted while its pane is closed, so the studio's pane toggle can flag it.
+  attention: CopilotAttention | null;
+  setAttention: (attention: CopilotAttention | null) => void;
 };
 
 export const useCopilotHeaderStore = create<CopilotHeaderState>((set) => ({
   controls: null,
   setControls: (controls) => set({ controls }),
-  awaitingAnswer: false,
-  setAwaitingAnswer: (awaitingAnswer) => set({ awaitingAnswer }),
+  attention: null,
+  setAttention: (attention) => set({ attention }),
 }));

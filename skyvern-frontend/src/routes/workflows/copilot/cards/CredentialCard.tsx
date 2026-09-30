@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { ChevronDownIcon, LockClosedIcon } from "@radix-ui/react-icons";
 import { useDebounce } from "use-debounce";
@@ -38,6 +39,11 @@ import {
   CopilotCard,
   GutterRow,
 } from "./cardChrome";
+import {
+  AttentionMarker,
+  AttentionTray,
+  type AttentionTrayPresentation,
+} from "./AttentionTray";
 import { TURN_ROW_INSET } from "./cardLayout";
 
 // Union of both a request-policy-time classifier's real reason tokens and a
@@ -119,6 +125,8 @@ export interface CredentialCardProps {
   // "auto-bound" mode only: whether the Change affordance is live (the tail turn). A scrollback
   // receipt stays read-only so a pick can't optimistically resolve without an actual continuation.
   canChange?: boolean;
+  // Set when the chat docks this ask above the composer instead of in the transcript.
+  tray?: AttentionTrayPresentation;
 }
 
 const SIGN_IN_WHY_LINE =
@@ -473,11 +481,13 @@ function CredentialUpdateAsk({
   credentialId,
   onUpdateCredential,
   onSkip,
+  tray,
 }: {
   frame: CredentialRequiredFrame;
   credentialId: string;
   onUpdateCredential?: (credential: CredentialApiResponse) => void;
   onSkip: () => void;
+  tray?: AttentionTrayPresentation;
 }) {
   const { remainingMs, expired } = useCountdown(frame.expires_at ?? "", true);
   const [rootRef, insideLiveRegion] = useInsideLiveRegion();
@@ -495,29 +505,28 @@ function CredentialUpdateAsk({
   const status = credential ? "" : (loadFailure ?? "Loading saved login…");
 
   return (
-    <div ref={rootRef}>
-      <AskMessage message={frame.message} />
-      <CopilotCard>
-        <CardHeader
-          icon={<LockClosedIcon className="h-3.5 w-3.5 text-warning" />}
-          wrapTitle
-          title={
-            rejected
-              ? `Update ${credential ? `'${credential.name}'` : "your saved login"} to sign in to ${site}`
-              : credential
-                ? `Add 2FA to '${credential.name}' to sign in to ${site}`
-                : `Add 2FA to your saved login for ${site}`
-          }
-          right={<PauseCountdown remainingMs={remainingMs} expired={expired} />}
-        />
-        <CardBody>
-          <GutterRow>
-            <span className="text-[11px] leading-relaxed text-muted-foreground">
-              {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
-            </span>
-          </GutterRow>
-        </CardBody>
-        <CardFooter className="flex flex-wrap items-center gap-2">
+    <AskChrome
+      tray={tray}
+      rootRef={rootRef}
+      message={frame.message}
+      title={
+        rejected
+          ? `Update ${credential ? `'${credential.name}'` : "your saved login"} to sign in to ${site}`
+          : credential
+            ? `Add 2FA to '${credential.name}' to sign in to ${site}`
+            : `Add 2FA to your saved login for ${site}`
+      }
+      countdown={<PauseCountdown remainingMs={remainingMs} expired={expired} />}
+      lines={[
+        <span
+          key="why"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
+        </span>,
+      ]}
+      footer={
+        <>
           <Button
             type="button"
             size="sm"
@@ -545,16 +554,111 @@ function CredentialUpdateAsk({
           <div className="ml-auto">
             <SkipButton onSkip={onSkip} disabled={expired} />
           </div>
-          {/* Mounted for the card's lifetime so only its text changes; inside an outer live region
-              the visible status is already announced. */}
-          <span
-            className="sr-only"
-            role={insideLiveRegion ? undefined : "status"}
-          >
-            {insideLiveRegion ? "" : status}
-          </span>
+        </>
+      }
+      announcer={
+        // Mounted for the card's lifetime so only its text changes; inside an outer live region
+        // the visible status is already announced.
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {insideLiveRegion ? "" : status}
+        </span>
+      }
+    />
+  );
+}
+
+// One unresolved ask, drawn either as a transcript card or as the tray docked above the composer.
+// The tray leaves the assistant's words to the transcript marker, which sits where the ask was raised.
+function AskChrome({
+  tray,
+  rootRef,
+  message,
+  title,
+  countdown,
+  lines,
+  footer,
+  announcer,
+}: {
+  tray?: AttentionTrayPresentation;
+  rootRef: RefObject<HTMLDivElement>;
+  message?: string;
+  title: string;
+  countdown: ReactNode;
+  lines: ReactNode[];
+  footer: ReactNode;
+  // Outside the collapsible body, so a minimized tray still announces a failure.
+  announcer: ReactNode;
+}) {
+  if (tray) {
+    return (
+      <div ref={rootRef}>
+        <AttentionTray
+          aria-label="Sign-in request"
+          title={title}
+          wrapTitle
+          meta={countdown}
+          collapsedTitle="Copilot needs to sign in"
+          collapsedMeta={countdown}
+          collapsed={tray.collapsed}
+          onCollapsedChange={tray.onCollapsedChange}
+          minimizeLabel="Minimize sign-in request"
+          upNext={tray.upNext}
+        >
+          <div className="flex min-h-0 flex-col gap-1 overflow-y-auto px-3 pb-2.5 pt-1">
+            {lines.map((line, index) => (
+              <div key={index}>{line}</div>
+            ))}
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5">
+            {footer}
+          </div>
+        </AttentionTray>
+        {announcer}
+      </div>
+    );
+  }
+  return (
+    <div ref={rootRef}>
+      <AskMessage message={message} />
+      <CopilotCard>
+        <CardHeader
+          icon={<LockClosedIcon className="h-3.5 w-3.5 text-warning" />}
+          wrapTitle
+          title={title}
+          right={countdown}
+        />
+        <CardBody>
+          {lines.map((line, index) => (
+            <GutterRow key={index}>{line}</GutterRow>
+          ))}
+        </CardBody>
+        <CardFooter className="flex flex-wrap items-center gap-2">
+          {footer}
         </CardFooter>
       </CopilotCard>
+      {announcer}
+    </div>
+  );
+}
+
+// Where a docked ask was raised: the assistant's words for it, then a pointer to the tray.
+export function CredentialAskMarker({ message }: { message?: string }) {
+  return (
+    <div>
+      <AskMessage message={message} />
+      <AttentionMarker
+        icon={
+          <LockClosedIcon
+            aria-hidden
+            className="size-3.5 shrink-0 text-amber-500"
+          />
+        }
+        title="Copilot needs to sign in"
+        hint="continue below"
+      />
     </div>
   );
 }
@@ -631,6 +735,7 @@ export function CredentialCard(props: Readonly<CredentialCardProps>) {
         credentialId={updateTargetId}
         onUpdateCredential={props.onUpdateCredential}
         onSkip={props.onSkip}
+        tray={props.tray}
       />
     );
   }
@@ -647,6 +752,7 @@ function CredentialAskCard({
   reloadKey,
   autoBound,
   canChange = false,
+  tray,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -907,34 +1013,36 @@ function CredentialAskCard({
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);
   return (
-    <div ref={rootRef}>
-      <AskMessage message={frame.message} />
-      <CopilotCard>
-        <CardHeader
-          icon={<LockClosedIcon className="h-3.5 w-3.5 text-warning" />}
-          wrapTitle
-          title={`Copilot needs to sign in to ${site}`}
-          right={
-            countdownActive ? (
-              <PauseCountdown remainingMs={remainingMs} expired={expired} />
-            ) : null
-          }
-        />
-        <CardBody>
-          <GutterRow>
-            <span className="text-[11px] leading-relaxed text-muted-foreground">
-              {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
-            </span>
-          </GutterRow>
-          {mode === "terminal" ? (
-            <GutterRow>
-              <span className="text-[11px] font-medium leading-relaxed">
+    <AskChrome
+      tray={tray}
+      rootRef={rootRef}
+      message={frame.message}
+      title={`Copilot needs to sign in to ${site}`}
+      countdown={
+        countdownActive ? (
+          <PauseCountdown remainingMs={remainingMs} expired={expired} />
+        ) : null
+      }
+      lines={[
+        <span
+          key="why"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
+        </span>,
+        ...(mode === "terminal"
+          ? [
+              <span
+                key="continue"
+                className="text-[11px] font-medium leading-relaxed"
+              >
                 Connect a credential and I&apos;ll continue.
-              </span>
-            </GutterRow>
-          ) : null}
-        </CardBody>
-        <CardFooter className="flex flex-wrap items-center gap-2">
+              </span>,
+            ]
+          : []),
+      ]}
+      footer={
+        <>
           <Button
             type="button"
             size="sm"
@@ -974,27 +1082,29 @@ function CredentialAskCard({
           <div className="ml-auto">
             <SkipButton onSkip={onSkip} disabled={disabled} />
           </div>
-          {/* Mounted for the card's lifetime so only its text changes: a live region that appears
-              already holding its text is read as ordinary new content and never announced. Inside
-              an outer live region it takes no role and repeats nothing that region already
-              contains, only the search failure, whose visible text sits in a portaled popover. */}
-          <span
-            className="sr-only"
-            role={insideLiveRegion ? undefined : "status"}
-          >
-            {searchFailed
-              ? SEARCH_FAILED_ANNOUNCEMENT
-              : insideLiveRegion
-                ? ""
-                : orgCredentials.status === "loading"
-                  ? "Loading saved logins…"
-                  : orgCredentials.status === "error"
-                    ? "Couldn't load your saved logins."
-                    : ""}
-          </span>
-        </CardFooter>
-      </CopilotCard>
-    </div>
+        </>
+      }
+      announcer={
+        // Mounted for the card's lifetime so only its text changes: a live region that appears
+        // already holding its text is read as ordinary new content and never announced. Inside an
+        // outer live region it takes no role and repeats nothing that region already contains,
+        // only the search failure, whose visible text sits in a portaled popover.
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {searchFailed
+            ? SEARCH_FAILED_ANNOUNCEMENT
+            : insideLiveRegion
+              ? ""
+              : orgCredentials.status === "loading"
+                ? "Loading saved logins…"
+                : orgCredentials.status === "error"
+                  ? "Couldn't load your saved logins."
+                  : ""}
+        </span>
+      }
+    />
   );
 }
 
