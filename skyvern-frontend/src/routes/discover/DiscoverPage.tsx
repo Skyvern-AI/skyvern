@@ -1,8 +1,5 @@
 import { useEffect, useRef } from "react";
 import { HomeTelemetry } from "@/util/homeTelemetry";
-import { GetStartedModal } from "@/components/onboarding/GetStartedModal";
-import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingErrorBoundary";
-import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import {
@@ -13,7 +10,7 @@ import {
 import { WorkflowTemplates } from "./WorkflowTemplates";
 import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
-import { useSearchParams } from "react-router-dom";
+import { useLocation, useSearchParams } from "react-router-dom";
 import { FilePlusIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
 
@@ -23,6 +20,8 @@ function getIntentExampleKey(
   switch (intent) {
     case "fill_forms":
       return "contact_us_forms";
+    case "job_applications":
+      return "job_application";
     case "extract_data":
       return "extractIntegrationsFromGong";
     case "monitor_website":
@@ -84,6 +83,16 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   // `/discover?focus=prompt` is the sidebar card's first-agent link: focus + prefill once, then drop the param.
   const [searchParams, setSearchParams] = useSearchParams();
   const focusPrompt = searchParams.get("focus") === "prompt";
+  const requestedExample = searchParams.get("example");
+  // Free text arrives in router state rather than the URL, so it never lands in history or logs.
+  const locationState: unknown = useLocation().state;
+  const prefillPrompt =
+    locationState &&
+    typeof locationState === "object" &&
+    "prefillPrompt" in locationState &&
+    typeof locationState.prefillPrompt === "string"
+      ? locationState.prefillPrompt
+      : null;
   useEffect(() => {
     if (!focusPrompt) {
       handledFocus.current = false;
@@ -94,14 +103,20 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
       const promptBox = promptBoxRef.current;
       if (!promptBox) return;
       handledFocus.current = true;
-      promptBox.focusAndPrefillExample(
-        getIntentExampleKey(onboarding?.state?.user_intent),
-      );
+      if (prefillPrompt) {
+        promptBox.focusAndPrefillPrompt(prefillPrompt);
+      } else {
+        promptBox.focusAndPrefillExample(
+          requestedExample,
+          getIntentExampleKey(onboarding?.state?.user_intent),
+        );
+      }
     }
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current);
         next.delete("focus");
+        next.delete("example");
         return next;
       },
       { replace: true },
@@ -110,16 +125,10 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
     focusPrompt,
     onboarding?.isLoading,
     onboarding?.state?.user_intent,
+    prefillPrompt,
+    requestedExample,
     setSearchParams,
   ]);
-
-  const onboardingModal = onboarding ? (
-    <OnboardingErrorBoundary
-      onError={() => OnboardingTelemetry.modalRenderError("discover")}
-    >
-      <GetStartedModal />
-    </OnboardingErrorBoundary>
-  ) : null;
 
   if (revamp) {
     return (
@@ -153,7 +162,6 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
             Skip — start from a blank agent
           </Button>
         </div>
-        {onboardingModal}
       </div>
     );
   }
@@ -192,7 +200,6 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
       <div className="mx-auto w-full max-w-[60rem] pb-8">
         <WorkflowTemplates />
       </div>
-      {onboardingModal}
     </div>
   );
 }

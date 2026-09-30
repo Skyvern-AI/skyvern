@@ -159,7 +159,13 @@ type PromptBoxProps = {
 };
 
 type PromptBoxHandle = {
-  focusAndPrefillExample: (key: ExamplePromptKey) => void;
+  /** Prefills `key`, or `fallback` when `key` is not a known example (e.g. from a URL). */
+  focusAndPrefillExample: (
+    key: string | null,
+    fallback: ExamplePromptKey,
+  ) => void;
+  /** Prefills the user's own words; never overwrites a prompt already typed. */
+  focusAndPrefillPrompt: (text: string) => void;
 };
 
 const HANDOFF_TITLE_MAX_LEN = 80;
@@ -288,13 +294,23 @@ function PromptBoxImpl(
   }, []);
 
   useImperativeHandle(ref, () => ({
-    focusAndPrefillExample: (key) => {
+    focusAndPrefillExample: (key, fallback) => {
       const selectedExample =
-        exampleCases.find((example) => example.key === key) ?? exampleCases[0];
+        exampleCases.find((example) => example.key === key) ??
+        exampleCases.find((example) => example.key === fallback) ??
+        exampleCases[0];
       if (!prompt.trim()) {
         cancelSpeech();
         setPrompt(selectedExample.prompt);
         setExampleAttribution({ id: selectedExample.key, edited: false });
+      }
+      textareaRef.current?.scrollIntoView?.({ block: "center" });
+      textareaRef.current?.focus({ preventScroll: true });
+    },
+    focusAndPrefillPrompt: (text) => {
+      if (!prompt.trim()) {
+        setPrompt(text);
+        setExampleAttribution(undefined);
       }
       textareaRef.current?.scrollIntoView?.({ block: "center" });
       textareaRef.current?.focus({ preventScroll: true });

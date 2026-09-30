@@ -5,6 +5,7 @@ import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
 import type { StreamState } from "@/routes/streaming/streamState";
+import { usePageSlots } from "@/store/PageSlots";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { HeroRecording } from "./runview/HeroRecording";
@@ -31,6 +32,7 @@ export function BrowserTab() {
     liveSurface,
   } = useBrowserPaneView();
   const postHog = usePostHog();
+  const { firstRunWaitCard: FirstRunWaitCard } = usePageSlots();
   const setRunStreamState = useStudioBrowserStore((s) => s.setRunStreamState);
 
   const {
@@ -93,6 +95,11 @@ export function BrowserTab() {
                 detail: "Getting your run's browser ready…",
                 pending: true,
               }}
+              footer={
+                FirstRunWaitCard ? (
+                  <FirstRunWaitCard phase="run_provisioning" />
+                ) : undefined
+              }
             />
           ) : (
             <RunLiveStream
@@ -128,6 +135,11 @@ export function BrowserTab() {
                 "Spinning up the debug browser — this only takes a moment.",
               pending: true,
             }}
+            footer={
+              FirstRunWaitCard ? (
+                <FirstRunWaitCard phase="debug_browser_warming" />
+              ) : undefined
+            }
           />
         )
       ) : view === "recording" ? (
