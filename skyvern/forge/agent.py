@@ -201,7 +201,6 @@ from skyvern.forge.taskv3.run_arms import (
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
     HUMANIZED_INPUT_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     resolve_run_arm,
     run_arm_enabled,
@@ -2342,18 +2341,6 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DATE_SEGMENT_AIM,
-            )
-            await resolve_run_arm(
-                context,
-                REQUIRED_FIELD_ANSWERS_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_REQUIRED_FIELD_ANSWERS,
-                properties={
-                    "workflow_permanent_id": task.workflow_permanent_id
-                    or context.workflow_permanent_id
-                    or "not_workflow"
-                },
             )
             await resolve_run_arm(
                 context,
