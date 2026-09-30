@@ -159,10 +159,10 @@ function CopilotCTAStep({
       template.workflow_permanent_id,
       selectedIntent,
     );
-    const cloned = convert({
-      ...template,
-      title: `${template.title} (copy)`,
-    });
+    const cloned = convert(
+      { ...template, title: `${template.title} (copy)` },
+      { asNewWorkflow: true },
+    );
     // flow_completed fires from useCreateWorkflowMutation (it owns the navigation
     // that unmounts this modal); the navigation also dismisses the modal.
     createWorkflowMutation.mutate({ ...cloned, _via: "onboarding_template" });

@@ -34,7 +34,7 @@ export const actionNodeDefaultData: ActionNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   disableCache: false,
-  engine: RunEngine.SkyvernV1,
+  engine: null,
   model: null,
   ignoreWorkflowSystemPrompt: false,
 } as const;

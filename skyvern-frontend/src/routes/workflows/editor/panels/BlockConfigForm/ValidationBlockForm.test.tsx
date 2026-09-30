@@ -18,6 +18,10 @@ const mockNodes = new Map<
 >();
 const updateNodeData = vi.fn();
 
+vi.mock("../../hooks/useEffectiveDefaultEngine", () => ({
+  useEffectiveDefaultEngine: () => null,
+}));
+
 vi.mock("@xyflow/react", async () => {
   const actual =
     await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");

@@ -2,6 +2,7 @@ import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { RunEngine } from "@/api/types";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
 import {
@@ -81,6 +82,7 @@ function ValidationEditorBody({
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
   const update = useUpdate<ValidationNodeData>({ id: blockId, editable });
+  const effectiveDefaultEngine = useEffectiveDefaultEngine();
 
   return (
     <div data-testid="validation-block-form" className="space-y-4">
@@ -144,6 +146,7 @@ function ValidationEditorBody({
                   </Label>
                 </div>
                 <RunEngineSelector
+                  effectiveDefaultEngine={effectiveDefaultEngine}
                   value={engine}
                   onChange={(next) => update({ engine: next })}
                   className="nopan w-52 text-xs"

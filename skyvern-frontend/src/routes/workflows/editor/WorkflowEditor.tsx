@@ -102,6 +102,7 @@ function WorkflowEditor() {
     blocksToRender,
     settings,
     !isGlobalWorkflow && !workflowDeleted,
+    workflow.effective_default_engine,
   );
 
   return (

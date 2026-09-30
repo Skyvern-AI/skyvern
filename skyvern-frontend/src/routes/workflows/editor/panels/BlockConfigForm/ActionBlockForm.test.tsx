@@ -7,6 +7,10 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 // exercises, and pulling the full barrel transitively imports every block
 // component plus their providers, none of which are needed to verify
 // ActionBlockForm's contract.
+vi.mock("../../hooks/useEffectiveDefaultEngine", () => ({
+  useEffectiveDefaultEngine: () => null,
+}));
+
 vi.mock("../../nodes", () => ({
   isWorkflowBlockNode: (node: { type: string }) =>
     node.type !== "nodeAdder" && node.type !== "start",

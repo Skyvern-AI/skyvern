@@ -9,6 +9,10 @@ import { navigationNodeDefaultData, type NavigationNodeData } from "./types";
 
 let nodeData: { type: "navigation"; data: NavigationNodeData } | null = null;
 
+vi.mock("../../hooks/useEffectiveDefaultEngine", () => ({
+  useEffectiveDefaultEngine: () => null,
+}));
+
 vi.mock("@xyflow/react", () => ({
   useNodesData: () => nodeData,
   useNodes: () => [],

@@ -30,7 +30,7 @@ export const baseHelpTooltipContent = {
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
-    "Default follows the workflow's engine routing (most new self-serve workflows run on Skyvern 3.0). Choosing Skyvern 3.0 or 2.0 pins this block to that engine.",
+    "Default follows the workflow's engine routing, or runs on Skyvern 3.0 for new workflows. Choosing an engine pins this block to it.",
 } as const;
 
 export const basePlaceholderContent = {
