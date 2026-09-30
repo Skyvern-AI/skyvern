@@ -56,6 +56,7 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
+from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -1429,6 +1430,18 @@ def _resolve_original_block_engine(cache_key: str, workflow: Workflow, workflow_
     return None
 
 
+def _script_block_engine(workflow: Workflow, label: str) -> RunEngine | None:
+    # In a run that honors chosen engines the helper's block carries the stored choice, pin or unset. Elsewhere
+    # unset routes exactly as the skyvern-1.0 these helpers used to set, so nothing changes before the cutoff.
+    context = skyvern_context.current()
+    if not run_honors_chosen_engine(context.workflow_run_id if context else None):
+        return None
+    for block in get_all_blocks(workflow.workflow_definition.blocks):
+        if block.label == label and isinstance(block, BaseTaskBlock):
+            return block.engine
+    return None
+
+
 async def _fallback_to_ai_run(
     block_type: BlockType,
     cache_key: str,
@@ -2346,7 +2359,7 @@ async def run_task(
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
             include_action_history_in_verification=True,
-            engine=RunEngine.skyvern_v1,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             model=model,
         )
         block_output = await task_block.execute_safe(
@@ -2947,7 +2960,7 @@ async def download(
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
             include_action_history_in_verification=True,
-            engine=RunEngine.skyvern_v1,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             model=model,
             download_suffix=download_suffix,
             **destination_block_kwargs,
@@ -3035,6 +3048,7 @@ async def action(
         block_validation_output = await _validate_and_get_output_parameter(label)
         action_block = ActionBlock(
             label=block_validation_output.label,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             output_parameter=block_validation_output.output_parameter,
             task_type=TaskType.action,
             url=url,
@@ -3127,6 +3141,7 @@ async def login(
         block_validation_output = await _validate_and_get_output_parameter(label)
         login_block = LoginBlock(
             label=block_validation_output.label,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             output_parameter=block_validation_output.output_parameter,
             url=url,
             navigation_goal=prompt,
@@ -3208,6 +3223,7 @@ async def extract(
         block_validation_output = await _validate_and_get_output_parameter(label)
         extraction_block = ExtractionBlock(
             label=block_validation_output.label,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             url=url,
             data_extraction_goal=prompt,
             max_steps_per_run=max_steps,
@@ -3315,6 +3331,7 @@ async def execute_validation(
     block_validation_output = await _validate_and_get_output_parameter(label)
     validation_block = ValidationBlock(
         label=block_validation_output.label,
+        engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
         output_parameter=block_validation_output.output_parameter,
         task_type=TaskType.validation,
         complete_criterion=complete_criterion,
