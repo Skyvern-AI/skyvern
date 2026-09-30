@@ -5906,9 +5906,65 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     }
     if (!invisible) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
     const radio = type === 'radio';
-    if (!_nativeProxy(el)) return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
+    // The click lands on coordinates this realm measured, never through a marker the page could move
+    // onto something else, so the point has to be the target's own: a cover there is a cover.
+    // Returns the point on a hit on the target, false under an unrelated element, null for no hit or a clipped-off point.
+    // A clip that can scroll (a long list) is scrolled once to bring the target into it; only one that cannot is final.
+    const centreHit = (t, retried) => {
+      const mid = () => { const b = t.getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; };
+      let [x, y] = mid();
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) {
+        try { t.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep */ }
+        [x, y] = mid();
+      }
+      let hit = null;
+      try { hit = document.elementFromPoint(x, y); } catch (e) { hit = null; }
+      for (let hops = 0; hit && hops < 32; hops++) {
+        let root = null;
+        try { root = hit.shadowRoot; } catch (e) { break; }
+        if (!root || root.nodeType !== 11) break;
+        let inner = null;
+        try { inner = root.elementFromPoint(x, y); } catch (e) { break; }
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+      for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+        if (n === t || n === el) return { x, y };
+      }
+      if (!hit) return null;
+      for (let n = t.assignedSlot || t.parentNode || t.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+        if (n.nodeType !== 1) continue;
+        const o = getComputedStyle(n).overflow;
+        if (o === 'visible') continue;
+        const c = n.getBoundingClientRect();
+        if (x >= c.left && x < c.right && y >= c.top && y < c.bottom) continue;
+        if (retried || !(/auto|scroll/.test(o) || n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) return null;
+        try { t.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep */ }
+        return centreHit(t, true);
+      }
+      return false;
+    };
+    // Opacity does not stop hit-testing and multiplies down the tree, so a faded-out panel, or stacked
+    // translucent wrappers, hide an input that elementFromPoint still returns. The input's own is excluded.
+    const fadedAncestry = () => {
+      let o = 1;
+      for (let n = el.assignedSlot || el.parentNode || el.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+        if (n.nodeType === 1) o *= parseFloat(getComputedStyle(n).opacity || '1');
+      }
+      return o < 0.05;
+    };
+    if (!_nativeProxy(el)) {
+      // Only the input's own transparency is waived: it still needs a box, no visibility:hidden, visible
+      // ancestors, and to be on top at its own centre, so it is clicked directly and read back as a toggle.
+      const at = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && !fadedAncestry() ? centreHit(el) : null;
+      if (at) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+      if (at === false) return { exists: true, skinned: false, labelClick: null, radio, covered: true };
+      return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
+    }
     const disabled = !!el.disabled;
     const none = { exists: true, skinned: true, labelClick: null, radio, disabled };
+    // `none` still gets a script click, so a proxy inside a faded panel is refused outright.
+    if (fadedAncestry()) return { ...none, unproxied: true };
     // Only a real <label> activates its control on click, and only the association THIS realm derives
     // counts: an `el.labels` the page shadows names a decoy, not a proxy. A realm the page can patch
     // (the main-world fallback) never offers one.
@@ -5921,31 +5977,9 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       return b.width > 0 && b.height > 0 && !wrapsOther(l);
     }) || null;
     if (!label || nativeControlOf(label) !== el) return none;
-    // The click lands on coordinates this realm measured, never through a marker the page could move
-    // onto something else, so the point has to be the label's own: a cover there is a cover.
-    let b = label.getBoundingClientRect();
-    if (b.bottom < 0 || b.right < 0 || b.top > innerHeight || b.left > innerWidth) {
-      try { label.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep */ }
-      b = label.getBoundingClientRect();
-    }
-    const x = b.left + b.width / 2, y = b.top + b.height / 2;
-    let hit = null;
-    try { hit = document.elementFromPoint(x, y); } catch (e) { hit = null; }
-    for (let hops = 0; hit && hops < 32; hops++) {
-      let root = null;
-      try { root = hit.shadowRoot; } catch (e) { break; }
-      if (!root || root.nodeType !== 11) break;
-      let inner = null;
-      try { inner = root.elementFromPoint(x, y); } catch (e) { break; }
-      if (!inner || inner === hit) break;
-      hit = inner;
-    }
-    let onLabel = false;
-    for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-      if (n === label || n === el) { onLabel = true; break; }
-    }
-    if (!onLabel) return { ...none, labelCovered: true };
-    return { exists: true, skinned: true, labelClick: { x, y }, radio, disabled };
+    const at = centreHit(label);
+    if (!at) return { ...none, labelCovered: true };
+    return { exists: true, skinned: true, labelClick: at, radio, disabled };
   } catch (e) { return { exists: false, skinned: false, labelClick: null }; }
 }"""
 )
@@ -12958,7 +12992,7 @@ def build_browser_tools(
         if isinstance(skin_probe, dict) and skin_probe.get("unproxied"):
             return await _unreachable_error(selector)
         skinned = bool(isinstance(skin_probe, dict) and skin_probe.get("skinned"))
-        if skinned and skin_probe.get("labelCovered"):
+        if isinstance(skin_probe, dict) and (skin_probe.get("covered") or (skinned and skin_probe.get("labelCovered"))):
             return _covered_error(selector, None, verb="clicked")
         label_click = skin_probe.get("labelClick") if isinstance(skin_probe, dict) else None
         if not isinstance(label_click, dict):
