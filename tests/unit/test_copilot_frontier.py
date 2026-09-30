@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from collections.abc import Callable
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
@@ -12,6 +14,7 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+import yaml
 from agents.items import ModelResponse
 from agents.models.interface import Model
 from agents.run_config import RunConfig
@@ -19,6 +22,8 @@ from agents.usage import Usage
 from jinja2.sandbox import SandboxedEnvironment
 from openai.types.responses import Response, ResponseCompletedEvent, ResponseOutputMessage, ResponseOutputText
 
+from skyvern.constants import SCRUBBED_VALUE
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
@@ -32,6 +37,11 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
+)
+from skyvern.forge.sdk.copilot.repair_origin_run import (
+    OriginOutputRefusal,
+    OriginOutputSnapshot,
+    seed_repair_origin_run,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
@@ -58,7 +68,27 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     terminal_ready_for_latch,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRunOutputParameter,
+    WorkflowRunStatus,
+)
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+from tests.unit.copilot_test_helpers import (
+    INERT_APPROVAL_WORKFLOW_YAML,
+    ORIGIN_OUTPUT_SENTINEL,
+    ORIGIN_RUN_ID,
+    REPAIRED_APPROVAL_WORKFLOW_YAML,
+    inert_approval_workflow,
+    install_origin_run,
+    make_copilot_ctx,
+    merge_origin_rows,
+    origin_block_rows,
+)
 
 
 class _FakeBlock:
@@ -4880,3 +4910,617 @@ async def test_test_end_to_end_will_not_touch_the_browser_after_a_raw_secret(
     result = await run_workflow_end_to_end(ctx, "workflow: yaml")
 
     assert result["ok"] is False
+
+
+_APPROVAL_VALUE = {"extracted_information": {"authorized": True, "note": ORIGIN_OUTPUT_SENTINEL}}
+
+_SOURCE_STATUS_FIRST_YAML = """
+title: inert approval
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: request_id
+  blocks:
+    - block_type: extraction
+      label: source_status
+      data_extraction_goal: "Report the repaired source status for authorization {{ approval.output.authorized }}."
+    - block_type: extraction
+      label: approval
+      url: https://example.test/approval
+      data_extraction_goal: "Extract whether request {{ request_id }} is authorized."
+      parameter_keys:
+        - request_id
+"""
+
+_SIGN_IN_SOURCE_STATUS_YAML = REPAIRED_APPROVAL_WORKFLOW_YAML.replace(
+    "    - block_type: extraction\n      label: source_status\n",
+    "    - block_type: login\n      label: source_status\n      url: https://example.test/sign-in\n"
+    "      navigation_goal: Sign in.\n",
+).replace('data_extraction_goal: "Report the repaired', 'complete_criterion: "Report the repaired')
+
+
+OriginRows = tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]
+
+
+async def _origin_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    origin_yaml: str = INERT_APPROVAL_WORKFLOW_YAML,
+    rows: str | Callable[[Workflow], OriginRows] = "completed",
+    requested: str | None = ORIGIN_RUN_ID,
+    origin: Workflow | None = None,
+    **run_overrides: object,
+) -> CopilotContext:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    origin = origin or await inert_approval_workflow(origin_yaml, workflow_id="w_origin")
+    origin_rows = (
+        rows(origin)
+        if callable(rows)
+        else {
+            "completed": origin_block_rows(origin, "approval", value=_APPROVAL_VALUE),
+            "explicit_null": origin_block_rows(origin, "approval", value=None),
+            "absent": ([], []),
+            "output_row_only": ([], origin_block_rows(origin, "approval", value=_APPROVAL_VALUE)[1]),
+            "failed": origin_block_rows(origin, "approval", status="failed", value=_APPROVAL_VALUE),
+            "unregistered": origin_block_rows(origin, "approval", registered=False),
+        }[rows]
+    )
+    install_origin_run(monkeypatch, origin_workflow=origin, rows=origin_rows, **run_overrides)
+    ctx = make_copilot_ctx()
+    await seed_repair_origin_run(ctx, workflow_run_id=requested)
+    return ctx
+
+
+async def _definitions(
+    candidate_yaml: str = REPAIRED_APPROVAL_WORKFLOW_YAML,
+) -> tuple[WorkflowDefinition, WorkflowDefinition]:
+    old = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+    new = await inert_approval_workflow(candidate_yaml, workflow_id="w_candidate")
+    return old.workflow_definition, new.workflow_definition
+
+
+@pytest.mark.asyncio
+async def test_an_edited_downstream_block_is_seeded_with_the_origin_output_and_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    old, new = await _definitions()
+
+    labels, seed, start, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert (labels, start) == (["source_status"], "source_status")
+    assert seed == {"approval": _APPROVAL_VALUE}
+    assert ctx.frontier_origin_reused_labels == ["approval"]
+    assert ctx.frontier_origin_output_refusal is None
+    assert ctx.verified_block_outputs == {}
+    assert ctx.verified_prefix_labels == []
+    assert ctx.composition_verified_labels == []
+    assert ctx.verified_prefix_block_end_urls == {}
+    assert ctx.frontier_resume_session_id is None
+    assert ORIGIN_OUTPUT_SENTINEL not in repr(ctx)
+
+
+@pytest.mark.parametrize(
+    ("candidate_yaml", "own_browser"),
+    [(INERT_APPROVAL_WORKFLOW_YAML, False), (_SIGN_IN_SOURCE_STATUS_YAML, True)],
+    ids=["run_blocks_unchanged_definition", "planner_gives_the_start_its_own_browser"],
+)
+@pytest.mark.asyncio
+async def test_every_planner_branch_that_drops_the_seed_is_refilled_from_the_origin(
+    monkeypatch: pytest.MonkeyPatch, candidate_yaml: str, own_browser: bool
+) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    old, new = await _definitions(candidate_yaml)
+    if candidate_yaml == INERT_APPROVAL_WORKFLOW_YAML:
+        old = new
+
+    labels, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert frontier_module._plan_frontier_base(make_copilot_ctx(), ["source_status"], old, new)[1] == {}
+    assert ctx.frontier_requires_own_browser is own_browser
+    assert labels == ["source_status"]
+    assert seed == {"approval": _APPROVAL_VALUE}
+    assert ctx.frontier_origin_reused_labels == ["approval"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rows", ["explicit_null", "unregistered"])
+async def test_a_stored_null_or_missing_output_is_never_reused(monkeypatch: pytest.MonkeyPatch, rows: str) -> None:
+    ctx = await _origin_turn(monkeypatch, rows=rows)
+    old, new = await _definitions()
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert "approval" not in seed
+    assert ctx.frontier_origin_output_refusal is not None
+    assert ctx.frontier_origin_output_refusal.reason is OriginOutputRefusal.OUTPUT_UNAVAILABLE
+
+
+def _with_workflow_prompt(workflow_yaml: str, prompt: str) -> str:
+    return workflow_yaml.replace(
+        "workflow_definition:\n", f'workflow_definition:\n  workflow_system_prompt: "{prompt}"\n', 1
+    )
+
+
+def _with_approval_export(workflow_yaml: str, schema_type: str) -> str:
+    goal = '      data_extraction_goal: "Extract whether request {{ request_id }} is authorized."\n'
+    return workflow_yaml.replace(
+        goal, f"{goal}      export_enabled: true\n      export_data_schema:\n        type: {schema_type}\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_producer_that_cannot_be_normalized_is_unavailable_not_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    old, new = await _definitions()
+
+    def _unparseable(*_args: object, **_kwargs: object) -> WorkflowDefinition:
+        raise ValueError("unparseable")
+
+    monkeypatch.setattr(frontier_module, "copilot_round_trip_definition", _unparseable)
+    _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert ctx.frontier_origin_output_refusal is not None
+    assert ctx.frontier_origin_output_refusal.reason is OriginOutputRefusal.OUTPUT_UNAVAILABLE
+
+
+_EXTRACTION_APPROVAL_BLOCK = """    - block_type: extraction
+      label: approval
+      url: https://example.test/approval
+      data_extraction_goal: "Extract whether request {{ request_id }} is authorized."
+      parameter_keys:
+        - request_id
+"""
+_UNBOUND_CODE_APPROVAL_BLOCK = """    - block_type: code
+      label: approval
+      code: "result = {'authorized': bool(request_id)}"
+"""
+
+
+@pytest.mark.parametrize(
+    "approval_block",
+    [_EXTRACTION_APPROVAL_BLOCK, _UNBOUND_CODE_APPROVAL_BLOCK],
+    ids=["unrouted_extraction", "code_without_parameter_keys"],
+)
+@pytest.mark.asyncio
+async def test_an_origin_version_saved_outside_copilot_is_compared_by_what_copilot_would_save(
+    monkeypatch: pytest.MonkeyPatch, approval_block: str
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    origin_yaml = INERT_APPROVAL_WORKFLOW_YAML.replace(_EXTRACTION_APPROVAL_BLOCK, approval_block)
+    copilot_saved = await inert_approval_workflow(origin_yaml, workflow_id="w_origin")
+    raw = yaml.safe_load(origin_yaml)
+    for block in raw["workflow_definition"]["blocks"]:
+        block["title"] = ""
+    api_definition = convert_workflow_definition(
+        workflow_definition_yaml=WorkflowCreateYAMLRequest.model_validate(raw).workflow_definition,
+        workflow_id="w_origin",
+    )
+    assert api_definition.blocks[0] != copilot_saved.workflow_definition.blocks[0]
+    ctx = await _origin_turn(
+        monkeypatch, origin=copilot_saved.model_copy(update={"workflow_definition": api_definition})
+    )
+    old = copilot_saved.workflow_definition
+    new = (
+        await inert_approval_workflow(
+            REPAIRED_APPROVAL_WORKFLOW_YAML.replace(_EXTRACTION_APPROVAL_BLOCK, approval_block),
+            workflow_id="w_candidate",
+        )
+    ).workflow_definition
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert seed == {"approval": _APPROVAL_VALUE}
+    assert ctx.frontier_origin_output_refusal is None
+
+
+@pytest.mark.parametrize(
+    ("candidate_yaml", "requested"),
+    [
+        (
+            REPAIRED_APPROVAL_WORKFLOW_YAML.replace(
+                "    - block_type: extraction\n      label: source_status\n",
+                "    - block_type: extraction\n      label: review\n      data_extraction_goal: Review the request.\n"
+                "    - block_type: extraction\n      label: source_status\n",
+            ),
+            "source_status",
+        ),
+        (REPAIRED_APPROVAL_WORKFLOW_YAML.replace("label: source_status", "label: source_check"), "source_check"),
+        (
+            REPAIRED_APPROVAL_WORKFLOW_YAML.replace(
+                "      label: approval\n", "      label: approval\n      title: Approval check\n"
+            ),
+            "source_status",
+        ),
+    ],
+    ids=["block_inserted_after_producer", "producer_successor_renamed", "producer_display_title_edited"],
+)
+@pytest.mark.asyncio
+async def test_an_unchanged_producer_is_reused_when_only_its_successor_changes(
+    monkeypatch: pytest.MonkeyPatch, candidate_yaml: str, requested: str
+) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    old, new = await _definitions(candidate_yaml)
+
+    _, seed, _, _ = _plan_frontier(ctx, [requested], old, new)
+
+    assert ctx.frontier_origin_output_refusal is None
+    assert seed == {"approval": _APPROVAL_VALUE}
+    assert ctx.frontier_origin_reused_labels == ["approval"]
+
+
+def _with_intake_before_approval(workflow_yaml: str, intake_goal: str = "Read the intake for {{ region }}.") -> str:
+    return workflow_yaml.replace(
+        "      key: request_id\n  blocks:\n",
+        "      key: request_id\n    - parameter_type: workflow\n      workflow_parameter_type: string\n"
+        "      key: region\n  blocks:\n    - block_type: extraction\n      label: intake\n"
+        f'      url: https://example.test/intake\n      data_extraction_goal: "{intake_goal}"\n'
+        "      parameter_keys:\n        - region\n",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_changed_block_before_the_producer_makes_its_origin_output_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await _origin_turn(monkeypatch, origin_yaml=_with_intake_before_approval(INERT_APPROVAL_WORKFLOW_YAML))
+    old, new = await _definitions(
+        _with_intake_before_approval(REPAIRED_APPROVAL_WORKFLOW_YAML, "Read the archived intake for {{ region }}.")
+    )
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert "approval" not in seed
+    refusal = ctx.frontier_origin_output_refusal
+    assert refusal is not None
+    assert refusal.as_payload() == {
+        "reason": "changed_producer",
+        "block_label": "approval",
+        "output_key": "approval_output",
+        "origin_workflow_run_id": ORIGIN_RUN_ID,
+        "changed_label": "intake",
+    }
+
+
+def _with_intake_after_approval(workflow_yaml: str) -> str:
+    moved = _with_intake_before_approval(workflow_yaml)
+    intake = moved[
+        moved.index("    - block_type: extraction\n      label: intake\n") : moved.index(
+            "    - block_type: extraction\n      label: approval\n"
+        )
+    ]
+    moved = moved.replace(intake, "", 1)
+    return moved.replace(
+        "    - block_type: extraction\n      label: source_status\n",
+        intake + "    - block_type: extraction\n      label: source_status\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate_yaml",
+    [REPAIRED_APPROVAL_WORKFLOW_YAML, _with_intake_after_approval(REPAIRED_APPROVAL_WORKFLOW_YAML)],
+    ids=["block_before_producer_removed", "block_before_producer_moved_after_it"],
+)
+@pytest.mark.asyncio
+async def test_a_producer_whose_predecessors_differ_from_the_origins_is_refused(
+    monkeypatch: pytest.MonkeyPatch, candidate_yaml: str
+) -> None:
+    ctx = await _origin_turn(monkeypatch, origin_yaml=_with_intake_before_approval(INERT_APPROVAL_WORKFLOW_YAML))
+    old, new = await _definitions(candidate_yaml)
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert "approval" not in seed
+    assert ctx.frontier_origin_output_refusal is not None
+    assert ctx.frontier_origin_output_refusal.reason is OriginOutputRefusal.CHANGED_PRODUCER
+
+
+@pytest.mark.asyncio
+async def test_the_dispatch_recheck_reports_the_reason_that_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = await _origin_turn(monkeypatch, rows="unregistered")
+    _, new = await _definitions()
+
+    refusal = frontier_module.origin_definition_refusal(ctx, ["approval"], "source_status", new)
+
+    assert refusal is not None
+    assert refusal.reason is OriginOutputRefusal.OUTPUT_UNAVAILABLE
+
+
+@pytest.mark.parametrize(("tone", "refused"), [(None, False), ("formal", True)])
+@pytest.mark.asyncio
+async def test_an_input_the_workflow_prompt_reads_must_match_the_origin(
+    monkeypatch: pytest.MonkeyPatch, tone: str | None, refused: bool
+) -> None:
+    def with_tone(workflow_yaml: str) -> str:
+        return _with_workflow_prompt(workflow_yaml, "Answer in a {{ tone }} tone.").replace(
+            "      key: request_id\n",
+            "      key: request_id\n    - parameter_type: workflow\n      workflow_parameter_type: string\n"
+            "      key: tone\n",
+        )
+
+    ctx = await _origin_turn(monkeypatch, origin_yaml=with_tone(INERT_APPROVAL_WORKFLOW_YAML))
+    _, new = await _definitions(with_tone(REPAIRED_APPROVAL_WORKFLOW_YAML))
+
+    refusal = frontier_module.origin_input_refusal(ctx, ["approval"], new, {"tone": tone})
+
+    assert (refusal.parameter_key if refusal is not None else None) == ("tone" if refused else None)
+
+
+@pytest.mark.parametrize(("region", "refused"), [(None, False), ("west", True)])
+@pytest.mark.asyncio
+async def test_an_input_read_only_by_a_block_before_the_producer_must_match_the_origin(
+    monkeypatch: pytest.MonkeyPatch, region: str | None, refused: bool
+) -> None:
+    workflow_yaml = _with_intake_before_approval(REPAIRED_APPROVAL_WORKFLOW_YAML)
+    ctx = await _origin_turn(monkeypatch, origin_yaml=_with_intake_before_approval(INERT_APPROVAL_WORKFLOW_YAML))
+    _, new = await _definitions(workflow_yaml)
+
+    refusal = frontier_module.origin_input_refusal(ctx, ["approval"], new, {"region": region})
+
+    assert (refusal is not None) is refused
+    if refusal is not None:
+        assert (refusal.reason, refusal.block_label, refusal.parameter_key) == (
+            OriginOutputRefusal.CHANGED_INPUT,
+            "approval",
+            "region",
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_same_turn_verified_output_wins_over_the_origin_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    verified = {"extracted_information": {"authorized": False}}
+    ctx.verified_block_outputs = {"approval": verified}
+    old, new = await _definitions()
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert seed == {"approval": verified}
+    assert ctx.frontier_origin_reused_labels == []
+    assert ctx.verified_block_outputs == {"approval": verified}
+
+
+@pytest.mark.asyncio
+async def test_a_producer_the_request_names_runs_instead_of_being_seeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = await _origin_turn(monkeypatch, rows="failed")
+    old, new = await _definitions()
+
+    labels, seed, _, _ = _plan_frontier(ctx, ["approval", "source_status"], old, new)
+
+    assert labels == ["approval", "source_status"]
+    assert seed == {}
+    assert ctx.frontier_origin_output_refusal is None
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [{"requested": None}, {"debug_session_id": "ds_debugger"}],
+    ids=["no_run_named", "debugger_block_run_is_never_an_origin"],
+)
+@pytest.mark.asyncio
+async def test_a_turn_opened_about_no_run_plans_exactly_as_before(
+    monkeypatch: pytest.MonkeyPatch, turn: dict[str, str | None]
+) -> None:
+    ctx = await _origin_turn(monkeypatch, **turn)
+    old, new = await _definitions()
+
+    plan = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert plan[:3] == (["source_status"], {}, "source_status")
+    assert ctx.frontier_origin_output_refusal is None
+    assert ctx.frontier_origin_reused_labels == []
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_plan_is_never_given_origin_outputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    _, new = await _definitions()
+    ctx.frontier_resume_session_id = "pbs_prefix"
+    plan: frontier_module.FrontierPlan = (["source_status"], {}, "source_status", "resumed")
+
+    assert frontier_module._fill_seed_from_origin(ctx, plan, new) == plan
+    assert ctx.frontier_origin_reused_labels == []
+
+
+@pytest.mark.parametrize(
+    ("rows", "run_overrides", "origin_yaml", "candidate_yaml", "expected"),
+    [
+        ("completed", {"organization_id": "org-other"}, None, None, OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN),
+        (
+            "completed",
+            {"workflow_permanent_id": "wfp-other"},
+            None,
+            None,
+            OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN,
+        ),
+        ("completed", {"status": WorkflowRunStatus.running}, None, None, OriginOutputRefusal.ORIGIN_UNSETTLED),
+        ("absent", {}, None, None, OriginOutputRefusal.UPSTREAM_ABSENT),
+        ("output_row_only", {}, None, None, OriginOutputRefusal.UPSTREAM_ABSENT),
+        ("failed", {}, None, None, OriginOutputRefusal.UPSTREAM_FAILED),
+        (
+            "completed",
+            {},
+            INERT_APPROVAL_WORKFLOW_YAML.replace("is authorized", "was approved"),
+            None,
+            OriginOutputRefusal.CHANGED_PRODUCER,
+        ),
+        ("unregistered", {}, None, None, OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ("completed", {}, None, _SOURCE_STATUS_FIRST_YAML, OriginOutputRefusal.ORDER_UNPROVABLE),
+        (
+            "completed",
+            {},
+            _with_approval_export(INERT_APPROVAL_WORKFLOW_YAML, "object"),
+            _with_approval_export(REPAIRED_APPROVAL_WORKFLOW_YAML, "array"),
+            OriginOutputRefusal.CHANGED_PRODUCER,
+        ),
+        (
+            "completed",
+            {},
+            _with_workflow_prompt(INERT_APPROVAL_WORKFLOW_YAML, "Answer briefly."),
+            _with_workflow_prompt(REPAIRED_APPROVAL_WORKFLOW_YAML, "Answer in full sentences."),
+            OriginOutputRefusal.CHANGED_PRODUCER,
+        ),
+    ],
+    ids=[
+        "foreign_organization",
+        "workflow_mismatch",
+        "origin_still_running",
+        "upstream_absent",
+        "output_row_without_a_block_row",
+        "upstream_failed",
+        "changed_producer",
+        "output_unavailable",
+        "order_unprovable",
+        "export_schema_edited_while_export_is_on",
+        "workflow_system_prompt_edited",
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unusable_origin_output_is_refused_by_name_without_its_value(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: str,
+    run_overrides: dict[str, object],
+    origin_yaml: str | None,
+    candidate_yaml: str | None,
+    expected: OriginOutputRefusal,
+) -> None:
+    ctx = await _origin_turn(
+        monkeypatch, origin_yaml=origin_yaml or INERT_APPROVAL_WORKFLOW_YAML, rows=rows, **run_overrides
+    )
+    old, new = await _definitions(candidate_yaml or REPAIRED_APPROVAL_WORKFLOW_YAML)
+
+    labels, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    refusal = ctx.frontier_origin_output_refusal
+    assert refusal is not None
+    # A run that failed the ownership checks is never named back to the model.
+    owned = expected is not OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN
+    assert refusal.as_payload() == {
+        "reason": expected.value,
+        "block_label": "approval",
+        "output_key": "approval_output",
+        **({"origin_workflow_run_id": ORIGIN_RUN_ID} if owned else {}),
+    }
+    assert labels == ["source_status"]
+    assert "approval" not in seed
+    assert ctx.frontier_origin_reused_labels == []
+    assert ORIGIN_OUTPUT_SENTINEL not in repr(ctx)
+
+
+_INTAKE_ORIGIN_YAML = _with_intake_before_approval(INERT_APPROVAL_WORKFLOW_YAML)
+_INTAKE_CANDIDATE_YAML = _with_intake_before_approval(REPAIRED_APPROVAL_WORKFLOW_YAML)
+_REVIEW_BLOCK = "    - block_type: extraction\n      label: review\n      data_extraction_goal: Review the intake.\n"
+_APPROVAL_BLOCK_START = "    - block_type: extraction\n      label: approval\n"
+
+
+def _with_review_before_approval(workflow_yaml: str, *, intake_jumps_to_approval: bool = False) -> str:
+    reviewed = workflow_yaml.replace(_APPROVAL_BLOCK_START, _REVIEW_BLOCK + _APPROVAL_BLOCK_START)
+    if intake_jumps_to_approval:
+        reviewed = reviewed.replace("      label: intake\n", "      label: intake\n      next_block_label: approval\n")
+    return reviewed
+
+
+def _approval_after_intake(*intake_rows: dict[str, Any], approval_minute: int = 2) -> Callable[[Workflow], OriginRows]:
+    def rows(origin: Workflow) -> OriginRows:
+        return merge_origin_rows(
+            *(origin_block_rows(origin, "intake", **row) for row in intake_rows),
+            origin_block_rows(origin, "approval", value=_APPROVAL_VALUE, minute=approval_minute),
+        )
+
+    return rows
+
+
+@pytest.mark.parametrize(
+    ("origin_yaml", "candidate_yaml", "rows", "reason", "changed_label"),
+    [
+        (_INTAKE_ORIGIN_YAML, _INTAKE_CANDIDATE_YAML, _approval_after_intake(), "upstream_absent", "intake"),
+        (
+            _INTAKE_ORIGIN_YAML,
+            _INTAKE_CANDIDATE_YAML,
+            _approval_after_intake({"status": "failed", "minute": 1, "registered": False}),
+            "upstream_failed",
+            "intake",
+        ),
+        (
+            _INTAKE_ORIGIN_YAML,
+            _INTAKE_CANDIDATE_YAML,
+            _approval_after_intake({"minute": 5}),
+            "order_unprovable",
+            "intake",
+        ),
+        (
+            _with_review_before_approval(_INTAKE_ORIGIN_YAML, intake_jumps_to_approval=True),
+            _with_review_before_approval(_INTAKE_CANDIDATE_YAML),
+            _approval_after_intake({"minute": 1}),
+            "order_unprovable",
+            None,
+        ),
+    ],
+    ids=[
+        "partial_origin_with_only_the_producer_row",
+        "block_before_the_producer_failed",
+        "block_before_the_producer_ran_after_it",
+        "origin_route_jumped_over_a_block_before_the_producer",
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_origin_that_did_not_run_the_producers_whole_prefix_first_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    origin_yaml: str,
+    candidate_yaml: str,
+    rows: Callable[[Workflow], OriginRows],
+    reason: str,
+    changed_label: str | None,
+) -> None:
+    ctx = await _origin_turn(monkeypatch, origin_yaml=origin_yaml, rows=rows)
+    old, new = await _definitions(candidate_yaml)
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert "approval" not in seed
+    refusal = ctx.frontier_origin_output_refusal
+    assert refusal is not None
+    assert refusal.as_payload() == {
+        "reason": reason,
+        "block_label": "approval",
+        "output_key": "approval_output",
+        "origin_workflow_run_id": ORIGIN_RUN_ID,
+        **({"changed_label": changed_label} if changed_label else {}),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_retried_producer_is_reused_from_its_latest_row_after_its_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def rows(origin: Workflow) -> OriginRows:
+        return merge_origin_rows(
+            origin_block_rows(origin, "intake", minute=0),
+            origin_block_rows(origin, "approval", status="failed", minute=1, registered=False),
+            origin_block_rows(origin, "intake", minute=2),
+            origin_block_rows(origin, "approval", value=_APPROVAL_VALUE, minute=3),
+        )
+
+    ctx = await _origin_turn(monkeypatch, origin_yaml=_INTAKE_ORIGIN_YAML, rows=rows)
+    old, new = await _definitions(_INTAKE_CANDIDATE_YAML)
+
+    _, seed, _, _ = _plan_frontier(ctx, ["source_status"], old, new)
+
+    assert ctx.frontier_origin_output_refusal is None
+    assert seed == {"approval": _APPROVAL_VALUE}
+
+
+@pytest.mark.asyncio
+async def test_a_scrubbed_origin_input_never_proves_the_test_input_equal(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = await _origin_turn(monkeypatch)
+    assert isinstance(ctx.repair_origin_outputs, OriginOutputSnapshot)
+    ctx.repair_origin_outputs = replace(ctx.repair_origin_outputs, input_values={"request_id": SCRUBBED_VALUE})
+    _, new = await _definitions()
+
+    refusal = frontier_module.origin_input_refusal(ctx, ["approval"], new, {"request_id": SCRUBBED_VALUE})
+
+    assert refusal is not None
+    assert (refusal.reason, refusal.parameter_key) == (OriginOutputRefusal.CHANGED_INPUT, "request_id")

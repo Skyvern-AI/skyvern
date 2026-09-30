@@ -84,6 +84,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.utils.yaml_loader import dump_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
@@ -1575,15 +1576,13 @@ async def _run_updated_workflow_blocks(
     tool_name: str,
     arguments: dict[str, Any],
     update_result: dict[str, Any],
-    prior_definition: object | None,
+    prior_definition: WorkflowDefinition | None,
     block_labels: list[str],
     parameters: dict[str, Any],
     handler_start: float,
 ) -> str:
     """Run a just-persisted definition through the shared frontier and debug-evidence seam."""
-    new_definition = None
-    if copilot_ctx.last_workflow is not None:
-        new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
+    new_definition = copilot_ctx.last_workflow.workflow_definition if copilot_ctx.last_workflow is not None else None
 
     labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
         copilot_ctx,
