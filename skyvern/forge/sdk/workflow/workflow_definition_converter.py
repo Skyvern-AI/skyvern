@@ -845,7 +845,7 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.TERMINATE:
-        return TerminateBlock(**base_kwargs, reason=block_yaml.reason)
+        return TerminateBlock(**base_kwargs, reason=block_yaml.reason, error_code=block_yaml.error_code)
 
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
         file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)

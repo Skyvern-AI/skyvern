@@ -114,7 +114,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "action": "Perform a single focused action on the current page",
     "login": "Handle authentication flows including username/password and TOTP/2FA",
     "wait": "Pause workflow execution for a specified duration",
-    "terminate": "End the workflow run as terminated with a reason, e.g. as a conditional branch target",
+    "terminate": "End the workflow run as terminated with a reason and an optional error code, e.g. as a conditional branch target",
     "validation": "Validate page state with complete/terminate criteria",
     "http_request": "Call an external HTTP API",
     "web_search": "Search Google or Exa and optionally process the results with a prompt",
@@ -261,7 +261,8 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
     "terminate": {
         "block_type": "terminate",
         "label": "stop_account_not_found",
-        "reason": "ACCOUNT_NOT_FOUND: no account matches {{ account_number }}",
+        "reason": "No account matches {{ account_number }}",
+        "error_code": "ACCOUNT_NOT_FOUND",
     },
     "text_prompt": {
         "block_type": "text_prompt",

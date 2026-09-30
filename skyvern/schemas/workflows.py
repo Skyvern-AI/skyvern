@@ -1,6 +1,7 @@
 import abc
 import ast
 import functools
+import re
 import textwrap
 import unicodedata
 from dataclasses import dataclass, field
@@ -1379,6 +1380,32 @@ class TerminateBlockYAML(BlockYAML):
     reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] = Field(
         description="Why the run ends here; supports Jinja templating."
     )
+    error_code: str | None = Field(
+        default=None,
+        description=(
+            "Optional error code added to the run's error codes; supports Jinja templating. "
+            "A literal code must be at most 128 characters. The rendered code must be at most 128 characters "
+            "and may contain only ASCII letters, digits, underscores, periods, colons, and hyphens."
+        ),
+    )
+
+    @field_validator("error_code", mode="before")
+    @classmethod
+    def normalize_error_code(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if re.search(r"\{[{%#]", value):
+            if _contains_unicode_category_c(value):
+                raise ValueError("error code keys must not contain Unicode category-C characters")
+            return value
+        if unusable := error_code_key_error(value):
+            raise ValueError(unusable)
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+            raise ValueError(
+                "literal error codes may contain only ASCII letters, digits, underscores, periods, colons, and hyphens"
+            )
+        return value
 
 
 class FileDownloadBlockYAML(BlockYAML):
