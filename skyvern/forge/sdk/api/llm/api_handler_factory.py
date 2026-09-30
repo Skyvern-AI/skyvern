@@ -1507,11 +1507,14 @@ class LLMAPIHandlerFactory:
             "anthropic/claude-opus-5",
             "anthropic/claude-opus-5-5",
             "bedrock/us.anthropic.claude-opus-5-5",
+            "anthropic/claude-sonnet-5-5",
+            "bedrock/global.anthropic.claude-sonnet-5-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
             "anthropic-claude-fable-5-1",
             "anthropic-claude-opus-5",
             "anthropic-claude-opus-5-5",
+            "anthropic-claude-sonnet-5-5",
         }
 
     @staticmethod

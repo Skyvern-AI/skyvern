@@ -24,7 +24,6 @@ LOG = structlog.get_logger()
 
 WORKFLOW_TASK_V3_AB_FLAG = "WORKFLOW_TASK_V3_AB"
 DISABLE_TASK_V3_FLAG = "DISABLE_TASK_V3"
-TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG = "TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT"
 
 # Trigger kinds whose run executes a workflow the platform minted for that one request rather than
 # one a customer built. The job-recipe endpoints are the whole set today: each call creates a fresh
@@ -51,36 +50,6 @@ class WorkflowBlockEngineRouteReason(StrEnum):
     disabled = "disabled"
     flag_undefined = "flag_undefined"
     flag_error = "flag_error"
-
-
-class NewWorkflowDefaultRollout(StrEnum):
-    """How ``TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT`` answered for a run the v3 default would enrol.
-
-    Only ``enrolled`` -- a conclusive True -- lets the rule fire. ``not_enrolled`` is a conclusive
-    False: the flag is inactive, the run fell outside the percentage, or a condition excluded it.
-    ``undefined`` means the key never resolved at all: nobody created it, or local evaluation has no
-    snapshot row for it yet. ``error`` means the evaluation raised. The last three are logged apart
-    from each other because only ``not_enrolled`` is a randomized cell -- a read that wants this
-    rule's control must pin that value, not the boolean.
-    """
-
-    enrolled = "enrolled"
-    not_enrolled = "not_enrolled"
-    undefined = "undefined"
-    error = "error"
-
-
-# Every resolution but a conclusive True leaves the run on the A/B path, so every off-state of the
-# flag -- inactive, deleted, 0%, a condition that excluded the run, an evaluation that raised -- turns
-# the rule off. An inactive flag is the one that has to be safe: posthog's local evaluator answers a
-# conclusive False for it (``_compute_flag_locally``, "if not active: return False"), which is the
-# gesture an operator reaches for mid-incident. Derived from the enum so a resolution added later
-# leaves the run on the A/B instead of enrolling it.
-_NOT_ENROLLED_RESOLUTIONS = frozenset(NewWorkflowDefaultRollout) - {NewWorkflowDefaultRollout.enrolled}
-
-
-def _rollout_enrols(rollout: NewWorkflowDefaultRollout | None) -> bool:
-    return rollout is not None and rollout not in _NOT_ENROLLED_RESOLUTIONS
 
 
 def _arm_label(override: RunEngine | None) -> str:
@@ -111,7 +80,6 @@ class WorkflowBlockEngineArmDecision:
 
     route_reason: WorkflowBlockEngineRouteReason | None = None
     billing_tier: BillingTier | None = None
-    new_workflow_default_rollout_resolution: NewWorkflowDefaultRollout | None = None
 
 
 NO_ARM_DECISION = WorkflowBlockEngineArmDecision()
@@ -236,56 +204,6 @@ async def _ab_flag_puts_run_in_treatment(
     )
 
 
-async def _resolve_new_workflow_default_rollout(
-    provider: BaseExperimentationProvider,
-    *,
-    workflow_run_id: str,
-    organization_id: str | None,
-    workflow_permanent_id: str | None,
-    billing_tier: BillingTier,
-) -> NewWorkflowDefaultRollout:
-    """How the rollout flag answered for a run the new-workflow v3 default would otherwise enrol.
-
-    This flag is what enrols: the share it does not enrol continues down ``WORKFLOW_TASK_V3_AB``
-    exactly as if the rule did not exist, which is where this population's concurrent control comes
-    from. It is also the only lever that stops the rule for less than everybody -- the cutoff is a
-    setting and needs a restart, and a condition on ``WORKFLOW_TASK_V3_AB`` cannot reach a run that
-    never evaluates it. Turning it off de-enrols rather than forcing v1: an unenrolled run can still
-    be treated by the A/B, so ``DISABLE_TASK_V3`` is the lever for getting an organization off v3.
-
-    ``resolve_feature_flag_strict`` rather than the boolean resolver, so an evaluation that raised is
-    labelled rather than collapsed: both PostHog providers swallow one into ``None`` and ``bool()`` it
-    to ``False``, which would report an error as a real "outside the percentage".
-
-    Only a conclusive ``True`` enrols. ``False``, ``None`` and a raised evaluation all leave the run on
-    the A/B, so every off-gesture on this flag -- disable, delete, 0%, an excluding condition -- turns
-    the rule off, and the cutoff does nothing until the flag resolves ``True`` for someone. A
-    condition on it must be written on person properties: the arm-resolving processes evaluate
-    PostHog locally, and a cohort, group or flag-dependency condition resolves to ``None``, which
-    enrols nobody.
-    """
-    try:
-        resolved = await provider.resolve_feature_flag_strict(
-            TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
-            workflow_run_id,
-            properties={
-                "organization_id": organization_id,
-                "workflow_permanent_id": workflow_permanent_id,
-                BILLING_TIER_PROPERTY: billing_tier.value,
-            },
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to evaluate the new-workflow v3 default rollout; leaving this run on the A/B",
-            workflow_run_id=workflow_run_id,
-            exc_info=True,
-        )
-        return NewWorkflowDefaultRollout.error
-    if resolved is None:
-        return NewWorkflowDefaultRollout.undefined
-    return NewWorkflowDefaultRollout.enrolled if resolved else NewWorkflowDefaultRollout.not_enrolled
-
-
 async def resolve_workflow_block_engine_arm(
     context: skyvern_context.SkyvernContext,
     *,
@@ -308,11 +226,7 @@ async def resolve_workflow_block_engine_arm(
     A self-serve organization's workflow born at or after
     ``settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF`` takes v3 without the percentage being
     consulted, so those runs are marked ``new_self_serve_workflow_default`` for every per-arm read to
-    exclude. ``TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT``, read only for the runs that rule would enrol,
-    is what enrols them; the share it leaves alone continues down the A/B, which is where this
-    population's concurrent control and its scoped kill come from. The rule fires only on a
-    conclusive True, so the cutoff is inert until the flag resolves True for someone, and disabling,
-    deleting or zeroing the flag turns the rule off.
+    exclude. No flag gates the rule: ``DISABLE_TASK_V3`` or unsetting the cutoff turns it off.
 
     ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
     the run was launched. Together they are what separates a workflow a customer keeps from the
@@ -336,7 +250,6 @@ async def resolve_workflow_block_engine_arm(
         run_is_eligible = ineligibility_reason is None
         billing_tier: BillingTier | None = None
         route_reason = WorkflowBlockEngineRouteReason.ineligible
-        rollout: NewWorkflowDefaultRollout | None = None
         try:
             if run_is_eligible:
                 # The kill switch, shared with the dispatch gate via task_v3_disabled so both
@@ -370,19 +283,8 @@ async def resolve_workflow_block_engine_arm(
                         and await _workflow_is_new_for_v3_default(workflow_permanent_id, organization_id)
                     )
                     if takes_new_workflow_default:
-                        # Read only for the runs the rule would enrol, so the A/B population is never
-                        # exposed to this flag and its bucketing is unchanged.
-                        rollout = await _resolve_new_workflow_default_rollout(
-                            provider,
-                            workflow_run_id=workflow_run_id,
-                            organization_id=organization_id,
-                            workflow_permanent_id=workflow_permanent_id,
-                            billing_tier=billing_tier,
-                        )
-                    if takes_new_workflow_default and _rollout_enrols(rollout):
                         # A workflow born at or after the cutoff runs its task blocks on v3 by
-                        # default, so the percentage knob is never consulted: the unenrolled share the
-                        # A/B then routes to control is the only concurrent control these runs have.
+                        # default, so the percentage knob is never consulted.
                         override = RunEngine.skyvern_v3
                         route_reason = WorkflowBlockEngineRouteReason.new_self_serve_workflow_default
                     else:
@@ -414,7 +316,6 @@ async def resolve_workflow_block_engine_arm(
         decision = WorkflowBlockEngineArmDecision(
             route_reason=route_reason,
             billing_tier=billing_tier,
-            new_workflow_default_rollout_resolution=rollout,
         )
         context.workflow_block_engine_override = override
         context.workflow_block_engine_arm_decision = decision
@@ -427,17 +328,6 @@ async def resolve_workflow_block_engine_arm(
             workflow_permanent_id=workflow_permanent_id,
             arm=_arm_label(override),
             route_reason=engine_arm_log_value(route_reason),
-            # True only for a run this rule enrolled, which is every run it treated: the rule's
-            # control cell is the unenrolled share the A/B then routed to control, so a read of the
-            # rule compares route_reason=new_self_serve_workflow_default against
-            # new_workflow_default_rollout_resolution=not_enrolled intersected with
-            # flag_bucket_control -- an unenrolled run re-enters the A/B and can be treated there.
-            new_workflow_default_rollout=_rollout_enrols(rollout),
-            # None whenever the rollout flag was not consulted. The three non-enrolling resolutions
-            # are indistinguishable in the boolean above, and only not_enrolled is a randomized cell,
-            # so both a check of whether the flag is answering at all and the rule's control cell read
-            # this field instead.
-            new_workflow_default_rollout_resolution=engine_arm_log_value(rollout),
             run_is_eligible=run_is_eligible,
             ineligibility_reason=ineligibility_reason,
             # None whenever the A/B was never consulted -- an ineligible run, or one the kill switch

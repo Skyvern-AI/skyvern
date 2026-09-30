@@ -3252,6 +3252,8 @@ class ForgeAgent:
                 caller_known_urls=verdict_known_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
+                # A block that completes on a download is not done by its one action.
+                single_action_block=isinstance(task_block, ActionBlock) and not task_block.complete_on_download,
             )
         finally:
             if context and credential_parameter_key is not None:

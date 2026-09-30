@@ -34,9 +34,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
-    TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
     WORKFLOW_TASK_V3_AB_FLAG,
-    NewWorkflowDefaultRollout,
     WorkflowBlockEngineRouteReason,
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -778,7 +776,6 @@ _V3_DEFAULT_CUTOFF = datetime(2026, 9, 15, tzinfo=UTC)
                 "task_v3_ab_arm": "treatment",
                 "route_reason": WorkflowBlockEngineRouteReason.flag_bucket_treatment,
                 "billing_tier": BillingTier.ENTERPRISE.value,
-                "new_workflow_default_rollout_resolution": None,
             },
         ),
         (
@@ -789,12 +786,11 @@ _V3_DEFAULT_CUTOFF = datetime(2026, 9, 15, tzinfo=UTC)
                 "task_v3_ab_arm": "control",
                 "route_reason": WorkflowBlockEngineRouteReason.flag_bucket_control,
                 "billing_tier": BillingTier.SELF_SERVE.value,
-                "new_workflow_default_rollout_resolution": None,
             },
         ),
         (
             _V3_DEFAULT_CUTOFF,
-            {WORKFLOW_TASK_V3_AB_FLAG: False, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG: True},
+            {WORKFLOW_TASK_V3_AB_FLAG: False},
             {
                 "ineligibility_reason": None,
                 "billing_tier": BillingTier.SELF_SERVE,
@@ -804,7 +800,6 @@ _V3_DEFAULT_CUTOFF = datetime(2026, 9, 15, tzinfo=UTC)
                 "task_v3_ab_arm": "treatment",
                 "route_reason": WorkflowBlockEngineRouteReason.new_self_serve_workflow_default,
                 "billing_tier": BillingTier.SELF_SERVE.value,
-                "new_workflow_default_rollout_resolution": NewWorkflowDefaultRollout.enrolled,
             },
         ),
         (
@@ -822,7 +817,6 @@ _V3_DEFAULT_CUTOFF = datetime(2026, 9, 15, tzinfo=UTC)
                 # collapsing the two would hide which of the ineligible/attribution-lost masses a
                 # per-tier read is missing.
                 "billing_tier": None,
-                "new_workflow_default_rollout_resolution": None,
             },
         ),
     ],
@@ -838,9 +832,9 @@ async def test_duration_log_carries_the_tier_and_route_reason_the_run_was_bucket
     expected: dict[str, object],
 ) -> None:
     # SKY-16122: a per-arm, per-tier outcome read has to come off one log line, so the duration log
-    # reports what resolve_workflow_block_engine_arm decided for the run — the route reason and the
-    # rollout resolution included, because the arm alone reads "treatment" for a bucketed run and for
-    # one the new-workflow default enrolled. Driven through the real resolver rather than a
+    # reports what resolve_workflow_block_engine_arm decided for the run — the route reason included,
+    # because the arm alone reads "treatment" for a bucketed run and for one the new-workflow default
+    # enrolled. Driven through the real resolver rather than a
     # hand-pinned context, which is what makes a dropped pin -- or a finalizer that reads the tier
     # again instead of the bucketed one -- red here.
     from structlog.testing import capture_logs

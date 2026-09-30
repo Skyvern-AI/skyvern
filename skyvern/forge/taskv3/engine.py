@@ -325,6 +325,7 @@ async def run_task_v3_agent_loop(
     unlisted_reask_criteria_untrusted: bool = False,
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
+    single_action_block: bool = False,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -633,6 +634,7 @@ async def run_task_v3_agent_loop(
             semantic_commit_stats=semantic_commit_stats,
             refuse_input_entry=refuse_input_entry,
             tool_trail=tool_trail,
+            single_action_block=single_action_block,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
