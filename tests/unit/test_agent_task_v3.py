@@ -4828,6 +4828,53 @@ async def test_execute_task_v3_failed_run_carries_failure_category(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_cls", "complete_on_download", "single_action"),
+    [(ActionBlock, False, True), (ActionBlock, True, False), (TaskBlock, False, False)],
+    ids=["action", "action_complete_on_download", "task"],
+)
+async def test_execute_task_v3_action_block_budget_exit_is_not_converted_after_the_loop(
+    monkeypatch: pytest.MonkeyPatch, block_cls: type[BaseTaskBlock], complete_on_download: bool, single_action: bool
+) -> None:
+    # The loop alone offers an action block's completion, through the finish tool's guards; a step-cap exit it
+    # returns means a guard refused that completion, so it stays failed. A download-completing block is not
+    # done by its one action.
+    outcome = LoopOutcome(
+        status="budget_exhausted", reason="cap", cap_trip="Reached the maximum steps (1)", billable_actions=["click"]
+    )
+    overrides: dict[str, Any] = {"complete_on_download": True} if complete_on_download else {}
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(block_cls, **overrides),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.failed
+    assert loop_mock.call_args.kwargs["single_action_block"] is single_action
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_action_block_completion_still_passes_the_completion_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(
+        status="completed",
+        reason="performed the block's action (click); a further action was past the block's step limit",
+        billable_actions=["click"],
+    )
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock),
+        completion_gate_vetoes=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.failed
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_budget_exit_carries_typed_category_and_partial_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

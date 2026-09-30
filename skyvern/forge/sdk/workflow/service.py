@@ -12919,9 +12919,6 @@ class WorkflowService:
                 # is what the non-enterprise ramp steps on.
                 route_reason=engine_arm_log_value(arm_decision.route_reason),
                 billing_tier=engine_arm_log_value(arm_decision.billing_tier),
-                new_workflow_default_rollout_resolution=engine_arm_log_value(
-                    arm_decision.new_workflow_default_rollout_resolution
-                ),
             )
             # Run minutes measure compute. A run finalized without ever reaching
             # `running` held no pod, and the created_at fallback above would bill its

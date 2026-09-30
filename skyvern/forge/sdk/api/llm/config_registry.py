@@ -23,8 +23,8 @@ GPT6_MODEL_NAMES: dict[str, str] = {
 }
 GPT6_REASONING_EFFORT: dict[str, str] = {
     "astra": "xhigh",
-    "sol": "xhigh",
-    "1_sol": "xhigh",
+    "sol": "medium",
+    "1_sol": "medium",
     "luna": settings.GPT6_LUNA_REASONING_EFFORT,
 }
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"
@@ -709,6 +709,17 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE5.5_SONNET",
+        LLMConfig(
+            "anthropic/claude-sonnet-5-5",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
@@ -854,6 +865,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE5.5_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-5-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5.5_SONNET_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/global.anthropic.claude-sonnet-5-5",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,

@@ -3175,6 +3175,9 @@ class LoopState:
     # has been submitted; entering one that has spent CREDENTIAL_SUBMIT_BUDGET is refused.
     credentials_entered: set[str] = field(default_factory=set)
     credential_submits: dict[str, int] = field(default_factory=dict)
+    # A single-action block's completion is offered through the finish tool at most once: a guard that
+    # holds a verdict only once would pass a second offer the model never saw it hold.
+    block_completion_offered: bool = False
 
 
 async def run_agent_tool_loop(
@@ -3245,6 +3248,9 @@ async def run_agent_tool_loop(
     # author input, so every FILL_TOOLS call is refused at dispatch.
     refuse_input_entry: bool = False,
     tool_trail: ToolTrail | None = None,
+    # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
+    # finish(completed) instead of failing the block, as the step engine completes it after that step.
+    single_action_block: bool = False,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -4158,6 +4164,32 @@ async def run_agent_tool_loop(
                     )
                     step_cap_trip = f"Reached the maximum steps ({st.max_action_steps})"
                     _append_skipped_tool_results(st.messages, tool_calls[idx:], "action-step budget reached")
+                    finish_spec = tool_by_name.get("finish")
+                    block_refusal: str | None = None
+                    if (
+                        single_action_block
+                        and st.billable_actions
+                        and finish_spec is not None
+                        and not st.block_completion_offered
+                    ):
+                        st.block_completion_offered = True
+                        block_reason = (
+                            f"performed the block's action ({st.billable_actions[0]}); "
+                            "a further action was past the block's step limit"
+                        )
+                        # Through the real handler, so every guard on a completed verdict still applies.
+                        try:
+                            block_finish = await finish_spec.handler({"status": "completed", "reason": block_reason})
+                        except Exception:
+                            LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                            block_finish = ToolResult.error("")
+                        if activity is not None:
+                            activity.held_verdict_batch_skip = False
+                        if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
+                            st.outcome = LoopOutcome("completed", block_reason)
+                            break
+                        if block_finish.status == "error":
+                            block_refusal = block_finish.content
                     # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
                     # away once the final turn is granted: a billable dispatch on the granted turn still
                     # hits it, which is the honest exit the grant exists to produce.
@@ -4192,9 +4224,10 @@ async def run_agent_tool_loop(
                             tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
                             tokens_remaining=None if activity is None else activity.tokens_remaining,
                         )
-                        st.messages.append(
-                            {"role": "user", "content": _budget_exhausted_observation(step_cap_trip, activity)}
-                        )
+                        observation = _budget_exhausted_observation(step_cap_trip, activity)
+                        if block_refusal:
+                            observation += f"\n\nThe block's completion was not accepted: {block_refusal}"
+                        st.messages.append({"role": "user", "content": observation})
                     break
             # Submit-shaped actions (the failure-evidence predicate, minus captcha) are reported BEFORE
             # dispatch, since after it the page may be the confirmation page. A failure here never fails
