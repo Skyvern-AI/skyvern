@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import io
 import json
+import math
 import os
 import random
 import re
@@ -26,9 +27,11 @@ import time
 import unicodedata
 import weakref
 from collections import Counter, defaultdict, deque
+from collections.abc import Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple
 from urllib.parse import urlparse
 
@@ -794,15 +797,281 @@ def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
     return n if isinstance(n, int) else None
 
 
-def _rows_declare_more(rows: list[dict[str, Any]], *, partial: bool = False, count: int | None = None) -> bool:
-    # `partial` (the scroller runs past the rendered rows) is passed only for a single window's read; a
-    # walk that covered the scroller's whole extent has measured that itself and passes the rows it walked
-    # as `count`, since its `rows` are keyed by label.
-    return (
-        partial
-        or any(o.get("setsize_unknown") for o in rows)
-        or max((int(o.get("setsize") or 0) for o in rows), default=0) > (len(rows) if count is None else count)
+_ORDINAL_CAP = 2**31 - 1
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListRow:
+    """One row as one scan read it. `box` is the row's [top, bottom] in its scroller's content space, None when
+    the row has no scroller or is pinned to the viewport."""
+
+    text: str
+    key: str
+    nav: bool
+    box: tuple[float, float] | None
+    after: str | None
+    line: float | None
+    setsize: int
+    setsize_unknown: bool
+    group: str
+    lead: bool
+    read: MappingProxyType[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListWindow:
+    """One scan of a list. `content` is the scroller's [padding top, scrollHeight - padding bottom], None when
+    no scroller runs past the rows, so the rows read are every row rendered. `chain` marks the scans of one
+    ordered walk from the top, whose adjacent windows must share a row; `walk_pass` counts walk restarts."""
+
+    rows: tuple[_ListRow, ...]
+    scroll_top: float
+    scroll_height: float
+    content: tuple[float, float] | None
+    fillers: tuple[tuple[float, float], ...]
+    eps: float
+    walk_pass: int = 0
+    chain: bool = True
+
+
+def _finite(v: Any) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+def _span(v: Any) -> tuple[float, float] | None:
+    if not isinstance(v, list) or len(v) != 2:
+        return None
+    top, bottom = _finite(v[0]), _finite(v[1])
+    return (top, bottom) if top is not None and bottom is not None and bottom > top else None
+
+
+def _ordinal(v: Any) -> int:
+    # The page sets aria-setsize, so an over-large or infinite value clamps rather than raises.
+    return int(min(v, _ORDINAL_CAP)) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _list_row(o: dict[str, Any]) -> _ListRow:
+    text = str(o.get("text") or "")
+    line = _finite(o.get("line"))
+    return _ListRow(
+        text=text,
+        key=_exact_tier_key(text),
+        nav=bool(o.get("nav")),
+        box=_span(o.get("box")),
+        after=str(o["after"]) if isinstance(o.get("after"), str) else None,
+        line=line if line is not None and line > 0 else None,
+        setsize=_ordinal(o.get("setsize")),
+        setsize_unknown=bool(o.get("setsize_unknown")),
+        group=str(o.get("group") or ""),
+        lead=o.get("lead") is not False,
+        read=MappingProxyType(dict(o)),
     )
+
+
+def _list_window(raw: Any, state: Any, *, walk_pass: int = 0, chain: bool = True) -> _ListWindow:
+    rows = tuple(_list_row(o) for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int))
+    if not isinstance(state, dict):
+        return _ListWindow(rows, 0.0, 0.0, None, (), 1.0, walk_pass, chain)
+    height = float(state.get("scrollHeight") or 0)
+    fillers = tuple(span for f in state.get("fillers") or [] if (span := _span(f)) is not None)
+    dpr = _finite(state.get("dpr"))
+    return _ListWindow(
+        rows=rows,
+        scroll_top=float(state.get("scrollTop") or 0),
+        scroll_height=height,
+        content=(float(state.get("padTop") or 0), height - float(state.get("padBottom") or 0)),
+        fillers=fillers,
+        eps=1 / dpr if dpr is not None and dpr > 0 else 1.0,
+        walk_pass=walk_pass,
+        chain=chain,
+    )
+
+
+def _row_identities(windows: Sequence[_ListWindow]) -> list[list[_ListRow]]:
+    """The distinct rows behind the reads of one frame, one list of reads per row. A read joins a row with its key
+    whose box it overlaps, never a second read from the same window: two reads in one window are two rows."""
+    groups: list[tuple[set[int], list[_ListRow]]] = []
+    for i, window in enumerate(windows):
+        for row in window.rows:
+            if not row.text:
+                continue
+            for seen_in, reads in groups:
+                prior = reads[-1].box
+                if (
+                    i not in seen_in
+                    and reads[0].key == row.key
+                    and (prior is None or row.box is None or min(prior[1], row.box[1]) > max(prior[0], row.box[0]))
+                ):
+                    seen_in.add(i)
+                    reads.append(row)
+                    break
+            else:
+                groups.append(({i}, [row]))
+    return [reads for _, reads in groups]
+
+
+def _frames_agree(a: _ListWindow, b: _ListWindow) -> bool:
+    # Chromium snaps scroll offsets to device pixels, so one frame reads one row within a device pixel.
+    eps = max(a.eps, b.eps)
+    return any(
+        ra.key == rb.key and abs(ra.box[0] - rb.box[0]) <= eps
+        for ra in a.rows
+        if ra.text and ra.box is not None
+        for rb in b.rows
+        if rb.text and rb.box is not None
+    )
+
+
+def _declared_shortfall(rows: Sequence[_ListRow]) -> int:
+    """0 when the rows hold what the list declares, -1 when it declares its total unknown, else the total it declares.
+    ARIA scopes aria-setsize to each group, so a group short of its own size is never covered by a full one."""
+    if any(r.setsize_unknown for r in rows):
+        return -1
+    held = Counter((r.group, r.setsize) for r in rows if r.setsize)
+    return sum(size for _, size in held) if any(size > n for (_, size), n in held.items()) else 0
+
+
+def _covered_length(spans: Sequence[tuple[float, float]], lo: float, hi: float) -> float:
+    covered, reach = 0.0, lo
+    for a, b in sorted(spans):
+        a, b = max(a, reach), min(b, hi)
+        if b > a:
+            covered += b - a
+            reach = b
+    return covered
+
+
+def _row_floor(windows: Sequence[_ListWindow]) -> float:
+    """The shortest row this list can render: its shortest row box read, or one line box of a row."""
+    rows = [r for w in windows for r in w.rows if r.text and r.box is not None]
+    return min([r.box[1] - r.box[0] for r in rows if r.box is not None] + [r.line for r in rows if r.line], default=0.0)
+
+
+def _rows_tile(chain: Sequence[_ListWindow]) -> bool:
+    if not chain:
+        return False
+    if all(w.content is None for w in chain):
+        return True
+    if any(w.content is None for w in chain) or not all(_frames_agree(a, b) for a, b in zip(chain, chain[1:])):
+        return False
+    placed = sorted(
+        (
+            (box, reads[0].text, {r.after for r in reads})
+            for reads in _row_identities(chain)
+            if (box := next((r.box for r in reads if r.box is not None), None)) is not None
+        ),
+        key=lambda p: p[0],
+    )
+    boxes = [box for box, _, _ in placed]
+    if not boxes:
+        return False
+    fillers = [f for w in chain for f in w.fillers]
+
+    def _slot(lo: float, hi: float) -> float:
+        return (hi - lo) - _covered_length(fillers, lo, hi)
+
+    interior: list[float] = []
+    spacing: list[float] = []
+    bottom = boxes[0][1]
+    for (_, text, _), ((top, bot), _, afters) in zip(placed, placed[1:]):
+        interior.append(_slot(bottom, top) if top > bottom else top - bottom)
+        if text in afters:
+            spacing.append(interior[-1])
+        bottom = max(bottom, bot)
+    start, end = chain[-1].content or (0.0, 0.0)
+    eps = max(w.eps for w in chain)
+    if boxes[0][0] - start < -eps or end - bottom < -eps:
+        return False
+    h_floor = _row_floor(chain)
+    # The list's own spacing g is read only between rows with nothing between them in the DOM, and its smallest
+    # such slot, so a hole can never raise it; with no such pair it is 0. Spacing that could hold the smallest row
+    # is not spacing.
+    g = min(spacing, default=0.0)
+    if g >= min(b - t for t, b in boxes):
+        return False
+    # A complete list leaves g between rows; one missing row leaves at least g + h_floor. The midpoint of those
+    # two, g + h_floor / 2, is the widest slot a complete list can show.
+    limit = g + h_floor / 2
+    return all(slot < limit for slot in [_slot(start, boxes[0][0]), _slot(bottom, end), *interior])
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListLog:
+    """Every window a walk read, in order. Appending returns a new log, so no read is ever overwritten."""
+
+    windows: tuple[_ListWindow, ...] = ()
+
+    def appended(self, window: _ListWindow) -> _ListLog:
+        return _ListLog((*self.windows, window))
+
+
+def _frames(windows: Sequence[_ListWindow]) -> list[list[_ListWindow]]:
+    by_pass: dict[int, list[_ListWindow]] = {}
+    for w in windows:
+        by_pass.setdefault(w.walk_pass, []).append(w)
+    return [by_pass[p] for p in sorted(by_pass)]
+
+
+def _rows_per_key(windows: Sequence[_ListWindow]) -> Counter[str]:
+    """The most distinct rows any one frame read for each key."""
+    most: Counter[str] = Counter()
+    for frame in _frames(windows):
+        most |= Counter(reads[0].key for reads in _row_identities(frame))
+    return most
+
+
+def _log_rows(windows: Sequence[_ListWindow]) -> list[_ListRow]:
+    """One read per distinct row: the last frame's rows, then any row an earlier frame read under a text the
+    last frame never read."""
+    frames = _frames(windows)
+    if not frames:
+        return []
+    rows = [reads[-1] for reads in _row_identities(frames[-1])]
+    texts = {r.text for r in rows}
+    for frame in frames[:-1]:
+        rows += [reads[-1] for reads in _row_identities(frame) if reads[-1].text not in texts]
+    return rows
+
+
+def _first_scroll_top(windows: Sequence[_ListWindow], text: str) -> float | None:
+    last = max((w.walk_pass for w in windows), default=0)
+    holding = [w for w in windows if any(r.text == text for r in w.rows)]
+    return next((w.scroll_top for w in holding if w.walk_pass == last), holding[0].scroll_top if holding else None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _WalkResult:
+    """What a scroll walk found, every field derived from its log. `rows` are the rows to report (every distinct
+    row when `definitive`, else the restored window's), `seen` every distinct non-navigational row it read."""
+
+    idx: int | None = None
+    hit: str | None = None
+    rows: tuple[dict[str, Any], ...] = ()
+    definitive: bool = False
+    complete: bool = False
+    twins: bool = False
+    twin_rows: int = 0
+    unproven: dict[str, Any] | None = None
+    seen: tuple[dict[str, Any], ...] = ()
+
+
+def _list_coverage(windows: Sequence[_ListWindow]) -> Literal["complete", "declares_more", "incomplete"]:
+    """Whether the rows read are the whole list: the one completeness rule for a single read and for a walk.
+    Geometry decides, over the chained windows of the walk's last pass: the frames agree, and no slot between
+    row boxes (both list ends included, a declared filler covering its own box) could hold a row. A declared size
+    only refuses: a widget may number each rendered window 1..N. `declares_more`: the rows tile the extent but the
+    list declares rows they do not hold."""
+    if not windows:
+        return "incomplete"
+    last = max(w.walk_pass for w in windows)
+    frame = [w for w in windows if w.walk_pass == last]
+    chain = [w for w in frame if w.chain]
+    unknown = any(r.setsize_unknown for w in windows for r in w.rows)
+    tiles = _rows_tile(chain)
+    declared = [max(reads, key=lambda r: r.setsize) for reads in _row_identities(frame) if reads[0].lead]
+    if unknown or _declared_shortfall(declared):
+        return "declares_more" if tiles else "incomplete"
+    return "complete" if tiles else "incomplete"
 
 
 def _lead_clause(text: str) -> str:
@@ -939,6 +1208,20 @@ def _commit_gate(
     if sum(1 for t in contenders if (r := _option_tier(value, t)) is not None and r <= rank) >= 2:
         return "ambiguous"
     return "commit" if complete else "incomplete"
+
+
+async def _read_list_window(page: Any, raw: Any, *, scroller: bool) -> _ListWindow:
+    """One read of the rows `raw` against the scroller the finder tagged. A tagged scroller whose state cannot be
+    read leaves an unbounded extent, so the read never proves the list whole."""
+    if not scroller:
+        return _list_window(raw, None)
+    try:
+        state = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": None})
+    except Exception:
+        state = None
+    if not isinstance(state, dict):
+        state = {"scrollHeight": math.inf}
+    return _list_window(raw, state)
 
 
 def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any]) -> ToolResult:
@@ -6416,16 +6699,12 @@ _MENU_AFTER_JS = (
 }"""
 )
 
-# Undeclared-virtualisation check over rows `g` ([{el, r}], top-to-bottom), shared by _FIND_MENU_JS and
-# the popup filter's row read so both judge a rendered window against the same scroller extent.
-_WINDOW_PARTIAL_JS = r"""
-  const windowPartial = (g, fallback) => {
-    // Undeclared virtualisation: a list that renders only a window declares nothing (no aria-setsize),
-    // but its scroll container carries the FULL extent (react-window sizes a spacer to the whole list).
-    // Rendered-in-full lists fill their scroll extent; a window leaves more than a row of it uncovered.
-    let partial = false;
-    // Tagged so a caller that hits `partial` can drive this same container's scrollTop to search past
-    // the rendered window, without re-deriving which ancestor is the scroller.
+# Tags the scroll container that owns rows `g` ([{el, r}], top-to-bottom) data-tv3-menu-scroller, shared by
+# _FIND_MENU_JS and the popup filter's row read. Whether the rows are the whole list is decided in Python by
+# `_list_coverage`, from the row boxes and the scroller state read against this tag.
+_TAG_LIST_SCROLLER_JS = r"""
+  const tagListScroller = (g, fallback) => {
+    let tagged = false;
     try {
       const first = g[0].r, last = g[g.length - 1].r;
       const span = last.bottom - first.top;
@@ -6449,13 +6728,32 @@ _WINDOW_PARTIAL_JS = r"""
           const insideList = !!listEl && listEl.nodeType === 1 && (sc === listEl || pContains(listEl, sc));
           const owned = inner ? inner.getBoundingClientRect().height : span;
           if (!insideList && owned < sc.scrollHeight - 2 * rowH && owned < 0.75 * sc.scrollHeight) continue;
-          partial = sc.scrollHeight - span >= 1.5 * rowH;
           sc.setAttribute('data-tv3-menu-scroller', '1');
+          tagged = true;
           break;
         }
       }
-    } catch (e) { partial = false; }
-    return partial;
+    } catch (e) { tagged = false; }
+    return tagged;
+  };
+"""
+
+# A box in the tagged scroller's content space, unrounded. Rect deltas carry every ancestor transform and
+# scrollTop does not, so the delta is divided by the scroller's own scale before scrollTop is added. A sticky
+# or fixed box sits at the viewport in every window, not at a list position, so it is no row and no filler.
+_LIST_BOX_JS = r"""
+  const contentBox = (el, sc) => {
+    const r = el.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+    const s = sc.offsetHeight > 0 && sr.height > 0 ? sr.height / sc.offsetHeight : 1;
+    const t = (r.top - sr.top) / s - sc.clientTop + sc.scrollTop;
+    return [t, t + r.height / s];
+  };
+  const pinned = (el, sc) => {
+    for (let n = el; n && n !== sc; n = composedParentElement(n)) {
+      const p = getComputedStyle(n).position;
+      if (p === 'sticky' || p === 'fixed') return true;
+    }
+    return false;
   };
 """
 
@@ -6473,7 +6771,7 @@ _FIND_MENU_JS = (
   const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
-    + _WINDOW_PARTIAL_JS
+    + _TAG_LIST_SCROLLER_JS
     + r"""
   const MENU_ROW_ROLES = """
     + _MENU_ROW_ROLES_JS
@@ -6777,7 +7075,7 @@ _FIND_MENU_JS = (
     options.push({ n: tagOf.get(head), text });
   }
   const count = listed.length;
-  const partial = windowPartial(best.g, best.p);
+  const scroller = tagListScroller(best.g, best.p);
   // A listbox or menu declares its options even when a row renders nothing this finder can read. Only
   // rendered, outermost options count (a filter hides the rest), unless the options state the set size.
   let declared = 0;
@@ -6800,7 +7098,7 @@ _FIND_MENU_JS = (
   // `count` is the note's rows; `tagged` is the leaves the full-text read should find, row pieces included;
   // `rows` is the distinct rendered rows those leaves sit in, the unit aria-setsize counts.
   const rendered = new Set(best.g.map((c) => composedClosest(c.el, DECLARED_ROW_SEL) || c.el)).size;
-  const out = { count, tagged: n, rows: rendered, options, partial, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
+  const out = { count, tagged: n, rows: rendered, options, scroller, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
   if (declared > count) out.declared = declared;
   return out;
 }"""
@@ -6819,8 +7117,10 @@ _MENU_OPTION_TEXTS_JS = (
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
     + _DECLARED_VALUES_JS
+    + _LIST_BOX_JS
     + r"""
   const attr = (arg && arg.attr) || 'menu';
+  const sc = pQS('[data-tv3-menu-scroller]');
   // The tagger tags the innermost leaf, which may hold none of a row's accessible-name attributes
   // (a `<span>` inside `<li role="option" aria-label="...">`) -- so the name is read from BOTH the
   // tagged leaf and its OPT_SEL ancestor, aria-label before aria-labelledby at each, first non-empty wins.
@@ -6849,6 +7149,10 @@ _MENU_OPTION_TEXTS_JS = (
   };
   const tagged = Array.from(pQSA('[data-tv3-' + attr + ']'));
   const boxes = leafBoxes(tagged);
+  // aria-setsize counts rows, and a declared row can hold several tagged leaves: only its first leaf leads it.
+  const rowOf = (el) => { try { return composedClosest(el, DECLARED_ROW_SEL); } catch (e) { return null; } };
+  const leadOf = new Map();
+  for (const el of tagged) { const r = rowOf(el); if (r && !leadOf.has(r)) leadOf.set(r, el); }
   return tagged.map((el) => {
     // An option whose ancestor declares aria-setsize is a child that declares none, so read the
     // closest declaring ancestor or the incomplete-list guard is bypassed.
@@ -6858,10 +7162,33 @@ _MENU_OPTION_TEXTS_JS = (
     const opt = composedClosest(el, OPT_SEL) || composedClosest(el, '[role="row"]');
     const setEl = composedClosest(el, '[aria-setsize]');
     const setsize = setEl ? parseInt(setEl.getAttribute('aria-setsize'), 10) : NaN;
-    // `pos` is the row's top in the scroller's own coordinate space (scroll-invariant), so a row seen
-    // in two overlapping windows reads the same and two rows wearing one text read apart.
-    const sc = pQS('[data-tv3-menu-scroller]');
-    const pos = sc ? Math.round(el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop) : null;
+    // aria-setsize counts the rows of one group, so each row carries its group's name.
+    const grp = composedClosest(opt || el, '[role="group"]');
+    // The ROW's box, not the tagged leaf's: a leaf sits at a different offset inside each row. `line` is one
+    // line box of the row, the floor on how short a row this list can render.
+    const rowEl = opt || el;
+    // `after`: the text of the tagged row in the element right before this row's own slot, past declared
+    // separators, so a slot between two rows with nothing else in the DOM between them is known; any other element
+    // between them (a placeholder) breaks it.
+    let after = null;
+    try {
+      let slotEl = rowEl;
+      while (slotEl.parentElement && slotEl.parentElement !== sc && slotEl.parentElement.children.length === 1) {
+        slotEl = slotEl.parentElement;
+      }
+      let prev = slotEl.previousElementSibling;
+      while (prev && prev.matches('[role="separator"],hr')) prev = prev.previousElementSibling;
+      const tag = '[data-tv3-' + attr + ']';
+      const prevRow = prev ? (prev.matches(tag) ? prev : prev.querySelector(tag)) : null;
+      if (prevRow) after = (prevRow.innerText || prevRow.textContent || '').trim() || null;
+    } catch (e) { after = null; }
+    let box = null, line = null;
+    try {
+      if (sc && pContains(sc, rowEl) && !pinned(rowEl, sc)) box = contentBox(rowEl, sc);
+      const cs = getComputedStyle(rowEl);
+      const lh = parseFloat(cs.lineHeight);
+      line = Number.isFinite(lh) ? lh : 1.2 * parseFloat(cs.fontSize);
+    } catch (e) { box = null; }
     let val = null;
     if (el.tagName === 'OPTION') {
       // The DOM `.value` IDL is the spec submission value ALREADY -- an explicit `value=""` and an
@@ -6919,7 +7246,11 @@ _MENU_OPTION_TEXTS_JS = (
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
       // aria-setsize="-1" declares the total unknown, so the rendered rows are never the whole list.
       setsize_unknown: setsize === -1,
-      pos: pos,
+      group: grp ? accessibleName(grp) || grp.id || 'group' : '',
+      lead: !rowOf(el) || leadOf.get(rowOf(el)) === el,
+      box: box,
+      after: after,
+      line: Number.isFinite(line) && line > 0 ? line : null,
       val: val,
       // 9 allowlisted attributes x 2 nodes = 18 possible entries; 24 can never truncate.
       vals: vetoVals.slice(0, 24),
@@ -6950,7 +7281,7 @@ _POPUP_FILTER_INPUT_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
-    + _WINDOW_PARTIAL_JS
+    + _TAG_LIST_SCROLLER_JS
     + _BUSY_CUE_JS
     + r"""
   const shown = (e) => {
@@ -6987,7 +7318,7 @@ _POPUP_FILTER_INPUT_JS = (
     const fresh = leaves.filter((e) => !e.hasAttribute('data-tv3-filter-base')).length;
     pQSA('[data-tv3-menu-scroller]').forEach((e) => e.removeAttribute('data-tv3-menu-scroller'));
     const g = leaves.map((e) => ({ el: e, r: e.getBoundingClientRect() }));
-    return { count: leaves.length, fresh, partial: g.length ? windowPartial(g, g[0].el) : false };
+    return { count: leaves.length, fresh, scroller: g.length ? tagListScroller(g, g[0].el) : false };
   }
   window.__tv3_popup_filter = null;
   pQSA('[data-tv3-popup-filter]').forEach((e) => e.removeAttribute('data-tv3-popup-filter'));
@@ -7090,18 +7421,32 @@ _MENU_WINDOW_FINGERPRINT_JS = (
 _MENU_SCROLLER_STEP_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
+    + _LIST_BOX_JS
     + r"""
   const el = pQS('[data-tv3-menu-scroller]');
   if (!el) return null;
   if (typeof arg.top === 'number') el.scrollTop = arg.top;
-  // A declared separator's own height is space no option can load into, so the walk may count it as covered. A
+  // A declared separator's own box is space no option can load into, so the walk may count it as covered. A
   // blank option or an unmarked blank row may be a placeholder for a row still loading and is never reported.
-  const box = el.getBoundingClientRect();
   const fillers = Array.from(el.querySelectorAll('[role="separator"],hr'))
-    .map((s) => s.getBoundingClientRect())
-    .filter((r) => r.height > 0 && r.bottom > box.top && r.top < box.bottom)
-    .map((r) => [Math.round(r.top - box.top + el.scrollTop), r.height]);
-  return { scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight, fillers };
+    .filter((s) => !pinned(s, el))
+    .map((s) => contentBox(s, el))
+    .filter((b) => b[1] > b[0]);
+  const cs = getComputedStyle(el);
+  // A CSS animation or transition running on the scroller, inside it or above it moves the boxes a read takes.
+  let moving = true;
+  try {
+    moving = document.getAnimations().some((a) => {
+      const t = a.playState === 'running' && a.effect ? a.effect.target : null;
+      return !!t && (pContains(el, t) || pContains(t, el));
+    });
+  } catch (e) { moving = true; }
+  return {
+    moving,
+    scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight,
+    padTop: parseFloat(cs.paddingTop) || 0, padBottom: parseFloat(cs.paddingBottom) || 0,
+    dpr: window.devicePixelRatio || 1, fillers,
+  };
 }"""
 )
 
@@ -14221,10 +14566,7 @@ def build_browser_tools(
                 # Only rows the widget DECLARED count against its own aria-setsize; a bare node padding
                 # the list would hide a genuinely truncated one.
                 declared_rendered = [o for o in rows if o.get("n") not in bare_ns]
-                declared_size = max((int(o.get("setsize") or 0) for o in declared_rendered), default=0)
-                overflow = 0
-                if _rows_declare_more(declared_rendered):
-                    overflow = declared_size if declared_size > len(declared_rendered) else -1
+                overflow = _declared_shortfall([_list_row(o) for o in declared_rendered])
                 idx = _pick(rows)
                 if idx is None and overflow == 0:
                     # No exact-label winner over the complete rendered list — but "several rows" may be
@@ -16456,16 +16798,13 @@ def build_browser_tools(
 
         # `overflowed` = the enumerated set is not the whole list, so uniqueness cannot be established and
         # ALL auto-commit is refused. That is true when the full read failed, when `_FIND_MENU_JS` tagged
-        # more leaves than the read returned (a row remounted between the two calls), OR when a row's `aria-setsize`
-        # declares more options than there are rendered rows (a virtualised list whose window is all that is in
-        # the DOM). aria-setsize counts rows, not leaves: two-leaf rows read back more leaves than rows.
-        declared = max((int(o.get("setsize") or 0) for o in read), default=0)
-        rendered_rows = found.get("rows")
-        if not isinstance(rendered_rows, int) or isinstance(rendered_rows, bool):
-            rendered_rows = len(read)
+        # more leaves than the read returned (a row remounted between the two calls), OR when `_list_coverage`
+        # cannot prove the rows read are the list (a virtualised list whose window is all that is in the DOM).
         size_unknown = any(o.get("setsize_unknown") for o in read)
         overflowed = (
-            not read or tagged > len(read) or declared > rendered_rows or size_unknown or bool(found.get("partial"))
+            not read
+            or tagged > len(read)
+            or _list_coverage([await _read_list_window(page, read, scroller=bool(found.get("scroller")))]) != "complete"
         )
         rows = read or (found.get("options") or [])
         rows.sort(key=_n_order)
@@ -16484,14 +16823,9 @@ def build_browser_tools(
                 'if one of them is the option you want, click it by its [data-tv3-menu="N"] selector'
             )
 
-        walked_twins = False
-        walked_twin_rows = 0
-        walk_complete = False
-        walk_unproven: dict[str, Any] | None = None
-        walk_seen: list[dict[str, Any]] = []
+        walk = _WalkResult()
 
-        async def _scroll_search_menu_option() -> tuple[int | None, str | None, list[dict[str, Any]], bool]:
-            nonlocal walked_twins, walked_twin_rows, walk_complete, walk_unproven, walk_seen
+        async def _scroll_search_menu_option() -> _WalkResult:
             unproven: str | None = None
             # A virtualised listbox only ever holds a window of rows in the DOM, so `value` may sit
             # outside what we already read. Drive the scroller `_FIND_MENU_JS` tagged, re-enumerating
@@ -16500,21 +16834,15 @@ def build_browser_tools(
             # so a number from an earlier window is not an identity. Any hit, exact or forward-prefix ("United
             # States" -> "United States Minor Outlying Islands"), commits only through `_commit_gate` once the walk
             # has reached the end: a twin, or the exact row a prefix stands in for, may still be below. A label
-            # seen at two different list positions (or twice in one window) is two rows wearing one text and is
-            # refused as ambiguous rather than collapsed by the dedupe.
-            seen: dict[str, dict[str, Any]] = {}
-            seen_top: dict[str, float] = {}
-            seen_pos: dict[str, list[float]] = {}
-            all_pos: set[float] = set()
-            fillers: dict[int, float] = {}
-            unknown_seen = False
-            ambiguous: set[str] = set()
-            extent = 0.0
-
+            # read on two distinct rows (two boxes, or twice in one window) is two rows wearing one text and is
+            # refused as ambiguous.
+            log = _ListLog()
+            walk_pass = 0
             last_fingerprint: str | None = None
 
-            async def _scan(top: float | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-                nonlocal last_fingerprint, extent, unknown_seen
+            async def _scan(top: float | None, *, chain: bool) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+                # The only writer of `log`: every verdict below is derived from the windows it appends.
+                nonlocal log, last_fingerprint
                 try:
                     state = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": top})
                 except Exception:
@@ -16534,69 +16862,61 @@ def build_browser_tools(
                     if (isinstance(fp, str) and fp != last_fingerprint) or time.monotonic() >= settle_until:
                         break
                 last_fingerprint = fp if isinstance(fp, str) else last_fingerprint
-                # Re-read the scroller AFTER the settle: a page appended during the wait must show in
-                # the extent this scan reports, or the bottom check would call the walk complete.
-                try:
-                    settled = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": None})
-                    if isinstance(settled, dict):
-                        state = settled
-                except Exception:
-                    pass
-                try:
-                    await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
-                    texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
-                except Exception:
-                    texts_raw = None
-                current: list[dict[str, Any]] = []
+                # Re-read the scroller AFTER the settle: a page appended during the wait must show in the extent
+                # this scan reports. A read taken while an animation runs on the list, or at a scroll offset other
+                # than the one asked for (short of the list end), may catch rows mid-move, so that window is taken
+                # on two equal reads in a row; a still read is taken as it is.
+                texts_raw: Any = None
+                prior: Any = None
+                steady_until = time.monotonic() + 0.4
+                while True:
+                    try:
+                        settled = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": None})
+                        if isinstance(settled, dict):
+                            state = settled
+                    except Exception:
+                        pass
+                    try:
+                        await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+                        texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
+                    except Exception:
+                        texts_raw = None
+                    if (
+                        (prior is None and not _unsteady(state, top))
+                        or (state, texts_raw) == prior
+                        or time.monotonic() >= steady_until
+                    ):
+                        break
+                    prior = (state, texts_raw)
+                    await asyncio.sleep(0.02)
+                window = _list_window(texts_raw, state, walk_pass=walk_pass, chain=chain)
+                log = log.appended(window)
+                return state, [dict(r.read) for r in window.rows if r.text]
+
+            def _unsteady(state: dict[str, Any], top: float | None) -> bool:
+                if state.get("moving") is not False:
+                    return True
+                if top is None:
+                    return False
                 here = float(state.get("scrollTop") or 0)
-                extent = max(extent, float(state.get("scrollHeight") or 0))
-                for span in state.get("fillers") or []:
-                    if isinstance(span, list) and len(span) == 2 and all(isinstance(v, (int, float)) for v in span):
-                        fillers[round(float(span[0]))] = float(span[1])
-                counts: dict[str, int] = {}
-                if isinstance(texts_raw, list):
-                    for o in texts_raw:
-                        if not isinstance(o, dict) or not isinstance(o.get("n"), int):
-                            continue
-                        # Any row in any window declaring its total unknown makes the whole walk incomplete.
-                        unknown_seen = unknown_seen or bool(o.get("setsize_unknown"))
-                        text = str(o.get("text") or "")
-                        if not text:
-                            continue
-                        # Ambiguity is judged on the matcher's canonical form ("US", "us", "U S" with a
-                        # zero-width space are one label), while `seen` keeps the raw text for display.
-                        key = _exact_tier_key(text)
-                        counts[key] = counts.get(key, 0) + 1
-                        current.append(o)
-                        pos = o.get("pos")
-                        if isinstance(pos, (int, float)):
-                            all_pos.add(round(float(pos)))
-                            positions = seen_pos.setdefault(key, [])
-                            positions.append(float(pos))
-                            # A row straddling two windows reads the same top (±subpixel rounding).
-                            if max(positions) - min(positions) > 3:
-                                ambiguous.add(key)
-                        seen[text] = o
-                        seen_top.setdefault(text, here)
-                ambiguous.update(k for k, n in counts.items() if n > 1)
-                return state, current
+                at_end = here + float(state.get("clientHeight") or 0) >= float(state.get("scrollHeight") or 0) - 1
+                return abs(here - max(0.0, top)) > 1 and not at_end
+
+            def _twin_keys() -> set[str]:
+                return {k for k, n in _rows_per_key(log.windows).items() if n > 1}
 
             def _is_ambiguous(text: str) -> bool:
-                return _exact_tier_key(text) in ambiguous
+                return _exact_tier_key(text) in _twin_keys()
 
             def _match_seen() -> str | None:
-                texts = [t for t, o in seen.items() if not o.get("nav") and not _is_ambiguous(t)]
+                twins = _twin_keys()
+                texts = list(
+                    dict.fromkeys(
+                        r.text for w in log.windows for r in w.rows if r.text and not r.nav and r.key not in twins
+                    )
+                )
                 hit = _match_menu_option(value, [{"n": k, "text": t} for k, t in enumerate(texts)])
                 return texts[hit] if hit is not None else None
-
-            def _rows_of(key: str) -> int:
-                # Rows, not labels: a label seen at tops more than 3px apart is that many rows.
-                ps = sorted(seen_pos.get(key, []))
-                at = 1 + sum(1 for a, b in zip(ps, ps[1:]) if b - a > 3) if ps else 1
-                return max(at, sum(1 for t in seen if _exact_tier_key(t) == key))
-
-            def _walked_rows() -> int:
-                return sum(_rows_of(key) for key in {_exact_tier_key(t) for t in seen})
 
             def _row_n(current: list[dict[str, Any]], text: str) -> int | None:
                 fresh = next((o for o in current if str(o.get("text") or "") == text and not o.get("nav")), None)
@@ -16616,14 +16936,20 @@ def build_browser_tools(
                 deferred = text
                 return None
 
+            def _next_target(top: float, step: float) -> float:
+                # The next window starts at the last row this one read, so adjacent windows share a row.
+                tops = [r.box[0] for r in log.windows[-1].rows if r.text and r.box is not None]
+                return max(tops) if tops and max(tops) > top + 1 else top + step
+
             # Read the window the open-click rendered first (the common in-window hit costs one scan and
             # never moves the list), then walk from the top so the scan order is position-independent.
-            state, current = await _scan(None)
+            state, current = await _scan(None, chain=False)
             if state is None:
-                return None, None, [], False
+                return _WalkResult()
             start_top = float(state.get("scrollTop") or 0)
             step = max(1.0, float(state.get("clientHeight") or 1))
             reached_end = False
+            restarted = False
             target = 0.0
             prev_top: float | None = None
             extent_before = float(state.get("scrollHeight") or 0)
@@ -16641,93 +16967,111 @@ def build_browser_tools(
                     break
                 if time.monotonic() > deadline:
                     break
-                state, current = await _scan(target)
+                state, current = await _scan(target, chain=True)
                 if state is None:
                     break
+                chained = [w for w in log.windows if w.chain and w.walk_pass == walk_pass]
+                if not restarted and len(chained) >= 2 and not _frames_agree(chained[-2], chained[-1]):
+                    # The list moved under the walk (a prepend, a re-measure), so its windows no longer stitch
+                    # into one frame: walk it once more from the top.
+                    restarted = True
+                    walk_pass += 1
+                    prev_top = None
+                    target = 0.0
+                    extent_before = float(state.get("scrollHeight") or 0)
+                    continue
                 top = float(state.get("scrollTop") or 0)
                 if top == prev_top:
                     # At the bottom: a list that appends a page on reaching its end grows only after a
                     # request; give it a beat and walk on if the extent moved, else the walk is done.
                     await asyncio.sleep(0.3)
-                    grown, current = await _scan(None)
+                    grown, current = await _scan(None, chain=True)
                     if grown is not None and float(grown.get("scrollHeight") or 0) > extent_before:
                         extent_before = float(grown.get("scrollHeight") or 0)
                         prev_top = None
-                        target = top + step
+                        target = _next_target(top, step)
                         continue
                     reached_end = True
                     break
                 prev_top = top
-                target = top + step
-
-            def _rows_cover_extent() -> bool:
-                # The rows seen tile the scroller's whole extent (no gap wider than ~1.5 rows, less than a row
-                # at either end): only then has the walk shown the full list. A scroller that grows past its
-                # rendered rows without re-rendering (or rendered too late) leaves gaps, and a prefix
-                # match over a partial list is not a match.
-                if len(all_pos) < 2 or extent <= 0:
-                    return False
-                ps = sorted(all_pos)
-
-                # Gaps are measured between ROW tops; a separator inside one only removes its own height, so
-                # separators can never close the gap a missing row leaves.
-                def _open(a: float, b: float) -> float:
-                    return (b - a) - sum(h for t, h in fillers.items() if a <= t < b)
-
-                gaps = [_open(a, b) for a, b in zip(ps, ps[1:]) if b - a > 0]
-                pitch = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
-                if pitch <= 0:
-                    return False
-                # Padding at the ends is allowed, but never a whole row: a missing first or last row could be a
-                # placeholder still loading a twin. Summing both ends cancels where the read node sits in its row;
-                # positions are whole pixels, so 4px of slack keeps a fractional row height from rounding under.
-                if _open(0.0, ps[0]) + _open(ps[-1], extent) - pitch >= pitch - 4:
-                    return False
-                return all(g <= 1.5 * pitch for g in gaps)
+                target = _next_target(top, step)
 
             if hit_text is not None and _is_ambiguous(hit_text):
                 reached_end = True
-            # A walk that was cut short (deadline, cap, scan failure), left gaps (a window that never rendered
-            # in time) or saw fewer rows than the list declares has not shown the rest of the list: a twin, or
-            # the exact row a prefix hit stands in for, may sit in what was not seen.
-            covered = reached_end and _rows_cover_extent()
-            walked_twins = want in ambiguous
-            walked_twin_rows = _rows_of(want) if walked_twins else 0
-            # A text-less option still counts against the declared size (it may be a placeholder whose row is still
-            # loading); only a declared separator is filler, and it counts neither there nor as a gap in the extent.
-            walk_complete = (
-                covered
-                and not size_unknown
-                and not unknown_seen
-                and not _rows_declare_more(list(seen.values()), count=_walked_rows())
-            )
-            walk_seen = [o for o in seen.values() if not o.get("nav")]
-            named = _value_contenders(value, [t for t, o in seen.items() if not o.get("nav")])
+            # A walk that was cut short (deadline, cap, scan failure), left a slot a row could fill, read windows
+            # that do not stitch into one frame, or saw fewer rows than the list declares has not shown the rest of
+            # the list: a twin, or the exact row a prefix hit stands in for, may sit in what was not seen.
+            coverage = _list_coverage(log.windows) if reached_end else "incomplete"
+            complete = coverage == "complete" and not size_unknown
+            decided_extent = next((w.scroll_height for w in reversed(log.windows) if w.chain), None)
+
+            def _verdict(text: str) -> Literal["commit", "ambiguous", "incomplete"]:
+                twins = _twin_keys()
+                return _commit_gate(
+                    text,
+                    value,
+                    complete=complete,
+                    twins_seen=want in twins or _exact_tier_key(text) in twins,
+                    contenders=_value_contenders(value, [r.text for r in _log_rows(log.windows) if not r.nav]),
+                )
+
+            def _result(
+                current: list[dict[str, Any]],
+                *,
+                definitive: bool,
+                idx: int | None = None,
+                hit: str | None = None,
+                unproven_row: dict[str, Any] | None = None,
+            ) -> _WalkResult:
+                twins = _twin_keys()
+                flagged = tuple(
+                    {**r.read, "ambiguous": True} if r.key in twins else dict(r.read) for r in _log_rows(log.windows)
+                )
+                return _WalkResult(
+                    idx=idx,
+                    hit=hit,
+                    rows=flagged if definitive else tuple(current),
+                    definitive=definitive,
+                    complete=complete,
+                    twins=want in twins,
+                    twin_rows=_rows_per_key(log.windows)[want] if want in twins else 0,
+                    unproven=unproven_row,
+                    seen=tuple(o for o in flagged if not o.get("nav")),
+                )
+
             for text in (hit_text, deferred if _match_seen() == deferred else None):
                 if text is None:
                     continue
-                verdict = _commit_gate(
-                    text,
-                    value,
-                    complete=walk_complete,
-                    twins_seen=walked_twins or _is_ambiguous(text),
-                    contenders=named,
-                )
+                verdict = _verdict(text)
+                if verdict == "commit":
+                    _, current = await _scan(_first_scroll_top(log.windows, text) or 0.0, chain=False)
+                    # The extent the coverage was decided on must still hold at the click: a list whose extent moved
+                    # by room for a row has rows the walk never read. A smaller move is a row box overhanging it.
+                    complete = (
+                        complete
+                        and decided_extent is not None
+                        and abs(log.windows[-1].scroll_height - decided_extent) < _row_floor(log.windows) / 2
+                    )
+                    verdict = _verdict(text)
+                    n = _row_n(current, text)
+                    if verdict == "commit" and n is not None:
+                        return _result(current, definitive=reached_end, idx=n, hit=text)
                 if verdict != "commit":
                     unproven = unproven or (text if verdict == "incomplete" else None)
-                    continue
-                _, current = await _scan(seen_top.get(text, 0.0))
-                n = _row_n(current, text)
-                if n is not None:
-                    return n, text, list(seen.values()), reached_end
             # Leave the list where the open-click rendered it so the model's next look() matches the
             # window it already reasoned about, or at the row the refusal will name. `data-tv3-menu` numbers from
             # earlier windows are not identities, so a full scan reports the option TEXTS it saw and a cut-short
             # one reports only the rows live in the restored window.
-            _, current = await _scan(seen_top.get(unproven, start_top) if unproven else start_top)
+            restore = _first_scroll_top(log.windows, unproven) if unproven else None
+            _, current = await _scan(start_top if restore is None else restore, chain=False)
             n_unproven = _row_n(current, unproven) if unproven else None
-            walk_unproven = (
-                None
+            # A walk that reached the end but left gaps is reported as cut short: its rows are not the
+            # whole list, so the definitive no-match/ambiguity verdicts do not apply.
+            definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else coverage != "incomplete")
+            return _result(
+                current,
+                definitive=definitive,
+                unproven_row=None
                 if n_unproven is None
                 else {
                     "n": n_unproven,
@@ -16735,15 +17079,8 @@ def build_browser_tools(
                     "why": "scrolled to the end of the list but could not prove it read every row"
                     if reached_end
                     else "the list is longer than we could enumerate before the walk was cut short",
-                }
+                },
             )
-            for text, o in seen.items():
-                if _is_ambiguous(text):
-                    o["ambiguous"] = True
-            # A walk that reached the end but left gaps is reported as cut short: its rows are not the
-            # whole list, so the definitive no-match/ambiguity verdicts do not apply.
-            definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else _rows_cover_extent())
-            return None, None, (list(seen.values()) if definitive else current), definitive
 
         # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
         # read in full, so "several rows matched" can safely be checked for one candidate wearing more
@@ -16753,7 +17090,13 @@ def build_browser_tools(
         matched_from_scroll: str | None = None
         scanned_all = False
         if idx is None and overflowed:
-            idx, matched_from_scroll, accumulated_rows, scanned_all = await _scroll_search_menu_option()
+            walk = await _scroll_search_menu_option()
+            idx, matched_from_scroll, accumulated_rows, scanned_all = (
+                walk.idx,
+                walk.hit,
+                list(walk.rows),
+                walk.definitive,
+            )
             if idx is not None and matched_from_scroll is not None:
                 options = [{"n": idx, "text": matched_from_scroll, "nav": False}]
                 rows = options
@@ -16765,16 +17108,15 @@ def build_browser_tools(
 
         want_key = _exact_tier_key(value)
         # Every row an incomplete walk saw is still evidence of a rival, though `options` is only the restored
-        # window. The walk keys rows by raw text and flags a label it saw on two rows: list that label twice.
+        # window. The walk reads one entry per distinct row, so a label it read on several rows is listed once per
+        # row even where the restored window shows only one of them.
         shown_texts = {str(o.get("text") or "") for o in options}
-        walk_twin_texts = {str(o.get("text") or "") for o in walk_seen if o.get("ambiguous")}
-        evidence_rows = [*options, *(o for o in walk_seen if str(o.get("text") or "") not in shown_texts)]
-        row_texts = [
-            t
-            for o in evidence_rows
-            for t in [str(o.get("text") or "")]
-            * (2 if o.get("ambiguous") or str(o.get("text") or "") in walk_twin_texts else 1)
-        ]
+        evidence_rows = [*options, *(o for o in walk.seen if str(o.get("text") or "") not in shown_texts)]
+        row_texts = [str(o.get("text") or "") for o in evidence_rows]
+        for key, n in Counter(_exact_tier_key(str(o.get("text") or "")) for o in walk.seen).items():
+            held = [t for t in row_texts if _exact_tier_key(t) == key]
+            if held and n > len(held):
+                row_texts += [held[0]] * (n - len(held))
         contenders = _value_contenders(value, row_texts)
 
         def _ambiguous_error() -> ToolResult:
@@ -16872,11 +17214,11 @@ def build_browser_tools(
                 except Exception:
                     raw = []
                 read_now = [o for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int)]
-                # Same completeness signals as the unfiltered read: a declared aria-setsize past the rows, or a
-                # scroller whose extent runs past them. `_commit_gate` commits no row from an incomplete read.
-                complete = not _rows_declare_more(
-                    read_now, partial=isinstance(tagged, dict) and bool(tagged.get("partial"))
+                # The same rule as the unfiltered read. `_commit_gate` commits no row from an incomplete read.
+                window = await _read_list_window(
+                    page, read_now, scroller=isinstance(tagged, dict) and bool(tagged.get("scroller"))
                 )
+                complete = _list_coverage([window]) == "complete"
                 fresh = int(tagged.get("fresh") or 0) if isinstance(tagged, dict) else 0
                 return sorted((o for o in read_now if not o.get("nav")), key=_n_order), complete, fresh
 
@@ -17046,9 +17388,9 @@ def build_browser_tools(
 
         # Only two visible rows that ARE the value make the filter pointless; a longer row that merely starts
         # with it says nothing about whether the exact one sits past the window.
-        exact_twins = walked_twins or sum(1 for t in contenders if _exact_tier_key(t) == want_key) >= 2
+        exact_twins = walk.twins or sum(1 for t in contenders if _exact_tier_key(t) == want_key) >= 2
         filtered_pick = False
-        if idx is None and not walk_complete and not exact_twins:
+        if idx is None and not walk.complete and not exact_twins:
             popup_pick = await _popup_filter_pick()
             if isinstance(popup_pick, ToolResult):
                 return popup_pick
@@ -17059,18 +17401,18 @@ def build_browser_tools(
             # Match over the FULL list above, but bound the error PAYLOAD: enumerate at most 15 rows,
             # each ≤60 chars, so a miss on a 250-option country list does not ship a 15KB tool message.
             shown = options[:15]
-            if walk_unproven is not None and len(contenders) < 2 and not exact_twins:
-                return _unproven_row_error(value, selector, str(walk_unproven["why"]), walk_unproven)
+            if walk.unproven is not None and len(contenders) < 2 and not exact_twins:
+                return _unproven_row_error(value, selector, str(walk.unproven["why"]), walk.unproven)
             if scanned_all:
                 if exact_twins:
                     shared = next((t for t in contenders if _exact_tier_key(t) == want_key), value)
-                    n_twins = max(2, walked_twin_rows, sum(1 for t in contenders if _exact_tier_key(t) == want_key))
+                    n_twins = max(2, walk.twin_rows, sum(1 for t in contenders if _exact_tier_key(t) == want_key))
                     return ToolResult.error(
                         f"{value!r} is ambiguous in {selector}'s list — {n_twins} options share the exact label "
                         f"{_model_text(shared, 60)!r}; the field is NOT filled — look() at the list and click the right one by "
                         'its [data-tv3-menu="N"] selector'
                     )
-                if len(contenders) >= 2 or (contenders and walk_complete):
+                if len(contenders) >= 2 or (contenders and walk.complete):
                     return _ambiguous_error()
                 if contenders:
                     only = _model_text(contenders[0], 60)
@@ -17194,7 +17536,7 @@ def build_browser_tools(
         lead = _lead_clause(matched)
         lead_unique = (
             not filtered_pick
-            and (not overflowed or walk_complete)
+            and (not overflowed or walk.complete)
             and sum(1 for o in evidence_rows if _lead_clause(str(o.get("text") or "")) == lead) == 1
         )
         try:

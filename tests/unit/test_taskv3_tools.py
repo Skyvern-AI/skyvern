@@ -24325,8 +24325,10 @@ def _cc_widget_script(
     setsize_extra: int = 0,
     thin_separators: bool = False,
     unknown_from: int = -1,
+    walk_shape: dict[str, Any] | None = None,
 ) -> str:
     # `#cc-search`, when rendered, filters by label prefix and shows only the first match.
+    # `walk_shape` switches to rows whose option box is the whole row (see `_cc_walk_shape_script`).
     # Modeled on a live probe of the real widget: the role=listbox node (#cc-menu) is NOT the scroll
     # container -- its child #cc-scroll (overflow-y:auto) is. #cc-scroll holds a <ul id=cc-spacer> sized
     # to the whole list; only a window of <li> rows -- absolutely positioned via transform:translateY --
@@ -24381,8 +24383,8 @@ def _cc_widget_script(
         "      li.appendChild(host);\n"
         "      spacer.appendChild(li);\n"
         "    }\n"
-        "  }\n"
-        "  function render() {\n"
+        "  }\n" + _cc_walk_shape_script(walk_shape, row_h) + "  function render() {\n"
+        "    if (SHAPE) { renderShape(); return; }\n"
         "    var scrollTop = scroller.scrollTop;\n"
         "    var start = Math.max(0, Math.floor(scrollTop / ROW_H));\n"
         "    var end = Math.min(N - 1, start + Math.ceil(VISIBLE_H / ROW_H) - 1);\n"
@@ -24432,6 +24434,7 @@ def _cc_widget_script(
         "    if (btn.getAttribute('aria-expanded') === 'true') { closeMenu(); } else { openMenu(); }\n"
         "  });\n"
         "  scroller.addEventListener('scroll', function () {\n"
+        "    if (SHAPE) shapeScrolled();\n"
         "    render();\n"
         "    if (LAZY.length && !lazyDone && scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) {\n"
         "      lazyDone = true;\n"
@@ -24457,6 +24460,68 @@ def _cc_widget_script(
     )
 
 
+def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
+    # Rows whose role=option box IS the row, laid out from per-row `heights` (default row_h) with the clickable
+    # leaf pushed down by per-row `offsets`. `sticky` pins a text row and a separator to the scroller top;
+    # `prepend` inserts rows at the top on the `prepend_at`-th scroll; `grow` appends rows on the first scroll
+    # away from the bottom; `enter_ms` slides every mounted row in from 40px below; `overscan` mounts that
+    # many rows past each end of the viewport, `drop_blanks` renders a blank row as no element at all, and `jitter` nudges the row labelled `jitter_label` down that
+    # many px on every other render.
+    return (
+        "  var SHAPE = " + json.dumps(shape) + ";\n"
+        "  var TOPS = [], shapeScrolls = 0, shapeRenders = 0, shapeAtEnd = false, shapeGrown = false;\n"
+        '  var STICKY_HTML = \'<li role="option" aria-disabled="true" style="position:sticky;top:0;height:22px;\' +\n'
+        "    'width:40px;margin-left:200px;z-index:3;background:#fff;line-height:16px\">Top</li>' +\n"
+        '    \'<li role="separator" style="position:sticky;top:22px;height:4px;width:40px;margin-left:200px;\' +\n'
+        "    'z-index:3;background:#ccc\"></li>';\n"
+        "  function shapeLayout() {\n"
+        "    N = COUNTRIES.length; TOPS = []; var total = 0;\n"
+        "    for (var i = 0; i < N; i++) { TOPS.push(total); total += COUNTRIES[i][2] || ROW_H; }\n"
+        "    spacer.style.height = total + 'px';\n"
+        "  }\n"
+        "  if (SHAPE) {\n"
+        "    COUNTRIES = COUNTRIES.map(function (c, i) {\n"
+        "      return [c[0], c[1], (SHAPE.heights || [])[i] || ROW_H, (SHAPE.offsets || [])[i] || 0];\n"
+        "    });\n"
+        "    ALL = COUNTRIES; shapeLayout();\n"
+        "  }\n"
+        "  function shapeScrolled() {\n"
+        "    shapeScrolls++;\n"
+        "    if (SHAPE.prepend && shapeScrolls === SHAPE.prepend_at) { COUNTRIES = SHAPE.prepend.concat(COUNTRIES); shapeLayout(); }\n"
+        "    if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) shapeAtEnd = true;\n"
+        "    else if (shapeAtEnd && SHAPE.grow && !shapeGrown) {\n"
+        "      shapeGrown = true; COUNTRIES = COUNTRIES.concat(SHAPE.grow); shapeLayout();\n"
+        "    }\n"
+        "  }\n"
+        "  function renderShape() {\n"
+        "    var s = scroller.scrollTop, first = -1, last = -1, i;\n"
+        "    for (i = 0; i < N; i++) {\n"
+        "      if (TOPS[i] + (COUNTRIES[i][2] || ROW_H) > s && TOPS[i] < s + VISIBLE_H) { if (first < 0) first = i; last = i; }\n"
+        "    }\n"
+        "    var html = SHAPE.sticky ? STICKY_HTML : '';\n"
+        "    shapeRenders++;\n"
+        "    if (first >= 0) {\n"
+        "      first = Math.max(0, first - (SHAPE.overscan || 0)); last = Math.min(N - 1, last + (SHAPE.overscan || 0));\n"
+        "      for (i = first; i <= last; i++) {\n"
+        "        var c = COUNTRIES[i], h = c[2] || ROW_H;\n"
+        "        if (SHAPE.drop_blanks && !c[0]) continue;\n"
+        "        var style = 'box-sizing:border-box;height:' + h + 'px;padding-top:' + (c[3] || 0) + 'px';\n"
+        "        if (SHAPE.jitter && c[0] === SHAPE.jitter_label && shapeRenders % 2) {\n"
+        "          style += ';transform:translateY(' + SHAPE.jitter + 'px)';\n"
+        "        }\n"
+        "        if (SHAPE.enter_ms) style += ';animation:tv3-enter ' + SHAPE.enter_ms + 'ms ease-out';\n"
+        "        html += '<li style=\"position:absolute;top:0;left:8px;width:calc(100% - 16px);height:' + h +\n"
+        "          'px;transform:translateY(' + TOPS[i] + 'px)\"><div role=\"option\" aria-selected=\"' +\n"
+        "          (i === currentIndex ? 'true' : 'false') + '\" id=\"item-' + i + '\" aria-label=\"' + c[0] + '\"' +\n"
+        "          (SETSIZE ? ' aria-setsize=\"' + (N + SETSIZE_EXTRA) + '\"' : '') + ' style=\"' + style + '\">' +\n"
+        "          '<div style=\"cursor:pointer;line-height:16px\">' + c[0] + '</div></div></li>';\n"
+        "      }\n"
+        "    }\n"
+        "    spacer.innerHTML = html;\n"
+        "  }\n"
+    )
+
+
 def _cc_widget_html(
     countries: list[tuple[str, str]],
     current_index: int,
@@ -24475,6 +24540,7 @@ def _cc_widget_html(
     unknown_from: int = -1,
     pad_px: int = 0,
     search_box: bool = False,
+    walk_shape: dict[str, Any] | None = None,
 ) -> str:
     # #cc-menu (role=listbox) is deliberately NOT scrollable -- overflow:visible, height pinned to
     # visible_h so its own scrollHeight == clientHeight, matching the real widget's DOM. #cc-scroll is
@@ -24492,12 +24558,17 @@ def _cc_widget_html(
         setsize_extra=setsize_extra,
         thin_separators=thin_separators,
         unknown_from=unknown_from,
+        walk_shape=walk_shape,
     )
     name, dial = countries[current_index]
+    scale = (walk_shape or {}).get("scale")
     role_attr = 'role="listbox"' if list_role else ""
     return (
-        "<!doctype html><html><body>\n"
-        '<div id="cc-wrap" style="position:absolute;left:20px;top:10px">\n'
+        "<!doctype html><html><head><style>@keyframes tv3-enter { from { transform: translateY(40px); } }</style>"
+        "</head><body>\n"
+        '<div id="cc-wrap" style="position:absolute;left:20px;top:10px'
+        + (f";transform:scale({scale});transform-origin:0 0" if scale else "")
+        + '">\n'
         '  <button id="cc" type="button" aria-haspopup="listbox" aria-expanded="false"\n'
         f'          aria-label="Select country calling code: {name}"\n'
         '          style="width:220px;height:32px">Country</button>\n'
@@ -24641,6 +24712,257 @@ async def test_select_combobox_walk_refusal_names_the_row_it_found_in_a_list_dec
         assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
         row = ref.group(0).split("] ")[0] + "]"
         assert "Canada" in await page.eval_on_selector(row, "el => el.textContent"), r.content
+
+
+_WALK_SLOTS = ("start", "middle", "end", "none")
+# Families a walk has to prove whole, each crossed with a row missing at one slot. Values: fixture knobs.
+_WALK_FAMILIES: dict[str, dict[str, Any]] = {
+    "mixed_heights_tall": {"heights": "tall"},
+    "mixed_heights_short": {"heights": "short"},
+    "inner_offsets": {"offsets": True},
+    "sticky_fillers": {"sticky": True},
+    "prepend_mid_walk": {"prepend_at": 3},
+    "ancestor_scale": {"scale": 1.25},
+    "enter_animation": {"enter_ms": 250},
+    "extent_grows_after_end": {"grow": True},
+    "double_counted_setsize": {"overscan": 2, "jitter": 4, "jitter_label": "Canada", "setsize": True},
+}
+
+
+def _walk_property_cases() -> list[tuple[str, str, str, bool]]:
+    """(family, slot, html, commits). A missing slot is a blank placeholder row that may still load a second
+    "Canada" (at the start of `prepend_mid_walk`, a second "Canada" the page prepends after the walk passed the
+    top). A list that grows after the walk's end check has rows the walk never read, so it refuses at every slot."""
+    cases: list[tuple[str, str, str, bool]] = []
+    base = [(f"Option {i:02d}", f"+{200 + i}") for i in range(40)]
+    base[14] = ("Canada", "+1")
+    layouts = [("plain", {"row_h": h, "pad_px": p}) for h in (58, 35.5) for p in (0, 8)]
+    layouts += [
+        (family, {"row_h": (58, 35.5)[k % 2], "pad_px": (0, 8)[k // 2 % 2]}) for k, family in enumerate(_WALK_FAMILIES)
+    ]
+    for family, sizes in layouts:
+        knobs = dict(_WALK_FAMILIES.get(family, {}))
+        for slot in _WALK_SLOTS:
+            rows = list(base)
+            hole = {"start": 0, "middle": 22, "end": len(rows), "none": None}[slot]
+            if hole is not None and not (family == "prepend_mid_walk" and slot == "start"):
+                rows.insert(hole, ("", ""))
+            shape: dict[str, Any] | None = None
+            if family != "plain":
+                shape = {k: v for k, v in knobs.items() if k not in ("heights", "offsets", "grow", "setsize", "scale")}
+                if family == "ancestor_scale":
+                    shape["scale"] = knobs["scale"]
+                at = 22 if hole is None else min(hole, len(rows) - 1)
+                if knobs.get("heights") == "tall":
+                    shape["heights"] = [32 if abs(i - at) <= 1 or i % 7 == 3 else 64 for i in range(len(rows))]
+                elif knobs.get("heights") == "short":
+                    shape["heights"] = [80 if i % 5 == 2 and abs(i - at) > 1 else 32 for i in range(len(rows))]
+                if knobs.get("offsets"):
+                    shape["offsets"] = [14 if i % 2 else 0 for i in range(len(rows))]
+                if knobs.get("prepend_at"):
+                    shape["prepend"] = [["Canada", "+2"]] if slot == "start" else [["Prepended", "+300"]]
+                if knobs.get("grow"):
+                    shape["grow"] = [["Late 1", "+301"], ["Late 2", "+302"]]
+            html = _cc_widget_html(rows, 30, setsize=bool(knobs.get("setsize")), walk_shape=shape, **sizes)
+            cases.append(
+                (
+                    f"{family}[row_h={sizes['row_h']},pad={sizes['pad_px']}]",
+                    slot,
+                    html,
+                    slot == "none" and family != "extent_grows_after_end",
+                )
+            )
+    # Holes in most slots: a placeholder (or no element at all) after every row, or two after every row. No slot
+    # between two read rows shows the list's own spacing, so every one of these refuses.
+    for row_h, box_rows in ((58, False), (58, True), (35.5, True)):
+        for every in (1, 2):
+            for drop in (False, True) if box_rows else (False,):
+                rows = [row for row in base for row in [row, *[("", "")] * every]]
+                shape = {"drop_blanks": drop} if box_rows else None
+                html = _cc_widget_html(rows, 30, row_h=row_h, walk_shape=shape)
+                name = f"holes_{every}_of_{every + 1}[row_h={row_h},{'box' if box_rows else 'plain'}{',no_element' if drop else ''}]"
+                cases.append((name, "most", html, False))
+    # Short placeholders between tall rows leave slots under the row height, so only the spacing read between
+    # DOM-adjacent rows tells them from spacing.
+    for every in (1, 2):
+        rows = [row for row in base for row in [row, *[("", "")] * every]]
+        shape = {"heights": [64 if name else 32 for name, _ in rows]}
+        html = _cc_widget_html(rows, 30, row_h=64, walk_shape=shape)
+        cases.append((f"holes_{every}_of_{every + 1}[short placeholders between 64px rows]", "most", html, False))
+    return cases
+
+
+def test_list_coverage_refuses_a_slot_at_the_midpoint_of_spacing_and_a_missing_row() -> None:
+    # Rows 20px tall, 4px apart: a complete list leaves 4px slots, one missing row at least 4 + 20. The widest slot
+    # a complete list may show is the midpoint, 4 + 20 / 2.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(slot: float) -> str:
+        rows, top = [], 0.0
+        for i in range(6):
+            rows.append({"n": i + 1, "text": f"Row {i}", "box": [top, top + 20], "line": 20, "after": f"Row {i - 1}"})
+            top += 20 + (slot if i == 2 else 4)
+        state = {"scrollTop": 0, "scrollHeight": top - 4, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        return _list_coverage([_list_window(rows, state)])
+
+    assert coverage(14 - 0.25) == "complete"
+    assert coverage(14) == "incomplete"
+
+
+def test_list_coverage_a_declared_size_never_proves_rows_the_geometry_leaves_unread() -> None:
+    # A virtualised list may size each rendered window: 8 rows declaring aria-setsize 8 at the top of a 6,400px
+    # extent. The declared size is met; the other 6,000px were never read.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    window = [{"n": i + 1, "text": f"R{i}", "box": [i * 50, i * 50 + 50], "line": 20, "setsize": 8} for i in range(8)]
+    long_list = {"scrollTop": 0, "scrollHeight": 6400, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+    assert _list_coverage([_list_window(window, long_list)]) == "incomplete"
+    assert _list_coverage([_list_window(window, long_list | {"scrollHeight": 400})]) == "complete"
+
+
+def test_list_coverage_refuses_a_group_short_of_its_own_declared_size() -> None:
+    # ARIA scopes aria-setsize to each group: group 1 reads all its rows, group 2 reads 4 of its 6. `room` is the
+    # extent left below the rows read; with none, the rows tile and only group 2's declared size shows the gap.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(groups: list[tuple[int, int]], room: float) -> str:
+        rows: list[dict[str, Any]] = []
+        top = 0.0
+        for g, (size, shown) in enumerate(groups):
+            for i in range(shown):
+                after = rows[-1]["text"] if rows else None
+                rows.append(
+                    {"n": len(rows) + 1, "text": f"G{g} R{i}", "box": [top, top + 20], "line": 20, "after": after}
+                    | {"setsize": size, "group": f"Group {g}"}
+                )
+                top += 20
+        state = {"scrollTop": 0, "scrollHeight": top + room, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        return _list_coverage([_list_window(rows, state)])
+
+    assert coverage([(10, 10), (6, 4)], room=40) == "incomplete"
+    assert coverage([(10, 10), (6, 4)], room=0) == "declares_more"
+    assert coverage([(6, 6), (6, 4)], room=0) == "declares_more"
+    assert coverage([(10, 10), (6, 6)], room=0) == "complete"
+
+
+def test_list_coverage_counts_the_largest_size_any_read_of_a_row_declares() -> None:
+    # Ten rows tile their extent and are read twice. A later read declaring 11, where the first declared 10 or
+    # nothing, still says the list holds a row the walk never read.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(first: int, later: int) -> str:
+        state = {"scrollTop": 0, "scrollHeight": 200, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        windows = [
+            _list_window(
+                [
+                    {"n": i + 1, "text": f"R{i}", "box": [i * 20, i * 20 + 20], "line": 20, "setsize": size}
+                    for i in range(10)
+                ],
+                state,
+            )
+            for size in (first, later)
+        ]
+        return _list_coverage(windows)
+
+    assert coverage(10, 10) == "complete"
+    assert coverage(10, 11) == "declares_more"
+    assert coverage(0, 11) == "declares_more"
+
+
+def test_list_coverage_refuses_a_declared_size_too_large_to_hold() -> None:
+    # The page sets aria-setsize: an over-large or infinite total refuses without raising.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(size: float) -> str:
+        rows = [
+            {"n": i + 1, "text": f"R{i}", "box": [i * 20, i * 20 + 20], "line": 20, "setsize": size} for i in range(3)
+        ]
+        state = {"scrollTop": 0, "scrollHeight": 60, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        return _list_coverage([_list_window(rows, state)])
+
+    assert coverage(0) == "complete"
+    assert coverage(1e30) == "declares_more"
+    assert coverage(float("inf")) == "declares_more"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_walk_commits_only_a_list_it_read_whole() -> None:
+    # Generated: every family crossed with a missing row at the start, middle, end or nowhere. A missing row
+    # refuses and leaves the field empty; a list with none commits "Canada".
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.tools import (  # noqa: PLC0415
+        _MENU_OPTION_TEXTS_JS,
+        _MENU_SCROLLER_STEP_JS,
+        _MENU_WINDOW_FINGERPRINT_JS,
+    )
+
+    class _ScriptLog:
+        # Records which probe each evaluate ran, so a case can count the row reads each walk window took.
+        def __init__(self, page: Any) -> None:
+            self._page = page
+            self.scripts: list[str] = []
+            self.steps: list[Any] = []
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._page, name)
+
+        async def evaluate(self, script: str, arg: Any = None) -> Any:
+            self.scripts.append(script)
+            result = await self._page.evaluate(script, arg)
+            if script == _MENU_SCROLLER_STEP_JS:
+                self.steps.append((arg, {k: v for k, v in (result or {}).items() if k != "fillers"}))
+            return result
+
+    def reread_windows(log: _ScriptLog) -> list[Any]:
+        # The scroller reads of every walk window that read its rows more than once.
+        steps = iter(log.steps)
+        out: list[Any] = []
+        window: list[Any] = []
+        reads = 0
+        for i, script in enumerate(log.scripts):
+            if script == _MENU_SCROLLER_STEP_JS:
+                if i + 1 < len(log.scripts) and log.scripts[i + 1] == _MENU_WINDOW_FINGERPRINT_JS:
+                    if reads > 1:
+                        out.append(window)
+                    window, reads = [], 0
+                window.append(next(steps))
+            elif script == _MENU_OPTION_TEXTS_JS:
+                reads += 1
+        return [*out, *([window] if reads > 1 else [])]
+
+    # Rows that never move during a read: each window is read once, and a missing row still refuses.
+    still = ("plain", "mixed_heights", "inner_offsets", "sticky", "ancestor_scale", "double_counted", "holes_")
+    cases = _walk_property_cases()
+    assert len(cases) >= 64, len(cases)
+    wrong: list[str] = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            for family, slot, html, commits in cases:
+                context = await browser.new_context(viewport={"width": 1024, "height": 900})
+                try:
+                    page = await context.new_page()
+                    await page.set_content(html)
+                    logged = _ScriptLog(page)
+                    tools = build_browser_tools(_fixed_page_provider(logged))
+                    r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+                    phone = await page.eval_on_selector("#phone", "el => el.value")
+                finally:
+                    await context.close()
+                # A scroll can land between two frames once in a walk; more than one re-read means still rows
+                # are being read twice.
+                if family.startswith(still) and len(reread := reread_windows(logged)) > 1:
+                    wrong.append(f"{family} slot={slot}: {len(reread)} still windows read twice: {reread[:2]}")
+                got = r.status == "ok" and phone == "+1"
+                if got != commits or (not commits and phone != ""):
+                    wrong.append(
+                        f"{family} slot={slot}: want {'commit' if commits else 'refuse'}, {r.status} phone={phone!r}: {r.content[:140]}"
+                    )
+        finally:
+            await browser.close()
+    assert not wrong, f"{len(wrong)}/{len(cases)} wrong:\n" + "\n".join(wrong)
 
 
 @_skip_no_browser
@@ -36229,9 +36551,11 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
         (
             "ambiguous-rows-text",
             60,
-            lambda t: taskv3_tools._ambiguous_rows_error(
-                "#who", "John", [{"n": 1, "text": t}, {"n": 2, "text": "B"}], next_step="pass the full text"
-            ).content,
+            lambda t: (
+                taskv3_tools._ambiguous_rows_error(
+                    "#who", "John", [{"n": 1, "text": t}, {"n": 2, "text": "B"}], next_step="pass the full text"
+                ).content
+            ),
         ),
         (
             "row-identity",
@@ -36256,9 +36580,9 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
         (
             "unproven-row",
             60,
-            lambda t: taskv3_tools._unproven_row_error(
-                "John", "#who", "scrolled to the end", {"n": 1, "text": t}
-            ).content,
+            lambda t: (
+                taskv3_tools._unproven_row_error("John", "#who", "scrolled to the end", {"n": 1, "text": t}).content
+            ),
         ),
         (
             "selection-report",
