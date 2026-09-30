@@ -89,6 +89,7 @@ def test_only_the_detail_get_carries_the_effective_default_engine(
     mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=_stored_workflow())
     mock_app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[_stored_workflow()])
     mock_app.DATABASE.workflows.is_workflow_copilot_authored = AsyncMock(return_value=False)
+    mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
     with (
         patch("skyvern.forge.sdk.routes.agent_protocol.app", mock_app),
         patch("skyvern.forge.sdk.routes.agent_protocol.effective_default_engine", AsyncMock(return_value=computed)),
