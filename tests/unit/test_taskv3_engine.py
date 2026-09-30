@@ -1961,7 +1961,7 @@ async def _system_prompt_for_run(*, precedence_arm: str | None = None) -> str:
 _DATE_MARKER = "\n\nToday's date is "
 
 
-_SYSTEM_PROMPT_SHA256 = "4b1e2c70182196a4a40f8dec1a134496cc6074a02b383ba42d4ef8df39d8937c"
+_SYSTEM_PROMPT_SHA256 = "aa708d82a5277e0f6f554345aad8a3a2a5bc672473c4f4331e5547918ce75bc9"
 _PAGE_FREE_SYSTEM_PROMPT_SHA256 = "f2467a7f82ea2db5e08b6da7576a3e58371295af0569cfe143d59903d2580f37"
 
 
@@ -2002,6 +2002,13 @@ async def test_prompt_arms_add_no_submit_pressure(precedence_arm: str | None) ->
     )
     assert do_not_invent in base_control
     assert do_not_invent in treatment
+    # Operator ruling 2026-09-30: the one date-of-birth default, and the contact values it never extends to.
+    birth_year_only = (
+        "If a required date-of-birth field needs a month and day and the task gives only the birth year, "
+        "enter 01/01/<year>. Never invent a street address or phone number."
+    )
+    assert birth_year_only in bullet
+    assert birth_year_only in base_control
     # The precedence paragraph sits beside that guard, so it may name submitting only to exempt that guard.
     if precedence_arm == "treatment":
         paragraph = treatment.split(CUSTOMER_PRECEDENCE_ANCHOR)[0].split("\n\n")[-1]
