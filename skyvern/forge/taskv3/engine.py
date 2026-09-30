@@ -21,7 +21,6 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
-import functools
 import json
 import time
 from datetime import UTC, datetime
@@ -71,7 +70,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import (
@@ -119,18 +117,7 @@ MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
-# The rule for a required sensitive field the task's data cannot fill; the required-field-answers prompt must keep it.
-SENSITIVE_FIELD_STOP_CLAUSE = "stop and report it rather than guessing"
-
-# The anchor ends before SENSITIVE_FIELD_STOP_CLAUSE so the required-field-answers prompt keeps that stop.
-REQUIRED_FIELD_ANSWERS_ANCHOR = (
-    "prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable "
-    "value you can. Do not invent sensitive or identifying values (government IDs, financial details, or "
-    "legal/eligibility attestations); if one of those is required and not provided, "
-)
-SELF_SCREEN_ANCHOR = "- A page message rejecting your submission"
-
-# Inserted above "How to work:" so it covers every section below it and sits outside every span another arm rewrites.
+# Inserted above "How to work:" so it covers every section below it.
 CUSTOMER_PRECEDENCE_ANCHOR = "\n\nHow to work:\n"
 CUSTOMER_PRECEDENCE_TEXT = (
     "\n\nThe task's goal, its completion and termination criteria, and the user's instructions for this task come "
@@ -165,43 +152,14 @@ Rules:
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
 
-@functools.lru_cache(maxsize=4)
-def _build_required_field_answers_prompt(fill_text: str, self_screen_bullet: str) -> str:
-    """Falls back to `SYSTEM_PROMPT` itself unless every anchor is uniquely present and the stop clause survives."""
-    if SYSTEM_PROMPT.count(REQUIRED_FIELD_ANSWERS_ANCHOR) != 1 or SYSTEM_PROMPT.count(SELF_SCREEN_ANCHOR) != 1:
-        return SYSTEM_PROMPT
-    prompt = SYSTEM_PROMPT.replace(REQUIRED_FIELD_ANSWERS_ANCHOR, fill_text).replace(
-        SELF_SCREEN_ANCHOR, self_screen_bullet + SELF_SCREEN_ANCHOR
-    )
-    if prompt.count(SENSITIVE_FIELD_STOP_CLAUSE) != 1:
-        return SYSTEM_PROMPT
-    return prompt
-
-
-def system_prompt_for_run_arms(
-    *, required_field_answers_text: tuple[str, str] | None, customer_precedence: bool
-) -> str:
-    """The v3 system prompt for this run's required-field-answers and customer-precedence arms.
-
-    `required_field_answers_text` is (fill text, self-screen bullet) for a run in that arm's treatment, else None.
-    With every arm off this is `SYSTEM_PROMPT` itself, not a copy, so the off arms cannot drift from today's prompt.
-    """
-    prompt = _system_prompt_for_fill_arms(required_field_answers_text=required_field_answers_text)
+def system_prompt_for_run_arms(*, customer_precedence: bool) -> str:
+    """With every arm off this is `SYSTEM_PROMPT` itself, not a copy, so the off arms cannot drift from it."""
     if not customer_precedence:
-        return prompt
-    if prompt.count(CUSTOMER_PRECEDENCE_ANCHOR) != 1:
-        LOG.error("Task V3 customer-precedence anchor is not uniquely present; sent the prompt without it")
-        return prompt
-    return prompt.replace(CUSTOMER_PRECEDENCE_ANCHOR, CUSTOMER_PRECEDENCE_TEXT + CUSTOMER_PRECEDENCE_ANCHOR)
-
-
-def _system_prompt_for_fill_arms(*, required_field_answers_text: tuple[str, str] | None) -> str:
-    if required_field_answers_text is None:
         return SYSTEM_PROMPT
-    prompt = _build_required_field_answers_prompt(*required_field_answers_text)
-    if prompt is SYSTEM_PROMPT:
-        LOG.error("Task V3 required-field-answers clause is not uniquely present; sent control")
-    return prompt
+    if SYSTEM_PROMPT.count(CUSTOMER_PRECEDENCE_ANCHOR) != 1:
+        LOG.error("Task V3 customer-precedence anchor is not uniquely present; sent the prompt without it")
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT.replace(CUSTOMER_PRECEDENCE_ANCHOR, CUSTOMER_PRECEDENCE_TEXT + CUSTOMER_PRECEDENCE_ANCHOR)
 
 
 OPAQUE_URL_GUIDANCE = """
@@ -569,18 +527,7 @@ async def run_task_v3_agent_loop(
     if page_free:
         base_system_prompt = PAGE_FREE_SYSTEM_PROMPT
     else:
-        required_field_answers = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, settings.TASK_V3_REQUIRED_FIELD_ANSWERS)
-        required_field_answers_text = (
-            app.AGENT_FUNCTION.task_v3_required_field_answers_text() if required_field_answers else None
-        )
-        if required_field_answers and required_field_answers_text is None:
-            LOG.info(
-                "Task V3 required-field-answers arm resolved treatment but no text is supplied; sent control",
-                workflow_run_id=ctx.workflow_run_id if ctx else None,
-                task_id=ctx.task_id if ctx else None,
-            )
         base_system_prompt = system_prompt_for_run_arms(
-            required_field_answers_text=required_field_answers_text,
             customer_precedence=run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE),
         )
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only

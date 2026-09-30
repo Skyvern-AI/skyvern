@@ -7,6 +7,7 @@ from the tools test, so the engine's wiring is exercised without a real LLM or b
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -41,9 +42,7 @@ from skyvern.forge.taskv3.engine import (
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
     OPAQUE_URL_GUIDANCE,
-    REQUIRED_FIELD_ANSWERS_ANCHOR,
-    SELF_SCREEN_ANCHOR,
-    SENSITIVE_FIELD_STOP_CLAUSE,
+    PAGE_FREE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
@@ -63,10 +62,7 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
-from skyvern.forge.taskv3.run_arms import (
-    CUSTOMER_PRECEDENCE_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
-)
+from skyvern.forge.taskv3.run_arms import CUSTOMER_PRECEDENCE_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import fallback_receipts
@@ -1945,25 +1941,9 @@ def test_dispatchable_deployments_covers_every_fallback_group_shape() -> None:
     assert "main" in _names(["fb1"], ["main", "fb1"])
 
 
-STUB_REQUIRED_FIELD_ANSWERS_FILL = "prefer the provided values. Stub fill rule. If one of those is required, "
-STUB_SELF_SCREEN_BULLET = "- Stub self-screen bullet.\n"
-
-
-@pytest.fixture
-def stub_required_field_answers_text(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
-    """Stands in for a deployment that supplies the required-field-answers text; OSS supplies none."""
-    texts = (STUB_REQUIRED_FIELD_ANSWERS_FILL, STUB_SELF_SCREEN_BULLET)
-    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_required_field_answers_text", lambda: texts)
-    return texts
-
-
-async def _system_prompt_for_run(
-    *, required_field_answers_arm: str | None = None, precedence_arm: str | None = None
-) -> str:
-    """The system message an actual engine run sends, with the fill-rule and precedence arms pinned."""
+async def _system_prompt_for_run(*, precedence_arm: str | None = None) -> str:
+    """The system message an actual engine run sends, with the precedence arm pinned."""
     context = SkyvernContext()
-    if required_field_answers_arm is not None:
-        context.run_arms = {**context.run_arms, REQUIRED_FIELD_ANSWERS_FLAG: ("wr_1", required_field_answers_arm)}
     if precedence_arm is not None:
         context.run_arms = {**context.run_arms, CUSTOMER_PRECEDENCE_FLAG: ("wr_1", precedence_arm)}
     skyvern_context.set(context)
@@ -1981,93 +1961,28 @@ async def _system_prompt_for_run(
 _DATE_MARKER = "\n\nToday's date is "
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("required_field_answers_arm", [None, "control", "unrandomized"])
-async def test_required_field_answers_off_arms_send_todays_prompt_unchanged(
-    required_field_answers_arm: str | None, stub_required_field_answers_text: tuple[str, str]
-) -> None:
-    # The off arms are the deployed prompt, byte for byte: a run outside the experiment must not be
-    # able to drift because the experiment exists.
-    system_prompt = await _system_prompt_for_run(required_field_answers_arm=required_field_answers_arm)
-    assert system_prompt.startswith(SYSTEM_PROMPT)
-    assert system_prompt_for_run_arms(required_field_answers_text=None, customer_precedence=False) is SYSTEM_PROMPT
+_SYSTEM_PROMPT_SHA256 = "4b1e2c70182196a4a40f8dec1a134496cc6074a02b383ba42d4ef8df39d8937c"
+_PAGE_FREE_SYSTEM_PROMPT_SHA256 = "f2467a7f82ea2db5e08b6da7576a3e58371295af0569cfe143d59903d2580f37"
 
 
-@pytest.mark.asyncio
-async def test_required_field_answers_treatment_is_not_the_silent_fallback(
-    stub_required_field_answers_text: tuple[str, str],
-) -> None:
-    # The builder falls back to today's prompt when an anchor stops matching; a green suite must not
-    # hide a treatment arm that is byte-identical to control.
-    treatment = await _system_prompt_for_run(required_field_answers_arm="treatment")
-    control = await _system_prompt_for_run(required_field_answers_arm="control")
-    treatment_body = treatment.split(_DATE_MARKER)[0]
-
-    assert not treatment.startswith(SYSTEM_PROMPT)
-    assert STUB_REQUIRED_FIELD_ANSWERS_FILL in treatment_body and STUB_SELF_SCREEN_BULLET in treatment_body
-    assert treatment_body.count(SENSITIVE_FIELD_STOP_CLAUSE) == 1
-    assert (
-        treatment_body.replace(STUB_REQUIRED_FIELD_ANSWERS_FILL, REQUIRED_FIELD_ANSWERS_ANCHOR).replace(
-            STUB_SELF_SCREEN_BULLET, ""
-        )
-        == control.split(_DATE_MARKER)[0]
+def test_system_prompts_are_pinned() -> None:
+    message = (
+        "{} changed. Any change to the Task V3 system prompt needs a dated operator ruling cited in the PR "
+        "(cloud_docs/task-v3/CHARTER.md, Governance) and a deliberate update of this pin."
     )
-
-
-@pytest.mark.asyncio
-async def test_required_field_answers_treatment_without_supplied_text_renders_control() -> None:
-    # OSS supplies no required-field-answers text, so that arm's treatment must be indistinguishable from
-    # its control, and say so once for the read to drop.
-    with capture_logs() as logs:
-        system_prompt = await _system_prompt_for_run(required_field_answers_arm="treatment")
-
-    assert system_prompt.split(_DATE_MARKER)[0] == SYSTEM_PROMPT
-    events = [e["event"] for e in logs]
-    assert (
-        events.count("Task V3 required-field-answers arm resolved treatment but no text is supplied; sent control") == 1
+    assert hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest() == _SYSTEM_PROMPT_SHA256, message.format("SYSTEM_PROMPT")
+    assert hashlib.sha256(PAGE_FREE_SYSTEM_PROMPT.encode()).hexdigest() == _PAGE_FREE_SYSTEM_PROMPT_SHA256, (
+        message.format("PAGE_FREE_SYSTEM_PROMPT")
     )
-
-
-@pytest.mark.parametrize(
-    "drifted_prompt",
-    [
-        SYSTEM_PROMPT.replace(REQUIRED_FIELD_ANSWERS_ANCHOR, ""),
-        SYSTEM_PROMPT.replace(SELF_SCREEN_ANCHOR, ""),
-        SYSTEM_PROMPT + REQUIRED_FIELD_ANSWERS_ANCHOR,
-    ],
-)
-def test_required_field_answers_falls_back_to_control_when_an_anchor_drifts(
-    monkeypatch: pytest.MonkeyPatch, drifted_prompt: str
-) -> None:
-    engine_mod._build_required_field_answers_prompt.cache_clear()
-    monkeypatch.setattr(engine_mod, "SYSTEM_PROMPT", drifted_prompt)
-    try:
-        with capture_logs() as logs:
-            prompt = system_prompt_for_run_arms(
-                required_field_answers_text=(STUB_REQUIRED_FIELD_ANSWERS_FILL, STUB_SELF_SCREEN_BULLET),
-                customer_precedence=False,
-            )
-    finally:
-        engine_mod._build_required_field_answers_prompt.cache_clear()
-    assert prompt is drifted_prompt
-    assert [e["event"] for e in logs] == ["Task V3 required-field-answers clause is not uniquely present; sent control"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("precedence_arm", [None, "treatment"])
-@pytest.mark.parametrize("required_field_answers_arm", [None, "treatment"])
-async def test_prompt_arms_add_no_submit_pressure(
-    required_field_answers_arm: str | None,
-    precedence_arm: str | None,
-    stub_required_field_answers_text: tuple[str, str],
-) -> None:
+async def test_prompt_arms_add_no_submit_pressure(precedence_arm: str | None) -> None:
     # The charter's non-negotiable: while the only thing standing between a model error and an
     # unauthorized submit is a line of system prompt, no arm may add prose that competes with it.
-    # Asserted on the prompt the engine actually sends, not the constant. The supplied
-    # required-field-answers wording itself is pinned against this where it lives.
-    treatment = await _system_prompt_for_run(
-        required_field_answers_arm=required_field_answers_arm, precedence_arm=precedence_arm
-    )
+    # Asserted on the prompt the engine actually sends, not the constant.
+    treatment = await _system_prompt_for_run(precedence_arm=precedence_arm)
     base_control = await _system_prompt_for_run()
     bullet = next(line for line in treatment.splitlines() if line.startswith("- Fill fields from the task's data"))
 
@@ -2079,16 +1994,14 @@ async def test_prompt_arms_add_no_submit_pressure(
     assert contract in base_control
     no_submit = "Do not submit forms or take irreversible actions unless the goal explicitly instructs it."
     assert no_submit in treatment and no_submit in base_control
-    # Pinned as a literal so an edit weakening SYSTEM_PROMPT cannot pass by weakening the constant too. Only the
-    # required-field-answers arm rewrites this rule; every other arm sends it verbatim.
+    # Pinned as a literal so an edit weakening SYSTEM_PROMPT cannot pass by weakening the constant too.
     do_not_invent = (
         "Do not invent sensitive or identifying values (government IDs, financial details, or "
         "legal/eligibility attestations); if one of those is required and not provided, stop and report it "
         "rather than guessing."
     )
     assert do_not_invent in base_control
-    if required_field_answers_arm is None:
-        assert do_not_invent in treatment
+    assert do_not_invent in treatment
     # The precedence paragraph sits beside that guard, so it may name submitting only to exempt that guard.
     if precedence_arm == "treatment":
         paragraph = treatment.split(CUSTOMER_PRECEDENCE_ANCHOR)[0].split("\n\n")[-1]
@@ -2109,7 +2022,7 @@ async def test_customer_precedence_off_arms_send_todays_prompt(precedence_arm: s
 
     assert system_prompt.startswith(SYSTEM_PROMPT)
     assert CUSTOMER_PRECEDENCE_TEXT not in system_prompt
-    assert system_prompt_for_run_arms(required_field_answers_text=None, customer_precedence=False) is SYSTEM_PROMPT
+    assert system_prompt_for_run_arms(customer_precedence=False) is SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
@@ -2134,38 +2047,11 @@ def test_customer_precedence_sends_the_prompt_unchanged_when_its_anchor_drifts(
 ) -> None:
     monkeypatch.setattr(engine_mod, "SYSTEM_PROMPT", drifted_prompt)
     with capture_logs() as logs:
-        prompt = system_prompt_for_run_arms(required_field_answers_text=None, customer_precedence=True)
+        prompt = system_prompt_for_run_arms(customer_precedence=True)
     assert prompt is drifted_prompt
     assert [e["event"] for e in logs] == [
         "Task V3 customer-precedence anchor is not uniquely present; sent the prompt without it"
     ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("required_field_answers_arm", [None, "treatment"])
-async def test_customer_precedence_composes_with_the_fill_rule_arms(
-    required_field_answers_arm: str | None,
-    stub_required_field_answers_text: tuple[str, str],
-) -> None:
-    without = _body(
-        await _system_prompt_for_run(required_field_answers_arm=required_field_answers_arm, precedence_arm="control")
-    )
-    with_precedence = _body(
-        await _system_prompt_for_run(required_field_answers_arm=required_field_answers_arm, precedence_arm="treatment")
-    )
-
-    # Above "How to work:" (named literally, not through the anchor constant), outside every span another arm rewrites.
-    assert with_precedence.count(CUSTOMER_PRECEDENCE_TEXT) == 1
-    assert with_precedence.split("\n\nHow to work:\n")[0].endswith(CUSTOMER_PRECEDENCE_TEXT)
-    assert with_precedence.replace(CUSTOMER_PRECEDENCE_TEXT, "", 1) == without
-    assert with_precedence.count(SENSITIVE_FIELD_STOP_CLAUSE) == 1
-    for other_arms_anchor in (
-        SENSITIVE_FIELD_STOP_CLAUSE,
-        REQUIRED_FIELD_ANSWERS_ANCHOR,
-        SELF_SCREEN_ANCHOR,
-        CUSTOMER_PRECEDENCE_ANCHOR,
-    ):
-        assert other_arms_anchor not in CUSTOMER_PRECEDENCE_TEXT
 
 
 @pytest.mark.asyncio

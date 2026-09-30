@@ -556,10 +556,6 @@ class Settings(BaseSettings):
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
-    # Swap in the fill-rule text an AgentFunction supplies (task_v3_required_field_answers_text); with no
-    # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the
-    # flag of the same name, read through run_arm_enabled().
-    TASK_V3_REQUIRED_FIELD_ANSWERS: bool = False
     # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
     # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
     TASK_V3_CUSTOMER_PRECEDENCE: bool = False

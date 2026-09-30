@@ -75,6 +75,7 @@ from skyvern.forge.taskv3.tools import (
     _TYPE_TARGET_PROBE_JS,
     NAVIGATION_DEAD_END_STATUSES,
     OBSERVE_DISPLAY_WIDTHS,
+    OBSERVE_POINTER_ROOT_CAP,
     OBSERVE_RETAIN_WIDTH_MIN,
     OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
@@ -10823,13 +10824,15 @@ async def test_observe_lists_delegated_pointer_div_trigger_and_its_menu_is_reach
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_controls_and_unnamed_boxes() -> None:
+async def test_observe_pointer_roots_skip_inherited_and_unnamed_boxes_and_list_a_holders_free_child() -> None:
     html = (
         "<!doctype html><html><body>"
         '<div style="cursor:pointer;width:300px"><span style="display:inline-block">Inherited child</span>'
         " Pointer root</div>"
         '<div style="cursor:pointer;width:300px"><button type="button">Real button</button>'
         "<span>Wrapper text</span></div>"
+        '<div style="cursor:pointer;width:300px"><span aria-hidden="true">receipt_long</span><span>Record 7</span>'
+        "<button>Pay</button></div>"
         '<div style="cursor:pointer;width:40px;height:40px"></div>'
         '<label style="cursor:pointer"><input type="checkbox"><span>Accept</span></label>'
         '<p style="width:220px;font:16px/20px sans-serif">Please read our full <span style="cursor:pointer">'
@@ -10858,7 +10861,10 @@ async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_control
         inherited = [line for line in ref_lines if "Inherited child" in line]
         assert len(inherited) == 1 and "div 'Inherited child Pointer root'" in inherited[0], ref_lines
         assert any("button 'Real button'" in line for line in ref_lines)
-        assert not any("Wrapper text" in line for line in ref_lines)
+        # A pointer box holding a control is not listed, but its control-free pointer child is.
+        assert any("span 'Wrapper text'" in line for line in ref_lines), ref_lines
+        assert any("span 'Record 7'" in line for line in ref_lines), ref_lines
+        assert not any("receipt_long" in line for line in ref_lines), ref_lines
         assert any("input/checkbox 'Accept'" in line for line in ref_lines), ref_lines
         assert not any("span 'Accept'" in line for line in ref_lines), ref_lines
         assert any("span 'terms of use'" in line for line in ref_lines), ref_lines
@@ -10868,7 +10874,7 @@ async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_control
         assert not any("Collapsed" in line for line in ref_lines), ref_lines
         yes = [line for line in ref_lines if "'Yes'" in line]
         assert len(yes) == 1 and "input/radio 'Yes'" in yes[0], ref_lines
-        assert len(ref_lines) == 11, ref_lines
+        assert len(ref_lines) == 14, ref_lines
 
     # A pointer control the reading drops does not stand in for its visible child.
     html = (
@@ -10979,6 +10985,29 @@ async def test_observe_pointer_root_cap_is_page_wide_and_never_costs_a_frames_fi
         clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'Frame save'")})
         assert clicked.status == "ok", clicked.content
         assert await page.evaluate("() => window.__saved") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_holder_stand_ins_never_displace_a_frames_pointer_roots_or_exceed_the_cap() -> None:
+    # The page's 30 holder rows and 5 plain roots fit its own cap; with the frame's 15 tiles the page-wide
+    # cap still holds, and the rows' stand-ins are what give way.
+    rows = "".join(
+        f'<div style="cursor:pointer;width:300px"><span>Row {i}</span><button type="button">Pay {i}</button></div>'
+        for i in range(30)
+    )
+    plain = "".join(f'<div style="cursor:pointer;width:200px">Plain {i}</div>' for i in range(5))
+    tiles = "".join(f"<div style='cursor:pointer;width:100px'>Tile {i}</div>" for i in range(15))
+    html = f'<!doctype html><html><body>{rows}{plain}<iframe srcdoc="{tiles}" width="300" height="400"></iframe></body></html>'
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.status == "ok"
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        for name in [f"Plain {i}" for i in range(5)] + [f"Tile {i}" for i in range(15)]:
+            assert any(f"div '{name}'" in line for line in ref_lines), (name, ref_lines)
+        pointer_lines = [line for line in ref_lines if re.match(r"^ref=\d+ (?:div|span) ", line)]
+        assert len(pointer_lines) == OBSERVE_POINTER_ROOT_CAP, pointer_lines
+        assert sum("'Pay " in line for line in ref_lines) == 30, ref_lines
 
 
 @_skip_no_browser
@@ -34285,6 +34314,24 @@ def test_merging_caps_elements_page_wide_and_counts_what_it_dropped() -> None:
     _merge_realm(page, {"elements": [{"f": 0}, {"f": 1}, {"f": 2}], "text": [], "textFull": [], "dropped": 7})
     assert page["dropped"] == 9
     assert page["mergeCapDropped"] == 2
+
+
+def test_a_holders_stand_in_children_never_displace_another_frames_pointer_roots() -> None:
+    # The page lists 5 plain pointer roots and 30 holder rows' stand-in children (35 fit its own cap); a
+    # frame lists 15 pointer tiles. Every plain root and tile keeps its place, and the rows share what is left.
+    from skyvern.forge.taskv3.tools import OBSERVE_POINTER_ROOT_CAP, _merge_realm, _rank_held_pointer_roots_last
+
+    plain = [{"pointerRoot": True, "plain": n} for n in range(5)]
+    held = [{"pointerRoot": True, "pointerHeld": True, "row": n} for n in range(30)]
+    page = {"elements": plain + held, "text": [], "textFull": [], "pointerListed": 35}
+    tiles = [{"pointerRoot": True, "tile": n} for n in range(15)]
+    _merge_realm(page, {"elements": tiles, "text": [], "textFull": [], "pointerListed": 15})
+    kept = _rank_held_pointer_roots_last(page)
+
+    assert [e for e in page["elements"] if not e.get("pointerHeld")] == plain + tiles
+    assert len(page["elements"]) == OBSERVE_POINTER_ROOT_CAP == len(kept)
+    assert kept == list(range(25)) + list(range(35, 50))
+    assert page["pointerCapped"] == 10 and page["pointerListed"] == OBSERVE_POINTER_ROOT_CAP
 
 
 @pytest.mark.asyncio

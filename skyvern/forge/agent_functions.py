@@ -990,11 +990,6 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
-    # (fill text, self-screen bullet) for the v3 required-field-answers arm's treatment prompt. OSS
-    # supplies none, so a run in that arm's treatment renders the control prompt.
-    def task_v3_required_field_answers_text(self) -> tuple[str, str] | None:
-        return None
-
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
     def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:

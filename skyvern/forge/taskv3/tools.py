@@ -1289,8 +1289,9 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # Emits `root`'s semantic matches merged in document order with its "pointer roots" (named, role-less
 # elements styled cursor:pointer, the only trace a delegated click listener leaves; v1 lists them via
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
-# not a root when the reading already covers it: it is, is inside, or holds a control `listable` keeps,
-# or its pointer parent is itself a root or covered.
+# not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
+# pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
+# named, control-free pointer descendant is listed for it, recorded in `state.held`.
 _WITH_POINTER_ROOTS_JS = (
     r"""(root, q, semantic, state, emit, listable) => {
   // A linked list, not an array: a page that poisons Array.prototype.push or its index setters
@@ -1424,10 +1425,22 @@ _WITH_POINTER_ROOTS_JS = (
         // A control the reading drops is not a root, but its pointer children may be.
         if (matches.call(el, q)) { if (listable(el)) state.covered.add(el); continue; }
         const sr = shadowRootOf.call(el);
-        if (inListable(parentOf.call(el)) || anyListable(qsa.call(el, q))
-          || (sr && sr.nodeType === 11 && anyListable(fragQsa.call(sr, q))) || heldBySlot(el)
+        const holds = anyListable(qsa.call(el, q));
+        if (inListable(parentOf.call(el)) || (sr && sr.nodeType === 11 && (holds || anyListable(fragQsa.call(sr, q))))
+          || heldBySlot(el)
           // A label bound to a control names that control, which is listed (or skinned) on its own.
           || (tag === 'label' && el.control)) { state.covered.add(el); continue; }
+        // A row or card that also carries a button is not listed (its centre may land on the button);
+        // its first named control-free pointer child stands for it instead, for as many holders as the
+        // cap could ever list. Past that a holder is covered, so a long list costs no more work than before.
+        if (holds) { (state.heldCount < state.heldCap ? state.holders : state.covered).add(el); continue; }
+        let holder = null;
+        for (let a = parent, i = 0; a && i < 64 && isPointer(a); a = parentOf.call(a), i++) {
+          if (state.holders.has(a)) { holder = a; break; }
+        }
+        if (holder && (state.represented.has(holder) || state.heldCount >= state.heldCap)) { state.covered.add(el); continue; }
+        // A decorative child (an icon font's ligature) does not name the row.
+        if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
         const r = bcr.call(el);
         if (!(r.width > 0 && r.height > 0)) continue;
         if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
@@ -1457,7 +1470,13 @@ _WITH_POINTER_ROOTS_JS = (
         if (!painted(el, r) || offRight(el, r)) continue;
         state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
         state.covered.add(el);
-        state.count++;
+        // A holder's child ranks below every other pointer root for the listing cap, so it neither
+        // spends the scan ceiling nor displaces a root the reading lists without holders.
+        if (holder) {
+          state.held.add(el);
+          state.heldCount++;
+          for (let a = holder, i = 0; a && i < 64 && state.holders.has(a); a = parentOf.call(a), i++) state.represented.add(a);
+        } else state.count++;
         const node = { el, next: null };
         if (tail) tail.next = node; else head = node;
         tail = node;
@@ -7726,7 +7745,9 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), count: 0, retain: _RETAIN_WIDTH, ceiling: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), heldCount: 0, heldCap: """
+    + str(OBSERVE_POINTER_ROOT_CAP)
+    + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
     + r""" };
   let pointerListed = 0;
@@ -8588,6 +8609,9 @@ async (__tv3TextArgs) => {
     return b.bottom + window.scrollY > 0 && b.top + window.scrollY < _scrollHeightOf.call(se)
       && b.right + window.scrollX > 0 && b.left + window.scrollX < _scrollWidthOf.call(se);
   };
+  // Places the cap keeps for the pointer roots not yet reached that no holder expansion produced
+  // (`count` tallies exactly those).
+  let pointerReserved = _pointerState.count;
   for (let idx = 0; idx < els.length; idx++) {
    const el = els[idx].el;
    const host = els[idx].host;
@@ -8603,6 +8627,7 @@ async (__tv3TextArgs) => {
     // The collector screened a pointer root with these same visibility gates, so none of the hidden
     // counters below ever describes one: a pointer root is listed or counted as one.
     pointerRoot = _pointerState.roots.has(el);
+    if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -8672,7 +8697,7 @@ async (__tv3TextArgs) => {
         continue;
       }
     }
-    if (pointerRoot && pointerListed >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
     if (!selector) {
       // We do not write inside a shadow root. Setting a marker there is a mutation of the
@@ -8732,6 +8757,7 @@ async (__tv3TextArgs) => {
     // recognition and leak its signing tail.
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
     if (pointerRoot) rec.pointerRoot = true;
+    if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
     if (removedBy) rec.a11yRemoved = removedBy;
@@ -10652,12 +10678,16 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     # Pointer roots ride outside the element budget here as in each realm, under their own cap applied
     # page-wide, so neither limit ever costs the other kind a place.
     room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not e.get("pointerRoot")))
-    pointer_room = max(0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot")))
+    pointer_room = max(
+        0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    )
     kept: list[int] = []
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerRoot"):
+        if e.get("pointerHeld"):
+            pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
+        elif e.get("pointerRoot"):
             if pointer_room == 0:
                 pointer_over_cap += 1
                 continue
@@ -10692,6 +10722,25 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     into["pointerListed"] = int(into.get("pointerListed") or 0) - pointer_over_cap
     for key in _OBSERVE_ANY_KEYS:
         into[key] = bool(into.get(key)) or bool(other.get(key))
+    return kept
+
+
+def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root.
+    Returns the kept indices, which the caller applies to its handle and owner lists."""
+    elements = data.get("elements") or []
+    room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    kept: list[int] = []
+    for i, e in enumerate(elements):
+        if e.get("pointerHeld"):
+            if room <= 0:
+                continue
+            room -= 1
+        kept.append(i)
+    over = len(elements) - len(kept)
+    data["elements"] = [elements[i] for i in kept]
+    data["pointerCapped"] = int(data.get("pointerCapped") or 0) + over
+    data["pointerListed"] = int(data.get("pointerListed") or 0) - over
     return kept
 
 
@@ -11166,6 +11215,17 @@ def build_browser_tools(
             main_handles.extend(frame_handles[i] for i in kept)
             owners.extend([frame] * len(kept))
             fresh[frame] = bool(frame_data.get("refsFresh"))
+        # A split reading already fails closed at pairing, so it is left for that check to refuse.
+        if len(main_handles) == len(owners) == len(main_data.get("elements") or []):
+            kept = _rank_held_pointer_roots_last(main_data)
+            kept_set = set(kept)
+            for spare in [h for i, h in enumerate(main_handles) if h is not None and i not in kept_set]:
+                try:
+                    await spare.dispose()
+                except Exception:
+                    pass
+            main_handles = [main_handles[i] for i in kept]
+            owners = [owners[i] for i in kept]
         # The page's identity re-checked AFTER the frames were read. The main frame navigating in between
         # would otherwise assemble one reading out of two documents -- the old page's url, text and
         # controls beside child frames belonging to its replacement -- and while the old main handles go
