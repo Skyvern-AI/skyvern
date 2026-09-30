@@ -179,7 +179,10 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
-from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
+from skyvern.forge.sdk.experimentation.workflow_block_engine import (
+    run_honors_chosen_engine,
+    workflow_block_engine_override,
+)
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -1879,11 +1882,17 @@ def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     return False
 
 
+def _engine_is_unset(engine: RunEngine | None) -> bool:
+    return engine is None
+
+
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    # Left out of the dump when unset, so a stored definition stays readable by an image whose engine
+    # field still rejects null (a rollout or a revert).
+    engine: RunEngine | None = Field(default=None, exclude_if=_engine_is_unset)
     complete_criterion: str | None = None
     complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
@@ -1974,19 +1983,25 @@ class BaseTaskBlock(Block):
         Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
         the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
         engine is honored as-authored, and a block the eligibility check never saw is left alone;
-        neither is ever rerouted.
+        neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
+        chosen engine, where an explicit skyvern_v1 is a pin too.
         """
+        declared = self.engine or RunEngine.skyvern_v1
         if (
-            self.engine != RunEngine.skyvern_v1
-            or self._exclude_from_engine_ab
+            self._exclude_from_engine_ab
             # Mirrors run_is_eligible_for_v3_ab: a block eligibility skipped as engine-inert must
-            # not be labeled v3 here either, or its row claims an engine that never ran. It does not
-            # re-check _task_block_supports_v3 because run-level eligibility already rejected the
-            # whole run if any block failed it; loosening that predicate means revisiting this.
+            # not be labeled v3 here either, or its row claims an engine that never ran.
             or self.block_type in _ENGINE_INERT_BLOCK_TYPES
+            # Redundant for an A/B run, whose eligibility already rejected any such block; a
+            # chosen-engine run skips that check, so a block v3 cannot execute stays off the override.
+            or not _task_block_supports_v3(self)
+        ):
+            return declared
+        if self.engine is not None and (
+            self.engine != RunEngine.skyvern_v1 or run_honors_chosen_engine(workflow_run_id)
         ):
             return self.engine
-        return workflow_block_engine_override(workflow_run_id) or self.engine
+        return workflow_block_engine_override(workflow_run_id) or declared
 
     def get_all_parameters(
         self,
@@ -14427,6 +14442,9 @@ class HumanInteractionBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.HUMAN_INTERACTION] = BlockType.HUMAN_INTERACTION  # type: ignore
+    # Engine-inert, and its YAML has no engine: keeping the stored value makes an unedited re-save
+    # write the definition it read, so the cached script is not cleared.
+    engine: RunEngine | None = Field(default=RunEngine.skyvern_v1, exclude_if=_engine_is_unset)
 
     instructions: str = "Please review and approve or reject to continue the workflow."
     positive_descriptor: str = "Approve"
@@ -15390,6 +15408,8 @@ class UrlBlock(BaseTaskBlock):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL  # type: ignore
     url: str
+    # Engine-inert; see HumanInteractionBlock.engine.
+    engine: RunEngine | None = Field(default=RunEngine.skyvern_v1, exclude_if=_engine_is_unset)
 
 
 class TaskV2Block(Block):
@@ -18946,7 +18966,7 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
             continue
-        if block.engine != RunEngine.skyvern_v1:
+        if block.engine not in (None, RunEngine.skyvern_v1):
             return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
             return V3AbIneligibleReason.unsupported_block
@@ -18956,6 +18976,31 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     if reroutable_blocks == 0:
         return V3AbIneligibleReason.no_reroutable_blocks
     return None
+
+
+def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:
+    """Whether any block of the run leaves its engine unchosen; None when the run has no engine to choose.
+
+    ``blocks`` is the flattened definition, as for v3_ab_ineligibility_reason. A script run is answered
+    too: its uncached blocks and its AI fallback run on the engine this decides. A prompt-criteria
+    condition counts as unchosen: its synthetic extraction block has no engine an author can set.
+    """
+    has_engine_block = False
+    for block in blocks:
+        if isinstance(block, ConditionalBlock):
+            if any(isinstance(branch.criteria, PromptBranchCriteria) for branch in block.branch_conditions):
+                return True
+            continue
+        if isinstance(block, WhileLoopBlock):
+            if isinstance(block.condition, PromptBranchCriteria):
+                return True
+            continue
+        if not isinstance(block, BaseTaskBlock) or block.block_type in _ENGINE_INERT_BLOCK_TYPES:
+            continue
+        if block.engine is None and _task_block_supports_v3(block):
+            return True
+        has_engine_block = True
+    return False if has_engine_block else None
 
 
 def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:

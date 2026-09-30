@@ -78,6 +78,7 @@ from skyvern.forge.sdk.db.repositories.tags import (
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.experimentation.workflow_block_engine import effective_default_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
     BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON,
@@ -5381,6 +5382,9 @@ async def get_workflow(
         ) or await app.DATABASE.workflows.is_workflow_copilot_authored(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=current_org.organization_id,
+        )
+        workflow.effective_default_engine = await effective_default_engine(
+            workflow_permanent_id, current_org.organization_id
         )
     return workflow
 

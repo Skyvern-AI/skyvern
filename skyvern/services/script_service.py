@@ -1419,12 +1419,13 @@ async def _detect_user_defined_errors(
         return []
 
 
-def _resolve_original_block_engine(cache_key: str, workflow: Workflow) -> RunEngine | None:
+def _resolve_original_block_engine(cache_key: str, workflow: Workflow, workflow_run_id: str | None) -> RunEngine | None:
     # Recursive: a cached block inside a for/while loop must keep its engine too (labels are
-    # validated globally unique, so the first match is the block).
+    # validated globally unique, so the first match is the block). Resolved rather than read, so an
+    # unset engine follows the run's routing like the block itself would.
     for block in get_all_blocks(workflow.workflow_definition.blocks):
         if block.label == cache_key:
-            return block.engine if isinstance(block, BaseTaskBlock) else None
+            return block.resolve_engine(workflow_run_id) if isinstance(block, BaseTaskBlock) else None
     return None
 
 
@@ -1672,7 +1673,7 @@ async def _fallback_to_ai_run(
         # Inherit the original block's engine when the caller left it at default; fail open to v1 on any miss.
         if engine == RunEngine.skyvern_v1:
             try:
-                resolved_engine = _resolve_original_block_engine(cache_key, workflow)
+                resolved_engine = _resolve_original_block_engine(cache_key, workflow, workflow_run_id)
                 if resolved_engine is not None and resolved_engine != RunEngine.skyvern_v1:
                     engine = resolved_engine
                     LOG.debug(

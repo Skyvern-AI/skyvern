@@ -144,10 +144,6 @@ class PDFImportService:
                 if keys_to_include:
                     blk["parameter_keys"] = keys_to_include
 
-            # Ensure engine where needed
-            if blk.get("block_type") in {"navigation", "action", "extraction", "login", "file_download"}:
-                blk.setdefault("engine", "skyvern-1.0")
-
             # Ensure url exists (can be empty string)
             if blk.get("block_type") in {"navigation", "action", "extraction", "file_download"}:
                 if blk.get("url") is None:

@@ -840,7 +840,7 @@ class TaskBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | str | None = None
@@ -1245,7 +1245,7 @@ class PDFParserBlockYAML(BlockYAML):
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -1260,7 +1260,7 @@ class ActionBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     navigation_goal: str | None = None
     selector: str | None = None
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
@@ -1283,7 +1283,7 @@ class NavigationBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1308,7 +1308,7 @@ class ExtractionBlockYAML(BlockYAML):
     data_extraction_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1328,7 +1328,7 @@ class LoginBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -1409,7 +1409,7 @@ class FileDownloadBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None

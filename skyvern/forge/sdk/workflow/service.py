@@ -120,6 +120,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_trans
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     ARM_ATTRIBUTION_LOST,
     WorkflowBlockEngineArmAttribution,
+    effective_default_engine,
     engine_arm_log_value,
     resolve_workflow_block_engine_arm,
     resolved_workflow_block_engine_arm_attribution,
@@ -167,6 +168,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    _ENGINE_INERT_BLOCK_TYPES,
     BaseTaskBlock,
     Block,
     BlockTypeVar,
@@ -188,6 +190,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     compute_conditional_scopes,
     get_all_blocks,
     resolve_conditional_merge_edges,
+    takes_default_engine,
     v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -1423,7 +1426,9 @@ class ReusedSessionBelowLifetimeFloor(Exception):
         self.shortfall = shortfall
 
 
-def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
+def _get_workflow_definition_core_data(
+    workflow_definition: WorkflowDefinition, *, unset_engine_is_v1: bool = True
+) -> dict[str, Any]:
     """
     This function dumps the workflow definition and removes the irrelevant data to the definition, like created_at and modified_at fields inside:
     - list of blocks
@@ -1472,6 +1477,15 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
             if current_obj.get("block_type") == BlockType.CODE.value:
                 for field in code_block_annotation_fields:
                     current_obj.pop(field, None)
+            # A definition stored before the engine became optional holds skyvern-1.0 where a re-save
+            # of the same blocks leaves it unset. The two route alike on an engine-inert block and
+            # before the chosen-engine cutoff; past it, unset means v3 and skyvern-1.0 is a pin.
+            if (
+                "block_type" in current_obj
+                and current_obj.get("engine") in (None, RunEngine.skyvern_v1.value)
+                and (unset_engine_is_v1 or current_obj["block_type"] in _ENGINE_INERT_BLOCK_TYPES)
+            ):
+                current_obj.pop("engine", None)
 
             # Add all nested dictionaries and lists to queue for processing
             for value in current_obj.values():
@@ -7818,6 +7832,7 @@ class WorkflowService:
                 workflow_status=workflow.status,
                 trigger_type=workflow_run.trigger_type,
                 ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
+                takes_default_engine=takes_default_engine(all_blocks),
             )
         else:
             LOG.warning(
@@ -11142,8 +11157,13 @@ class WorkflowService:
         current_definition: dict[str, Any] = {}
         new_definition: dict[str, Any] = {}
         if previous_valid_workflow:
-            current_definition = _get_workflow_definition_core_data(previous_valid_workflow.workflow_definition)
-            new_definition = _get_workflow_definition_core_data(workflow_definition)
+            unset_engine_is_v1 = await effective_default_engine(workflow.workflow_permanent_id, organization_id) is None
+            current_definition = _get_workflow_definition_core_data(
+                previous_valid_workflow.workflow_definition, unset_engine_is_v1=unset_engine_is_v1
+            )
+            new_definition = _get_workflow_definition_core_data(
+                workflow_definition, unset_engine_is_v1=unset_engine_is_v1
+            )
             has_changes = current_definition != new_definition
 
             # Log definition changes for debugging cache invalidation issues

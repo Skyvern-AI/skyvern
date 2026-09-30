@@ -32,6 +32,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_run_metadata,
     normalize_run_with,
 )
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE,
@@ -260,6 +261,11 @@ class Workflow(BaseModel):
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False
+    effective_default_engine: RunEngine | None = Field(
+        default=None,
+        description="The engine a task block with no `engine` set runs on in this agent, or null when "
+        "engine routing decides it. Populated by the detail endpoint only.",
+    )
     original_created_by: str | None = Field(
         default=None,
         description="Who created the agent's first version. Populated by the list endpoint only.",
