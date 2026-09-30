@@ -1,13 +1,19 @@
 import { describe, expect, test } from "vitest";
 
-import { RunEngine } from "@/api/types";
+import { ProxyLocation, RunEngine } from "@/api/types";
 
 import type { AppNode } from "./nodes";
-import type { WorkflowBlock } from "../types/workflowTypes";
+import type {
+  WorkflowApiResponse,
+  WorkflowBlock,
+  WorkflowSettings,
+} from "../types/workflowTypes";
 import {
   blockRunErrors,
-  convertToNode,
+  convert,
   createNode,
+  getElements,
+  getWorkflowBlocks,
   getWorkflowErrors,
   pendingGoalChangesOf,
   withGoalUndoRecordsFrom,
@@ -40,6 +46,36 @@ function minimalTaskBlock(overrides: { engine?: RunEngine } = {}) {
     ...overrides,
   } as unknown as WorkflowBlock;
 }
+
+const SETTINGS: WorkflowSettings = {
+  proxyLocation: ProxyLocation.Residential,
+  webhookCallbackUrl: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
+  persistBrowserSession: false,
+  reuseBrowserSession: false,
+  pinSavedSessionIp: false,
+  browserProfileId: null,
+  browserProfileKey: null,
+  model: null,
+  maxScreenshotScrolls: null,
+  maxElapsedTimeMinutes: null,
+  extraHttpHeaders: null,
+  cdpConnectHeaders: null,
+  runWith: "agent",
+  codeVersion: null,
+  scriptCacheKey: null,
+  aiFallback: true,
+  maskSecrets: false,
+  runSequentially: false,
+  sequentialKey: null,
+  finallyBlockLabel: null,
+  workflowSystemPrompt: null,
+  errorCodeMapping: null,
+  retryPolicy: null,
+};
 
 function codeBlock(goalNeedsRegeneration: boolean | null): AppNode {
   return {
@@ -150,34 +186,86 @@ describe("blockRunErrors", () => {
   });
 });
 
-describe("createNode", () => {
-  test("defaults a new task block to the routable Skyvern 1.0 engine, not a V3 pin", () => {
+function loadAndSave(
+  stored: RunEngine | undefined,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  const { nodes, edges } = getElements(
+    [minimalTaskBlock(stored ? { engine: stored } : {})],
+    SETTINGS,
+    true,
+    effectiveDefaultEngine,
+  );
+  const [saved] = getWorkflowBlocks(nodes, edges);
+  return (saved as { engine?: RunEngine | null }).engine;
+}
+
+describe("block engine load and save", () => {
+  test("a new block is Default and saves no engine", () => {
     const node = createNode({ id: "n1" }, "task", "My Task");
 
-    expect((node.data as { engine: RunEngine | null }).engine).toBe(
-      RunEngine.SkyvernV1,
-    );
-  });
-});
-
-describe("convertToNode", () => {
-  test("fills a saved task block missing an engine with Skyvern 1.0, not the new-node default", () => {
-    const node = convertToNode({ id: "n1" }, minimalTaskBlock(), true);
-
-    expect((node.data as { engine: RunEngine | null }).engine).toBe(
-      RunEngine.SkyvernV1,
-    );
+    expect(getWorkflowBlocks([node], [])[0]).toMatchObject({ engine: null });
   });
 
-  test("keeps a saved block's explicit engine unchanged", () => {
-    const node = convertToNode(
-      { id: "n1" },
-      minimalTaskBlock({ engine: RunEngine.SkyvernV3 }),
-      true,
-    );
-
-    expect((node.data as { engine: RunEngine | null }).engine).toBe(
+  test.each([
+    ["unset", undefined, null, null],
+    ["skyvern-1.0 on a routed workflow", RunEngine.SkyvernV1, null, null],
+    [
+      "skyvern-1.0 on a chosen-engine workflow",
+      RunEngine.SkyvernV1,
       RunEngine.SkyvernV3,
-    );
+      RunEngine.SkyvernV1,
+    ],
+    [
+      "skyvern-1.0 when the workflow's default is unknown",
+      RunEngine.SkyvernV1,
+      undefined,
+      RunEngine.SkyvernV1,
+    ],
+    ["skyvern-2.0", RunEngine.SkyvernV2, null, RunEngine.SkyvernV2],
+    ["skyvern-3.0", RunEngine.SkyvernV3, null, RunEngine.SkyvernV3],
+  ])("%s loads and saves as %s", (_, stored, effective, expected) => {
+    expect(loadAndSave(stored, effective)).toBe(expected);
+  });
+
+  test("a copy drops a legacy skyvern-1.0 unless the source honours chosen engines; an export keeps it", () => {
+    const source = {
+      title: "Source",
+      description: null,
+      is_saved_task: false,
+      status: null,
+      run_with: "agent",
+      workflow_definition: {
+        parameters: [],
+        blocks: [
+          minimalTaskBlock({ engine: RunEngine.SkyvernV1 }),
+          {
+            ...minimalTaskBlock({ engine: RunEngine.SkyvernV3 }),
+            label: "b2",
+          },
+        ],
+      },
+    } as unknown as WorkflowApiResponse;
+    const engines = (request: ReturnType<typeof convert>) =>
+      request.workflow_definition.blocks.map(
+        (block) => (block as { engine?: RunEngine | null }).engine,
+      );
+
+    expect(engines(convert(source, { asNewWorkflow: true }))).toEqual([
+      null,
+      RunEngine.SkyvernV3,
+    ]);
+    expect(
+      engines(
+        convert(
+          { ...source, effective_default_engine: RunEngine.SkyvernV3 },
+          { asNewWorkflow: true },
+        ),
+      ),
+    ).toEqual([RunEngine.SkyvernV1, RunEngine.SkyvernV3]);
+    expect(engines(convert(source))).toEqual([
+      RunEngine.SkyvernV1,
+      RunEngine.SkyvernV3,
+    ]);
   });
 });

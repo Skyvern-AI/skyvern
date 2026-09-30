@@ -128,10 +128,10 @@ function BulkActionBar({
       const results = await runWithConcurrency(
         selectedWorkflows.map((workflow) => () => {
           const yaml = convertToYAML(
-            convert({
-              ...workflow,
-              title: `Copy of ${workflow.title}`,
-            }),
+            convert(
+              { ...workflow, title: `Copy of ${workflow.title}` },
+              { asNewWorkflow: true },
+            ),
           );
           return client.post("/workflows", yaml, {
             headers: { "Content-Type": "text/plain" },

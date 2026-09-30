@@ -600,10 +600,10 @@ function GetStartedModalForUser() {
       template.workflow_permanent_id,
       selectedIntent!,
     );
-    const cloned = convert({
-      ...template,
-      title: `${template.title} (copy)`,
-    });
+    const cloned = convert(
+      { ...template, title: `${template.title} (copy)` },
+      { asNewWorkflow: true },
+    );
     // Completion telemetry fires from useCreateWorkflowMutation (it owns the
     // navigation that unmounts this modal); first_save_at prevents re-display,
     // so no dismiss write is needed here.

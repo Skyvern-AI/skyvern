@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
@@ -148,6 +149,7 @@ function FileDownloadEditorBody({
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
+  const effectiveDefaultEngine = useEffectiveDefaultEngine();
   const hasInteracted = useHasInteractedThisSession();
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     parameterKeys.length > 0 ? parameterKeys[0] : undefined,
@@ -614,6 +616,7 @@ function FileDownloadEditorBody({
                   </Label>
                 </div>
                 <RunEngineSelector
+                  effectiveDefaultEngine={effectiveDefaultEngine}
                   value={engine}
                   onChange={(next) => update({ engine: next })}
                   className="nopan w-52 text-xs"

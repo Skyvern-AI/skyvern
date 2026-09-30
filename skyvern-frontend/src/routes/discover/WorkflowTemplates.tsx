@@ -168,7 +168,10 @@ function WorkflowTemplates({ folderId }: { folderId?: string | null } = {}) {
               if (!plainClick) return;
               event.preventDefault();
               createWorkflow.mutate({
-                ...convert({ ...workflow, title: `${workflow.title} (copy)` }),
+                ...convert(
+                  { ...workflow, title: `${workflow.title} (copy)` },
+                  { asNewWorkflow: true },
+                ),
                 folder_id: folderId,
                 _via: TEMPLATE_VIA,
               });

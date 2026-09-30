@@ -60,7 +60,12 @@ function Debugger() {
 
   const settings = apiWorkflowToSettings(workflow);
 
-  const elements = getElements(blocksToRender, settings, true);
+  const elements = getElements(
+    blocksToRender,
+    settings,
+    true,
+    workflow.effective_default_engine,
+  );
 
   return (
     <div className="relative flex h-screen w-full">

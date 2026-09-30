@@ -495,9 +495,15 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             useWorkflowHasChangesStore
               .getState()
               .clearPendingRecording(recordingId);
+          // Only the detail GET computes effective_default_engine; the PUT returns null for it.
           queryClient.setQueryData(
             ["workflow", saveData.workflow.workflow_permanent_id],
-            response.data,
+            (prev?: WorkflowApiResponse) => ({
+              ...response.data,
+              effective_default_engine:
+                prev?.effective_default_engine ??
+                response.data.effective_default_engine,
+            }),
           );
           setHasChanges(false, { fromYamlCommit: true });
         }

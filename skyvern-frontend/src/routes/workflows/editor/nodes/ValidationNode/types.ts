@@ -24,7 +24,7 @@ export const validationNodeDefaultData: ValidationNodeData = {
   parameterKeys: [],
   disableCache: false,
   model: null,
-  engine: RunEngine.SkyvernV1,
+  engine: null,
 };
 
 export function isValidationNode(node: Node): node is ValidationNode {
