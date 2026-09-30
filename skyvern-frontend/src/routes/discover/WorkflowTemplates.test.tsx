@@ -15,6 +15,10 @@ const templates = [
     title: "Invoice Downloading",
   },
   { workflow_permanent_id: "wpid_c", title: "County - Business Registration" },
+  ...Array.from({ length: 11 }, (_, index) => ({
+    workflow_permanent_id: `wpid_template_${index}`,
+    title: `Template ${index + 1}`,
+  })),
 ];
 
 vi.mock("../workflows/hooks/useGlobalWorkflowsQuery", () => ({
@@ -99,5 +103,39 @@ describe("WorkflowTemplates", () => {
       "State Agency - Annual Report Filing",
       "County - Business Registration",
     ]);
+  });
+
+  it("expands all templates and collapses back to six", () => {
+    render(
+      <MemoryRouter>
+        <WorkflowTemplates />
+      </MemoryRouter>,
+    );
+
+    const cards = screen.getAllByRole("link");
+    const isHiddenAtMd = (card: Element) =>
+      card.classList.contains("md:hidden");
+    const expandButton = screen.getByRole("button", { name: "See all 15" });
+
+    expect(cards).toHaveLength(15);
+    expect(expandButton.getAttribute("aria-expanded")).toBe("false");
+    expect(cards.slice(0, 6).every((card) => !isHiddenAtMd(card))).toBe(true);
+    expect(cards.slice(6).every(isHiddenAtMd)).toBe(true);
+
+    fireEvent.click(expandButton);
+
+    const collapseButton = screen.getByRole("button", { name: "Show fewer" });
+    expect(collapseButton.getAttribute("aria-expanded")).toBe("true");
+    expect(cards.every((card) => !isHiddenAtMd(card))).toBe(true);
+
+    fireEvent.click(collapseButton);
+
+    expect(
+      screen
+        .getByRole("button", { name: "See all 15" })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(cards.slice(0, 6).every((card) => !isHiddenAtMd(card))).toBe(true);
+    expect(cards.slice(6).every(isHiddenAtMd)).toBe(true);
   });
 });

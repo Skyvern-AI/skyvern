@@ -111,10 +111,9 @@ vi.mock("./CyclingPlaceholderTextarea", async () => {
     CyclingPlaceholderTextarea: React.forwardRef<
       HTMLTextAreaElement,
       TextareaHTMLAttributes<HTMLTextAreaElement> & { cycling?: boolean }
-    >(({ cycling, ...props }, ref) => {
-      void cycling;
-      return <textarea ref={ref} {...props} />;
-    }),
+    >(({ cycling, ...props }, ref) => (
+      <textarea ref={ref} data-cycling={cycling} {...props} />
+    )),
   };
 });
 
@@ -245,9 +244,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function promptInput() {
+  return document.getElementById(
+    "discover-prompt-input",
+  ) as HTMLTextAreaElement;
+}
+
 async function submitPrompt(text: string) {
   renderPromptBox();
-  fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+  fireEvent.change(promptInput(), {
     target: { value: text },
   });
   fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -255,6 +260,20 @@ async function submitPrompt(text: string) {
 }
 
 describe("PromptBox", () => {
+  test.each([
+    ["legacy", false],
+    ["redesigned", true],
+  ])(
+    "stops cycling example placeholders once the prompt is focused (%s)",
+    (_label, minimal) => {
+      renderPromptBox(false, undefined, minimal);
+      const textarea = promptInput();
+      expect(textarea.dataset.cycling).toBe("true");
+      fireEvent.focus(textarea);
+      expect(textarea.dataset.cycling).toBe("false");
+    },
+  );
+
   test.each([
     ["legacy", false, false, "RESIDENTIAL"],
     ["redesigned", false, true, "RESIDENTIAL"],
@@ -301,7 +320,7 @@ describe("PromptBox", () => {
       );
       renderPromptBox();
 
-      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      fireEvent.change(promptInput(), {
         target: { value: "Start" },
       });
       await act(async () => undefined);
@@ -340,7 +359,7 @@ describe("PromptBox", () => {
       .mockResolvedValueOnce({ data: {} });
 
     renderPromptBox();
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "First identity" },
     });
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
@@ -349,7 +368,7 @@ describe("PromptBox", () => {
     authState.userId = "user-b";
     currentOrgState.organizationId = "org-b";
     renderPromptBox();
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Second identity" },
     });
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(2));
@@ -372,7 +391,7 @@ describe("PromptBox", () => {
         .mockResolvedValueOnce({ data: {} });
 
       renderPromptBox();
-      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      fireEvent.change(promptInput(), {
         target: { value: "First mount" },
       });
       await act(async () => undefined);
@@ -383,7 +402,7 @@ describe("PromptBox", () => {
         await vi.advanceTimersByTimeAsync(PREWARM_DISPATCH_WAIT_TIMEOUT_MS);
       });
       renderPromptBox();
-      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      fireEvent.change(promptInput(), {
         target: { value: "Later mount" },
       });
       await act(async () => undefined);
@@ -401,7 +420,7 @@ describe("PromptBox", () => {
     mockPost.mockResolvedValue({ data: {} });
     const ref = createRef<PromptBoxHandle>();
     renderPromptBox(false, ref);
-    const textarea = screen.getByPlaceholderText("Enter your prompt...");
+    const textarea = promptInput();
     textarea.scrollIntoView = vi.fn();
 
     act(() =>
@@ -481,7 +500,7 @@ describe("PromptBox", () => {
       });
 
     renderPromptBox();
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Visit the docs" },
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -584,9 +603,7 @@ describe("PromptBox", () => {
     fireEvent.click(card);
     expect(card.getAttribute("aria-pressed")).toBe("true");
 
-    const textarea = screen.getByPlaceholderText(
-      "Enter your prompt...",
-    ) as HTMLTextAreaElement;
+    const textarea = promptInput() as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: `${textarea.value} now` } });
     expect(card.getAttribute("aria-pressed")).toBe("false");
   });
@@ -712,9 +729,7 @@ describe("PromptBox", () => {
   test("reuses the shipped sample prompts for onboarding intent keys", () => {
     const ref = createRef<PromptBoxHandle>();
     renderPromptBox(false, ref);
-    const textarea = screen.getByPlaceholderText(
-      "Enter your prompt...",
-    ) as HTMLTextAreaElement;
+    const textarea = promptInput() as HTMLTextAreaElement;
     const cases = [
       ["finditparts", "finditparts.com"],
       ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
@@ -742,7 +757,7 @@ describe("PromptBox", () => {
 
     expect(screen.queryByText("Skyvern 2.0")).toBeNull();
 
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Visit the docs" },
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -811,7 +826,7 @@ describe("PromptBox", () => {
     expect(await screen.findByText("Max steps: 10")).toBeTruthy();
     expect(screen.getByLabelText("Advanced settings, 1 changed")).toBeTruthy();
 
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Visit the docs" },
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -878,6 +893,46 @@ describe("PromptBox", () => {
     expect(mockSetAutoplay).not.toHaveBeenCalled();
   });
 
+  test("holds submit until the job example's sample resume is attached, then hands it off", async () => {
+    let resolveFetch!: (response: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (resolveFetch = resolve))),
+    );
+    mockPost.mockImplementation((path: string) =>
+      Promise.resolve({
+        data:
+          path === "/upload_file"
+            ? { file_id: "file_resume" }
+            : {
+                workflow_permanent_id: "wpid_job",
+                workflow_definition: { blocks: [] },
+              },
+      }),
+    );
+
+    renderPromptBox(true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    const submit = screen.getByLabelText("submit-prompt") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith("/sample-resume.pdf"),
+    );
+    expect(submit.disabled).toBe(true);
+    resolveFetch(new Response(new Blob(["%PDF"]), { status: 200 }));
+    await waitFor(() => expect(submit.disabled).toBe(false));
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalled());
+    expect(mockNavigate.mock.calls[0]![1].state.copilotAttachedFiles).toEqual([
+      expect.objectContaining({
+        file_id: "file_resume",
+        filename: "sample-resume.pdf",
+      }),
+    ]);
+  });
+
   test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {
     studioState.enabled = true;
     mockPost.mockResolvedValue({
@@ -889,7 +944,7 @@ describe("PromptBox", () => {
 
     renderPromptBox(true);
 
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Build this in studio" },
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -928,7 +983,7 @@ describe("PromptBox", () => {
       });
 
       renderPromptBox(handoff);
-      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      fireEvent.change(promptInput(), {
         target: { value: "Visit the docs" },
       });
       fireEvent.click(screen.getByLabelText("submit-prompt"));
