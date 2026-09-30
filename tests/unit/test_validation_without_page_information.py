@@ -85,7 +85,8 @@ def test_converter_defaults_engine_and_max_steps_per_run_when_omitted() -> None:
     historical hardcoded step cap of 2 (not the YAML field's own None default)."""
     block_yaml = ValidationBlockYAML(label="v", complete_criterion="x")
     block = block_yaml_to_block(block_yaml, {"v_output": _output_parameter("v")})
-    assert block.engine == RunEngine.skyvern_v1
+    assert block.engine is None
+    assert block.resolve_engine(None) == RunEngine.skyvern_v1
     assert block.max_steps_per_run == 2
 
 

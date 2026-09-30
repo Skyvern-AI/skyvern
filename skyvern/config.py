@@ -591,6 +591,11 @@ class Settings(BaseSettings):
     # which covers the job recipe endpoints because those build a published definition. Enrolled runs
     # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
+    # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
+    # task block's chosen engine and run a block with no engine on Task V3, outside WORKFLOW_TASK_V3_AB.
+    # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
+    # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
+    TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -1078,7 +1083,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", mode="before")
+    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", "TASK_V3_CHOSEN_ENGINE_CUTOFF", mode="before")
     @classmethod
     def _task_v3_default_engine_workflow_cutoff_off_sentinels(cls, value: Any) -> Any:
         # This setting is the rule's settings-side kill path, and blanking an already-set env var is

@@ -8942,8 +8942,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -9257,8 +9263,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "navigation_goal": {
             "anyOf": [
@@ -14455,8 +14467,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -14792,8 +14810,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "data_schema": {
             "anyOf": [
@@ -15205,8 +15229,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -15742,8 +15772,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "error_code_mapping": {
             "anyOf": [
@@ -18630,7 +18666,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "skyvern-1.0"
           },
           "complete_criterion": {
@@ -19443,8 +19486,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -19748,8 +19797,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "navigation_goal": {
             "anyOf": [
@@ -20257,8 +20312,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -20555,8 +20616,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "error_code_mapping": {
             "anyOf": [
@@ -24442,8 +24509,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -24742,8 +24815,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "navigation_goal": {
             "anyOf": [
@@ -27396,7 +27475,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "skyvern-1.0"
           },
           "complete_criterion": {
@@ -27839,8 +27925,14 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -28128,8 +28220,14 @@
             "default": false
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "complete_criterion": {
             "anyOf": [
@@ -29560,6 +29658,17 @@
             "type": "boolean",
             "title": "Copilot Authored",
             "default": false
+          },
+          "effective_default_engine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The engine a task block with no `engine` set runs on in this agent, or null when engine routing decides it. Populated by the detail endpoint only."
           },
           "original_created_by": {
             "anyOf": [
