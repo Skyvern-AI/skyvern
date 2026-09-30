@@ -2532,6 +2532,7 @@ def make_finish_tool(
             settle_rounds=result.settle_rounds if result is not None else 0,
             goal_check_verdict=result.goal_check_verdict if result is not None else None,
             llm_key=result.llm_key if result is not None else None,
+            reask_llm_key=result.reask_llm_key if result is not None else None,
             skipped_reason=result.skipped_reason if result is not None else "reask_error",
             # Never the quote itself: it is page text, possibly customer data.
             quote_chars=result.quote_chars if result is not None else 0,

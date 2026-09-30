@@ -21,6 +21,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import functools
 import json
 import time
 from datetime import UTC, datetime
@@ -30,7 +31,8 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
+from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES, LLMCaller
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
@@ -454,10 +456,10 @@ async def run_task_v3_agent_loop(
         goal_verdicts.append(verdict)
         return verdict
 
-    async def _reask_judge(prompt: str) -> dict[str, Any] | None:
-        # The run's own model: a judge key exists only for goal-check treatment, and a pinned model must not be
-        # overridden. No message history, so the loop's transcript is untouched.
-        return await llm_caller.call(
+    async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
+        # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
+        # No message history, so the loop's transcript is untouched.
+        return await reask_caller.call(
             prompt=prompt,
             prompt_name=UNLISTED_REASK_PROMPT_NAME,
             step=step,
@@ -472,6 +474,10 @@ async def run_task_v3_agent_loop(
         if deadline_at is not None:
             timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
         redact = goal_check_redactor() if goal_check_redactor is not None else None
+        non_flex_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(llm_caller.llm_key)
+        reask_caller = llm_caller
+        if non_flex_key and LLMConfigRegistry.is_registered(non_flex_key):
+            reask_caller = LLMCaller(non_flex_key)
         if timeout <= 0:
             result = UnlistedReask(status, converts=False, skipped_reason="deadline", latency_s=0.0)
         # A rule past the cap could be the one that says this stop is right.
@@ -491,7 +497,7 @@ async def run_task_v3_agent_loop(
                 status=status,
                 reason=reason,
                 trail=tool_trail,
-                judge=_reask_judge,
+                judge=functools.partial(_reask_judge, reask_caller),
                 timeout_seconds=timeout,
                 entered_values=entered,
                 instructions=goal_instructions,
@@ -500,6 +506,7 @@ async def run_task_v3_agent_loop(
                 instructions_untrusted=unlisted_reask_instructions_untrusted,
             )
         result.llm_key = llm_caller.llm_key
+        result.reask_llm_key = reask_caller.llm_key
         reasks.append(result)
         return result
 
