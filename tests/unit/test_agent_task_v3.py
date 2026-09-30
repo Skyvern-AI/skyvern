@@ -81,7 +81,6 @@ from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
@@ -180,7 +179,6 @@ async def _run_execute_task_v3(
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
-        loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
@@ -351,40 +349,12 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("workflow_permanent_id", "targeted_wpid"),
-    [("wpid_required_field_answers", "wpid_required_field_answers"), (None, "not_workflow")],
+    [("wpid_customer_precedence", "wpid_customer_precedence"), (None, "not_workflow")],
 )
-async def test_execute_task_v3_resolves_the_required_field_answers_arm_before_the_loop_reads_it(
+async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_loop_reads_it(
     monkeypatch: pytest.MonkeyPatch, workflow_permanent_id: str | None, targeted_wpid: str
 ) -> None:
     # The rollout is targeted by workflow, so the flag must be evaluated with the wpid property.
-    monkeypatch.setattr(settings, "TASK_V3_REQUIRED_FIELD_ANSWERS", False)
-    provider = AsyncMock(return_value="treatment")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_required_field_answers_reach",
-        workflow_permanent_id=workflow_permanent_id,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id != task.task_id
-    assert loop_mock.required_field_answers_during_loop is True
-    assert loop_mock.context.run_arms[REQUIRED_FIELD_ANSWERS_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        REQUIRED_FIELD_ANSWERS_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id, "workflow_permanent_id": targeted_wpid},
-    )
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_loop_reads_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", False)
     provider = AsyncMock(return_value="treatment")
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
@@ -394,7 +364,7 @@ async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_l
         monkeypatch,
         outcome,
         workflow_run_id="wr_customer_precedence_reach",
-        workflow_permanent_id="wpid_customer_precedence",
+        workflow_permanent_id=workflow_permanent_id,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -405,7 +375,7 @@ async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_l
     provider.assert_any_await(
         CUSTOMER_PRECEDENCE_FLAG,
         task.workflow_run_id,
-        properties={"organization_id": task.organization_id, "workflow_permanent_id": "wpid_customer_precedence"},
+        properties={"organization_id": task.organization_id, "workflow_permanent_id": targeted_wpid},
     )
 
 
