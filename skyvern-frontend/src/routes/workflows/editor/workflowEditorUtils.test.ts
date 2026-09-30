@@ -18,6 +18,8 @@ import {
   pendingGoalChangesOf,
   withGoalUndoRecordsFrom,
 } from "./workflowEditorUtils";
+import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
+import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
 
 function minimalTaskBlock(overrides: { engine?: RunEngine } = {}) {
   return {
@@ -101,6 +103,17 @@ function codeBlock(goalNeedsRegeneration: boolean | null): AppNode {
 }
 
 describe("getWorkflowErrors", () => {
+  test("validates a new Terminate node without throwing", () => {
+    const node = {
+      id: "terminate-1",
+      type: "terminate",
+      position: { x: 0, y: 0 },
+      data: { ...terminateNodeDefaultData, label: "Stop" },
+    } as AppNode;
+
+    expect(getWorkflowErrors([node])).toEqual(["Stop: Reason is required."]);
+  });
+
   test("refuses to save a code block whose edited Goal has not been rebuilt into code", () => {
     const errors = getWorkflowErrors([codeBlock(true)]);
 
@@ -183,6 +196,125 @@ describe("blockRunErrors", () => {
     expect(
       blockRunErrors([codeBlock(false), otherBlock], "send_report"),
     ).toEqual([]);
+  });
+});
+
+describe("terminate block error code round trip", () => {
+  function terminateBlock(errorCode: string | null | undefined) {
+    return {
+      block_type: "terminate",
+      label: "stop",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+      ignore_workflow_system_prompt: false,
+      reason: "No account matches {{ account_number }}",
+      ...(errorCode === undefined ? {} : { error_code: errorCode }),
+    } as unknown as WorkflowBlock;
+  }
+
+  function loadAndSaveTerminate(errorCode: string | null | undefined) {
+    const { nodes, edges } = getElements(
+      [terminateBlock(errorCode)],
+      SETTINGS,
+      true,
+    );
+    return getWorkflowBlocks(nodes, edges)[0] as unknown as Record<
+      string,
+      unknown
+    >;
+  }
+
+  test.each([
+    ["a 128-character code", "A".repeat(128), null],
+    ["surrounding whitespace", `  ${"A".repeat(128)}  `, null],
+    ["an empty code", "   ", null],
+    ["a 129-character code", "A".repeat(129), "128 characters"],
+    ["a control character", "BAD\u0000CODE", "Unicode category-C"],
+    ["a Unicode format character", "BAD\u200dCODE", "Unicode category-C"],
+    ["a literal encoded code", "AUTH%3cab", "ASCII letters"],
+    ["a literal code with separators", "A_B.C:D-E", null],
+    ["a templated code", "AUTH_{{ outcome_code }}", null],
+    [
+      "a long statement template",
+      `{% if ${"true and ".repeat(20)}true %}ACCOUNT_LOCKED{% endif %}`,
+      null,
+    ],
+    [
+      "a statement-templated code",
+      "{% if locked %}ACCOUNT_LOCKED{% else %}ACCOUNT_MISSING{% endif %}",
+      null,
+    ],
+    ["a comment-templated code", "{# note #}ACCOUNT_LOCKED", null],
+  ])("validates %s before save", (_, code, expectedMessage) => {
+    const { nodes } = getElements([terminateBlock(code)], SETTINGS, true);
+    const errors = getWorkflowErrors(nodes);
+
+    expect(errors.filter((error) => error.includes("Error Code"))).toEqual(
+      expectedMessage ? [expect.stringContaining(expectedMessage)] : [],
+    );
+  });
+
+  test("offers a Terminate code in the retry rule picker", () => {
+    const { nodes } = getElements(
+      [terminateBlock("ACCOUNT_NOT_FOUND")],
+      SETTINGS,
+      true,
+    );
+
+    expect(collectKnownErrorCodes(nodes)).toContain("ACCOUNT_NOT_FOUND");
+  });
+
+  test("does not offer unrendered Terminate templates in the retry picker", () => {
+    const { nodes } = getElements(
+      [
+        terminateBlock("ACCOUNT_NOT_FOUND"),
+        { ...terminateBlock("{{ outcome_code }}"), label: "stop_2" },
+        { ...terminateBlock("AUTH_{{ outcome_code }}"), label: "stop_3" },
+        { ...terminateBlock("{% if ok %}READY{% endif %}"), label: "stop_4" },
+      ],
+      SETTINGS,
+      true,
+    );
+
+    expect(collectKnownErrorCodes(nodes)).toEqual(["ACCOUNT_NOT_FOUND"]);
+  });
+
+  test.each([
+    ["a stored code", "ACCOUNT_NOT_FOUND", "ACCOUNT_NOT_FOUND"],
+    ["a templated code", "{{ outcome_code }}", "{{ outcome_code }}"],
+    ["a definition saved before the field existed", undefined, null],
+    ["a cleared code", "", null],
+    ["a whitespace-only code", "   ", null],
+  ])("%s loads and saves as %s", (_, stored, expected) => {
+    expect(loadAndSaveTerminate(stored)).toMatchObject({
+      block_type: "terminate",
+      reason: "No account matches {{ account_number }}",
+      error_code: expected,
+    });
+  });
+
+  test("an export keeps the code and a definition without one exports null", () => {
+    const source = {
+      title: "Source",
+      description: null,
+      is_saved_task: false,
+      status: null,
+      run_with: "agent",
+      workflow_definition: {
+        parameters: [],
+        blocks: [
+          terminateBlock("ACCOUNT_NOT_FOUND"),
+          { ...terminateBlock(undefined), label: "stop_2" },
+        ],
+      },
+    } as unknown as WorkflowApiResponse;
+
+    expect(
+      convert(source).workflow_definition.blocks.map(
+        (block) => (block as { error_code?: string | null }).error_code,
+      ),
+    ).toEqual(["ACCOUNT_NOT_FOUND", null]);
   });
 });
 

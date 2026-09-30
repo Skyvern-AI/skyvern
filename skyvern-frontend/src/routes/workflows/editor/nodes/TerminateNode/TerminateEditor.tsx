@@ -2,6 +2,7 @@ import { useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 import { helpTooltips } from "../../helpContent";
@@ -39,7 +40,23 @@ function TerminateEditorBody({
           nodeId={blockId}
           onChange={(value) => update({ reason: value })}
           value={data.reason}
-          placeholder="e.g. ACCOUNT_NOT_FOUND: no account matches {{ account_number }}"
+          placeholder="e.g. No account matches {{ account_number }}"
+          className="nopan text-xs"
+        />
+      </div>
+      <div className="space-y-2">
+        <div className="flex gap-2">
+          <Label className="text-xs text-tertiary-foreground">
+            Error Code (Optional)
+          </Label>
+          <HelpTooltip content={helpTooltips["terminate"]["errorCode"]} />
+        </div>
+        <WorkflowBlockInput
+          name="errorCode"
+          nodeId={blockId}
+          onChange={(value) => update({ errorCode: value })}
+          value={data.errorCode}
+          placeholder="e.g. ACCOUNT_NOT_FOUND"
           className="nopan text-xs"
         />
       </div>
