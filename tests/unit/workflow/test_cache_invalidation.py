@@ -254,10 +254,15 @@ def _as_the_previous_image_stored_it(definition: WorkflowDefinition) -> dict:
 
 
 async def _resave(
-    stored: dict, resaved: WorkflowDefinition, monkeypatch: pytest.MonkeyPatch, *, born_at: datetime
+    stored: dict,
+    resaved: WorkflowDefinition,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    born_at: datetime | None,
+    cutoff: datetime | None = _CUTOFF,
 ) -> AsyncMock:
     """Save ``resaved`` over a workflow whose previous version holds ``stored``; returns the cache clear."""
-    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", _CUTOFF)
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
     now = datetime.now(timezone.utc)
     previous = Workflow(
         workflow_id="w_1",
@@ -288,6 +293,14 @@ async def _resave(
 
 
 @pytest.mark.parametrize(
+    ("born_at", "cutoff"),
+    [
+        (_CUTOFF - timedelta(days=30), _CUTOFF),
+        # No cutoff set: the two route alike whatever the birth lookup returns.
+        (None, None),
+    ],
+)
+@pytest.mark.parametrize(
     "nav_engine",
     [
         # The editor, which sends the stored skyvern-1.0 back.
@@ -298,12 +311,12 @@ async def _resave(
 )
 @pytest.mark.asyncio
 async def test_an_unchanged_resave_of_a_previously_stored_definition_keeps_its_cached_scripts(
-    monkeypatch: pytest.MonkeyPatch, nav_engine: str | None
+    monkeypatch: pytest.MonkeyPatch, nav_engine: str | None, born_at: datetime | None, cutoff: datetime | None
 ) -> None:
     resaved = convert_workflow_definition(_yaml_definition(nav_engine), "w_1")
     stored = _as_the_previous_image_stored_it(resaved)
 
-    clear_groups = await _resave(stored, resaved, monkeypatch, born_at=_CUTOFF - timedelta(days=30))
+    clear_groups = await _resave(stored, resaved, monkeypatch, born_at=born_at, cutoff=cutoff)
 
     clear_groups.assert_not_awaited()
     if nav_engine is not None:
@@ -311,15 +324,24 @@ async def test_an_unchanged_resave_of_a_previously_stored_definition_keeps_its_c
         assert resaved.model_dump(mode="json") == stored
 
 
+@pytest.mark.parametrize(
+    "born_at",
+    [
+        _CUTOFF + timedelta(days=1),
+        # The birth lookup failed: the workflow may be past the cutoff, so the two stay distinct.
+        None,
+    ],
+)
 @pytest.mark.asyncio
-async def test_past_the_cutoff_switching_a_legacy_pin_to_default_is_a_change(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_past_the_cutoff_switching_a_legacy_pin_to_default_is_a_change(
+    monkeypatch: pytest.MonkeyPatch, born_at: datetime | None
+) -> None:
     # Unset runs on v3 there and skyvern-1.0 is an explicit pin, so the cached script must be cleared;
     # the engine-inert blocks around it still compare equal.
     stored = convert_workflow_definition(_yaml_definition(RunEngine.skyvern_v1.value), "w_1").model_dump(mode="json")
     resaved = convert_workflow_definition(_yaml_definition(None), "w_1")
-    born_after = _CUTOFF + timedelta(days=1)
 
-    clear_groups = await _resave(stored, resaved, monkeypatch, born_at=born_after)
+    clear_groups = await _resave(stored, resaved, monkeypatch, born_at=born_at)
 
     clear_groups.assert_awaited_once()
     assert clear_groups.await_args.kwargs["plan"].label == "nav"

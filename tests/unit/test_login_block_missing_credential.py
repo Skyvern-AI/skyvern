@@ -201,6 +201,7 @@ async def test_preflight_passes_the_login_block_a_cached_script_builds() -> None
         organization_id="o_test",
         browser_session_id=None,
         context=SimpleNamespace(parent_workflow_run_block_id=None),
+        workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
     )
     with (
         patch.object(script_service.script_run_context_manager, "get_cached_fn", return_value=None),

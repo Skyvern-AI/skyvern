@@ -10,8 +10,8 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
 
-# Re-frozen for SKY-17181: the extension-mode evaluation guidance changed.
-DEFAULT_INSTRUCTIONS_SHA256 = "f2b0ac0fea44be39e5be84ec28617ad6fc9b6323003d1114c08d4dd7e9598d7f"
+# Re-frozen for SKY-17457: engine guidance omits the field by default and sets skyvern-1.0 only on request.
+DEFAULT_INSTRUCTIONS_SHA256 = "3b05238400b52f2120120403f80b2a8af9c487e41990b95efb5310ccd0376312"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.

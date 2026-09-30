@@ -36,6 +36,29 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
+
+@pytest.mark.asyncio
+async def test_a_copilot_round_trip_leaves_an_unset_block_engine_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Past the chosen-engine cutoff a written skyvern-1.0 is a pin, not the default an omitted engine runs.
+    blocks = [
+        {"block_type": "navigation", "label": "nav", "url": "https://example.com", "navigation_goal": "Go"},
+        {"block_type": "extraction", "label": "ex", "data_extraction_goal": "Read"},
+        {"block_type": "file_download", "label": "dl", "navigation_goal": "Download"},
+        {"block_type": "login", "label": "lg"},
+    ]
+    monkeypatch.setattr(
+        app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(side_effect=WorkflowNotFound("wp"))
+    )
+    document = {"title": "t", "workflow_definition": {"version": 2, "parameters": [], "blocks": blocks}}
+    stored = await _process_workflow_yaml("w", "wp", "o", yaml.safe_dump(document))
+
+    copilot_yaml = workflow_yaml_module.workflow_to_copilot_yaml(stored)
+    applied = await _process_workflow_yaml("w", "wp", "o", copilot_yaml, settings_fallback_workflow=stored)
+
+    assert all("engine" not in block for block in yaml.safe_load(copilot_yaml)["workflow_definition"]["blocks"])
+    assert all("engine" not in block for block in applied.model_dump(mode="json")["workflow_definition"]["blocks"])
+
+
 _SETTING_VALUES: dict[str, tuple[Any, Any]] = {
     "is_saved_task": (True, False),
     "description": ("Saved description", "Edited description"),
