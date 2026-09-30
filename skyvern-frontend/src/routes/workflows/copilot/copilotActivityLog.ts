@@ -7,10 +7,10 @@ import {
   ToolCallKind,
   TurnFacts,
   TurnNarrativeState,
+  blockPassed,
   condenseActivityEntries,
   hasObservedBlockEvidence,
   hasPendingToolCall,
-  isBlockOk,
   parseUtcIsoMs,
   ranCleanOnCurrentSource,
   toolActivityDisplayLabel,
@@ -799,22 +799,48 @@ export function callRollup(
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+// The row's blocks keyed by the tool call id of the run call that ran them: the
+// first run call, in row order, still running when the block was first seen (its
+// start, else its end, since a short block can be first polled finished). A
+// block with neither, or seen after every dated call returned, goes to the row's
+// last run call. Empty when the row made no run call.
+export function blocksByRunCall(row: ActivityRow): Map<string, BlockState[]> {
+  const runCalls = row.entries.filter(
+    (entry) =>
+      entry.toolName !== undefined && toolCallKind(entry.toolName) === "run",
+  );
+  const byCall = new Map<string, BlockState[]>();
+  const lastRun = runCalls[runCalls.length - 1];
+  const lastId = lastRun === undefined ? undefined : toolCallIdOf(lastRun);
+  if (lastId === undefined) return byCall;
+  for (const block of row.blocks) {
+    const seenMs = parseUtcIsoMs(block.startedAt ?? block.endedAt);
+    const host =
+      seenMs === null
+        ? undefined
+        : runCalls.find((entry) => {
+            if (entry.kind === "tool_call") return true;
+            const endedMs = parseUtcIsoMs(entry.timestamp);
+            return endedMs !== null && endedMs >= seenMs;
+          });
+    const id = (host && toolCallIdOf(host)) || lastId;
+    byCall.set(id, [...(byCall.get(id) ?? []), block]);
+  }
+  return byCall;
+}
+
 export function failedRowBlocks(row: ActivityRow): BlockState[] {
   return row.blocks.filter((block) => block.state === "failed");
 }
 
-// A run row whose every block the run recorded as ok and evaluated; null otherwise.
+// A run row whose every block passed, by the same rule its cards use; null otherwise.
 export function passedBlockCount(row: ActivityRow): number | null {
   if (row.kind !== "run" || row.pending || row.blocks.length === 0) {
     return null;
   }
   const last = row.entries[row.entries.length - 1];
   if (last?.kind === "tool_result" && last.success === false) return null;
-  return row.blocks.every(
-    (block) => isBlockOk(block) && block.outcome !== "not_evaluated",
-  )
-    ? row.blocks.length
-    : null;
+  return row.blocks.every(blockPassed) ? row.blocks.length : null;
 }
 
 function isFailedTest(row: ActivityRow): boolean {

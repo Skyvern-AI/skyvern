@@ -663,7 +663,14 @@ function Workspace({
     canUndo: canUndoWorkflowEdit,
     canRedo: canRedoWorkflowEdit,
     historyApplyTrigger,
-  } = useWorkflowHistory({ nodes, edges, setNodes, setEdges });
+  } = useWorkflowHistory({
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    organizationId: workflow.organization_id,
+    workflowPermanentId: workflow.workflow_permanent_id,
+  });
   const [restoreApplyTrigger, setRestoreApplyTrigger] = useState(0);
   const captureLiveEditorState = (): EditorStateSnapshot => {
     const titles = useWorkflowTitleStore.getState();
@@ -1516,6 +1523,7 @@ function Workspace({
   };
 
   const cycleBrowser = useMutation({
+    mutationKey: ["cycleBrowser"],
     mutationFn: async (id: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client.post<DebugSessionApiResponse>(`/debug-session/${id}/new`);
@@ -1997,6 +2005,7 @@ function Workspace({
     workflowChangesStore.setHasChanges(true);
     postHog.capture("builder.block.added", {
       org_id: workflow.organization_id,
+      workflow_permanent_id: workflow.workflow_permanent_id,
       block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
     });

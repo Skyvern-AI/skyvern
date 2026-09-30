@@ -428,6 +428,86 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
   });
 
+  it("names a code block's raised error by its line and keeps its full text one click deep", async () => {
+    const failure =
+      "Locator.fill: Timeout 30000ms exceeded.\nCall log:\n  - waiting for the email field";
+    timelineGet.mockResolvedValue({
+      data: [
+        {
+          type: "block",
+          block: {
+            workflow_run_block_id: "wrb_1",
+            actions: [
+              {
+                action_id: "a2",
+                action_type: "null_action",
+                status: "failed",
+                task_id: null,
+                step_id: null,
+                step_order: null,
+                action_order: 1,
+                confidence_float: null,
+                description: "code error at line 8",
+                reasoning: null,
+                intention: null,
+                response: failure,
+                created_by: null,
+                text: null,
+                output: { code_line: 8 },
+              },
+            ],
+          },
+          children: [],
+          thought: null,
+          created_at: "2026-06-10T00:00:00Z",
+          modified_at: "2026-06-10T00:00:00Z",
+        },
+      ],
+    });
+
+    await renderChat();
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage({
+      type: "turn_start",
+      turn_id: "turn-1",
+      turn_index: 0,
+      mode: "build",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    streamCalls[0]!.onMessage({
+      type: "design_start",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    for (const [status, timestamp] of [
+      ["running", "2026-06-10T00:00:00Z"],
+      ["failed", "2026-06-10T00:00:31Z"],
+    ]) {
+      streamCalls[0]!.onMessage({
+        type: "block_progress",
+        workflow_run_id: "wr_1",
+        workflow_run_block_id: "wrb_1",
+        block_label: "block_1",
+        block_type: "code",
+        status,
+        iteration: 0,
+        timestamp,
+      });
+    }
+
+    // The recorded step replays before it settles into its failure.
+    await waitFor(() => expect(screen.getByText("line 8")).toBeTruthy(), {
+      timeout: 3000,
+    });
+    expect(screen.getByText("Code error")).toBeTruthy();
+    expect(screen.queryByText("Screenshot")).toBeNull();
+    expect(
+      screen.getByText("Locator.fill: Timeout 30000ms exceeded."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/waiting for the email field/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(screen.getByText(/waiting for the email field/)).toBeTruthy();
+  });
+
   it("patches an already-frozen AI message when the timeline fetch resolves after the terminal response", async () => {
     let resolveTimeline!: (value: { data: unknown[] }) => void;
     timelineGet.mockImplementation(

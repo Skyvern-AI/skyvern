@@ -252,6 +252,7 @@ export function BrowserPaneActions() {
   const moreActionsRef = useRef<HTMLButtonElement>(null);
 
   const cycleBrowser = useMutation({
+    mutationKey: ["cycleBrowser"],
     mutationFn: async (workflowId: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client.post<DebugSessionApiResponse>(
