@@ -39,8 +39,8 @@ type Props = {
 };
 
 function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
-  const enableCopilotHandoff =
-    useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
+  const copilotHandoffFlag = useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF");
+  const enableCopilotHandoff = copilotHandoffFlag === true;
   const createWorkflowMutation = useCreateWorkflowMutation({
     onCreated: revamp ? onRevampComplete : undefined,
   });
@@ -172,6 +172,7 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
       <PromptBox
         ref={promptBoxRef}
         enableCopilotHandoff={enableCopilotHandoff}
+        handoffFlagLoading={copilotHandoffFlag === undefined}
         secondaryAction={
           <Button
             variant="ghost"
