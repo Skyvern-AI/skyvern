@@ -14761,6 +14761,88 @@ async def test_click_refuses_a_skinned_checkbox_with_no_proxy_at_all() -> None:
         assert await page.eval_on_selector("#nolabel", "el => el.checked") is False
 
 
+# A transparent native checkbox stretched over its own styled box is what a person clicks, in view, below
+# the fold, with only its top edge above the fold, or further down a scrollable list. One inside a collapsed
+# section, a faded-out panel (even behind its <label>), or stacked translucent wrappers, or under an unrelated
+# cover, is not reachable, and the two are told apart.
+_OPACITY0_OVERLAY_CHECKBOX_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div style="position:relative;width:24px;height:24px;margin:20px">
+    <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+    <input id="overlay" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+  </div>
+  <div style="height:0;overflow:hidden">
+    <div style="position:relative;width:24px;height:24px">
+      <input id="collapsed" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+    </div>
+  </div>
+  <div style="position:relative;width:24px;height:24px;margin:20px">
+    <input id="covered" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+    <div style="position:absolute;inset:0;z-index:2;background:#fff">Show more</div>
+  </div>
+  <div style="position:relative;width:24px;height:24px;margin:20px;opacity:0">
+    <input id="faded" type="checkbox" aria-label="Faded panel option" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+  </div>
+  <div style="opacity:0;margin:20px">
+    <label style="display:inline-block;width:120px;height:24px"><input id="labelfaded" type="checkbox" style="opacity:0">Faded label</label>
+  </div>
+  <div style="opacity:0.2;margin:20px">
+    <div style="position:relative;width:24px;height:24px;opacity:0.2">
+      <input id="stacked" type="checkbox" aria-label="Stacked fade option" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+    </div>
+  </div>
+  <div style="height:100px;overflow:auto;margin:20px">
+    <div style="height:600px"></div>
+    <div style="position:relative;width:24px;height:24px">
+      <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+      <input id="inlist" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+    </div>
+  </div>
+  <div style="position:absolute;left:20px;top:calc(100vh - 8px);width:24px;height:24px">
+    <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+    <input id="straddle" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+  </div>
+  <div style="height:3000px"></div>
+  <div style="position:relative;width:24px;height:24px;margin:20px">
+    <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+    <input id="below" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+  </div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["#overlay", "#below", "#straddle", "#inlist"])
+async def test_click_checks_a_transparent_checkbox_laid_over_its_own_styled_box(selector: str) -> None:
+    async with _content_page(_OPACITY0_OVERLAY_CHECKBOX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": selector})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector(selector, "el => el.checked") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "diagnosis"),
+    [
+        ("#collapsed", "not rendered"),
+        ("#faded", "not rendered"),
+        ("#labelfaded", "not rendered"),
+        ("#stacked", "not rendered"),
+        ("#covered", "something else is on top of it"),
+    ],
+)
+async def test_click_still_refuses_a_transparent_checkbox_nothing_reaches(selector: str, diagnosis: str) -> None:
+    async with _content_page(_OPACITY0_OVERLAY_CHECKBOX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": selector})
+        assert r.status == "error"
+        assert diagnosis in r.content, r.content
+        assert await page.eval_on_selector(selector, "el => el.checked") is False
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_pre_seeded_marker_holding_a_line_separator_cannot_forge_a_line() -> None:
