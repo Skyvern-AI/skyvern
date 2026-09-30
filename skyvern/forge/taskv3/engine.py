@@ -595,11 +595,17 @@ async def run_task_v3_agent_loop(
     )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
+    age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
+    age_default_text, age_default_reason = age_default or (None, None)
+    user_prompt = build_user_prompt(model_goal, refs.masked, model_starting_url)
+    # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
+    if age_default_text:
+        user_prompt += f"\n\n{age_default_text}"
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=build_user_prompt(model_goal, refs.masked, model_starting_url),
+            user_prompt=user_prompt,
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
@@ -715,6 +721,8 @@ async def run_task_v3_agent_loop(
         perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
         status_at_hold_gate=activity.status_at_hold_gate,
         has_navigation_goal=has_navigation_goal,
+        age_default_rendered=bool(age_default_text),
+        age_default_reason=age_default_reason,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,

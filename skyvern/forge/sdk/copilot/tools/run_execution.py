@@ -3697,6 +3697,7 @@ async def _run_blocks_and_collect_debug(
     sensitive_run_custody_lock: asyncio.Lock | None = None
     sensitive_run_session_id: str | None = None
     interim_run_id: str | None = None
+    current_context = skyvern_context.current()
     # Set only where the run may already be executing, so an unwind before either executor call
     # can still retract the run-start record.
     run_submission_attempted = False
@@ -3710,7 +3711,7 @@ async def _run_blocks_and_collect_debug(
             # select a newer proposal while this run still carries the previous definition.
             resolved_workflow_id=snapshot.workflow.workflow_id,
             max_steps=None,
-            request_id=None,
+            request_id=current_context.request_id if current_context is not None else None,
             # The trigger type (and the -ui queue routing it implies) is a cloud contract; ask the
             # AgentFunction for it rather than hardcoding "manual == -ui pool" in OSS. OSS base
             # returns None (no routing hint); cloud returns the value its executor routes to -ui.

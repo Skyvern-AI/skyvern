@@ -12906,6 +12906,8 @@ class WorkflowService:
                     else latest_attempt is not None and is_retry_pending(status, now, latest_attempt)
                 ),
                 organization_id=workflow_run.organization_id,
+                debug_session_id=workflow_run.debug_session_id,
+                copilot_session_id=workflow_run.copilot_session_id,
                 start_hold=_start_hold(workflow_run),
                 backup_queue=app.AGENT_FUNCTION.is_backup_queue_organization(workflow_run.organization_id),
                 run_with=workflow_run.run_with,
@@ -16297,6 +16299,7 @@ class WorkflowService:
         LOG.info(
             "Creating workflow from request",
             organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id or new_workflow_permanent_id,
             title=title,
         )
         if new_workflow_permanent_id:
@@ -16558,7 +16561,7 @@ class WorkflowService:
             if new_workflow_id:
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             raise
-        except Exception as e:
+        except Exception:
             if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
                 await app.DATABASE.browser_recordings.detach_from_workflow_version(
                     recording_id=recording_id_to_attach,
@@ -16567,13 +16570,20 @@ class WorkflowService:
                 )
             if new_workflow_id:
                 LOG.error(
-                    f"Failed to create workflow from request, deleting workflow {new_workflow_id}",
+                    "Failed to create workflow from request, deleting workflow",
                     organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=new_workflow_id,
                 )
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             else:
-                LOG.exception(f"Failed to create workflow from request, title: {title}")
-            raise e
+                LOG.exception(
+                    "Failed to create workflow from request",
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    title=title,
+                )
+            raise
 
     async def _refresh_workflow_schedule_runtime_limits(
         self,
