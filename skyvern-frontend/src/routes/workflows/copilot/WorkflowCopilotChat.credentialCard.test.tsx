@@ -15,6 +15,7 @@ import {
   canonicalRecoveriesByWorkflow,
 } from "./WorkflowCopilotChat";
 
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import {
   beginYamlCommit,
@@ -580,6 +581,85 @@ describe("WorkflowCopilotChat — activity log", () => {
 });
 
 describe("WorkflowCopilotChat — credential receipt placement", () => {
+  it("releases the dock and header flag when a docked sign-in request times out", async () => {
+    await streamScoutTurn();
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByRole("group", { name: "Sign-in request" })).toBeTruthy();
+    expect(useCopilotHeaderStore.getState().attention).toBe("credential");
+
+    // The server sends no frame on timeout, so the deadline alone has to release the dock.
+    await act(async () => vi.advanceTimersByTimeAsync(300_001));
+    expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
+    expect(screen.queryByText(/continue below/)).toBeNull();
+    expect(screen.getAllByText("Timed out").length).toBeGreaterThan(0);
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
+  });
+
+  it("docks a live sign-in request above the composer and hands the receipt back to the transcript", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+    });
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const tray = await screen.findByRole("group", { name: "Sign-in request" });
+    const marker = screen.getByText(/continue below/);
+    expect(
+      precedes(
+        document.querySelector('[data-activity-row-id="tc-1"]')!,
+        marker,
+      ),
+    ).toBe(true);
+    expect(precedes(marker, tray)).toBe(true);
+    expect(
+      precedes(
+        tray,
+        screen.getByRole("group", { name: "Copilot message composer" }),
+      ),
+    ).toBe(true);
+    expect(screen.getAllByRole("button", { name: "Skip for now" })).toEqual([
+      within(tray).getByRole("button", { name: "Skip for now" }),
+    ]);
+    expect(useCopilotHeaderStore.getState().attention).toBe("credential");
+
+    // Minimized, the tray keeps its name on the control that restores it.
+    fireEvent.click(
+      within(tray).getByRole("button", { name: "Minimize sign-in request" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show Sign-in request" }),
+    );
+    expect(screen.getByRole("group", { name: "Sign-in request" })).toBeTruthy();
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "credential_pause_resolved",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        resume_token: "rt-abc",
+        outcome: "connected",
+        credential_id: "cred-hn",
+        name: "HN Login",
+        timestamp: new Date().toISOString(),
+      });
+    });
+    expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
+    expect(screen.queryByText(/continue below/)).toBeNull();
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
+  });
+
   it("keeps a mid-turn credential card after the row it was raised on, live and once the turn ends", async () => {
     credentialsData.current = [
       { credential_id: "cred-hn", name: "HN Login", tested_url: null },
@@ -2090,9 +2170,14 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await waitFor(() =>
       expect(credentialsGets().length).toBeGreaterThanOrEqual(1),
     );
+    // The notice sits in the tray, and a second copy of the ask in the transcript would add a button.
+    const tray = await screen.findByRole("group", { name: "Sign-in request" });
     expect(
-      await screen.findByText(/Couldn't load your saved logins/),
-    ).toBeTruthy();
+      within(tray).getAllByText(/Couldn't load your saved logins/),
+    ).toHaveLength(1);
+    expect(
+      screen.getAllByRole("button", { name: "Connect credential" }),
+    ).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Connect credential" }),
@@ -2322,6 +2407,9 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     });
     expect(await screen.findByRole("combobox")).toBeTruthy();
     expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+    // A stranded ask is no longer the tail turn, so it stays inline instead of holding the dock.
+    expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
 
   it("hides a stale terminal ask once it is no longer the last message", async () => {

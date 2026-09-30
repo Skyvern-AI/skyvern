@@ -38,7 +38,7 @@ import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import {
   CopilotActiveDot,
   CopilotPaneControls,
-  CopilotRecordingStatus,
+  CopilotPaneStatus,
 } from "./CopilotPaneHeader";
 import {
   EditorPaneBlockSearch,
@@ -1082,7 +1082,7 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <StudioPane
                 {...paneProps("copilot")}
-                headerExtras={<CopilotRecordingStatus />}
+                headerExtras={<CopilotPaneStatus />}
                 headerActions={<CopilotPaneControls />}
                 iconBadge={<CopilotActiveDot />}
               >

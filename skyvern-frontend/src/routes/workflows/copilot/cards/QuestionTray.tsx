@@ -1,15 +1,11 @@
 import { useEffect, useId, useRef, type KeyboardEvent } from "react";
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  ChevronUpIcon,
-} from "@radix-ui/react-icons";
+import { CheckIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
 import type { QuestionStepper } from "../useQuestionStepper";
 import type { QuestionInteraction } from "../workflowCopilotTypes";
-
-export const MAX_KEYED_CHOICES = 9;
+import { AttentionTray } from "./AttentionTray";
+import { keyedChoiceFor, MAX_KEYED_CHOICES } from "./keyedChoice";
 
 // One tray renders at a time, so the composer can name the prompt it is answering.
 export const QUESTION_PROMPT_ID = "copilot-question-prompt";
@@ -26,6 +22,7 @@ export function QuestionTray({
   onCancel,
   cancelDisabled,
   cancelTitle,
+  upNext,
 }: {
   interaction: QuestionInteraction;
   stepper: QuestionStepper;
@@ -40,6 +37,7 @@ export function QuestionTray({
   onCancel?: () => void;
   cancelDisabled?: boolean;
   cancelTitle?: string;
+  upNext?: string | null;
 }) {
   const titleId = useId();
   const advanceRef = useRef<HTMLButtonElement>(null);
@@ -55,77 +53,35 @@ export function QuestionTray({
   const part = interaction.parts[stepper.index];
   const noun = total === 1 ? "question" : "questions";
 
-  if (collapsed) {
-    return (
-      <div className="flex items-center gap-2 rounded-t-lg border border-b-0 border-amber-500/50 bg-amber-500/[0.06] px-3 py-1.5 text-xs">
-        <span
-          aria-hidden
-          className="size-2 shrink-0 rounded-full bg-amber-500"
-        />
-        <span className="min-w-0 flex-1 truncate font-semibold text-amber-700 dark:text-yellow-400">
-          Copilot is waiting on {total} {noun}
-        </span>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-6 px-2 text-xs"
-          aria-expanded={false}
-          onClick={() => onCollapsedChange(false)}
-        >
-          Show
-          <ChevronUpIcon className="ml-1 size-3.5" />
-        </Button>
-      </div>
-    );
-  }
-
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (disabled || !part || part.choices.length > MAX_KEYED_CHOICES) return;
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    const choice = part.choices[Number(event.key) - 1];
-    if (!/^[1-9]$/.test(event.key) || !choice) return;
+    const choice = keyedChoiceFor(event, part.choices);
+    if (!choice) return;
     event.preventDefault();
     stepper.toggleChoice(part.part_id, choice.choice_id);
   };
 
   return (
-    <div
-      role="group"
+    <AttentionTray
       aria-label="Question parts"
       aria-describedby={titleId}
       data-interaction-id={interaction.interaction_id}
       onKeyDown={onKeyDown}
-      className="flex max-h-[50vh] min-w-0 flex-col overflow-hidden rounded-t-lg border border-b-0 border-amber-500/50 bg-amber-500/[0.06]"
+      title="Copilot needs your answer"
+      titleId={titleId}
+      meta={
+        total > 1 ? (
+          <span className="tabular-nums text-muted-foreground">
+            {stepper.index + 1} of {total}
+          </span>
+        ) : null
+      }
+      collapsedTitle={`Copilot is waiting on ${total} ${noun}`}
+      collapsed={collapsed}
+      onCollapsedChange={onCollapsedChange}
+      minimizeLabel="Minimize question"
+      upNext={upNext}
     >
-      <div className="flex items-center gap-2 px-3 pb-1 pt-2 text-xs">
-        <span
-          aria-hidden
-          className="size-2 shrink-0 rounded-full bg-amber-500 shadow-[0_0_0_3px_rgba(245,158,11,0.18)]"
-        />
-        <span
-          id={titleId}
-          className="min-w-0 truncate font-semibold text-amber-700 dark:text-yellow-400"
-        >
-          Copilot needs your answer
-        </span>
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          {total > 1 ? (
-            <span className="tabular-nums text-muted-foreground">
-              {stepper.index + 1} of {total}
-            </span>
-          ) : null}
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-6 text-muted-foreground"
-            aria-label="Minimize question"
-            aria-expanded
-            onClick={() => onCollapsedChange(true)}
-          >
-            <ChevronDownIcon className="size-3.5" />
-          </Button>
-        </div>
-      </div>
       {/* Stays mounted across steps so Back and Next read the new question to a screen reader
           whose focus is still in the composer. */}
       <span className="sr-only" aria-live="polite">
@@ -271,6 +227,6 @@ export function QuestionTray({
           )}
         </div>
       </div>
-    </div>
+    </AttentionTray>
   );
 }
