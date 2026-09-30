@@ -43,6 +43,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _browser_session_loss_result,
     _prepare_browser_session_for_dispatch,
     _record_browser_call_outcome,
+    is_redaction_withheld,
     scrub_model_facing_tool_result,
 )
 from skyvern.forge.sdk.copilot.runtime import (
@@ -531,7 +532,7 @@ async def run_browser_code(
             else result
         )
         scrubbed = scrub_model_facing_tool_result(copilot_ctx, result_to_scrub)
-        if retained_reference is not None and scrubbed:
+        if retained_reference is not None and scrubbed and not is_redaction_withheld(scrubbed):
             # This server-generated capability is not derived from credential data. Scrubbing a coincidental
             # secret substring would corrupt the lookup key and make exact-source promotion impossible.
             scrubbed["executed_source_reference"] = retained_reference

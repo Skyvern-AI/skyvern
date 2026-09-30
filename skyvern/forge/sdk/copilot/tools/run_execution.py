@@ -2444,15 +2444,26 @@ async def _fetch_dispatched_terminal_page_evidence(
         return None
     if artifact_bytes.startswith(_ZIP_MAGIC_PREFIXES):
         return None
+    # Cut before redaction: a registered value whose first 1-7 characters land on the cut is not caught, because
+    # the redactor only recognises a dangling prefix of 8 or more characters.
     raw_html = artifact_bytes.decode("utf-8", errors="ignore")[:_MAX_POST_RUN_PAGE_HTML_CHARS]
     scrubbed_html = (
         app.AGENT_FUNCTION.redact_codeblock_parameter_values(
-            raw_html, _mutable_redaction_value(artifact_redaction_parameters)
+            raw_html,
+            _mutable_redaction_value(artifact_redaction_parameters),
+            max_disclosure_chars=_MAX_POST_RUN_PAGE_HTML_CHARS,
         )
         if artifact_redaction_parameters
         else raw_html
     )
     if not isinstance(scrubbed_html, str) or not scrubbed_html:
+        # The HTML is cut to the budget before redaction, so a refusal here is never about size. The size is not
+        # logged because the refused parameters cannot vouch that it differs from a registered value.
+        LOG.warning(
+            "copilot_model_facing_result_withheld",
+            tool_name="post_run_page_html",
+            reason="redaction_unavailable",
+        )
         return None
     try:
         evidence = await asyncio.wait_for(

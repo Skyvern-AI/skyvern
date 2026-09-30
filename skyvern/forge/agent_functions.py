@@ -1279,7 +1279,14 @@ class AgentFunction:
         under them; OSS has no runner, so its budget is unknown rather than unlimited."""
         return None
 
-    def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
+    def redact_codeblock_parameter_values(
+        self,
+        value: Any,
+        parameters: dict[str, Any],
+        *,
+        max_disclosure_chars: int | None = None,
+        max_disclosure_nodes: int | None = None,
+    ) -> Any:
         """Cloud overrides this with the runner's canonical parameter scrubber."""
         return value
 
