@@ -345,6 +345,7 @@ from skyvern.services.webhook_delivery import (
 from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-exported; several tests import it from this module
     BLOCK_TYPES_THAT_SHOULD_BE_CACHED,
     create_script_version_from_review,
+    engine_only_loop_child_types,
     is_block_type_cacheable,
 )
 from skyvern.utils.contained_effects import contained_effect
@@ -8859,8 +8860,10 @@ class WorkflowService:
         # bypassing _execute_single_block. Recursively walk all nesting levels
         # so deeply nested blocks (e.g., file_download inside a double-nested
         # loop) get cached functions generated.
+        # Skip engine-only loops: their script never runs, so queueing an unexecuted branch child regenerates every run.
         if (
             isinstance(block, (ForLoopBlock, WhileLoopBlock))
+            and is_block_type_cacheable(block)
             and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
             and workflow_run_block_result.status in cacheable_statuses
         ):
@@ -8921,6 +8924,7 @@ class WorkflowService:
                 in_cache=block.label in script_blocks_by_label,
                 disable_cache=block.disable_cache,
                 requires_agent=block_requires_agent,
+                engine_only_child_types=sorted(child_type.value for child_type in engine_only_loop_child_types(block)),
             )
 
         fallback_episode_id: str | None = None

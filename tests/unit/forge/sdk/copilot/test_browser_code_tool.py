@@ -2118,7 +2118,9 @@ async def test_a_tainted_page_withholds_its_location_from_browser_code_page_stat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code", [pytest.param(" ", id="refused"), pytest.param("1", id="ran-with-source-reference")])
-async def test_a_browser_code_result_the_scrub_empties_stays_empty(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+async def test_a_browser_code_result_the_scrub_cannot_redact_is_withheld(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
     _patch_cell_runtime(monkeypatch)
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_scrub_emptied"
@@ -2129,4 +2131,6 @@ async def test_a_browser_code_result_the_scrub_empties_stays_empty(monkeypatch: 
     finally:
         clear_session_scrub_values(ctx.browser_session_id)
 
-    assert result == {}
+    assert mcp_adapter.is_redaction_withheld(result) and result["ok"] is False
+    assert result["data"]["redaction_withheld"]["reason"] == "redaction_unavailable"
+    assert set(result) == {"page_state", "ok", "error", "data"}

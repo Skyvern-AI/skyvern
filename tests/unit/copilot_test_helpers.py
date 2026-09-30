@@ -819,7 +819,7 @@ def redact_parameter_values(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, 
     """Give ``ctx`` code-block parameters and a redactor that replaces each of their values with ``[redacted]``."""
     ctx.codeblock_redaction_parameters = parameters
 
-    def redact(value: Any, active: dict[str, Any]) -> Any:
+    def redact(value: Any, active: dict[str, Any], **_budget: object) -> Any:
         if isinstance(value, str):
             for secret in active.values():
                 value = value.replace(secret, "[redacted]")

@@ -606,7 +606,7 @@ async def test_nonsensitive_origin_parameters_still_scrub_dispatched_terminal_ht
     _stub_app(monkeypatch, artifacts, {"art_parameter": html.encode()})
     seen_parameters: list[object] = []
 
-    def redact(value: object, parameters: object) -> object:
+    def redact(value: object, parameters: object, **_budget: object) -> object:
         seen_parameters.append(parameters)
         return value.replace(parameter_value, "[REDACTED]") if isinstance(value, str) else value
 
@@ -1324,7 +1324,7 @@ async def test_dispatched_fetch_scrubs_persisted_terminal_html_before_parsing(
     _stub_app(monkeypatch, artifacts, {"art_secret": html.encode()})
     seen: list[object] = []
 
-    def scrub(value: object, redaction_parameters: object) -> object:
+    def scrub(value: object, redaction_parameters: object, **_budget: object) -> object:
         seen.append(value)
         assert redaction_parameters == {"password": secret}
         return value.replace(secret, "[REDACTED]") if isinstance(value, str) else value

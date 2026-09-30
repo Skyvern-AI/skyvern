@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
@@ -130,7 +131,7 @@ def _script_block(label: str, run_signature: str, requires_agent: bool = False) 
     )
 
 
-def _completed_result(block: NavigationBlock | LoginBlock | ConditionalBlock) -> BlockResult:
+def _completed_result(block: NavigationBlock | LoginBlock | ConditionalBlock | ForLoopBlock) -> BlockResult:
     return BlockResult(
         success=True,
         output_parameter=block.output_parameter,
@@ -141,7 +142,7 @@ def _completed_result(block: NavigationBlock | LoginBlock | ConditionalBlock) ->
 
 async def _run_single_block(
     service: WorkflowService,
-    block: NavigationBlock | LoginBlock | ConditionalBlock,
+    block: NavigationBlock | LoginBlock | ConditionalBlock | ForLoopBlock,
     *,
     workflow: MagicMock | None = None,
     workflow_run: MagicMock | None = None,
@@ -756,6 +757,72 @@ async def test_script_success_skips_agent_execution(monkeypatch: pytest.MonkeyPa
     assert block_result.workflow_run_block_id == "wrb_script_1"
     assert returned_blocks == set()
     assert should_stop is False
+
+
+def _loop_holding_a_conditional() -> ForLoopBlock:
+    conditional = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("cond_output"),
+        branch_conditions=[
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ current_value }}"), next_block_label="nav_a"),
+            BranchCondition(is_default=True, next_block_label="nav_b"),
+        ],
+    )
+    return ForLoopBlock(
+        label="loop",
+        output_parameter=_output_parameter("loop_output"),
+        loop_blocks=[conditional, _navigation_block("nav_a"), _navigation_block("nav_b")],
+    )
+
+
+async def _run_cached_loop_holding_a_conditional(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], AsyncMock, set]:
+    """Script run of a loop whose script and executed branch are already cached; nav_b never ran."""
+    block = _loop_holding_a_conditional()
+    script_calls: list[str] = []
+    execute_safe = AsyncMock(return_value=_completed_result(block))
+    monkeypatch.setattr(ForLoopBlock, "execute_safe", execute_safe)
+    # Only reached if the cached script runs and fails; stubbed so that regression fails on the assertions.
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", AsyncMock())
+
+    _, blocks_to_update, _, _, _ = await _run_single_block(
+        WorkflowService(),
+        block,
+        workflow_run=_workflow_run(ai_fallback=False),
+        is_script_run=True,
+        script_blocks_by_label={
+            "loop": _script_block("loop", "record_dispatch()"),
+            "nav_a": _script_block("nav_a", "record_dispatch()"),
+        },
+        loaded_script_module=SimpleNamespace(record_dispatch=lambda: script_calls.append("called")),
+    )
+    return script_calls, execute_safe, blocks_to_update
+
+
+@pytest.mark.asyncio
+async def test_cached_loop_holding_a_conditional_runs_through_the_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    script_calls, execute_safe, _ = await _run_cached_loop_holding_a_conditional(monkeypatch)
+
+    assert script_calls == []
+    execute_safe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_engine_only_loop_logs_which_child_kept_it_off_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    with capture_logs() as logs:
+        await _run_cached_loop_holding_a_conditional(monkeypatch)
+
+    [mode_resolved] = [log for log in logs if log["event"] == "Block execution mode resolved"]
+    assert mode_resolved["execution_mode"] == "ai"
+    assert mode_resolved["engine_only_child_types"] == ["conditional"]
+
+
+@pytest.mark.asyncio
+async def test_engine_only_loop_does_not_queue_its_children_for_regeneration(monkeypatch: pytest.MonkeyPatch) -> None:
+    # nav_b sits on a branch that did not run, so codegen has no actions to mint it from:
+    # queueing it would regenerate the script on every run.
+    _, _, blocks_to_update = await _run_cached_loop_holding_a_conditional(monkeypatch)
+
+    assert blocks_to_update == set()
 
 
 @pytest.mark.asyncio

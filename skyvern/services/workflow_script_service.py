@@ -60,17 +60,21 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 
 # Loop children that must always run through the engine: codegen emits them as a
 # no-op comment, so a cached loop would silently skip them.
-_ENGINE_ONLY_LOOP_CHILD_TYPES = {BlockType.WEB_SEARCH, BlockType.TERMINATE}
+_ENGINE_ONLY_LOOP_CHILD_TYPES = {BlockType.WEB_SEARCH, BlockType.TERMINATE, BlockType.CONDITIONAL}
 
 
-def _contains_engine_only_child(block: Any) -> bool:
+def engine_only_loop_child_types(block: Any) -> set[BlockType]:
+    """Engine-only block types nested at any depth inside a loop; empty for any other block."""
     block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
-    if block_type in _ENGINE_ONLY_LOOP_CHILD_TYPES:
-        return True
-    if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
-        children = block.get("loop_blocks", []) if isinstance(block, dict) else block.loop_blocks
-        return any(_contains_engine_only_child(child) for child in children)
-    return False
+    if block_type not in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
+        return set()
+    found: set[BlockType] = set()
+    for child in block.get("loop_blocks", []) if isinstance(block, dict) else block.loop_blocks:
+        child_type = child.get("block_type") if isinstance(child, dict) else getattr(child, "block_type", None)
+        if child_type in _ENGINE_ONLY_LOOP_CHILD_TYPES:
+            found.add(BlockType(child_type))
+        found |= engine_only_loop_child_types(child)
+    return found
 
 
 def is_block_type_cacheable(block: Any) -> bool:
@@ -80,7 +84,8 @@ def is_block_type_cacheable(block: Any) -> bool:
     block with export enabled is excluded: the generated script's cached replay
     function only carries prompt/schema/url/model (see _build_extract_statement), so
     a cached run would silently skip the Parquet export while still reporting
-    success (SKY-15396).
+    success (SKY-15396). A loop holding an engine-only child (_ENGINE_ONLY_LOOP_CHILD_TYPES)
+    is excluded for the same reason: loop codegen emits every child in list order.
 
     Accepts either a Block model instance or its dict/model_dump form, matching the
     two shapes callers hold across script generation and workflow execution.
@@ -88,7 +93,7 @@ def is_block_type_cacheable(block: Any) -> bool:
     block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
     if block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED:
         return False
-    if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP} and _contains_engine_only_child(block):
+    if engine_only_loop_child_types(block):
         return False
     if block_type == BlockType.EXTRACTION:
         export_enabled = (

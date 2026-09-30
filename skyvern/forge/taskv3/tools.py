@@ -636,8 +636,8 @@ class _TypeaheadPick(NamedTuple):
     clicked: bool
     declared: bool
     note: str | None = None
-    # How many rows the widget DECLARED beyond the ones it rendered, so a refusal can tell "nothing on
-    # this list is it" from "nothing on the part of it we could read".
+    # How many rows the widget DECLARED beyond the ones it rendered (-1: its total is unknown), so a refusal
+    # can tell "nothing on this list is it" from "nothing on the part of it we could read".
     overflow: int = 0
     # Whether the commit surface already vouched for the chosen label BEFORE the pick click — such a
     # surface proves nothing about the commit and must not vouch for it downstream either.
@@ -792,6 +792,23 @@ def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
                 return None
     n = rows[0].get("n")
     return n if isinstance(n, int) else None
+
+
+def _rows_declare_more(rows: list[dict[str, Any]], *, partial: bool = False, count: int | None = None) -> bool:
+    # `partial` (the scroller runs past the rendered rows) is passed only for a single window's read; a
+    # walk that covered the scroller's whole extent has measured that itself and passes the rows it walked
+    # as `count`, since its `rows` are keyed by label.
+    return (
+        partial
+        or any(o.get("setsize_unknown") for o in rows)
+        or max((int(o.get("setsize") or 0) for o in rows), default=0) > (len(rows) if count is None else count)
+    )
+
+
+def _lead_clause(text: str) -> str:
+    # The leading clause the anchor-lead read compares, split the way its JS splits it.
+    norm = " ".join(text.split()).lower()
+    return re.split(r"\s*[,;|(]\s*|\s+[-\u2013\u2014]\s+", norm)[0].strip()
 
 
 def _prefix_tokens(s: str) -> list[str]:
@@ -2162,11 +2179,28 @@ _FIND_SUGGESTION_JS = (
     }
     return { count: n, options, declared: false };
   }
-  pool.sort((a, b) => b.score - a.score || a.h - b.h);
-  const best = pool[0];
+  // An empty-state row is never the winner: one the widget disables, or one that echoes the typed
+  // query back inside quotation marks ('No results for "x"'), which is how a list quotes the user's input.
+  const QUOTES = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e';
+  const typedNorm = String(args.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const emptyState = (n) => {
+    if (composedClosest(n, '[aria-disabled="true"]')) return true;
+    const t = (n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const at = typedNorm ? t.indexOf(typedNorm) : -1;
+    return at > 0 && QUOTES.includes(t[at - 1]) && QUOTES.includes(t[at + typedNorm.length] || '');
+  };
+  const live = pool.filter((c) => !emptyState(c.el));
+  // The exact row the widget will not take still names the answer, so no lesser row may stand in for it.
+  const barred = pool.find((c) => c.exactRow && emptyState(c.el));
+  if (barred && !live.some((c) => c.exactRow)) {
+    return { count: 1, options: [], declared: false, barredExact: (barred.el.innerText || '').trim().slice(0, 60) };
+  }
+  if (!live.length) return null;
+  live.sort((a, b) => b.score - a.score || a.h - b.h);
+  const best = live[0];
   // Two leading-clause matches for a short value ("No, ..." and "No - ...") with no exact row are
   // ambiguous: geometry must not decide an answer, so refuse and let the caller report the options.
-  if (exact !== null && !best.exactRow && pool.length > 1 && pool[1].score === best.score) return null;
+  if (exact !== null && !best.exactRow && live.length > 1 && live[1].score === best.score) return null;
   // Refuse to tag a multi-row CONTAINER even when it is the only match (its score came from different
   // rows' text combined, and clicking it would land on an arbitrary middle row). A real suggestion is a
   // single row: its visible child elements, if any, sit on one line (inline sub-parts), not stacked rows.
@@ -2441,45 +2475,6 @@ _FIND_CATEGORIES_JS = (
 }"""
 )
 
-# Tier-1 semantic commit read (SKY-15322): ONE shape-invariant probe consulted before the shape
-# heuristics below. Decisive-ACCEPT-only — it answers {committed: true} or {committed: false}
-# ("unknown"), never a decisive negative, so an unresolvable widget always falls to the heuristics
-# unchanged. Every accept rests on a signal the tool did NOT author: raw value equality is NOT one
-# (the tool typed the intended string itself, so it holds on every dead click — the equal-value
-# impostor pair proves no black-box read can split that case).
-# Tier-1 semantic commit read (SKY-15322): the narrowed solid core. ONE decisive-accept rule —
-# the value TRANSFORM on a real form control: the widget rewrote what the tool typed into the
-# intended value (raw equality is never evidence; the tool authored the typed string). Everything
-# else is unknown by contract and falls to the shape heuristics unchanged: native selects (their own
-# tool verifies by value; selection state alone carries no click causality), contenteditable anchors
-# (three review rounds showed their text state cannot carry commit causality — completion, previews
-# and blur-expansion are all indistinguishable from selection at the DOM level), and ARIA selection
-# state (four distinct false-accept shapes across temporal, wiring, polarity and cross-root
-# dimensions — retired to a later phase rather than guarded a fifth time).
-_SEMANTIC_COMMIT_STATE_JS = (
-    r"""(arg) => {"""
-    + _PIERCED_QUERY_JS
-    + r"""
-  const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
-  const want = nrm(arg.intended);
-  if (!want) return { committed: false };
-  let el = null;
-  try { el = pQS(arg.sel); } catch (e) { el = null; }
-  if (!el && arg.el && arg.el.isConnected) el = arg.el;
-  if (!el) return { committed: false };
-  if (el.tagName === 'SELECT') return { committed: false };
-  if (el.isContentEditable) return { committed: false };
-  // The typed baseline must have been READ from the element by the caller and is opt-in
-  // (typedTrusted !== true reads as untrusted), so a caller that forgets the key fails SAFE.
-  if (arg.typedTrusted !== true) return { committed: false };
-  const cur = el.value;
-  if (nrm(cur) === want && nrm(arg.typed) !== want) {
-    return { committed: true, via: 'value-transform', value: String(cur || '').trim() };
-  }
-  return { committed: false };
-}"""
-)
-
 # A field's own committed-value surface: React-Select / styled combobox widgets move a commit OUT of
 # the filter input into a single-value node or chip beside it (clearing the input), so reading el.value
 # misses it. Reads only once the widget reports closed (aria-expanded=false) — a still-open list
@@ -2492,12 +2487,17 @@ _SEMANTIC_COMMIT_STATE_JS = (
 # `ownCommittedSurface` is the display form (D1's short-surface read, observe/D3): one node's text or
 # aria, joined across several surfaces (multi-value chips) with ", ".
 _OWN_COMMITTED_SURFACE_FN_JS = r"""
-  const ownWidgetClosed = (el) => {
+  // `popupOpen`, when a caller passes it, lets a widget that exposes no aria-expanded at all read as
+  // closed once its own popup is gone.
+  const ownWidgetClosed = (el, popupOpen) => {
     const expandedEl = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
-    return (expandedEl ? expandedEl.getAttribute('aria-expanded') : null) === 'false';
+    const exp = expandedEl ? expandedEl.getAttribute('aria-expanded') : null;
+    if (exp === 'false') return true;
+    return exp == null && typeof popupOpen === 'function' && !popupOpen(el);
   };
-  const ownCommittedSurfaces = (el) => {
-    if (!ownWidgetClosed(el)) return [];
+  // `anyState` reads the nodes even while the list is open, for a baseline that may only over-count.
+  const ownCommittedSurfaces = (el, popupOpen, anyState) => {
+    if (!anyState && !ownWidgetClosed(el, popupOpen)) return [];
     const TRIGGER = "[role=combobox],[aria-haspopup=listbox],[aria-haspopup=menu],button[aria-expanded],input[role=combobox],select";
     const SURFACE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label'],[role=option][aria-selected=true],.chip,.pill,[class*='token']";
     const VALUE_NODE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label']";
@@ -2740,8 +2740,16 @@ _VERIFY_COMMIT_JS = (
     // container — a re-render that merely replaces row nodes strips the row tags but keeps the
     // container, and must not read as a commit; suggListOpen). Exact equality with the CHOSEN label only.
     if (!args.liveOffer && args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
-  } else if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) {
-    return cur;
+  } else if (cur) {
+    // The tool typed `typed` itself, so a value that is only that text back (whole, or with nothing beyond it
+    // that names the chosen row) counts only once the list closed, and a value relates to the pick through
+    // the chosen row, never through the typed query.
+    const fold = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
+    const c = fold(chosen), inner = fold(cur).slice(c.length + 2, -1);
+    const namesChosen = fold(cur) === c || (fold(cur).startsWith(c + ' (') && fold(cur).endsWith(')') && !!inner && !/[()]/.test(inner));
+    const echo = !!typed && (fold(cur) === fold(typed) || (fold(cur).includes(fold(typed)) && !namesChosen
+      && !overlaps(fold(cur).replace(fold(typed), ' '), chosen)));
+    if ((!echo || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen))) return cur;
   }
   const cont = el.closest('div,li,fieldset');
   if (cont) {
@@ -2752,13 +2760,15 @@ _VERIFY_COMMIT_JS = (
     for (const h of cont.querySelectorAll('input[type=hidden]')) {
       const v = (h.value || '').trim();
       if (!v || isOtherRow(v)) continue;
+      // A hidden copy of the typed query that was already there before the click is the tool's own text.
+      if (typed && preHidden.has(v) && (eqi(v, typed) || overlaps(v, typed))) continue;
       if (eqi(v, chosen)) return v;
       if (args.noSuggestionList) {
         const declaredHidden = Array.isArray(args.chosenValues) ? args.chosenValues : [];
         if ((overlaps(v, chosen) || declaredHidden.some((d) => eqi(d, v))) && !preHidden.has(v)) return v;
         continue;
       }
-      if (overlaps(v, chosen) || eqi(v, typed) || overlaps(v, typed)) return v;
+      if (overlaps(v, chosen)) return v;
     }
   }
   // React-Select / styled combobox: on commit the value moves OUT of the filter input into a
@@ -2888,6 +2898,255 @@ _OWN_FIELD_SCOPES_FN_JS = r"""
     return scopes;
   };
 """
+
+# The hidden-input values _VERIFY_COMMIT_JS would read for this field, in the same div/li/fieldset scope.
+_HIDDEN_VALUES_JS = (
+    "el => { const c = el.closest('div,li,fieldset'); if (!c) return []; "
+    "return Array.from(c.querySelectorAll('input[type=hidden]')).map((h) => (h.value || '').trim()).filter(Boolean); }"
+)
+
+# What the field ITSELF shows as committed, read only from sources it owns: its own label or
+# aria-labelledby text past the caption, a removable chip in its single-field container, its own anchor
+# text once its own popup is gone, or a painted value node. A neighbour's label, a row still offered in
+# a list, and the raw text of the field's own input never count. Returns the source name, or ''.
+_FIELD_OWN_STATE_FN_JS = r"""
+  const OFFER_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="option"],[role="menuitem"],[data-tv3-sugglist],[data-tv3-sugg],[data-tv3-menu]';
+  const ownNrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const ownPopupOpen = (el) => {
+    const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
+    if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
+    return fieldOwnPopup(el, true) !== null;
+  };
+  const offered = (n) => { try { return composedClosest(n, OFFER_SEL) !== null; } catch (e) { return true; } };
+  const textRuns = (root, el) => {
+    const runs = [];
+    const walk = (n, depth) => {
+      if (depth > 6) return;
+      for (const c of n.childNodes) {
+        if (runs.length > 8) return;
+        if (c.nodeType === 3) {
+          const t = ownNrm(c.nodeValue);
+          if (t) runs.push(t);
+          continue;
+        }
+        if (c.nodeType !== 1 || c === el) continue;
+        let skip = true;
+        try {
+          skip = c.matches('input,select,textarea,button,[role="button"],script,style,svg') || c.matches(OFFER_SEL) || !visible(c);
+        } catch (e) { skip = true; }
+        if (!skip) walk(c, depth + 1);
+      }
+    };
+    walk(root, 0);
+    return runs;
+  };
+  // The value a label shows is its LAST text run, after a caption that differs from it ("Country" / "Canada").
+  const ownLabelHolds = (el, want) => {
+    const labels = [];
+    try { for (const l of (el.labels || [])) labels.push(l); } catch (e) { /* not a labelable element */ }
+    const root = el.getRootNode();
+    for (const id of String(el.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+      let t = null;
+      try { t = id && root.getElementById ? root.getElementById(id) : null; } catch (e) { t = null; }
+      if (t && t !== el && !pContains(t, el) && labels.indexOf(t) === -1) labels.push(t);
+    }
+    for (const l of labels) {
+      if (offered(l) || !visible(l)) continue;
+      const runs = textRuns(l, el);
+      if (runs.length >= 2 && runs[runs.length - 1] === want && runs[0] !== want) return true;
+    }
+    return false;
+  };
+  // A chip is removable: it nests a control, or its name offers removal ("White Dismiss"). A button that
+  // merely names an option ("Choose Canada", a quick pick) is an offer, not a commit.
+  const CHIP_SEL = 'button,[role="button"],[class*="chip" i],[class*="pill" i],[class*="token" i],[class*="multi-value" i],[class*="multiValue" i]';
+  const REMOVAL_RE = /\b(?:remove|dismiss|delete|clear|deselect|unselect)\b|^[x\u00d7\u2715\u2716\u2a2f]$/;
+  // The chip's branch under the scope it shares with the field holds no caption of its own: a sibling
+  // group's chips sit under that group's caption ("Countries lived in"), which a field-less group cannot
+  // otherwise be told apart by.
+  const captionFree = (scope, c) => {
+    let branch = c;
+    while (branch && scopeUp(branch) !== scope) branch = scopeUp(branch);
+    if (!branch || branch.nodeType !== 1 || branch === c) return true;
+    const runs = [];
+    const walk = (n, depth) => {
+      if (depth > 6 || runs.length) return;
+      for (const k of n.childNodes) {
+        if (k.nodeType === 3) { if (ownNrm(k.nodeValue)) { runs.push(k); return; } continue; }
+        if (k.nodeType !== 1) continue;
+        let skip = true;
+        try { skip = k.matches(CHIP_SEL) || k.matches('script,style,svg') || !visible(k); } catch (e) { skip = true; }
+        if (!skip) walk(k, depth + 1);
+      }
+    };
+    walk(branch, 0);
+    return runs.length === 0;
+  };
+  const idRefs = (el, attr) => {
+    const root = el.getRootNode();
+    const out = [];
+    for (const id of String(el.getAttribute(attr) || '').split(/\s+/)) {
+      let t = null;
+      try { t = id && root.getElementById ? root.getElementById(id) : null; } catch (e) { t = null; }
+      if (t) out.push(t);
+    }
+    return out;
+  };
+  // Proof that a chip is the field's own: the field describes it through ARIA, or it shares the field's
+  // innermost container with nothing else there that carries text (other than the field's own label) and
+  // no labelled group between it and that container.
+  const chipProvablyOwned = (el, c) => {
+    if (idRefs(el, 'aria-describedby').some((t) => pContains(t, c))) return true;
+    const scope = ownFieldScopes(el).find((s) => pContains(s, c));
+    if (!scope) return false;
+    for (let n = scopeUp(c); n && n !== scope; n = scopeUp(n)) {
+      if (n.nodeType !== 1) continue;
+      if (n.tagName === 'FIELDSET' || n.hasAttribute('aria-label') || n.hasAttribute('aria-labelledby')) return false;
+    }
+    const own = idRefs(el, 'aria-labelledby');
+    try { for (const l of (el.labels || [])) own.push(l); } catch (e) { /* not a labelable element */ }
+    let text = false;
+    const walk = (n, depth) => {
+      if (depth > 8 || text) return;
+      for (const k of n.childNodes) {
+        if (k.nodeType === 3) { if (ownNrm(k.nodeValue)) { text = true; return; } continue; }
+        if (k.nodeType !== 1 || k === el) continue;
+        let skip = true;
+        try { skip = own.includes(k) || k.matches(CHIP_SEL) || k.matches('input,select,textarea,script,style,svg') || !visible(k); } catch (e) { skip = true; }
+        if (!skip) walk(k, depth + 1);
+      }
+    };
+    walk(scope, 0);
+    return !text;
+  };
+  // `strict` (the pre-act no-op) keeps only chips whose ownership is provable.
+  const ownChipLabels = (el, strict) => {
+    const found = [];
+    for (const scope of ownFieldScopes(el)) {
+      for (const c of scope.querySelectorAll(CHIP_SEL)) {
+        if (found.some((f) => f.node === c) || excludedFor(el, c) || offered(c) || !visible(c)) continue;
+        if (c.matches('[aria-selected],[aria-pressed],[aria-checked],[aria-expanded],[type="submit" i]')) continue;
+        const runs = textRuns(c, el);
+        if (!runs.length) continue;
+        const aria = ownNrm(c.getAttribute('aria-label'));
+        let removable = runs.slice(1).some((t) => REMOVAL_RE.test(t)) || (!!aria && aria !== runs[0] && REMOVAL_RE.test(aria));
+        try { removable = removable || c.querySelector('button,[role="button"]') !== null; } catch (e) { /* keep */ }
+        if (!removable || !captionFree(scope, c) || (strict && !chipProvablyOwned(el, c))) continue;
+        found.push({ node: c, label: runs.filter((t) => !REMOVAL_RE.test(t)).join(' ') });
+      }
+    }
+    return found.filter((f) => !found.some((o) => o !== f && f.node.contains(o.node))).map((f) => f.label);
+  };
+  const anchorHolds = (el, want, anyState) => {
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable) return false;
+    if (!anyState && ownPopupOpen(el)) return false;
+    if (textRuns(el, el).join(' ') === want) return true;
+    const head = ownNrm(el.getAttribute('aria-label')).split('|')[0];
+    return !!head && (head.includes(':') ? head.slice(head.indexOf(':') + 1).trim() : head) === want;
+  };
+  // An anchor may show only the committed row's leading clause ("Riverton" for "Riverton, North
+  // Province"). That counts only as a CHANGE from the anchor's own text before its list opened, and only
+  // when no other option the list showed shares that clause (`leadUnique`).
+  const anchorShowsLead = (el, want, pre) => {
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable || ownPopupOpen(el)) return false;
+    const lead = want.split(/\s*[,;|(]\s*|\s+[-\u2013\u2014]\s+/)[0].trim();
+    if (!lead || lead === want || ownNrm(el.textContent) === ownNrm(pre)) return false;
+    return textRuns(el, el).join(' ') === lead;
+  };
+  // Every source that shows `want`. `anyState` ignores whether the list is open: a pre-click baseline
+  // read that way can only over-count, which only withholds an accept.
+  const fieldOwnSources = (el, want, anyState) => {
+    const out = [];
+    if (!want) return out;
+    if (ownLabelHolds(el, want)) out.push('label');
+    if (ownChipLabels(el).includes(want)) out.push('chip');
+    if (anchorHolds(el, want, anyState)) out.push('anchor');
+    const surfaces = ownCommittedSurfaces(el, ownPopupOpen, anyState);
+    if (surfaces.some((s) => s.displayed && (ownNrm(s.text) === want || ownNrm(s.aria) === want))) out.push('value-node');
+    return out;
+  };
+"""
+
+# Tier-1 semantic commit read (SKY-15322), decisive-ACCEPT-only: {committed: true} or {committed: false}
+# ("unknown"), never a decisive negative, so an unresolvable widget falls to the shape heuristics
+# unchanged. It accepts on the field's own committed state (fieldOwnSources, after a click: only a source the
+# `baseline` read taken before the click did not show) or on a value TRANSFORM (the widget rewrote the text the
+# tool typed into the intended value); raw value equality is never evidence, since the tool authored the text.
+# Native selects and contenteditable anchors stay unknown (their state carries no click causality), and
+# ARIA selection state is never read: an offered row can carry it.
+_SEMANTIC_COMMIT_STATE_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _OWN_FIELD_SCOPES_FN_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + _FIELD_OWN_STATE_FN_JS
+    + r"""
+  const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = nrm(arg.intended);
+  let el = null;
+  try { el = pQS(arg.sel); } catch (e) { el = null; }
+  if (!el && arg.el && arg.el.isConnected) el = arg.el;
+  if (arg.snapshot === true) {
+    // The field's committed state as raw parts, for a caller that asks whether ANY of it changed:
+    // its own value, its container's hidden values, and its own aria-label and text (\u0001-joined).
+    if (!el) return null;
+    const hiddenValues = """
+    + _HIDDEN_VALUES_JS
+    + r""";
+    return [
+      el.isContentEditable ? (el.textContent || '') : (el.value || ''),
+      hiddenValues(el).join(', '),
+      nrm(el.getAttribute('aria-label')) + '\u0001' + nrm(el.textContent),
+    ];
+  }
+  if (arg.baseline === true) {
+    if (!el || !want) return null;
+    return fieldOwnSources(el, want, true);
+  }
+  if (!el || !want) return { committed: false };
+  if (el.tagName === 'SELECT') return { committed: false };
+  if (el.isContentEditable) return { committed: false };
+  // After a click, a source counts only when it did not already show the value before the click; an
+  // unread baseline withholds every source.
+  const preHeld = Array.isArray(arg.preHeld) ? arg.preHeld : null;
+  let via = '';
+  if (preHeld !== null) {
+    try { via = fieldOwnSources(el, want, false).find((s) => !preHeld.includes(s)) || ''; } catch (e) { via = ''; }
+  }
+  if (via) return { committed: true, via: via, value: String(arg.intended).trim() };
+  let lead = false;
+  try {
+    lead = typeof arg.preAnchor === 'string' && arg.leadUnique === true && anchorShowsLead(el, want, arg.preAnchor);
+  } catch (e) { lead = false; }
+  if (lead) return { committed: true, via: 'anchor-lead', value: String(arg.intended).trim() };
+  // The typed baseline must have been READ from the element by the caller and is opt-in
+  // (typedTrusted !== true reads as untrusted), so a caller that forgets the key fails SAFE.
+  if (arg.typedTrusted !== true) return { committed: false };
+  const cur = el.value;
+  if (nrm(cur) === want && nrm(arg.typed) !== want) {
+    return { committed: true, via: 'value-transform', value: String(cur || '').trim() };
+  }
+  return { committed: false };
+}"""
+)
+
+# The labels of the removable chips the field's own container holds; null when unreadable.
+_OWN_CHIPS_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _OWN_FIELD_SCOPES_FN_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + _FIELD_OWN_STATE_FN_JS
+    + r"""
+  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return null;
+  // A popup the field declares is its list, whatever its role; while it is on screen no chip counts as held.
+  if (arg.strict === true && declaredTargets(el).some((t) => !pContains(t, el) && visible(t))) return null;
+  return ownChipLabels(el, arg.strict === true);
+}"""
+)
 
 # Whether the field's own widget container shows `chosen` as a committed-selection surface: a pill /
 # selected-item row (its leading aria-label clause or leaf text IS the label), or a bare label node the
@@ -3200,12 +3459,6 @@ _MENU_ROW_VALUES_JS = (
   const row = pQS('[data-tv3-menu="' + n + '"]');
   return row ? declaredValues(row) : [];
 }"""
-)
-
-# The hidden-input values _VERIFY_COMMIT_JS would read for this field, in the same div/li/fieldset scope.
-_HIDDEN_VALUES_JS = (
-    "el => { const c = el.closest('div,li,fieldset'); if (!c) return []; "
-    "return Array.from(c.querySelectorAll('input[type=hidden]')).map((h) => (h.value || '').trim()).filter(Boolean); }"
 )
 
 # Why a reaction probe's answer about this selector may not carry a claim. `unprobeable` -- in-page
@@ -6852,21 +7105,7 @@ _MENU_SCROLLER_STEP_JS = (
 }"""
 )
 
-# Whether the anchor (or its nearest aria-expanded ancestor) currently reports an OPEN list. Used to
-# gate the "close a stray open list" Escape: sending Escape with no menu open would bubble to and close
-# a surrounding dialog, so we only send it once a menu is confirmed open.
-_MENU_OPEN_JS = (
-    r"""(arg) => {"""
-    + _PIERCED_QUERY_JS
-    + r"""
-  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
-  if (!el) return false;
-  const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
-  return !!(exp && exp.getAttribute('aria-expanded') === 'true');
-}"""
-)
-
-# Whether a DECLARED field's own list is still open: _MENU_OPEN_JS's aria-expanded check, OR the popup
+# Whether a DECLARED field's own list is still open: its aria-expanded=true, OR the popup
 # the field declares (fieldOwnPopup, from _ROW_SEMANTICS_JS) is still rendered. A widget that re-searches
 # on the value it just wrote back can leave rows on screen with aria-expanded never having flipped.
 _TYPEAHEAD_LIST_OPEN_JS = (
@@ -6879,6 +7118,37 @@ _TYPEAHEAD_LIST_OPEN_JS = (
   const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
   if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
   return !!fieldOwnPopup(el, true);
+}"""
+)
+
+# Whether the field's own list is KNOWN closed: aria-expanded="false" on the field or its owning combobox, or a
+# declared popup that exists and is not rendered. No declared state is unknown, never closed.
+_OWN_LIST_CLOSED_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  const el = (arg.sel ? pQS(arg.sel) : null) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el || fieldOwnPopup(el, true)) return false;
+  const owner = el.getAttribute('aria-expanded') != null ? el : composedClosest(el, '[role="combobox"][aria-expanded]');
+  if (owner) return owner.getAttribute('aria-expanded') === 'false';
+  const popups = declaredTargets(el).filter((t) => !pContains(t, el));
+  const shown = (t) => { const r = t.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  return popups.length > 0 && !popups.some(shown);
+}"""
+)
+
+# Whether the field declares its list's state: aria-expanded, a declared popup, or a declared popup id that
+# resolves to nothing (the list is unmounted). Without one, an open list reads the same as a closed one.
+_LIST_STATE_DECLARED_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  const el = (arg.sel ? pQS(arg.sel) : null) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return false;
+  const declares = !!(el.getAttribute('aria-controls') || el.getAttribute('aria-owns'));
+  return el.closest('[aria-expanded]') !== null || !!fieldOwnPopup(el, false) || (declares && !declaredTargets(el).length);
 }"""
 )
 
@@ -13611,7 +13881,15 @@ def build_browser_tools(
         return [str(t) for t in raw if isinstance(t, str)] if isinstance(raw, list) else None
 
     async def _semantic_commit_read(
-        page: Any, selector: str, intended: str, typed: str, *, typed_trusted: bool
+        page: Any,
+        selector: str,
+        intended: str,
+        typed: str,
+        *,
+        typed_trusted: bool,
+        pre_held: list[str] | None = None,
+        pre_anchor: str | None = None,
+        lead_unique: bool = False,
     ) -> str | None:
         # Decisive-accept-only: the committed value when the semantic probe proves the commit, else
         # None ("unknown") — the caller's shape heuristics run unchanged on None, so this tier can
@@ -13624,6 +13902,9 @@ def build_browser_tools(
                     "intended": intended,
                     "typed": typed,
                     "typedTrusted": typed_trusted,
+                    "preHeld": pre_held,
+                    "preAnchor": pre_anchor,
+                    "leadUnique": lead_unique,
                 },
             )
         except Exception:
@@ -13632,6 +13913,41 @@ def build_browser_tools(
             LOG.debug("taskv3 semantic commit accept", selector=selector, via=str(read.get("via") or ""))
             return str(read.get("value")).strip()
         return None
+
+    async def _field_already_holds(page: Any, selector: str, value: str) -> bool:
+        # Only a toggle field, one showing its values as removable chips that a re-click would remove, skips a
+        # held value, and only with its own list known closed; every other field acts and verifies the click.
+        if not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY:
+            return False
+        await input_dispatch.approach(page, selector)
+        try:
+            if not await page.evaluate(_OWN_LIST_CLOSED_JS, await _probe_arg(page, selector)):
+                return False
+        except Exception:
+            return False
+        chips = await _own_chip_labels(page, selector, strict=True)
+        return _exact_tier_key(value) in {_exact_tier_key(c) for c in chips or []}
+
+    async def _field_own_baseline(page: Any, selector: str, value: str) -> list[str] | None:
+        # Which of the field's own sources show `value` just before a click; None when unread.
+        try:
+            read = await page.evaluate(
+                _SEMANTIC_COMMIT_STATE_JS,
+                {**(await _probe_arg(page, selector)), "intended": value, "baseline": True},
+            )
+        except Exception:
+            return None
+        return [str(v) for v in read if isinstance(v, str)] if isinstance(read, list) else None
+
+    async def _own_chip_labels(page: Any, selector: str, strict: bool = False) -> list[str] | None:
+        try:
+            chips = await page.evaluate(_OWN_CHIPS_JS, {**(await _probe_arg(page, selector)), "strict": strict})
+        except Exception:
+            return None
+        return [str(c) for c in chips if isinstance(c, str)] if isinstance(chips, list) else None
+
+    async def _holds_own_chips(page: Any, selector: str) -> bool:
+        return bool(await _own_chip_labels(page, selector))
 
     async def _settled_commit_read(
         page: Any, selector: str, verify_args: dict[str, Any], chosen: str, pre_surface_hit: bool
@@ -13643,6 +13959,8 @@ def build_browser_tools(
         readable = False
         committed = ""
         counted = False
+        pre_held = verify_args.get("preHeld")
+        pre_anchor = verify_args.get("preAnchorClosed")
         for attempt in range(4):
             if attempt:
                 await asyncio.sleep(0.7)
@@ -13681,6 +13999,9 @@ def build_browser_tools(
                     chosen,
                     str(verify_args.get("typed") or ""),
                     typed_trusted=verify_args.get("typedTrusted") is True,
+                    pre_held=pre_held if isinstance(pre_held, list) else None,
+                    pre_anchor=pre_anchor.split("\u0001")[-1] if isinstance(pre_anchor, str) else None,
+                    lead_unique=verify_args.get("leadUnique") is True,
                 )
                 if semantic is not None:
                     if semantic_commit_stats is not None:
@@ -13887,8 +14208,8 @@ def build_browser_tools(
             # tagged. Where nothing declares one, the finder already reduced the reaction to a single
             # winner and there is nothing left to choose between — except under a reduced query, whose
             # rows answer a broader question than the caller asked. The 4th value is the declared
-            # aria-setsize when it exceeds the rendered row count (0 otherwise), reported in the refusal
-            # note so the model knows to name the option's full label rather than retry blindly.
+            # aria-setsize when it exceeds the rendered row count, -1 when the rows declare their total
+            # unknown, 0 otherwise; the refusal note reports it so the model names the full label.
             tagged = [o for o in (found.get("options") or []) if isinstance(o, dict) and isinstance(o.get("n"), int)]
             if not tagged:
                 return bool(found.get("declared")), [], None, 0
@@ -13901,7 +14222,9 @@ def build_browser_tools(
                 # the list would hide a genuinely truncated one.
                 declared_rendered = [o for o in rows if o.get("n") not in bare_ns]
                 declared_size = max((int(o.get("setsize") or 0) for o in declared_rendered), default=0)
-                overflow = declared_size if declared_rendered and declared_size > len(declared_rendered) else 0
+                overflow = 0
+                if _rows_declare_more(declared_rendered):
+                    overflow = declared_size if declared_size > len(declared_rendered) else -1
                 idx = _pick(rows)
                 if idx is None and overflow == 0:
                     # No exact-label winner over the complete rendered list — but "several rows" may be
@@ -13978,11 +14301,19 @@ def build_browser_tools(
             )
             if found is None:
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            barred = found.get("barredExact")
+            if isinstance(barred, str):
+                verdict = ToolResult.error(
+                    f"the exact option {_model_text(barred, 60)!r} in {selector}'s list is disabled, so it cannot be selected "
+                    "— the field is NOT filled; no other option was picked in its place"
+                )
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False, verdict=verdict)
             declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
             stamp = f'[data-tv3-sugg="{idx}"]'
         if idx is None:
+            declares = "its total unknown" if overflow < 0 else f"{overflow} rows"
             note = (
-                f"the list declares {overflow} rows and only {len(rows)} are rendered — type the option's full label"
+                f"the list declares {declares} and only {len(rows)} are rendered — type the option's full label"
                 if declared_rows and overflow
                 else None
             )
@@ -14017,6 +14348,7 @@ def build_browser_tools(
         pre_value = pre_value_read if pre_value_read is not None else value
         clicked = False
         pre_surface_hit = await _surface_confirms(page, selector, best_txt)
+        pre_held = await _field_own_baseline(page, selector, best_txt)
         try:
             await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "sugg", "n": idx})
         except Exception:
@@ -14050,6 +14382,7 @@ def build_browser_tools(
                         from_focus = bool(info.get("fromFocus"))
                         declared = [str(v) for v in (info.get("declared") or []) if isinstance(v, str)]
                         pre_surface_hit = await _surface_confirms(page, selector, best_txt)
+                        pre_held = await _field_own_baseline(page, selector, best_txt)
                         try:
                             await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "sugg", "n": idx})
                         except Exception:
@@ -14099,6 +14432,7 @@ def build_browser_tools(
                     if _exact_tier_key(text) != _exact_tier_key(best_txt)
                 ],
                 "nestedRows": _rows_nested_in(idx, rows),
+                "preHeld": pre_held,
             },
             best_txt,
             pre_surface_hit,
@@ -14422,7 +14756,9 @@ def build_browser_tools(
             # Only a field the click could not reach can misroute its keys, and only that path restores.
             # A checked click leaves the page untagged and pays nothing.
             collateral.extend(await _capture_collateral(page, selector))
-        await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
+        # Clearing an empty multi-value input sends Delete, which removes the field's last chip.
+        if not (pre_value == "" and await _holds_own_chips(page, selector)):
+            await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
         await input_dispatch.type_keys(
             page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed), secret=secret, replace=True
         )
@@ -15791,6 +16127,10 @@ def build_browser_tools(
             return _covered_error(exc.selector, exc.occluder)
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
+        if pick.verdict is not None:
+            # Nothing was picked either way, so the typed query comes back out and its list closes.
+            await _restore_pre_type_value(page, selector, pre_value, [text])
+            return pick.verdict
         if reach != "click":
             # focus() without a click cannot show the field took the keystrokes: a segmented control
             # may move the caret to a sibling segment or drop the keys. So only a read-back that holds
@@ -15974,7 +16314,13 @@ def build_browser_tools(
             return False
 
     async def _open_observe_pick(
-        page: Any, selector: str, value: str, *, close_open_menu: bool = False, search: str | None = None
+        page: Any,
+        selector: str,
+        value: str,
+        *,
+        close_open_menu: bool = False,
+        search: str | None = None,
+        pre_checked: bool = False,
     ) -> ToolResult:
         # Commit a click-to-open single-select in ONE call: open the list, enumerate the option rows the
         # click rendered (v3's own _FIND_MENU_JS tags them data-tv3-menu="N"), deterministically pick the
@@ -15983,14 +16329,16 @@ def build_browser_tools(
         # and a non-typeable button/div anchor both land here. When no deterministic match is found the
         # tool returns a truthful did-not-commit AND the observed options, so the model resolves a
         # genuinely unexpected widget by sight (look()/act-by-mark) — never a blind text-LLM guess.
+        if not pre_checked and await _field_already_holds(page, selector, value):
+            return _already_held_result(selector, value)
         if close_open_menu:
             # A prior keystroke attempt may have opened this widget's list; close it so the pre-snapshot
             # captures the CLOSED page and _FIND_MENU_JS counts only rows THIS open-click renders. Escape
-            # is sent ONLY once a menu is confirmed open (aria-expanded=true) — a stray Escape with nothing
-            # open would bubble to and close a surrounding dialog, discarding the form. If the widget does
-            # not expose aria-expanded, we skip Escape and let the reopen self-heal below handle a toggle.
+            # is sent ONLY once the field's own list is confirmed open (aria-expanded=true, or its declared
+            # popup rendered) — a stray Escape with nothing open would bubble to and close a surrounding
+            # dialog, discarding the form. An undeclared list is left to the reopen self-heal below.
             try:
-                menu_open = bool(await page.evaluate(_MENU_OPEN_JS, await _probe_arg(page, selector)))
+                menu_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector)))
             except Exception:
                 menu_open = False
             if menu_open:
@@ -15999,6 +16347,17 @@ def build_browser_tools(
                     await asyncio.sleep(0.1)
                 except Exception:
                     pass
+        # The anchor's text with its list closed: an open list can change it, so a baseline read later would
+        # let the anchor's return to its closed text pass for a commit.
+        pre_anchor_closed: str | None = None
+        try:
+            probe_closed = await _probe_arg(page, selector)
+            if await page.evaluate(_LIST_STATE_DECLARED_JS, probe_closed) and not await page.evaluate(
+                _TYPEAHEAD_LIST_OPEN_JS, probe_closed
+            ):
+                pre_anchor_closed = str(await page.evaluate(_ANCHOR_SURFACE_JS, probe_closed) or "")
+        except Exception:
+            pre_anchor_closed = None
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
             await input_dispatch.approach(page, selector)
@@ -16126,12 +16485,13 @@ def build_browser_tools(
             )
 
         walked_twins = False
+        walked_twin_rows = 0
         walk_complete = False
         walk_unproven: dict[str, Any] | None = None
         walk_seen: list[dict[str, Any]] = []
 
         async def _scroll_search_menu_option() -> tuple[int | None, str | None, list[dict[str, Any]], bool]:
-            nonlocal walked_twins, walk_complete, walk_unproven, walk_seen
+            nonlocal walked_twins, walked_twin_rows, walk_complete, walk_unproven, walk_seen
             unproven: str | None = None
             # A virtualised listbox only ever holds a window of rows in the DOM, so `value` may sit
             # outside what we already read. Drive the scroller `_FIND_MENU_JS` tagged, re-enumerating
@@ -16229,14 +16589,14 @@ def build_browser_tools(
                 hit = _match_menu_option(value, [{"n": k, "text": t} for k, t in enumerate(texts)])
                 return texts[hit] if hit is not None else None
 
-            def _walked_rows() -> int:
+            def _rows_of(key: str) -> int:
                 # Rows, not labels: a label seen at tops more than 3px apart is that many rows.
-                total = 0
-                for key in {_exact_tier_key(t) for t in seen}:
-                    ps = sorted(seen_pos.get(key, []))
-                    at = 1 + sum(1 for a, b in zip(ps, ps[1:]) if b - a > 3) if ps else 1
-                    total += max(at, sum(1 for t in seen if _exact_tier_key(t) == key))
-                return total
+                ps = sorted(seen_pos.get(key, []))
+                at = 1 + sum(1 for a, b in zip(ps, ps[1:]) if b - a > 3) if ps else 1
+                return max(at, sum(1 for t in seen if _exact_tier_key(t) == key))
+
+            def _walked_rows() -> int:
+                return sum(_rows_of(key) for key in {_exact_tier_key(t) for t in seen})
 
             def _row_n(current: list[dict[str, Any]], text: str) -> int | None:
                 fresh = next((o for o in current if str(o.get("text") or "") == text and not o.get("nav")), None)
@@ -16332,10 +16692,16 @@ def build_browser_tools(
             # the exact row a prefix hit stands in for, may sit in what was not seen.
             covered = reached_end and _rows_cover_extent()
             walked_twins = want in ambiguous
-            declared = max((int(o.get("setsize") or 0) for o in seen.values()), default=0)
+            walked_twin_rows = _rows_of(want) if walked_twins else 0
             # A text-less option still counts against the declared size (it may be a placeholder whose row is still
             # loading); only a declared separator is filler, and it counts neither there nor as a gap in the extent.
-            walk_complete = covered and not size_unknown and not unknown_seen and declared <= _walked_rows()
+            walk_complete = (
+                covered
+                and not size_unknown
+                and not unknown_seen
+                and not _rows_declare_more(list(seen.values()), count=_walked_rows())
+            )
+            walk_seen = [o for o in seen.values() if not o.get("nav")]
             named = _value_contenders(value, [t for t, o in seen.items() if not o.get("nav")])
             for text in (hit_text, deferred if _match_seen() == deferred else None):
                 if text is None:
@@ -16377,7 +16743,6 @@ def build_browser_tools(
             # A walk that reached the end but left gaps is reported as cut short: its rows are not the
             # whole list, so the definitive no-match/ambiguity verdicts do not apply.
             definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else _rows_cover_extent())
-            walk_seen = [o for o in seen.values() if not o.get("nav")]
             return None, None, (list(seen.values()) if definitive else current), definitive
 
         # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
@@ -16454,26 +16819,16 @@ def build_browser_tools(
                 )
 
             async def _committed() -> list[str | None]:
-                # The field's own value, its container's hidden values and its label, each None when unread.
-                probe = await _probe_arg(page, selector)
-                state: list[str | None] = []
+                # The field's own value, its container's hidden values, its aria-label and text; None when unread.
                 try:
-                    own = await page.eval_on_selector(
-                        selector, "el => (el.isContentEditable ? (el.textContent || '') : (el.value || ''))"
+                    read = await page.evaluate(
+                        _SEMANTIC_COMMIT_STATE_JS, {**(await _probe_arg(page, selector)), "snapshot": True}
                     )
-                    state.append(str(own or ""))
                 except Exception:
-                    state.append(None)
-                try:
-                    hidden = await page.eval_on_selector(selector, _HIDDEN_VALUES_JS)
-                    state.append(", ".join(str(v) for v in hidden) if isinstance(hidden, list) else None)
-                except Exception:
-                    state.append(None)
-                try:
-                    state.append(str(await page.evaluate(_ANCHOR_SURFACE_JS, probe) or ""))
-                except Exception:
-                    state.append(None)
-                return state
+                    read = None
+                if not isinstance(read, list) or len(read) != 3:
+                    return [None, None, None]
+                return [part if isinstance(part, str) else None for part in read]
 
             before = await _committed()
 
@@ -16519,10 +16874,8 @@ def build_browser_tools(
                 read_now = [o for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int)]
                 # Same completeness signals as the unfiltered read: a declared aria-setsize past the rows, or a
                 # scroller whose extent runs past them. `_commit_gate` commits no row from an incomplete read.
-                complete = (
-                    max((int(o.get("setsize") or 0) for o in read_now), default=0) <= len(read_now)
-                    and not any(o.get("setsize_unknown") for o in read_now)
-                    and not (isinstance(tagged, dict) and tagged.get("partial"))
+                complete = not _rows_declare_more(
+                    read_now, partial=isinstance(tagged, dict) and bool(tagged.get("partial"))
                 )
                 fresh = int(tagged.get("fresh") or 0) if isinstance(tagged, dict) else 0
                 return sorted((o for o in read_now if not o.get("nav")), key=_n_order), complete, fresh
@@ -16694,12 +17047,14 @@ def build_browser_tools(
         # Only two visible rows that ARE the value make the filter pointless; a longer row that merely starts
         # with it says nothing about whether the exact one sits past the window.
         exact_twins = walked_twins or sum(1 for t in contenders if _exact_tier_key(t) == want_key) >= 2
+        filtered_pick = False
         if idx is None and not walk_complete and not exact_twins:
             popup_pick = await _popup_filter_pick()
             if isinstance(popup_pick, ToolResult):
                 return popup_pick
             if popup_pick is not None:
                 idx, options = popup_pick
+                filtered_pick = True
         if idx is None:
             # Match over the FULL list above, but bound the error PAYLOAD: enumerate at most 15 rows,
             # each ≤60 chars, so a miss on a 250-option country list does not ship a 15KB tool message.
@@ -16707,7 +17062,15 @@ def build_browser_tools(
             if walk_unproven is not None and len(contenders) < 2 and not exact_twins:
                 return _unproven_row_error(value, selector, str(walk_unproven["why"]), walk_unproven)
             if scanned_all:
-                if len(contenders) >= 2 or exact_twins or (contenders and walk_complete):
+                if exact_twins:
+                    shared = next((t for t in contenders if _exact_tier_key(t) == want_key), value)
+                    n_twins = max(2, walked_twin_rows, sum(1 for t in contenders if _exact_tier_key(t) == want_key))
+                    return ToolResult.error(
+                        f"{value!r} is ambiguous in {selector}'s list — {n_twins} options share the exact label "
+                        f"{_model_text(shared, 60)!r}; the field is NOT filled — look() at the list and click the right one by "
+                        'its [data-tv3-menu="N"] selector'
+                    )
+                if len(contenders) >= 2 or (contenders and walk_complete):
                     return _ambiguous_error()
                 if contenders:
                     only = _model_text(contenders[0], 60)
@@ -16813,7 +17176,7 @@ def build_browser_tools(
             # that multi-selects, declared or not. Leave it; close the list the way the widget closes
             # itself.
             try:
-                if await page.evaluate(_MENU_OPEN_JS, probe):
+                if await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, probe):
                     await input_dispatch.press(_current_page(), None, "Escape")
             except Exception:
                 pass
@@ -16826,6 +17189,14 @@ def build_browser_tools(
         except Exception:
             chosen_values = []
         pre_surface_hit = await _surface_confirms(page, selector, matched)
+        pre_held = await _field_own_baseline(page, selector, matched)
+        # A leading clause names the row only when the whole list was read and no other row shares it.
+        lead = _lead_clause(matched)
+        lead_unique = (
+            not filtered_pick
+            and (not overflowed or walk_complete)
+            and sum(1 for o in evidence_rows if _lead_clause(str(o.get("text") or "")) == lead) == 1
+        )
         try:
             await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "menu", "n": idx})
         except Exception:
@@ -16851,6 +17222,9 @@ def build_browser_tools(
                 "typedTrusted": typed_trusted,
                 "preHidden": pre_hidden,
                 "preSurface": pre_surface,
+                "preHeld": pre_held,
+                "preAnchorClosed": pre_anchor_closed,
+                "leadUnique": lead_unique,
             },
             matched,
             pre_surface_hit,
@@ -16872,6 +17246,9 @@ def build_browser_tools(
                 )
             return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
         return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
+
+    def _already_held_result(selector: str, value: str) -> ToolResult:
+        return ToolResult.ok(f"{value!r} was already selected for {selector}; left it as is")
 
     def _surface_holds(matched: str, surface: str, value: str) -> bool:
         def norm(t: str) -> str:
@@ -16979,6 +17356,9 @@ def build_browser_tools(
                 return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
             return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
 
+        if await _field_already_holds(page, selector, value):
+            return _already_held_result(selector, value)
+
         if live_offer is not None:
             live_pick = await _commit_typeahead(
                 page, selector, value, rounds=0, pre_own=await _own_surface_text(page, selector), live_offer=live_offer
@@ -17051,6 +17431,9 @@ def build_browser_tools(
                 rung_pick = await _commit_typeahead(
                     page, selector, value, rounds=4, exact_only=True, probe=rung, pre_own=pre_own
                 )
+                if rung_pick.verdict is not None:
+                    await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                    return rung_pick.verdict
                 if rung_pick.suggestion is not None:
                     return await _typeahead_verdict_result(
                         rung_pick.suggestion,
@@ -17298,7 +17681,9 @@ def build_browser_tools(
                         data={"release_own_list": True},
                     )
                 # The focus-click of the type attempt may have opened this widget's list, so close it first.
-                opened = await _open_observe_pick(page, selector, value, close_open_menu=True, search=search)
+                opened = await _open_observe_pick(
+                    page, selector, value, close_open_menu=True, search=search, pre_checked=True
+                )
                 if restore_on_refusal and opened.status != "ok":
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                 return opened
@@ -17326,7 +17711,7 @@ def build_browser_tools(
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
             return verdict
         # A non-typeable anchor (a button/div that only opens a list on click): open, observe, pick.
-        return await _open_observe_pick(page, selector, value, search=search)
+        return await _open_observe_pick(page, selector, value, search=search, pre_checked=True)
 
     async def select_option(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
