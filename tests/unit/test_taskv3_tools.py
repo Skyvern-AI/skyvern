@@ -12676,14 +12676,12 @@ _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
 @pytest.mark.parametrize(
     "template", [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML], ids=["unclickable", "skinned-subpixel"]
 )
-@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
 async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(
-    misroute: str, text: str, template: str, coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
+    misroute: str, text: str, template: str
 ) -> None:
-    # Reaching the field by focus() alone, or by a press no hit test checked, proves nothing about the
-    # keystrokes. A success here would turn today's loud failure into a date that reads as filled and is not.
+    # Reaching the field by focus() alone proves nothing about the keystrokes. A success here would turn
+    # today's loud failure into a date that reads as filled and is not.
     # A raised error is the loud outcome too: the tool wrapper turns it into a tool error.
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
     html = template + f"<script>{misroute}</script>"
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -12693,9 +12691,9 @@ async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_
             assert "outside of the viewport" in str(exc), exc
         else:
             assert r.status == "error", r.content
-            if coordinate_click and text != text.strip() and template is _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML:
-                # Only the on-screen sub-pixel field is pressed. That path Tabs out, so the widget has
-                # committed its trimmed value: it is reported and left in place, not taken back.
+            if text != text.strip():
+                # The focus path Tabs out, so the widget has committed its trimmed value: it is reported
+                # and left in place, not taken back.
                 assert "holds '2023'" in r.content, r.content
                 assert await page.eval_on_selector("#year", "el => el.value") == "2023"
                 return
@@ -13795,13 +13793,11 @@ _ECHO_SCRIPT = (
         "skinned-subpixel-declared-slow-rows",
     ],
 )
-@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
 async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as_filled(
-    template: str, aria: str, delay_ms: int, echo: str, coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
+    template: str, aria: str, delay_ms: int, echo: str
 ) -> None:
     # A field that DECLARES a list is refused before it is focused, so the page must be untouched:
     # asserting only the verdict cannot tell that guard from a later one reaching the same answer.
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
     declares = bool(aria)
     async with _content_page(template.format(aria=aria, delay_ms=delay_ms, echo=echo)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -13879,35 +13875,79 @@ _SEGMENTED_DATE_TRUSTED_PRESS_HTML = """
 
 @_skip_no_browser
 @pytest.mark.asyncio
-@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
-async def test_type_fills_a_segment_that_takes_keys_only_after_a_trusted_press(
-    coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
+async def test_type_reports_a_segment_that_takes_keys_only_after_a_trusted_press_as_not_filled() -> None:
+    # No path presses the pointer, so the digits show in the display and the field stays empty: honestly refused.
     async with _content_page(_SEGMENTED_DATE_TRUSTED_PRESS_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
-        if not coordinate_click:
-            # focus() alone: the digits show in the display and the field stays empty, so it is refused.
-            assert r.status == "error", r.content
-            assert "NOT filled" in r.content, r.content
-            assert await page.eval_on_selector("#year", "el => el.value") == ""
-            return
+        assert r.status == "error", r.content
+        assert "NOT filled" in r.content, r.content
+        assert await page.eval_on_selector("#year", "el => el.value") == ""
+        assert await page.eval_on_selector("#month", "el => el.value") == ""
+
+
+# The same widget with its keys accepted on focus alone: the input fills, and the widget commits on blur.
+_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
+    "let armed = false;", "let armed = true;"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_tabs_out_of_a_focused_segment_so_the_widget_commits_it() -> None:
+    async with _content_page(_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
         assert r.status == "ok", r.content
-        assert await page.eval_on_selector("#year", "el => el.value") == "2023"
         assert await page.evaluate("() => window.__committedYear") == "2023"
         assert await page.eval_on_selector("#month", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reads_nothing_back_when_the_navigation_check_cannot_be_planted() -> None:
+    # The sentinel refuses to be set once the field holds focus, so whether the Tab navigated is unknown.
+    blocker = (
+        "<script>let v; Object.defineProperty(window, '__tv3_doc', {configurable: true, get() { return v; },"
+        " set(x) { if (document.activeElement && document.activeElement.id === 'year') throw new Error('no');"
+        " v = x; }});</script>"
+    )
+    async with _content_page(_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML + blocker) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "error", r.content
+        assert "could not be checked" in r.content, r.content
+
+
+# The year's first key also lands in the month, as the production section widget does when the month is
+# filled before the year.
+_SEGMENTED_DATE_FIRST_DIGIT_BLEED_HTML = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+    "year.value += e.key;",
+    'if (!year.value) { const m = document.getElementById("month"); m.value = e.key; } year.value += e.key;',
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_never_reports_a_clean_fill_when_a_sibling_segment_took_a_key() -> None:
+    async with _content_page(_SEGMENTED_DATE_FIRST_DIGIT_BLEED_HTML) as page:
+        await page.eval_on_selector("#month", "el => { el.value = '03'; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        assert "1 other field(s) in the same group changed" in r.content, r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "2"
 
 
 _COMMIT_ON_BLUR = 'year.addEventListener("blur", () => { window.__committedYear = year.value; });'
 
 
 def _segment_reformatting_on_blur(reformat: str) -> str:
-    html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
+    html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
         _COMMIT_ON_BLUR,
         'year.addEventListener("blur", () => { ' + reformat + " window.__committedYear = year.value; });",
     )
-    assert html != _SEGMENTED_DATE_TRUSTED_PRESS_HTML
+    assert html != _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML
     return html
 
 
@@ -13927,9 +13967,8 @@ def _segment_reformatting_on_blur(reformat: str) -> str:
     ids=["zero-pad", "century", "clamp", "unrelated", "trim"],
 )
 async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_text(
-    reformat: str, typed: str, held: str, monkeypatch: pytest.MonkeyPatch
+    reformat: str, typed: str, held: str
 ) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
     async with _content_page(_segment_reformatting_on_blur(reformat)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": typed})
@@ -13943,8 +13982,7 @@ async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_t
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("secret", ["typed-credential", "one-time-code-box"])
-async def test_type_does_not_echo_a_changed_value_it_may_not_show(secret: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
+async def test_type_does_not_echo_a_changed_value_it_may_not_show(secret: str) -> None:
     html = _segment_reformatting_on_blur('year.value = year.value + "9";')
     text = "4417"
     resolve = None
@@ -14071,13 +14109,13 @@ async def test_type_stops_when_the_forced_click_navigates_away() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_type_stops_when_leaving_the_focused_segment_navigates_away() -> None:
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
-    start_html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
-        "if (e.isTrusted) armed = true;", 'if (e.isTrusted) location.href = "/elsewhere";'
+    start_html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+        _COMMIT_ON_BLUR, 'year.addEventListener("blur", () => { location.href = "/elsewhere"; });'
     )
+    assert start_html != _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         try:
@@ -14093,12 +14131,12 @@ async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: 
             await page.route("**/*", _serve)
             await page.goto("http://segment.test/start")
             tools = build_browser_tools(_fixed_page_provider(page))
-            try:
-                r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
-            except Exception as exc:
-                assert "outside of the viewport" in str(exc), exc
-            else:
-                assert r.status == "error", r.content
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            assert r.status == "error", r.content
+            assert "navigated, or could not be checked, when focus" in r.content, r.content
+            assert (r.data or {}).get("page_state_changed") is True, r.data
+            # Nothing may act on the destination: a list cleanup there would press Escape on a page nobody observed.
+            assert not (r.data or {}).get("release_own_list"), r.data
             assert page.url.endswith("/elsewhere"), page.url
             assert await page.eval_on_selector("#year", "el => el.value") == ""
         finally:
@@ -14109,16 +14147,12 @@ async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("origin", ["same", "cross"])
 @pytest.mark.parametrize("placement", ["inside", "clipped"])
-async def test_type_presses_a_framed_segment_only_where_its_frame_shows_it(
-    origin: str, placement: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The press is a main-page mouse event, so it must land in frame-offset coordinates. A field the frame
-    # clips (fixed below the frame's 120px height) has its centre over the parent page, where a
-    # page-wide decoy would take the press instead.
+async def test_type_never_presses_the_parent_page_over_a_framed_segment(origin: str, placement: str) -> None:
+    # A field the frame clips (fixed below the frame's 120px height) has its centre over the parent page,
+    # where a page-wide decoy would take any pointer press. Focus reaches the field without one.
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
-    frame_html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML
+    frame_html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML
     decoy = ""
     if placement == "clipped":
         frame_html = frame_html.replace(
@@ -14149,14 +14183,10 @@ async def test_type_presses_a_framed_segment_only_where_its_frame_shows_it(
             await frame.wait_for_selector("#year", state="attached")
             tools = build_browser_tools(_fixed_page_provider(page))
             r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
-            if placement == "inside":
-                assert r.status == "ok", r.content
-                assert await frame.evaluate("() => window.__committedYear") == "2023"
-                return
             assert await page.evaluate("() => window.__decoyPressed") is None
-            assert r.status == "error", r.content
-            assert "could only be focused, not clicked" in r.content, r.content
-            assert await frame.eval_on_selector("#year", "el => el.value") == ""
+            # Pins today's base path: it types into a framed field even where the parent page covers it.
+            assert r.status == "ok", r.content
+            assert await frame.evaluate("() => window.__committedYear") == "2023"
         finally:
             await browser.close()
 

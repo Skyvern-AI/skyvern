@@ -35,10 +35,10 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
+    _model_call_telemetry_scope,
     current_model_attempt_telemetry,
     current_model_call_telemetry,
     model_attempt_telemetry_scope,
-    model_call_telemetry_scope,
 )
 from skyvern.forge.sdk.copilot.pending_operation import (
     _turn_operations,
@@ -581,9 +581,9 @@ def test_chat_stop_metadata_captures_direct_refusal() -> None:
 
 def test_attempt_telemetry_keeps_only_the_latest_model_call() -> None:
     with model_attempt_telemetry_scope() as attempt:
-        with model_call_telemetry_scope(1) as first:
+        with _model_call_telemetry_scope(1) as first:
             first.finish_reason = "length"
-        with model_call_telemetry_scope(2) as second:
+        with _model_call_telemetry_scope(2) as second:
             second.finish_reason = "content_filter"
             second.content_filter = True
 
@@ -597,7 +597,7 @@ async def test_concurrent_attempt_stop_metadata_is_isolated() -> None:
     release = asyncio.Event()
 
     async def observe(index: int, reason: str) -> tuple[int, str | None]:
-        with model_attempt_telemetry_scope() as attempt, model_call_telemetry_scope(index) as call:
+        with model_attempt_telemetry_scope() as attempt, _model_call_telemetry_scope(index) as call:
             call.finish_reason = reason
             await release.wait()
         return attempt.latest_stop_metadata.model_call_index, attempt.latest_stop_metadata.finish_reason
@@ -623,9 +623,9 @@ async def test_model_error_resets_context(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_nested_model_call_scopes_restore_outer_call() -> None:
-    with model_call_telemetry_scope(1) as outer:
+    with _model_call_telemetry_scope(1) as outer:
         assert current_model_call_telemetry() is outer
-        with model_call_telemetry_scope(2) as inner:
+        with _model_call_telemetry_scope(2) as inner:
             assert current_model_call_telemetry() is inner
         assert current_model_call_telemetry() is outer
 
@@ -697,7 +697,7 @@ def test_completed_model_call_emits_datadog_usage_with_explicit_zeroes(
     )
     monkeypatch.setattr(model_telemetry_module, "_model_call_cost", lambda telemetry, model: 0.125)
 
-    with model_call_telemetry_scope(3, model="gpt-5.6-sol") as telemetry:
+    with _model_call_telemetry_scope(3, model="gpt-5.6-sol") as telemetry:
         telemetry.cache_mode = "explicit"
         telemetry.cache_breakpoint_count = 1
         telemetry.cache_stable_prefix_chars = 118_024
@@ -739,7 +739,7 @@ def test_datadog_usage_preserves_missing_cache_write_as_absent(
     )
     monkeypatch.setattr(model_telemetry_module, "_model_call_cost", lambda telemetry, model: None)
 
-    with model_call_telemetry_scope(
+    with _model_call_telemetry_scope(
         4,
         model="azure/gpt-5.6-sol",
         base_url="https://example.openai.azure.com",
@@ -770,7 +770,7 @@ def test_datadog_usage_attributes_fallback_spend_to_response_model(
         lambda telemetry, model: priced_models.append(model) or 0.25,
     )
 
-    with model_call_telemetry_scope(
+    with _model_call_telemetry_scope(
         5,
         model="azure/gpt-5.6-sol",
         base_url="https://example.openai.azure.com",
@@ -798,7 +798,7 @@ async def test_datadog_usage_names_the_provider_that_served_an_in_call_fallback(
     async def served_by_openai() -> AsyncIterator[ModelResponseStream]:
         yield chunk
 
-    with model_call_telemetry_scope(
+    with _model_call_telemetry_scope(
         6,
         model="azure/gpt-5.6-terra",
         base_url="https://example.openai.azure.com",
@@ -821,7 +821,7 @@ def test_model_call_without_provider_usage_does_not_emit_datadog_event(
         lambda *args, **kwargs: events.append((args, kwargs)),
     )
 
-    with model_call_telemetry_scope(5, model="gpt-5.6-sol"):
+    with _model_call_telemetry_scope(5, model="gpt-5.6-sol"):
         pass
 
     assert events == []
@@ -835,7 +835,7 @@ def test_datadog_logging_failure_does_not_escape_or_leak_context(
 
     monkeypatch.setattr(model_telemetry_module.LOG, "info", fail_to_log)
 
-    with model_call_telemetry_scope(6, model="gpt-5.6-sol") as telemetry:
+    with _model_call_telemetry_scope(6, model="gpt-5.6-sol") as telemetry:
         telemetry.input_tokens = 100
         telemetry.output_tokens = 5
 
@@ -949,7 +949,7 @@ def test_otel_provider_name_rejects_lookalike_azure_urls(base_url: str) -> None:
 def test_model_call_scope_names_the_open_operation_and_retires_it_on_exit() -> None:
     install_pending_operation_slot()
 
-    with model_call_telemetry_scope(0, model="gpt-5.6-sol"):
+    with _model_call_telemetry_scope(0, model="gpt-5.6-sol"):
         while_open = pending_operation_fields()
 
     after_exit = pending_operation_fields()

@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote, urlparse
 
 import pytest
+from agents.mcp.util import MCPUtil
+from agents.tool_context import ToolContext
 from fastmcp import FastMCP
 from mcp.types import CallToolResult
 from playwright.async_api import Route
@@ -37,6 +39,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _transform_args,
     resolve_browser_session_binding,
 )
+from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
@@ -3681,3 +3684,37 @@ class TestPageStateOnBrowserResults:
 
         assert result.isError is True
         assert "redaction_withheld" in result.content[0].text and "timed out" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    name = "get_block_schema"
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name]},
+        allowlist=frozenset({aliases[name]}),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        advertised = await server.list_tools()
+        assert [tool.name for tool in advertised] == [name]
+        schema = advertised[0].inputSchema
+        assert "user_facing_reason" in schema["properties"]
+        assert "user_facing_reason" not in schema.get("required", [])
+        tool = MCPUtil.to_function_tool(advertised[0], server, convert_schemas_to_strict=False)
+        assert serialize_tool_surface([tool]).payload["tools"][0]["params_json_schema"] == schema
+        tc = ToolContext(context=ctx, tool_name=name, tool_call_id="schema-call", tool_arguments="{}")
+        for reason in (None, "", "   ", 17, {"bad": True}, "I will inspect the code block options."):
+            result = await tool.on_invoke_tool(tc, json.dumps({"block_type": "code", "user_facing_reason": reason}))
+            assert "input validation error" not in str(result).lower()
+            assert "code" in str(result)
+        original = _transform_args(
+            {"block_type": "code", "user_facing_reason": "Explain"}, _build_skyvern_mcp_overlays()[name]
+        )
+        assert original == {"block_type": "code"}
+    finally:
+        await server.cleanup()

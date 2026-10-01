@@ -82,7 +82,6 @@ from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
@@ -188,7 +187,6 @@ async def _run_execute_task_v3(
         # runs before any loop_raises, even when the loop goes on to raise).
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
-        loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
@@ -305,32 +303,6 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_buckets_the_type_coordinate_click_arm_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Bucketing by block (task_id) would give one workflow run several draws and inflate exposure.
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", False)
-    provider = AsyncMock(return_value="treatment")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_type_coordinate_click_reach",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id != task.task_id
-    assert loop_mock.type_coordinate_click_enabled_during_loop is True
-    assert loop_mock.context.run_arms[TYPE_COORDINATE_CLICK_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        TYPE_COORDINATE_CLICK_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import ModuleType
 from typing import Any
 from unittest.mock import MagicMock
@@ -9,22 +10,48 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.api.llm.api_handler_factory import _enrich_llm_span
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.routes.workflow_copilot import bind_copilot_session_id
+from skyvern.forge.sdk.forge_log import redact_registered_log_payload
+from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChat
 
 
 class TestBindCopilotSessionId:
+    def test_only_resolved_chat_rows_establish_log_provenance(self) -> None:
+        chat = WorkflowCopilotChat(
+            workflow_copilot_chat_id="wcc_580123909436827407502",
+            organization_id="o_example",
+            workflow_permanent_id="wpid_example",
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+        context = SkyvernContext(copilot_session_id="outer", runtime_secret_values={"123"})
+        with skyvern_context.scoped(context):
+            with _bind_copilot_session_id(chat):
+                _, resolved = redact_registered_log_payload(
+                    "diagnostic", {"copilot_session_id": context.copilot_session_id}
+                )
+                with _bind_copilot_session_id(chat.workflow_copilot_chat_id):
+                    _, supplied = redact_registered_log_payload(
+                        "diagnostic", {"copilot_session_id": context.copilot_session_id}
+                    )
+                assert context.copilot_session_id == chat.workflow_copilot_chat_id
+            assert context.copilot_session_id == "outer"
+        assert resolved["copilot_session_id"] == chat.workflow_copilot_chat_id
+        assert REDACTED_SECRET_PLACEHOLDER in supplied["copilot_session_id"]
+
     def test_sets_id_during_scope_when_ambient_context_present(self) -> None:
         with skyvern_context.scoped(SkyvernContext(copilot_session_id=None)):
-            with bind_copilot_session_id("chat_xyz"):
+            with _bind_copilot_session_id("chat_xyz"):
                 ctx = skyvern_context.current()
                 assert ctx is not None
                 assert ctx.copilot_session_id == "chat_xyz"
 
     def test_restores_prior_value_on_normal_exit(self) -> None:
         with skyvern_context.scoped(SkyvernContext(copilot_session_id="outer")):
-            with bind_copilot_session_id("inner"):
+            with _bind_copilot_session_id("inner"):
                 assert skyvern_context.current().copilot_session_id == "inner"  # type: ignore[union-attr]
             assert skyvern_context.current().copilot_session_id == "outer"  # type: ignore[union-attr]
 
@@ -34,13 +61,13 @@ class TestBindCopilotSessionId:
 
         with skyvern_context.scoped(SkyvernContext(copilot_session_id="outer")):
             with pytest.raises(_Boom):
-                with bind_copilot_session_id("inner"):
+                with _bind_copilot_session_id("inner"):
                     raise _Boom("body raised")
             assert skyvern_context.current().copilot_session_id == "outer"  # type: ignore[union-attr]
 
     def test_noop_when_chat_id_is_none(self) -> None:
         with skyvern_context.scoped(SkyvernContext(copilot_session_id="outer")):
-            with bind_copilot_session_id(None):
+            with _bind_copilot_session_id(None):
                 # No overwrite — the outer value must stick.
                 assert skyvern_context.current().copilot_session_id == "outer"  # type: ignore[union-attr]
             assert skyvern_context.current().copilot_session_id == "outer"  # type: ignore[union-attr]
@@ -49,7 +76,7 @@ class TestBindCopilotSessionId:
         skyvern_context.reset()
         # Helper must not raise when there is no context to mutate — the
         # copilot route should still function, just without the tag.
-        with bind_copilot_session_id("chat_xyz"):
+        with _bind_copilot_session_id("chat_xyz"):
             assert skyvern_context.current() is None
         assert skyvern_context.current() is None
 

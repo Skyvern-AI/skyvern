@@ -271,7 +271,8 @@ async def test_the_advertised_tab_contract_is_closed_around_the_fields_it_offers
 
     tab_new = (await _advertised_schemas(ablation, registered))["skyvern_tab_new"]
 
-    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME}
+    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME, "user_facing_reason"}
+    assert "user_facing_reason" not in tab_new.get("required", [])
     assert tab_new["additionalProperties"] is False
     validator = Draft202012Validator(tab_new)
     assert validator.is_valid({"url": "https://example.com"})

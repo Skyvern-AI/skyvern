@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 import textwrap
@@ -326,7 +327,8 @@ def test_org_age_is_an_integer_field_not_a_msg_suffix(org_age: int | None) -> No
     if org_age is None:
         assert "org_age" not in event_dict
     else:
-        assert type(event_dict["org_age"]) is int and event_dict["org_age"] == org_age
+        emitted_age = json.loads(json.dumps(event_dict))["org_age"]
+        assert type(emitted_age) is int and emitted_age == org_age
     assert event_dict["msg"] == "Run task activity started | workflow_run_id=wr_1"
 
 

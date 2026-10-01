@@ -39,6 +39,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import (
     CODEBLOCK_LOG_REDACTED,
+    _generated_log_value,
     _GeneratedLogValue,
     add_filename_section,
     add_log_context,
@@ -663,6 +664,93 @@ def test_export_payload_scrubs_copied_provenance_and_preserves_sliced_generated_
     assert result["forged_[REDACTED_SECRET]"] == "tsk_[REDACTED_SECRET]"
     assert "123" not in json.dumps(result["payload"])
     assert attributes == original and message.startswith("caller 123")
+
+
+@pytest.mark.parametrize("value", [128, 0.128])
+def test_numeric_provenance_survives_copies_only_at_its_source_field(value: int | float) -> None:
+    generated = _generated_log_value("usage", value)
+    with pytest.raises(AttributeError):
+        generated.field = "copied"
+    with pytest.raises(AttributeError):
+        delattr(generated, "field")
+    attributes = {"usage": copy.deepcopy(generated), "copied": generated, "payload": {"usage": generated}}
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"12"})):
+        first = redact_registered_secrets(logging.getLogger(), "info", attributes)
+        _, exported = redact_registered_log_payload("diagnostic", first)
+    assert exported["usage"] == value and type(exported["usage"]) is type(value)
+    assert exported["copied"] == REDACTED_SECRET_PLACEHOLDER
+    assert exported["payload"]["usage"] == REDACTED_SECRET_PLACEHOLDER
+    assert json.loads(json.dumps(exported))["usage"] == value
+    assert attributes["copied"] == value
+
+
+def test_generated_string_subclasses_cannot_bypass_caller_text_scrubbing() -> None:
+    class CallerValue(_GeneratedLogValue):
+        pass
+
+    credential = "fake-registered-credential"
+    value = CallerValue("diagnostic", ((credential, False),))
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={credential})):
+        _, exported = redact_registered_log_payload("diagnostic", {"diagnostic": value})
+    assert exported["diagnostic"] == REDACTED_SECRET_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "from skyvern.forge.sdk.forge_log import _generated_log_value\n",
+        "from skyvern.forge.sdk import forge_log\nforge_log._generated_log_value('diagnostic', 'fake-credential')\n",
+        "from skyvern.forge.sdk.forge_log import _GeneratedLogInt\n",
+        "from skyvern.forge.sdk.forge_log import _GeneratedLogValue\n",
+        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_copilot_model_usage\n",
+        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_direct_copilot_model_usage\n",
+        "from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id\n",
+        "from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope\n",
+        "from skyvern.forge.sdk.api.llm.config_registry import _register_builtin_config\n",
+        "from skyvern.forge.sdk.forge_log import _model_log_value\n",
+    ],
+)
+def test_uploaded_scripts_reject_direct_private_log_provenance_access(code: str) -> None:
+    from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+    from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
+
+    with pytest.raises(InsecureCodeDetected):
+        is_safe_script_code(code)
+    assert not hasattr(forge_log, "generated_log_value")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "marker.parts = (('fake-registered-credential', True),)",
+        "marker.field = 'diagnostic'",
+        "del marker.parts",
+        "del marker.field",
+    ],
+)
+def test_validated_script_cannot_mutate_registered_model_provenance(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry, _register_builtin_config
+    from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+    from skyvern.schemas.llm import LLMConfig
+
+    monkeypatch.setattr(LLMConfigRegistry, "_configs", {})
+    _register_builtin_config("TEST_IMMUTABLE", LLMConfig("gpt-5.6-terra", [], False, False))
+    code = (
+        "from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry\n"
+        "marker = LLMConfigRegistry.get_config('TEST_IMMUTABLE').model_name\n"
+        f"{mutation}\n"
+    )
+    is_safe_script_code(code)
+    with pytest.raises(AttributeError):
+        exec(code, {})
+    marker = LLMConfigRegistry.get_config("TEST_IMMUTABLE").model_name
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5.6", "fake-registered-credential"})):
+        _, values = redact_registered_log_payload("diagnostic", {"model_name": marker, "copied": marker})
+    assert values["model_name"] == "gpt-5.6-terra"
+    assert values["copied"] == f"gpt-{REDACTED_SECRET_PLACEHOLDER}-terra"
+    assert "fake-registered-credential" not in repr(values)
 
 
 @pytest.mark.asyncio
