@@ -170,8 +170,8 @@ export function StudioPaneToggles() {
     >
       {STUDIO_PANE_IDS.map((id) => {
         const { icon: Icon } = STUDIO_PANE_META[id];
-        // The run pane's tab names the inspected run ("View Run: wr_…") so the
-        // run id reads from the top bar; railLabel falls back to "Past Runs".
+        // The top-bar run control names the inspected run; it falls back to
+        // "Past Runs" when there is no URL-addressed run.
         const label = railLabel(id, runId);
         const open = panes.includes(id);
         const blockedByDeletion = paneBlockedByDeletion(id);
