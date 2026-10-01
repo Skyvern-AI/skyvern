@@ -32,6 +32,7 @@ from playwright.async_api import Browser, BrowserContext
 
 from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.core.session_manager import request_session_scope
+from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -159,7 +160,11 @@ class _BrowserCallOutcome:
         return deepcopy(self._raw_result_payload)
 
     def with_raw_result(self, raw_result: dict[str, Any]) -> _BrowserCallOutcome:
-        return replace(self, _raw_result_payload=_copy_browser_result(raw_result))
+        outcome = replace(self, _raw_result_payload=_copy_browser_result(raw_result))
+        return outcome.as_redaction_withheld() if is_redaction_withheld(raw_result) else outcome
+
+    def as_redaction_withheld(self) -> _BrowserCallOutcome:
+        return replace(self, ok=False, payload_omitted=True, error_kind=self.error_kind or "tool")
 
 
 @dataclass(frozen=True)
@@ -508,13 +513,17 @@ class SchemaOverlay:
     # stripped before the call, so the underlying tool never sees an argument it cannot accept.
     copilot_params: dict[str, Any] = field(default_factory=dict)
     requires_browser: bool = False
-    # Dispatch overwrites workflow_permanent_id with the chat's own, so the model cannot aim the
-    # call at any other workflow. Pair it with hiding that param from the schema.
+    # Dispatch overwrites binds_chat_workflow_param with the chat's own workflow, so the model cannot
+    # aim the call at any other workflow. Pair it with hiding that param from the schema.
     binds_chat_workflow: bool = False
+    binds_chat_workflow_param: str = "workflow_permanent_id"
     # Creates or changes future runs, so a turn without browser authority, which may not start a
     # run either, does not see it.
     requires_run_authority: bool = False
     redacts_sensitive_origin_structured_result: bool = False
+    # Set when the post-hook is what keeps stored values from the model: a crash then withholds the
+    # result instead of falling back to the unfiltered one.
+    post_hook_fails_closed: bool = False
     timeout: int | None = None
     pre_hook: PreHook | None = None
     post_hook: PostHook | None = None
@@ -744,6 +753,62 @@ def _mapping_at(value: Any, path: tuple[str, ...]) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+_REDACTION_WITHHELD_KEY = "redaction_withheld"
+_RedactionWithheldReason = Literal["redaction_budget", "redaction_unavailable"]
+
+
+def is_redaction_withheld(result: object) -> bool:
+    data = result.get("data") if isinstance(result, dict) else None
+    return isinstance(data, dict) and isinstance(data.get(_REDACTION_WITHHELD_KEY), dict)
+
+
+def _original_chars(result: Any) -> int | None:
+    if is_redaction_withheld(result):
+        inherited = result["data"][_REDACTION_WITHHELD_KEY].get("original_chars")
+        return inherited if type(inherited) is int else None
+    try:
+        return len(json.dumps(result, default=str, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _redaction_withheld_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None, failure: _RedactionWithheldReason
+) -> dict[str, Any]:
+    original_chars = _original_chars(result)
+    rewithheld = is_redaction_withheld(result)
+    if rewithheld:
+        inherited_budget = result["data"][_REDACTION_WITHHELD_KEY].get("reason") == "redaction_budget"
+        failure = "redaction_budget" if inherited_budget else "redaction_unavailable"
+    # An inherited size can be missing because it was dropped as a registered value, not because it was small.
+    over_budget = original_chars > MCP_MAX_RESPONSE_CHARS if original_chars is not None else rewithheld
+    reason: _RedactionWithheldReason = (
+        "redaction_budget" if failure == "redaction_budget" and over_budget else "redaction_unavailable"
+    )
+    # A size equal to a registered value would disclose it, so the size is only reported when it scrubs to itself.
+    if original_chars is not None:
+        probe = {"original_chars": original_chars, "text": str(original_chars)}
+        if _scrub_model_facing_tool_result(ctx, probe) != probe:
+            original_chars = None
+    if not rewithheld:
+        LOG.warning(
+            "copilot_model_facing_result_withheld",
+            tool_name=tool_name,
+            reason=reason,
+            original_chars=original_chars,
+            active_parameter_sets=len(_active_parameter_sets(ctx)),
+        )
+    withheld: dict[str, Any] = {"reason": reason}
+    if original_chars is not None:
+        withheld["original_chars"] = original_chars
+    if reason == "redaction_budget":
+        size = f" ({original_chars} characters)" if original_chars is not None else ""
+        error = f"Result withheld, too large to redact{size}."
+    else:
+        error = "Result withheld: it could not be redacted safely."
+    return {"ok": False, "error": error, "data": {_REDACTION_WITHHELD_KEY: withheld}}
+
+
 def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name: str | None = None) -> dict[str, Any]:
     driver_codes = {
         path: code
@@ -752,9 +817,8 @@ def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name:
         is not None
     }
     scrubbed = _scrub_model_facing_tool_result(ctx, result)
-    # An empty result is the fail-closed answer; writing a code into it would read as a successful call.
-    if not scrubbed:
-        return scrubbed
+    if not isinstance(scrubbed, dict):
+        return _redaction_withheld_result(ctx, result, tool_name=tool_name, failure=scrubbed)
     for path, code in driver_codes.items():
         parent = _mapping_at(scrubbed, path)
         if parent is not None:
@@ -762,15 +826,27 @@ def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name:
     return scrubbed
 
 
-def _scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
+def _scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any] | _RedactionWithheldReason:
     scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
     if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
-        return {}
+        return "redaction_unavailable"
     scrubbed = scrubbed_secrets
     for parameter_set in _active_parameter_sets(ctx):
-        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(scrubbed, parameter_set)
-        if not isinstance(candidate, dict) or not _mapping_keys_preserved(scrubbed, candidate):
-            return {}
+        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(
+            scrubbed,
+            parameter_set,
+            max_disclosure_chars=MCP_MAX_RESPONSE_CHARS,
+            max_disclosure_nodes=MCP_MAX_RESPONSE_CHARS,
+        )
+        if not isinstance(candidate, dict):
+            # The redactor returns the same non-dict for a blown budget and for a parameter set it refuses,
+            # so ask it about an empty input to tell the two apart.
+            refuses_parameters = not isinstance(
+                app.AGENT_FUNCTION.redact_codeblock_parameter_values({}, parameter_set), dict
+            )
+            return "redaction_unavailable" if refuses_parameters else "redaction_budget"
+        if not _mapping_keys_preserved(scrubbed, candidate):
+            return "redaction_unavailable"
         if type(scrubbed.get("ok")) is bool:
             candidate["ok"] = scrubbed["ok"]
         scrubbed = candidate
@@ -1759,7 +1835,7 @@ class SkyvernOverlayMCPServer(MCPServer):
 
         mcp_args = _transform_args(arguments, overlay)
         if overlay.binds_chat_workflow:
-            mcp_args["workflow_permanent_id"] = copilot_ctx.workflow_permanent_id
+            mcp_args[overlay.binds_chat_workflow_param] = copilot_ctx.workflow_permanent_id
 
         if overlay.requires_browser:
             phases.enter("session_prepare")
@@ -1950,10 +2026,24 @@ class SkyvernOverlayMCPServer(MCPServer):
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
                         raise
                     except Exception:
-                        # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                        # An enrichment hook's crash must not fail the action or keep partial credit.
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                        LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
-                        copilot_result = base_copilot_result
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
+                        )
+                        if overlay.post_hook_fails_closed:
+                            server_outcome = ", which reported an error" if failed else ", which reported success"
+                            copilot_result = {
+                                "ok": False,
+                                "error": (
+                                    f"{tool_name} reached the server{server_outcome}, but its result could not "
+                                    "be prepared for display and is withheld."
+                                ),
+                            }
+                        else:
+                            copilot_result = base_copilot_result
                     # The last disclosure boundary, so it also runs after a crashed post-hook. It fails
                     # closed when an unexpected producer marks the exact session while an enrichment awaits.
                     sensitive_result_is_scrubbable = (
@@ -1977,6 +2067,8 @@ class SkyvernOverlayMCPServer(MCPServer):
             if isinstance(copilot_result, dict):
                 await _stamp_page_state(copilot_result)
             copilot_result = scrub_model_facing_tool_result(copilot_ctx, copilot_result, tool_name=mcp_name)
+            if browser_outcome is not None and is_redaction_withheld(copilot_result):
+                browser_outcome = browser_outcome.as_redaction_withheld()
 
             def _commit_evidence() -> None:
                 if browser_outcome is not None:

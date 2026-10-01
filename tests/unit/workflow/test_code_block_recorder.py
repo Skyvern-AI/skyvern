@@ -3064,7 +3064,7 @@ async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_loca
     monkeypatch.setattr(
         block_module.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters: value),
+        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters, **_budget: value),
     )
     context = SimpleNamespace(mask_secrets_in_data=lambda value: value.replace(secret, "*****"))
     block = _make_code_block("pass")

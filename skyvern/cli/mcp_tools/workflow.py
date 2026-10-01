@@ -350,6 +350,9 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         "run_id": run_id,
         "status": str(_get_value(run, "status")) if _get_value(run, "status") is not None else None,
         "run_type": str(run_type) if run_type is not None else None,
+        "created_at": _jsonable(_get_value(run, "created_at")),
+        "trigger_type": _jsonable(_get_value(run, "trigger_type")),
+        "copilot_session_id": _get_value(run, "copilot_session_id"),
         "artifact_summary": _summarize_artifacts(run, output_stats),
         "output_summary": output_summary,
     }
@@ -1648,16 +1651,20 @@ async def skyvern_workflow_run_list(
 
     with Timer() as timer:
         try:
-            requested_page_size = page_size
-            runs = await list_workflow_runs_raw(
+            list_runs = functools.partial(
+                list_workflow_runs_raw,
                 workflow_id,
-                page=page,
-                page_size=requested_page_size + 1,
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
                 include_child_runs=include_child_runs,
             )
+            runs = await list_runs(page=page, page_size=page_size)
+            has_more = False
+            if len(runs) == page_size:
+                # The route offsets by (page - 1) * page_size, so this one-row page is the next page's first run.
+                next_run = await list_runs(page=page * page_size + 1, page_size=1)
+                has_more = bool(next_run)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -1677,9 +1684,6 @@ async def skyvern_workflow_run_list(
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check your API key and workflow run filters"),
             )
-
-    has_more = len(runs) > page_size
-    runs = runs[:page_size]
 
     return make_result(
         "skyvern_workflow_run_list",

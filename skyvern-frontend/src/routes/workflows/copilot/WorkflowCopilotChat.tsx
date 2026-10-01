@@ -25,6 +25,7 @@ import {
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
 import {
+  Fragment,
   useState,
   useEffect,
   useLayoutEffect,
@@ -38,8 +39,10 @@ import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
 import {
   ActionsApiResponse,
+  ActionTypes,
   type CredentialApiResponse,
   getReadableActionType,
+  Status,
 } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
@@ -67,7 +70,10 @@ import {
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import {
+  type CopilotAttention,
+  useCopilotHeaderStore,
+} from "@/store/useCopilotHeaderStore";
 import {
   buildWorkflowCopilotContext,
   buildWorkflowYamlDocument,
@@ -133,6 +139,12 @@ import {
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { AutoAcceptChip } from "./AutoAcceptChip";
 import { PendingGoalChangesCard } from "./PendingGoalChangesCard";
+import {
+  TEMPLATE_GUIDANCE_MESSAGE_ID,
+  TEMPLATE_INPUTS_MESSAGE_ID,
+} from "../templateGuidance";
+import { TemplateInputsCard } from "./cards/TemplateInputsCard";
+import { useMountEffect } from "@/hooks/useMountEffect";
 import { SelectedBlockChip } from "./SelectedBlockChip";
 import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
@@ -164,7 +176,10 @@ import {
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { useHistoryLoad } from "./useHistoryLoad";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
-import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
+import {
+  ConnectedAccountChoiceCard,
+  ConnectedAccountChoiceMarker,
+} from "./cards/ConnectedAccountChoiceCard";
 import { QuestionReceipt } from "./cards/QuestionReceipt";
 import { QUESTION_PROMPT_ID, QuestionTray } from "./cards/QuestionTray";
 import { useQuestionStepper } from "./useQuestionStepper";
@@ -180,9 +195,11 @@ import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
+import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
 import {
+  CredentialAskMarker,
   CredentialCard,
   type CredentialRequiredFrame,
   type CredentialRequiredReason,
@@ -445,26 +462,56 @@ type ArmedProductAction =
 // they land without hammering the timeline endpoint.
 const RECORDED_ACTIONS_POLL_INTERVAL_MS = 2500;
 
-function recordedActionDurationMs(action: ActionsApiResponse): number | null {
+function recordedActionOutput(
+  action: ActionsApiResponse,
+): Record<string, unknown> | null {
   const output = action.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return null;
   }
-  const durationMs = (output as Record<string, unknown>).duration_ms;
-  return typeof durationMs === "number" ? durationMs : null;
+  return output as Record<string, unknown>;
+}
+
+// A code block records an error raised outside any page call as a failed
+// null_action whose output carries `code_line`, even when the line is unknown.
+function isCodeErrorAction(action: ActionsApiResponse): boolean {
+  const output = recordedActionOutput(action);
+  return (
+    action.action_type === ActionTypes.NullAction &&
+    action.status === Status.Failed &&
+    output !== null &&
+    "code_line" in output
+  );
 }
 
 function toRecordedActionSummary(
   action: ActionsApiResponse,
 ): RecordedActionSummary {
+  const output = recordedActionOutput(action);
+  const codeError = isCodeErrorAction(action);
+  const codeLine = codeError ? output?.code_line : null;
+  const durationMs = output?.duration_ms;
+  const failed = action.status === Status.Failed;
   return {
     actionId: action.action_id,
-    label: getReadableActionType(action.action_type),
+    label: getReadableActionType(
+      action.action_type,
+      codeError ? { nullActionLabel: "Code error" } : {},
+    ),
     // The chat has no workflow definition in scope, so rows resolve from the action
     // itself; the run-view timeline additionally matches the definition's step text.
-    summary: describeRecordedAction(action, null),
-    durationMs: recordedActionDurationMs(action),
-    failed: action.status === "failed",
+    // A code error's description only restates its line, and a failure's
+    // response is shown in full under the row, so neither repeats as the summary.
+    summary: codeError
+      ? null
+      : describeRecordedAction(
+          failed ? { ...action, response: null } : action,
+          null,
+        ),
+    durationMs: typeof durationMs === "number" ? durationMs : null,
+    failed,
+    codeLine: typeof codeLine === "number" ? codeLine : null,
+    response: failed ? action.response?.trim() || null : null,
   };
 }
 
@@ -625,6 +672,7 @@ export interface ChatMessage {
   kind?:
     | "run_lifecycle"
     | "status_notice"
+    | "template_inputs"
     | "recording_refinement"
     | "initial_handoff";
   recoveryTurnId?: string;
@@ -997,6 +1045,63 @@ type CredentialResolution = CredentialPauseHistorical & {
   continued?: boolean;
 };
 
+type TerminalCredentialAsk = {
+  turnId: string;
+  frame: CredentialRequiredFrame;
+  localResolution: CredentialResolution | undefined;
+  resolvedOutcome: CredentialPauseHistorical | undefined;
+  canContinue: boolean;
+};
+
+// The actionable ask is only live on the tail message; a resolved receipt renders on any message so
+// a scrolled-back turn keeps its outcome. A stranded ask (its auto-continue failed) stays actionable off-tail.
+function terminalCredentialAskFor(
+  message: ChatMessage,
+  isLastMessage: boolean,
+  credentialResolutions: Record<string, CredentialResolution>,
+  pauseCardResolutions: Record<string, CredentialResolution>,
+  strandedTerminalContinuations: ReadonlySet<string>,
+): TerminalCredentialAsk | null {
+  const turnId = message.narrative?.turnId ?? null;
+  if (!message.narrative || turnId === null) return null;
+  const frame = credentialCardFrameFor(message.narrative);
+  if (!frame) return null;
+  const localResolution = credentialResolutions[turnId];
+  // The persisted pause verdict outranks the optimistic click, so a pick the server did not admit
+  // never reads as connected; the click's name survives via pauseCardResolutions.
+  const resolvedOutcome =
+    historicalCredentialOutcome(message.narrative, pauseCardResolutions) ??
+    localResolution;
+  const canContinue =
+    isLastMessage || strandedTerminalContinuations.has(turnId);
+  if (!resolvedOutcome && !canContinue) return null;
+  return { turnId, frame, localResolution, resolvedOutcome, canContinue };
+}
+
+function connectedAccountChoiceStateFor(
+  messages: ChatMessage[],
+  index: number,
+) {
+  const choices = messages[index]?.narrative?.connectedAccountChoices ?? [];
+  const adjacentMessage = nextAnsweringMessage(messages, index);
+  const selectedConnectionId =
+    adjacentMessage?.sender === "user" &&
+    choices.some((choice) => choice.connection_id === adjacentMessage.content)
+      ? adjacentMessage.content
+      : null;
+  // Once any later conversation message exists, this account-choice turn is historical. Only an
+  // exact structured selection may render a receipt; prose must never make the old card actionable
+  // again between stream completion and the next assistant response.
+  const hasUnconsumedAdjacentMessage =
+    adjacentMessage !== undefined && selectedConnectionId === null;
+  return {
+    choices,
+    adjacentMessage,
+    selectedConnectionId,
+    hasUnconsumedAdjacentMessage,
+  };
+}
+
 // Append a resolution under its key (a turn or a card), capping the map with oldest-eviction like
 // the sibling per-turn maps (turnSnapshots/turnOwnedRunIds). delete-then-set
 // re-inserts an existing key as newest so an active one isn't evicted.
@@ -1254,6 +1359,9 @@ interface WorkflowCopilotChatProps {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
+  /** Assistant-authored first message shown when a template copy opens. */
+  templateGuidance?: string;
+  onTemplateGuidanceShown?: () => void;
   /** Files uploaded before the handoff; sent with the initial message. */
   initialAttachments?: Array<CopilotAttachedFile>;
   initialAction?: CopilotProductAction;
@@ -1488,6 +1596,8 @@ export function WorkflowCopilotChat({
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
+  templateGuidance,
+  onTemplateGuidanceShown,
   initialAttachments,
   initialAction,
   onInitialMessageConsumed,
@@ -1527,19 +1637,40 @@ export function WorkflowCopilotChat({
   // while the existing composer remains available for instructions and
   // clarifications. SOP upload and finishing a recording own it exclusively.
   const authoringInProgress = isUploadingSOP || recordingIsFinishing;
-  const [messages, setMessages] = useState<ChatMessage[]>(() =>
-    !initialAction && initialMessage
+  const [messages, setMessages] = useState<ChatMessage[]>(() => [
+    ...(templateGuidance
+      ? [
+          {
+            id: TEMPLATE_GUIDANCE_MESSAGE_ID,
+            sender: "ai" as const,
+            content: templateGuidance,
+            kind: "status_notice" as const,
+          },
+          {
+            id: TEMPLATE_INPUTS_MESSAGE_ID,
+            sender: "ai" as const,
+            content: "",
+            kind: "template_inputs" as const,
+          },
+        ]
+      : []),
+    ...(!initialAction && initialMessage
       ? [
           {
             id: initialHandoffMessageId,
-            sender: "user",
+            sender: "user" as const,
             content: initialMessage,
-            kind: "initial_handoff",
+            kind: "initial_handoff" as const,
             attachedFiles: initialAttachments,
           },
         ]
-      : [],
-  );
+      : []),
+  ]);
+  const templateGuidanceShownRef = useRef(onTemplateGuidanceShown);
+  templateGuidanceShownRef.current = onTemplateGuidanceShown;
+  useMountEffect(() => {
+    if (templateGuidance) templateGuidanceShownRef.current?.();
+  });
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -3051,6 +3182,13 @@ export function WorkflowCopilotChat({
               message.content === initialHandoff.content,
           );
         const nextMessages: ChatMessage[] = [
+          ...(carryForwardLifecycle
+            ? prev.filter(
+                (message) =>
+                  message.id === TEMPLATE_GUIDANCE_MESSAGE_ID ||
+                  message.id === TEMPLATE_INPUTS_MESSAGE_ID,
+              )
+            : []),
           ...(initialHandoff && !historyIncludesInitialHandoff
             ? [initialHandoff]
             : []),
@@ -6629,11 +6767,126 @@ export function WorkflowCopilotChat({
         setInputValue(settled);
     });
   }, [inputValue, isSpeechListening, stopSpeech, trayQuestionId]);
+
+  // What Copilot is waiting on the user for, docked above the composer one at a time. A question
+  // goes first because the composer answers it; the others wait behind it as "Up next".
+  const visibleRecoveredPauseFrames = isLoadingHistory
+    ? []
+    : recoveredPauseFrames.filter(
+        (frame) =>
+          frame.workflow_copilot_chat_id === workflowCopilotChatId &&
+          frame.turn_id !== livePauseFrame?.turn_id,
+      );
+  // The server sends nothing when a pause times out, so expiry is read from the frame itself; a
+  // missing or malformed expires_at counts as expired, matching the card's countdown.
+  const openPauseFrames = isLoadingHistory
+    ? []
+    : [
+        ...(livePauseFrame &&
+        livePauseFrame.turn_id === narrative.turnId &&
+        narrative.terminal === null
+          ? [livePauseFrame]
+          : []),
+        ...visibleRecoveredPauseFrames,
+      ].filter(
+        (frame) =>
+          !pauseCardResolutions[frame.resume_token] &&
+          Date.parse(frame.expires_at ?? "") > Date.now(),
+      );
+  const trayPauseFrame = openPauseFrames[0] ?? null;
+  const nextPauseExpiry = openPauseFrames.length
+    ? Math.min(
+        ...openPauseFrames.map((frame) => Date.parse(frame.expires_at ?? "")),
+      )
+    : null;
+  const [, setPauseExpiryTick] = useState(0);
+  useEffect(() => {
+    if (nextPauseExpiry === null) return;
+    const timer = window.setTimeout(
+      () => setPauseExpiryTick((tick) => tick + 1),
+      Math.max(0, nextPauseExpiry - Date.now()) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [nextPauseExpiry]);
+  const lastTurnIndex = findLastTurnIndex(messages);
+  // Only the tail turn's ask docks; a stranded one further up stays actionable inline.
+  const tailTerminalAsk =
+    trayPauseFrame || isLoadingHistory || lastTurnIndex < 0
+      ? null
+      : terminalCredentialAskFor(
+          messages[lastTurnIndex]!,
+          true,
+          credentialResolutions,
+          pauseCardResolutions,
+          strandedTerminalContinuations,
+        );
+  const trayTerminalAsk =
+    tailTerminalAsk && !tailTerminalAsk.resolvedOutcome
+      ? tailTerminalAsk
+      : null;
+  const trayCredentialKey = trayPauseFrame
+    ? `pause:${trayPauseFrame.resume_token}`
+    : trayTerminalAsk
+      ? `terminal:${trayTerminalAsk.turnId}`
+      : null;
+  const trayAccountChoice = (() => {
+    const tail = messages[lastTurnIndex];
+    const turnId = tail?.narrative?.turnId ?? null;
+    // A pick waiting in the queue already answered it, so the dock steps aside for the inline card.
+    if (
+      tail?.sender !== "ai" ||
+      turnId === null ||
+      queuedPrompt?.selectedConnectedAccountId !== undefined
+    ) {
+      return null;
+    }
+    const { choices, adjacentMessage } = connectedAccountChoiceStateFor(
+      messages,
+      lastTurnIndex,
+    );
+    // A picker with only reconnect links has nothing to choose, so it stays inline.
+    return adjacentMessage === undefined &&
+      choices.some((choice) => choice.state === "active")
+      ? { turnId, choices }
+      : null;
+  })();
+  // The question always leads, so it never needs an "Up next" label.
+  const attentionQueue: { kind: CopilotAttention; upNext?: string }[] = [];
+  if (trayQuestion) {
+    attentionQueue.push({ kind: "question" });
+  }
+  if (trayCredentialKey) {
+    attentionQueue.push({
+      kind: "credential",
+      upNext: "Copilot needs to sign in",
+    });
+  }
+  if (trayAccountChoice) {
+    attentionQueue.push({ kind: "account", upNext: "Choose a Google account" });
+  }
+  const activeAttention = attentionQueue[0]?.kind ?? null;
+  const attentionUpNext = attentionQueue[1]?.upNext ?? null;
+  // Only the open tray replaces its transcript card; queued items stay actionable inline.
+  const dockedPauseFrame =
+    activeAttention === "credential" ? trayPauseFrame : null;
+  const dockedTerminalAsk =
+    activeAttention === "credential" ? trayTerminalAsk : null;
+  const dockedAccountChoice =
+    activeAttention === "account" ? trayAccountChoice : null;
+  const [collapsedAttentionKey, setCollapsedAttentionKey] = useState<
+    string | null
+  >(null);
+  const attentionTray = (key: string): AttentionTrayPresentation => ({
+    collapsed: collapsedAttentionKey === key,
+    onCollapsedChange: (collapsed) =>
+      setCollapsedAttentionKey(collapsed ? key : null),
+    upNext: attentionUpNext,
+  });
   useEffect(() => {
     const store = useCopilotHeaderStore.getState();
-    store.setAwaitingAnswer(hasPendingQuestion);
-    return () => store.setAwaitingAnswer(false);
-  }, [hasPendingQuestion]);
+    store.setAttention(activeAttention);
+    return () => store.setAttention(null);
+  }, [activeAttention]);
   const uploadDroppedAttachments = useCallback(
     (files: FileList) => {
       const droppedFiles = Array.from(files);
@@ -9056,6 +9309,68 @@ export function WorkflowCopilotChat({
     return null;
   };
 
+  const pauseCredentialCard = (
+    frame: WorkflowCopilotCredentialRequiredUpdate,
+    tray?: AttentionTrayPresentation,
+  ) => (
+    <CredentialCard
+      key={frame.resume_token}
+      frame={liveFrameToCardFrame(frame)}
+      mode="inline-pause"
+      reloadKey={credentialsReloadKey}
+      resolvedOutcome={pauseCardResolutions[frame.resume_token]}
+      onUpdateCredential={(credential) =>
+        openCredentialModal(frame, frame.turn_id, false, credential)
+      }
+      // A picked credential (id + name from the fetched list) answers through the typed resume
+      // POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
+      onConnect={(credentialId, name) =>
+        credentialId
+          ? void respondToCredentialPause(
+              frame,
+              "connected",
+              credentialId,
+              name,
+            )
+          : openCredentialModal(frame, frame.turn_id)
+      }
+      onSkip={() => void respondToCredentialPause(frame, "skip")}
+      tray={tray}
+    />
+  );
+  const terminalCredentialCard = (
+    ask: TerminalCredentialAsk,
+    tray?: AttentionTrayPresentation,
+  ) => (
+    <CredentialCard
+      frame={ask.frame}
+      mode="terminal"
+      reloadKey={credentialsReloadKey}
+      resolvedOutcome={ask.resolvedOutcome}
+      continued={Boolean(ask.localResolution?.continued)}
+      // A picked credential (id + name from the fetched list) auto-continues by id; the
+      // Add-credential CTA (no id) opens the modal instead. A stranded ask (its prior continue
+      // failed) may continue too, though it is no longer the tail.
+      onConnect={(credentialId, name) =>
+        credentialId
+          ? continueAfterTerminalConnect(
+              ask.turnId,
+              credentialId,
+              name ?? ask.localResolution?.name,
+              ask.canContinue,
+            )
+          : openCredentialModal(null, ask.turnId, ask.canContinue)
+      }
+      onSkip={() => resolveTerminalCredential(ask.turnId, "skip")}
+      tray={tray}
+    />
+  );
+  const accountChoiceBusy = (turnId: string) =>
+    isLoading ||
+    hasPendingQuestion ||
+    acceptUnresolved ||
+    connectedAccountChoicePendingTurnId === turnId;
+
   // The live turn places its plan and its credential card exactly where the finished turn will, so
   // nothing moves when the turn ends.
   const liveAnchored: AnchoredTurnItem[] = [];
@@ -9082,36 +9397,15 @@ export function WorkflowCopilotChat({
         narrative,
         livePauseFrame.anchor_tool_call_id,
       ),
-      node: (
-        <CredentialCard
-          key={livePauseFrame.resume_token}
-          frame={liveFrameToCardFrame(livePauseFrame)}
-          mode="inline-pause"
-          reloadKey={credentialsReloadKey}
-          resolvedOutcome={pauseCardResolutions[livePauseFrame.resume_token]}
-          onUpdateCredential={(credential) =>
-            openCredentialModal(
-              livePauseFrame,
-              livePauseFrame.turn_id,
-              false,
-              credential,
-            )
-          }
-          // A picked credential (id + name from the fetched list) answers through the typed
-          // resume POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
-          onConnect={(credentialId, name) =>
-            credentialId
-              ? void respondToCredentialPause(
-                  livePauseFrame,
-                  "connected",
-                  credentialId,
-                  name,
-                )
-              : openCredentialModal(livePauseFrame, livePauseFrame.turn_id)
-          }
-          onSkip={() => void respondToCredentialPause(livePauseFrame, "skip")}
-        />
-      ),
+      node:
+        dockedPauseFrame?.resume_token === livePauseFrame.resume_token ? (
+          <CredentialAskMarker
+            key={livePauseFrame.resume_token}
+            message={livePauseFrame.message}
+          />
+        ) : (
+          pauseCredentialCard(livePauseFrame)
+        ),
     });
   }
 
@@ -9231,7 +9525,6 @@ export function WorkflowCopilotChat({
       ? `Listening… · ${browserStatusText}`
       : "Listening…"
     : browserStatusText;
-  const lastTurnIndex = findLastTurnIndex(messages);
   // The composer is the text field for the pending question, so while one is pending it says so
   // rather than inviting a new request.
   const latestTurnIsAsk = questionInteractions.some(
@@ -9696,6 +9989,9 @@ export function WorkflowCopilotChat({
                     />
                   );
                 }
+                if (message.kind === "template_inputs") {
+                  return <TemplateInputsCard key={message.id} />;
+                }
                 if (message.kind === "status_notice") {
                   return (
                     <div key={message.id} role="status" aria-live="polite">
@@ -9742,73 +10038,29 @@ export function WorkflowCopilotChat({
                 if (message.sender === "ai" && message.narrative) {
                   questionsPlaced = true;
                   const turnId = message.narrative.turnId;
-                  const choices = message.narrative.connectedAccountChoices;
-                  const adjacentMessage = nextAnsweringMessage(messages, index);
-                  const selectedConnectionId =
-                    adjacentMessage?.sender === "user" &&
-                    choices.some(
-                      (choice) =>
-                        choice.connection_id === adjacentMessage.content,
-                    )
-                      ? adjacentMessage.content
-                      : null;
-                  // Once any later conversation message exists, this account-choice turn is
-                  // historical. Only an exact structured selection may render a receipt;
-                  // prose must never make the old card actionable again between stream
-                  // completion and the next assistant response.
-                  const hasUnconsumedAdjacentMessage =
-                    adjacentMessage !== undefined &&
-                    selectedConnectionId === null;
+                  const {
+                    choices,
+                    adjacentMessage,
+                    selectedConnectionId,
+                    hasUnconsumedAdjacentMessage,
+                  } = connectedAccountChoiceStateFor(messages, index);
                   const showReviewGate =
                     shouldShowDiffCard(message.narrative) ||
                     (turnId !== null && turnId === pendingProposalTurnId);
                   const credentialCard = (() => {
-                    if (isLoadingHistory || turnId === null) return null;
-                    const credFrame = credentialCardFrameFor(message.narrative);
-                    if (!credFrame) return null;
-                    const localResolution = credentialResolutions[turnId];
-                    // The persisted pause verdict outranks the optimistic click, so a pick the server
-                    // did not admit never reads as connected; the click's name survives via pauseCardResolutions.
-                    const resolvedOutcome =
-                      historicalCredentialOutcome(
-                        message.narrative,
-                        pauseCardResolutions,
-                      ) ?? localResolution;
-                    // The actionable ask is only live on the tail message; a resolved receipt still
-                    // renders on any message so a scrolled-back turn keeps its outcome. Without this,
-                    // picking on a stale card would show a receipt with no backend call or continue.
-                    // A stranded ask (its auto-continue failed) stays actionable off-tail for a retry.
-                    if (
-                      !resolvedOutcome &&
-                      !isLastMessage &&
-                      !strandedTerminalContinuations.has(turnId)
-                    )
-                      return null;
-                    return (
-                      <CredentialCard
-                        frame={credFrame}
-                        mode="terminal"
-                        reloadKey={credentialsReloadKey}
-                        resolvedOutcome={resolvedOutcome}
-                        continued={Boolean(localResolution?.continued)}
-                        // A picked credential (id + name from the fetched list) auto-continues by
-                        // id; the Add-credential CTA (no id) opens the modal instead. A stranded ask
-                        // (its prior continue failed) may continue too, though it is no longer the tail.
-                        onConnect={(credentialId, name) => {
-                          const canContinue =
-                            isLastMessage ||
-                            strandedTerminalContinuations.has(turnId);
-                          return credentialId
-                            ? continueAfterTerminalConnect(
-                                turnId,
-                                credentialId,
-                                name ?? localResolution?.name,
-                                canContinue,
-                              )
-                            : openCredentialModal(null, turnId, canContinue);
-                        }}
-                        onSkip={() => resolveTerminalCredential(turnId, "skip")}
-                      />
+                    if (isLoadingHistory) return null;
+                    const ask = terminalCredentialAskFor(
+                      message,
+                      isLastMessage,
+                      credentialResolutions,
+                      pauseCardResolutions,
+                      strandedTerminalContinuations,
+                    );
+                    if (!ask) return null;
+                    return dockedTerminalAsk?.turnId === ask.turnId ? (
+                      <CredentialAskMarker />
+                    ) : (
+                      terminalCredentialCard(ask)
                     );
                   })();
                   const autoBoundCard = (() => {
@@ -9938,18 +10190,19 @@ export function WorkflowCopilotChat({
                           a Google account.
                         </p>
                       ) : null}
-                      {turnId !== null && choices.length > 0 ? (
+                      {turnId !== null &&
+                      choices.length > 0 &&
+                      dockedAccountChoice?.turnId === turnId ? (
+                        <ConnectedAccountChoiceMarker />
+                      ) : turnId !== null && choices.length > 0 ? (
                         <ConnectedAccountChoiceCard
                           choices={choices}
                           selectedConnectionId={selectedConnectionId}
                           disabled={
                             !isLastMessage ||
-                            isLoading ||
-                            hasPendingQuestion ||
                             hasUnconsumedAdjacentMessage ||
                             selectedConnectionId !== null ||
-                            acceptUnresolved ||
-                            connectedAccountChoicePendingTurnId === turnId
+                            accountChoiceBusy(turnId)
                           }
                           onSelect={(connectionId) =>
                             handleConnectedAccountChoice(turnId, connectionId)
@@ -10203,41 +10456,16 @@ export function WorkflowCopilotChat({
             RESPONSE has frozen the narrative into the latest AI message —
             otherwise the same turn would render twice.
           */}
-            {!isLoadingHistory &&
-              recoveredPauseFrames
-                .filter(
-                  (frame) =>
-                    frame.workflow_copilot_chat_id === workflowCopilotChatId &&
-                    frame.turn_id !== livePauseFrame?.turn_id,
-                )
-                .map((frame) => (
-                  <CredentialCard
-                    key={frame.resume_token}
-                    frame={liveFrameToCardFrame(frame)}
-                    mode="inline-pause"
-                    reloadKey={credentialsReloadKey}
-                    resolvedOutcome={pauseCardResolutions[frame.resume_token]}
-                    onConnect={(credentialId, name) =>
-                      credentialId
-                        ? void respondToCredentialPause(
-                            frame,
-                            "connected",
-                            credentialId,
-                            name,
-                          )
-                        : openCredentialModal(frame, frame.turn_id)
-                    }
-                    onUpdateCredential={(credential) =>
-                      openCredentialModal(
-                        frame,
-                        frame.turn_id,
-                        false,
-                        credential,
-                      )
-                    }
-                    onSkip={() => void respondToCredentialPause(frame, "skip")}
-                  />
-                ))}
+            {visibleRecoveredPauseFrames.map((frame) =>
+              frame.resume_token === dockedPauseFrame?.resume_token ? (
+                <CredentialAskMarker
+                  key={frame.resume_token}
+                  message={frame.message}
+                />
+              ) : (
+                pauseCredentialCard(frame)
+              ),
+            )}
             {narrative.turnId !== null && narrative.terminal === null && (
               <div
                 className="flex flex-col gap-2"
@@ -10507,6 +10735,37 @@ export function WorkflowCopilotChat({
               isLoading || acceptUnresolved || isSubmittingQuestion
             }
             cancelTitle={acceptHoldReason ?? undefined}
+            upNext={attentionUpNext}
+          />
+        ) : null}
+        {trayCredentialKey && (dockedPauseFrame || dockedTerminalAsk) ? (
+          // Keyed so moving between asks never carries one ask's picker state into the next.
+          <Fragment key={trayCredentialKey}>
+            {dockedPauseFrame
+              ? pauseCredentialCard(
+                  dockedPauseFrame,
+                  attentionTray(trayCredentialKey),
+                )
+              : dockedTerminalAsk
+                ? terminalCredentialCard(
+                    dockedTerminalAsk,
+                    attentionTray(trayCredentialKey),
+                  )
+                : null}
+          </Fragment>
+        ) : null}
+        {dockedAccountChoice ? (
+          <ConnectedAccountChoiceCard
+            choices={dockedAccountChoice.choices}
+            selectedConnectionId={null}
+            disabled={accountChoiceBusy(dockedAccountChoice.turnId)}
+            onSelect={(connectionId) =>
+              handleConnectedAccountChoice(
+                dockedAccountChoice.turnId,
+                connectionId,
+              )
+            }
+            tray={attentionTray(`account:${dockedAccountChoice.turnId}`)}
           />
         ) : null}
         {showQueuedStrip && queuedPrompt ? (
@@ -10530,8 +10789,8 @@ export function WorkflowCopilotChat({
           onDrop={handleComposerDrop}
           className={cn(
             "relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2 transition-colors focus-within:border-ring",
-            (showQueuedStrip || trayQuestion) && "rounded-t-none",
-            trayQuestion && "border-amber-500/50",
+            (showQueuedStrip || activeAttention) && "rounded-t-none",
+            activeAttention && "border-amber-500/50",
           )}
         >
           {isFileDragging ? (

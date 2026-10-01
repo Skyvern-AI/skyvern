@@ -444,6 +444,7 @@ class UnlistedReask:
     # The goal check's verdict on the converted completion, when a goal judge is wired.
     goal_check_verdict: str | None = None
     llm_key: str | None = None
+    reask_llm_key: str | None = None
 
 
 async def run_unlisted_reask(

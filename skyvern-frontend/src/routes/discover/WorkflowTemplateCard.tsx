@@ -1,4 +1,5 @@
 import { ArrowRightIcon, FileTextIcon } from "@radix-ui/react-icons";
+import type { MouseEvent } from "react";
 import { Link } from "react-router-dom";
 import { cn } from "@/util/utils";
 import {
@@ -13,7 +14,7 @@ type Props = {
   category: TemplateCategory | null;
   popular?: boolean;
   to: string;
-  onClick: () => void;
+  onClick: (event?: MouseEvent<HTMLAnchorElement>) => void;
   className?: string;
 };
 
@@ -32,7 +33,7 @@ function WorkflowTemplateCard({
   return (
     <Link
       to={to}
-      onClick={onClick}
+      onClick={(event) => onClick(event)}
       onAuxClick={(event) => {
         if (event.button === 1) onClick();
       }}

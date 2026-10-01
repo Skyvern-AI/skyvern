@@ -1092,10 +1092,10 @@ function WorkflowsTree() {
           open={isTemplateDialogOpen}
           onOpenChange={setIsTemplateDialogOpen}
           onSelectTemplate={(template) => {
-            const clonedWorkflow = convert({
-              ...template,
-              title: `${template.title} (copy)`,
-            });
+            const clonedWorkflow = convert(
+              { ...template, title: `${template.title} (copy)` },
+              { asNewWorkflow: true },
+            );
             createWorkflowMutation.mutate({
               ...clonedWorkflow,
               folder_id: selectedFolderId,
@@ -1103,7 +1103,7 @@ function WorkflowsTree() {
           }}
         />
 
-        <WorkflowTemplates />
+        <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
   );

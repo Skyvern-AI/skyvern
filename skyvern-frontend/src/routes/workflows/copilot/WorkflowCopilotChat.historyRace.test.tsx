@@ -2921,7 +2921,7 @@ describe("WorkflowCopilotChat — question transport", () => {
     expect(tray.nextElementSibling).toBe(
       screen.getByRole("group", { name: "Copilot message composer" }),
     );
-    expect(useCopilotHeaderStore.getState().awaitingAnswer).toBe(true);
+    expect(useCopilotHeaderStore.getState().attention).toBe("question");
 
     cancelPost.mockResolvedValueOnce({
       data: {
@@ -2962,7 +2962,7 @@ describe("WorkflowCopilotChat — question transport", () => {
         screen.queryByRole("group", { name: "Question parts" }),
       ).toBeNull(),
     );
-    expect(useCopilotHeaderStore.getState().awaitingAnswer).toBe(false);
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
 
   it("waits for an answer before the composer sends, and locks Cancel while it posts", async () => {

@@ -132,14 +132,34 @@ class TestIsBlockTypeCacheable:
         assert workflow_script_service.is_block_type_cacheable(non_cacheable) is False
 
     @pytest.mark.parametrize("loop_type", [BlockType.FOR_LOOP, BlockType.WHILE_LOOP])
-    def test_loop_containing_a_terminate_block_is_not_cacheable(self, loop_type: BlockType) -> None:
-        terminate = {"label": "stop", "block_type": BlockType.TERMINATE, "reason": "missing"}
+    @pytest.mark.parametrize(
+        "engine_only_child",
+        [
+            {"label": "stop", "block_type": BlockType.TERMINATE, "reason": "missing"},
+            {"label": "search", "block_type": BlockType.WEB_SEARCH, "query": "q"},
+            {
+                "label": "route",
+                "block_type": BlockType.CONDITIONAL,
+                "branch_conditions": [
+                    {"criteria": {"expression": "{{ current_value }}"}, "next_block_label": "fill"},
+                    {"is_default": True, "next_block_label": None},
+                ],
+            },
+        ],
+        ids=["terminate", "web_search", "conditional"],
+    )
+    def test_loop_containing_an_engine_only_block_is_not_cacheable(
+        self, loop_type: BlockType, engine_only_child: dict
+    ) -> None:
         task = {"label": "fill", "block_type": BlockType.TASK}
-        direct = {"label": "outer", "block_type": loop_type, "loop_blocks": [task, terminate]}
+        direct = {"label": "outer", "block_type": loop_type, "loop_blocks": [task, engine_only_child]}
         nested = {
             "label": "outer",
             "block_type": loop_type,
-            "loop_blocks": [task, {"label": "inner", "block_type": BlockType.FOR_LOOP, "loop_blocks": [terminate]}],
+            "loop_blocks": [
+                task,
+                {"label": "inner", "block_type": BlockType.FOR_LOOP, "loop_blocks": [engine_only_child]},
+            ],
         }
         plain = {"label": "outer", "block_type": loop_type, "loop_blocks": [task]}
 

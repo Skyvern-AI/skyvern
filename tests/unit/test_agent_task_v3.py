@@ -67,11 +67,12 @@ from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
-from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
+from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE, CodeProgressRecord
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_GUARD,
     NAV_DEAD_END_GUARD,
+    TOKEN_BUDGET_EXTENDED_EVENT,
     LoopOutcome,
     RoundAction,
     ToolSpec,
@@ -81,7 +82,6 @@ from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
@@ -104,6 +104,7 @@ from skyvern.webeye.actions.actions import (
 from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_engine import _fixed_read_tool, _ReaskAnsweringCaller
+from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
 
 
@@ -120,6 +121,10 @@ async def _run_execute_task_v3(
     provider_probe_calls: int = 0,
     get_working_page_side_effect: list[Any] | None = None,
     must_get_working_page_side_effect: BaseException | list[Any] | None = None,
+    # Both page accessors return this page, for tests that probe what the run's closures read.
+    working_page: Any = None,
+    # A real browser state whose accessors stand in for the mocked ones.
+    real_browser_state: Any = None,
     loop_raises: BaseException | None = None,
     update_task_side_effect: BaseException | None = None,
     completion_gate_vetoes: bool = False,
@@ -128,19 +133,20 @@ async def _run_execute_task_v3(
     own_block_row: WorkflowRunBlock | None = None,
     own_block_lookup_raises: BaseException | None = None,
     workflow_owned_recovery: bool = False,
+    recovery_code_progress: CodeProgressRecord | None = None,
     landed_url: str | None = None,
     navigation_status: int | None = None,
     page_url_after_settle: str | None = None,
     # Where the page is once the loop returns -- the loop itself can leave the tab somewhere else.
     page_url_after_loop: str | None = None,
-    # A tab the run opened that is newer than the page the tools act on, at this URL once the loop returns.
-    newest_tab_url_after_loop: str | None = None,
-    pinned_page_open: bool = False,
     # The block's own (url, navigation_goal) as the AUTHOR typed them, pinned through the real block
     # seam before the render that produced the task fields above.
     unrendered_block_fields: tuple[str | None, str | None] | None = None,
     # Called with the loop's kwargs before the loop returns, to drive state the loop's tools own.
     on_loop: Callable[[dict[str, Any]], None] | None = None,
+    on_loop_async: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    # Replaces the canned `outcome`: receives the kwargs agent.py built and returns the loop's outcome.
+    loop_body: Callable[[dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
     # A prompt the fake loop hands the goal judge, the way the finish gate would, when one was built.
     goal_judge_prompt: str | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
@@ -154,8 +160,6 @@ async def _run_execute_task_v3(
     step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
 
     browser_state, _, page = make_browser_state()
-    if pinned_page_open:
-        page.is_closed = MagicMock(return_value=False)
     # What setup's navigation RECORDED: the response's own URL beside the status it came back with,
     # which after a redirect is not the URL it asked for.
     browser_state.last_navigation_status = navigation_status
@@ -168,6 +172,12 @@ async def _run_execute_task_v3(
         browser_state.get_working_page = AsyncMock(side_effect=get_working_page_side_effect)
     else:
         browser_state.get_working_page = AsyncMock(return_value=page)
+    if working_page is not None:
+        browser_state.must_get_working_page = AsyncMock(return_value=working_page)
+        browser_state.get_working_page = AsyncMock(return_value=working_page)
+    if real_browser_state is not None:
+        browser_state.must_get_working_page = AsyncMock(side_effect=real_browser_state.must_get_working_page)
+        browser_state.get_working_page = AsyncMock(side_effect=real_browser_state.get_working_page)
     browser_state.take_post_action_screenshot = AsyncMock(
         return_value=b"png-bytes",
         side_effect=RuntimeError("screenshot boom") if screenshot_raises else None,
@@ -180,7 +190,6 @@ async def _run_execute_task_v3(
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
-        loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
@@ -189,6 +198,10 @@ async def _run_execute_task_v3(
                 await cb(round_actions, turn_text)
         if on_loop is not None:
             on_loop(kwargs)
+        if on_loop_async is not None:
+            await on_loop_async(kwargs)
+        if loop_body is not None:
+            return await loop_body(kwargs)
         if goal_judge_prompt is not None and kwargs.get("goal_judge") is not None:
             page.is_closed = MagicMock(return_value=False)
             loop_mock.goal_judge_response = await kwargs["goal_judge"](goal_judge_prompt)
@@ -199,10 +212,6 @@ async def _run_execute_task_v3(
             raise loop_raises
         if page_url_after_loop is not None:
             page.url = page_url_after_loop
-        if newest_tab_url_after_loop is not None:
-            newest_tab = MagicMock(url=newest_tab_url_after_loop)
-            newest_tab.main_frame.child_frames = []
-            browser_state.get_working_page = AsyncMock(return_value=newest_tab)
         return outcome
 
     loop_mock = AsyncMock(side_effect=_loop)
@@ -287,6 +296,7 @@ async def _run_execute_task_v3(
             task_block=task_block,
             workflow_owned_recovery=workflow_owned_recovery,
             recovery_credential_parameter_keys=recovery_credential_parameter_keys,
+            recovery_code_progress=recovery_code_progress,
         )
     finally:
         skyvern_context.reset()
@@ -351,40 +361,12 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("workflow_permanent_id", "targeted_wpid"),
-    [("wpid_required_field_answers", "wpid_required_field_answers"), (None, "not_workflow")],
+    [("wpid_customer_precedence", "wpid_customer_precedence"), (None, "not_workflow")],
 )
-async def test_execute_task_v3_resolves_the_required_field_answers_arm_before_the_loop_reads_it(
+async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_loop_reads_it(
     monkeypatch: pytest.MonkeyPatch, workflow_permanent_id: str | None, targeted_wpid: str
 ) -> None:
     # The rollout is targeted by workflow, so the flag must be evaluated with the wpid property.
-    monkeypatch.setattr(settings, "TASK_V3_REQUIRED_FIELD_ANSWERS", False)
-    provider = AsyncMock(return_value="treatment")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_required_field_answers_reach",
-        workflow_permanent_id=workflow_permanent_id,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id != task.task_id
-    assert loop_mock.required_field_answers_during_loop is True
-    assert loop_mock.context.run_arms[REQUIRED_FIELD_ANSWERS_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        REQUIRED_FIELD_ANSWERS_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id, "workflow_permanent_id": targeted_wpid},
-    )
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_loop_reads_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", False)
     provider = AsyncMock(return_value="treatment")
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
@@ -394,7 +376,7 @@ async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_l
         monkeypatch,
         outcome,
         workflow_run_id="wr_customer_precedence_reach",
-        workflow_permanent_id="wpid_customer_precedence",
+        workflow_permanent_id=workflow_permanent_id,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -405,7 +387,7 @@ async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_l
     provider.assert_any_await(
         CUSTOMER_PRECEDENCE_FLAG,
         task.workflow_run_id,
-        properties={"organization_id": task.organization_id, "workflow_permanent_id": "wpid_customer_precedence"},
+        properties={"organization_id": task.organization_id, "workflow_permanent_id": targeted_wpid},
     )
 
 
@@ -2039,6 +2021,7 @@ async def _run_execute_step_gate(
     experimentation_provider: BaseExperimentationProvider | None = None,
     workflow_run: Any = None,
     workflow_owned_recovery: bool = False,
+    recovery_code_progress: CodeProgressRecord | None = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2094,6 +2077,7 @@ async def _run_execute_step_gate(
                     engine=engine,
                     task_block=task_block,
                     workflow_owned_recovery=workflow_owned_recovery,
+                    recovery_code_progress=recovery_code_progress,
                     download_baseline_files=[],
                 )
             except _StepEngineDispatched:
@@ -2236,6 +2220,22 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
     assert any(
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_step_hands_the_recovery_code_outline_to_the_v3_run() -> None:
+    record = CodeProgressRecord(before=(), failed_step="click export", failed_line=3, after=())
+
+    v3_mock, _step_engine_mock = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        workflow_owned_recovery=True,
+        recovery_code_progress=record,
+        workflow_run_id="wr_recovery_outline",
+    )
+
+    v3_mock.assert_awaited_once()
+    assert v3_mock.await_args.kwargs["recovery_code_progress"] is record
 
 
 @pytest.mark.asyncio
@@ -2996,6 +2996,70 @@ async def test_execute_task_v3_atomic_block_ceiling_pinned_to_its_own_cap(monkey
     assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 5
 
 
+class _AdvancingFormPage(_FakePage):
+    """Every action advances the form, so the next observe is fresh page-change evidence."""
+
+    async def evaluate(self, _js: str) -> str:
+        raw = await super().evaluate(_js)
+        if "document.readyState" in _js:
+            return raw
+        section = sum(1 for name, _args in self.calls if name in ("click", "fill", "type"))
+        data = json.loads(raw)
+        data["title"] = f"Apply, section {section}"
+        data["elements"][0]["label"] = f"Section {section} first name"
+        return json.dumps(data)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_navigation_block_token_trip_with_progress_is_extended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A long form resends a growing transcript, so the token backstop trips while most of the step budget is
+    # unspent. Driven through agent.py with the real engine and loop, so the step floor, ceilings and backstops
+    # agent.py configures are the ones the grant must survive. The form is filled one field per round, and each
+    # new field followed by a changed page renews the grant.
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(5):
+        script.append([("observe", {})])
+        script.append([("type", {"selector": f"#field-{i}", "text": f"answer {i}"})])
+    script.append([("observe", {})])
+    script.append([("click", {"selector": "#submit"})])
+    script.append([("finish", {"status": "completed", "reason": "submitted"})])
+    caller = _ScriptedCaller(script, turn_tokens=200_000)
+    page = _AdvancingFormPage()
+    loop_kwargs: dict[str, Any] = {}
+
+    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return await run_task_v3_agent_loop(
+            # The scripted caller takes no step-scoped call kwargs.
+            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
+        )
+
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=None))
+    with capture_logs() as logs:
+        _step, task, _loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
+            task_block=_make_block(NavigationBlock, navigation_goal="Fill and submit the application"),
+            workflow_run_id="wr_long_form",
+            max_steps_per_run=10,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            loop_body=_real_loop,
+            working_page=page,
+        )
+    assert loop_kwargs["max_action_steps"] == MIN_ACTION_STEPS
+    granted = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
+    assert [(entry["guard"], entry["original_max_tokens"]) for entry in granted] == [
+        ("max_tokens", loop_kwargs["max_tokens"]),
+        ("max_tokens", granted[0]["max_tokens"]),
+    ]
+    assert granted[0]["action_steps"] < MIN_ACTION_STEPS
+    assert caller.calls == len(script)
+    assert task.status == TaskStatus.completed
+
+
 @pytest.mark.asyncio
 async def test_execute_task_v3_no_workflow_ceiling_without_a_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     # No org pool -> no hard ceiling: the loop's extension is bounded only by its own gate.
@@ -3167,27 +3231,37 @@ async def test_execute_task_v3_should_cancel_skips_workflow_read_for_bare_task(
 
 
 # ---------------------------------------------------------------------------
-# P4: the page provider (live re-resolution for workflow blocks, once for bare tasks)
+# P4: the page provider (live re-resolution on every tool call)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_bare_task_provider_resolves_page_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A bare task must preserve today's exact semantics: must_get_working_page grabs the page once
-    # up front, and every later provider call returns that same object, not a re-resolved one.
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+@pytest.mark.parametrize("customer_precedence", [False, True], ids=["one_compose_pass", "recompose_pass"])
+async def test_a_recovery_code_outline_reaches_the_model_goal_but_never_the_task_row(
+    monkeypatch: pytest.MonkeyPatch, customer_precedence: bool
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", customer_precedence)
+    record = CodeProgressRecord(
+        before=("open the portal",), failed_step="click the invoices tab", failed_line=2, after=("download",)
+    )
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
-        outcome,
-        provider_probe_calls=3,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        workflow_owned_recovery=True,
+        recovery_code_progress=record,
+        workflow_run_id="wr_recovery_outline",
+        navigation_goal="Download the latest invoice",
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
-    assert loop_mock.resolved_pages == [loop_mock.resolved_pages[0]] * 3
-    loop_mock.browser_state.must_get_working_page.assert_awaited_once()
-    # The completion gate reads the page once on a completed outcome; the PROVIDER itself never
-    # consults get_working_page for a bare task.
-    assert loop_mock.browser_state.get_working_page.await_count <= 1
+
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert goal.startswith("(This goal contains a value of unverified origin") is customer_precedence
+    assert goal.count("Code outline") == 1
+    assert goal.endswith("- Later in the code: download")
+    assert task.navigation_goal == "Download the latest invoice"
+    assert "Code outline" not in str(loop_mock.update_task_kwargs)
 
 
 @pytest.mark.asyncio
@@ -3974,36 +4048,6 @@ async def test_execute_task_v3_completed_on_a_page_still_loading_completes(monke
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_bare_task_judges_its_pinned_page_not_the_newest_tab(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A bare task's tools act on one pinned page; a blank popup it opened along the way is not that page.
-    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    _step, task, _loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        pinned_page_open=True,
-        newest_tab_url_after_loop="about:blank",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert task.status == TaskStatus.completed
-
-    _step, task, _loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        pinned_page_open=True,
-        page_url_after_loop="about:blank",
-        newest_tab_url_after_loop="https://example.com/results",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert task.status == TaskStatus.failed
-    assert "blank page" in (task.failure_reason or "")
 
 
 @pytest.mark.asyncio
@@ -5122,44 +5166,6 @@ async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_bare_task_fingerprint_samples_the_pinned_page(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A bare task pins one page for the run, so its fingerprint must sample THAT page. Going through
-    # browser_state.get_working_page() would return the newest tab after any popup — sampling a page
-    # the model never acted on — and would repoint the working page as a side effect, which is a
-    # behaviour change to the live bare-task arm rather than the scoped one this gate intends.
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    pinned = MagicMock()
-    pinned.is_closed = MagicMock(return_value=False)
-    pinned.evaluate = AsyncMock(return_value="pinned-hash:100:10")
-    popup = MagicMock()
-    popup.is_closed = MagicMock(return_value=False)
-    popup.evaluate = AsyncMock(return_value="popup-hash:1:1")
-
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        must_get_working_page_side_effect=[pinned],
-        get_working_page_side_effect=[popup, popup, popup],
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
-    before = loop_mock.browser_state.get_working_page.await_count
-    assert await fingerprint() == "pinned-hash:100:10"
-    # The sampler probed the pinned page and never the popup, and did not consult (or repoint) the
-    # browser's working page to do it. Counting the delta rather than asserting never-awaited: the
-    # post-loop completion-veto gate legitimately calls get_working_page once, before this point.
-    popup.evaluate.assert_not_awaited()
-    assert loop_mock.browser_state.get_working_page.await_count == before
-
-    # A closed pinned page yields None rather than silently falling back to another tab.
-    pinned.is_closed = MagicMock(return_value=True)
-    assert await fingerprint() is None
-
-
-@pytest.mark.asyncio
 async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch: pytest.MonkeyPatch) -> None:
     # The settle deferral is a live gate: a main-frame-only fingerprint reads a page whose child frame
     # is still rendering as settled. So a change inside the frame alone must move the fingerprint.
@@ -5182,7 +5188,7 @@ async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned],
+        working_page=pinned,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -5230,7 +5236,7 @@ async def test_execute_task_v3_document_identity_changes_with_an_acted_in_frame_
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned],
+        working_page=pinned,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -5309,7 +5315,7 @@ async def test_execute_task_v3_document_identity_raises_when_a_realm_is_unidenti
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned],
+        working_page=pinned,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -5332,7 +5338,7 @@ async def test_execute_task_v3_document_identity_raises_when_a_realm_is_unidenti
     _step, _task, loop_mock2, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        must_get_working_page_side_effect=[pinned2],
+        working_page=pinned2,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )

@@ -13,6 +13,7 @@ import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS, size_capped
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowRequest,
@@ -197,6 +198,7 @@ def _known_drift_definition(block_type: str) -> dict[str, object]:
         }
     elif block_type == "terminate":
         block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        block["error_code"] = "ACCOUNT_NOT_FOUND"
     else:
         raise ValueError(f"Unsupported known drift block type: {block_type}")
 
@@ -283,6 +285,7 @@ async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     elif block_type == "terminate":
         assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
@@ -328,6 +331,7 @@ async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     elif block_type == "terminate":
         assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
@@ -4772,3 +4776,61 @@ async def test_registered_large_workflow_get_reports_skills_with_overflow_hint(
     assert f"carries {len(prompt)} persisted skill-instruction characters" in skills["hint"]
     assert "--id wpid_test --version 7 --definition-file wf.json" in skills["hint"]
     assert "data.workflow_definition.workflow_system_prompt" not in skills["hint"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run",
+    [
+        {
+            "workflow_run_id": "wr_api",
+            "status": "terminated",
+            "created_at": "2026-09-20T08:30:00+00:00",
+            "trigger_type": "api",
+            "copilot_session_id": "wcc_1",
+        },
+        SimpleNamespace(
+            workflow_run_id="wr_api",
+            status="terminated",
+            created_at=datetime(2026, 9, 20, 8, 30, tzinfo=timezone.utc),
+            trigger_type=WorkflowRunTriggerType.api,
+            copilot_session_id="wcc_1",
+        ),
+    ],
+    ids=["api_json", "typed"],
+)
+async def test_workflow_run_list_summary_carries_when_and_how_each_run_started(
+    run: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", AsyncMock(return_value=[run]))
+
+    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", status=["terminated"])
+
+    summary = json.loads(json.dumps(result))["data"]["runs"][0]
+    assert summary["created_at"] == "2026-09-20T08:30:00+00:00"
+    assert summary["trigger_type"] == "api"
+    assert summary["copilot_session_id"] == "wcc_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_count", [13, 10])
+async def test_workflow_run_list_pages_through_every_run_in_order(
+    run_count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_ids = [f"wr_{i}" for i in range(run_count)]
+
+    async def list_runs(workflow_id: str, *, page: int, page_size: int, **_: object) -> list[dict[str, str]]:
+        offset = (page - 1) * page_size
+        return [{"workflow_run_id": run_id, "status": "terminated"} for run_id in run_ids[offset : offset + page_size]]
+
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", list_runs)
+
+    seen: list[str] = []
+    for page in range(1, 10):
+        data = (await workflow_tools.skyvern_workflow_run_list("wpid_x", page=page, page_size=5))["data"]
+        assert data["runs"], f"has_more promised page {page}, which was empty"
+        seen.extend(run["run_id"] for run in data["runs"])
+        if not data["has_more"]:
+            break
+
+    assert seen == run_ids

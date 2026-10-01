@@ -13,16 +13,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
+from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.block import TaskBlock
+from skyvern.forge.sdk.workflow.models.block import (
+    BaseTaskBlock,
+    Block,
+    TaskBlock,
+    takes_default_engine,
+    v3_ab_ineligibility_reason,
+)
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import BlockType, WorkflowDefinitionYAML
 from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from tests.unit._workflow_block_engine_fakes import FakeExperimentationProvider, resolve_arm
 
 MODULE = "skyvern.services.script_service"
 
@@ -39,7 +49,7 @@ def _make_output_parameter(key: str) -> OutputParameter:
     )
 
 
-def _make_task_block(label: str, engine: RunEngine = RunEngine.skyvern_v1) -> TaskBlock:
+def _make_task_block(label: str, engine: RunEngine | None = RunEngine.skyvern_v1) -> TaskBlock:
     return TaskBlock(
         label=label,
         output_parameter=_make_output_parameter(f"{label}_output"),
@@ -138,6 +148,63 @@ async def test_fallback_keeps_default_engine_when_block_missing_from_definition(
 
 
 @pytest.mark.asyncio
+async def test_failed_cached_task_carries_detected_codes_to_block_update() -> None:
+    workflow = _make_workflow([_make_task_block("my_block")])
+    app = _make_app(workflow)
+    app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=SimpleNamespace(ai_fallback=False))
+    app.DATABASE.tasks.get_task = AsyncMock(return_value=SimpleNamespace(errors=[]))
+    app.DATABASE.tasks.update_task = AsyncMock()
+    error = UserDefinedError(error_code="blocked", reasoning="Blocked", confidence_float=1.0)
+    update_block = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._detect_user_defined_errors", new=AsyncMock(return_value=[error])),
+        patch(f"{MODULE}._update_workflow_block", update_block),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            error_code_mapping={"blocked": "Blocked"},
+            error=RuntimeError("Script failed"),
+            workflow_run_block_id="wrb_test",
+        )
+
+    assert update_block.await_args.kwargs["error_codes"] == ["blocked"]
+
+
+@pytest.mark.asyncio
+async def test_ai_fallback_carries_refreshed_task_codes_to_block_update() -> None:
+    workflow = _make_workflow([_make_task_block("my_block")])
+    app = _make_app(workflow)
+    app.DATABASE.tasks.get_task = AsyncMock(
+        side_effect=[
+            SimpleNamespace(url="https://example.com", errors=[]),
+            SimpleNamespace(
+                status=TaskStatus.failed,
+                failure_reason="Fallback identified the failure",
+                errors=[{"error_code": "picked", "reasoning": "Matched"}],
+            ),
+        ]
+    )
+    update_block = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._update_workflow_block", update_block),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            workflow_run_block_id="wrb_test",
+        )
+
+    assert update_block.await_args.kwargs["error_codes"] == ["picked"]
+
+
+@pytest.mark.asyncio
 async def test_fallback_fails_open_to_default_when_engine_lookup_raises() -> None:
     workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v3)])
     app = _make_app(workflow)
@@ -177,6 +244,124 @@ async def test_fallback_respects_explicit_engine_without_lookup() -> None:
     assert _fallback_task_block(app).engine == RunEngine.skyvern_v2
 
 
+@pytest.mark.parametrize(
+    ("born_at", "expected"),
+    [
+        (datetime(2026, 10, 2, tzinfo=timezone.utc), RunEngine.skyvern_v3),
+        (datetime(2026, 9, 1, tzinfo=timezone.utc), RunEngine.skyvern_v1),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fallback_of_an_unset_engine_block_follows_the_chosen_engine_cutoff(
+    monkeypatch: pytest.MonkeyPatch, born_at: datetime, expected: RunEngine
+) -> None:
+    # A script run of a workflow born past the cutoff: its cached block's AI fallback must run where
+    # the same block would run uncached, v3, not on the skyvern_v1 an unset engine used to mean.
+    monkeypatch.setattr(settings, "TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", None)
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", datetime(2026, 10, 1, tzinfo=timezone.utc))
+    blocks = [_make_task_block("my_block", engine=None)]
+    workflow = _make_workflow(blocks)
+    context = _make_context()
+    await resolve_arm(
+        context,
+        FakeExperimentationProvider(),
+        workflow_run_id="wr_test",
+        ineligibility_reason=v3_ab_ineligibility_reason(blocks, is_script_run=True),
+        takes_default_engine=takes_default_engine(blocks),
+        first_version_created_at=born_at,
+    )
+    app = _make_app(workflow)
+
+    with patch(f"{MODULE}.app", app), patch(f"{MODULE}.skyvern_context.current", return_value=context):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION, cache_key="my_block", prompt="do the thing"
+        )
+
+    assert _fallback_task_block(app).engine == expected
+
+
+_UNCACHED_HELPER_CALLS = {
+    "navigation": lambda: script_service.run_task(prompt="p", label="navigation"),
+    "file_download": lambda: script_service.download(prompt="p", label="file_download"),
+    "action": lambda: script_service.action(prompt="p", label="action"),
+    "login": lambda: script_service.login(prompt="p", label="login"),
+    "extraction": lambda: script_service.extract(prompt="p", label="extraction"),
+    "validation": lambda: script_service.execute_validation("done", None, None, label="validation"),
+}
+
+
+class _Built(Exception):
+    pass
+
+
+_CUTOFF = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("cutoff", "born_at"),
+    [
+        pytest.param(_CUTOFF, datetime(2026, 10, 2, tzinfo=timezone.utc), id="past_cutoff"),
+        pytest.param(_CUTOFF, datetime(2026, 9, 30, tzinfo=timezone.utc), id="born_before_cutoff"),
+        pytest.param(None, datetime(2026, 10, 2, tzinfo=timezone.utc), id="cutoff_unset"),
+    ],
+)
+@pytest.mark.parametrize("stored_engine", [None, RunEngine.skyvern_v1.value, RunEngine.skyvern_v3.value])
+@pytest.mark.parametrize("block_type", list(_UNCACHED_HELPER_CALLS))
+@pytest.mark.asyncio
+async def test_an_uncached_script_block_runs_where_its_stored_block_would_only_past_the_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+    block_type: str,
+    stored_engine: str | None,
+    cutoff: datetime | None,
+    born_at: datetime,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", None)
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
+    goal = {"validation": "complete_criterion", "extraction": "data_extraction_goal"}.get(block_type, "navigation_goal")
+    stored_block = {"block_type": block_type, "label": block_type, goal: "p"}
+    if stored_engine is not None:
+        stored_block["engine"] = stored_engine
+    # A second block left unset makes the run take the default engine, so a skyvern-1.0 pin is honored.
+    unset_block = {"block_type": "navigation", "label": "unset", "navigation_goal": "p"}
+    definition = convert_workflow_definition(
+        WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": [stored_block, unset_block]}), "w_test"
+    )
+    workflow = _make_workflow(definition.blocks)
+    stored = definition.blocks[0]
+    context = _make_context()
+    await resolve_arm(
+        context,
+        FakeExperimentationProvider(),
+        workflow_run_id="wr_test",
+        ineligibility_reason=v3_ab_ineligibility_reason(workflow.workflow_definition.blocks, is_script_run=True),
+        takes_default_engine=takes_default_engine(workflow.workflow_definition.blocks),
+        first_version_created_at=born_at,
+    )
+    ran_on: list[tuple[RunEngine, RunEngine]] = []
+
+    async def capture(self: Block, **_: object) -> None:
+        assert isinstance(self, BaseTaskBlock) and isinstance(stored, BaseTaskBlock)
+        ran_on.append((self.resolve_engine("wr_test"), stored.resolve_engine("wr_test")))
+        raise _Built
+
+    with (
+        patch(f"{MODULE}.app", _make_app(workflow)),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+        patch(f"{MODULE}.skyvern_context.ensure_context", return_value=context),
+        patch(f"{MODULE}.script_run_context_manager.get_cached_fn", return_value=None),
+        patch.object(Block, "execute_safe", capture),
+        pytest.raises(_Built),
+    ):
+        await _UNCACHED_HELPER_CALLS[block_type]()
+
+    [(helper_engine, stored_block_engine)] = ran_on
+    if cutoff is not None and born_at > cutoff:
+        assert helper_engine == stored_block_engine
+    else:
+        # Outside the cutoff the helpers keep main's behaviour, where every stored engine ran on skyvern_v1.
+        assert helper_engine == RunEngine.skyvern_v1
+
+
 def test_resolver_finds_loop_nested_block_engine() -> None:
     # A cached block inside a for-loop must keep its configured engine on fallback; the lookup
     # is recursive (labels are globally unique, nested included).
@@ -191,8 +376,8 @@ def test_resolver_finds_loop_nested_block_engine() -> None:
         output_parameter=nested.output_parameter,
     )
     workflow = _make_workflow([loop])
-    assert script_service._resolve_original_block_engine("inner_block", workflow) == RunEngine.skyvern_v3
-    assert script_service._resolve_original_block_engine("missing", workflow) is None
+    assert script_service._resolve_original_block_engine("inner_block", workflow, None) == RunEngine.skyvern_v3
+    assert script_service._resolve_original_block_engine("missing", workflow, None) is None
 
 
 def _make_run_context(values: dict[str, object]) -> MagicMock:

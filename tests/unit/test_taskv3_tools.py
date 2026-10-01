@@ -75,6 +75,7 @@ from skyvern.forge.taskv3.tools import (
     _TYPE_TARGET_PROBE_JS,
     NAVIGATION_DEAD_END_STATUSES,
     OBSERVE_DISPLAY_WIDTHS,
+    OBSERVE_POINTER_ROOT_CAP,
     OBSERVE_RETAIN_WIDTH_MIN,
     OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
@@ -10823,13 +10824,15 @@ async def test_observe_lists_delegated_pointer_div_trigger_and_its_menu_is_reach
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_controls_and_unnamed_boxes() -> None:
+async def test_observe_pointer_roots_skip_inherited_and_unnamed_boxes_and_list_a_holders_free_child() -> None:
     html = (
         "<!doctype html><html><body>"
         '<div style="cursor:pointer;width:300px"><span style="display:inline-block">Inherited child</span>'
         " Pointer root</div>"
         '<div style="cursor:pointer;width:300px"><button type="button">Real button</button>'
         "<span>Wrapper text</span></div>"
+        '<div style="cursor:pointer;width:300px"><span aria-hidden="true">receipt_long</span><span>Record 7</span>'
+        "<button>Pay</button></div>"
         '<div style="cursor:pointer;width:40px;height:40px"></div>'
         '<label style="cursor:pointer"><input type="checkbox"><span>Accept</span></label>'
         '<p style="width:220px;font:16px/20px sans-serif">Please read our full <span style="cursor:pointer">'
@@ -10858,7 +10861,10 @@ async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_control
         inherited = [line for line in ref_lines if "Inherited child" in line]
         assert len(inherited) == 1 and "div 'Inherited child Pointer root'" in inherited[0], ref_lines
         assert any("button 'Real button'" in line for line in ref_lines)
-        assert not any("Wrapper text" in line for line in ref_lines)
+        # A pointer box holding a control is not listed, but its control-free pointer child is.
+        assert any("span 'Wrapper text'" in line for line in ref_lines), ref_lines
+        assert any("span 'Record 7'" in line for line in ref_lines), ref_lines
+        assert not any("receipt_long" in line for line in ref_lines), ref_lines
         assert any("input/checkbox 'Accept'" in line for line in ref_lines), ref_lines
         assert not any("span 'Accept'" in line for line in ref_lines), ref_lines
         assert any("span 'terms of use'" in line for line in ref_lines), ref_lines
@@ -10868,7 +10874,7 @@ async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_control
         assert not any("Collapsed" in line for line in ref_lines), ref_lines
         yes = [line for line in ref_lines if "'Yes'" in line]
         assert len(yes) == 1 and "input/radio 'Yes'" in yes[0], ref_lines
-        assert len(ref_lines) == 11, ref_lines
+        assert len(ref_lines) == 14, ref_lines
 
     # A pointer control the reading drops does not stand in for its visible child.
     html = (
@@ -10979,6 +10985,29 @@ async def test_observe_pointer_root_cap_is_page_wide_and_never_costs_a_frames_fi
         clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'Frame save'")})
         assert clicked.status == "ok", clicked.content
         assert await page.evaluate("() => window.__saved") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_holder_stand_ins_never_displace_a_frames_pointer_roots_or_exceed_the_cap() -> None:
+    # The page's 30 holder rows and 5 plain roots fit its own cap; with the frame's 15 tiles the page-wide
+    # cap still holds, and the rows' stand-ins are what give way.
+    rows = "".join(
+        f'<div style="cursor:pointer;width:300px"><span>Row {i}</span><button type="button">Pay {i}</button></div>'
+        for i in range(30)
+    )
+    plain = "".join(f'<div style="cursor:pointer;width:200px">Plain {i}</div>' for i in range(5))
+    tiles = "".join(f"<div style='cursor:pointer;width:100px'>Tile {i}</div>" for i in range(15))
+    html = f'<!doctype html><html><body>{rows}{plain}<iframe srcdoc="{tiles}" width="300" height="400"></iframe></body></html>'
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.status == "ok"
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        for name in [f"Plain {i}" for i in range(5)] + [f"Tile {i}" for i in range(15)]:
+            assert any(f"div '{name}'" in line for line in ref_lines), (name, ref_lines)
+        pointer_lines = [line for line in ref_lines if re.match(r"^ref=\d+ (?:div|span) ", line)]
+        assert len(pointer_lines) == OBSERVE_POINTER_ROOT_CAP, pointer_lines
+        assert sum("'Pay " in line for line in ref_lines) == 30, ref_lines
 
 
 @_skip_no_browser
@@ -14730,6 +14759,88 @@ async def test_click_refuses_a_skinned_checkbox_with_no_proxy_at_all() -> None:
         assert r.status == "error"
         assert elapsed < 10
         assert await page.eval_on_selector("#nolabel", "el => el.checked") is False
+
+
+# A transparent native checkbox stretched over its own styled box is what a person clicks, in view, below
+# the fold, with only its top edge above the fold, or further down a scrollable list. One inside a collapsed
+# section, a faded-out panel (even behind its <label>), or stacked translucent wrappers, or under an unrelated
+# cover, is not reachable, and the two are told apart.
+_OPACITY0_OVERLAY_CHECKBOX_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div style="position:relative;width:24px;height:24px;margin:20px">
+    <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+    <input id="overlay" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+  </div>
+  <div style="height:0;overflow:hidden">
+    <div style="position:relative;width:24px;height:24px">
+      <input id="collapsed" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+    </div>
+  </div>
+  <div style="position:relative;width:24px;height:24px;margin:20px">
+    <input id="covered" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+    <div style="position:absolute;inset:0;z-index:2;background:#fff">Show more</div>
+  </div>
+  <div style="position:relative;width:24px;height:24px;margin:20px;opacity:0">
+    <input id="faded" type="checkbox" aria-label="Faded panel option" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+  </div>
+  <div style="opacity:0;margin:20px">
+    <label style="display:inline-block;width:120px;height:24px"><input id="labelfaded" type="checkbox" style="opacity:0">Faded label</label>
+  </div>
+  <div style="opacity:0.2;margin:20px">
+    <div style="position:relative;width:24px;height:24px;opacity:0.2">
+      <input id="stacked" type="checkbox" aria-label="Stacked fade option" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0">
+    </div>
+  </div>
+  <div style="height:100px;overflow:auto;margin:20px">
+    <div style="height:600px"></div>
+    <div style="position:relative;width:24px;height:24px">
+      <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+      <input id="inlist" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+    </div>
+  </div>
+  <div style="position:absolute;left:20px;top:calc(100vh - 8px);width:24px;height:24px">
+    <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+    <input id="straddle" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+  </div>
+  <div style="height:3000px"></div>
+  <div style="position:relative;width:24px;height:24px;margin:20px">
+    <span style="position:absolute;inset:0;border:2px solid #333;pointer-events:none"></span>
+    <input id="below" type="checkbox" style="position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;z-index:1">
+  </div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["#overlay", "#below", "#straddle", "#inlist"])
+async def test_click_checks_a_transparent_checkbox_laid_over_its_own_styled_box(selector: str) -> None:
+    async with _content_page(_OPACITY0_OVERLAY_CHECKBOX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": selector})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector(selector, "el => el.checked") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "diagnosis"),
+    [
+        ("#collapsed", "not rendered"),
+        ("#faded", "not rendered"),
+        ("#labelfaded", "not rendered"),
+        ("#stacked", "not rendered"),
+        ("#covered", "something else is on top of it"),
+    ],
+)
+async def test_click_still_refuses_a_transparent_checkbox_nothing_reaches(selector: str, diagnosis: str) -> None:
+    async with _content_page(_OPACITY0_OVERLAY_CHECKBOX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": selector})
+        assert r.status == "error"
+        assert diagnosis in r.content, r.content
+        assert await page.eval_on_selector(selector, "el => el.checked") is False
 
 
 @_skip_no_browser
@@ -24214,8 +24325,10 @@ def _cc_widget_script(
     setsize_extra: int = 0,
     thin_separators: bool = False,
     unknown_from: int = -1,
+    walk_shape: dict[str, Any] | None = None,
 ) -> str:
     # `#cc-search`, when rendered, filters by label prefix and shows only the first match.
+    # `walk_shape` switches to rows whose option box is the whole row (see `_cc_walk_shape_script`).
     # Modeled on a live probe of the real widget: the role=listbox node (#cc-menu) is NOT the scroll
     # container -- its child #cc-scroll (overflow-y:auto) is. #cc-scroll holds a <ul id=cc-spacer> sized
     # to the whole list; only a window of <li> rows -- absolutely positioned via transform:translateY --
@@ -24270,8 +24383,8 @@ def _cc_widget_script(
         "      li.appendChild(host);\n"
         "      spacer.appendChild(li);\n"
         "    }\n"
-        "  }\n"
-        "  function render() {\n"
+        "  }\n" + _cc_walk_shape_script(walk_shape, row_h) + "  function render() {\n"
+        "    if (SHAPE) { renderShape(); return; }\n"
         "    var scrollTop = scroller.scrollTop;\n"
         "    var start = Math.max(0, Math.floor(scrollTop / ROW_H));\n"
         "    var end = Math.min(N - 1, start + Math.ceil(VISIBLE_H / ROW_H) - 1);\n"
@@ -24321,6 +24434,7 @@ def _cc_widget_script(
         "    if (btn.getAttribute('aria-expanded') === 'true') { closeMenu(); } else { openMenu(); }\n"
         "  });\n"
         "  scroller.addEventListener('scroll', function () {\n"
+        "    if (SHAPE) shapeScrolled();\n"
         "    render();\n"
         "    if (LAZY.length && !lazyDone && scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) {\n"
         "      lazyDone = true;\n"
@@ -24346,6 +24460,68 @@ def _cc_widget_script(
     )
 
 
+def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
+    # Rows whose role=option box IS the row, laid out from per-row `heights` (default row_h) with the clickable
+    # leaf pushed down by per-row `offsets`. `sticky` pins a text row and a separator to the scroller top;
+    # `prepend` inserts rows at the top on the `prepend_at`-th scroll; `grow` appends rows on the first scroll
+    # away from the bottom; `enter_ms` slides every mounted row in from 40px below; `overscan` mounts that
+    # many rows past each end of the viewport, `drop_blanks` renders a blank row as no element at all, and `jitter` nudges the row labelled `jitter_label` down that
+    # many px on every other render.
+    return (
+        "  var SHAPE = " + json.dumps(shape) + ";\n"
+        "  var TOPS = [], shapeScrolls = 0, shapeRenders = 0, shapeAtEnd = false, shapeGrown = false;\n"
+        '  var STICKY_HTML = \'<li role="option" aria-disabled="true" style="position:sticky;top:0;height:22px;\' +\n'
+        "    'width:40px;margin-left:200px;z-index:3;background:#fff;line-height:16px\">Top</li>' +\n"
+        '    \'<li role="separator" style="position:sticky;top:22px;height:4px;width:40px;margin-left:200px;\' +\n'
+        "    'z-index:3;background:#ccc\"></li>';\n"
+        "  function shapeLayout() {\n"
+        "    N = COUNTRIES.length; TOPS = []; var total = 0;\n"
+        "    for (var i = 0; i < N; i++) { TOPS.push(total); total += COUNTRIES[i][2] || ROW_H; }\n"
+        "    spacer.style.height = total + 'px';\n"
+        "  }\n"
+        "  if (SHAPE) {\n"
+        "    COUNTRIES = COUNTRIES.map(function (c, i) {\n"
+        "      return [c[0], c[1], (SHAPE.heights || [])[i] || ROW_H, (SHAPE.offsets || [])[i] || 0];\n"
+        "    });\n"
+        "    ALL = COUNTRIES; shapeLayout();\n"
+        "  }\n"
+        "  function shapeScrolled() {\n"
+        "    shapeScrolls++;\n"
+        "    if (SHAPE.prepend && shapeScrolls === SHAPE.prepend_at) { COUNTRIES = SHAPE.prepend.concat(COUNTRIES); shapeLayout(); }\n"
+        "    if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) shapeAtEnd = true;\n"
+        "    else if (shapeAtEnd && SHAPE.grow && !shapeGrown) {\n"
+        "      shapeGrown = true; COUNTRIES = COUNTRIES.concat(SHAPE.grow); shapeLayout();\n"
+        "    }\n"
+        "  }\n"
+        "  function renderShape() {\n"
+        "    var s = scroller.scrollTop, first = -1, last = -1, i;\n"
+        "    for (i = 0; i < N; i++) {\n"
+        "      if (TOPS[i] + (COUNTRIES[i][2] || ROW_H) > s && TOPS[i] < s + VISIBLE_H) { if (first < 0) first = i; last = i; }\n"
+        "    }\n"
+        "    var html = SHAPE.sticky ? STICKY_HTML : '';\n"
+        "    shapeRenders++;\n"
+        "    if (first >= 0) {\n"
+        "      first = Math.max(0, first - (SHAPE.overscan || 0)); last = Math.min(N - 1, last + (SHAPE.overscan || 0));\n"
+        "      for (i = first; i <= last; i++) {\n"
+        "        var c = COUNTRIES[i], h = c[2] || ROW_H;\n"
+        "        if (SHAPE.drop_blanks && !c[0]) continue;\n"
+        "        var style = 'box-sizing:border-box;height:' + h + 'px;padding-top:' + (c[3] || 0) + 'px';\n"
+        "        if (SHAPE.jitter && c[0] === SHAPE.jitter_label && shapeRenders % 2) {\n"
+        "          style += ';transform:translateY(' + SHAPE.jitter + 'px)';\n"
+        "        }\n"
+        "        if (SHAPE.enter_ms) style += ';animation:tv3-enter ' + SHAPE.enter_ms + 'ms ease-out';\n"
+        "        html += '<li style=\"position:absolute;top:0;left:8px;width:calc(100% - 16px);height:' + h +\n"
+        "          'px;transform:translateY(' + TOPS[i] + 'px)\"><div role=\"option\" aria-selected=\"' +\n"
+        "          (i === currentIndex ? 'true' : 'false') + '\" id=\"item-' + i + '\" aria-label=\"' + c[0] + '\"' +\n"
+        "          (SETSIZE ? ' aria-setsize=\"' + (N + SETSIZE_EXTRA) + '\"' : '') + ' style=\"' + style + '\">' +\n"
+        "          '<div style=\"cursor:pointer;line-height:16px\">' + c[0] + '</div></div></li>';\n"
+        "      }\n"
+        "    }\n"
+        "    spacer.innerHTML = html;\n"
+        "  }\n"
+    )
+
+
 def _cc_widget_html(
     countries: list[tuple[str, str]],
     current_index: int,
@@ -24364,6 +24540,7 @@ def _cc_widget_html(
     unknown_from: int = -1,
     pad_px: int = 0,
     search_box: bool = False,
+    walk_shape: dict[str, Any] | None = None,
 ) -> str:
     # #cc-menu (role=listbox) is deliberately NOT scrollable -- overflow:visible, height pinned to
     # visible_h so its own scrollHeight == clientHeight, matching the real widget's DOM. #cc-scroll is
@@ -24381,12 +24558,17 @@ def _cc_widget_html(
         setsize_extra=setsize_extra,
         thin_separators=thin_separators,
         unknown_from=unknown_from,
+        walk_shape=walk_shape,
     )
     name, dial = countries[current_index]
+    scale = (walk_shape or {}).get("scale")
     role_attr = 'role="listbox"' if list_role else ""
     return (
-        "<!doctype html><html><body>\n"
-        '<div id="cc-wrap" style="position:absolute;left:20px;top:10px">\n'
+        "<!doctype html><html><head><style>@keyframes tv3-enter { from { transform: translateY(40px); } }</style>"
+        "</head><body>\n"
+        '<div id="cc-wrap" style="position:absolute;left:20px;top:10px'
+        + (f";transform:scale({scale});transform-origin:0 0" if scale else "")
+        + '">\n'
         '  <button id="cc" type="button" aria-haspopup="listbox" aria-expanded="false"\n'
         f'          aria-label="Select country calling code: {name}"\n'
         '          style="width:220px;height:32px">Country</button>\n'
@@ -24532,6 +24714,257 @@ async def test_select_combobox_walk_refusal_names_the_row_it_found_in_a_list_dec
         assert "Canada" in await page.eval_on_selector(row, "el => el.textContent"), r.content
 
 
+_WALK_SLOTS = ("start", "middle", "end", "none")
+# Families a walk has to prove whole, each crossed with a row missing at one slot. Values: fixture knobs.
+_WALK_FAMILIES: dict[str, dict[str, Any]] = {
+    "mixed_heights_tall": {"heights": "tall"},
+    "mixed_heights_short": {"heights": "short"},
+    "inner_offsets": {"offsets": True},
+    "sticky_fillers": {"sticky": True},
+    "prepend_mid_walk": {"prepend_at": 3},
+    "ancestor_scale": {"scale": 1.25},
+    "enter_animation": {"enter_ms": 250},
+    "extent_grows_after_end": {"grow": True},
+    "double_counted_setsize": {"overscan": 2, "jitter": 4, "jitter_label": "Canada", "setsize": True},
+}
+
+
+def _walk_property_cases() -> list[tuple[str, str, str, bool]]:
+    """(family, slot, html, commits). A missing slot is a blank placeholder row that may still load a second
+    "Canada" (at the start of `prepend_mid_walk`, a second "Canada" the page prepends after the walk passed the
+    top). A list that grows after the walk's end check has rows the walk never read, so it refuses at every slot."""
+    cases: list[tuple[str, str, str, bool]] = []
+    base = [(f"Option {i:02d}", f"+{200 + i}") for i in range(40)]
+    base[14] = ("Canada", "+1")
+    layouts = [("plain", {"row_h": h, "pad_px": p}) for h in (58, 35.5) for p in (0, 8)]
+    layouts += [
+        (family, {"row_h": (58, 35.5)[k % 2], "pad_px": (0, 8)[k // 2 % 2]}) for k, family in enumerate(_WALK_FAMILIES)
+    ]
+    for family, sizes in layouts:
+        knobs = dict(_WALK_FAMILIES.get(family, {}))
+        for slot in _WALK_SLOTS:
+            rows = list(base)
+            hole = {"start": 0, "middle": 22, "end": len(rows), "none": None}[slot]
+            if hole is not None and not (family == "prepend_mid_walk" and slot == "start"):
+                rows.insert(hole, ("", ""))
+            shape: dict[str, Any] | None = None
+            if family != "plain":
+                shape = {k: v for k, v in knobs.items() if k not in ("heights", "offsets", "grow", "setsize", "scale")}
+                if family == "ancestor_scale":
+                    shape["scale"] = knobs["scale"]
+                at = 22 if hole is None else min(hole, len(rows) - 1)
+                if knobs.get("heights") == "tall":
+                    shape["heights"] = [32 if abs(i - at) <= 1 or i % 7 == 3 else 64 for i in range(len(rows))]
+                elif knobs.get("heights") == "short":
+                    shape["heights"] = [80 if i % 5 == 2 and abs(i - at) > 1 else 32 for i in range(len(rows))]
+                if knobs.get("offsets"):
+                    shape["offsets"] = [14 if i % 2 else 0 for i in range(len(rows))]
+                if knobs.get("prepend_at"):
+                    shape["prepend"] = [["Canada", "+2"]] if slot == "start" else [["Prepended", "+300"]]
+                if knobs.get("grow"):
+                    shape["grow"] = [["Late 1", "+301"], ["Late 2", "+302"]]
+            html = _cc_widget_html(rows, 30, setsize=bool(knobs.get("setsize")), walk_shape=shape, **sizes)
+            cases.append(
+                (
+                    f"{family}[row_h={sizes['row_h']},pad={sizes['pad_px']}]",
+                    slot,
+                    html,
+                    slot == "none" and family != "extent_grows_after_end",
+                )
+            )
+    # Holes in most slots: a placeholder (or no element at all) after every row, or two after every row. No slot
+    # between two read rows shows the list's own spacing, so every one of these refuses.
+    for row_h, box_rows in ((58, False), (58, True), (35.5, True)):
+        for every in (1, 2):
+            for drop in (False, True) if box_rows else (False,):
+                rows = [row for row in base for row in [row, *[("", "")] * every]]
+                shape = {"drop_blanks": drop} if box_rows else None
+                html = _cc_widget_html(rows, 30, row_h=row_h, walk_shape=shape)
+                name = f"holes_{every}_of_{every + 1}[row_h={row_h},{'box' if box_rows else 'plain'}{',no_element' if drop else ''}]"
+                cases.append((name, "most", html, False))
+    # Short placeholders between tall rows leave slots under the row height, so only the spacing read between
+    # DOM-adjacent rows tells them from spacing.
+    for every in (1, 2):
+        rows = [row for row in base for row in [row, *[("", "")] * every]]
+        shape = {"heights": [64 if name else 32 for name, _ in rows]}
+        html = _cc_widget_html(rows, 30, row_h=64, walk_shape=shape)
+        cases.append((f"holes_{every}_of_{every + 1}[short placeholders between 64px rows]", "most", html, False))
+    return cases
+
+
+def test_list_coverage_refuses_a_slot_at_the_midpoint_of_spacing_and_a_missing_row() -> None:
+    # Rows 20px tall, 4px apart: a complete list leaves 4px slots, one missing row at least 4 + 20. The widest slot
+    # a complete list may show is the midpoint, 4 + 20 / 2.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(slot: float) -> str:
+        rows, top = [], 0.0
+        for i in range(6):
+            rows.append({"n": i + 1, "text": f"Row {i}", "box": [top, top + 20], "line": 20, "after": f"Row {i - 1}"})
+            top += 20 + (slot if i == 2 else 4)
+        state = {"scrollTop": 0, "scrollHeight": top - 4, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        return _list_coverage([_list_window(rows, state)])
+
+    assert coverage(14 - 0.25) == "complete"
+    assert coverage(14) == "incomplete"
+
+
+def test_list_coverage_a_declared_size_never_proves_rows_the_geometry_leaves_unread() -> None:
+    # A virtualised list may size each rendered window: 8 rows declaring aria-setsize 8 at the top of a 6,400px
+    # extent. The declared size is met; the other 6,000px were never read.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    window = [{"n": i + 1, "text": f"R{i}", "box": [i * 50, i * 50 + 50], "line": 20, "setsize": 8} for i in range(8)]
+    long_list = {"scrollTop": 0, "scrollHeight": 6400, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+    assert _list_coverage([_list_window(window, long_list)]) == "incomplete"
+    assert _list_coverage([_list_window(window, long_list | {"scrollHeight": 400})]) == "complete"
+
+
+def test_list_coverage_refuses_a_group_short_of_its_own_declared_size() -> None:
+    # ARIA scopes aria-setsize to each group: group 1 reads all its rows, group 2 reads 4 of its 6. `room` is the
+    # extent left below the rows read; with none, the rows tile and only group 2's declared size shows the gap.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(groups: list[tuple[int, int]], room: float) -> str:
+        rows: list[dict[str, Any]] = []
+        top = 0.0
+        for g, (size, shown) in enumerate(groups):
+            for i in range(shown):
+                after = rows[-1]["text"] if rows else None
+                rows.append(
+                    {"n": len(rows) + 1, "text": f"G{g} R{i}", "box": [top, top + 20], "line": 20, "after": after}
+                    | {"setsize": size, "group": f"Group {g}"}
+                )
+                top += 20
+        state = {"scrollTop": 0, "scrollHeight": top + room, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        return _list_coverage([_list_window(rows, state)])
+
+    assert coverage([(10, 10), (6, 4)], room=40) == "incomplete"
+    assert coverage([(10, 10), (6, 4)], room=0) == "declares_more"
+    assert coverage([(6, 6), (6, 4)], room=0) == "declares_more"
+    assert coverage([(10, 10), (6, 6)], room=0) == "complete"
+
+
+def test_list_coverage_counts_the_largest_size_any_read_of_a_row_declares() -> None:
+    # Ten rows tile their extent and are read twice. A later read declaring 11, where the first declared 10 or
+    # nothing, still says the list holds a row the walk never read.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(first: int, later: int) -> str:
+        state = {"scrollTop": 0, "scrollHeight": 200, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        windows = [
+            _list_window(
+                [
+                    {"n": i + 1, "text": f"R{i}", "box": [i * 20, i * 20 + 20], "line": 20, "setsize": size}
+                    for i in range(10)
+                ],
+                state,
+            )
+            for size in (first, later)
+        ]
+        return _list_coverage(windows)
+
+    assert coverage(10, 10) == "complete"
+    assert coverage(10, 11) == "declares_more"
+    assert coverage(0, 11) == "declares_more"
+
+
+def test_list_coverage_refuses_a_declared_size_too_large_to_hold() -> None:
+    # The page sets aria-setsize: an over-large or infinite total refuses without raising.
+    from skyvern.forge.taskv3.tools import _list_coverage, _list_window  # noqa: PLC0415
+
+    def coverage(size: float) -> str:
+        rows = [
+            {"n": i + 1, "text": f"R{i}", "box": [i * 20, i * 20 + 20], "line": 20, "setsize": size} for i in range(3)
+        ]
+        state = {"scrollTop": 0, "scrollHeight": 60, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
+        return _list_coverage([_list_window(rows, state)])
+
+    assert coverage(0) == "complete"
+    assert coverage(1e30) == "declares_more"
+    assert coverage(float("inf")) == "declares_more"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_walk_commits_only_a_list_it_read_whole() -> None:
+    # Generated: every family crossed with a missing row at the start, middle, end or nowhere. A missing row
+    # refuses and leaves the field empty; a list with none commits "Canada".
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.tools import (  # noqa: PLC0415
+        _MENU_OPTION_TEXTS_JS,
+        _MENU_SCROLLER_STEP_JS,
+        _MENU_WINDOW_FINGERPRINT_JS,
+    )
+
+    class _ScriptLog:
+        # Records which probe each evaluate ran, so a case can count the row reads each walk window took.
+        def __init__(self, page: Any) -> None:
+            self._page = page
+            self.scripts: list[str] = []
+            self.steps: list[Any] = []
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._page, name)
+
+        async def evaluate(self, script: str, arg: Any = None) -> Any:
+            self.scripts.append(script)
+            result = await self._page.evaluate(script, arg)
+            if script == _MENU_SCROLLER_STEP_JS:
+                self.steps.append((arg, {k: v for k, v in (result or {}).items() if k != "fillers"}))
+            return result
+
+    def reread_windows(log: _ScriptLog) -> list[Any]:
+        # The scroller reads of every walk window that read its rows more than once.
+        steps = iter(log.steps)
+        out: list[Any] = []
+        window: list[Any] = []
+        reads = 0
+        for i, script in enumerate(log.scripts):
+            if script == _MENU_SCROLLER_STEP_JS:
+                if i + 1 < len(log.scripts) and log.scripts[i + 1] == _MENU_WINDOW_FINGERPRINT_JS:
+                    if reads > 1:
+                        out.append(window)
+                    window, reads = [], 0
+                window.append(next(steps))
+            elif script == _MENU_OPTION_TEXTS_JS:
+                reads += 1
+        return [*out, *([window] if reads > 1 else [])]
+
+    # Rows that never move during a read: each window is read once, and a missing row still refuses.
+    still = ("plain", "mixed_heights", "inner_offsets", "sticky", "ancestor_scale", "double_counted", "holes_")
+    cases = _walk_property_cases()
+    assert len(cases) >= 64, len(cases)
+    wrong: list[str] = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            for family, slot, html, commits in cases:
+                context = await browser.new_context(viewport={"width": 1024, "height": 900})
+                try:
+                    page = await context.new_page()
+                    await page.set_content(html)
+                    logged = _ScriptLog(page)
+                    tools = build_browser_tools(_fixed_page_provider(logged))
+                    r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+                    phone = await page.eval_on_selector("#phone", "el => el.value")
+                finally:
+                    await context.close()
+                # A scroll can land between two frames once in a walk; more than one re-read means still rows
+                # are being read twice.
+                if family.startswith(still) and len(reread := reread_windows(logged)) > 1:
+                    wrong.append(f"{family} slot={slot}: {len(reread)} still windows read twice: {reread[:2]}")
+                got = r.status == "ok" and phone == "+1"
+                if got != commits or (not commits and phone != ""):
+                    wrong.append(
+                        f"{family} slot={slot}: want {'commit' if commits else 'refuse'}, {r.status} phone={phone!r}: {r.content[:140]}"
+                    )
+        finally:
+            await browser.close()
+    assert not wrong, f"{len(wrong)}/{len(cases)} wrong:\n" + "\n".join(wrong)
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -24583,6 +25016,35 @@ async def test_observe_marks_button_listbox_anchor_as_combobox() -> None:
         r = await _tool(tools, "observe").handler({})
     line = next(ln for ln in r.content.splitlines() if "Select country calling code:" in ln)
     assert "[autocomplete→use select_combobox]" in line, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_does_not_take_a_shared_lead_clause_the_walk_saw_as_the_committed_row() -> None:
+    # The walk passes "Riverton, South Province" before it finds "Riverton, Riverdale County" far down the list;
+    # the widget then commits the sibling and shows only "Riverton". That clause names two walked rows.
+    places = [(f"Place {i:02d}", f"+{i}") for i in range(30)]
+    places[2] = ("Riverton, South Province", "+2")
+    places[-1] = ("Riverton, Riverdale County", "+29")
+    misroute = """
+<script>
+(function () {
+  var btn = document.getElementById('cc');
+  new MutationObserver(function () {
+    var label = btn.getAttribute('aria-label') || '';
+    if (label.indexOf('Riverdale County') < 0) return;
+    btn.setAttribute('aria-label', 'Select country calling code: Riverton, South Province');
+    btn.textContent = 'Riverton';
+  }).observe(btn, { attributes: true, attributeFilter: ['aria-label'] });
+})();
+</script>
+</body>"""
+    async with _content_page(_cc_widget_html(places, 0).replace("</body>", misroute)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Riverton, Riverdale County"})
+        label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
+        assert label.endswith("South Province"), label
+        assert r.status != "ok", r.content
 
 
 @_skip_no_browser
@@ -25759,6 +26221,561 @@ async def _run_generated_popup_shape(browser: Any, shape: dict[str, str]) -> lis
     return [f"{shape}: {f} -- {r.content[:300]}" for f in failures]
 
 
+_COMMIT_STATE_VOCAB = ["Canada", "Cape Verde", "Chile", "China", "Colombia", "Denmark", "France"]
+
+
+def _generated_commit_state_widget_html(shape: dict[str, str]) -> str:
+    # One field in a form beside an unrelated input, a SIBLING field with its own label, and an empty block
+    # below the field. `path` is a typeahead input or a click-to-open anchor; `surface` is where a commit shows
+    # (the input's value, a painted single-value node, a removable chip button, the label's own value line, or
+    # the anchor's text). `extra` pre-holds the value, writes the pick into the sibling instead, renders a
+    # dependent sub-form below the field on commit, answers an absent value with an echo row, starts with
+    # another chip, or multi-selects so the list stays open. `quickpick` puts inert suggestion buttons naming the
+    # options beside the field, `neighbour_chips` a sibling chip group with no field control of its own, and
+    # `filter_popup_dead` a list whose row click is dead and re-renders the list with its own filter box
+    # (`_split` also splits each row's text across a checkbox and highlight markup; `_inline` does that in a
+    # list laid out in the page's flow; `_div_inline` renders it as roleless divs with no checkbox). `mirror`
+    # copies each keystroke into a hidden input beside the field. `held_open` holds the value with the
+    # field's list already open, and `controlled_chip_popup` opens it before the call as a roleless list the field
+    # names in aria-controls (`_bare`: names nowhere), each row shaped like a chip with its own dismiss control.
+    # `disabled_exact` greys out the exact row beside a longer one, `toggle_async` deselects a held chip a beat after the click, and
+    # `short_open_text` / `short_misroute` show only a leading clause that several options share.
+    # The widget's committed truth is body[data-committed].
+    return f"""
+<!doctype html><html><body style="margin:0">
+<form id="f" onsubmit="return false" style="position:relative;padding:20px">
+  <input id="x-name" type="text" style="width:200px;height:24px">
+  <div id="grp" style="position:relative;margin-top:10px">
+    <label id="lbl" for="fld">Country<span id="lbl-val" style="display:block"></span></label>
+    <div id="ctl" style="display:flex;gap:4px;align-items:center;min-height:30px">
+      <span id="chips"></span><span id="sv" class="select__single-value"></span>
+      <span id="anchor-slot"></span>
+    </div>
+  </div>
+  <div id="dep"></div>
+  <div id="sib" style="margin-top:260px">
+    <label id="sib-lbl" for="sib-in">Other country<span id="sib-val" style="display:block"></span></label>
+    <span id="sib-chips"></span><input id="sib-in" type="text" style="width:200px;height:24px">
+  </div>
+</form>
+<script>
+(function () {{
+  var S = {json.dumps(shape)}, VOCAB = {json.dumps(_COMMIT_STATE_VOCAB)};
+  var TYPE = S.path === 'typeahead', DECL = S.declared === 'yes', EXP = S.aria === 'expanded';
+  var MULTI = S.surface === 'chip' || S.extra === 'left_open';
+  var OPEN_TEXT = '';
+  // The short_* extras show only the committed row's leading clause on the anchor ("Riverton").
+  var SHORT = S.extra.indexOf('short') === 0, shown = S.extra === 'short_unchanged' ? 'Riverton' : 'Make a selection';
+  if (SHORT) VOCAB = ['Riverdale, North Province', 'Riverton, Riverdale County', 'Rivers, South Province'];
+  if (S.extra.indexOf('short_open_text') === 0) VOCAB = ['Riverdale, North Province', 'Riverton, Riverdale County'];
+  if (S.extra === 'short_misroute') VOCAB = ['Riverton, Riverdale County', 'Riverton, South Province'];
+  if (S.extra.indexOf('disabled_exact') === 0) VOCAB = ['Canada', S.near, 'Chile'];
+  var DEAD_POPUP = S.extra.indexOf('filter_popup_dead') === 0;
+  var slot = document.getElementById('anchor-slot'), grp = document.getElementById('grp');
+  var chips = document.getElementById('chips'), sv = document.getElementById('sv');
+  var lblVal = document.getElementById('lbl-val'), list = null, field, cbLabel = null, truth = [];
+  window.__rowClicks = 0;
+  window.__escapes = 0;
+  if (TYPE) {{
+    field = document.createElement('input');
+    field.type = 'text';
+    field.autocomplete = 'off';
+    field.style.cssText = 'width:200px;height:24px';
+  }} else {{
+    field = document.createElement('div');
+    field.tabIndex = 0;
+    field.style.cssText = 'width:250px;height:30px;border:1px solid #999';
+    cbLabel = document.createElement('span');
+    cbLabel.textContent = 'Make a selection';
+    field.appendChild(cbLabel);
+  }}
+  field.id = 'fld';
+  field.setAttribute('role', 'combobox');
+  if (TYPE) field.setAttribute('aria-autocomplete', 'list');
+  var CHIP_ROWS = S.extra.indexOf('controlled_chip_popup') === 0;
+  if (DECL || S.extra === 'controlled_chip_popup') field.setAttribute('aria-controls', 'fld-list');
+  if (EXP) field.setAttribute('aria-expanded', 'false');
+  slot.appendChild(field);
+  function counted(el) {{
+    el.setAttribute('data-inputs', '0');
+    el.addEventListener('input', function () {{
+      el.setAttribute('data-inputs', String(Number(el.getAttribute('data-inputs')) + 1));
+    }});
+  }}
+  ['x-name', 'sib-in'].forEach(function (id) {{ counted(document.getElementById(id)); }});
+  if (TYPE) counted(field);
+  if (S.mirror === 'yes') {{
+    var mirror = document.createElement('input');
+    mirror.type = 'hidden';
+    document.getElementById('ctl').appendChild(mirror);
+    field.addEventListener('input', function () {{ mirror.value = field.value; }});
+  }}
+  function sync() {{ document.body.setAttribute('data-committed', truth.join('|')); }}
+  function chip(host, name) {{
+    if (S.extra === 'rs_held') {{
+      var mv = document.createElement('div');
+      mv.className = 'select__multi-value';
+      mv.innerHTML = '<div class="select__multi-value__label">' + name + '</div><div role="button" aria-label="Remove '
+        + name + '" class="select__multi-value__remove"><svg width="8" height="8"><rect width="8" height="8"></rect></svg></div>';
+      host.appendChild(mv);
+      return;
+    }}
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'tag-btn';
+    var words = S.extra === 'split_chip' ? name.split(' ') : [name];
+    b.appendChild(document.createTextNode(words[0]));
+    if (words.length > 1) {{ var rest = document.createElement('span'); rest.textContent = ' ' + words.slice(1).join(' '); b.appendChild(rest); }}
+    var sr = document.createElement('span');
+    sr.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)';
+    sr.textContent = 'Dismiss';
+    b.appendChild(sr);
+    host.appendChild(b);
+  }}
+  function paint() {{
+    if (S.surface === 'chip') {{ chips.innerHTML = ''; truth.forEach(function (n) {{ chip(chips, n); }}); }}
+    if (S.surface === 'single') sv.textContent = truth[0] || '';
+    if (S.surface === 'label') lblVal.textContent = truth[0] || '';
+    if (!TYPE) cbLabel.textContent = (MULTI ? truth.length + ' selected' : SHORT ? shown : (truth[0] || 'Make a selection')) + OPEN_TEXT;
+    sync();
+  }}
+  function close() {{
+    if (list) {{ list.remove(); list = null; }}
+    if (OPEN_TEXT || S.extra === 'preview_open') {{ OPEN_TEXT = ''; paint(); }}
+    if (EXP) field.setAttribute('aria-expanded', 'false');
+  }}
+  function commit(name) {{
+    window.__rowClicks++;
+    if (DEAD_POPUP) {{
+      setTimeout(function () {{ if (list) {{ list.remove(); list = null; render(field.value.trim().toLowerCase()); }} }}, 50);
+      return;
+    }}
+    if (S.extra.indexOf('short_open_text') === 0) {{ close(); return; }}
+    if (S.extra === 'short_misroute') {{ truth = ['Riverton, South Province']; shown = 'Riverton'; paint(); close(); return; }}
+    if (S.extra === 'toggle_async') {{
+      if (TYPE) field.value = '';
+      close();
+      setTimeout(function () {{ var at = truth.indexOf(name); if (at >= 0) truth.splice(at, 1); else truth.push(name); paint(); }}, 900);
+      return;
+    }}
+    if (SHORT) {{
+      if (S.extra === 'short') {{ truth = [name]; shown = name.split(',')[0]; }}
+      if (S.extra === 'short_wrong') shown = 'Riverdale';
+      if (S.extra === 'short_placeholder') shown = 'Select\u2026';
+      if (S.extra === 'short_sibling') document.getElementById('sib-cb').textContent = name.split(',')[0];
+      paint();
+      close();
+      return;
+    }}
+    if (S.extra === 'sibling') {{
+      document.getElementById('sib-val').textContent = name;
+      document.getElementById('sib-in').value = name;
+      chip(document.getElementById('sib-chips'), name);
+      if (TYPE) field.value = '';
+      close();
+      return;
+    }}
+    if (MULTI) {{
+      var at = truth.indexOf(name);
+      if (at >= 0) truth.splice(at, 1); else truth.push(name);
+    }} else {{
+      truth = [name];
+    }}
+    if (TYPE) field.value = S.surface !== 'value' ? '' : S.extra === 'decorated_open' ? name + ' (CA)' : name;
+    paint();
+    if (S.extra === 'dependent') {{
+      document.getElementById('dep').innerHTML =
+        '<div style="padding:4px"><label for="dep-in">Postal code</label><input id="dep-in" type="text"></div>';
+    }}
+    if (S.extra !== 'left_open' && S.extra !== 'decorated_open') close();
+    else if (list) render('');
+  }}
+  function row(name, echo) {{
+    var DIVS = DECL || S.extra === 'filter_popup_dead_div_inline';
+    var r = document.createElement(DIVS ? 'div' : 'li');
+    if (DECL) r.setAttribute('role', 'option');
+    if (DECL || S.extra === 'left_open') r.setAttribute('aria-selected', truth.indexOf(name) >= 0 ? 'true' : 'false');
+    r.style.cssText = 'height:24px;cursor:pointer';
+    if (echo === 'disabled') {{ r.setAttribute('aria-disabled', 'true'); r.textContent = 'No results for ' + name; }}
+    else if (echo) r.textContent = 'No results found for\\u00a0"' + name + '"';
+    else if (S.extra === 'filter_popup_dead_div_inline') r.innerHTML = '<b>' + name.slice(0, 3) + '</b>' + name.slice(3);
+    else if (CHIP_ROWS) {{
+      r.className = 'chip';
+      r.innerHTML = name + '<button type="button" aria-label="Dismiss" style="width:12px;height:12px"></button>';
+    }}
+    else if (S.extra.indexOf('filter_popup_dead_') === 0) {{
+      r.innerHTML = '<input type="checkbox"><span><b>' + name.slice(0, 3) + '</b>' + name.slice(3) + '</span>';
+    }} else r.textContent = name;
+    var greyed = S.extra.indexOf('disabled_exact') === 0 && name === S.target;
+    if (greyed) r.setAttribute('aria-disabled', 'true');
+    r.addEventListener('click', function () {{
+      if (greyed) return;
+      if (echo) {{ document.body.setAttribute('data-echo-clicked', '1'); return; }}
+      commit(name);
+    }});
+    return r;
+  }}
+  function render(q) {{
+    if (!list) {{
+      list = document.createElement(DECL || S.extra === 'filter_popup_dead_div_inline' ? 'div' : 'ul');
+      list.id = 'fld-list';
+      if (DECL) list.setAttribute('role', 'listbox');
+      if (S.extra === 'left_open') list.setAttribute('aria-multiselectable', 'true');
+      list.style.cssText = S.extra === 'filter_popup_dead_inline' || S.extra === 'filter_popup_dead_div_inline'
+        ? 'list-style:none;margin:0;padding:0;width:260px;background:#fff'
+        : 'list-style:none;margin:0;padding:0;position:absolute;left:0;top:64px;width:260px;background:#fff;z-index:5';
+      grp.appendChild(list);
+      if (EXP) field.setAttribute('aria-expanded', 'true');
+      if (S.extra.indexOf('short_open_text') === 0) {{ OPEN_TEXT = ' (choose below)'; paint(); }}
+      if (S.extra === 'preview_open') cbLabel.textContent = S.target;
+    }}
+    list.innerHTML = '';
+    if (DEAD_POPUP) {{
+      var filter = document.createElement('input');
+      filter.placeholder = 'Filter';
+      list.appendChild(filter);
+    }}
+    var hits = VOCAB.filter(function (n) {{ return (!q || n.toLowerCase().indexOf(q) === 0); }});
+    // A fuzzy search answers the query with every near spelling it knows.
+    if (q && S.near) hits = VOCAB.slice(0, 2);
+    if (q && !hits.length && S.extra === 'echo') list.appendChild(row(field.value.trim(), S.echo));
+    hits.forEach(function (n) {{ list.appendChild(row(n, '')); }});
+  }}
+  if (S.extra === 'held' || S.extra === 'held_open' || S.extra === 'left_open' || S.extra === 'toggle_async') {{
+    truth = [S.target];
+  }}
+  if (S.extra === 'disabled_exact_held' || S.extra === 'rs_held') truth = [S.target];
+  if (S.extra.indexOf('short_open_text') === 0) {{ truth = ['Riverton, South Province']; shown = 'Riverton'; }}
+  if (S.extra === 'split_chip') truth = ['Canada East'];
+  if (S.extra === 'preview_open') truth = ['Chile'];
+  if (S.extra === 'prior_chip') truth = ['Chile'];
+  if (S.extra === 'held_raw') field.value = S.target;
+  if (SHORT) {{
+    var sibCb = document.createElement('div');
+    sibCb.id = 'sib-cb';
+    sibCb.setAttribute('role', 'combobox');
+    sibCb.textContent = 'Make a selection';
+    document.getElementById('sib').appendChild(sibCb);
+  }}
+  if (S.extra === 'quickpick') {{
+    var picks = document.createElement('span');
+    VOCAB.slice(0, 2).forEach(function (n) {{
+      var q = document.createElement('button');
+      q.type = 'button';
+      q.setAttribute('aria-label', 'Choose ' + n);
+      q.textContent = n;
+      picks.appendChild(q);
+    }});
+    document.getElementById('ctl').appendChild(picks);
+  }}
+  if (S.extra === 'caption_chip' || S.extra === 'group_chip') {{
+    var removable = '<span class="chip">' + S.target + '<button type="button" aria-label="Remove"><svg width="8" height="8">'
+      + '<rect width="8" height="8"></rect></svg></button></span>';
+    var held = document.createElement(S.extra === 'caption_chip' ? 'span' : 'div');
+    if (S.extra === 'caption_chip') held.innerHTML = '<span>Countries lived in</span>' + removable;
+    else {{ held.setAttribute('role', 'group'); held.setAttribute('aria-label', 'Countries lived in'); held.innerHTML = removable; }}
+    var ctl = document.getElementById('ctl');
+    if (S.extra === 'caption_chip') while (held.firstChild) ctl.insertBefore(held.firstChild, slot);
+    else ctl.insertBefore(held, slot);
+  }}
+  if (S.extra === 'neighbour_chips') {{
+    var other = document.createElement('div');
+    other.innerHTML = '<span>Countries lived in</span><span class="chip">' + S.target
+      + '<button type="button" aria-label="Remove"><svg width="8" height="8"><rect width="8" height="8"></rect></svg>'
+      + '</button></span><button type="button">Add</button>';
+    grp.insertBefore(other, grp.firstChild);
+  }}
+  paint();
+  if (TYPE) {{
+    field.addEventListener('input', function () {{
+      var q = field.value.trim().toLowerCase();
+      if (!q) {{ close(); return; }}
+      render(q);
+    }});
+    field.addEventListener('keydown', function (e) {{
+      if ((e.key === 'Backspace' || e.key === 'Delete') && field.value === '' && MULTI && truth.length) {{
+        truth.pop();
+        paint();
+      }}
+    }});
+  }} else {{
+    field.addEventListener('click', function () {{ if (list) close(); else render(''); }});
+  }}
+  document.addEventListener('keydown', function (e) {{ if (e.key === 'Escape') {{ window.__escapes++; close(); }} }});
+  if (S.extra === 'label_hint') lblVal.innerHTML = 'e.g. <b>' + S.target + '</b>';
+  if (S.extra === 'held_open' || S.extra === 'short_open_text_open' || S.extra === 'preview_open' || CHIP_ROWS) render('');
+}})();
+</script>
+</body></html>
+"""
+
+
+def _generated_commit_state_shapes() -> list[dict[str, str]]:
+    def shape(
+        path: str,
+        surface: str,
+        aria: str,
+        declared: str,
+        extra: str,
+        echo: str = "",
+        tool: str = "select_combobox",
+        near: str = "",
+        mirror: str = "no",
+    ) -> dict[str, str]:
+        return {
+            "family": "commit_state",
+            "tool": tool,
+            "near": near,
+            "mirror": mirror,
+            "path": path,
+            "surface": surface,
+            "aria": aria,
+            "declared": declared,
+            "extra": extra,
+            "echo": echo,
+            # A quoted echo shares only its inner words with the query, so the target has one.
+            "target": "Riverton, Riverdale County"
+            if extra.startswith("short")
+            else {"quoted": "Lost City Atlantis", "disabled": "Atlantis"}.get(echo, "Canada"),
+        }
+
+    arias = ("expanded", "none")
+    typed = ("value", "single", "chip", "label")
+    shapes = [shape("typeahead", s, a, d, "none") for s in typed for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", s, a, "yes", "held") for s in ("single", "chip", "label") for a in arias]
+    shapes += [shape("typeahead", "value", a, d, "held_raw") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", s, "none", d, "sibling") for s in ("single", "chip", "label") for d in ("yes", "no")]
+    shapes += [shape("typeahead", s, a, "no", "dependent") for s in ("value", "single", "label") for a in arias]
+    shapes += [shape("typeahead", "value", a, "no", "echo", e) for a in arias for e in ("quoted", "disabled")]
+    shapes += [shape("typeahead", "chip", a, d, "prior_chip") for a in arias for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", a, "yes", x) for a in arias for x in ("none", "held", "left_open")]
+    shapes += [shape("click", "anchor", "none", "yes", x) for x in ("sibling", "dependent")]
+    shapes += [shape("click", "anchor", a, "no", "held") for a in arias]
+    shapes += [shape("typeahead", s, "none", d, "quickpick") for s in ("value", "single") for d in ("yes", "no")]
+    shapes += [shape("typeahead", "value", "none", d, "neighbour_chips") for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", "none", "yes", x) for x in ("quickpick", "neighbour_chips")]
+    # A removable chip beside the field that another field's caption or labelled group owns, and a held
+    # React-Select-style chip that is the field's own.
+    shapes += [
+        shape("typeahead", s, "none", d, x)
+        for x in ("caption_chip", "group_chip")
+        for s in ("value", "single")
+        for d in ("yes", "no")
+    ]
+    shapes += [shape("click", "anchor", "none", "yes", x) for x in ("caption_chip", "group_chip")]
+    shapes += [shape("typeahead", "chip", a, d, "rs_held") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", "value", a, d, "filter_popup_dead") for a in arias for d in ("yes", "no")]
+    shorts = ("short", "short_wrong", "short_unchanged", "short_sibling", "short_placeholder")
+    shapes += [shape("click", "anchor", a, "yes", x) for a in arias for x in shorts]
+    for tool in ("select_combobox", "type"):
+        for x in ("filter_popup_dead_split", "filter_popup_dead_inline"):
+            shapes += [shape("typeahead", "value", a, d, x, tool=tool) for a in arias for d in ("yes", "no")]
+        # The exact row is greyed out beside a row one prefix, stem or extra word away from it.
+        for near in ("Canada East", "Canadian", "Canad", "Upper Canada Region"):
+            shapes += [shape("typeahead", "value", a, "no", "disabled_exact", tool=tool, near=near) for a in arias]
+            shapes += [shape("typeahead", "chip", a, "no", "disabled_exact_held", tool=tool, near=near) for a in arias]
+    shapes += [shape("typeahead", "chip", a, d, "toggle_async", tool="type") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", "chip", a, d, "none", tool="type") for a in arias for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", a, "yes", x) for a in arias for x in ("short_open_text", "short_misroute")]
+    # A dead click that re-renders the popup, whatever its rows look like, with the typed query also copied
+    # into a hidden input; and the real commits beside them, with and without a dependent sub-form.
+    dead = ("filter_popup_dead", "filter_popup_dead_split", "filter_popup_dead_inline", "filter_popup_dead_div_inline")
+    for tool in ("select_combobox", "type"):
+        shapes += [
+            shape("typeahead", "value", a, d, "filter_popup_dead_div_inline", tool=tool)
+            for a in arias
+            for d in ("yes", "no")
+        ]
+        shapes += [
+            shape("typeahead", "value", a, d, x, tool=tool, mirror="yes")
+            for x in dead
+            for a in arias
+            for d in ("yes", "no")
+        ]
+        shapes += [
+            shape("typeahead", "value", a, "no", x, tool=tool, mirror="yes")
+            for x in ("none", "dependent")
+            for a in arias
+        ]
+    shapes += [
+        shape("typeahead", s, a, d, "held_open")
+        for s in ("chip", "label")
+        for a, d in (("expanded", "no"), ("none", "yes"), ("expanded", "yes"))
+    ]
+    shapes += [shape("click", "anchor", a, "yes", "held_open") for a in arias]
+    # A label hint naming the value beside an empty field, a held chip whose text only starts with it, and an
+    # already-open list whose open state nothing declares.
+    shapes += [
+        shape("typeahead", s, a, d, "label_hint") for s in ("value", "single") for a in arias for d in ("yes", "no")
+    ]
+    shapes += [shape("typeahead", "chip", a, d, "split_chip") for a in arias for d in ("yes", "no")]
+    shapes += [shape("click", "anchor", "none", "no", "short_open_text_open")]
+    # An open list whose anchor previews the highlighted row, and a commit that writes the row's text plus a
+    # code while its list stays on screen.
+    shapes += [shape("click", "anchor", a, d, "preview_open") for a in arias for d in ("yes", "no")]
+    shapes += [shape("typeahead", "value", a, "yes", "decorated_open") for a in arias]
+    shapes += [
+        shape("typeahead", "value", "none", "no", x) for x in ("controlled_chip_popup", "controlled_chip_popup_bare")
+    ]
+    return shapes
+
+
+async def _run_generated_commit_state_shape(browser: Any, shape: dict[str, str]) -> list[str]:
+    target = shape["target"]
+    context = await browser.new_context(viewport={"width": 1024, "height": 900})
+    try:
+        page = await context.new_page()
+        await page.set_content(_generated_commit_state_widget_html(shape))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        if shape["tool"] == "type":
+            r = await _tool(tools, "type").handler({"selector": "#fld", "text": target})
+            await asyncio.sleep(1.2)
+        else:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": target})
+        state = await page.evaluate(
+            """() => ({
+              committed: document.body.getAttribute('data-committed') || '',
+              rowClicks: window.__rowClicks,
+              escapes: window.__escapes,
+              fieldInputs: Number(document.getElementById('fld').getAttribute('data-inputs') || 0),
+              echoClicked: document.body.hasAttribute('data-echo-clicked'),
+              listShown: !!document.getElementById('fld-list'),
+              outside: ['x-name', 'sib-in'].map((id) => [id, document.getElementById(id).getAttribute('data-inputs')]),
+              xName: document.getElementById('x-name').value,
+            })"""
+        )
+    finally:
+        await context.close()
+    held = [v for v in state["committed"].split("|") if v]
+    before = {
+        "held": [target],
+        "held_open": [target],
+        "left_open": [target],
+        "prior_chip": ["Chile"],
+        "disabled_exact_held": [target],
+        "rs_held": [target],
+        "toggle_async": [target],
+        "short_open_text": ["Riverton, South Province"],
+        "short_open_text_open": ["Riverton, South Province"],
+        "split_chip": ["Canada East"],
+    }.get(shape["extra"], [])
+    failures = []
+    if r.status == "ok" and target not in held:
+        failures.append(f"(a) ok but the field holds {held!r}")
+    # `short_misroute` is the widget committing another row than the one clicked; only (a) judges it.
+    misroute = shape["extra"] == "short_misroute"
+    if not misroute and r.status != "ok" and held != before and not all(v in r.content for v in held):
+        failures.append(f"(b) field changed to {held!r} unnamed")
+    failures += [f"(c) outside #{i} inputs={n}" for i, n in state["outside"] if n != "0"]
+    if state["xName"]:
+        failures.append("(c) outside #x-name holds text")
+    # Only a toggle field (its values shown as removable chips) with its list known closed (aria-expanded="false")
+    # skips a held value. A single-value field re-picks it and may then be refused when the click changes nothing it
+    # shows; an anchor that already showed the value in an open list's preview cannot vouch for the click either. A
+    # held chip whose list is open or undeclared is clicked too, and the click that removes it is reported as not
+    # committed.
+    single_held = shape["extra"] in ("held", "held_open") and shape["surface"] != "chip"
+    open_toggle = shape["surface"] == "chip" and (
+        shape["extra"] == "held_open" or (shape["extra"] in ("held", "rs_held") and shape["aria"] != "expanded")
+    )
+    weak_held = single_held or shape["extra"] == "preview_open"
+    # A click-to-open list marks the held row aria-selected, which main already reads as selected.
+    if shape["extra"] == "held" and single_held and shape["path"] == "typeahead" and not state["rowClicks"]:
+        failures.append("(l) a single-value field skipped the re-pick")
+    if open_toggle and not state["rowClicks"]:
+        failures.append("(l) a held chip with its list open or undeclared was not re-picked")
+    if (
+        shape["extra"] in ("held", "left_open", "rs_held")
+        and not single_held
+        and not open_toggle
+        and (state["rowClicks"] or state["fieldInputs"])
+    ):
+        failures.append(f"(f) re-pick acted: {state['rowClicks']} row clicks, {state['fieldInputs']} inputs")
+    if shape["extra"] == "held" and not single_held and not open_toggle and state["escapes"]:
+        failures.append(f"(k) pressed Escape {state['escapes']} times on a held field with no list open")
+    # A type() click on a held chip's row toggles it off; this row judges only what the tool reported.
+    if shape["extra"] != "toggle_async" and not open_toggle and any(v not in held for v in before):
+        failures.append(f"(g) a value the field held before was removed: {held!r}")
+    if not misroute and any(v not in before and v != target for v in held):
+        failures.append(f"(j) committed a row other than the target: {held!r}")
+    if state["echoClicked"]:
+        failures.append("(h) clicked the empty-state row that echoes the query")
+    if r.status == "ok" and state["listShown"]:
+        failures.append("(i) ok but the field's own list was left open")
+    # A plain input that shows only the text the tool typed has no committed state of its own, and once the
+    # page renders anything new beside it that cannot be told from a dead click, so it is refused.
+    echo_beside_new_content = shape["extra"] == "dependent" and shape["surface"] == "value"
+    expects_ok = shape["extra"] in ("short",) or not (
+        open_toggle
+        or shape["extra"] in ("sibling", "echo", "disabled_exact", "toggle_async", "disabled_exact_held")
+        or shape["extra"].startswith(("short", "filter_popup_dead"))
+        or echo_beside_new_content
+    )
+    if expects_ok and not weak_held and r.status != "ok":
+        failures.append("coverage: expected a commit")
+    if not expects_ok and r.status == "ok" and shape["extra"] not in ("toggle_async", "disabled_exact_held"):
+        failures.append("reported ok for a pick the field never took")
+    return [f"{shape}: {f} -- {r.content[:300]}" for f in failures]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_holds_nothing_on_a_label_hint_or_a_partial_chip() -> None:
+    """The pre-act "already holds" no-op applies only to a toggle field with its list known closed: a label hint, an
+    open list's anchor preview, a chip that only starts with the value, a held single value, or a chip-shaped row of
+    an open roleless popup, declared or not, does not skip the fill, while an exact chip on a closed field still does.
+    A list whose open state nothing declares never lends its anchor text as the pre-click baseline. A commit that
+    writes the chosen row plus a code counts with its list still open; the typed text left behind by a dead click
+    does not."""
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    shapes = [
+        s
+        for s in _generated_commit_state_shapes()
+        if s["extra"]
+        in (
+            "label_hint",
+            "split_chip",
+            "short_open_text_open",
+            "preview_open",
+            "decorated_open",
+            "controlled_chip_popup",
+            "controlled_chip_popup_bare",
+        )
+        or (s["extra"] == "held" and s["surface"] in ("single", "chip"))
+        or (s["extra"] == "filter_popup_dead" and s["tool"] == "select_combobox")
+    ]
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            results = await asyncio.gather(*(_run_generated_commit_state_shape(browser, s) for s in shapes))
+        finally:
+            await browser.close()
+    failures = [f for r in results for f in r]
+    assert len(shapes) == 33
+    assert not failures, "\n".join(failures)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_acts_past_a_chip_it_cannot_prove_is_its_own() -> None:
+    """A removable chip under another field's caption or labelled group, laid out in the field's own wrapper, does
+    not make a re-pick a no-op: the field is filled and verified. A React-Select-style chip the field owns still is
+    when the field declares its list closed."""
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    shapes = [s for s in _generated_commit_state_shapes() if s["extra"] in ("caption_chip", "group_chip", "rs_held")]
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            results = await asyncio.gather(*(_run_generated_commit_state_shape(browser, s) for s in shapes))
+        finally:
+            await browser.close()
+    failures = [f for r in results for f in r]
+    assert len(shapes) == 14
+    assert not failures, "\n".join(failures)
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_popup_filter_property_over_generated_widget_shapes() -> None:
@@ -25771,10 +26788,15 @@ async def test_select_combobox_popup_filter_property_over_generated_widget_shape
     received input; (d) a changed field is never called NOT filled; (e) the refusal claims the list's search
     box answered only when a filter box was typed into. A field behind a key sink that swallows keys must stay
     unchanged: the first typed character never lands there, so nothing more is typed.
+
+    The commit-state shapes judge a commit by what the field itself holds. Beyond (a)-(c): (f) re-picking a
+    chip a toggle field holds with its list known closed neither types nor clicks, while (l) a single-value field re-picks;
+    (g) nothing the field held before is removed; (h) an empty-state row echoing the query is never clicked; (i) an
+    ok leaves the field's own list closed.
     """
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    shapes = _generated_popup_shapes()
+    shapes = _generated_popup_shapes() + _generated_commit_state_shapes()
     gate = asyncio.Semaphore(6)
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
@@ -25782,13 +26804,15 @@ async def test_select_combobox_popup_filter_property_over_generated_widget_shape
 
             async def _one(shape: dict[str, str]) -> list[str]:
                 async with gate:
+                    if shape.get("family") == "commit_state":
+                        return await _run_generated_commit_state_shape(browser, shape)
                     return await _run_generated_popup_shape(browser, shape)
 
             results = await asyncio.gather(*(_one(s) for s in shapes))
         finally:
             await browser.close()
     failures = [f for r in results for f in r]
-    assert len(shapes) >= 101
+    assert len(shapes) >= 295
     assert not failures, "\n".join(failures)
 
 
@@ -29314,6 +30338,66 @@ async def test_select_combobox_does_not_toggle_off_an_already_selected_multi_sel
         assert still == "true", still
         label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
         assert label == "Countries: Germany", label
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed_by", ["aria_expanded_false", "hidden_declared_popup"])
+async def test_select_combobox_leaves_a_held_chip_only_when_its_list_is_known_closed(closed_by: str) -> None:
+    # A held chip is left as is only when the field's own list is known closed: aria-expanded="false" on the field,
+    # or the popup it declares exists and is hidden.
+    aria = "expanded" if closed_by == "aria_expanded_false" else "none"
+    shape = next(
+        s
+        for s in _generated_commit_state_shapes()
+        if (s["path"], s["extra"], s["surface"], s["aria"], s["declared"]) == ("typeahead", "held", "chip", aria, "yes")
+    )
+    html = _generated_commit_state_widget_html(shape)
+    if closed_by == "hidden_declared_popup":
+        html = html.replace('<div id="dep">', '<div id="fld-list" role="listbox" hidden></div><div id="dep">', 1)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": shape["target"]})
+        state = await page.evaluate(
+            "() => [document.body.getAttribute('data-committed'), window.__rowClicks,"
+            " Number(document.getElementById('fld').getAttribute('data-inputs'))]"
+        )
+    assert r.status == "ok" and "already selected" in r.content, r.content
+    assert state == [shape["target"], 0, 0], state
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_already_held_chip_inside_an_expanded_accordion() -> None:
+    # The held field sits in an expanded accordion that collapses on any Escape. Nothing declares the field's own list
+    # closed, so the re-pick acts as on main; it reports only what the field holds and leaves the accordion open.
+    shape = next(
+        s
+        for s in _generated_commit_state_shapes()
+        if (s["path"], s["extra"], s["surface"], s["aria"], s["declared"])
+        == ("typeahead", "held", "chip", "none", "yes")
+    )
+    html = _generated_commit_state_widget_html(shape)
+    html = html.replace('<div id="grp"', '<div id="acc" role="region" aria-expanded="true"><div id="grp"', 1)
+    html = html.replace('<div id="dep">', '</div><div id="dep">', 1)
+    html = html.replace(
+        "</body>",
+        "<script>window.__docEscapes = 0; document.addEventListener('keydown', function (e) { if (e.key === 'Escape') "
+        "{ window.__docEscapes++; document.getElementById('acc').setAttribute('aria-expanded', 'false'); } }, true);"
+        "</script></body>",
+        1,
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": shape["target"]})
+        state = await page.evaluate(
+            "() => [document.body.getAttribute('data-committed'), window.__docEscapes, window.__rowClicks,"
+            " document.getElementById('acc').getAttribute('aria-expanded')]"
+        )
+    committed, escapes, row_clicks, acc_expanded = state
+    assert "already selected" not in r.content and row_clicks == 1, (r.content, state)
+    assert r.status != "ok" or committed == shape["target"], (r.content, state)
+    assert escapes == 0 and acc_expanded == "true", state
 
 
 @_skip_no_browser
@@ -34287,6 +35371,24 @@ def test_merging_caps_elements_page_wide_and_counts_what_it_dropped() -> None:
     assert page["mergeCapDropped"] == 2
 
 
+def test_a_holders_stand_in_children_never_displace_another_frames_pointer_roots() -> None:
+    # The page lists 5 plain pointer roots and 30 holder rows' stand-in children (35 fit its own cap); a
+    # frame lists 15 pointer tiles. Every plain root and tile keeps its place, and the rows share what is left.
+    from skyvern.forge.taskv3.tools import OBSERVE_POINTER_ROOT_CAP, _merge_realm, _rank_held_pointer_roots_last
+
+    plain = [{"pointerRoot": True, "plain": n} for n in range(5)]
+    held = [{"pointerRoot": True, "pointerHeld": True, "row": n} for n in range(30)]
+    page = {"elements": plain + held, "text": [], "textFull": [], "pointerListed": 35}
+    tiles = [{"pointerRoot": True, "tile": n} for n in range(15)]
+    _merge_realm(page, {"elements": tiles, "text": [], "textFull": [], "pointerListed": 15})
+    kept = _rank_held_pointer_roots_last(page)
+
+    assert [e for e in page["elements"] if not e.get("pointerHeld")] == plain + tiles
+    assert len(page["elements"]) == OBSERVE_POINTER_ROOT_CAP == len(kept)
+    assert kept == list(range(25)) + list(range(35, 50))
+    assert page["pointerCapped"] == 10 and page["pointerListed"] == OBSERVE_POINTER_ROOT_CAP
+
+
 @pytest.mark.asyncio
 async def test_the_download_notice_rebuild_keeps_every_field_the_inner_wrappers_set() -> None:
     # _apply_download_signal is the OUTERMOST wrapper on every tool, and when it has a notice to
@@ -35449,9 +36551,11 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
         (
             "ambiguous-rows-text",
             60,
-            lambda t: taskv3_tools._ambiguous_rows_error(
-                "#who", "John", [{"n": 1, "text": t}, {"n": 2, "text": "B"}], next_step="pass the full text"
-            ).content,
+            lambda t: (
+                taskv3_tools._ambiguous_rows_error(
+                    "#who", "John", [{"n": 1, "text": t}, {"n": 2, "text": "B"}], next_step="pass the full text"
+                ).content
+            ),
         ),
         (
             "row-identity",
@@ -35476,9 +36580,9 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
         (
             "unproven-row",
             60,
-            lambda t: taskv3_tools._unproven_row_error(
-                "John", "#who", "scrolled to the end", {"n": 1, "text": t}
-            ).content,
+            lambda t: (
+                taskv3_tools._unproven_row_error("John", "#who", "scrolled to the end", {"n": 1, "text": t}).content
+            ),
         ),
         (
             "selection-report",
@@ -36351,6 +37455,8 @@ async def test_click_toggle_probe_matches_the_toggle_state_observe_prints() -> N
         assert await probe({"selector": "#loose"}) is True
 
 
+_CC_COUNTRIES_NO_EXACT_US = [c for c in _CC_COUNTRIES if c[0] != "United States"]
+
 _TEXT_DELTA_HEADER = "page newly shows (since your previous tool call): "
 _TEXT_DELTA_HEADER_RE = re.compile(
     r"page newly shows \((?:since your previous tool call|over your last \d+ tool calls)\): "
@@ -36549,6 +37655,45 @@ def _m4_generated_cases(seed: int, draws: int) -> list[tuple[str, str, str, str]
     rng = random.Random(seed)
     cases += [tuple(rng.choice(d) for d in dims) for _ in range(draws)]
     return cases  # type: ignore[return-value]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setsize_js", "commits"),
+    [
+        pytest.param("'-1'", False, id="unknown_every_row"),
+        pytest.param("(i < 38 || i > 42) ? '-1' : ''", False, id="unknown_off_open_window"),
+        pytest.param(f"'{len(_CC_COUNTRIES_NO_EXACT_US)}'", True, id="declared_total_equals_rows"),
+    ],
+)
+async def test_select_combobox_prefix_hit_after_a_full_walk_obeys_the_walked_rows_setsize(
+    setsize_js: str, commits: bool
+) -> None:
+    # aria-setsize="-1" on ANY walked row says the rows are not the whole list, so the lone prefix row
+    # "United States Minor Outlying Islands" must not commit for "United States" -- including when the open
+    # window (rows 38..42) declares no size. A declared total equal to the rows walked is complete: it commits.
+    html = _cc_widget_html(_CC_COUNTRIES_NO_EXACT_US, _CC_CURRENT_INDEX)
+    marked = html.replace(
+        "'\" id=\"item-' + i + '\"",
+        "'\"' + (("
+        + setsize_js
+        + ") ? ' aria-setsize=\"' + ("
+        + setsize_js
+        + ") + '\"' : '') + ' id=\"item-' + i + '\"",
+    )
+    assert marked != html
+    async with _content_page(marked) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        pre_label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
+        if commits:
+            assert r.status == "ok", r.content
+            assert label.endswith("United States Minor Outlying Islands"), label
+        else:
+            assert r.status == "error", r.content
+            assert label == pre_label, label
 
 
 @_skip_no_browser
@@ -37252,6 +38397,34 @@ async def test_child_frame_text_past_the_char_bound_is_refused_in_the_frame(monk
 
 @_skip_no_browser
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setsize", "commits"),
+    [
+        pytest.param(None, True, id="no_setsize_collapses"),
+        pytest.param("-1", False, id="total_unknown_refuses"),
+    ],
+)
+async def test_select_combobox_collapses_twice_rendered_suggestion_only_over_a_complete_list(
+    setsize: str | None, commits: bool
+) -> None:
+    # Two identical rows are one candidate rendered twice only when they are the whole list; rows declaring
+    # aria-setsize="-1" are never the whole list, so a same-label option may sit unrendered.
+    attrs = [{"aria-setsize": setsize}, {"aria-setsize": setsize}] if setsize else None
+    async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS, attrs=attrs)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        if commits:
+            assert r.status == "ok", r.content
+            assert clicked_index == 0, clicked_index
+        else:
+            assert r.status == "error", r.content
+            assert clicked_index is None, clicked_index
+            assert "declares its total unknown" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_refused_call_neither_reports_nor_reads_so_the_next_call_reports_across_it() -> None:
     # A refused call dispatched nothing, so it carries no section and does not move the baseline; the
     # next result reports what rendered and names both calls.
@@ -37780,6 +38953,22 @@ async def test_an_action_on_a_working_tab_reopened_after_loss_reports_what_it_sh
         result = await _tool(tools, "click").handler({"selector": "#go"})
         assert result.status == "ok", result.content
         assert _delta_lines(result) == ["Row loaded"], result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_names_exact_twins_the_walk_saw_and_routes_to_a_click() -> None:
+    # The walk sees two "Congo" rows at different positions; text alone cannot separate them, so the error
+    # must say so and route to a click rather than ask for a fuller text that does not exist.
+    items = [("Congo", "CG-1"), *_POPUP_SEARCH_STATES[:19], ("Congo", "CG-2"), *_POPUP_SEARCH_STATES[19:30]]
+    html = _popup_search_combobox_html(items=items, setsize=True, filtered_window=1, values=True)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Congo"})
+        assert r.status == "error", r.content
+        assert "2 options share the exact label 'Congo'" in r.content, r.content
+        assert "look()" in r.content and "data-tv3-menu" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
 
 
 @_skip_no_browser

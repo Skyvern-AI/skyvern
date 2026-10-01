@@ -97,6 +97,7 @@ vi.mock("@/hooks/useFeatureFlag", () => ({
 }));
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => undefined,
+  usePostHog: () => ({ capture: vi.fn() }),
 }));
 vi.mock("@/store/onboarding/useOnboardingState", () => ({
   useOnboardingStateOptional: () => null,

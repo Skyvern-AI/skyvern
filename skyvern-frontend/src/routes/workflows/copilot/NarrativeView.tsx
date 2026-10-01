@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  CheckIcon,
   ChevronRightIcon,
   CodeIcon,
   Cross2Icon,
@@ -24,6 +25,7 @@ import {
   ActivityLog,
   ActivityRow as ActivityRowModel,
   FinishedTurnSummary,
+  blocksByRunCall,
   callLabel,
   callRollup,
   condenseCalls,
@@ -43,6 +45,7 @@ import {
   RecordedActionSummary,
   ToolCallKind,
   TurnNarrativeState,
+  blockPassed,
   formatElapsed,
   humanizeJudgeText,
   hasObservedBlockEvidence,
@@ -305,62 +308,6 @@ function AttemptsBadge({ attempts }: { attempts?: number }) {
   );
 }
 
-// A block's line inside the activity log: a gutter glyph, the block's name, and
-// a trailing disclosure. Status rides inline at the end of the name.
-function FLogLine({
-  glyph,
-  children,
-  trailing,
-  onClick,
-  expanded,
-  title,
-}: {
-  glyph: React.ReactNode;
-  children: React.ReactNode;
-  trailing?: React.ReactNode;
-  onClick?: () => void;
-  expanded?: boolean;
-  title?: string;
-}) {
-  const body = (
-    <>
-      <span
-        // Baseline-aligned, per the design canvas — but these glyphs do not fill
-        // their box the way letters fill theirs, so sharing a baseline leaves
-        // their ink centre ~1.5px below the sentence's and they read as sloppy.
-        // Centring the box does not move ink; only a transform does. The offset
-        // is measured, not eyeballed: render the row and compare the ink bands
-        // of the two columns, and re-derive it if the type changes.
-        className="inline-block -translate-y-[1.5px] text-center font-mono text-[11px] text-muted-foreground dark:text-slate-500"
-        aria-hidden="true"
-      >
-        {glyph}
-      </span>
-      <span className="min-w-0 text-left text-[12.5px] leading-[1.5] text-muted-foreground dark:text-slate-400">
-        {children}
-      </span>
-      <span className="whitespace-nowrap font-mono text-[10.5px] tabular-nums text-muted-foreground dark:text-slate-500">
-        {trailing}
-      </span>
-    </>
-  );
-  const shape =
-    "grid w-full grid-cols-[18px_1fr_auto] items-baseline gap-x-2.5 py-[3px]";
-  return onClick === undefined ? (
-    <div className={shape}>{body}</div>
-  ) : (
-    <button
-      type="button"
-      className={`${shape} cursor-pointer text-left`}
-      aria-expanded={expanded}
-      onClick={onClick}
-      title={title}
-    >
-      {body}
-    </button>
-  );
-}
-
 function ActivityRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
@@ -469,6 +416,10 @@ function FRecordedActionRow({
       ? "animate-copilot-row-flash-error"
       : "animate-copilot-row-flash-success"
     : "";
+  const detail = [
+    action.codeLine !== null ? `line ${action.codeLine}` : action.summary,
+    action.response,
+  ].filter((part): part is string => Boolean(part));
   return (
     <FSubRow
       glyph={action.failed ? "✕" : "✓"}
@@ -483,14 +434,53 @@ function FRecordedActionRow({
       >
         {action.label}
       </span>
-      {action.summary ? (
+      {detail.length > 0 ? (
         <span className="text-muted-foreground dark:text-slate-500">
           {" "}
-          · {action.summary}
+          · {detail.join(SEP)}
         </span>
       ) : null}
     </FSubRow>
   );
+}
+
+interface ActionReveal {
+  // Recorded actions shown so far, oldest first.
+  visible: RecordedActionSummary[];
+  total: number;
+  // Index into `visible` of the action still replaying, or -1.
+  revealingIndex: number;
+  flashing: (index: number) => boolean;
+}
+
+// Time-derived, not timer-chained: recomputed from wall-clock time on every
+// render/tick so collapse, remount, and StrictMode double-invoke can never
+// restart or duplicate the reveal.
+function useActionReveal(block: BlockState): ActionReveal {
+  const recordedActions = block.recordedActions;
+  const total = recordedActions?.length ?? 0;
+  const durations = useMemo(
+    () => (recordedActions ?? []).map((a) => a.durationMs),
+    [recordedActions],
+  );
+  const offsets = useMemo(() => buildRevealOffsets(durations), [durations]);
+  const totalMs = offsets.length > 0 ? offsets[offsets.length - 1]! : 0;
+  const elapsedReveal =
+    total > 0 ? Date.now() - (block.recordedActionsAt ?? 0) : 0;
+  const revealedCount = total > 0 ? revealedCountAt(offsets, elapsedReveal) : 0;
+  const replaying = total > 0 && elapsedReveal >= 0 && revealedCount < total;
+  const visibleCount =
+    total === 0 || elapsedReveal < 0
+      ? 0
+      : Math.min(revealedCount + (replaying ? 1 : 0), total);
+  useFrameTick(total > 0 && (replaying || elapsedReveal < totalMs));
+  return {
+    visible: (recordedActions ?? []).slice(0, visibleCount),
+    total,
+    revealingIndex: replaying ? revealedCount : -1,
+    flashing: (i) =>
+      i < revealedCount && elapsedReveal - offsets[i]! < FLASH_WINDOW_MS,
+  };
 }
 
 interface FBlockRunProps {
@@ -499,15 +489,6 @@ interface FBlockRunProps {
   onSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
   ownsOutcomeNotConfirmed?: boolean;
-  // Inside the activity log the card sheds its puck for the shared row grid,
-  // so a block does not read as a different species from the steps around it.
-  flat?: boolean;
-  // When the activity log owns this card's row, open/closed comes from there
-  // so the row and the card never disagree about a single click.
-  expansion?: { open: boolean; onToggle: () => void };
-  // Historical failed attempts stay quiet in the collapsed timeline. Their
-  // full failure treatment remains available in the expanded evidence.
-  quietFailure?: boolean;
 }
 
 function FBlockRun({
@@ -516,9 +497,6 @@ function FBlockRun({
   onSelect,
   outcomeReasonFallback,
   ownsOutcomeNotConfirmed,
-  flat,
-  expansion,
-  quietFailure,
 }: FBlockRunProps) {
   const displayLabel = humanizeBlockLabel(block.label);
   const palette = paletteFor(block.blockType);
@@ -539,7 +517,6 @@ function FBlockRun({
     !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
-  const prominentFailure = isFail && !quietFailure;
   const isStopped = block.state === "stopped";
   const isDraft = block.state === "drafted";
   const collapsedOutcomeReason =
@@ -555,7 +532,7 @@ function FBlockRun({
       ? "border-emerald-400/60"
       : isOutcomeNotShown
         ? "border-amber-400/60"
-        : prominentFailure
+        : isFail
           ? "border-rose-400/60"
           : "border-slate-500/60";
   const accentText = isRunning
@@ -564,7 +541,7 @@ function FBlockRun({
       ? "text-emerald-700 dark:text-emerald-300"
       : isOutcomeNotShown
         ? "text-amber-700 dark:text-amber-300"
-        : prominentFailure
+        : isFail
           ? "text-rose-700 dark:text-rose-300"
           : isVerifying || isRanNeutral
             ? "text-tertiary-foreground"
@@ -575,50 +552,18 @@ function FBlockRun({
       ? "bg-emerald-500/15"
       : isOutcomeNotShown
         ? "bg-amber-500/15"
-        : prominentFailure
+        : isFail
           ? "bg-rose-500/15"
           : "bg-slate-elevation3";
 
-  const recordedActions = block.recordedActions;
-  const hasActions =
-    recordedActions !== undefined && recordedActions.length > 0;
-  const durations = useMemo(
-    () => (recordedActions ?? []).map((a) => a.durationMs),
-    [recordedActions],
-  );
-  const offsets = useMemo(() => buildRevealOffsets(durations), [durations]);
-  const totalMs = offsets.length > 0 ? offsets[offsets.length - 1]! : 0;
-  // Time-derived, not timer-chained: recomputed from wall-clock time on
-  // every render/tick so collapse, remount, and StrictMode double-invoke
-  // can never restart or duplicate the reveal.
-  const elapsedReveal = hasActions
-    ? Date.now() - (block.recordedActionsAt ?? 0)
-    : 0;
-  const revealedCount = hasActions
-    ? revealedCountAt(offsets, elapsedReveal)
-    : 0;
-  const replayingAction =
-    hasActions && elapsedReveal >= 0 && revealedCount < recordedActions!.length;
-  const visibleActionCount = !hasActions
-    ? 0
-    : elapsedReveal < 0
-      ? 0
-      : Math.min(
-          revealedCount + (replayingAction ? 1 : 0),
-          recordedActions!.length,
-        );
+  const reveal = useActionReveal(block);
+  const hasActions = reveal.total > 0;
 
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
-  const open = expansion
-    ? expansion.open
-    : userOpen === null
-      ? defaultOpen
-      : userOpen;
+  const open = userOpen === null ? defaultOpen : userOpen;
   // A stop stays inspectable but not self-opening: the user knows why it
-  // stopped, so it should not demand attention the way a failure does. Under
-  // the activity log `expansion` supplies the open state and none of this
-  // applies — there, every finished row folds, a failure included.
+  // stopped, so it should not demand attention the way a failure does.
   const hasExpandableDetail =
     isRunning ||
     block.activity.length > 0 ||
@@ -628,15 +573,13 @@ function FBlockRun({
     ownsOutcomeReason;
   const toggleable =
     hasExpandableDetail &&
-    (expansion !== undefined ||
-      isOk ||
+    (isOk ||
       isOutcomeNotShown ||
       ownsOutcomeReason ||
       isVerifying ||
       isRanNeutral ||
       isStopped);
   useTick(isRunning);
-  useFrameTick(hasActions && (replayingAction || elapsedReveal < totalMs));
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
   const statusText = isOk
@@ -651,24 +594,6 @@ function FBlockRun({
             ? "halted"
             : isStopped
               ? `stopped${elapsed ? ` · ${elapsed}` : ""}`
-              : isDraft
-                ? "drafted"
-                : "queued";
-  // The visible mark carries the state for sighted readers; this is the same
-  // state as a word, without the duration statusText folds in — the row
-  // already has an elapsed column.
-  const stateWord = isOk
-    ? "done"
-    : isRunning
-      ? "working"
-      : isVerifying
-        ? "verifying outcome"
-        : isRanNeutral || isOutcomeNotShown
-          ? "ran"
-          : isFail
-            ? "halted"
-            : isStopped
-              ? "stopped"
               : isDraft
                 ? "drafted"
                 : "queued";
@@ -700,20 +625,16 @@ function FBlockRun({
   const onHeaderClick = () => {
     onSelect?.(block.label);
     if (!toggleable) return;
-    if (expansion) {
-      expansion.onToggle();
-    } else {
-      setUserOpen((v) => !(v === null ? defaultOpen : v));
-    }
+    setUserOpen((v) => !(v === null ? defaultOpen : v));
   };
   const collapsedExtras = (
     <>
-      {!open && !expansion && isOk && block.activity.length > 0 ? (
+      {!open && isOk && block.activity.length > 0 ? (
         <div className="mt-0.5 text-[12px] leading-[1.5] text-muted-foreground">
           {block.activity[block.activity.length - 1]!.text}
         </div>
       ) : null}
-      {!open && !expansion && isOutcomeNotShown ? (
+      {!open && isOutcomeNotShown ? (
         <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
           {`Outcome not confirmed — ${OUTCOME_NOT_CONFIRMED_REASON}`}
           {collapsedOutcomeReason
@@ -749,21 +670,14 @@ function FBlockRun({
       {block.activity.map((entry) => (
         <ActivityRow key={entry.id} entry={entry} />
       ))}
-      {hasActions
-        ? recordedActions!
-            .slice(0, visibleActionCount)
-            .map((action, i) => (
-              <FRecordedActionRow
-                key={action.actionId}
-                action={action}
-                revealing={replayingAction && i === revealedCount}
-                flash={
-                  i < revealedCount &&
-                  elapsedReveal - offsets[i]! < FLASH_WINDOW_MS
-                }
-              />
-            ))
-        : null}
+      {reveal.visible.map((action, i) => (
+        <FRecordedActionRow
+          key={action.actionId}
+          action={action}
+          revealing={i === reveal.revealingIndex}
+          flash={reveal.flashing(i)}
+        />
+      ))}
       {isFail ? (
         <div className="mt-1 flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
           <span className="text-[11px] font-bold text-rose-700 dark:text-rose-300">
@@ -791,27 +705,6 @@ function FBlockRun({
     </div>
   );
 
-  if (flat) {
-    return (
-      <div className="flex flex-col">
-        <FLogLine
-          glyph={<span className={accentText}>{stateGlyph}</span>}
-          trailing={toggleable ? <Chevron open={open} /> : null}
-          onClick={onHeaderClick}
-          expanded={toggleable && expansion ? open : undefined}
-          title={`Highlight ${block.label} on canvas`}
-        >
-          {displayLabel}
-          <span className="sr-only">{` · ${stateWord}`}</span>
-        </FLogLine>
-        <div className="pl-[28px]">{collapsedExtras}</div>
-        {open && hasExpandableDetail ? (
-          <div className="pl-[28px]">{blockDetail}</div>
-        ) : null}
-      </div>
-    );
-  }
-
   return (
     <div className="flex flex-col">
       <button
@@ -819,7 +712,7 @@ function FBlockRun({
         className={`flex w-full items-start gap-3 px-1 py-1 text-left ${
           toggleable ? "cursor-pointer" : "cursor-default"
         }`}
-        aria-expanded={toggleable && expansion ? expansion.open : undefined}
+        aria-expanded={toggleable ? open : undefined}
         onClick={onHeaderClick}
         title={`Highlight ${block.label} on canvas`}
       >
@@ -973,6 +866,44 @@ interface FActivityLogProps {
   anchoredBeforeRows?: AnchoredTurnItem[];
 }
 
+// Unified-diff lines keep their +/- colors; a muted peek greys them out.
+function renderPatchLine(line: string, i: number, muted: boolean) {
+  return (
+    <span
+      key={`${i}-${line}`}
+      className={[
+        "block",
+        line.startsWith("+")
+          ? "text-emerald-700 dark:text-emerald-300"
+          : line.startsWith("-")
+            ? "text-rose-700 dark:text-rose-300"
+            : "text-muted-foreground",
+        muted ? "!text-muted-foreground" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      {line}
+    </span>
+  );
+}
+
+function DiffPatch({
+  patch,
+  className,
+}: {
+  patch: string;
+  className?: string;
+}) {
+  return (
+    <pre
+      className={`overflow-x-auto whitespace-pre rounded border border-border/60 bg-muted/40 p-2 text-[11px] leading-[1.5] ${className ?? ""}`}
+    >
+      {patch.split("\n").map((line, i) => renderPatchLine(line, i, false))}
+    </pre>
+  );
+}
+
 // The kind gutter sits to the left of ActivityRow's own status column, so a
 // row reads <kind> <status> <text> and neither signal displaces the other.
 // The counts line sits outside the row's own expand button, so its `view diff`
@@ -996,24 +927,6 @@ function FCodeWriteDiff({
     restoreFocusAfterPeek.current = false;
   }, [open]);
   const patchLines = diff.patch?.split("\n") ?? [];
-  const renderLine = (line: string, i: number, muted: boolean) => (
-    <span
-      key={`${i}-${line}`}
-      className={[
-        "block",
-        line.startsWith("+")
-          ? "text-emerald-700 dark:text-emerald-300"
-          : line.startsWith("-")
-            ? "text-rose-700 dark:text-rose-300"
-            : "text-muted-foreground",
-        muted ? "!text-muted-foreground" : "",
-      ]
-        .filter(Boolean)
-        .join(" ")}
-    >
-      {line}
-    </span>
-  );
   return (
     <div className="flex flex-col">
       <FSubRow glyph="±" glyphClass="text-sky-700 dark:text-sky-300">
@@ -1050,9 +963,7 @@ function FCodeWriteDiff({
         )}
       </FSubRow>
       {open && diff.patch !== undefined ? (
-        <pre className="ml-5 overflow-x-auto whitespace-pre rounded border border-border/60 bg-muted/40 p-2 text-[11px] leading-[1.5]">
-          {patchLines.map((line, i) => renderLine(line, i, false))}
-        </pre>
+        <DiffPatch patch={diff.patch} className="ml-5" />
       ) : peek && diff.patch !== undefined ? (
         <button
           type="button"
@@ -1066,7 +977,9 @@ function FCodeWriteDiff({
           }}
         >
           <code className="block whitespace-pre">
-            {patchLines.slice(0, 2).map((line, i) => renderLine(line, i, true))}
+            {patchLines
+              .slice(0, 2)
+              .map((line, i) => renderPatchLine(line, i, true))}
           </code>
           <span
             aria-hidden="true"
@@ -1092,11 +1005,17 @@ const STEP_TEXT = "text-foreground/75";
 // The no-break space binds each "·" to the item before it, so a wrapped tail never starts a line with one.
 const SEP = "\u00a0· ";
 
-function Chevron({ open }: { open: boolean }) {
+function Chevron({
+  open,
+  className = "text-muted-foreground",
+}: {
+  open: boolean;
+  className?: string;
+}) {
   return (
     <ChevronRightIcon
       aria-hidden="true"
-      className={`size-3 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none ${
+      className={`size-3 shrink-0 transition-transform motion-reduce:transition-none ${className} ${
         open ? "rotate-90" : ""
       }`}
     />
@@ -1132,6 +1051,468 @@ function FFailurePin({ block }: { block: BlockState }) {
       {/* A flex gap is not text, so copied or spoken text needs the space. */}{" "}
       <span className="text-muted-foreground">failed</span>
     </span>
+  );
+}
+
+type TestCardTone =
+  | "running"
+  | "failed"
+  | "notConfirmed"
+  | "passed"
+  | "neutral";
+
+const TEST_CARD_TONE: Record<
+  TestCardTone,
+  { card: string; word: string; glyph: string }
+> = {
+  running: {
+    card: "border-blue-400/40 bg-blue-400/[0.06]",
+    word: "text-blue-700 dark:text-blue-300",
+    glyph: "text-blue-600 dark:text-blue-400",
+  },
+  failed: {
+    card: "border-rose-500/40 bg-rose-500/[0.06]",
+    word: "text-rose-700 dark:text-rose-300",
+    glyph: "text-rose-600 dark:text-rose-500",
+  },
+  notConfirmed: {
+    card: "border-amber-500/40 bg-amber-500/[0.06]",
+    word: "text-amber-700 dark:text-amber-300",
+    glyph: "text-amber-600 dark:text-amber-300",
+  },
+  passed: {
+    card: "border-emerald-500/40 bg-emerald-500/[0.06]",
+    word: "text-emerald-700 dark:text-emerald-300",
+    glyph: "text-emerald-600 dark:text-emerald-500",
+  },
+  neutral: {
+    card: "border-slate-500/40 bg-slate-500/[0.06]",
+    word: "text-slate-700 dark:text-slate-300",
+    glyph: "text-slate-500 dark:text-slate-400",
+  },
+};
+
+interface TestCardStatus {
+  tone: TestCardTone;
+  word: string;
+  // Muted words after the status, for a state the word alone does not name.
+  note: string | null;
+  glyph: React.ReactNode;
+}
+
+function testCardStatus(block: BlockState, turnEnded: boolean): TestCardStatus {
+  const glyphClass = "size-3.5";
+  switch (block.state) {
+    case "running":
+      return {
+        tone: "running",
+        word: "Testing",
+        note: null,
+        glyph: <Spinner />,
+      };
+    case "failed":
+      return {
+        tone: "failed",
+        word: "Failed",
+        note: null,
+        glyph: <Cross2Icon aria-hidden="true" className={glyphClass} />,
+      };
+    case "stopped":
+      return {
+        tone: "neutral",
+        word: "Stopped",
+        note: null,
+        glyph: <StopIcon aria-hidden="true" className="size-3" />,
+      };
+    case "skipped":
+      return { tone: "neutral", word: "Skipped", note: null, glyph: "–" };
+    case "queued":
+      return { tone: "neutral", word: "Queued", note: null, glyph: "·" };
+    case "drafted":
+      return { tone: "neutral", word: "Drafted", note: null, glyph: "·" };
+    case "completed":
+      break;
+  }
+  if (blockPassed(block)) {
+    return {
+      tone: "passed",
+      word: "Passed",
+      note: null,
+      glyph: <CheckIcon aria-hidden="true" className={glyphClass} />,
+    };
+  }
+  if (
+    block.outcome === "not_demonstrated" &&
+    !isInterimOutcome(block.outcomeRole)
+  ) {
+    return {
+      tone: "notConfirmed",
+      word: "Not confirmed",
+      note: null,
+      glyph: "!",
+    };
+  }
+  // A verdict still pending at turn end (dropped stream) reads as ran, never
+  // as the live verifying beat.
+  if (block.outcome === "evaluating" && !turnEnded) {
+    return {
+      tone: "neutral",
+      word: "Ran",
+      note: "verifying outcome…",
+      glyph: "…",
+    };
+  }
+  return { tone: "neutral", word: "Ran", note: null, glyph: "•" };
+}
+
+function formatActionDuration(ms: number | null): string | null {
+  if (ms === null) return null;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const secs = Math.round(ms / 1000);
+  return `${Math.floor(secs / 60)}:${(secs % 60).toString().padStart(2, "0")}`;
+}
+
+// A failure's first line reads under its row in full; the rest of the recorded
+// text opens below it. The split is display-only: no meaning is read from it.
+function FFailureText({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const [firstLine = "", ...rest] = text.split("\n");
+  const more = rest.join("\n").trim();
+  const hasMore = more.length > 0;
+  return (
+    <div className="ml-[22px] flex flex-col gap-1.5">
+      <p className="whitespace-pre-wrap break-words text-[12.5px] leading-[1.5] text-rose-800 [overflow-wrap:anywhere] dark:text-rose-100">
+        {firstLine}
+      </p>
+      {hasMore && open ? (
+        <pre className="whitespace-pre-wrap break-words rounded-md border border-rose-500/30 bg-background p-2 font-mono text-[11px] leading-[1.5] text-foreground/80 [overflow-wrap:anywhere]">
+          {more}
+        </pre>
+      ) : null}
+      {hasMore ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+          className="flex w-fit items-center gap-1 text-[11.5px] text-muted-foreground hover:text-foreground"
+        >
+          <Chevron open={open} />
+          {open ? "Hide details" : "Show details"}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function FCardActionRow({
+  action,
+  revealing,
+  flash,
+  failureText,
+}: {
+  action: RecordedActionSummary;
+  revealing: boolean;
+  flash: boolean;
+  failureText: string | null;
+}) {
+  const shimmerRef = useShimmerText<HTMLSpanElement>(revealing);
+  const failed = !revealing && action.failed;
+  const duration = revealing ? null : formatActionDuration(action.durationMs);
+  const flashClass = flash
+    ? failed
+      ? "animate-copilot-row-flash-error"
+      : "animate-copilot-row-flash-success"
+    : "";
+  const row = (
+    <div className="flex items-start gap-2 text-[12px] leading-[1.5]">
+      <span className="flex h-[18px] w-3.5 shrink-0 items-center justify-center">
+        {revealing ? (
+          <Spinner small />
+        ) : failed ? (
+          <Cross2Icon
+            aria-hidden="true"
+            className="size-[13px] text-rose-600 dark:text-rose-500"
+          />
+        ) : (
+          <CheckIcon
+            aria-hidden="true"
+            className="size-[13px] text-emerald-600 dark:text-emerald-500"
+          />
+        )}
+      </span>
+      <span
+        ref={shimmerRef}
+        className={`shrink-0 ${
+          failed
+            ? "font-semibold text-rose-700 dark:text-rose-300"
+            : "text-foreground"
+        } ${flashClass}`}
+      >
+        {action.label}
+      </span>
+      <span
+        className={`min-w-0 flex-1 break-words [overflow-wrap:anywhere] ${
+          failed && action.codeLine !== null
+            ? "text-rose-700 dark:text-rose-300"
+            : "text-muted-foreground"
+        }`}
+      >
+        {failed && action.codeLine !== null
+          ? `line ${action.codeLine}`
+          : action.summary}
+      </span>
+      {duration === null ? null : (
+        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+          {duration}
+        </span>
+      )}
+      <span className="sr-only">{failed ? " · failed" : ""}</span>
+    </div>
+  );
+  if (!failed) return row;
+  return (
+    <div className="-mx-1.5 flex flex-col gap-1.5 rounded-md bg-rose-500/[0.08] px-1.5 py-2">
+      {row}
+      {failureText === null ? null : <FFailureText text={failureText} />}
+    </div>
+  );
+}
+
+// One card per block run of a test. The header says where the block stands;
+// the body holds the code change that block got and the steps its run took.
+function FTestRunCard({
+  block,
+  diff,
+  diffOpen,
+  onDiffToggle,
+  callFailure,
+  outcomeReason,
+  ownsVerdict,
+  turnEnded,
+  open,
+  onToggle,
+  onSelect,
+}: {
+  block: BlockState;
+  diff: CodeWriteDiff | null;
+  diffOpen: boolean;
+  onDiffToggle: () => void;
+  // The failed run call's error, for a failure that recorded no text of its own.
+  callFailure: string | null;
+  // Why the run did not confirm the block's outcome, when it says.
+  outcomeReason: string | null;
+  // This block holds the turn's unconfirmed verdict, so its card is where the
+  // reason reads; the turn card stands down for it.
+  ownsVerdict: boolean;
+  turnEnded: boolean;
+  open: boolean;
+  onToggle: () => void;
+  onSelect?: (label: string) => void;
+}) {
+  const status = testCardStatus(block, turnEnded);
+  const tone = TEST_CARD_TONE[status.tone];
+  const isRunning = block.state === "running";
+  useTick(isRunning);
+  const reveal = useActionReveal(block);
+  const elapsed = isRunning
+    ? liveElapsed(block.startedAt)
+    : formatElapsed(block.startedAt, block.endedAt);
+
+  const actions = reveal.visible;
+  let lastFailed = -1;
+  actions.forEach((action, i) => {
+    if (action.failed && i !== reveal.revealingIndex) lastFailed = i;
+  });
+  const failureOf = (action: RecordedActionSummary, i: number) =>
+    action.response ?? (i === lastFailed ? callFailure : null);
+  // A failed block whose run recorded no failed step still says why. It stays
+  // put while actions replay above it, then moves onto the step that failed.
+  const recordedFailure = (block.recordedActions ?? []).some((a) => a.failed);
+  const blockFailure =
+    block.state === "failed" && lastFailed === -1
+      ? (callFailure ?? (recordedFailure ? null : "Halted — see run details."))
+      : null;
+  const reason =
+    status.tone === "notConfirmed"
+      ? (outcomeReason ??
+        "The step ran, but the run did not demonstrate the goal was met.")
+      : ownsVerdict && outcomeReason !== null
+        ? `Outcome not confirmed — ${outcomeReason}`
+        : null;
+
+  const hasBody =
+    diff !== null ||
+    actions.length > 0 ||
+    blockFailure !== null ||
+    block.activity.length > 0;
+  const expanded = hasBody && open;
+  const summary = [
+    reveal.total > 0
+      ? `${reveal.total} ${reveal.total === 1 ? "action" : "actions"}`
+      : null,
+    elapsed,
+  ]
+    .filter((part) => part !== null)
+    .join(" · ");
+
+  const header = (
+    <>
+      <span
+        className={`flex h-5 w-3.5 shrink-0 items-center justify-center text-[12px] font-bold ${tone.glyph}`}
+        aria-hidden="true"
+      >
+        {hasBody && !expanded ? (
+          <Chevron open={false} className={tone.word} />
+        ) : (
+          status.glyph
+        )}
+      </span>
+      <span className="min-w-0 flex-1 break-words">
+        <span className={`font-semibold ${tone.word}`}>{status.word}</span>{" "}
+        <span className="text-foreground">
+          {humanizeBlockLabel(block.label)}
+        </span>
+        {status.note === null ? null : (
+          <span className="text-muted-foreground">{`${SEP}${status.note}`}</span>
+        )}
+      </span>
+      {(expanded ? elapsed : summary) ? (
+        <span className="shrink-0 whitespace-nowrap text-[11.5px] tabular-nums text-muted-foreground">
+          {expanded ? elapsed : summary}
+        </span>
+      ) : null}
+    </>
+  );
+  const headerClass = `flex w-full min-w-0 items-start gap-2 px-3 text-left text-[12.5px] leading-5 ${
+    reason === null ? "py-[11px]" : "pb-1 pt-[11px]"
+  }`;
+
+  return (
+    <div
+      data-testid="copilot-test-card"
+      data-tone={status.tone}
+      className={`overflow-hidden rounded-lg border ${tone.card}`}
+    >
+      <button
+        type="button"
+        className={headerClass}
+        aria-expanded={hasBody ? expanded : undefined}
+        title={`Highlight ${block.label} on canvas`}
+        onClick={() => {
+          onSelect?.(block.label);
+          if (hasBody) onToggle();
+        }}
+      >
+        {header}
+      </button>
+      {reason === null ? null : (
+        <p className="px-3 pb-[11px] pl-[34px] text-[12px] leading-[1.5] text-muted-foreground">
+          {reason}
+        </p>
+      )}
+      {expanded ? (
+        <div className="flex flex-col gap-2 border-t border-border bg-slate-elevation2 px-3 py-2.5">
+          {diff === null ? null : (
+            <FCardCodeChange
+              diff={diff}
+              open={diffOpen}
+              onToggle={onDiffToggle}
+            />
+          )}
+          {diff !== null &&
+          (actions.length > 0 ||
+            blockFailure !== null ||
+            block.activity.length > 0) ? (
+            <div aria-hidden="true" className="h-px bg-border" />
+          ) : null}
+          {actions.map((action, i) => (
+            <FCardActionRow
+              key={action.actionId}
+              action={action}
+              revealing={i === reveal.revealingIndex}
+              flash={reveal.flashing(i)}
+              failureText={failureOf(action, i)}
+            />
+          ))}
+          {blockFailure === null ? null : (
+            <div className="-mx-1.5 flex flex-col gap-1.5 rounded-md bg-rose-500/[0.08] px-1.5 py-2">
+              <div className="flex items-start gap-2 text-[12px] leading-[1.5]">
+                <span className="flex h-[18px] w-3.5 shrink-0 items-center justify-center">
+                  <Cross2Icon
+                    aria-hidden="true"
+                    className="size-[13px] text-rose-600 dark:text-rose-500"
+                  />
+                </span>
+                <span className="font-semibold text-rose-700 dark:text-rose-300">
+                  Error
+                </span>
+              </div>
+              <FFailureText text={blockFailure} />
+            </div>
+          )}
+          {block.activity.map((entry) => (
+            <ActivityRow key={entry.id} entry={entry} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// A failed call's error: the sanitized detail when the stream carried it, else
+// its saved result line.
+function callFailureText(entry: ActivityEntry): string | null {
+  if (entry.kind !== "tool_result" || entry.success !== false) return null;
+  return entry.detail ?? (entry.text !== callLabel(entry) ? entry.text : null);
+}
+
+function FCardCodeChange({
+  diff,
+  open,
+  onToggle,
+}: {
+  diff: CodeWriteDiff;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const counts = (
+    <span className="font-mono text-[11px] tabular-nums">
+      <span className="text-emerald-700 dark:text-emerald-500">{`+${diff.added}`}</span>{" "}
+      <span className="text-rose-700 dark:text-rose-500">{`−${diff.removed}`}</span>
+    </span>
+  );
+  const lineClass =
+    "flex w-fit items-center gap-1.5 text-[12px] leading-[1.5] text-muted-foreground";
+  // A patch dropped for size keeps its counts; there is nothing to open.
+  if (diff.patch === undefined) {
+    return (
+      <div
+        className={`${lineClass} pl-[18px]`}
+        title={
+          diff.patchDropped
+            ? "The diff was too large to keep, so only its line counts were saved."
+            : undefined
+        }
+      >
+        <span>Code change</span>
+        {counts}
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-1.5">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
+        className={`${lineClass} hover:text-foreground`}
+      >
+        <Chevron open={open} />
+        <span>Code change</span>
+        {counts}
+      </button>
+      {open ? <DiffPatch patch={diff.patch} /> : null}
+    </div>
   );
 }
 
@@ -1239,6 +1620,8 @@ function FActivityLogRow({
   diffOpen,
   diffPeek,
   onDiffToggle,
+  cardOpen,
+  onCardToggle,
   turnEnded,
   onBlockSelect,
   outcomeReasonFallback,
@@ -1250,6 +1633,8 @@ function FActivityLogRow({
   diffOpen: (label: string) => boolean;
   diffPeek: (label: string) => boolean;
   onDiffToggle: (label: string) => void;
+  cardOpen: (blockKey: string, fallback: boolean) => boolean;
+  onCardToggle: (blockKey: string, open: boolean) => void;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
@@ -1286,35 +1671,94 @@ function FActivityLogRow({
       </p>
     );
 
-  const diffNodes = row.codeDiffs.map((diff) => (
-    <FCodeWriteDiff
-      key={diff.label}
-      diff={diff}
-      open={diffOpen(diff.label)}
-      peek={diffPeek(diff.label)}
-      onToggle={() => onDiffToggle(diff.label)}
-    />
-  ));
-  const blockNodes = row.blocks.map((b) => (
-    <FBlockRun
-      key={b.workflowRunBlockId || b.label}
-      block={b}
-      turnEnded={turnEnded}
-      onSelect={onBlockSelect}
-      outcomeReasonFallback={outcomeReasonFallback}
-      ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
-      flat
-      quietFailure
-      expansion={
-        row.entries.length === 0 && row.blocks.length === 1
-          ? { open, onToggle }
-          : undefined
+  // A block its run call ran reads as one card in that call's place, and the
+  // row's newest code change moves into the card of the newest run of its label:
+  // its first card there, since loop iterations share one.
+  const blocksByCall = blocksByRunCall(row);
+  const diffCardKey = new Map<string, string>();
+  const claimDiffs = (blocks: BlockState[]) => {
+    const claimed = new Set<string>();
+    for (const block of blocks) {
+      if (
+        !claimed.has(block.label) &&
+        row.codeDiffs.some((diff) => diff.label === block.label)
+      ) {
+        claimed.add(block.label);
+        diffCardKey.set(block.label, blockIdentity(block));
       }
-    />
-  ));
+    }
+  };
+  if (blocksByCall.size === 0) claimDiffs(row.blocks);
+  // A retry whose patched block has not started yet keeps its new patch on the
+  // row, not in the earlier attempt's card.
+  for (const entry of row.entries) {
+    for (const diff of entry.codeDiffs ?? []) diffCardKey.delete(diff.label);
+    const hosted = blocksByCall.get(toolCallIdOf(entry) ?? "");
+    if (hosted !== undefined) claimDiffs(hosted);
+  }
+  const isCardOpen = (block: BlockState) =>
+    cardOpen(
+      blockIdentity(block),
+      block.state === "running" || block.state === "failed",
+    );
+  // A run call's error reads once: on the last card whose block failed.
+  const cardNode = (
+    block: BlockState,
+    host: ActivityEntry | undefined,
+    carriesCallFailure: boolean,
+  ) => {
+    const key = blockIdentity(block);
+    const diff =
+      diffCardKey.get(block.label) === key
+        ? (row.codeDiffs.find((d) => d.label === block.label) ?? null)
+        : null;
+    const reasonFallback =
+      key === outcomeOwnerKey || block.outcome === "not_demonstrated"
+        ? outcomeReasonFallback
+        : null;
+    const cardIsOpen = isCardOpen(block);
+    return (
+      <FTestRunCard
+        key={key}
+        block={block}
+        diff={diff}
+        diffOpen={diffOpen(block.label)}
+        onDiffToggle={() => onDiffToggle(block.label)}
+        callFailure={
+          host !== undefined && carriesCallFailure
+            ? callFailureText(host)
+            : null
+        }
+        outcomeReason={normalizeOutcomeReason(
+          block.outcomeReason ?? reasonFallback,
+        )}
+        ownsVerdict={key === outcomeOwnerKey}
+        turnEnded={turnEnded}
+        open={cardIsOpen}
+        onToggle={() => onCardToggle(key, cardIsOpen)}
+        onSelect={onBlockSelect}
+      />
+    );
+  };
+  const diffNodes = row.codeDiffs
+    .filter((diff) => !diffCardKey.has(diff.label))
+    .map((diff) => (
+      <FCodeWriteDiff
+        key={diff.label}
+        diff={diff}
+        open={diffOpen(diff.label)}
+        peek={diffPeek(diff.label)}
+        onToggle={() => onDiffToggle(diff.label)}
+      />
+    ));
 
   const diffEvidence = (
     <div className="mb-1 ml-[18px] mt-0.5 flex flex-col gap-1">{diffNodes}</div>
+  );
+  const cardStack = (cards: React.ReactNode[], key?: string) => (
+    <div key={key} className="my-1 flex flex-col gap-1.5">
+      {cards}
+    </div>
   );
 
   // A block observed with no step of its own keeps its card as the line.
@@ -1322,7 +1766,9 @@ function FActivityLogRow({
     return (
       <div className="flex flex-col">
         {reasonNode}
-        {blockNodes}
+        {cardStack(
+          row.blocks.map((block) => cardNode(block, undefined, false)),
+        )}
         {open && diffNodes.length > 0 ? diffEvidence : null}
       </div>
     );
@@ -1397,12 +1843,16 @@ function FActivityLogRow({
       )}
     </span>
   );
+  // An open row's running card already carries the loader.
+  const cardShowsLive =
+    open &&
+    row.blocks.some((block) => block.state === "running" && isCardOpen(block));
   const line = (
     <>
       <span className="flex h-[19px] w-3 shrink-0 items-center">
         {hasDetail ? <Chevron open={open} /> : null}
       </span>
-      {row.live ? (
+      {row.live && !cardShowsLive ? (
         <span className="flex h-[19px] shrink-0 items-center">
           <Spinner small />
           <span className="sr-only">in progress</span>
@@ -1424,61 +1874,94 @@ function FActivityLogRow({
         row.blocks.length > 1,
       );
 
-  const lastIndexWhere = (predicate: (entry: ActivityEntry) => boolean) => {
-    for (let i = calls.length - 1; i >= 0; i -= 1) {
-      if (predicate(calls[i]!.entry)) return i;
-    }
-    return -1;
-  };
-  const diffHost =
-    diffNodes.length === 0
-      ? -1
-      : lastIndexWhere((entry) => (entry.codeDiffs?.length ?? 0) > 0);
-  const blockHost =
-    blockNodes.length === 0
-      ? -1
-      : lastIndexWhere(
-          (entry) =>
-            entry.toolName !== undefined &&
-            toolCallKind(entry.toolName) === "run",
-        );
-  const blockEvidence = <FDetailBox>{blockNodes}</FDetailBox>;
+  const hostedBlocks = (entry: ActivityEntry) =>
+    blocksByCall.get(toolCallIdOf(entry) ?? "") ?? [];
+  let diffHost = -1;
+  if (diffNodes.length > 0) {
+    calls.forEach(({ entry }, i) => {
+      if (
+        (entry.codeDiffs?.length ?? 0) > 0 &&
+        hostedBlocks(entry).length === 0
+      ) {
+        diffHost = i;
+      }
+    });
+  }
 
-  const body = (
-    <ul className="mb-1 ml-[18px] mt-0.5 flex list-none flex-col gap-px border-l border-border pl-2">
-      {diffNodes.length > 0 && diffHost === -1 ? <li>{diffEvidence}</li> : null}
-      {calls.map(({ entry, count }, i) => {
-        const failed = entry.kind === "tool_result" && entry.success === false;
-        const result =
-          failed && resultShown(entry) ? (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-[1.5] text-rose-700 dark:text-rose-300">
-              {entry.text}
-            </pre>
-          ) : null;
-        return (
-          <FCallItem
-            key={toolCallIdOf(entry) ?? entry.id}
-            entry={entry}
-            turnEnded={turnEnded}
-            count={count}
-            detail={result}
-            inlineResult={!failed && resultShown(entry) ? entry.text : null}
-            // The exact server error is the evidence a failed step owes.
-            defaultOpen={failed}
-            evidence={
-              <>
-                {i === diffHost ? diffEvidence : null}
-                {i === blockHost ? blockEvidence : null}
-              </>
-            }
-          />
-        );
-      })}
-      {blockNodes.length > 0 && blockHost === -1 ? (
-        <li>{blockEvidence}</li>
-      ) : null}
-    </ul>
-  );
+  // Calls read as one bordered list; a card breaks the list where its call
+  // was, so the log keeps the order things happened in.
+  const listClass =
+    "mb-1 ml-[18px] mt-0.5 flex list-none flex-col gap-px border-l border-border pl-2";
+  const segments: React.ReactNode[] = [];
+  let items: React.ReactNode[] = [];
+  const flushItems = () => {
+    if (items.length === 0) return;
+    segments.push(
+      <ul key={`calls-${segments.length}`} className={listClass}>
+        {items}
+      </ul>,
+    );
+    items = [];
+  };
+  if (diffNodes.length > 0 && diffHost === -1) {
+    items.push(<li key="diffs">{diffEvidence}</li>);
+  }
+  const carded = new Set<BlockState>();
+  calls.forEach(({ entry, count }, i) => {
+    const hosted = hostedBlocks(entry);
+    const failed = entry.kind === "tool_result" && entry.success === false;
+    const result =
+      failed && resultShown(entry) ? (
+        <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-[1.5] text-rose-700 dark:text-rose-300">
+          {entry.text}
+        </pre>
+      ) : null;
+    const callItem = (
+      <FCallItem
+        key={toolCallIdOf(entry) ?? entry.id}
+        entry={entry}
+        turnEnded={turnEnded}
+        count={count}
+        detail={result}
+        inlineResult={!failed && resultShown(entry) ? entry.text : null}
+        // The exact server error is the evidence a failed step owes.
+        defaultOpen={failed}
+        evidence={i === diffHost ? diffEvidence : null}
+      />
+    );
+    if (hosted.length > 0) {
+      // A failed card carries its call's error; with none to carry it, the
+      // call keeps its own row above the cards.
+      if (result !== null && !hosted.some((b) => b.state === "failed")) {
+        items.push(callItem);
+      }
+      flushItems();
+      hosted.forEach((block) => carded.add(block));
+      const lastFailedHosted = hosted.map((b) => b.state).lastIndexOf("failed");
+      segments.push(
+        cardStack(
+          hosted.map((block, blockIndex) =>
+            cardNode(block, entry, blockIndex === lastFailedHosted),
+          ),
+          `cards-${toolCallIdOf(entry) ?? entry.id}`,
+        ),
+      );
+      return;
+    }
+    items.push(callItem);
+  });
+  flushItems();
+  // A block whose call was condensed into an identical sibling still shows.
+  const uncarded = row.blocks.filter((block) => !carded.has(block));
+  if (uncarded.length > 0) {
+    segments.push(
+      cardStack(
+        uncarded.map((block) => cardNode(block, undefined, false)),
+        "cards-rest",
+      ),
+    );
+  }
+  const body = <>{segments}</>;
 
   return (
     <div className="flex flex-col">
@@ -1626,12 +2109,13 @@ function FActivityLog({
     },
     [lastInteractedRow],
   );
-  const toggleDiff = useCallback(
-    (rowId: string, label: string, open: boolean) => {
+  // A diff or a test card inside a row, keyed `<kind>:<row id>:<id>`.
+  const toggleEvidence = useCallback(
+    (rowId: string, key: string, open: boolean) => {
       lastInteractedRow.current = rowId;
       setOverride((prev) => {
         const next = new Map(prev);
-        next.set(`diff:${rowId}:${label}`, !open);
+        next.set(key, !open);
         // Expanding evidence is also an explicit request to keep its parent
         // visible when the automatic frontier advances.
         if (!open) next.set(rowId, true);
@@ -1718,7 +2202,21 @@ function FActivityLog({
                   diffOpen={diffOpen}
                   diffPeek={diffPeek}
                   onDiffToggle={(label) =>
-                    toggleDiff(row.id, label, diffOpen(label))
+                    toggleEvidence(
+                      row.id,
+                      `diff:${row.id}:${label}`,
+                      diffOpen(label),
+                    )
+                  }
+                  cardOpen={(blockKey, fallback) =>
+                    override.get(`card:${row.id}:${blockKey}`) ?? fallback
+                  }
+                  onCardToggle={(blockKey, cardIsOpen) =>
+                    toggleEvidence(
+                      row.id,
+                      `card:${row.id}:${blockKey}`,
+                      cardIsOpen,
+                    )
                   }
                   turnEnded={turnEnded}
                   onBlockSelect={onBlockSelect}

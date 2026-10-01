@@ -317,6 +317,72 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.queryByText("0 actions")).toBeNull();
   });
 
+  it("flags a completed conditional that routed on an evaluation error, and only that one", () => {
+    const error =
+      "Workflow branch evaluation context is too large to process safely. Reduce the workflow input or prior block output size, then retry.";
+    const promptBranch = {
+      branch_id: "b_prompt",
+      branch_index: 0,
+      criteria_type: "prompt",
+      original_expression: "user selected premium plan",
+      result: false,
+      is_matched: false,
+      is_default: false,
+      next_block_label: "premium",
+      error: null,
+    };
+    const defaultBranch = {
+      branch_id: "b_default",
+      branch_index: 1,
+      criteria_type: null,
+      original_expression: null,
+      rendered_expression: null,
+      result: null,
+      is_matched: true,
+      is_default: true,
+      next_block_label: "fallback_block",
+      error: null,
+    };
+    const evaluated = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "check_plan",
+      status: Status.Completed,
+      executed_branch_id: "b_default",
+      executed_branch_next_block: "fallback_block",
+      output: {
+        branch_taken: "fallback_block",
+        evaluations: [promptBranch, defaultBranch],
+      },
+    });
+    const errored = buildBlock({
+      ...evaluated,
+      output: {
+        branch_taken: "fallback_block",
+        evaluations: [{ ...promptBranch, result: null, error }, defaultBranch],
+        evaluation_error: error,
+      },
+    });
+    const renderRow = (block: WorkflowRunBlock) => (
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />
+    );
+
+    const { rerender } = render(renderRow(evaluated));
+    expect(screen.queryByText("evaluation error")).toBeNull();
+
+    rerender(renderRow(errored));
+    const flag = screen.getByText("evaluation error");
+    expect(flag.getAttribute("title")).toContain(error);
+    // The block still reports completed; the flag sits beside that status.
+    expect(screen.getByRole("img", { name: "completed" })).toBeDefined();
+  });
+
   it("renders action rows under a code block and lets the user select an action", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({

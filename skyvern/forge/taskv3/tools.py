@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import io
 import json
+import math
 import os
 import random
 import re
@@ -26,9 +27,11 @@ import time
 import unicodedata
 import weakref
 from collections import Counter, defaultdict, deque
+from collections.abc import Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple
 from urllib.parse import urlparse
 
@@ -636,8 +639,8 @@ class _TypeaheadPick(NamedTuple):
     clicked: bool
     declared: bool
     note: str | None = None
-    # How many rows the widget DECLARED beyond the ones it rendered, so a refusal can tell "nothing on
-    # this list is it" from "nothing on the part of it we could read".
+    # How many rows the widget DECLARED beyond the ones it rendered (-1: its total is unknown), so a refusal
+    # can tell "nothing on this list is it" from "nothing on the part of it we could read".
     overflow: int = 0
     # Whether the commit surface already vouched for the chosen label BEFORE the pick click — such a
     # surface proves nothing about the commit and must not vouch for it downstream either.
@@ -794,6 +797,289 @@ def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
     return n if isinstance(n, int) else None
 
 
+_ORDINAL_CAP = 2**31 - 1
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListRow:
+    """One row as one scan read it. `box` is the row's [top, bottom] in its scroller's content space, None when
+    the row has no scroller or is pinned to the viewport."""
+
+    text: str
+    key: str
+    nav: bool
+    box: tuple[float, float] | None
+    after: str | None
+    line: float | None
+    setsize: int
+    setsize_unknown: bool
+    group: str
+    lead: bool
+    read: MappingProxyType[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListWindow:
+    """One scan of a list. `content` is the scroller's [padding top, scrollHeight - padding bottom], None when
+    no scroller runs past the rows, so the rows read are every row rendered. `chain` marks the scans of one
+    ordered walk from the top, whose adjacent windows must share a row; `walk_pass` counts walk restarts."""
+
+    rows: tuple[_ListRow, ...]
+    scroll_top: float
+    scroll_height: float
+    content: tuple[float, float] | None
+    fillers: tuple[tuple[float, float], ...]
+    eps: float
+    walk_pass: int = 0
+    chain: bool = True
+
+
+def _finite(v: Any) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+def _span(v: Any) -> tuple[float, float] | None:
+    if not isinstance(v, list) or len(v) != 2:
+        return None
+    top, bottom = _finite(v[0]), _finite(v[1])
+    return (top, bottom) if top is not None and bottom is not None and bottom > top else None
+
+
+def _ordinal(v: Any) -> int:
+    # The page sets aria-setsize, so an over-large or infinite value clamps rather than raises.
+    return int(min(v, _ORDINAL_CAP)) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _list_row(o: dict[str, Any]) -> _ListRow:
+    text = str(o.get("text") or "")
+    line = _finite(o.get("line"))
+    return _ListRow(
+        text=text,
+        key=_exact_tier_key(text),
+        nav=bool(o.get("nav")),
+        box=_span(o.get("box")),
+        after=str(o["after"]) if isinstance(o.get("after"), str) else None,
+        line=line if line is not None and line > 0 else None,
+        setsize=_ordinal(o.get("setsize")),
+        setsize_unknown=bool(o.get("setsize_unknown")),
+        group=str(o.get("group") or ""),
+        lead=o.get("lead") is not False,
+        read=MappingProxyType(dict(o)),
+    )
+
+
+def _list_window(raw: Any, state: Any, *, walk_pass: int = 0, chain: bool = True) -> _ListWindow:
+    rows = tuple(_list_row(o) for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int))
+    if not isinstance(state, dict):
+        return _ListWindow(rows, 0.0, 0.0, None, (), 1.0, walk_pass, chain)
+    height = float(state.get("scrollHeight") or 0)
+    fillers = tuple(span for f in state.get("fillers") or [] if (span := _span(f)) is not None)
+    dpr = _finite(state.get("dpr"))
+    return _ListWindow(
+        rows=rows,
+        scroll_top=float(state.get("scrollTop") or 0),
+        scroll_height=height,
+        content=(float(state.get("padTop") or 0), height - float(state.get("padBottom") or 0)),
+        fillers=fillers,
+        eps=1 / dpr if dpr is not None and dpr > 0 else 1.0,
+        walk_pass=walk_pass,
+        chain=chain,
+    )
+
+
+def _row_identities(windows: Sequence[_ListWindow]) -> list[list[_ListRow]]:
+    """The distinct rows behind the reads of one frame, one list of reads per row. A read joins a row with its key
+    whose box it overlaps, never a second read from the same window: two reads in one window are two rows."""
+    groups: list[tuple[set[int], list[_ListRow]]] = []
+    for i, window in enumerate(windows):
+        for row in window.rows:
+            if not row.text:
+                continue
+            for seen_in, reads in groups:
+                prior = reads[-1].box
+                if (
+                    i not in seen_in
+                    and reads[0].key == row.key
+                    and (prior is None or row.box is None or min(prior[1], row.box[1]) > max(prior[0], row.box[0]))
+                ):
+                    seen_in.add(i)
+                    reads.append(row)
+                    break
+            else:
+                groups.append(({i}, [row]))
+    return [reads for _, reads in groups]
+
+
+def _frames_agree(a: _ListWindow, b: _ListWindow) -> bool:
+    # Chromium snaps scroll offsets to device pixels, so one frame reads one row within a device pixel.
+    eps = max(a.eps, b.eps)
+    return any(
+        ra.key == rb.key and abs(ra.box[0] - rb.box[0]) <= eps
+        for ra in a.rows
+        if ra.text and ra.box is not None
+        for rb in b.rows
+        if rb.text and rb.box is not None
+    )
+
+
+def _declared_shortfall(rows: Sequence[_ListRow]) -> int:
+    """0 when the rows hold what the list declares, -1 when it declares its total unknown, else the total it declares.
+    ARIA scopes aria-setsize to each group, so a group short of its own size is never covered by a full one."""
+    if any(r.setsize_unknown for r in rows):
+        return -1
+    held = Counter((r.group, r.setsize) for r in rows if r.setsize)
+    return sum(size for _, size in held) if any(size > n for (_, size), n in held.items()) else 0
+
+
+def _covered_length(spans: Sequence[tuple[float, float]], lo: float, hi: float) -> float:
+    covered, reach = 0.0, lo
+    for a, b in sorted(spans):
+        a, b = max(a, reach), min(b, hi)
+        if b > a:
+            covered += b - a
+            reach = b
+    return covered
+
+
+def _row_floor(windows: Sequence[_ListWindow]) -> float:
+    """The shortest row this list can render: its shortest row box read, or one line box of a row."""
+    rows = [r for w in windows for r in w.rows if r.text and r.box is not None]
+    return min([r.box[1] - r.box[0] for r in rows if r.box is not None] + [r.line for r in rows if r.line], default=0.0)
+
+
+def _rows_tile(chain: Sequence[_ListWindow]) -> bool:
+    if not chain:
+        return False
+    if all(w.content is None for w in chain):
+        return True
+    if any(w.content is None for w in chain) or not all(_frames_agree(a, b) for a, b in zip(chain, chain[1:])):
+        return False
+    placed = sorted(
+        (
+            (box, reads[0].text, {r.after for r in reads})
+            for reads in _row_identities(chain)
+            if (box := next((r.box for r in reads if r.box is not None), None)) is not None
+        ),
+        key=lambda p: p[0],
+    )
+    boxes = [box for box, _, _ in placed]
+    if not boxes:
+        return False
+    fillers = [f for w in chain for f in w.fillers]
+
+    def _slot(lo: float, hi: float) -> float:
+        return (hi - lo) - _covered_length(fillers, lo, hi)
+
+    interior: list[float] = []
+    spacing: list[float] = []
+    bottom = boxes[0][1]
+    for (_, text, _), ((top, bot), _, afters) in zip(placed, placed[1:]):
+        interior.append(_slot(bottom, top) if top > bottom else top - bottom)
+        if text in afters:
+            spacing.append(interior[-1])
+        bottom = max(bottom, bot)
+    start, end = chain[-1].content or (0.0, 0.0)
+    eps = max(w.eps for w in chain)
+    if boxes[0][0] - start < -eps or end - bottom < -eps:
+        return False
+    h_floor = _row_floor(chain)
+    # The list's own spacing g is read only between rows with nothing between them in the DOM, and its smallest
+    # such slot, so a hole can never raise it; with no such pair it is 0. Spacing that could hold the smallest row
+    # is not spacing.
+    g = min(spacing, default=0.0)
+    if g >= min(b - t for t, b in boxes):
+        return False
+    # A complete list leaves g between rows; one missing row leaves at least g + h_floor. The midpoint of those
+    # two, g + h_floor / 2, is the widest slot a complete list can show.
+    limit = g + h_floor / 2
+    return all(slot < limit for slot in [_slot(start, boxes[0][0]), _slot(bottom, end), *interior])
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListLog:
+    """Every window a walk read, in order. Appending returns a new log, so no read is ever overwritten."""
+
+    windows: tuple[_ListWindow, ...] = ()
+
+    def appended(self, window: _ListWindow) -> _ListLog:
+        return _ListLog((*self.windows, window))
+
+
+def _frames(windows: Sequence[_ListWindow]) -> list[list[_ListWindow]]:
+    by_pass: dict[int, list[_ListWindow]] = {}
+    for w in windows:
+        by_pass.setdefault(w.walk_pass, []).append(w)
+    return [by_pass[p] for p in sorted(by_pass)]
+
+
+def _rows_per_key(windows: Sequence[_ListWindow]) -> Counter[str]:
+    """The most distinct rows any one frame read for each key."""
+    most: Counter[str] = Counter()
+    for frame in _frames(windows):
+        most |= Counter(reads[0].key for reads in _row_identities(frame))
+    return most
+
+
+def _log_rows(windows: Sequence[_ListWindow]) -> list[_ListRow]:
+    """One read per distinct row: the last frame's rows, then any row an earlier frame read under a text the
+    last frame never read."""
+    frames = _frames(windows)
+    if not frames:
+        return []
+    rows = [reads[-1] for reads in _row_identities(frames[-1])]
+    texts = {r.text for r in rows}
+    for frame in frames[:-1]:
+        rows += [reads[-1] for reads in _row_identities(frame) if reads[-1].text not in texts]
+    return rows
+
+
+def _first_scroll_top(windows: Sequence[_ListWindow], text: str) -> float | None:
+    last = max((w.walk_pass for w in windows), default=0)
+    holding = [w for w in windows if any(r.text == text for r in w.rows)]
+    return next((w.scroll_top for w in holding if w.walk_pass == last), holding[0].scroll_top if holding else None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _WalkResult:
+    """What a scroll walk found, every field derived from its log. `rows` are the rows to report (every distinct
+    row when `definitive`, else the restored window's), `seen` every distinct non-navigational row it read."""
+
+    idx: int | None = None
+    hit: str | None = None
+    rows: tuple[dict[str, Any], ...] = ()
+    definitive: bool = False
+    complete: bool = False
+    twins: bool = False
+    twin_rows: int = 0
+    unproven: dict[str, Any] | None = None
+    seen: tuple[dict[str, Any], ...] = ()
+
+
+def _list_coverage(windows: Sequence[_ListWindow]) -> Literal["complete", "declares_more", "incomplete"]:
+    """Whether the rows read are the whole list: the one completeness rule for a single read and for a walk.
+    Geometry decides, over the chained windows of the walk's last pass: the frames agree, and no slot between
+    row boxes (both list ends included, a declared filler covering its own box) could hold a row. A declared size
+    only refuses: a widget may number each rendered window 1..N. `declares_more`: the rows tile the extent but the
+    list declares rows they do not hold."""
+    if not windows:
+        return "incomplete"
+    last = max(w.walk_pass for w in windows)
+    frame = [w for w in windows if w.walk_pass == last]
+    chain = [w for w in frame if w.chain]
+    unknown = any(r.setsize_unknown for w in windows for r in w.rows)
+    tiles = _rows_tile(chain)
+    declared = [max(reads, key=lambda r: r.setsize) for reads in _row_identities(frame) if reads[0].lead]
+    if unknown or _declared_shortfall(declared):
+        return "declares_more" if tiles else "incomplete"
+    return "complete" if tiles else "incomplete"
+
+
+def _lead_clause(text: str) -> str:
+    # The leading clause the anchor-lead read compares, split the way its JS splits it.
+    norm = " ".join(text.split()).lower()
+    return re.split(r"\s*[,;|(]\s*|\s+[-\u2013\u2014]\s+", norm)[0].strip()
+
+
 def _prefix_tokens(s: str) -> list[str]:
     # Fold commas and apostrophes so a short value token-prefix-matches a punctuated label ("Yes" → "Yes, I
     # consent"). A slash is left intact so a combined "Yes/No" option is not prefix-matched by "Yes".
@@ -922,6 +1208,20 @@ def _commit_gate(
     if sum(1 for t in contenders if (r := _option_tier(value, t)) is not None and r <= rank) >= 2:
         return "ambiguous"
     return "commit" if complete else "incomplete"
+
+
+async def _read_list_window(page: Any, raw: Any, *, scroller: bool) -> _ListWindow:
+    """One read of the rows `raw` against the scroller the finder tagged. A tagged scroller whose state cannot be
+    read leaves an unbounded extent, so the read never proves the list whole."""
+    if not scroller:
+        return _list_window(raw, None)
+    try:
+        state = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": None})
+    except Exception:
+        state = None
+    if not isinstance(state, dict):
+        state = {"scrollHeight": math.inf}
+    return _list_window(raw, state)
 
 
 def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any]) -> ToolResult:
@@ -1289,8 +1589,9 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # Emits `root`'s semantic matches merged in document order with its "pointer roots" (named, role-less
 # elements styled cursor:pointer, the only trace a delegated click listener leaves; v1 lists them via
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
-# not a root when the reading already covers it: it is, is inside, or holds a control `listable` keeps,
-# or its pointer parent is itself a root or covered.
+# not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
+# pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
+# named, control-free pointer descendant is listed for it, recorded in `state.held`.
 _WITH_POINTER_ROOTS_JS = (
     r"""(root, q, semantic, state, emit, listable) => {
   // A linked list, not an array: a page that poisons Array.prototype.push or its index setters
@@ -1424,10 +1725,22 @@ _WITH_POINTER_ROOTS_JS = (
         // A control the reading drops is not a root, but its pointer children may be.
         if (matches.call(el, q)) { if (listable(el)) state.covered.add(el); continue; }
         const sr = shadowRootOf.call(el);
-        if (inListable(parentOf.call(el)) || anyListable(qsa.call(el, q))
-          || (sr && sr.nodeType === 11 && anyListable(fragQsa.call(sr, q))) || heldBySlot(el)
+        const holds = anyListable(qsa.call(el, q));
+        if (inListable(parentOf.call(el)) || (sr && sr.nodeType === 11 && (holds || anyListable(fragQsa.call(sr, q))))
+          || heldBySlot(el)
           // A label bound to a control names that control, which is listed (or skinned) on its own.
           || (tag === 'label' && el.control)) { state.covered.add(el); continue; }
+        // A row or card that also carries a button is not listed (its centre may land on the button);
+        // its first named control-free pointer child stands for it instead, for as many holders as the
+        // cap could ever list. Past that a holder is covered, so a long list costs no more work than before.
+        if (holds) { (state.heldCount < state.heldCap ? state.holders : state.covered).add(el); continue; }
+        let holder = null;
+        for (let a = parent, i = 0; a && i < 64 && isPointer(a); a = parentOf.call(a), i++) {
+          if (state.holders.has(a)) { holder = a; break; }
+        }
+        if (holder && (state.represented.has(holder) || state.heldCount >= state.heldCap)) { state.covered.add(el); continue; }
+        // A decorative child (an icon font's ligature) does not name the row.
+        if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
         const r = bcr.call(el);
         if (!(r.width > 0 && r.height > 0)) continue;
         if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
@@ -1457,7 +1770,13 @@ _WITH_POINTER_ROOTS_JS = (
         if (!painted(el, r) || offRight(el, r)) continue;
         state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
         state.covered.add(el);
-        state.count++;
+        // A holder's child ranks below every other pointer root for the listing cap, so it neither
+        // spends the scan ceiling nor displaces a root the reading lists without holders.
+        if (holder) {
+          state.held.add(el);
+          state.heldCount++;
+          for (let a = holder, i = 0; a && i < 64 && state.holders.has(a); a = parentOf.call(a), i++) state.represented.add(a);
+        } else state.count++;
         const node = { el, next: null };
         if (tail) tail.next = node; else head = node;
         tail = node;
@@ -2143,11 +2462,28 @@ _FIND_SUGGESTION_JS = (
     }
     return { count: n, options, declared: false };
   }
-  pool.sort((a, b) => b.score - a.score || a.h - b.h);
-  const best = pool[0];
+  // An empty-state row is never the winner: one the widget disables, or one that echoes the typed
+  // query back inside quotation marks ('No results for "x"'), which is how a list quotes the user's input.
+  const QUOTES = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e';
+  const typedNorm = String(args.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const emptyState = (n) => {
+    if (composedClosest(n, '[aria-disabled="true"]')) return true;
+    const t = (n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const at = typedNorm ? t.indexOf(typedNorm) : -1;
+    return at > 0 && QUOTES.includes(t[at - 1]) && QUOTES.includes(t[at + typedNorm.length] || '');
+  };
+  const live = pool.filter((c) => !emptyState(c.el));
+  // The exact row the widget will not take still names the answer, so no lesser row may stand in for it.
+  const barred = pool.find((c) => c.exactRow && emptyState(c.el));
+  if (barred && !live.some((c) => c.exactRow)) {
+    return { count: 1, options: [], declared: false, barredExact: (barred.el.innerText || '').trim().slice(0, 60) };
+  }
+  if (!live.length) return null;
+  live.sort((a, b) => b.score - a.score || a.h - b.h);
+  const best = live[0];
   // Two leading-clause matches for a short value ("No, ..." and "No - ...") with no exact row are
   // ambiguous: geometry must not decide an answer, so refuse and let the caller report the options.
-  if (exact !== null && !best.exactRow && pool.length > 1 && pool[1].score === best.score) return null;
+  if (exact !== null && !best.exactRow && live.length > 1 && live[1].score === best.score) return null;
   // Refuse to tag a multi-row CONTAINER even when it is the only match (its score came from different
   // rows' text combined, and clicking it would land on an arbitrary middle row). A real suggestion is a
   // single row: its visible child elements, if any, sit on one line (inline sub-parts), not stacked rows.
@@ -2422,45 +2758,6 @@ _FIND_CATEGORIES_JS = (
 }"""
 )
 
-# Tier-1 semantic commit read (SKY-15322): ONE shape-invariant probe consulted before the shape
-# heuristics below. Decisive-ACCEPT-only — it answers {committed: true} or {committed: false}
-# ("unknown"), never a decisive negative, so an unresolvable widget always falls to the heuristics
-# unchanged. Every accept rests on a signal the tool did NOT author: raw value equality is NOT one
-# (the tool typed the intended string itself, so it holds on every dead click — the equal-value
-# impostor pair proves no black-box read can split that case).
-# Tier-1 semantic commit read (SKY-15322): the narrowed solid core. ONE decisive-accept rule —
-# the value TRANSFORM on a real form control: the widget rewrote what the tool typed into the
-# intended value (raw equality is never evidence; the tool authored the typed string). Everything
-# else is unknown by contract and falls to the shape heuristics unchanged: native selects (their own
-# tool verifies by value; selection state alone carries no click causality), contenteditable anchors
-# (three review rounds showed their text state cannot carry commit causality — completion, previews
-# and blur-expansion are all indistinguishable from selection at the DOM level), and ARIA selection
-# state (four distinct false-accept shapes across temporal, wiring, polarity and cross-root
-# dimensions — retired to a later phase rather than guarded a fifth time).
-_SEMANTIC_COMMIT_STATE_JS = (
-    r"""(arg) => {"""
-    + _PIERCED_QUERY_JS
-    + r"""
-  const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
-  const want = nrm(arg.intended);
-  if (!want) return { committed: false };
-  let el = null;
-  try { el = pQS(arg.sel); } catch (e) { el = null; }
-  if (!el && arg.el && arg.el.isConnected) el = arg.el;
-  if (!el) return { committed: false };
-  if (el.tagName === 'SELECT') return { committed: false };
-  if (el.isContentEditable) return { committed: false };
-  // The typed baseline must have been READ from the element by the caller and is opt-in
-  // (typedTrusted !== true reads as untrusted), so a caller that forgets the key fails SAFE.
-  if (arg.typedTrusted !== true) return { committed: false };
-  const cur = el.value;
-  if (nrm(cur) === want && nrm(arg.typed) !== want) {
-    return { committed: true, via: 'value-transform', value: String(cur || '').trim() };
-  }
-  return { committed: false };
-}"""
-)
-
 # A field's own committed-value surface: React-Select / styled combobox widgets move a commit OUT of
 # the filter input into a single-value node or chip beside it (clearing the input), so reading el.value
 # misses it. Reads only once the widget reports closed (aria-expanded=false) — a still-open list
@@ -2473,12 +2770,17 @@ _SEMANTIC_COMMIT_STATE_JS = (
 # `ownCommittedSurface` is the display form (D1's short-surface read, observe/D3): one node's text or
 # aria, joined across several surfaces (multi-value chips) with ", ".
 _OWN_COMMITTED_SURFACE_FN_JS = r"""
-  const ownWidgetClosed = (el) => {
+  // `popupOpen`, when a caller passes it, lets a widget that exposes no aria-expanded at all read as
+  // closed once its own popup is gone.
+  const ownWidgetClosed = (el, popupOpen) => {
     const expandedEl = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
-    return (expandedEl ? expandedEl.getAttribute('aria-expanded') : null) === 'false';
+    const exp = expandedEl ? expandedEl.getAttribute('aria-expanded') : null;
+    if (exp === 'false') return true;
+    return exp == null && typeof popupOpen === 'function' && !popupOpen(el);
   };
-  const ownCommittedSurfaces = (el) => {
-    if (!ownWidgetClosed(el)) return [];
+  // `anyState` reads the nodes even while the list is open, for a baseline that may only over-count.
+  const ownCommittedSurfaces = (el, popupOpen, anyState) => {
+    if (!anyState && !ownWidgetClosed(el, popupOpen)) return [];
     const TRIGGER = "[role=combobox],[aria-haspopup=listbox],[aria-haspopup=menu],button[aria-expanded],input[role=combobox],select";
     const SURFACE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label'],[role=option][aria-selected=true],.chip,.pill,[class*='token']";
     const VALUE_NODE = "[class*='single-value'],[class*='singleValue'],[class*='multi-value__label']";
@@ -2721,8 +3023,16 @@ _VERIFY_COMMIT_JS = (
     // container — a re-render that merely replaces row nodes strips the row tags but keeps the
     // container, and must not read as a commit; suggListOpen). Exact equality with the CHOSEN label only.
     if (!args.liveOffer && args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
-  } else if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) {
-    return cur;
+  } else if (cur) {
+    // The tool typed `typed` itself, so a value that is only that text back (whole, or with nothing beyond it
+    // that names the chosen row) counts only once the list closed, and a value relates to the pick through
+    // the chosen row, never through the typed query.
+    const fold = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
+    const c = fold(chosen), inner = fold(cur).slice(c.length + 2, -1);
+    const namesChosen = fold(cur) === c || (fold(cur).startsWith(c + ' (') && fold(cur).endsWith(')') && !!inner && !/[()]/.test(inner));
+    const echo = !!typed && (fold(cur) === fold(typed) || (fold(cur).includes(fold(typed)) && !namesChosen
+      && !overlaps(fold(cur).replace(fold(typed), ' '), chosen)));
+    if ((!echo || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen))) return cur;
   }
   const cont = el.closest('div,li,fieldset');
   if (cont) {
@@ -2733,13 +3043,15 @@ _VERIFY_COMMIT_JS = (
     for (const h of cont.querySelectorAll('input[type=hidden]')) {
       const v = (h.value || '').trim();
       if (!v || isOtherRow(v)) continue;
+      // A hidden copy of the typed query that was already there before the click is the tool's own text.
+      if (typed && preHidden.has(v) && (eqi(v, typed) || overlaps(v, typed))) continue;
       if (eqi(v, chosen)) return v;
       if (args.noSuggestionList) {
         const declaredHidden = Array.isArray(args.chosenValues) ? args.chosenValues : [];
         if ((overlaps(v, chosen) || declaredHidden.some((d) => eqi(d, v))) && !preHidden.has(v)) return v;
         continue;
       }
-      if (overlaps(v, chosen) || eqi(v, typed) || overlaps(v, typed)) return v;
+      if (overlaps(v, chosen)) return v;
     }
   }
   // React-Select / styled combobox: on commit the value moves OUT of the filter input into a
@@ -2869,6 +3181,255 @@ _OWN_FIELD_SCOPES_FN_JS = r"""
     return scopes;
   };
 """
+
+# The hidden-input values _VERIFY_COMMIT_JS would read for this field, in the same div/li/fieldset scope.
+_HIDDEN_VALUES_JS = (
+    "el => { const c = el.closest('div,li,fieldset'); if (!c) return []; "
+    "return Array.from(c.querySelectorAll('input[type=hidden]')).map((h) => (h.value || '').trim()).filter(Boolean); }"
+)
+
+# What the field ITSELF shows as committed, read only from sources it owns: its own label or
+# aria-labelledby text past the caption, a removable chip in its single-field container, its own anchor
+# text once its own popup is gone, or a painted value node. A neighbour's label, a row still offered in
+# a list, and the raw text of the field's own input never count. Returns the source name, or ''.
+_FIELD_OWN_STATE_FN_JS = r"""
+  const OFFER_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="option"],[role="menuitem"],[data-tv3-sugglist],[data-tv3-sugg],[data-tv3-menu]';
+  const ownNrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const ownPopupOpen = (el) => {
+    const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
+    if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
+    return fieldOwnPopup(el, true) !== null;
+  };
+  const offered = (n) => { try { return composedClosest(n, OFFER_SEL) !== null; } catch (e) { return true; } };
+  const textRuns = (root, el) => {
+    const runs = [];
+    const walk = (n, depth) => {
+      if (depth > 6) return;
+      for (const c of n.childNodes) {
+        if (runs.length > 8) return;
+        if (c.nodeType === 3) {
+          const t = ownNrm(c.nodeValue);
+          if (t) runs.push(t);
+          continue;
+        }
+        if (c.nodeType !== 1 || c === el) continue;
+        let skip = true;
+        try {
+          skip = c.matches('input,select,textarea,button,[role="button"],script,style,svg') || c.matches(OFFER_SEL) || !visible(c);
+        } catch (e) { skip = true; }
+        if (!skip) walk(c, depth + 1);
+      }
+    };
+    walk(root, 0);
+    return runs;
+  };
+  // The value a label shows is its LAST text run, after a caption that differs from it ("Country" / "Canada").
+  const ownLabelHolds = (el, want) => {
+    const labels = [];
+    try { for (const l of (el.labels || [])) labels.push(l); } catch (e) { /* not a labelable element */ }
+    const root = el.getRootNode();
+    for (const id of String(el.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+      let t = null;
+      try { t = id && root.getElementById ? root.getElementById(id) : null; } catch (e) { t = null; }
+      if (t && t !== el && !pContains(t, el) && labels.indexOf(t) === -1) labels.push(t);
+    }
+    for (const l of labels) {
+      if (offered(l) || !visible(l)) continue;
+      const runs = textRuns(l, el);
+      if (runs.length >= 2 && runs[runs.length - 1] === want && runs[0] !== want) return true;
+    }
+    return false;
+  };
+  // A chip is removable: it nests a control, or its name offers removal ("White Dismiss"). A button that
+  // merely names an option ("Choose Canada", a quick pick) is an offer, not a commit.
+  const CHIP_SEL = 'button,[role="button"],[class*="chip" i],[class*="pill" i],[class*="token" i],[class*="multi-value" i],[class*="multiValue" i]';
+  const REMOVAL_RE = /\b(?:remove|dismiss|delete|clear|deselect|unselect)\b|^[x\u00d7\u2715\u2716\u2a2f]$/;
+  // The chip's branch under the scope it shares with the field holds no caption of its own: a sibling
+  // group's chips sit under that group's caption ("Countries lived in"), which a field-less group cannot
+  // otherwise be told apart by.
+  const captionFree = (scope, c) => {
+    let branch = c;
+    while (branch && scopeUp(branch) !== scope) branch = scopeUp(branch);
+    if (!branch || branch.nodeType !== 1 || branch === c) return true;
+    const runs = [];
+    const walk = (n, depth) => {
+      if (depth > 6 || runs.length) return;
+      for (const k of n.childNodes) {
+        if (k.nodeType === 3) { if (ownNrm(k.nodeValue)) { runs.push(k); return; } continue; }
+        if (k.nodeType !== 1) continue;
+        let skip = true;
+        try { skip = k.matches(CHIP_SEL) || k.matches('script,style,svg') || !visible(k); } catch (e) { skip = true; }
+        if (!skip) walk(k, depth + 1);
+      }
+    };
+    walk(branch, 0);
+    return runs.length === 0;
+  };
+  const idRefs = (el, attr) => {
+    const root = el.getRootNode();
+    const out = [];
+    for (const id of String(el.getAttribute(attr) || '').split(/\s+/)) {
+      let t = null;
+      try { t = id && root.getElementById ? root.getElementById(id) : null; } catch (e) { t = null; }
+      if (t) out.push(t);
+    }
+    return out;
+  };
+  // Proof that a chip is the field's own: the field describes it through ARIA, or it shares the field's
+  // innermost container with nothing else there that carries text (other than the field's own label) and
+  // no labelled group between it and that container.
+  const chipProvablyOwned = (el, c) => {
+    if (idRefs(el, 'aria-describedby').some((t) => pContains(t, c))) return true;
+    const scope = ownFieldScopes(el).find((s) => pContains(s, c));
+    if (!scope) return false;
+    for (let n = scopeUp(c); n && n !== scope; n = scopeUp(n)) {
+      if (n.nodeType !== 1) continue;
+      if (n.tagName === 'FIELDSET' || n.hasAttribute('aria-label') || n.hasAttribute('aria-labelledby')) return false;
+    }
+    const own = idRefs(el, 'aria-labelledby');
+    try { for (const l of (el.labels || [])) own.push(l); } catch (e) { /* not a labelable element */ }
+    let text = false;
+    const walk = (n, depth) => {
+      if (depth > 8 || text) return;
+      for (const k of n.childNodes) {
+        if (k.nodeType === 3) { if (ownNrm(k.nodeValue)) { text = true; return; } continue; }
+        if (k.nodeType !== 1 || k === el) continue;
+        let skip = true;
+        try { skip = own.includes(k) || k.matches(CHIP_SEL) || k.matches('input,select,textarea,script,style,svg') || !visible(k); } catch (e) { skip = true; }
+        if (!skip) walk(k, depth + 1);
+      }
+    };
+    walk(scope, 0);
+    return !text;
+  };
+  // `strict` (the pre-act no-op) keeps only chips whose ownership is provable.
+  const ownChipLabels = (el, strict) => {
+    const found = [];
+    for (const scope of ownFieldScopes(el)) {
+      for (const c of scope.querySelectorAll(CHIP_SEL)) {
+        if (found.some((f) => f.node === c) || excludedFor(el, c) || offered(c) || !visible(c)) continue;
+        if (c.matches('[aria-selected],[aria-pressed],[aria-checked],[aria-expanded],[type="submit" i]')) continue;
+        const runs = textRuns(c, el);
+        if (!runs.length) continue;
+        const aria = ownNrm(c.getAttribute('aria-label'));
+        let removable = runs.slice(1).some((t) => REMOVAL_RE.test(t)) || (!!aria && aria !== runs[0] && REMOVAL_RE.test(aria));
+        try { removable = removable || c.querySelector('button,[role="button"]') !== null; } catch (e) { /* keep */ }
+        if (!removable || !captionFree(scope, c) || (strict && !chipProvablyOwned(el, c))) continue;
+        found.push({ node: c, label: runs.filter((t) => !REMOVAL_RE.test(t)).join(' ') });
+      }
+    }
+    return found.filter((f) => !found.some((o) => o !== f && f.node.contains(o.node))).map((f) => f.label);
+  };
+  const anchorHolds = (el, want, anyState) => {
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable) return false;
+    if (!anyState && ownPopupOpen(el)) return false;
+    if (textRuns(el, el).join(' ') === want) return true;
+    const head = ownNrm(el.getAttribute('aria-label')).split('|')[0];
+    return !!head && (head.includes(':') ? head.slice(head.indexOf(':') + 1).trim() : head) === want;
+  };
+  // An anchor may show only the committed row's leading clause ("Riverton" for "Riverton, North
+  // Province"). That counts only as a CHANGE from the anchor's own text before its list opened, and only
+  // when no other option the list showed shares that clause (`leadUnique`).
+  const anchorShowsLead = (el, want, pre) => {
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable || ownPopupOpen(el)) return false;
+    const lead = want.split(/\s*[,;|(]\s*|\s+[-\u2013\u2014]\s+/)[0].trim();
+    if (!lead || lead === want || ownNrm(el.textContent) === ownNrm(pre)) return false;
+    return textRuns(el, el).join(' ') === lead;
+  };
+  // Every source that shows `want`. `anyState` ignores whether the list is open: a pre-click baseline
+  // read that way can only over-count, which only withholds an accept.
+  const fieldOwnSources = (el, want, anyState) => {
+    const out = [];
+    if (!want) return out;
+    if (ownLabelHolds(el, want)) out.push('label');
+    if (ownChipLabels(el).includes(want)) out.push('chip');
+    if (anchorHolds(el, want, anyState)) out.push('anchor');
+    const surfaces = ownCommittedSurfaces(el, ownPopupOpen, anyState);
+    if (surfaces.some((s) => s.displayed && (ownNrm(s.text) === want || ownNrm(s.aria) === want))) out.push('value-node');
+    return out;
+  };
+"""
+
+# Tier-1 semantic commit read (SKY-15322), decisive-ACCEPT-only: {committed: true} or {committed: false}
+# ("unknown"), never a decisive negative, so an unresolvable widget falls to the shape heuristics
+# unchanged. It accepts on the field's own committed state (fieldOwnSources, after a click: only a source the
+# `baseline` read taken before the click did not show) or on a value TRANSFORM (the widget rewrote the text the
+# tool typed into the intended value); raw value equality is never evidence, since the tool authored the text.
+# Native selects and contenteditable anchors stay unknown (their state carries no click causality), and
+# ARIA selection state is never read: an offered row can carry it.
+_SEMANTIC_COMMIT_STATE_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _OWN_FIELD_SCOPES_FN_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + _FIELD_OWN_STATE_FN_JS
+    + r"""
+  const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = nrm(arg.intended);
+  let el = null;
+  try { el = pQS(arg.sel); } catch (e) { el = null; }
+  if (!el && arg.el && arg.el.isConnected) el = arg.el;
+  if (arg.snapshot === true) {
+    // The field's committed state as raw parts, for a caller that asks whether ANY of it changed:
+    // its own value, its container's hidden values, and its own aria-label and text (\u0001-joined).
+    if (!el) return null;
+    const hiddenValues = """
+    + _HIDDEN_VALUES_JS
+    + r""";
+    return [
+      el.isContentEditable ? (el.textContent || '') : (el.value || ''),
+      hiddenValues(el).join(', '),
+      nrm(el.getAttribute('aria-label')) + '\u0001' + nrm(el.textContent),
+    ];
+  }
+  if (arg.baseline === true) {
+    if (!el || !want) return null;
+    return fieldOwnSources(el, want, true);
+  }
+  if (!el || !want) return { committed: false };
+  if (el.tagName === 'SELECT') return { committed: false };
+  if (el.isContentEditable) return { committed: false };
+  // After a click, a source counts only when it did not already show the value before the click; an
+  // unread baseline withholds every source.
+  const preHeld = Array.isArray(arg.preHeld) ? arg.preHeld : null;
+  let via = '';
+  if (preHeld !== null) {
+    try { via = fieldOwnSources(el, want, false).find((s) => !preHeld.includes(s)) || ''; } catch (e) { via = ''; }
+  }
+  if (via) return { committed: true, via: via, value: String(arg.intended).trim() };
+  let lead = false;
+  try {
+    lead = typeof arg.preAnchor === 'string' && arg.leadUnique === true && anchorShowsLead(el, want, arg.preAnchor);
+  } catch (e) { lead = false; }
+  if (lead) return { committed: true, via: 'anchor-lead', value: String(arg.intended).trim() };
+  // The typed baseline must have been READ from the element by the caller and is opt-in
+  // (typedTrusted !== true reads as untrusted), so a caller that forgets the key fails SAFE.
+  if (arg.typedTrusted !== true) return { committed: false };
+  const cur = el.value;
+  if (nrm(cur) === want && nrm(arg.typed) !== want) {
+    return { committed: true, via: 'value-transform', value: String(cur || '').trim() };
+  }
+  return { committed: false };
+}"""
+)
+
+# The labels of the removable chips the field's own container holds; null when unreadable.
+_OWN_CHIPS_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _OWN_FIELD_SCOPES_FN_JS
+    + _OWN_COMMITTED_SURFACE_FN_JS
+    + _FIELD_OWN_STATE_FN_JS
+    + r"""
+  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return null;
+  // A popup the field declares is its list, whatever its role; while it is on screen no chip counts as held.
+  if (arg.strict === true && declaredTargets(el).some((t) => !pContains(t, el) && visible(t))) return null;
+  return ownChipLabels(el, arg.strict === true);
+}"""
+)
 
 # Whether the field's own widget container shows `chosen` as a committed-selection surface: a pill /
 # selected-item row (its leading aria-label clause or leaf text IS the label), or a bare label node the
@@ -3181,12 +3742,6 @@ _MENU_ROW_VALUES_JS = (
   const row = pQS('[data-tv3-menu="' + n + '"]');
   return row ? declaredValues(row) : [];
 }"""
-)
-
-# The hidden-input values _VERIFY_COMMIT_JS would read for this field, in the same div/li/fieldset scope.
-_HIDDEN_VALUES_JS = (
-    "el => { const c = el.closest('div,li,fieldset'); if (!c) return []; "
-    "return Array.from(c.querySelectorAll('input[type=hidden]')).map((h) => (h.value || '').trim()).filter(Boolean); }"
 )
 
 # Why a reaction probe's answer about this selector may not carry a claim. `unprobeable` -- in-page
@@ -5887,9 +6442,65 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     }
     if (!invisible) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
     const radio = type === 'radio';
-    if (!_nativeProxy(el)) return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
+    // The click lands on coordinates this realm measured, never through a marker the page could move
+    // onto something else, so the point has to be the target's own: a cover there is a cover.
+    // Returns the point on a hit on the target, false under an unrelated element, null for no hit or a clipped-off point.
+    // A clip that can scroll (a long list) is scrolled once to bring the target into it; only one that cannot is final.
+    const centreHit = (t, retried) => {
+      const mid = () => { const b = t.getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; };
+      let [x, y] = mid();
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) {
+        try { t.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep */ }
+        [x, y] = mid();
+      }
+      let hit = null;
+      try { hit = document.elementFromPoint(x, y); } catch (e) { hit = null; }
+      for (let hops = 0; hit && hops < 32; hops++) {
+        let root = null;
+        try { root = hit.shadowRoot; } catch (e) { break; }
+        if (!root || root.nodeType !== 11) break;
+        let inner = null;
+        try { inner = root.elementFromPoint(x, y); } catch (e) { break; }
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+      for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+        if (n === t || n === el) return { x, y };
+      }
+      if (!hit) return null;
+      for (let n = t.assignedSlot || t.parentNode || t.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+        if (n.nodeType !== 1) continue;
+        const o = getComputedStyle(n).overflow;
+        if (o === 'visible') continue;
+        const c = n.getBoundingClientRect();
+        if (x >= c.left && x < c.right && y >= c.top && y < c.bottom) continue;
+        if (retried || !(/auto|scroll/.test(o) || n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) return null;
+        try { t.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep */ }
+        return centreHit(t, true);
+      }
+      return false;
+    };
+    // Opacity does not stop hit-testing and multiplies down the tree, so a faded-out panel, or stacked
+    // translucent wrappers, hide an input that elementFromPoint still returns. The input's own is excluded.
+    const fadedAncestry = () => {
+      let o = 1;
+      for (let n = el.assignedSlot || el.parentNode || el.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+        if (n.nodeType === 1) o *= parseFloat(getComputedStyle(n).opacity || '1');
+      }
+      return o < 0.05;
+    };
+    if (!_nativeProxy(el)) {
+      // Only the input's own transparency is waived: it still needs a box, no visibility:hidden, visible
+      // ancestors, and to be on top at its own centre, so it is clicked directly and read back as a toggle.
+      const at = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && !fadedAncestry() ? centreHit(el) : null;
+      if (at) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+      if (at === false) return { exists: true, skinned: false, labelClick: null, radio, covered: true };
+      return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
+    }
     const disabled = !!el.disabled;
     const none = { exists: true, skinned: true, labelClick: null, radio, disabled };
+    // `none` still gets a script click, so a proxy inside a faded panel is refused outright.
+    if (fadedAncestry()) return { ...none, unproxied: true };
     // Only a real <label> activates its control on click, and only the association THIS realm derives
     // counts: an `el.labels` the page shadows names a decoy, not a proxy. A realm the page can patch
     // (the main-world fallback) never offers one.
@@ -5902,31 +6513,9 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       return b.width > 0 && b.height > 0 && !wrapsOther(l);
     }) || null;
     if (!label || nativeControlOf(label) !== el) return none;
-    // The click lands on coordinates this realm measured, never through a marker the page could move
-    // onto something else, so the point has to be the label's own: a cover there is a cover.
-    let b = label.getBoundingClientRect();
-    if (b.bottom < 0 || b.right < 0 || b.top > innerHeight || b.left > innerWidth) {
-      try { label.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep */ }
-      b = label.getBoundingClientRect();
-    }
-    const x = b.left + b.width / 2, y = b.top + b.height / 2;
-    let hit = null;
-    try { hit = document.elementFromPoint(x, y); } catch (e) { hit = null; }
-    for (let hops = 0; hit && hops < 32; hops++) {
-      let root = null;
-      try { root = hit.shadowRoot; } catch (e) { break; }
-      if (!root || root.nodeType !== 11) break;
-      let inner = null;
-      try { inner = root.elementFromPoint(x, y); } catch (e) { break; }
-      if (!inner || inner === hit) break;
-      hit = inner;
-    }
-    let onLabel = false;
-    for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-      if (n === label || n === el) { onLabel = true; break; }
-    }
-    if (!onLabel) return { ...none, labelCovered: true };
-    return { exists: true, skinned: true, labelClick: { x, y }, radio, disabled };
+    const at = centreHit(label);
+    if (!at) return { ...none, labelCovered: true };
+    return { exists: true, skinned: true, labelClick: at, radio, disabled };
   } catch (e) { return { exists: false, skinned: false, labelClick: null }; }
 }"""
 )
@@ -6110,16 +6699,12 @@ _MENU_AFTER_JS = (
 }"""
 )
 
-# Undeclared-virtualisation check over rows `g` ([{el, r}], top-to-bottom), shared by _FIND_MENU_JS and
-# the popup filter's row read so both judge a rendered window against the same scroller extent.
-_WINDOW_PARTIAL_JS = r"""
-  const windowPartial = (g, fallback) => {
-    // Undeclared virtualisation: a list that renders only a window declares nothing (no aria-setsize),
-    // but its scroll container carries the FULL extent (react-window sizes a spacer to the whole list).
-    // Rendered-in-full lists fill their scroll extent; a window leaves more than a row of it uncovered.
-    let partial = false;
-    // Tagged so a caller that hits `partial` can drive this same container's scrollTop to search past
-    // the rendered window, without re-deriving which ancestor is the scroller.
+# Tags the scroll container that owns rows `g` ([{el, r}], top-to-bottom) data-tv3-menu-scroller, shared by
+# _FIND_MENU_JS and the popup filter's row read. Whether the rows are the whole list is decided in Python by
+# `_list_coverage`, from the row boxes and the scroller state read against this tag.
+_TAG_LIST_SCROLLER_JS = r"""
+  const tagListScroller = (g, fallback) => {
+    let tagged = false;
     try {
       const first = g[0].r, last = g[g.length - 1].r;
       const span = last.bottom - first.top;
@@ -6143,13 +6728,32 @@ _WINDOW_PARTIAL_JS = r"""
           const insideList = !!listEl && listEl.nodeType === 1 && (sc === listEl || pContains(listEl, sc));
           const owned = inner ? inner.getBoundingClientRect().height : span;
           if (!insideList && owned < sc.scrollHeight - 2 * rowH && owned < 0.75 * sc.scrollHeight) continue;
-          partial = sc.scrollHeight - span >= 1.5 * rowH;
           sc.setAttribute('data-tv3-menu-scroller', '1');
+          tagged = true;
           break;
         }
       }
-    } catch (e) { partial = false; }
-    return partial;
+    } catch (e) { tagged = false; }
+    return tagged;
+  };
+"""
+
+# A box in the tagged scroller's content space, unrounded. Rect deltas carry every ancestor transform and
+# scrollTop does not, so the delta is divided by the scroller's own scale before scrollTop is added. A sticky
+# or fixed box sits at the viewport in every window, not at a list position, so it is no row and no filler.
+_LIST_BOX_JS = r"""
+  const contentBox = (el, sc) => {
+    const r = el.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+    const s = sc.offsetHeight > 0 && sr.height > 0 ? sr.height / sc.offsetHeight : 1;
+    const t = (r.top - sr.top) / s - sc.clientTop + sc.scrollTop;
+    return [t, t + r.height / s];
+  };
+  const pinned = (el, sc) => {
+    for (let n = el; n && n !== sc; n = composedParentElement(n)) {
+      const p = getComputedStyle(n).position;
+      if (p === 'sticky' || p === 'fixed') return true;
+    }
+    return false;
   };
 """
 
@@ -6167,7 +6771,7 @@ _FIND_MENU_JS = (
   const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
-    + _WINDOW_PARTIAL_JS
+    + _TAG_LIST_SCROLLER_JS
     + r"""
   const MENU_ROW_ROLES = """
     + _MENU_ROW_ROLES_JS
@@ -6471,7 +7075,7 @@ _FIND_MENU_JS = (
     options.push({ n: tagOf.get(head), text });
   }
   const count = listed.length;
-  const partial = windowPartial(best.g, best.p);
+  const scroller = tagListScroller(best.g, best.p);
   // A listbox or menu declares its options even when a row renders nothing this finder can read. Only
   // rendered, outermost options count (a filter hides the rest), unless the options state the set size.
   let declared = 0;
@@ -6494,7 +7098,7 @@ _FIND_MENU_JS = (
   // `count` is the note's rows; `tagged` is the leaves the full-text read should find, row pieces included;
   // `rows` is the distinct rendered rows those leaves sit in, the unit aria-setsize counts.
   const rendered = new Set(best.g.map((c) => composedClosest(c.el, DECLARED_ROW_SEL) || c.el)).size;
-  const out = { count, tagged: n, rows: rendered, options, partial, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
+  const out = { count, tagged: n, rows: rendered, options, scroller, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
   if (declared > count) out.declared = declared;
   return out;
 }"""
@@ -6513,8 +7117,10 @@ _MENU_OPTION_TEXTS_JS = (
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
     + _DECLARED_VALUES_JS
+    + _LIST_BOX_JS
     + r"""
   const attr = (arg && arg.attr) || 'menu';
+  const sc = pQS('[data-tv3-menu-scroller]');
   // The tagger tags the innermost leaf, which may hold none of a row's accessible-name attributes
   // (a `<span>` inside `<li role="option" aria-label="...">`) -- so the name is read from BOTH the
   // tagged leaf and its OPT_SEL ancestor, aria-label before aria-labelledby at each, first non-empty wins.
@@ -6543,6 +7149,10 @@ _MENU_OPTION_TEXTS_JS = (
   };
   const tagged = Array.from(pQSA('[data-tv3-' + attr + ']'));
   const boxes = leafBoxes(tagged);
+  // aria-setsize counts rows, and a declared row can hold several tagged leaves: only its first leaf leads it.
+  const rowOf = (el) => { try { return composedClosest(el, DECLARED_ROW_SEL); } catch (e) { return null; } };
+  const leadOf = new Map();
+  for (const el of tagged) { const r = rowOf(el); if (r && !leadOf.has(r)) leadOf.set(r, el); }
   return tagged.map((el) => {
     // An option whose ancestor declares aria-setsize is a child that declares none, so read the
     // closest declaring ancestor or the incomplete-list guard is bypassed.
@@ -6552,10 +7162,33 @@ _MENU_OPTION_TEXTS_JS = (
     const opt = composedClosest(el, OPT_SEL) || composedClosest(el, '[role="row"]');
     const setEl = composedClosest(el, '[aria-setsize]');
     const setsize = setEl ? parseInt(setEl.getAttribute('aria-setsize'), 10) : NaN;
-    // `pos` is the row's top in the scroller's own coordinate space (scroll-invariant), so a row seen
-    // in two overlapping windows reads the same and two rows wearing one text read apart.
-    const sc = pQS('[data-tv3-menu-scroller]');
-    const pos = sc ? Math.round(el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop) : null;
+    // aria-setsize counts the rows of one group, so each row carries its group's name.
+    const grp = composedClosest(opt || el, '[role="group"]');
+    // The ROW's box, not the tagged leaf's: a leaf sits at a different offset inside each row. `line` is one
+    // line box of the row, the floor on how short a row this list can render.
+    const rowEl = opt || el;
+    // `after`: the text of the tagged row in the element right before this row's own slot, past declared
+    // separators, so a slot between two rows with nothing else in the DOM between them is known; any other element
+    // between them (a placeholder) breaks it.
+    let after = null;
+    try {
+      let slotEl = rowEl;
+      while (slotEl.parentElement && slotEl.parentElement !== sc && slotEl.parentElement.children.length === 1) {
+        slotEl = slotEl.parentElement;
+      }
+      let prev = slotEl.previousElementSibling;
+      while (prev && prev.matches('[role="separator"],hr')) prev = prev.previousElementSibling;
+      const tag = '[data-tv3-' + attr + ']';
+      const prevRow = prev ? (prev.matches(tag) ? prev : prev.querySelector(tag)) : null;
+      if (prevRow) after = (prevRow.innerText || prevRow.textContent || '').trim() || null;
+    } catch (e) { after = null; }
+    let box = null, line = null;
+    try {
+      if (sc && pContains(sc, rowEl) && !pinned(rowEl, sc)) box = contentBox(rowEl, sc);
+      const cs = getComputedStyle(rowEl);
+      const lh = parseFloat(cs.lineHeight);
+      line = Number.isFinite(lh) ? lh : 1.2 * parseFloat(cs.fontSize);
+    } catch (e) { box = null; }
     let val = null;
     if (el.tagName === 'OPTION') {
       // The DOM `.value` IDL is the spec submission value ALREADY -- an explicit `value=""` and an
@@ -6613,7 +7246,11 @@ _MENU_OPTION_TEXTS_JS = (
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
       // aria-setsize="-1" declares the total unknown, so the rendered rows are never the whole list.
       setsize_unknown: setsize === -1,
-      pos: pos,
+      group: grp ? accessibleName(grp) || grp.id || 'group' : '',
+      lead: !rowOf(el) || leadOf.get(rowOf(el)) === el,
+      box: box,
+      after: after,
+      line: Number.isFinite(line) && line > 0 ? line : null,
       val: val,
       // 9 allowlisted attributes x 2 nodes = 18 possible entries; 24 can never truncate.
       vals: vetoVals.slice(0, 24),
@@ -6644,7 +7281,7 @@ _POPUP_FILTER_INPUT_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
-    + _WINDOW_PARTIAL_JS
+    + _TAG_LIST_SCROLLER_JS
     + _BUSY_CUE_JS
     + r"""
   const shown = (e) => {
@@ -6681,7 +7318,7 @@ _POPUP_FILTER_INPUT_JS = (
     const fresh = leaves.filter((e) => !e.hasAttribute('data-tv3-filter-base')).length;
     pQSA('[data-tv3-menu-scroller]').forEach((e) => e.removeAttribute('data-tv3-menu-scroller'));
     const g = leaves.map((e) => ({ el: e, r: e.getBoundingClientRect() }));
-    return { count: leaves.length, fresh, partial: g.length ? windowPartial(g, g[0].el) : false };
+    return { count: leaves.length, fresh, scroller: g.length ? tagListScroller(g, g[0].el) : false };
   }
   window.__tv3_popup_filter = null;
   pQSA('[data-tv3-popup-filter]').forEach((e) => e.removeAttribute('data-tv3-popup-filter'));
@@ -6784,36 +7421,36 @@ _MENU_WINDOW_FINGERPRINT_JS = (
 _MENU_SCROLLER_STEP_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
+    + _LIST_BOX_JS
     + r"""
   const el = pQS('[data-tv3-menu-scroller]');
   if (!el) return null;
   if (typeof arg.top === 'number') el.scrollTop = arg.top;
-  // A declared separator's own height is space no option can load into, so the walk may count it as covered. A
+  // A declared separator's own box is space no option can load into, so the walk may count it as covered. A
   // blank option or an unmarked blank row may be a placeholder for a row still loading and is never reported.
-  const box = el.getBoundingClientRect();
   const fillers = Array.from(el.querySelectorAll('[role="separator"],hr'))
-    .map((s) => s.getBoundingClientRect())
-    .filter((r) => r.height > 0 && r.bottom > box.top && r.top < box.bottom)
-    .map((r) => [Math.round(r.top - box.top + el.scrollTop), r.height]);
-  return { scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight, fillers };
+    .filter((s) => !pinned(s, el))
+    .map((s) => contentBox(s, el))
+    .filter((b) => b[1] > b[0]);
+  const cs = getComputedStyle(el);
+  // A CSS animation or transition running on the scroller, inside it or above it moves the boxes a read takes.
+  let moving = true;
+  try {
+    moving = document.getAnimations().some((a) => {
+      const t = a.playState === 'running' && a.effect ? a.effect.target : null;
+      return !!t && (pContains(el, t) || pContains(t, el));
+    });
+  } catch (e) { moving = true; }
+  return {
+    moving,
+    scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight,
+    padTop: parseFloat(cs.paddingTop) || 0, padBottom: parseFloat(cs.paddingBottom) || 0,
+    dpr: window.devicePixelRatio || 1, fillers,
+  };
 }"""
 )
 
-# Whether the anchor (or its nearest aria-expanded ancestor) currently reports an OPEN list. Used to
-# gate the "close a stray open list" Escape: sending Escape with no menu open would bubble to and close
-# a surrounding dialog, so we only send it once a menu is confirmed open.
-_MENU_OPEN_JS = (
-    r"""(arg) => {"""
-    + _PIERCED_QUERY_JS
-    + r"""
-  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
-  if (!el) return false;
-  const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
-  return !!(exp && exp.getAttribute('aria-expanded') === 'true');
-}"""
-)
-
-# Whether a DECLARED field's own list is still open: _MENU_OPEN_JS's aria-expanded check, OR the popup
+# Whether a DECLARED field's own list is still open: its aria-expanded=true, OR the popup
 # the field declares (fieldOwnPopup, from _ROW_SEMANTICS_JS) is still rendered. A widget that re-searches
 # on the value it just wrote back can leave rows on screen with aria-expanded never having flipped.
 _TYPEAHEAD_LIST_OPEN_JS = (
@@ -6826,6 +7463,37 @@ _TYPEAHEAD_LIST_OPEN_JS = (
   const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
   if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
   return !!fieldOwnPopup(el, true);
+}"""
+)
+
+# Whether the field's own list is KNOWN closed: aria-expanded="false" on the field or its owning combobox, or a
+# declared popup that exists and is not rendered. No declared state is unknown, never closed.
+_OWN_LIST_CLOSED_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  const el = (arg.sel ? pQS(arg.sel) : null) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el || fieldOwnPopup(el, true)) return false;
+  const owner = el.getAttribute('aria-expanded') != null ? el : composedClosest(el, '[role="combobox"][aria-expanded]');
+  if (owner) return owner.getAttribute('aria-expanded') === 'false';
+  const popups = declaredTargets(el).filter((t) => !pContains(t, el));
+  const shown = (t) => { const r = t.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  return popups.length > 0 && !popups.some(shown);
+}"""
+)
+
+# Whether the field declares its list's state: aria-expanded, a declared popup, or a declared popup id that
+# resolves to nothing (the list is unmounted). Without one, an open list reads the same as a closed one.
+_LIST_STATE_DECLARED_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  const el = (arg.sel ? pQS(arg.sel) : null) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return false;
+  const declares = !!(el.getAttribute('aria-controls') || el.getAttribute('aria-owns'));
+  return el.closest('[aria-expanded]') !== null || !!fieldOwnPopup(el, false) || (declares && !declaredTargets(el).length);
 }"""
 )
 
@@ -7726,7 +8394,9 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), count: 0, retain: _RETAIN_WIDTH, ceiling: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), heldCount: 0, heldCap: """
+    + str(OBSERVE_POINTER_ROOT_CAP)
+    + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
     + r""" };
   let pointerListed = 0;
@@ -8588,6 +9258,9 @@ async (__tv3TextArgs) => {
     return b.bottom + window.scrollY > 0 && b.top + window.scrollY < _scrollHeightOf.call(se)
       && b.right + window.scrollX > 0 && b.left + window.scrollX < _scrollWidthOf.call(se);
   };
+  // Places the cap keeps for the pointer roots not yet reached that no holder expansion produced
+  // (`count` tallies exactly those).
+  let pointerReserved = _pointerState.count;
   for (let idx = 0; idx < els.length; idx++) {
    const el = els[idx].el;
    const host = els[idx].host;
@@ -8603,6 +9276,7 @@ async (__tv3TextArgs) => {
     // The collector screened a pointer root with these same visibility gates, so none of the hidden
     // counters below ever describes one: a pointer root is listed or counted as one.
     pointerRoot = _pointerState.roots.has(el);
+    if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -8672,7 +9346,7 @@ async (__tv3TextArgs) => {
         continue;
       }
     }
-    if (pointerRoot && pointerListed >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
     if (!selector) {
       // We do not write inside a shadow root. Setting a marker there is a mutation of the
@@ -8732,6 +9406,7 @@ async (__tv3TextArgs) => {
     // recognition and leak its signing tail.
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
     if (pointerRoot) rec.pointerRoot = true;
+    if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
     if (removedBy) rec.a11yRemoved = removedBy;
@@ -10652,12 +11327,16 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     # Pointer roots ride outside the element budget here as in each realm, under their own cap applied
     # page-wide, so neither limit ever costs the other kind a place.
     room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not e.get("pointerRoot")))
-    pointer_room = max(0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot")))
+    pointer_room = max(
+        0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    )
     kept: list[int] = []
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerRoot"):
+        if e.get("pointerHeld"):
+            pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
+        elif e.get("pointerRoot"):
             if pointer_room == 0:
                 pointer_over_cap += 1
                 continue
@@ -10692,6 +11371,25 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     into["pointerListed"] = int(into.get("pointerListed") or 0) - pointer_over_cap
     for key in _OBSERVE_ANY_KEYS:
         into[key] = bool(into.get(key)) or bool(other.get(key))
+    return kept
+
+
+def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root.
+    Returns the kept indices, which the caller applies to its handle and owner lists."""
+    elements = data.get("elements") or []
+    room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    kept: list[int] = []
+    for i, e in enumerate(elements):
+        if e.get("pointerHeld"):
+            if room <= 0:
+                continue
+            room -= 1
+        kept.append(i)
+    over = len(elements) - len(kept)
+    data["elements"] = [elements[i] for i in kept]
+    data["pointerCapped"] = int(data.get("pointerCapped") or 0) + over
+    data["pointerListed"] = int(data.get("pointerListed") or 0) - over
     return kept
 
 
@@ -10959,6 +11657,10 @@ def build_browser_tools(
     # navigation every handle in it is dead, and re-querying a remembered selector would resolve it
     # against a page the model never saw.
     _observe_document: list[str] = []
+    # The page (tab) the last successful observe/get_html/look read, and the one refs were read from, so an
+    # act on a different tab can say so.
+    _read_page: list[Any] = []
+    _observed_page: list[Any] = []
     _look_count = [0]  # per-run look() invocations, capped at _LOOK_MAX_PER_RUN
     # The (canonical URL, filled-field count) of the last same-URL reload the destructive-nav guard
     # refused. A repeat to that URL confirms intent and is allowed — but only if the at-risk state has
@@ -11031,6 +11733,9 @@ def build_browser_tools(
             return page.url
         except Exception:
             return ""
+
+    async def _other_tab_url(page: Any, read: list[Any]) -> str | None:
+        return None if not read or read[0] is page else _mask_refs(await _url(page))
 
     async def _realm_url(page: Any, realm: Any) -> str:
         """The URL of the document a realm is currently showing; `None` means the page's main frame."""
@@ -11166,6 +11871,17 @@ def build_browser_tools(
             main_handles.extend(frame_handles[i] for i in kept)
             owners.extend([frame] * len(kept))
             fresh[frame] = bool(frame_data.get("refsFresh"))
+        # A split reading already fails closed at pairing, so it is left for that check to refuse.
+        if len(main_handles) == len(owners) == len(main_data.get("elements") or []):
+            kept = _rank_held_pointer_roots_last(main_data)
+            kept_set = set(kept)
+            for spare in [h for i, h in enumerate(main_handles) if h is not None and i not in kept_set]:
+                try:
+                    await spare.dispose()
+                except Exception:
+                    pass
+            main_handles = [main_handles[i] for i in kept]
+            owners = [owners[i] for i in kept]
         # The page's identity re-checked AFTER the frames were read. The main frame navigating in between
         # would otherwise assemble one reading out of two documents -- the old page's url, text and
         # controls beside child frames belonging to its replacement -- and while the old main handles go
@@ -11233,6 +11949,7 @@ def build_browser_tools(
                 pass
         _observe_manifest.clear()
         _observe_document[:] = [canonical_url(await _url(page))]
+        _observed_page[:] = [page]
         # Per realm, the document each reading came from. A CHILD FRAME can navigate while the parent
         # does not, and a page-wide URL check cannot see that: every ref minted into the old frame
         # document would stay "valid" and re-resolve against a document the model never saw. A ref that
@@ -12032,6 +12749,17 @@ def build_browser_tools(
                 finally:
                     _prefetched_page.clear()
                 page = _current_page()
+                if spec_name in ("observe", "get_html", "look"):
+                    if result.status == "ok" and page is not None:
+                        _read_page[:] = [page]
+                # A stale ref/mark already names the tab it was read from.
+                elif page is not None and result.error_class not in ("stale_ref", "stale_mark"):
+                    if (other_tab := await _other_tab_url(page, _read_page)) is not None:
+                        result = dataclasses.replace(
+                            result,
+                            content=f"{result.content} (on {other_tab}, a different tab than your last "
+                            "observe/get_html/look read)",
+                        )
                 if _reports and _seeds:
                     last_action[:] = [(spec_name, key, page, browser_calls[0])] if page is not None else []
                 if not _reports or result.status != "ok" or page is None:
@@ -12898,7 +13626,7 @@ def build_browser_tools(
         if isinstance(skin_probe, dict) and skin_probe.get("unproxied"):
             return await _unreachable_error(selector)
         skinned = bool(isinstance(skin_probe, dict) and skin_probe.get("skinned"))
-        if skinned and skin_probe.get("labelCovered"):
+        if isinstance(skin_probe, dict) and (skin_probe.get("covered") or (skinned and skin_probe.get("labelCovered"))):
             return _covered_error(selector, None, verb="clicked")
         label_click = skin_probe.get("labelClick") if isinstance(skin_probe, dict) else None
         if not isinstance(label_click, dict):
@@ -13517,7 +14245,15 @@ def build_browser_tools(
         return [str(t) for t in raw if isinstance(t, str)] if isinstance(raw, list) else None
 
     async def _semantic_commit_read(
-        page: Any, selector: str, intended: str, typed: str, *, typed_trusted: bool
+        page: Any,
+        selector: str,
+        intended: str,
+        typed: str,
+        *,
+        typed_trusted: bool,
+        pre_held: list[str] | None = None,
+        pre_anchor: str | None = None,
+        lead_unique: bool = False,
     ) -> str | None:
         # Decisive-accept-only: the committed value when the semantic probe proves the commit, else
         # None ("unknown") — the caller's shape heuristics run unchanged on None, so this tier can
@@ -13530,6 +14266,9 @@ def build_browser_tools(
                     "intended": intended,
                     "typed": typed,
                     "typedTrusted": typed_trusted,
+                    "preHeld": pre_held,
+                    "preAnchor": pre_anchor,
+                    "leadUnique": lead_unique,
                 },
             )
         except Exception:
@@ -13538,6 +14277,41 @@ def build_browser_tools(
             LOG.debug("taskv3 semantic commit accept", selector=selector, via=str(read.get("via") or ""))
             return str(read.get("value")).strip()
         return None
+
+    async def _field_already_holds(page: Any, selector: str, value: str) -> bool:
+        # Only a toggle field, one showing its values as removable chips that a re-click would remove, skips a
+        # held value, and only with its own list known closed; every other field acts and verifies the click.
+        if not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY:
+            return False
+        await input_dispatch.approach(page, selector)
+        try:
+            if not await page.evaluate(_OWN_LIST_CLOSED_JS, await _probe_arg(page, selector)):
+                return False
+        except Exception:
+            return False
+        chips = await _own_chip_labels(page, selector, strict=True)
+        return _exact_tier_key(value) in {_exact_tier_key(c) for c in chips or []}
+
+    async def _field_own_baseline(page: Any, selector: str, value: str) -> list[str] | None:
+        # Which of the field's own sources show `value` just before a click; None when unread.
+        try:
+            read = await page.evaluate(
+                _SEMANTIC_COMMIT_STATE_JS,
+                {**(await _probe_arg(page, selector)), "intended": value, "baseline": True},
+            )
+        except Exception:
+            return None
+        return [str(v) for v in read if isinstance(v, str)] if isinstance(read, list) else None
+
+    async def _own_chip_labels(page: Any, selector: str, strict: bool = False) -> list[str] | None:
+        try:
+            chips = await page.evaluate(_OWN_CHIPS_JS, {**(await _probe_arg(page, selector)), "strict": strict})
+        except Exception:
+            return None
+        return [str(c) for c in chips if isinstance(c, str)] if isinstance(chips, list) else None
+
+    async def _holds_own_chips(page: Any, selector: str) -> bool:
+        return bool(await _own_chip_labels(page, selector))
 
     async def _settled_commit_read(
         page: Any, selector: str, verify_args: dict[str, Any], chosen: str, pre_surface_hit: bool
@@ -13549,6 +14323,8 @@ def build_browser_tools(
         readable = False
         committed = ""
         counted = False
+        pre_held = verify_args.get("preHeld")
+        pre_anchor = verify_args.get("preAnchorClosed")
         for attempt in range(4):
             if attempt:
                 await asyncio.sleep(0.7)
@@ -13587,6 +14363,9 @@ def build_browser_tools(
                     chosen,
                     str(verify_args.get("typed") or ""),
                     typed_trusted=verify_args.get("typedTrusted") is True,
+                    pre_held=pre_held if isinstance(pre_held, list) else None,
+                    pre_anchor=pre_anchor.split("\u0001")[-1] if isinstance(pre_anchor, str) else None,
+                    lead_unique=verify_args.get("leadUnique") is True,
                 )
                 if semantic is not None:
                     if semantic_commit_stats is not None:
@@ -13793,8 +14572,8 @@ def build_browser_tools(
             # tagged. Where nothing declares one, the finder already reduced the reaction to a single
             # winner and there is nothing left to choose between — except under a reduced query, whose
             # rows answer a broader question than the caller asked. The 4th value is the declared
-            # aria-setsize when it exceeds the rendered row count (0 otherwise), reported in the refusal
-            # note so the model knows to name the option's full label rather than retry blindly.
+            # aria-setsize when it exceeds the rendered row count, -1 when the rows declare their total
+            # unknown, 0 otherwise; the refusal note reports it so the model names the full label.
             tagged = [o for o in (found.get("options") or []) if isinstance(o, dict) and isinstance(o.get("n"), int)]
             if not tagged:
                 return bool(found.get("declared")), [], None, 0
@@ -13806,8 +14585,7 @@ def build_browser_tools(
                 # Only rows the widget DECLARED count against its own aria-setsize; a bare node padding
                 # the list would hide a genuinely truncated one.
                 declared_rendered = [o for o in rows if o.get("n") not in bare_ns]
-                declared_size = max((int(o.get("setsize") or 0) for o in declared_rendered), default=0)
-                overflow = declared_size if declared_rendered and declared_size > len(declared_rendered) else 0
+                overflow = _declared_shortfall([_list_row(o) for o in declared_rendered])
                 idx = _pick(rows)
                 if idx is None and overflow == 0:
                     # No exact-label winner over the complete rendered list — but "several rows" may be
@@ -13884,11 +14662,19 @@ def build_browser_tools(
             )
             if found is None:
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            barred = found.get("barredExact")
+            if isinstance(barred, str):
+                verdict = ToolResult.error(
+                    f"the exact option {_model_text(barred, 60)!r} in {selector}'s list is disabled, so it cannot be selected "
+                    "— the field is NOT filled; no other option was picked in its place"
+                )
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False, verdict=verdict)
             declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
             stamp = f'[data-tv3-sugg="{idx}"]'
         if idx is None:
+            declares = "its total unknown" if overflow < 0 else f"{overflow} rows"
             note = (
-                f"the list declares {overflow} rows and only {len(rows)} are rendered — type the option's full label"
+                f"the list declares {declares} and only {len(rows)} are rendered — type the option's full label"
                 if declared_rows and overflow
                 else None
             )
@@ -13923,6 +14709,7 @@ def build_browser_tools(
         pre_value = pre_value_read if pre_value_read is not None else value
         clicked = False
         pre_surface_hit = await _surface_confirms(page, selector, best_txt)
+        pre_held = await _field_own_baseline(page, selector, best_txt)
         try:
             await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "sugg", "n": idx})
         except Exception:
@@ -13956,6 +14743,7 @@ def build_browser_tools(
                         from_focus = bool(info.get("fromFocus"))
                         declared = [str(v) for v in (info.get("declared") or []) if isinstance(v, str)]
                         pre_surface_hit = await _surface_confirms(page, selector, best_txt)
+                        pre_held = await _field_own_baseline(page, selector, best_txt)
                         try:
                             await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "sugg", "n": idx})
                         except Exception:
@@ -14005,6 +14793,7 @@ def build_browser_tools(
                     if _exact_tier_key(text) != _exact_tier_key(best_txt)
                 ],
                 "nestedRows": _rows_nested_in(idx, rows),
+                "preHeld": pre_held,
             },
             best_txt,
             pre_surface_hit,
@@ -14328,7 +15117,9 @@ def build_browser_tools(
             # Only a field the click could not reach can misroute its keys, and only that path restores.
             # A checked click leaves the page untagged and pays nothing.
             collateral.extend(await _capture_collateral(page, selector))
-        await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
+        # Clearing an empty multi-value input sends Delete, which removes the field's last chip.
+        if not (pre_value == "" and await _holds_own_chips(page, selector)):
+            await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
         await input_dispatch.type_keys(
             page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed), secret=secret, replace=True
         )
@@ -15697,6 +16488,10 @@ def build_browser_tools(
             return _covered_error(exc.selector, exc.occluder)
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
+        if pick.verdict is not None:
+            # Nothing was picked either way, so the typed query comes back out and its list closes.
+            await _restore_pre_type_value(page, selector, pre_value, [text])
+            return pick.verdict
         if reach != "click":
             # focus() without a click cannot show the field took the keystrokes: a segmented control
             # may move the caret to a sibling segment or drop the keys. So only a read-back that holds
@@ -15880,7 +16675,13 @@ def build_browser_tools(
             return False
 
     async def _open_observe_pick(
-        page: Any, selector: str, value: str, *, close_open_menu: bool = False, search: str | None = None
+        page: Any,
+        selector: str,
+        value: str,
+        *,
+        close_open_menu: bool = False,
+        search: str | None = None,
+        pre_checked: bool = False,
     ) -> ToolResult:
         # Commit a click-to-open single-select in ONE call: open the list, enumerate the option rows the
         # click rendered (v3's own _FIND_MENU_JS tags them data-tv3-menu="N"), deterministically pick the
@@ -15889,14 +16690,16 @@ def build_browser_tools(
         # and a non-typeable button/div anchor both land here. When no deterministic match is found the
         # tool returns a truthful did-not-commit AND the observed options, so the model resolves a
         # genuinely unexpected widget by sight (look()/act-by-mark) — never a blind text-LLM guess.
+        if not pre_checked and await _field_already_holds(page, selector, value):
+            return _already_held_result(selector, value)
         if close_open_menu:
             # A prior keystroke attempt may have opened this widget's list; close it so the pre-snapshot
             # captures the CLOSED page and _FIND_MENU_JS counts only rows THIS open-click renders. Escape
-            # is sent ONLY once a menu is confirmed open (aria-expanded=true) — a stray Escape with nothing
-            # open would bubble to and close a surrounding dialog, discarding the form. If the widget does
-            # not expose aria-expanded, we skip Escape and let the reopen self-heal below handle a toggle.
+            # is sent ONLY once the field's own list is confirmed open (aria-expanded=true, or its declared
+            # popup rendered) — a stray Escape with nothing open would bubble to and close a surrounding
+            # dialog, discarding the form. An undeclared list is left to the reopen self-heal below.
             try:
-                menu_open = bool(await page.evaluate(_MENU_OPEN_JS, await _probe_arg(page, selector)))
+                menu_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector)))
             except Exception:
                 menu_open = False
             if menu_open:
@@ -15905,6 +16708,17 @@ def build_browser_tools(
                     await asyncio.sleep(0.1)
                 except Exception:
                     pass
+        # The anchor's text with its list closed: an open list can change it, so a baseline read later would
+        # let the anchor's return to its closed text pass for a commit.
+        pre_anchor_closed: str | None = None
+        try:
+            probe_closed = await _probe_arg(page, selector)
+            if await page.evaluate(_LIST_STATE_DECLARED_JS, probe_closed) and not await page.evaluate(
+                _TYPEAHEAD_LIST_OPEN_JS, probe_closed
+            ):
+                pre_anchor_closed = str(await page.evaluate(_ANCHOR_SURFACE_JS, probe_closed) or "")
+        except Exception:
+            pre_anchor_closed = None
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
             await input_dispatch.approach(page, selector)
@@ -16003,16 +16817,13 @@ def build_browser_tools(
 
         # `overflowed` = the enumerated set is not the whole list, so uniqueness cannot be established and
         # ALL auto-commit is refused. That is true when the full read failed, when `_FIND_MENU_JS` tagged
-        # more leaves than the read returned (a row remounted between the two calls), OR when a row's `aria-setsize`
-        # declares more options than there are rendered rows (a virtualised list whose window is all that is in
-        # the DOM). aria-setsize counts rows, not leaves: two-leaf rows read back more leaves than rows.
-        declared = max((int(o.get("setsize") or 0) for o in read), default=0)
-        rendered_rows = found.get("rows")
-        if not isinstance(rendered_rows, int) or isinstance(rendered_rows, bool):
-            rendered_rows = len(read)
+        # more leaves than the read returned (a row remounted between the two calls), OR when `_list_coverage`
+        # cannot prove the rows read are the list (a virtualised list whose window is all that is in the DOM).
         size_unknown = any(o.get("setsize_unknown") for o in read)
         overflowed = (
-            not read or tagged > len(read) or declared > rendered_rows or size_unknown or bool(found.get("partial"))
+            not read
+            or tagged > len(read)
+            or _list_coverage([await _read_list_window(page, read, scroller=bool(found.get("scroller")))]) != "complete"
         )
         rows = read or (found.get("options") or [])
         rows.sort(key=_n_order)
@@ -16031,13 +16842,9 @@ def build_browser_tools(
                 'if one of them is the option you want, click it by its [data-tv3-menu="N"] selector'
             )
 
-        walked_twins = False
-        walk_complete = False
-        walk_unproven: dict[str, Any] | None = None
-        walk_seen: list[dict[str, Any]] = []
+        walk = _WalkResult()
 
-        async def _scroll_search_menu_option() -> tuple[int | None, str | None, list[dict[str, Any]], bool]:
-            nonlocal walked_twins, walk_complete, walk_unproven, walk_seen
+        async def _scroll_search_menu_option() -> _WalkResult:
             unproven: str | None = None
             # A virtualised listbox only ever holds a window of rows in the DOM, so `value` may sit
             # outside what we already read. Drive the scroller `_FIND_MENU_JS` tagged, re-enumerating
@@ -16046,21 +16853,15 @@ def build_browser_tools(
             # so a number from an earlier window is not an identity. Any hit, exact or forward-prefix ("United
             # States" -> "United States Minor Outlying Islands"), commits only through `_commit_gate` once the walk
             # has reached the end: a twin, or the exact row a prefix stands in for, may still be below. A label
-            # seen at two different list positions (or twice in one window) is two rows wearing one text and is
-            # refused as ambiguous rather than collapsed by the dedupe.
-            seen: dict[str, dict[str, Any]] = {}
-            seen_top: dict[str, float] = {}
-            seen_pos: dict[str, list[float]] = {}
-            all_pos: set[float] = set()
-            fillers: dict[int, float] = {}
-            unknown_seen = False
-            ambiguous: set[str] = set()
-            extent = 0.0
-
+            # read on two distinct rows (two boxes, or twice in one window) is two rows wearing one text and is
+            # refused as ambiguous.
+            log = _ListLog()
+            walk_pass = 0
             last_fingerprint: str | None = None
 
-            async def _scan(top: float | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-                nonlocal last_fingerprint, extent, unknown_seen
+            async def _scan(top: float | None, *, chain: bool) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+                # The only writer of `log`: every verdict below is derived from the windows it appends.
+                nonlocal log, last_fingerprint
                 try:
                     state = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": top})
                 except Exception:
@@ -16080,69 +16881,61 @@ def build_browser_tools(
                     if (isinstance(fp, str) and fp != last_fingerprint) or time.monotonic() >= settle_until:
                         break
                 last_fingerprint = fp if isinstance(fp, str) else last_fingerprint
-                # Re-read the scroller AFTER the settle: a page appended during the wait must show in
-                # the extent this scan reports, or the bottom check would call the walk complete.
-                try:
-                    settled = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": None})
-                    if isinstance(settled, dict):
-                        state = settled
-                except Exception:
-                    pass
-                try:
-                    await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
-                    texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
-                except Exception:
-                    texts_raw = None
-                current: list[dict[str, Any]] = []
+                # Re-read the scroller AFTER the settle: a page appended during the wait must show in the extent
+                # this scan reports. A read taken while an animation runs on the list, or at a scroll offset other
+                # than the one asked for (short of the list end), may catch rows mid-move, so that window is taken
+                # on two equal reads in a row; a still read is taken as it is.
+                texts_raw: Any = None
+                prior: Any = None
+                steady_until = time.monotonic() + 0.4
+                while True:
+                    try:
+                        settled = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": None})
+                        if isinstance(settled, dict):
+                            state = settled
+                    except Exception:
+                        pass
+                    try:
+                        await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+                        texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
+                    except Exception:
+                        texts_raw = None
+                    if (
+                        (prior is None and not _unsteady(state, top))
+                        or (state, texts_raw) == prior
+                        or time.monotonic() >= steady_until
+                    ):
+                        break
+                    prior = (state, texts_raw)
+                    await asyncio.sleep(0.02)
+                window = _list_window(texts_raw, state, walk_pass=walk_pass, chain=chain)
+                log = log.appended(window)
+                return state, [dict(r.read) for r in window.rows if r.text]
+
+            def _unsteady(state: dict[str, Any], top: float | None) -> bool:
+                if state.get("moving") is not False:
+                    return True
+                if top is None:
+                    return False
                 here = float(state.get("scrollTop") or 0)
-                extent = max(extent, float(state.get("scrollHeight") or 0))
-                for span in state.get("fillers") or []:
-                    if isinstance(span, list) and len(span) == 2 and all(isinstance(v, (int, float)) for v in span):
-                        fillers[round(float(span[0]))] = float(span[1])
-                counts: dict[str, int] = {}
-                if isinstance(texts_raw, list):
-                    for o in texts_raw:
-                        if not isinstance(o, dict) or not isinstance(o.get("n"), int):
-                            continue
-                        # Any row in any window declaring its total unknown makes the whole walk incomplete.
-                        unknown_seen = unknown_seen or bool(o.get("setsize_unknown"))
-                        text = str(o.get("text") or "")
-                        if not text:
-                            continue
-                        # Ambiguity is judged on the matcher's canonical form ("US", "us", "U S" with a
-                        # zero-width space are one label), while `seen` keeps the raw text for display.
-                        key = _exact_tier_key(text)
-                        counts[key] = counts.get(key, 0) + 1
-                        current.append(o)
-                        pos = o.get("pos")
-                        if isinstance(pos, (int, float)):
-                            all_pos.add(round(float(pos)))
-                            positions = seen_pos.setdefault(key, [])
-                            positions.append(float(pos))
-                            # A row straddling two windows reads the same top (±subpixel rounding).
-                            if max(positions) - min(positions) > 3:
-                                ambiguous.add(key)
-                        seen[text] = o
-                        seen_top.setdefault(text, here)
-                ambiguous.update(k for k, n in counts.items() if n > 1)
-                return state, current
+                at_end = here + float(state.get("clientHeight") or 0) >= float(state.get("scrollHeight") or 0) - 1
+                return abs(here - max(0.0, top)) > 1 and not at_end
+
+            def _twin_keys() -> set[str]:
+                return {k for k, n in _rows_per_key(log.windows).items() if n > 1}
 
             def _is_ambiguous(text: str) -> bool:
-                return _exact_tier_key(text) in ambiguous
+                return _exact_tier_key(text) in _twin_keys()
 
             def _match_seen() -> str | None:
-                texts = [t for t, o in seen.items() if not o.get("nav") and not _is_ambiguous(t)]
+                twins = _twin_keys()
+                texts = list(
+                    dict.fromkeys(
+                        r.text for w in log.windows for r in w.rows if r.text and not r.nav and r.key not in twins
+                    )
+                )
                 hit = _match_menu_option(value, [{"n": k, "text": t} for k, t in enumerate(texts)])
                 return texts[hit] if hit is not None else None
-
-            def _walked_rows() -> int:
-                # Rows, not labels: a label seen at tops more than 3px apart is that many rows.
-                total = 0
-                for key in {_exact_tier_key(t) for t in seen}:
-                    ps = sorted(seen_pos.get(key, []))
-                    at = 1 + sum(1 for a, b in zip(ps, ps[1:]) if b - a > 3) if ps else 1
-                    total += max(at, sum(1 for t in seen if _exact_tier_key(t) == key))
-                return total
 
             def _row_n(current: list[dict[str, Any]], text: str) -> int | None:
                 fresh = next((o for o in current if str(o.get("text") or "") == text and not o.get("nav")), None)
@@ -16162,14 +16955,20 @@ def build_browser_tools(
                 deferred = text
                 return None
 
+            def _next_target(top: float, step: float) -> float:
+                # The next window starts at the last row this one read, so adjacent windows share a row.
+                tops = [r.box[0] for r in log.windows[-1].rows if r.text and r.box is not None]
+                return max(tops) if tops and max(tops) > top + 1 else top + step
+
             # Read the window the open-click rendered first (the common in-window hit costs one scan and
             # never moves the list), then walk from the top so the scan order is position-independent.
-            state, current = await _scan(None)
+            state, current = await _scan(None, chain=False)
             if state is None:
-                return None, None, [], False
+                return _WalkResult()
             start_top = float(state.get("scrollTop") or 0)
             step = max(1.0, float(state.get("clientHeight") or 1))
             reached_end = False
+            restarted = False
             target = 0.0
             prev_top: float | None = None
             extent_before = float(state.get("scrollHeight") or 0)
@@ -16187,87 +16986,111 @@ def build_browser_tools(
                     break
                 if time.monotonic() > deadline:
                     break
-                state, current = await _scan(target)
+                state, current = await _scan(target, chain=True)
                 if state is None:
                     break
+                chained = [w for w in log.windows if w.chain and w.walk_pass == walk_pass]
+                if not restarted and len(chained) >= 2 and not _frames_agree(chained[-2], chained[-1]):
+                    # The list moved under the walk (a prepend, a re-measure), so its windows no longer stitch
+                    # into one frame: walk it once more from the top.
+                    restarted = True
+                    walk_pass += 1
+                    prev_top = None
+                    target = 0.0
+                    extent_before = float(state.get("scrollHeight") or 0)
+                    continue
                 top = float(state.get("scrollTop") or 0)
                 if top == prev_top:
                     # At the bottom: a list that appends a page on reaching its end grows only after a
                     # request; give it a beat and walk on if the extent moved, else the walk is done.
                     await asyncio.sleep(0.3)
-                    grown, current = await _scan(None)
+                    grown, current = await _scan(None, chain=True)
                     if grown is not None and float(grown.get("scrollHeight") or 0) > extent_before:
                         extent_before = float(grown.get("scrollHeight") or 0)
                         prev_top = None
-                        target = top + step
+                        target = _next_target(top, step)
                         continue
                     reached_end = True
                     break
                 prev_top = top
-                target = top + step
-
-            def _rows_cover_extent() -> bool:
-                # The rows seen tile the scroller's whole extent (no gap wider than ~1.5 rows, less than a row
-                # at either end): only then has the walk shown the full list. A scroller that grows past its
-                # rendered rows without re-rendering (or rendered too late) leaves gaps, and a prefix
-                # match over a partial list is not a match.
-                if len(all_pos) < 2 or extent <= 0:
-                    return False
-                ps = sorted(all_pos)
-
-                # Gaps are measured between ROW tops; a separator inside one only removes its own height, so
-                # separators can never close the gap a missing row leaves.
-                def _open(a: float, b: float) -> float:
-                    return (b - a) - sum(h for t, h in fillers.items() if a <= t < b)
-
-                gaps = [_open(a, b) for a, b in zip(ps, ps[1:]) if b - a > 0]
-                pitch = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
-                if pitch <= 0:
-                    return False
-                # Padding at the ends is allowed, but never a whole row: a missing first or last row could be a
-                # placeholder still loading a twin. Summing both ends cancels where the read node sits in its row;
-                # positions are whole pixels, so 4px of slack keeps a fractional row height from rounding under.
-                if _open(0.0, ps[0]) + _open(ps[-1], extent) - pitch >= pitch - 4:
-                    return False
-                return all(g <= 1.5 * pitch for g in gaps)
+                target = _next_target(top, step)
 
             if hit_text is not None and _is_ambiguous(hit_text):
                 reached_end = True
-            # A walk that was cut short (deadline, cap, scan failure), left gaps (a window that never rendered
-            # in time) or saw fewer rows than the list declares has not shown the rest of the list: a twin, or
-            # the exact row a prefix hit stands in for, may sit in what was not seen.
-            covered = reached_end and _rows_cover_extent()
-            walked_twins = want in ambiguous
-            declared = max((int(o.get("setsize") or 0) for o in seen.values()), default=0)
-            # A text-less option still counts against the declared size (it may be a placeholder whose row is still
-            # loading); only a declared separator is filler, and it counts neither there nor as a gap in the extent.
-            walk_complete = covered and not size_unknown and not unknown_seen and declared <= _walked_rows()
-            named = _value_contenders(value, [t for t, o in seen.items() if not o.get("nav")])
+            # A walk that was cut short (deadline, cap, scan failure), left a slot a row could fill, read windows
+            # that do not stitch into one frame, or saw fewer rows than the list declares has not shown the rest of
+            # the list: a twin, or the exact row a prefix hit stands in for, may sit in what was not seen.
+            coverage = _list_coverage(log.windows) if reached_end else "incomplete"
+            complete = coverage == "complete" and not size_unknown
+            decided_extent = next((w.scroll_height for w in reversed(log.windows) if w.chain), None)
+
+            def _verdict(text: str) -> Literal["commit", "ambiguous", "incomplete"]:
+                twins = _twin_keys()
+                return _commit_gate(
+                    text,
+                    value,
+                    complete=complete,
+                    twins_seen=want in twins or _exact_tier_key(text) in twins,
+                    contenders=_value_contenders(value, [r.text for r in _log_rows(log.windows) if not r.nav]),
+                )
+
+            def _result(
+                current: list[dict[str, Any]],
+                *,
+                definitive: bool,
+                idx: int | None = None,
+                hit: str | None = None,
+                unproven_row: dict[str, Any] | None = None,
+            ) -> _WalkResult:
+                twins = _twin_keys()
+                flagged = tuple(
+                    {**r.read, "ambiguous": True} if r.key in twins else dict(r.read) for r in _log_rows(log.windows)
+                )
+                return _WalkResult(
+                    idx=idx,
+                    hit=hit,
+                    rows=flagged if definitive else tuple(current),
+                    definitive=definitive,
+                    complete=complete,
+                    twins=want in twins,
+                    twin_rows=_rows_per_key(log.windows)[want] if want in twins else 0,
+                    unproven=unproven_row,
+                    seen=tuple(o for o in flagged if not o.get("nav")),
+                )
+
             for text in (hit_text, deferred if _match_seen() == deferred else None):
                 if text is None:
                     continue
-                verdict = _commit_gate(
-                    text,
-                    value,
-                    complete=walk_complete,
-                    twins_seen=walked_twins or _is_ambiguous(text),
-                    contenders=named,
-                )
+                verdict = _verdict(text)
+                if verdict == "commit":
+                    _, current = await _scan(_first_scroll_top(log.windows, text) or 0.0, chain=False)
+                    # The extent the coverage was decided on must still hold at the click: a list whose extent moved
+                    # by room for a row has rows the walk never read. A smaller move is a row box overhanging it.
+                    complete = (
+                        complete
+                        and decided_extent is not None
+                        and abs(log.windows[-1].scroll_height - decided_extent) < _row_floor(log.windows) / 2
+                    )
+                    verdict = _verdict(text)
+                    n = _row_n(current, text)
+                    if verdict == "commit" and n is not None:
+                        return _result(current, definitive=reached_end, idx=n, hit=text)
                 if verdict != "commit":
                     unproven = unproven or (text if verdict == "incomplete" else None)
-                    continue
-                _, current = await _scan(seen_top.get(text, 0.0))
-                n = _row_n(current, text)
-                if n is not None:
-                    return n, text, list(seen.values()), reached_end
             # Leave the list where the open-click rendered it so the model's next look() matches the
             # window it already reasoned about, or at the row the refusal will name. `data-tv3-menu` numbers from
             # earlier windows are not identities, so a full scan reports the option TEXTS it saw and a cut-short
             # one reports only the rows live in the restored window.
-            _, current = await _scan(seen_top.get(unproven, start_top) if unproven else start_top)
+            restore = _first_scroll_top(log.windows, unproven) if unproven else None
+            _, current = await _scan(start_top if restore is None else restore, chain=False)
             n_unproven = _row_n(current, unproven) if unproven else None
-            walk_unproven = (
-                None
+            # A walk that reached the end but left gaps is reported as cut short: its rows are not the
+            # whole list, so the definitive no-match/ambiguity verdicts do not apply.
+            definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else coverage != "incomplete")
+            return _result(
+                current,
+                definitive=definitive,
+                unproven_row=None
                 if n_unproven is None
                 else {
                     "n": n_unproven,
@@ -16275,16 +17098,8 @@ def build_browser_tools(
                     "why": "scrolled to the end of the list but could not prove it read every row"
                     if reached_end
                     else "the list is longer than we could enumerate before the walk was cut short",
-                }
+                },
             )
-            for text, o in seen.items():
-                if _is_ambiguous(text):
-                    o["ambiguous"] = True
-            # A walk that reached the end but left gaps is reported as cut short: its rows are not the
-            # whole list, so the definitive no-match/ambiguity verdicts do not apply.
-            definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else _rows_cover_extent())
-            walk_seen = [o for o in seen.values() if not o.get("nav")]
-            return None, None, (list(seen.values()) if definitive else current), definitive
 
         # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
         # read in full, so "several rows matched" can safely be checked for one candidate wearing more
@@ -16294,7 +17109,13 @@ def build_browser_tools(
         matched_from_scroll: str | None = None
         scanned_all = False
         if idx is None and overflowed:
-            idx, matched_from_scroll, accumulated_rows, scanned_all = await _scroll_search_menu_option()
+            walk = await _scroll_search_menu_option()
+            idx, matched_from_scroll, accumulated_rows, scanned_all = (
+                walk.idx,
+                walk.hit,
+                list(walk.rows),
+                walk.definitive,
+            )
             if idx is not None and matched_from_scroll is not None:
                 options = [{"n": idx, "text": matched_from_scroll, "nav": False}]
                 rows = options
@@ -16306,16 +17127,15 @@ def build_browser_tools(
 
         want_key = _exact_tier_key(value)
         # Every row an incomplete walk saw is still evidence of a rival, though `options` is only the restored
-        # window. The walk keys rows by raw text and flags a label it saw on two rows: list that label twice.
+        # window. The walk reads one entry per distinct row, so a label it read on several rows is listed once per
+        # row even where the restored window shows only one of them.
         shown_texts = {str(o.get("text") or "") for o in options}
-        walk_twin_texts = {str(o.get("text") or "") for o in walk_seen if o.get("ambiguous")}
-        evidence_rows = [*options, *(o for o in walk_seen if str(o.get("text") or "") not in shown_texts)]
-        row_texts = [
-            t
-            for o in evidence_rows
-            for t in [str(o.get("text") or "")]
-            * (2 if o.get("ambiguous") or str(o.get("text") or "") in walk_twin_texts else 1)
-        ]
+        evidence_rows = [*options, *(o for o in walk.seen if str(o.get("text") or "") not in shown_texts)]
+        row_texts = [str(o.get("text") or "") for o in evidence_rows]
+        for key, n in Counter(_exact_tier_key(str(o.get("text") or "")) for o in walk.seen).items():
+            held = [t for t in row_texts if _exact_tier_key(t) == key]
+            if held and n > len(held):
+                row_texts += [held[0]] * (n - len(held))
         contenders = _value_contenders(value, row_texts)
 
         def _ambiguous_error() -> ToolResult:
@@ -16360,26 +17180,16 @@ def build_browser_tools(
                 )
 
             async def _committed() -> list[str | None]:
-                # The field's own value, its container's hidden values and its label, each None when unread.
-                probe = await _probe_arg(page, selector)
-                state: list[str | None] = []
+                # The field's own value, its container's hidden values, its aria-label and text; None when unread.
                 try:
-                    own = await page.eval_on_selector(
-                        selector, "el => (el.isContentEditable ? (el.textContent || '') : (el.value || ''))"
+                    read = await page.evaluate(
+                        _SEMANTIC_COMMIT_STATE_JS, {**(await _probe_arg(page, selector)), "snapshot": True}
                     )
-                    state.append(str(own or ""))
                 except Exception:
-                    state.append(None)
-                try:
-                    hidden = await page.eval_on_selector(selector, _HIDDEN_VALUES_JS)
-                    state.append(", ".join(str(v) for v in hidden) if isinstance(hidden, list) else None)
-                except Exception:
-                    state.append(None)
-                try:
-                    state.append(str(await page.evaluate(_ANCHOR_SURFACE_JS, probe) or ""))
-                except Exception:
-                    state.append(None)
-                return state
+                    read = None
+                if not isinstance(read, list) or len(read) != 3:
+                    return [None, None, None]
+                return [part if isinstance(part, str) else None for part in read]
 
             before = await _committed()
 
@@ -16423,13 +17233,11 @@ def build_browser_tools(
                 except Exception:
                     raw = []
                 read_now = [o for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int)]
-                # Same completeness signals as the unfiltered read: a declared aria-setsize past the rows, or a
-                # scroller whose extent runs past them. `_commit_gate` commits no row from an incomplete read.
-                complete = (
-                    max((int(o.get("setsize") or 0) for o in read_now), default=0) <= len(read_now)
-                    and not any(o.get("setsize_unknown") for o in read_now)
-                    and not (isinstance(tagged, dict) and tagged.get("partial"))
+                # The same rule as the unfiltered read. `_commit_gate` commits no row from an incomplete read.
+                window = await _read_list_window(
+                    page, read_now, scroller=isinstance(tagged, dict) and bool(tagged.get("scroller"))
                 )
+                complete = _list_coverage([window]) == "complete"
                 fresh = int(tagged.get("fresh") or 0) if isinstance(tagged, dict) else 0
                 return sorted((o for o in read_now if not o.get("nav")), key=_n_order), complete, fresh
 
@@ -16599,21 +17407,31 @@ def build_browser_tools(
 
         # Only two visible rows that ARE the value make the filter pointless; a longer row that merely starts
         # with it says nothing about whether the exact one sits past the window.
-        exact_twins = walked_twins or sum(1 for t in contenders if _exact_tier_key(t) == want_key) >= 2
-        if idx is None and not walk_complete and not exact_twins:
+        exact_twins = walk.twins or sum(1 for t in contenders if _exact_tier_key(t) == want_key) >= 2
+        filtered_pick = False
+        if idx is None and not walk.complete and not exact_twins:
             popup_pick = await _popup_filter_pick()
             if isinstance(popup_pick, ToolResult):
                 return popup_pick
             if popup_pick is not None:
                 idx, options = popup_pick
+                filtered_pick = True
         if idx is None:
             # Match over the FULL list above, but bound the error PAYLOAD: enumerate at most 15 rows,
             # each ≤60 chars, so a miss on a 250-option country list does not ship a 15KB tool message.
             shown = options[:15]
-            if walk_unproven is not None and len(contenders) < 2 and not exact_twins:
-                return _unproven_row_error(value, selector, str(walk_unproven["why"]), walk_unproven)
+            if walk.unproven is not None and len(contenders) < 2 and not exact_twins:
+                return _unproven_row_error(value, selector, str(walk.unproven["why"]), walk.unproven)
             if scanned_all:
-                if len(contenders) >= 2 or exact_twins or (contenders and walk_complete):
+                if exact_twins:
+                    shared = next((t for t in contenders if _exact_tier_key(t) == want_key), value)
+                    n_twins = max(2, walk.twin_rows, sum(1 for t in contenders if _exact_tier_key(t) == want_key))
+                    return ToolResult.error(
+                        f"{value!r} is ambiguous in {selector}'s list — {n_twins} options share the exact label "
+                        f"{_model_text(shared, 60)!r}; the field is NOT filled — look() at the list and click the right one by "
+                        'its [data-tv3-menu="N"] selector'
+                    )
+                if len(contenders) >= 2 or (contenders and walk.complete):
                     return _ambiguous_error()
                 if contenders:
                     only = _model_text(contenders[0], 60)
@@ -16719,7 +17537,7 @@ def build_browser_tools(
             # that multi-selects, declared or not. Leave it; close the list the way the widget closes
             # itself.
             try:
-                if await page.evaluate(_MENU_OPEN_JS, probe):
+                if await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, probe):
                     await input_dispatch.press(_current_page(), None, "Escape")
             except Exception:
                 pass
@@ -16732,6 +17550,14 @@ def build_browser_tools(
         except Exception:
             chosen_values = []
         pre_surface_hit = await _surface_confirms(page, selector, matched)
+        pre_held = await _field_own_baseline(page, selector, matched)
+        # A leading clause names the row only when the whole list was read and no other row shares it.
+        lead = _lead_clause(matched)
+        lead_unique = (
+            not filtered_pick
+            and (not overflowed or walk.complete)
+            and sum(1 for o in evidence_rows if _lead_clause(str(o.get("text") or "")) == lead) == 1
+        )
         try:
             await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "menu", "n": idx})
         except Exception:
@@ -16757,6 +17583,9 @@ def build_browser_tools(
                 "typedTrusted": typed_trusted,
                 "preHidden": pre_hidden,
                 "preSurface": pre_surface,
+                "preHeld": pre_held,
+                "preAnchorClosed": pre_anchor_closed,
+                "leadUnique": lead_unique,
             },
             matched,
             pre_surface_hit,
@@ -16778,6 +17607,9 @@ def build_browser_tools(
                 )
             return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
         return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
+
+    def _already_held_result(selector: str, value: str) -> ToolResult:
+        return ToolResult.ok(f"{value!r} was already selected for {selector}; left it as is")
 
     def _surface_holds(matched: str, surface: str, value: str) -> bool:
         def norm(t: str) -> str:
@@ -16885,6 +17717,9 @@ def build_browser_tools(
                 return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
             return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
 
+        if await _field_already_holds(page, selector, value):
+            return _already_held_result(selector, value)
+
         if live_offer is not None:
             live_pick = await _commit_typeahead(
                 page, selector, value, rounds=0, pre_own=await _own_surface_text(page, selector), live_offer=live_offer
@@ -16957,6 +17792,9 @@ def build_browser_tools(
                 rung_pick = await _commit_typeahead(
                     page, selector, value, rounds=4, exact_only=True, probe=rung, pre_own=pre_own
                 )
+                if rung_pick.verdict is not None:
+                    await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                    return rung_pick.verdict
                 if rung_pick.suggestion is not None:
                     return await _typeahead_verdict_result(
                         rung_pick.suggestion,
@@ -17204,7 +18042,9 @@ def build_browser_tools(
                         data={"release_own_list": True},
                     )
                 # The focus-click of the type attempt may have opened this widget's list, so close it first.
-                opened = await _open_observe_pick(page, selector, value, close_open_menu=True, search=search)
+                opened = await _open_observe_pick(
+                    page, selector, value, close_open_menu=True, search=search, pre_checked=True
+                )
                 if restore_on_refusal and opened.status != "ok":
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                 return opened
@@ -17232,7 +18072,7 @@ def build_browser_tools(
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
             return verdict
         # A non-typeable anchor (a button/div that only opens a list on click): open, observe, pick.
-        return await _open_observe_pick(page, selector, value, search=search)
+        return await _open_observe_pick(page, selector, value, search=search, pre_checked=True)
 
     async def select_option(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -17886,6 +18726,7 @@ def build_browser_tools(
                 "handle": handle,
                 "tag": e.get("tag", ""),
                 "label": e.get("label", ""),
+                "page": page,
             }
         await _clear_look_tags(page)
         # Draw ONLY the marks we retained a handle for, so every number on the image is one the model
@@ -18017,8 +18858,12 @@ def build_browser_tools(
                 error_class="mark_not_in_latest",
             )
         handle = entry.get("handle")
+        other_tab = await _other_tab_url(page, [entry.get("page", page)])
         stale = ToolResult.error(
-            f"mark {mark} no longer points to an element on the page — it moved or the page "
+            f"mark {mark} was read from a different tab than the working page, which is now {other_tab}; marks "
+            "from that tab do not apply here. Call look() again and act on a fresh number."
+            if other_tab is not None
+            else f"mark {mark} no longer points to an element on the page — it moved or the page "
             "re-rendered since look(). Call look() again and act on a fresh number.",
             data={"page_state_changed": True},
             error_class="stale_mark",
@@ -18159,8 +19004,12 @@ def build_browser_tools(
                 f"ref={ref} is not a ref from the latest observe — re-observe and use a ref from the new observation",
                 error_class="ref_not_in_latest",
             )
+        other_tab = await _other_tab_url(page, _observed_page)
         stale = ToolResult.error(
-            f"ref={ref} no longer points to an element on the page — it moved or the page re-rendered "
+            f"ref={ref} was read from a different tab than the working page, which is now {other_tab}; refs "
+            "from that tab do not apply here. Call observe() again and act on a fresh ref."
+            if other_tab is not None
+            else f"ref={ref} no longer points to an element on the page — it moved or the page re-rendered "
             "since observe(). Call observe() again and act on a fresh ref.",
             data={"page_state_changed": True},
             error_class="stale_ref",

@@ -897,6 +897,57 @@ def test_failed_run_injects_pending_runtime_authoring_context_before_page_observ
     assert contract.repair_decision.target_blocks == ["search_registry"]
 
 
+@pytest.mark.parametrize(
+    ("codes", "repairs"),
+    [
+        pytest.param(["net::ERR_SSL_PROTOCOL_ERROR"], True, id="ssl_protocol_error_names_no_owner_and_repairs"),
+        pytest.param(
+            ["net::ERR_TUNNEL_CONNECTION_FAILED", "net::ERR_SSL_PROTOCOL_ERROR"],
+            True,
+            id="ssl_beside_a_tunnel_code_is_not_proxy_owned_and_repairs",
+        ),
+        pytest.param(["net::ERR_CERT_DATE_INVALID"], False, id="certificate_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN"], False, id="pinned_key_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_SERVER_CERT_CHANGED"], False, id="server_cert_changed_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_SERVER_CERT_BAD_FORMAT"], False, id="bad_server_cert_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_KEY_USAGE_INCOMPATIBLE"], False, id="key_usage_names_the_target_and_stops"),
+    ],
+)
+def test_a_driver_tls_failure_reaches_repair_only_when_it_names_no_owner(codes: list[str], repairs: bool) -> None:
+    code = codes[-1]
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "open_report",
+                    "status": "failed",
+                    "failure_reason": f"Failed to navigate to url https://localhost:8900/tls_repair/. Error message: "
+                    f"Page.goto: {code} at https://localhost:8900/tls_repair/",
+                    "error_codes": codes,
+                }
+            ],
+        },
+    }
+
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+    inject_runtime_authoring_repair_context(ctx, run_result)
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=run_result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert ("authoring_repair_context" in run_result["data"]) is repairs
+    assert contract.repair_decision.next_action == (RepairNextAction.REPAIR if repairs else RepairNextAction.STOP)
+
+
 def test_runtime_repair_context_keeps_a_runner_denials_named_replacement_whole() -> None:
     # The secure runner's listener denial names its replacement after ~500 characters; the recorder
     # must carry the block's failure reason far enough for the repair prompt to see that route.

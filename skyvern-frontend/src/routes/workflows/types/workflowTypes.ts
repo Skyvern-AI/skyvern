@@ -606,6 +606,7 @@ export type WaitBlock = WorkflowBlockBase & {
 export type TerminateBlock = WorkflowBlockBase & {
   block_type: "terminate";
   reason: string;
+  error_code?: string | null;
 };
 
 export type FileDownloadBlock = WorkflowBlockBase & {
@@ -834,6 +835,7 @@ export type WorkflowApiResponse = {
   original_created_by?: string | null;
   original_created_at?: string | null;
   copilot_authored?: boolean | null;
+  effective_default_engine?: RunEngine | null;
 };
 
 // Each save inserts a new version row, so created_at is the latest save; the list endpoint adds the first version's.

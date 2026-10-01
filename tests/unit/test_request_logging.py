@@ -125,6 +125,10 @@ class TestIsSensitiveKey:
             "cdp_connect_headers",
             # One-time codes
             "cached_totp",
+            # OAuth credentials
+            "client_secret",
+            "access_token",
+            "refresh_token",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:

@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     contains_internal_machinery_leak,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.repair_origin_run import OriginBlockOutput, OriginExecutionSettings, OriginOutputSnapshot
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
@@ -58,7 +59,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML
@@ -565,6 +566,9 @@ title: human approval example
 workflow_definition:
   parameters: []
   blocks:
+    - block_type: wait
+      label: request_access
+      wait_sec: 1
     - block_type: human_interaction
       label: approve_login
       timeout_seconds: 3600
@@ -615,6 +619,17 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     ctx = make_copilot_ctx(browser_session_id="pbs_chat")
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_outputs_run_id = "wr_origin"
+    ctx.repair_origin_outputs = OriginOutputSnapshot(
+        definition=harness["workflow"].workflow_definition,
+        outputs={
+            "request_access": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"sent": True}
+            )
+        },
+        settings=OriginExecutionSettings.of(harness["workflow"]),
+    )
+    ctx.frontier_origin_reused_labels = ["request_access"]
     before = set(run_execution._DETACHED_CLEANUP_TASKS)
 
     started = time.monotonic()
@@ -626,6 +641,8 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     assert result["data"]["control_signal"]["kind"] == "watchdog_paused", result
     assert "paused" in result["data"]["user_facing_summary"].lower()
     assert "uncertain" not in result["error"].lower()
+    assert result["data"]["reused_origin_output_labels"] == ["request_access"]
+    assert result["data"]["origin_workflow_run_id"] == "wr_origin"
 
     harness["cancel_run_task"].assert_not_awaited()
     harness["cooperative_cancel"].assert_not_awaited()

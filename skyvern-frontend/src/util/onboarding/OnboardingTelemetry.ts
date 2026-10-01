@@ -16,6 +16,8 @@ type Surface =
 
 type TourLayer = 1 | 2;
 
+const QUESTIONNAIRE_SURFACE = "welcome_page";
+
 type QuestionnaireShownInput = {
   primaryIntent: QuestionnaireUserIntentV1 | null;
   promptReason: "initial" | "resume";
@@ -78,10 +80,6 @@ function capture(event: string, properties: Properties): boolean {
 
 // -- Flow events --
 
-function flowStarted(surface: Surface): void {
-  capture("onboarding.flow_started", { surface });
-}
-
 function flowCompleted(surface: Surface): void {
   capture("onboarding.flow_completed", { surface });
 }
@@ -126,46 +124,11 @@ function tourDismissed(surface: Surface, lastStep: string): void {
   capture("onboarding.tour_dismissed", { surface, last_step: lastStep });
 }
 
-// -- Modal events --
-
-function modalOpened(surface: Surface): void {
-  capture("onboarding.modal_opened", { surface });
-}
-
-function modalTemplateSelected(
-  surface: Surface,
-  templateId: string,
-  intent: string,
-): void {
-  capture("onboarding.modal_template_selected", {
-    surface,
-    template_id: templateId,
-    intent,
-  });
-}
-
-function modalCopilotClicked(
-  surface: Surface,
-  intent: string,
-  promptText: string,
-): void {
-  capture("onboarding.modal_copilot_clicked", {
-    surface,
-    intent,
-    // capture only length, never the raw prompt - it can contain customer URLs / PII
-    prompt_length: promptText.length,
-  });
-}
-
-function modalSkipped(surface: Surface): void {
-  capture("onboarding.modal_skipped", { surface });
-}
-
 function questionnaireResponseProperties(input: QuestionnaireResponseInput) {
   return {
     questionnaire_version: 1,
     "$feature/onboarding_questionnaire_v1": true,
-    surface: "get_started_modal",
+    surface: QUESTIONNAIRE_SURFACE,
     response_id: input.responseId,
     revision: input.revision,
     ...(input.organizationId ? { organization_id: input.organizationId } : {}),
@@ -175,10 +138,14 @@ function questionnaireResponseProperties(input: QuestionnaireResponseInput) {
 function questionnaireAnswerProperties(answers: QuestionnaireAnswersV1) {
   return {
     role: answers.role,
-    company_context: answers.company_context,
-    scale_intent: answers.scale_intent,
+    company_context: answers.company_context ?? null,
+    scale_intent: answers.scale_intent ?? null,
     referral_source: answers.referral_source,
     referral_source_detail: answers.referral_source_detail ?? null,
+    audience: answers.audience ?? null,
+    weekly_run_volume: answers.weekly_run_volume ?? null,
+    // Free text never leaves the app; only whether it was given.
+    organization_name_present: Boolean(answers.organization_name),
   };
 }
 
@@ -186,7 +153,7 @@ function questionnaireShown(input: QuestionnaireShownInput): boolean {
   return capture("onboarding_questionnaire_shown", {
     questionnaire_version: 1,
     "$feature/onboarding_questionnaire_v1": true,
-    surface: "get_started_modal",
+    surface: QUESTIONNAIRE_SURFACE,
     primary_intent: input.primaryIntent,
     prompt_reason: input.promptReason,
     ...(input.organizationId ? { organization_id: input.organizationId } : {}),
@@ -283,10 +250,6 @@ function error(surface: Surface): void {
   capture("onboarding.error", { surface });
 }
 
-function modalRenderError(surface: Surface): void {
-  capture("onboarding.modal_render_error", { surface });
-}
-
 function tourError(surface: Surface): void {
   capture("onboarding.tour_error", { surface });
 }
@@ -302,7 +265,6 @@ function hintDismissed(surface: Surface, hintId: string): void {
 }
 
 export const OnboardingTelemetry = {
-  flowStarted,
   flowCompleted,
   dropOff,
   tourStarted,
@@ -311,10 +273,6 @@ export const OnboardingTelemetry = {
   tourSkipped,
   stepCompleted,
   tourDismissed,
-  modalOpened,
-  modalTemplateSelected,
-  modalCopilotClicked,
-  modalSkipped,
   questionnaireShown,
   questionnaireCompleted,
   questionnaireSkipped,
@@ -328,7 +286,6 @@ export const OnboardingTelemetry = {
   abVariantAssigned,
   registerVariant,
   error,
-  modalRenderError,
   tourError,
   hintShown,
   hintDismissed,

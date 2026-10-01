@@ -10,33 +10,29 @@ import {
 } from "./ui/select";
 import { BadgeLabel, type BadgeVariant } from "./BadgeLabel";
 
+const DEFAULT_ENGINE_VALUE = "default";
+
 type EngineOption = {
-  value: RunEngine;
+  value: RunEngine | typeof DEFAULT_ENGINE_VALUE;
   label: ReactNode;
   badge?: string;
   badgeVariant?: BadgeVariant;
 };
 
-const defaultEngineLabel = (
-  <span className="flex items-center gap-1.5">
-    <span>Default</span>
-    <span className="text-xs text-muted-foreground">
-      follows routing; most new self-serve workflows run on 3.0
-    </span>
-  </span>
-);
-
 type Props = {
   value: RunEngine | null;
-  onChange: (value: RunEngine) => void;
+  onChange: (value: RunEngine | null) => void;
   className?: string;
   availableEngines?: Array<RunEngine>;
+  effectiveDefaultEngine?: RunEngine | null;
 };
 
-const allEngineOptions: Array<EngineOption> = [
+const engineOptions: Array<EngineOption & { value: RunEngine }> = [
   {
     value: RunEngine.SkyvernV1,
-    label: defaultEngineLabel,
+    label: "Skyvern 1.0",
+    badge: "Legacy",
+    badgeVariant: "default",
   },
   {
     value: RunEngine.SkyvernV2,
@@ -70,7 +66,6 @@ const allEngineOptions: Array<EngineOption> = [
   },
 ];
 
-// Default engines for blocks that don't support V2 mode
 const defaultEngines: Array<RunEngine> = [
   RunEngine.SkyvernV1,
   RunEngine.SkyvernV3,
@@ -78,25 +73,38 @@ const defaultEngines: Array<RunEngine> = [
   RunEngine.AnthropicCua,
 ];
 
+const defaultOption: EngineOption = {
+  value: DEFAULT_ENGINE_VALUE,
+  label: "Default",
+};
+
 function RunEngineSelector({
   value,
   onChange,
   className,
   availableEngines,
+  effectiveDefaultEngine = null,
 }: Props) {
-  const engines = availableEngines ?? defaultEngines;
+  // Without a chosen-engine default, a skyvern-1.0 block is the routed Default, so it cannot be pinned.
+  const engines = (availableEngines ?? defaultEngines).filter(
+    (engine) => engine !== RunEngine.SkyvernV1 || effectiveDefaultEngine,
+  );
   const visibleEngines =
     value && !engines.includes(value) ? [...engines, value] : engines;
-  const engineOptions = allEngineOptions.filter((opt) =>
-    visibleEngines.includes(opt.value),
-  );
-
-  const selectedOption = engineOptions.find(
-    (opt) => opt.value === (value ?? RunEngine.SkyvernV1),
-  );
+  const options: Array<EngineOption> = [
+    defaultOption,
+    ...engineOptions.filter((opt) => visibleEngines.includes(opt.value)),
+  ];
+  const selectValue = value ?? DEFAULT_ENGINE_VALUE;
+  const selectedOption = options.find((opt) => opt.value === selectValue);
 
   return (
-    <Select value={value ?? RunEngine.SkyvernV1} onValueChange={onChange}>
+    <Select
+      value={selectValue}
+      onValueChange={(next) =>
+        onChange(next === DEFAULT_ENGINE_VALUE ? null : (next as RunEngine))
+      }
+    >
       <SelectTrigger className={className}>
         <SelectValue>
           {selectedOption && (
@@ -109,7 +117,7 @@ function RunEngineSelector({
         </SelectValue>
       </SelectTrigger>
       <SelectContent>
-        {engineOptions.map((option) => (
+        {options.map((option) => (
           <SelectItem key={option.value} value={option.value}>
             <BadgeLabel
               label={option.label}

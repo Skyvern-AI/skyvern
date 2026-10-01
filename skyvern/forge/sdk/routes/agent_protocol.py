@@ -78,6 +78,7 @@ from skyvern.forge.sdk.db.repositories.tags import (
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.experimentation.workflow_block_engine import effective_default_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
     BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON,
@@ -1362,16 +1363,26 @@ async def update_workflow_legacy(
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
+
+    def log_save_rejected(error: Exception) -> None:
+        LOG.info(
+            "Workflow save rejected",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_id,
+            error_type=type(error).__name__,
+        )
+
     # validate the workflow
     raw_yaml = await request.body()
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
     except yaml.YAMLError as exc:
+        log_save_rejected(exc)
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
@@ -1379,10 +1390,16 @@ async def update_workflow_legacy(
             edited_by=user_id,
         )
     except WorkflowDefinitionValidationException as e:
-        raise e
-    except (SkyvernHTTPException, ValidationError) as e:
+        log_save_rejected(e)
+        raise
+    except ValidationError as e:
+        log_save_rejected(e)
+        raise
+    except SkyvernHTTPException as e:
         # Bubble up well-formed client errors so they are not converted to 500s
-        raise e
+        if 400 <= e.status_code < 500:
+            log_save_rejected(e)
+        raise
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -1390,6 +1407,8 @@ async def update_workflow_legacy(
             organization_id=current_org.organization_id,
         )
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
+    await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+    return workflow
 
 
 @base_router.post(
@@ -1451,7 +1470,7 @@ async def update_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
             workflow_permanent_id=workflow_id,
@@ -1473,6 +1492,8 @@ async def update_workflow(
             workflow_permanent_id=workflow_id,
         )
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
+    await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+    return workflow
 
 
 @legacy_base_router.delete(
@@ -3573,6 +3594,7 @@ async def run_block(
             organization=organization,
             user_id=user_id,
             browser_session_id=browser_session_id,
+            debug_session_id=block_run_request.debug_session_id,
             block_outputs=block_run_request.block_outputs,
         )
     except SkyvernHTTPException:
@@ -3582,6 +3604,8 @@ async def run_block(
             "Unexpected error running blocks",
             workflow_id=block_run_request.workflow_id,
             organization_id=organization.organization_id,
+            debug_session_id=block_run_request.debug_session_id,
+            block_label_count=len(block_run_request.block_labels),
         )
         raise
 
@@ -5020,18 +5044,30 @@ async def get_workflow_run_with_workflow_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await run_service.coalesce_in_flight(
+        _build_workflow_run_with_workflow_id,
+        current_org.organization_id,
+        workflow_id,
+        workflow_run_id,
+        caps_run_response_values(x_user_agent),
+    )
+
+
+async def _build_workflow_run_with_workflow_id(
+    organization_id: str, workflow_id: str, workflow_run_id: str, cap_output_values: bool
+) -> dict[str, Any]:
     workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_permanent_id=workflow_id,
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         include_cost=True,
-        cap_output_values=caps_run_response_values(x_user_agent),
+        cap_output_values=cap_output_values,
     )
     return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
     )
 
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
@@ -5055,25 +5091,36 @@ async def get_workflow_and_run_from_workflow_run_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await run_service.coalesce_in_flight(
+        _build_workflow_and_run_from_workflow_run_id,
+        current_org.organization_id,
+        workflow_run_id,
+        caps_run_response_values(x_user_agent),
+    )
+
+
+async def _build_workflow_and_run_from_workflow_run_id(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool
+) -> WorkflowRunWithWorkflowResponse:
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         filter_deleted=False,
     )
 
     workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         include_cost=True,
         allow_deleted=True,
-        cap_output_values=caps_run_response_values(x_user_agent),
+        cap_output_values=cap_output_values,
     )
     workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
 
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
     )
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
     workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
@@ -5129,10 +5176,21 @@ async def get_workflow_run(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunResponseBase:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await run_service.coalesce_in_flight(
+        _build_workflow_run,
+        current_org.organization_id,
+        workflow_run_id,
+        caps_run_response_values(x_user_agent),
+    )
+
+
+async def _build_workflow_run(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool
+) -> WorkflowRunResponseBase:
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
         workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
-        cap_output_values=caps_run_response_values(x_user_agent),
+        organization_id=organization_id,
+        cap_output_values=cap_output_values,
     )
 
 
@@ -5362,6 +5420,9 @@ async def get_workflow(
         ) or await app.DATABASE.workflows.is_workflow_copilot_authored(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=current_org.organization_id,
+        )
+        workflow.set_effective_default_engine(
+            await effective_default_engine(workflow_permanent_id, current_org.organization_id)
         )
     return workflow
 

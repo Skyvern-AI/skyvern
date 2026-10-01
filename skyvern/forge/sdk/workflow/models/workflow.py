@@ -5,10 +5,13 @@ from typing import Any, List
 from pydantic import (
     BaseModel,
     Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
     ValidationInfo,
     computed_field,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import Self, deprecated
@@ -32,6 +35,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_run_metadata,
     normalize_run_with,
 )
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE,
@@ -260,6 +264,13 @@ class Workflow(BaseModel):
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False
+    effective_default_engine: RunEngine | None = Field(
+        default=None,
+        description="The engine a task block with no `engine` set runs on in this agent, or null when "
+        "engine routing decides it. Populated by the detail endpoint only.",
+    )
+    # Set by the detail GET; elsewhere the key is omitted, since a null would claim routing decides the engine.
+    _effective_default_engine_computed: bool = PrivateAttr(default=False)
     original_created_by: str | None = Field(
         default=None,
         description="Who created the agent's first version. Populated by the list endpoint only.",
@@ -277,6 +288,18 @@ class Workflow(BaseModel):
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
+
+    # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
+    @model_serializer(mode="wrap")
+    def _omit_uncomputed_engine(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if not self._effective_default_engine_computed:
+            data.pop("effective_default_engine", None)
+        return data
+
+    def set_effective_default_engine(self, engine: RunEngine | None) -> None:
+        self.effective_default_engine = engine
+        self._effective_default_engine_computed = True
 
     created_at: datetime
     modified_at: datetime
@@ -411,6 +434,15 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+
+def start_hold_reason(*, sequential_key: str | None, depends_on_workflow_run_id: str | None) -> str:
+    """Why a run may wait by design before it starts: a sequential lane, a dependency, or neither."""
+    if sequential_key:
+        return "sequential"
+    if depends_on_workflow_run_id:
+        return "dependency"
+    return "none"
 
 
 def resolve_reuse_browser_session(*, run_override: bool | None, workflow_default: bool) -> bool:

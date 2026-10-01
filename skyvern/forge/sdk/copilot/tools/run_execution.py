@@ -148,6 +148,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     screened_recorded_url,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
+from skyvern.forge.sdk.copilot.repair_origin_run import OriginOutputRefusal, OriginOutputRefusalDetail
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -292,6 +293,10 @@ from .frontier import (
     _workflow_with_runtime_block_goal_context,
     _workflow_with_runtime_frontier_anchor,
     _workflow_with_runtime_frontier_starter_url_seed,
+    logged_origin_refusal,
+    origin_definition_refusal,
+    origin_input_refusal,
+    origin_settings_refusal,
 )
 from .guardrails import (
     _authority_tool_error,
@@ -328,6 +333,7 @@ RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 
 COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
+COPILOT_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Copilot test-run snapshot; execution was not started."
 
 # Block types that can reach exec() in the API process, so a run containing one may
 # only proceed on the sandboxed worker. CODE compiles user code directly;
@@ -1663,6 +1669,9 @@ class _RunExecution:
     unbound_keys: list[str]
     explicit_blank: bool
     reused_origin_input_keys: list[str] = dataclass_field(default_factory=list)
+    reused_origin_output_labels: list[str] = dataclass_field(default_factory=list)
+    origin_workflow_run_id: str | None = None
+    origin_output_not_reused: OriginOutputRefusalDetail | None = None
     proposal_owner_turn_id: str | None = None
     proposal_revision: int | None = None
     outcome: RecordedRunOutcome | None = None
@@ -1798,6 +1807,7 @@ async def _attach_registered_output_parameter_values(
     workflow: Workflow | None,
     data: dict[str, Any],
     persisted_output_parameters: list[Any] | None = None,
+    excluded_block_labels: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     try:
         registered_rows = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
@@ -1838,6 +1848,8 @@ async def _attach_registered_output_parameter_values(
                 block_info["output_parameter_key"] = output_parameter_key
         if output_parameter_key and not block_info.get("block_label"):
             block_info.update(index_by_key.get(output_parameter_key, {}))
+        if block_info.get("block_label") in excluded_block_labels:
+            continue
         value = getattr(row, "value", None)
         item = {
             "workflow_run_id": workflow_run_id,
@@ -2432,15 +2444,26 @@ async def _fetch_dispatched_terminal_page_evidence(
         return None
     if artifact_bytes.startswith(_ZIP_MAGIC_PREFIXES):
         return None
+    # Cut before redaction: a registered value whose first 1-7 characters land on the cut is not caught, because
+    # the redactor only recognises a dangling prefix of 8 or more characters.
     raw_html = artifact_bytes.decode("utf-8", errors="ignore")[:_MAX_POST_RUN_PAGE_HTML_CHARS]
     scrubbed_html = (
         app.AGENT_FUNCTION.redact_codeblock_parameter_values(
-            raw_html, _mutable_redaction_value(artifact_redaction_parameters)
+            raw_html,
+            _mutable_redaction_value(artifact_redaction_parameters),
+            max_disclosure_chars=_MAX_POST_RUN_PAGE_HTML_CHARS,
         )
         if artifact_redaction_parameters
         else raw_html
     )
     if not isinstance(scrubbed_html, str) or not scrubbed_html:
+        # The HTML is cut to the budget before redaction, so a refusal here is never about size. The size is not
+        # logged because the refused parameters cannot vouch that it differs from a registered value.
+        LOG.warning(
+            "copilot_model_facing_result_withheld",
+            tool_name="post_run_page_html",
+            reason="redaction_unavailable",
+        )
         return None
     try:
         evidence = await asyncio.wait_for(
@@ -3191,6 +3214,25 @@ async def _halt_turn_if_superseded(
     stash_build_test_superseded_halt(ctx, workflow_run_id=workflow_run_id)
 
 
+def _attach_reused_origin_outputs(data: dict[str, Any], execution: _RunExecution) -> None:
+    if execution.reused_origin_output_labels:
+        data["reused_origin_output_labels"] = list(execution.reused_origin_output_labels)
+        data["origin_workflow_run_id"] = execution.origin_workflow_run_id
+    if execution.origin_output_not_reused is not None:
+        data["origin_output_not_reused"] = execution.origin_output_not_reused.as_payload()
+
+
+def _stop_reusing_origin_outputs(
+    execution: _RunExecution, block_outputs_to_seed: dict[str, Any], refusal: OriginOutputRefusalDetail
+) -> dict[str, Any]:
+    """Drop the origin seeds so the test runs as it would with no origin, and keep why as a fact."""
+    reused = set(execution.reused_origin_output_labels)
+    execution.reused_origin_output_labels = []
+    execution.origin_workflow_run_id = None
+    execution.origin_output_not_reused = refusal
+    return {label: value for label, value in block_outputs_to_seed.items() if label not in reused}
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -3221,10 +3263,14 @@ async def _run_blocks_and_collect_debug(
     start_provenance: FrontierStartProvenance = (
         "initial" if explicit_blank else ctx.frontier_start_provenance or "unanchored"
     )
+    origin_output_refusal = None if explicit_blank else ctx.frontier_origin_output_refusal
+    reused_origin_output_labels = [] if explicit_blank else list(ctx.frontier_origin_reused_labels)
     if not explicit_blank:
         ctx.frontier_resume_session_id = None
         ctx.frontier_requires_own_browser = False
         ctx.frontier_start_provenance = None
+        ctx.frontier_origin_output_refusal = None
+        ctx.frontier_origin_reused_labels = []
 
     block_labels = params["block_labels"]
     if not block_labels:
@@ -3270,6 +3316,8 @@ async def _run_blocks_and_collect_debug(
         proposal_revision=ctx.proposal_revision if snapshot.provenance == "staged" else None,
         unbound_keys=[],
         explicit_blank=explicit_blank,
+        reused_origin_output_labels=reused_origin_output_labels,
+        origin_workflow_run_id=ctx.repair_origin_outputs_run_id if reused_origin_output_labels else None,
     )
 
     if explicit_blank and snapshot.provenance == "canonical" and execution.source_is_current(ctx):
@@ -3280,6 +3328,35 @@ async def _run_blocks_and_collect_debug(
     for label in block_labels:
         if not workflow.get_output_parameter(label):
             return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
+
+    # Resolved once: the origin-input check must compare exactly what gets dispatched.
+    origin_checked_resolution: tuple[dict[str, Any], list[str], list[str]] | None = None
+    origin_checked_parameter_keys: set[str] = set()
+    if reused_origin_output_labels:
+        origin_output_refusal = origin_definition_refusal(
+            ctx, reused_origin_output_labels, labels_to_execute[0], workflow.workflow_definition
+        ) or origin_settings_refusal(ctx, reused_origin_output_labels, workflow)
+        if origin_output_refusal is None:
+            origin_checked_parameter_keys = {parameter.key for parameter in snapshot.workflow_parameters}
+            origin_checked_resolution = _resolve_run_data_and_unbound_keys(
+                snapshot.workflow_parameters,
+                params.get("parameters") or {},
+                ephemeral_input_values=(
+                    _ephemeral_input_values_by_parameter_key(execution.metadata, ctx.scout_trajectory)
+                    if use_ephemeral_inputs
+                    else {}
+                ),
+                origin_parameters=ctx.repair_origin_input_values,
+                origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
+            )
+            origin_output_refusal = origin_input_refusal(
+                ctx, reused_origin_output_labels, workflow.workflow_definition, origin_checked_resolution[0]
+            )
+        if origin_output_refusal is not None:
+            block_outputs_to_seed = _stop_reusing_origin_outputs(
+                execution, block_outputs_to_seed, origin_output_refusal
+            )
+    execution.origin_output_not_reused = origin_output_refusal
 
     workflow_definition = workflow.workflow_definition
     finally_block_label = (
@@ -3471,12 +3548,15 @@ async def _run_blocks_and_collect_debug(
         if use_ephemeral_inputs
         else {}
     )
-    data, unbound_required_parameter_keys, reused_origin_input_keys = _resolve_run_data_and_unbound_keys(
-        list(snapshot.workflow_parameters),
-        user_params,
-        ephemeral_input_values=ephemeral_input_values,
-        origin_parameters=ctx.repair_origin_input_values,
-        origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
+    data, unbound_required_parameter_keys, reused_origin_input_keys = (
+        origin_checked_resolution
+        or _resolve_run_data_and_unbound_keys(
+            list(snapshot.workflow_parameters),
+            user_params,
+            ephemeral_input_values=ephemeral_input_values,
+            origin_parameters=ctx.repair_origin_input_values,
+            origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
+        )
     )
     browser_seed: BuildTestBrowserSeed | None = None
     browser_seed_source: BrowserSeedSource | None = None
@@ -3656,14 +3736,14 @@ async def _run_blocks_and_collect_debug(
                 snapshot_provenance=snapshot.provenance,
                 exc_info=True,
             )
-            if dispatch_to_worker:
-                return _copilot_sandbox_unavailable_result(
-                    organization_id=ctx.organization_id,
-                    workflow_permanent_id=ctx.workflow_permanent_id,
-                )
             return {
                 "ok": False,
-                "error": "Unable to prepare the Copilot test-run snapshot; execution was not started.",
+                "error": COPILOT_SNAPSHOT_PREPARATION_ERROR,
+                "data": {
+                    "workflow_run_id": None,
+                    "failure_reason": COPILOT_SNAPSHOT_PREPARATION_ERROR,
+                    "blocks": [],
+                },
             }
 
     if dispatch_workflow is not None:
@@ -3671,6 +3751,25 @@ async def _run_blocks_and_collect_debug(
 
     all_workflow_params = list(snapshot.workflow_parameters)
     all_output_params = list(snapshot.output_parameters)
+    # The check above resolved every key the dispatched run reads only if persistence added none and dropped none.
+    unchecked_parameter_keys = (
+        sorted(origin_checked_parameter_keys ^ {parameter.key for parameter in all_workflow_params})
+        if origin_checked_resolution is not None
+        else []
+    )
+    if unchecked_parameter_keys and execution.reused_origin_output_labels:
+        block_outputs_to_seed = _stop_reusing_origin_outputs(
+            execution,
+            block_outputs_to_seed,
+            logged_origin_refusal(
+                OriginOutputRefusalDetail(
+                    reason=OriginOutputRefusal.CHANGED_INPUT,
+                    block_label=execution.reused_origin_output_labels[0],
+                    origin_workflow_run_id=ctx.repair_origin_outputs_run_id,
+                    parameter_key=unchecked_parameter_keys[0],
+                )
+            ),
+        )
 
     ctx.unbound_required_parameter_keys = unbound_required_parameter_keys
     execution.reused_origin_input_keys = reused_origin_input_keys
@@ -3697,6 +3796,7 @@ async def _run_blocks_and_collect_debug(
     sensitive_run_custody_lock: asyncio.Lock | None = None
     sensitive_run_session_id: str | None = None
     interim_run_id: str | None = None
+    current_context = skyvern_context.current()
     # Set only where the run may already be executing, so an unwind before either executor call
     # can still retract the run-start record.
     run_submission_attempted = False
@@ -3710,7 +3810,7 @@ async def _run_blocks_and_collect_debug(
             # select a newer proposal while this run still carries the previous definition.
             resolved_workflow_id=snapshot.workflow.workflow_id,
             max_steps=None,
-            request_id=None,
+            request_id=current_context.request_id if current_context is not None else None,
             # The trigger type (and the -ui queue routing it implies) is a cloud contract; ask the
             # AgentFunction for it rather than hardcoding "manual == -ui pool" in OSS. OSS base
             # returns None (no routing hint); cloud returns the value its executor routes to -ui.
@@ -3800,6 +3900,10 @@ async def _run_blocks_and_collect_debug(
                     "error": "The pending Copilot proposal changed before the test started; reload and try again.",
                 }
         ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
+        # A seeded producer's value belongs to the run that produced it, never to this one.
+        seeded_only_labels = frozenset(block_outputs_to_seed) - frozenset(labels_that_may_execute)
+        if seeded_only_labels:
+            ctx.seeded_only_labels_by_run_id[workflow_run.workflow_run_id] = seeded_only_labels
         # The browser session the run attaches overrides the run row's proxy in the browser layer,
         # so the proxy this run acts through is the session's whenever it declares one.
         session_made_hop, run_session_proxy_location = await browser_session_hop_proxy(ctx, run_session_id)
@@ -4157,6 +4261,7 @@ async def _run_blocks_and_collect_debug(
                 result["data"]["user_facing_summary"] = user_facing_summary
                 if execution.reused_origin_input_keys:
                     result["data"]["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
+                _attach_reused_origin_outputs(result["data"], execution)
                 if run_cancelled_by_watchdog:
                     result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
                 failed_result = _newest_failed_result(result["data"]["blocks"])
@@ -4313,6 +4418,7 @@ async def _run_blocks_and_collect_debug(
             result_data["runtime_frontier_starter_url_seeded"] = True
         if execution.reused_origin_input_keys:
             result_data["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
+        _attach_reused_origin_outputs(result_data, execution)
         if not run_ok and run and getattr(run, "failure_reason", None):
             result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
         if not run_ok and run and getattr(run, "failure_category", None):
@@ -4336,6 +4442,7 @@ async def _run_blocks_and_collect_debug(
             workflow=output_identity_workflow,
             data=result_data,
             persisted_output_parameters=all_output_params,
+            excluded_block_labels=seeded_only_labels,
         )
         # The run's terminal facts are known here, so the outcome is committed before any
         # browser-dependent probe: a probe the turn deadline cancels must not erase what the run did.
@@ -4420,6 +4527,12 @@ async def _run_blocks_and_collect_debug(
         # trust blocks that individually succeeded inside it.
         if run_fully_completed and execution.source_is_current(ctx):
             for label, output in block_outputs_by_label.items():
+                # Seeded as-is into the next run's `<label>_output`, so the block's own registered value is
+                # kept rather than the {output_key: value} map the result packet shows.
+                output_parameter = snapshot.workflow.get_output_parameter(label)
+                registered = registered_outputs_by_label.get(label, {})
+                if output_parameter is not None and output_parameter.key in registered:
+                    output = registered[output_parameter.key]
                 ctx.verified_block_outputs[label] = output
             # Rebuilt from this run's rows alone: the position was forgotten at dispatch, and the
             # browser these pages describe is the one this run used.
@@ -4723,6 +4836,7 @@ async def _get_run_results(
             if run_workflow is not None
             else None
         ),
+        excluded_block_labels=ctx.seeded_only_labels_by_run_id.get(workflow_run_id, frozenset()),
     )
 
     cold_artifact_requires_redaction_context = _workflow_requires_terminal_artifact_redaction(run_workflow)
@@ -5402,6 +5516,7 @@ def _record_run_blocks_result(
     # the unattended page-observation self-heal verifier remains a separate lane.
     copilot_ctx.completion_verification_result = None
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
+    copilot_ctx.last_test_run_started = bool(run_id) or (isinstance(data, dict) and bool(data.get("blocks")))
     run_browser_session_id = data.get("browser_session_id") if isinstance(data, dict) else None
     copilot_ctx.last_run_blocks_browser_session_id = (
         run_browser_session_id if isinstance(run_browser_session_id, str) and run_browser_session_id else None

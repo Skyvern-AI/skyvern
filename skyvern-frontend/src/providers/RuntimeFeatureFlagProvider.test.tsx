@@ -56,6 +56,15 @@ describe("RuntimeFeatureFlagProvider", () => {
     expect(result.current).toEqual({ codeMode: true, codeAccess: false });
   });
 
+  it("reports the Discover Copilot handoff as off so the home toolbar does not wait on it", () => {
+    const { result } = renderHook(
+      () => useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF"),
+      { wrapper },
+    );
+
+    expect(result.current).toBe(false);
+  });
+
   it("leaves unrelated cloud feature flags unresolved", () => {
     const { result } = renderHook(() => useFeatureFlag("SOME_CLOUD_FLAG"), {
       wrapper,

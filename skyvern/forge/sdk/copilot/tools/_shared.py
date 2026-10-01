@@ -40,7 +40,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _requested_output_labels_by_path,
     proxy_hop_failure_reason,
 )
-from skyvern.forge.sdk.copilot.mcp_adapter import _browser_session_error_disposition, _browser_session_loss_result
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    _browser_session_error_disposition,
+    _browser_session_loss_result,
+    is_redaction_withheld,
+)
 from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
@@ -1000,6 +1004,8 @@ async def _composition_get_structured_evidence_result(
                 f"and {type(exc).__name__} carried no message"
             )
     if outcome is not None and outcome.payload_omitted:
+        if is_redaction_withheld(result):
+            return None, f"structured page evidence was withheld: {result.get('error')}"
         return None, "structured page evidence was omitted at the MCP boundary"
     if not result.get("ok"):
         LOG.warning(

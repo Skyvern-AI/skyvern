@@ -5,11 +5,14 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
-import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
+import type {
+  BranchEvaluation,
+  WorkflowRunBlock,
+} from "../../types/workflowRunTypes";
 import { BlockDetailConditional } from "./BlockDetailConditional";
 
 function buildConditional(
@@ -44,6 +47,22 @@ function buildConditional(
     loop_values: null,
     current_value: null,
     current_index: null,
+    ...overrides,
+  };
+}
+
+function evaluation(
+  overrides: Partial<BranchEvaluation> & { branch_id: string },
+): BranchEvaluation {
+  return {
+    branch_index: 0,
+    criteria_type: "jinja2_template",
+    original_expression: null,
+    result: null,
+    is_matched: false,
+    is_default: false,
+    next_block_label: null,
+    error: null,
     ...overrides,
   };
 }
@@ -148,15 +167,22 @@ describe("BlockDetailConditional", () => {
   });
 
   it("falls back to the legacy executed_branch_expression rendering when no evaluations array", () => {
+    // The shape a conditional evaluated from cached code writes.
     const block = buildConditional({
       executed_branch_id: "b_match",
       executed_branch_expression: "{{ x == 1 }}",
       executed_branch_result: true,
+      output: {
+        branch_taken: "next",
+        branch_index: 0,
+        next_block_label: "next",
+      },
     });
 
     render(<BlockDetailConditional block={block} />);
-    expect(screen.getByText(/evaluation/i)).toBeDefined();
+    expect(screen.getByText(/^evaluation$/i)).toBeDefined();
     expect(screen.getByText("{{ x == 1 }}")).toBeDefined();
+    expect(screen.queryByText(/could not be evaluated/i)).toBeNull();
   });
 
   it("renders valid JSON rendered branch values with the JSON explorer", () => {
@@ -199,6 +225,179 @@ describe("BlockDetailConditional", () => {
     });
     render(<BlockDetailConditional block={block} />);
     expect(screen.getByText(/no conditions matched/i)).toBeDefined();
+  });
+
+  it("says a condition could not be evaluated and the default branch was taken, though the block completed", () => {
+    const error =
+      "Failed to evaluate natural language branches: Branch evaluation failed: LLM exploded";
+    const block = buildConditional({
+      status: Status.Completed,
+      executed_branch_id: "b_default",
+      executed_branch_next_block: "fallback_block",
+      output: {
+        branch_taken: "fallback_block",
+        evaluations: [
+          evaluation({
+            branch_id: "b_prompt",
+            criteria_type: "prompt",
+            original_expression: "user selected premium plan",
+            next_block_label: "premium",
+            error,
+          }),
+          evaluation({
+            branch_id: "b_default",
+            is_default: true,
+            is_matched: true,
+            criteria_type: null,
+            next_block_label: "fallback_block",
+          }),
+        ],
+        evaluation_error: error,
+      },
+    });
+
+    render(<BlockDetailConditional block={block} />);
+
+    const notice = screen.getByText(/could not be evaluated/i);
+    expect(notice.textContent).toMatch(/default branch/i);
+    // The reason is stated once: the branch does not repeat what the notice says.
+    expect(screen.getAllByText(error)).toHaveLength(1);
+    const erroredRow = screen
+      .getByText("user selected premium plan")
+      .closest("li")!;
+    expect(within(erroredRow).getByText("error")).toBeDefined();
+    expect(screen.getByText("fallback_block")).toBeDefined();
+  });
+
+  it("marks an errored branch differently from one that evaluated false, and shows an error the notice does not state", () => {
+    const promptError =
+      "Failed to evaluate natural language branches: Branch evaluation failed: LLM exploded";
+    const jinjaError =
+      "Failed to format Jinja style parameter '{{ total > }}'. Reason: unexpected 'end of print statement'. <img src=x onerror=alert(1)>";
+    const block = buildConditional({
+      executed_branch_id: "b_default",
+      executed_branch_next_block: "fallback_block",
+      output: {
+        evaluations: [
+          evaluation({
+            branch_id: "b_false",
+            original_expression: "{{ total > 100 }}",
+            result: false,
+            next_block_label: "big_order",
+          }),
+          evaluation({
+            branch_id: "b_prompt",
+            criteria_type: "prompt",
+            original_expression: "the page shows an invoice",
+            next_block_label: "invoice",
+            error: promptError,
+          }),
+          evaluation({
+            branch_id: "b_jinja_error",
+            original_expression: "{{ total > }}",
+            next_block_label: "other",
+            error: jinjaError,
+          }),
+          evaluation({
+            branch_id: "b_default",
+            is_default: true,
+            is_matched: true,
+            criteria_type: null,
+            next_block_label: "fallback_block",
+          }),
+        ],
+        evaluation_error: promptError,
+      },
+    });
+
+    const { container } = render(<BlockDetailConditional block={block} />);
+
+    const falseRow = screen.getByText("{{ total > 100 }}").closest("li")!;
+    expect(within(falseRow).getByText("false")).toBeDefined();
+    expect(within(falseRow).queryByText("error")).toBeNull();
+
+    const jinjaRow = screen.getByText("{{ total > }}").closest("li")!;
+    expect(within(jinjaRow).getByText("error")).toBeDefined();
+    expect(within(jinjaRow).queryByText("false")).toBeNull();
+    // Rendered as text: the markup in the message stays a string.
+    expect(within(jinjaRow).getByText(jinjaError)).toBeDefined();
+    expect(container.querySelector("img")).toBeNull();
+
+    const promptRow = screen
+      .getByText("the page shows an invoice")
+      .closest("li")!;
+    expect(within(promptRow).getByText("error")).toBeDefined();
+    expect(screen.getAllByText(promptError)).toHaveLength(1);
+  });
+
+  it("does not claim the default branch was taken when a later branch matched after the error", () => {
+    const branchError =
+      "Failed to format Jinja style parameter '{{ total > }}'. Reason: unexpected 'end of print statement'.";
+    const block = buildConditional({
+      executed_branch_id: "b_true",
+      executed_branch_expression: "{{ total > 10 }}",
+      executed_branch_result: true,
+      executed_branch_next_block: "big_order",
+      output: {
+        evaluations: [
+          evaluation({
+            branch_id: "b_error",
+            original_expression: "{{ total > }}",
+            next_block_label: "invoice",
+            error: branchError,
+          }),
+          evaluation({
+            branch_id: "b_true",
+            original_expression: "{{ total > 10 }}",
+            rendered_expression: "12 > 10",
+            result: true,
+            is_matched: true,
+            next_block_label: "big_order",
+          }),
+        ],
+        evaluation_error: `Failed to evaluate branch 0 for route_document: ${branchError}`,
+      },
+    });
+
+    render(<BlockDetailConditional block={block} />);
+
+    const notice = screen.getByText(/could not be evaluated/i);
+    expect(notice.textContent).not.toMatch(/default branch/i);
+    expect(
+      screen.getByText(
+        `Failed to evaluate branch 0 for route_document: ${branchError}`,
+      ),
+    ).toBeDefined();
+  });
+
+  it("renders no evaluation-error notice or error marker when the output carries no error", () => {
+    const block = buildConditional({
+      executed_branch_id: "b_true",
+      output: {
+        evaluations: [
+          evaluation({
+            branch_id: "b_true",
+            original_expression: "{{ count > 3 }}",
+            rendered_expression: "5 > 3",
+            result: true,
+            is_matched: true,
+            next_block_label: "notify_team",
+          }),
+          evaluation({
+            branch_id: "b_default",
+            is_default: true,
+            criteria_type: null,
+            next_block_label: "fallback",
+          }),
+        ],
+      },
+    });
+
+    render(<BlockDetailConditional block={block} />);
+
+    expect(screen.getByText("notify_team")).toBeDefined();
+    expect(screen.queryByText(/could not be evaluated/i)).toBeNull();
+    expect(screen.queryByText("error")).toBeNull();
   });
 
   it("renders no evaluation/branches section before the conditional has resolved a branch", () => {

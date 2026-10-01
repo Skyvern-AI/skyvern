@@ -192,6 +192,7 @@ from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
     goal_check_eligible,
 )
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
@@ -201,7 +202,6 @@ from skyvern.forge.taskv3.run_arms import (
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
     HUMANIZED_INPUT_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     resolve_run_arm,
     run_arm_enabled,
@@ -2217,6 +2217,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_code_progress: CodeProgressRecord | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -2271,45 +2272,31 @@ class ForgeAgent:
         from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, select_previous_block
         from skyvern.utils.token_counter import approx_count_tokens
 
-        # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
-        # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
-        # Bare tasks keep today's exact semantics: one page grabbed up front, for the run's duration.
+        # Every task re-resolves the live working page on every tool call, so a click that opens a
+        # new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
+        # Fail fast (with the recovery attempt must_get makes) when the page is already gone at the
+        # start; mid-run losses surface through the per-call provider instead.
+        await browser_state.must_get_working_page()
         # A block reuses the browser across blocks, so neither the landing status nor its URL belongs
         # to this block's start; only a bare task names a starting page in the dead-end verdict.
         initial_navigation_url: str | None = None
-        follows_working_page = task_block is not None or workflow_owned_recovery
-        if follows_working_page:
-            # Fail fast (with the same recovery attempt bare tasks get) when the page is already
-            # gone at block start; mid-run losses surface through the per-call provider instead.
-            await browser_state.must_get_working_page()
-
-            async def _page_provider() -> Any:
-                # must_get (not get): recovers a crashed/closed page via _reopen_lost_working_page,
-                # matching the step engine's per-action re-acquisition; its raise on unrecoverable
-                # loss is contained by the loop's per-tool-call error handling.
-                return await browser_state.must_get_working_page()
-
-            async def _fingerprint_page() -> Any:
-                # get (not must_get): recovery at finish time could navigate and induce duplicate
-                # actions, so a lost page yields None and the verdict is accepted as-is.
-                return await browser_state.get_working_page()
-
-        else:
-            initial_page = await browser_state.must_get_working_page()
+        if task_block is None and not workflow_owned_recovery:
             # The pair setup recorded, not the page's URL now: the status belongs to the landed response
             # (page.goto returns the last redirect hop), and the settle and challenge-solver waits that
             # follow it give a client-side redirect time to move the page somewhere the status was never
             # about. Reading the page here would name that destination as the page that 404ed.
             initial_navigation_url = browser_state.last_navigation_url
 
-            async def _page_provider() -> Any:
-                return initial_page
+        async def _page_provider() -> Any:
+            # must_get (not get): recovers a crashed/closed page via _reopen_lost_working_page,
+            # matching the step engine's per-action re-acquisition; its raise on unrecoverable
+            # loss is contained by the loop's per-tool-call error handling.
+            return await browser_state.must_get_working_page()
 
-            async def _fingerprint_page() -> Any:
-                # The fingerprint MUST sample the page the tools act on. Bare tasks pin one page for
-                # the run, and browser_state.get_working_page() would both return the newest tab
-                # (wrong page after any popup) and repoint the working page as a side effect.
-                return None if initial_page.is_closed() else initial_page
+        async def _fingerprint_page() -> Any:
+            # get (not must_get): recovery at finish time could navigate and induce duplicate
+            # actions, so a lost page yields None and the verdict is accepted as-is.
+            return await browser_state.get_working_page()
 
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         workflow_run_context = (
@@ -2342,18 +2329,6 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DATE_SEGMENT_AIM,
-            )
-            await resolve_run_arm(
-                context,
-                REQUIRED_FIELD_ANSWERS_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_REQUIRED_FIELD_ANSWERS,
-                properties={
-                    "workflow_permanent_id": task.workflow_permanent_id
-                    or context.workflow_permanent_id
-                    or "not_workflow"
-                },
             )
             await resolve_run_arm(
                 context,
@@ -2464,6 +2439,7 @@ class ForgeAgent:
                     framing=framing,
                     block_context_section=block_context_section,
                     page_data_note=page_data_note,
+                    code_progress=recovery_code_progress,
                 ),
             )
 
@@ -3004,8 +2980,7 @@ class ForgeAgent:
 
         async def _reload_page() -> None:
             # Observed by the action policy like the legacy internal refresh; the loop records it in
-            # the action round. A bare task pins one page, so it is passed explicitly.
-            pinned = None if task_block is not None else await _page_provider()
+            # the action round.
             preflight_action(
                 ReloadPageAction(
                     reasoning="a page-level handler requested a refresh",
@@ -3014,10 +2989,10 @@ class ForgeAgent:
                     task_id=task.task_id,
                     step_id=step.step_id,
                 ),
-                pinned if pinned is not None else await _fingerprint_page(),
+                await _fingerprint_page(),
                 site="internal_refresh",
             )
-            await browser_state.reload_page(page=pinned)
+            await browser_state.reload_page()
 
         async def _restore_page_url(page: Any, url: str) -> None:
             # Not `reload_page`: the tab is blanked in place, so reloading it reloads `about:blank`.
@@ -3302,8 +3277,7 @@ class ForgeAgent:
             elif not page_free_validation and not download_finalized:
                 blank_page = None
                 try:
-                    # A block's tools act on the working page the gate just read; a bare task's on its pinned page.
-                    first_sample = gate_page if follows_working_page else await _fingerprint_page()
+                    first_sample = gate_page
 
                     async def _settle_should_stop() -> bool:
                         if time.monotonic() >= loop_deadline_at:
@@ -3681,6 +3655,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_code_progress: CodeProgressRecord | None = None,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
@@ -3902,6 +3877,7 @@ class ForgeAgent:
                         workflow_owned_recovery=workflow_owned_recovery,
                         recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                         recovery_release_parameter_keys=recovery_release_parameter_keys,
+                        recovery_code_progress=recovery_code_progress,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)

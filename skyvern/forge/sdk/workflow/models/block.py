@@ -159,7 +159,6 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
-from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
 from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -179,7 +178,10 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
-from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
+from skyvern.forge.sdk.experimentation.workflow_block_engine import (
+    run_honors_chosen_engine,
+    workflow_block_engine_override,
+)
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -285,6 +287,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.emails import EmailBodyFormat
@@ -1669,6 +1672,43 @@ class Block(BaseModel, abc.ABC):
         current_index: int | None = None,
         **kwargs: dict,
     ) -> BlockResult:
+        result = await self._execute_to_block_result(
+            workflow_run_id,
+            parent_workflow_run_block_id,
+            organization_id,
+            browser_session_id,
+            current_value,
+            current_index,
+            **kwargs,
+        )
+        self.record_result_outcome(workflow_run_id, result)
+        return result
+
+    def record_result_outcome(self, workflow_run_id: str, result: BlockResult) -> None:
+        if result.status is None:
+            return
+        try:
+            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        except WorkflowRunContextNotInitialized:
+            # The run was torn down while this block finished; nothing is left to read the record.
+            return
+        try:
+            workflow_run_context.record_block_outcome(
+                self.label, result.status, result.error_codes, result.failure_reason
+            )
+        except Exception:
+            LOG.warning("Failed to record block outcome", block_label=self.label, exc_info=True)
+
+    async def _execute_to_block_result(
+        self,
+        workflow_run_id: str,
+        parent_workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
         # block_type slices the 303s p95 by block kind — task/for_loop/code/extraction
         # have wildly different latency profiles. Set early so it's present even if
         # execute_safe raises before any child work.
@@ -1879,11 +1919,17 @@ def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     return False
 
 
+def _engine_is_unset(engine: RunEngine | None) -> bool:
+    return engine is None
+
+
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    # Left out of the dump when unset, so a stored definition stays readable by an image whose engine
+    # field still rejects null (a rollout or a revert).
+    engine: RunEngine | None = Field(default=None, exclude_if=_engine_is_unset)
     complete_criterion: str | None = None
     complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
@@ -1974,19 +2020,25 @@ class BaseTaskBlock(Block):
         Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
         the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
         engine is honored as-authored, and a block the eligibility check never saw is left alone;
-        neither is ever rerouted.
+        neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
+        chosen engine, where an explicit skyvern_v1 is a pin too.
         """
+        declared = self.engine or RunEngine.skyvern_v1
         if (
-            self.engine != RunEngine.skyvern_v1
-            or self._exclude_from_engine_ab
+            self._exclude_from_engine_ab
             # Mirrors run_is_eligible_for_v3_ab: a block eligibility skipped as engine-inert must
-            # not be labeled v3 here either, or its row claims an engine that never ran. It does not
-            # re-check _task_block_supports_v3 because run-level eligibility already rejected the
-            # whole run if any block failed it; loosening that predicate means revisiting this.
+            # not be labeled v3 here either, or its row claims an engine that never ran.
             or self.block_type in _ENGINE_INERT_BLOCK_TYPES
+            # Redundant for an A/B run, whose eligibility already rejected any such block; a
+            # chosen-engine run skips that check, so a block v3 cannot execute stays off the override.
+            or not _task_block_supports_v3(self)
+        ):
+            return declared
+        if self.engine is not None and (
+            self.engine != RunEngine.skyvern_v1 or run_honors_chosen_engine(workflow_run_id)
         ):
             return self.engine
-        return workflow_block_engine_override(workflow_run_id) or self.engine
+        return workflow_block_engine_override(workflow_run_id) or declared
 
     def get_all_parameters(
         self,
@@ -7478,25 +7530,33 @@ async def wrapper({default_args}):
                 return idx
         return None
 
-    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
-        safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
-        # Steps are a code-derived outline, not an authored goal, so they may only narrow one.
-        if not self.prompt:
-            return safe_main
-        matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
-        if matched_step is None or not matched_step.description:
-            return safe_main
+    def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
+        return workflow_run_context.mask_secrets_in_data(self.prompt or "")
+
+    def _code_progress_record(
+        self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None
+    ) -> CodeProgressRecord | None:
+        if failing_line is None:
+            return None
+        index = self._matched_step_index_for_failing_line(failing_line)
+        if index is None:
+            return None
         steps = self.steps or []
-        matched_index = next((idx for idx, step in enumerate(steps) if step is matched_step), None)
-        if matched_index is None:
-            matched_index = len(steps) - 1
-        descriptions = [matched_step.description] + [
-            step.description for step in steps[matched_index + 1 :] if step.description
-        ]
-        safe_mini = "\nThen: ".join(
-            workflow_run_context.mask_secrets_in_data(description) for description in descriptions
+        failed = steps[index]
+        if not failed.description:
+            return None
+
+        def masked(chunk: list[CodeBlockStep]) -> tuple[str, ...]:
+            return tuple(
+                workflow_run_context.mask_secrets_in_data(step.description) for step in chunk if step.description
+            )
+
+        return CodeProgressRecord(
+            before=masked(steps[:index]),
+            failed_step=workflow_run_context.mask_secrets_in_data(failed.description),
+            failed_line=failing_line,
+            after=masked(steps[index + 1 :]),
         )
-        return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
 
     async def _record_unregistered_download_intent(
         self,
@@ -7691,10 +7751,7 @@ async def wrapper({default_args}):
         escalation_step: Step | None = None
         recovery_block_id: str | None = None
         try:
-            navigation_goal = self._compose_heal_goal(
-                workflow_run_context=workflow_run_context,
-                failing_line=failing_line,
-            )
+            navigation_goal = self._compose_heal_goal(workflow_run_context=workflow_run_context)
             navigation_payload = {
                 parameter.key: workflow_run_context.get_value_or_none(parameter.key) for parameter in self.parameters
             }
@@ -7884,6 +7941,9 @@ async def wrapper({default_args}):
                     workflow_owned_recovery=True,
                     recovery_credential_parameter_keys=login_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_code_progress=self._code_progress_record(
+                        workflow_run_context=workflow_run_context, failing_line=failing_line
+                    ),
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -14427,6 +14487,9 @@ class HumanInteractionBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.HUMAN_INTERACTION] = BlockType.HUMAN_INTERACTION  # type: ignore
+    # Engine-inert, and its YAML has no engine: keeping the stored value makes an unedited re-save
+    # write the definition it read, so the cached script is not cleared.
+    engine: RunEngine | None = Field(default=RunEngine.skyvern_v1, exclude_if=_engine_is_unset)
 
     instructions: str = "Please review and approve or reject to continue the workflow."
     positive_descriptor: str = "Approve"
@@ -15390,6 +15453,8 @@ class UrlBlock(BaseTaskBlock):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL  # type: ignore
     url: str
+    # Engine-inert; see HumanInteractionBlock.engine.
+    engine: RunEngine | None = Field(default=RunEngine.skyvern_v1, exclude_if=_engine_is_unset)
 
 
 class TaskV2Block(Block):
@@ -16840,6 +16905,9 @@ def _neutralize_jinja_delimiters(value: Any) -> Any:
     return value
 
 
+CONDITIONAL_DEBUG_OUTPUT_FIELDS = frozenset({"llm_prompt", "llm_response", "evaluations"})
+
+
 class BranchEvaluationContext:
     """Collection of runtime data that BranchCriteria evaluators can consume."""
 
@@ -16883,10 +16951,28 @@ class BranchEvaluationContext:
             "workflow_run_id",
         }
 
+        # Block references registered as a copy of `<label>_output`, this run's and carried in.
+        block_aliases = ctx.workflow_run_outputs.keys() | ctx.carried_block_labels
+        workflow_definition = ctx.workflow.workflow_definition if ctx.workflow else None
+        conditional_output_keys: set[str] = set()
+        for block in get_all_blocks(workflow_definition.blocks if workflow_definition else []):
+            if block.block_type != BlockType.CONDITIONAL:
+                continue
+            conditional_output_keys.add(block.output_parameter.key)
+            # A parameter may share the label; only a registered alias is the block's own output.
+            alias = block.output_parameter.key.removesuffix("_output")
+            if alias in block_aliases:
+                conditional_output_keys.add(alias)
+
         snapshot: dict[str, Any] = {}
         for key, value in raw_values.items():
             # Skip noisy keys
             if key in keys_to_skip:
+                continue
+
+            # A synthetic branch-evaluation block records its raw response under a generated label; a key the
+            # author declared, or a block produced, under that prefix is theirs and stays.
+            if key.startswith("prompt_branch_eval_") and key not in ctx.parameters and key not in block_aliases:
                 continue
 
             # For block outputs (dicts with extracted_information), only include extracted_information
@@ -16894,9 +16980,22 @@ class BranchEvaluationContext:
                 extracted = value.get("extracted_information")
                 if extracted is not None:
                     snapshot[key] = extracted
+            elif key in conditional_output_keys and isinstance(value, dict):
+                # An earlier conditional's stored prompt embedded this same snapshot; re-sending it, its raw
+                # response and its per-branch detail grows every later evaluation. The routing fields stay.
+                snapshot[key] = {
+                    field: item for field, item in value.items() if field not in CONDITIONAL_DEBUG_OUTPUT_FIELDS
+                }
             else:
                 # Include parameter values directly
                 snapshot[key] = value
+
+        # `<label>` is registered as a copy of `<label>_output`. Keep one; a copy that differs (keys merged
+        # across loop iterations) holds something the output does not, so it stays.
+        for label in block_aliases:
+            output_key = f"{label}_output"
+            if label in snapshot and output_key in snapshot and snapshot[label] == snapshot[output_key]:
+                del snapshot[label]
 
         # Copy loop variables (current_value, current_index, current_item) to top level
         # Required for pure NatLang expressions like "current_value['date']" to work
@@ -17953,12 +18052,14 @@ class ConditionalBlock(Block):
         """
         Evaluate natural language branch conditions in batch.
 
-        All prompt-based conditions are batched into ONE LLM call for performance.
+        Prompt-based conditions are batched into a synthetic ExtractionBlock per evaluation attempt.
         Jinja parts ({{ }}) are pre-rendered before sending to LLM.
 
         Evaluation strategy:
-        - If any condition is pure natural language, use ExtractionBlock for browser/page context.
-        - If all conditions contain Jinja and are pre-rendered, use direct LLM call (no browser context).
+        - Every batch runs through the ExtractionBlock with the run's browser session, including
+          batches whose conditions are all pre-rendered Jinja.
+        - The workflow context snapshot is added to the prompt only when a condition is pure natural
+          language or its Jinja fails to render.
 
         Returns:
             A tuple of (results, rendered_expressions, extraction_goal, llm_response):
@@ -18692,6 +18793,7 @@ class WorkflowTriggerBlock(Block):
                             # workflow's engine, so persist that engine on the child run for fidelity even
                             # though it carries a browser_session_id. None for caller-supplied/parent-shared.
                             server_owned_browser_type=child_effective_browser_type if created_fresh_session else None,
+                            reject_empty_workflow=True,
                         )
                     except Exception as e:
                         error_msg = get_user_facing_exception_message(e)
@@ -18945,7 +19047,7 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
             continue
-        if block.engine != RunEngine.skyvern_v1:
+        if block.engine not in (None, RunEngine.skyvern_v1):
             return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
             return V3AbIneligibleReason.unsupported_block
@@ -18955,6 +19057,31 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     if reroutable_blocks == 0:
         return V3AbIneligibleReason.no_reroutable_blocks
     return None
+
+
+def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:
+    """Whether any block of the run leaves its engine unchosen; None when the run has no engine to choose.
+
+    ``blocks`` is the flattened definition, as for v3_ab_ineligibility_reason. A script run is answered
+    too: its uncached blocks and its AI fallback run on the engine this decides. A prompt-criteria
+    condition counts as unchosen: its synthetic extraction block has no engine an author can set.
+    """
+    has_engine_block = False
+    for block in blocks:
+        if isinstance(block, ConditionalBlock):
+            if any(isinstance(branch.criteria, PromptBranchCriteria) for branch in block.branch_conditions):
+                return True
+            continue
+        if isinstance(block, WhileLoopBlock):
+            if isinstance(block.condition, PromptBranchCriteria):
+                return True
+            continue
+        if not isinstance(block, BaseTaskBlock) or block.block_type in _ENGINE_INERT_BLOCK_TYPES:
+            continue
+        if block.engine is None and _task_block_supports_v3(block):
+            return True
+        has_engine_block = True
+    return False if has_engine_block else None
 
 
 def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:

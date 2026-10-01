@@ -1,6 +1,9 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 
-import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import {
+  COPILOT_ATTENTION_CHIP,
+  useCopilotHeaderStore,
+} from "@/store/useCopilotHeaderStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
@@ -85,13 +88,20 @@ export function CopilotActiveDot() {
   );
 }
 
-export function CopilotRecordingStatus() {
+export function CopilotPaneStatus() {
   const recording = useRecordingStore((state) => state.isRecording);
   const finishing = useRecordingStore(
     (state) => state.finishRequested || state.isCommitting,
   );
+  const attention = useCopilotHeaderStore((state) => state.attention);
   if (!recording && !finishing) {
-    return null;
+    // The tray it points at can sit below the fold of a short pane, or under a collapsed line.
+    return attention ? (
+      <span className="flex items-center gap-1 text-[10px] font-medium text-amber-700 dark:text-yellow-400">
+        <span className="size-1 rounded-full bg-amber-500" aria-hidden="true" />
+        {COPILOT_ATTENTION_CHIP[attention]}
+      </span>
+    ) : null;
   }
   return (
     <span className="flex items-center gap-1 text-[10px] font-medium text-red-600 dark:text-red-400">

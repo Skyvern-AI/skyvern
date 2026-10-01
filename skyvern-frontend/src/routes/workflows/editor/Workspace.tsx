@@ -1,4 +1,9 @@
 import {
+  TEMPLATE_VIA,
+  buildTemplateGuidanceMessage,
+  withoutTemplateViaParam,
+} from "../templateGuidance";
+import {
   bindCopilotReviewClose,
   captureEditorState,
   restoreEditorState,
@@ -532,6 +537,19 @@ function Workspace({
     () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
+  const templateGuidance = useMemo(
+    () =>
+      embedded && searchParams.get("via") === TEMPLATE_VIA
+        ? buildTemplateGuidanceMessage(workflow)
+        : undefined,
+    [embedded, searchParams, workflow],
+  );
+  const handleTemplateGuidanceShown = useCallback(() => {
+    navigate(location.pathname + withoutTemplateViaParam(location.search), {
+      replace: true,
+      state: location.state,
+    });
+  }, [location.pathname, location.search, location.state, navigate]);
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage && !initialCopilotAction) return;
     clearStoredInitialCopilotMessage();
@@ -558,7 +576,8 @@ function Workspace({
     if (
       shouldOpenCopilotPaneForHandoff({
         embedded,
-        hasInitialCopilotMessage: Boolean(initialCopilotMessage),
+        hasInitialCopilotMessage:
+          Boolean(initialCopilotMessage) || Boolean(templateGuidance),
         copilotPaneOpen: studioCopilotOpen,
       })
     ) {
@@ -663,7 +682,14 @@ function Workspace({
     canUndo: canUndoWorkflowEdit,
     canRedo: canRedoWorkflowEdit,
     historyApplyTrigger,
-  } = useWorkflowHistory({ nodes, edges, setNodes, setEdges });
+  } = useWorkflowHistory({
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    organizationId: workflow.organization_id,
+    workflowPermanentId: workflow.workflow_permanent_id,
+  });
   const [restoreApplyTrigger, setRestoreApplyTrigger] = useState(0);
   const captureLiveEditorState = (): EditorStateSnapshot => {
     const titles = useWorkflowTitleStore.getState();
@@ -1516,6 +1542,7 @@ function Workspace({
   };
 
   const cycleBrowser = useMutation({
+    mutationKey: ["cycleBrowser"],
     mutationFn: async (id: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client.post<DebugSessionApiResponse>(`/debug-session/${id}/new`);
@@ -1997,6 +2024,7 @@ function Workspace({
     workflowChangesStore.setHasChanges(true);
     postHog.capture("builder.block.added", {
       org_id: workflow.organization_id,
+      workflow_permanent_id: workflow.workflow_permanent_id,
       block_type: blockTypeFromNode(node) ?? nodeType,
       position: previousNodeIndex + 1,
     });
@@ -3405,6 +3433,8 @@ function Workspace({
       {withStudioPaneBoundary(
         "copilot",
         <WorkflowCopilotChat
+          templateGuidance={templateGuidance}
+          onTemplateGuidanceShown={handleTemplateGuidanceShown}
           organizationId={workflow.organization_id}
           captureProductEvent={captureProductEvent}
           captureEditorState={captureLiveEditorState}

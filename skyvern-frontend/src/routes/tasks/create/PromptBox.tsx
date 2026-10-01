@@ -4,7 +4,6 @@ import { Createv2TaskRequest } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import img from "@/assets/promptBoxBg.png";
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
@@ -14,6 +13,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
 import {
+  ArrowUpIcon,
   CheckIcon,
   ChevronDownIcon,
   Cross2Icon,
@@ -21,13 +21,18 @@ import {
   FileTextIcon,
   GlobeIcon,
   GearIcon,
-  PaperPlaneIcon,
   PlusIcon,
   ReloadIcon,
   TextAlignLeftIcon,
   UploadIcon,
   VideoIcon,
 } from "@radix-ui/react-icons";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -39,6 +44,7 @@ import { AxiosError, type AxiosResponse } from "axios";
 import {
   forwardRef,
   type ForwardedRef,
+  type KeyboardEvent,
   type ReactNode,
   useCallback,
   useEffect,
@@ -48,10 +54,11 @@ import {
 } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  generatePhoneNumber,
-  generateUniqueEmail,
-} from "../data/sampleTaskData";
-import { CapabilityExamples } from "./CapabilityExamples";
+  CapabilityExamples,
+  JOB_APPLICATION_PROMPT,
+  SAMPLE_RESUME_PATH,
+  SAMPLE_RESUME_PUBLIC_URL,
+} from "./CapabilityExamples";
 import { ExampleCasePill } from "./ExampleCasePill";
 import { CyclingPlaceholderTextarea } from "./CyclingPlaceholderTextarea";
 import {
@@ -80,7 +87,8 @@ const exampleCases = [
     key: "job_application",
     hint: "jobs.lever.co",
     label: "Apply for a job",
-    prompt: `Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply, fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully. Here's the user information: {"name":"John Doe","email":"${generateUniqueEmail()}","phone":"${generatePhoneNumber()}","resume_url":"https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf","cover_letter":"Generate a compelling cover letter for me"}`,
+    prompt: JOB_APPLICATION_PROMPT,
+    attachment: SAMPLE_RESUME_PATH,
     icon: <InboxIcon className="size-6" />,
   },
   {
@@ -88,7 +96,7 @@ const exampleCases = [
     hint: "finditparts.com",
     label: "Add a product to cart",
     prompt:
-      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Your goal is COMPLETE when you\'re on the cart page and the specified product is in the cart. Extract all product quantity information from the cart page. Do not attempt to checkout.',
+      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Extract all product quantity information from the cart page. Do not attempt to checkout.',
     icon: <CartIcon className="size-6" />,
   },
   {
@@ -129,6 +137,8 @@ type ExampleAttribution = { id: string; edited: boolean };
 const UPLOAD_RETENTION_DAYS = 30;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
 const MAX_HOME_ATTACHMENTS = 20;
+// A failed /customer load leaves the flag unknown for the whole session, so stop waiting and show the flag-off controls.
+const HANDOFF_FLAG_WAIT_MS = 3000;
 
 const HOW_IT_WORKS = [
   {
@@ -150,6 +160,8 @@ const HOW_IT_WORKS = [
 
 type PromptBoxProps = {
   enableCopilotHandoff?: boolean;
+  /** Hides the toolbar controls until `enableCopilotHandoff` is known (at most HANDOFF_FLAG_WAIT_MS), so they don't swap on load. */
+  handoffFlagLoading?: boolean;
   /** Home-screen variant: no prompt improver and no advanced settings. */
   minimal?: boolean;
   /** Fires once an agent has been created from this prompt box. */
@@ -159,20 +171,17 @@ type PromptBoxProps = {
 };
 
 type PromptBoxHandle = {
-  focusAndPrefillExample: (key: ExamplePromptKey) => void;
+  /** Prefills `key`, or `fallback` when `key` is not a known example (e.g. from a URL). */
+  focusAndPrefillExample: (
+    key: string | null,
+    fallback: ExamplePromptKey,
+  ) => void;
+  /** Prefills the user's own words; never overwrites a prompt already typed. */
+  focusAndPrefillPrompt: (text: string) => void;
 };
-
-const HANDOFF_TITLE_MAX_LEN = 80;
 
 function blankToNull(value: string | null): string | null {
   return value?.trim() || null;
-}
-
-function deriveHandoffTitle(prompt: string): string {
-  const collapsed = prompt.replace(/\s+/g, " ").trim();
-  if (!collapsed) return "New Agent";
-  if (collapsed.length <= HANDOFF_TITLE_MAX_LEN) return collapsed;
-  return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
 }
 
 function buildBlankWorkflowRequest(
@@ -242,6 +251,7 @@ function showCreateErrorToast(title: string, error: unknown) {
 function PromptBoxImpl(
   {
     enableCopilotHandoff = false,
+    handoffFlagLoading = false,
     minimal = false,
     onAgentCreated,
     secondaryAction,
@@ -272,6 +282,16 @@ function PromptBoxImpl(
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [promptTouched, setPromptTouched] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
+  const [handoffFlagWaitExpired, setHandoffFlagWaitExpired] = useState(false);
+  useEffect(() => {
+    if (!handoffFlagLoading) return;
+    const timer = window.setTimeout(
+      () => setHandoffFlagWaitExpired(true),
+      HANDOFF_FLAG_WAIT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [handoffFlagLoading]);
+  const hideFlagControls = handoffFlagLoading && !handoffFlagWaitExpired;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { setAutoplay } = useAutoplayStore();
   // react-query isPending only flips on the next render, so a same-frame
@@ -288,13 +308,30 @@ function PromptBoxImpl(
   }, []);
 
   useImperativeHandle(ref, () => ({
-    focusAndPrefillExample: (key) => {
+    focusAndPrefillExample: (key, fallback) => {
       const selectedExample =
-        exampleCases.find((example) => example.key === key) ?? exampleCases[0];
+        exampleCases.find((example) => example.key === key) ??
+        exampleCases.find((example) => example.key === fallback) ??
+        exampleCases[0];
       if (!prompt.trim()) {
         cancelSpeech();
-        setPrompt(selectedExample.prompt);
+        setPrompt(
+          withExampleAttachment(
+            selectedExample.prompt,
+            "attachment" in selectedExample
+              ? selectedExample.attachment
+              : undefined,
+          ),
+        );
         setExampleAttribution({ id: selectedExample.key, edited: false });
+      }
+      textareaRef.current?.scrollIntoView?.({ block: "center" });
+      textareaRef.current?.focus({ preventScroll: true });
+    },
+    focusAndPrefillPrompt: (text) => {
+      if (!prompt.trim()) {
+        setPrompt(text);
+        setExampleAttribution(undefined);
       }
       textareaRef.current?.scrollIntoView?.({ block: "center" });
       textareaRef.current?.focus({ preventScroll: true });
@@ -302,7 +339,17 @@ function PromptBoxImpl(
   }));
 
   const uploadDocumentMutation = useMutation({
-    mutationFn: async (file: File) => {
+    mutationFn: async (source: File | string) => {
+      let file = source;
+      if (typeof file === "string") {
+        const response = await fetch(file);
+        if (!response.ok) {
+          throw new Error(`Failed to load ${file} (${response.status})`);
+        }
+        file = new File([await response.blob()], file.split("/").pop()!, {
+          type: "application/pdf",
+        });
+      }
       const client = await getClient(credentialGetter);
       const formData = new FormData();
       formData.append("file", file);
@@ -329,11 +376,35 @@ function PromptBoxImpl(
       );
       textareaRef.current?.focus();
     },
-    onError: (error: AxiosError) => {
+    onError: (error: unknown) => {
       HomeTelemetry.uploadDocumentFinished(false);
       showCreateErrorToast("Failed to upload file", error);
     },
   });
+
+  // Returns the prompt to load. Attachments only reach the copilot handoff path,
+  // so the plain task path gets the file's public URL in the prompt instead.
+  const withExampleAttachment = (prompt: string, path?: string) => {
+    const filename = path?.split("/").pop();
+    if (!path || !filename) return prompt;
+    if (!enableCopilotHandoff) {
+      return `${prompt} The attached resume is at ${SAMPLE_RESUME_PUBLIC_URL}; download it from there.`;
+    }
+    if (attachedFiles.length >= MAX_HOME_ATTACHMENTS) {
+      toast({
+        variant: "destructive",
+        title: "Too many attachments",
+        description: "Remove an attachment to add the example's resume.",
+      });
+      return prompt;
+    }
+    // Starting the upload here (not after a fetch) flips isPending before the next render,
+    // which disables submit and the example buttons until the resume is attached.
+    if (!attachedFiles.some((file) => file.filename === filename)) {
+      uploadDocumentMutation.mutate(path);
+    }
+    return prompt;
+  };
 
   const recordTaskMutation = useMutation({
     mutationFn: async () => {
@@ -494,7 +565,8 @@ function PromptBoxImpl(
     }) => {
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(
-        buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
+        // A default title lets Copilot name the agent from this prompt on its first turn.
+        buildBlankWorkflowRequest("New Agent", runWith),
       );
       const result = await client.post<string, AxiosResponse<unknown>>(
         "/workflows",
@@ -609,6 +681,123 @@ function PromptBoxImpl(
     generateWorkflowMutation.mutate({ prompt, attempt });
   };
 
+  const handlePromptKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // With no precise pointer (a phone) assume an on-screen keyboard, which has no Shift+Enter, so Return stays a
+    // newline and the send button submits. A tablet with a keyboard but no trackpad falls in this bucket too.
+    if (
+      e.key !== "Enter" ||
+      e.shiftKey ||
+      e.nativeEvent.isComposing ||
+      !window.matchMedia?.("(any-pointer: fine)").matches
+    ) {
+      return;
+    }
+    e.preventDefault();
+    if (prompt.trim()) {
+      submitPrompt({ prompt, attribution: exampleAttribution });
+    }
+  };
+
+  const attachmentChips =
+    attachedFiles.length > 0 ? (
+      <div className="flex flex-wrap gap-1.5 px-1 pt-2">
+        {attachedFiles.map((file) => (
+          <span
+            key={file.file_id}
+            className="inline-flex items-center gap-1.5 rounded-md border border-input bg-slate-elevation2 px-2 py-1 text-xs text-foreground"
+          >
+            <FileTextIcon aria-hidden="true" className="size-3.5" />
+            <span className="max-w-[16rem] truncate">{file.filename}</span>
+            <button
+              type="button"
+              aria-label={`Remove ${file.filename}`}
+              className="text-muted-foreground hover:text-foreground"
+              onClick={() =>
+                setAttachedFiles((current) =>
+                  current.filter((f) => f.file_id !== file.file_id),
+                )
+              }
+            >
+              <Cross2Icon aria-hidden="true" className="size-3" />
+            </button>
+          </span>
+        ))}
+      </div>
+    ) : null;
+
+  const fileInput = (
+    <input
+      ref={fileInputRef}
+      type="file"
+      className="hidden"
+      aria-label="Upload document"
+      onChange={(event) => {
+        const file = event.target.files?.[0];
+        if (file) {
+          uploadDocumentMutation.mutate(file);
+        }
+        event.target.value = "";
+      }}
+    />
+  );
+
+  const renderAddMenu = (sizeClassName: string) => (
+    <DropdownMenu
+      onOpenChange={(open) => {
+        if (open) HomeTelemetry.addMenuOpened();
+      }}
+    >
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Add files and more"
+                disabled={isSubmitting}
+                className={cn(
+                  "flex shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50",
+                  sizeClassName,
+                )}
+              >
+                {uploadDocumentMutation.isPending ||
+                recordTaskMutation.isPending ? (
+                  <ReloadIcon className="size-4 animate-spin" />
+                ) : (
+                  <PlusIcon aria-hidden="true" className="size-[18px]" />
+                )}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>Add files and more</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+      <DropdownMenuContent align="start">
+        {enableCopilotHandoff ? (
+          <DropdownMenuItem
+            disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
+            onSelect={() => {
+              HomeTelemetry.uploadDocumentSelected();
+              fileInputRef.current?.click();
+            }}
+          >
+            <UploadIcon className="mr-2 size-4" />
+            Upload document
+          </DropdownMenuItem>
+        ) : null}
+        <DropdownMenuItem
+          onSelect={() => {
+            HomeTelemetry.recordTaskSelected();
+            recordTaskMutation.mutate();
+          }}
+        >
+          <VideoIcon className="mr-2 size-4" />
+          Record task
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
   if (!minimal) {
     return (
       <div className="relative isolate flex flex-col items-center pb-4 pt-12 md:pt-24">
@@ -631,28 +820,42 @@ function PromptBoxImpl(
         </div>
         <div className="mt-6 flex w-full max-w-[45rem] flex-col md:mt-9">
           <div className="flex w-full flex-col rounded-2xl border border-input bg-background text-muted-foreground shadow-[0_12px_32px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] focus-within:border-foreground/20 focus-within:shadow-[0_0_0_4px_rgba(79,70,229,0.10),0_12px_32px_rgba(0,0,0,0.06)] dark:bg-slate-elevation1 dark:shadow-[0_12px_32px_rgba(0,0,0,0.35)] dark:focus-within:shadow-[0_0_0_4px_rgba(165,180,252,0.14),0_12px_32px_rgba(0,0,0,0.35)]">
-            <AutoResizingTextarea
+            <CyclingPlaceholderTextarea
               ref={textareaRef}
               id="discover-prompt-input"
               className="max-h-[14rem] min-h-[6rem] resize-none overflow-y-auto border-0 bg-transparent px-5 pb-1.5 pt-[18px] text-base leading-6 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0 md:text-[15px]"
               value={prompt}
               onChange={(e) => updatePrompt(e.target.value)}
-              placeholder="Enter your prompt..."
+              onKeyDown={handlePromptKeyDown}
+              onFocus={() => setPromptTouched(true)}
+              cycling={!promptTouched}
             />
-            <div className="flex items-center gap-1 px-2.5 pb-2.5 pt-2">
-              <SpeechInputButton
-                isSupported={isSpeechSupported}
-                isListening={isSpeechListening}
-                isHearingSpeech={isSpeechHearing}
-                disabled={isSubmitting}
-                onToggle={() => {
-                  HomeTelemetry.voiceToggled();
-                  toggleSpeech();
-                }}
-                className="size-11 border-0 bg-transparent shadow-none hover:bg-muted md:size-9"
-                iconClassName="h-[18px] w-[18px]"
-              />
-              {!enableCopilotHandoff ? (
+            {enableCopilotHandoff ? (
+              <div className="px-5">{attachmentChips}</div>
+            ) : null}
+            <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
+              {!hideFlagControls && enableCopilotHandoff ? (
+                <>
+                  {renderAddMenu("size-11 md:size-9")}
+                  {fileInput}
+                </>
+              ) : null}
+              {!hideFlagControls ? (
+                <SpeechInputButton
+                  isSupported={isSpeechSupported}
+                  isListening={isSpeechListening}
+                  isHearingSpeech={isSpeechHearing}
+                  disabled={isSubmitting}
+                  onToggle={() => {
+                    HomeTelemetry.voiceToggled();
+                    setPromptTouched(true);
+                    toggleSpeech();
+                  }}
+                  className="size-11 rounded-full border-0 bg-transparent md:size-9"
+                  iconClassName="h-[18px] w-[18px]"
+                />
+              ) : null}
+              {!hideFlagControls && !enableCopilotHandoff ? (
                 <AdvancedSettingsPopover
                   settings={taskRunSettings}
                   onChange={setTaskRunSettings}
@@ -663,14 +866,14 @@ function PromptBoxImpl(
                   }}
                   tab={advancedSettingsTab}
                   onTabChange={setAdvancedSettingsTab}
-                  triggerClassName="size-11 rounded-[10px] md:size-9"
+                  triggerClassName="size-11 rounded-full md:size-9"
                 />
               ) : null}
               <button
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="ml-auto flex size-11 items-center justify-center rounded-[10px] bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none md:size-9"
+                className="ml-auto flex size-11 shrink-0 items-center justify-center rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:opacity-50 md:size-9"
                 onClick={() => {
                   submitPrompt({ prompt, attribution: exampleAttribution });
                 }}
@@ -678,10 +881,7 @@ function PromptBoxImpl(
                 {isSubmitting ? (
                   <ReloadIcon className="size-4 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    aria-hidden="true"
-                    className="size-4 shrink-0"
-                  />
+                  <ArrowUpIcon aria-hidden="true" className="size-4" />
                 )}
               </button>
             </div>
@@ -725,7 +925,12 @@ function PromptBoxImpl(
                     label: example.label,
                   });
                   cancelSpeech();
-                  setPrompt(example.prompt);
+                  setPrompt(
+                    withExampleAttachment(
+                      example.prompt,
+                      "attachment" in example ? example.attachment : undefined,
+                    ),
+                  );
                   setExampleAttribution({ id: example.key, edited: false });
                   textareaRef.current?.focus();
                 }}
@@ -780,95 +985,15 @@ function PromptBoxImpl(
             className="max-h-[8rem] min-h-[4rem] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
             value={prompt}
             onChange={(e) => updatePrompt(e.target.value)}
+            onKeyDown={handlePromptKeyDown}
             onFocus={() => setPromptTouched(true)}
             cycling={!promptTouched}
           />
-          {attachedFiles.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5 px-1 pt-2">
-              {attachedFiles.map((file) => (
-                <span
-                  key={file.file_id}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-input bg-slate-elevation2 px-2 py-1 text-xs text-foreground"
-                >
-                  <FileTextIcon aria-hidden="true" className="size-3.5" />
-                  <span className="max-w-[16rem] truncate">
-                    {file.filename}
-                  </span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${file.filename}`}
-                    className="text-muted-foreground hover:text-foreground"
-                    onClick={() =>
-                      setAttachedFiles((current) =>
-                        current.filter((f) => f.file_id !== file.file_id),
-                      )
-                    }
-                  >
-                    <Cross2Icon aria-hidden="true" className="size-3" />
-                  </button>
-                </span>
-              ))}
-            </div>
-          ) : null}
+          {attachmentChips}
           <div className="flex items-center gap-1 pt-2">
-            <DropdownMenu
-              onOpenChange={(open) => {
-                if (open) HomeTelemetry.addMenuOpened();
-              }}
-            >
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Add to prompt"
-                  disabled={isSubmitting}
-                  className="flex size-8 items-center justify-center rounded-lg border border-input text-foreground transition-colors hover:bg-muted disabled:opacity-50"
-                >
-                  {uploadDocumentMutation.isPending ||
-                  recordTaskMutation.isPending ? (
-                    <ReloadIcon className="size-4 animate-spin" />
-                  ) : (
-                    <PlusIcon aria-hidden="true" className="size-4" />
-                  )}
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start">
-                {enableCopilotHandoff ? (
-                  <DropdownMenuItem
-                    disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
-                    onSelect={() => {
-                      HomeTelemetry.uploadDocumentSelected();
-                      fileInputRef.current?.click();
-                    }}
-                  >
-                    <UploadIcon className="mr-2 size-4" />
-                    Upload document
-                  </DropdownMenuItem>
-                ) : null}
-                <DropdownMenuItem
-                  onSelect={() => {
-                    HomeTelemetry.recordTaskSelected();
-                    recordTaskMutation.mutate();
-                  }}
-                >
-                  <VideoIcon className="mr-2 size-4" />
-                  Record task
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <input
-              ref={fileInputRef}
-              type="file"
-              className="hidden"
-              aria-label="Upload document"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) {
-                  uploadDocumentMutation.mutate(file);
-                }
-                event.target.value = "";
-              }}
-            />
-            <div className="ml-auto flex items-center gap-1">
+            {renderAddMenu("size-8")}
+            {fileInput}
+            <div className="ml-auto flex items-center gap-1.5">
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
@@ -876,16 +1001,17 @@ function PromptBoxImpl(
                 disabled={isSubmitting}
                 onToggle={() => {
                   HomeTelemetry.voiceToggled();
+                  setPromptTouched(true);
                   toggleSpeech();
                 }}
-                className="h-8 w-8 border-0 bg-transparent shadow-none hover:bg-muted"
+                className="h-8 w-8 rounded-full border-0 bg-transparent"
                 iconClassName="h-4 w-4"
               />
               <button
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="flex size-8 items-center justify-center rounded-lg bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
+                className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:opacity-50"
                 onClick={() => {
                   submitPrompt({ prompt, attribution: exampleAttribution });
                 }}
@@ -893,10 +1019,7 @@ function PromptBoxImpl(
                 {isSubmitting ? (
                   <ReloadIcon className="size-4 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    aria-hidden="true"
-                    className="size-4 shrink-0"
-                  />
+                  <ArrowUpIcon aria-hidden="true" className="size-4" />
                 )}
               </button>
             </div>
@@ -914,7 +1037,9 @@ function PromptBoxImpl(
                 label: example.label,
               });
               cancelSpeech();
-              setPrompt(example.prompt);
+              setPrompt(
+                withExampleAttachment(example.prompt, example.attachment),
+              );
               setExampleAttribution({ id: example.id, edited: false });
               setPromptTouched(true);
               textareaRef.current?.focus();

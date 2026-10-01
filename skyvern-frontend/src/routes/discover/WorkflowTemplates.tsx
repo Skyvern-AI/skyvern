@@ -4,6 +4,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import { useGlobalWorkflowsQuery } from "../workflows/hooks/useGlobalWorkflowsQuery";
+import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
+import { convert } from "../workflows/editor/workflowEditorUtils";
+import { TEMPLATE_VIA } from "../workflows/templateGuidance";
 import { WorkflowTemplateCard } from "./WorkflowTemplateCard";
 import { HomeTelemetry } from "@/util/homeTelemetry";
 import { TEMPORARY_TEMPLATE_IMAGES } from "./TemporaryTemplateImages";
@@ -20,9 +23,10 @@ const COLLAPSED_COUNT = 6;
 
 type Filter = TemplateCategory | "all";
 
-function WorkflowTemplates() {
+function WorkflowTemplates({ folderId }: { folderId?: string | null } = {}) {
   const { data: workflowTemplates, isLoading } = useGlobalWorkflowsQuery();
   const studioEnabled = useWorkflowStudioEnabled();
+  const createWorkflow = useCreateWorkflowMutation();
   const [filter, setFilter] = useState<Filter>("all");
   const [expanded, setExpanded] = useState(false);
 
@@ -143,10 +147,33 @@ function WorkflowTemplates() {
               workflow.workflow_permanent_id,
               studioEnabled,
             )}
-            onClick={() => {
+            onClick={(event) => {
+              // The card calls onClick without an event for middle clicks; that must stay a non-plain click.
+              const plainClick =
+                !!event &&
+                event.button === 0 &&
+                !event.metaKey &&
+                !event.ctrlKey &&
+                !event.shiftKey &&
+                !event.altKey;
+              if (plainClick && createWorkflow.isPending) {
+                event.preventDefault();
+                return;
+              }
               HomeTelemetry.templateClicked({
                 workflowPermanentId: workflow.workflow_permanent_id,
                 title: workflow.title,
+              });
+              // Modified and middle clicks keep opening the read-only template.
+              if (!plainClick) return;
+              event.preventDefault();
+              createWorkflow.mutate({
+                ...convert(
+                  { ...workflow, title: `${workflow.title} (copy)` },
+                  { asNewWorkflow: true },
+                ),
+                folder_id: folderId,
+                _via: TEMPLATE_VIA,
               });
             }}
             className={cn("w-64 shrink-0 snap-start md:w-auto", {

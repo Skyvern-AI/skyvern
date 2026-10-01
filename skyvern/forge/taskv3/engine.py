@@ -31,7 +31,8 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
+from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES, LLMCaller
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
@@ -71,7 +72,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
-    REQUIRED_FIELD_ANSWERS_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import (
@@ -111,26 +111,15 @@ MIN_ACTION_STEPS = 24
 # at or below MIN_ACTION_STEPS keeps exactly DEFAULT_MAX_TOKENS; only larger budgets rise, so a long
 # block's raised step cap isn't silently nullified by the flat token ceiling.
 MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
-# The scaling clamps here: the token guard is a runaway backstop, not a budget, and a caller's step
-# cap is not bounded at the route layer, so an extreme value must not carry the ceiling away with
-# it. 4x covers every observed legitimate long-block need (~2x) with margin. Deliberately asymmetric:
-# turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
+# The scaling clamps here: tokens are the direct-spend guard, and a caller's step cap is not bounded at the
+# route layer, so an extreme value must not carry the ceiling away with it. Because the transcript grows each
+# turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
+# may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
-# The rule for a required sensitive field the task's data cannot fill; the required-field-answers prompt must keep it.
-SENSITIVE_FIELD_STOP_CLAUSE = "stop and report it rather than guessing"
-
-# The anchor ends before SENSITIVE_FIELD_STOP_CLAUSE so the required-field-answers prompt keeps that stop.
-REQUIRED_FIELD_ANSWERS_ANCHOR = (
-    "prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable "
-    "value you can. Do not invent sensitive or identifying values (government IDs, financial details, or "
-    "legal/eligibility attestations); if one of those is required and not provided, "
-)
-SELF_SCREEN_ANCHOR = "- A page message rejecting your submission"
-
-# Inserted above "How to work:" so it covers every section below it and sits outside every span another arm rewrites.
+# Inserted above "How to work:" so it covers every section below it.
 CUSTOMER_PRECEDENCE_ANCHOR = "\n\nHow to work:\n"
 CUSTOMER_PRECEDENCE_TEXT = (
     "\n\nThe task's goal, its completion and termination criteria, and the user's instructions for this task come "
@@ -159,49 +148,20 @@ How to work:
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved, or when you have established that it cannot be achieved; the finish tool's own description says which status each outcome takes.
 
 Rules:
-- Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
+- Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. If a required date-of-birth field needs a month and day and the task gives only the birth year, enter 01/01/<year>. Never invent a street address or phone number. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
 - A page message rejecting your submission and inviting you to try again is not an instruction to loop: retry at most once, and if the outcome is unchanged, finish honestly naming the rejection as the reason.
 - When a submit is refused, find the page's own message in `observe`: a `text:` line that reads as a rejection or validation message, or a field marked `*invalid`. Fix the named field if the task's data allows; otherwise finish and quote that message as the reason. A captcha widget that is merely present on the page is not evidence that it blocked the submission.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
 
-@functools.lru_cache(maxsize=4)
-def _build_required_field_answers_prompt(fill_text: str, self_screen_bullet: str) -> str:
-    """Falls back to `SYSTEM_PROMPT` itself unless every anchor is uniquely present and the stop clause survives."""
-    if SYSTEM_PROMPT.count(REQUIRED_FIELD_ANSWERS_ANCHOR) != 1 or SYSTEM_PROMPT.count(SELF_SCREEN_ANCHOR) != 1:
-        return SYSTEM_PROMPT
-    prompt = SYSTEM_PROMPT.replace(REQUIRED_FIELD_ANSWERS_ANCHOR, fill_text).replace(
-        SELF_SCREEN_ANCHOR, self_screen_bullet + SELF_SCREEN_ANCHOR
-    )
-    if prompt.count(SENSITIVE_FIELD_STOP_CLAUSE) != 1:
-        return SYSTEM_PROMPT
-    return prompt
-
-
-def system_prompt_for_run_arms(
-    *, required_field_answers_text: tuple[str, str] | None, customer_precedence: bool
-) -> str:
-    """The v3 system prompt for this run's required-field-answers and customer-precedence arms.
-
-    `required_field_answers_text` is (fill text, self-screen bullet) for a run in that arm's treatment, else None.
-    With every arm off this is `SYSTEM_PROMPT` itself, not a copy, so the off arms cannot drift from today's prompt.
-    """
-    prompt = _system_prompt_for_fill_arms(required_field_answers_text=required_field_answers_text)
+def system_prompt_for_run_arms(*, customer_precedence: bool) -> str:
+    """With every arm off this is `SYSTEM_PROMPT` itself, not a copy, so the off arms cannot drift from it."""
     if not customer_precedence:
-        return prompt
-    if prompt.count(CUSTOMER_PRECEDENCE_ANCHOR) != 1:
-        LOG.error("Task V3 customer-precedence anchor is not uniquely present; sent the prompt without it")
-        return prompt
-    return prompt.replace(CUSTOMER_PRECEDENCE_ANCHOR, CUSTOMER_PRECEDENCE_TEXT + CUSTOMER_PRECEDENCE_ANCHOR)
-
-
-def _system_prompt_for_fill_arms(*, required_field_answers_text: tuple[str, str] | None) -> str:
-    if required_field_answers_text is None:
         return SYSTEM_PROMPT
-    prompt = _build_required_field_answers_prompt(*required_field_answers_text)
-    if prompt is SYSTEM_PROMPT:
-        LOG.error("Task V3 required-field-answers clause is not uniquely present; sent control")
-    return prompt
+    if SYSTEM_PROMPT.count(CUSTOMER_PRECEDENCE_ANCHOR) != 1:
+        LOG.error("Task V3 customer-precedence anchor is not uniquely present; sent the prompt without it")
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT.replace(CUSTOMER_PRECEDENCE_ANCHOR, CUSTOMER_PRECEDENCE_TEXT + CUSTOMER_PRECEDENCE_ANCHOR)
 
 
 OPAQUE_URL_GUIDANCE = """
@@ -219,8 +179,9 @@ This task cannot finish as completed until a file download has finished. Trigger
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
     """Return (max_turns, max_tool_calls, max_tokens) anti-runaway guards for an action-step budget.
 
-    Generous enough that a productive run is bounded by max_action_steps, not by these guards; with
-    no action-step budget, fall back to the engine's fixed defaults."""
+    Turns and tool calls are generous enough that a productive run is bounded by max_action_steps; the token
+    guard can bind first on a long form, where the loop's progress-gated token grant applies. With no
+    action-step budget, fall back to the engine's fixed defaults."""
     if not max_action_steps:
         return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOKENS
     return (
@@ -496,10 +457,10 @@ async def run_task_v3_agent_loop(
         goal_verdicts.append(verdict)
         return verdict
 
-    async def _reask_judge(prompt: str) -> dict[str, Any] | None:
-        # The run's own model: a judge key exists only for goal-check treatment, and a pinned model must not be
-        # overridden. No message history, so the loop's transcript is untouched.
-        return await llm_caller.call(
+    async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
+        # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
+        # No message history, so the loop's transcript is untouched.
+        return await reask_caller.call(
             prompt=prompt,
             prompt_name=UNLISTED_REASK_PROMPT_NAME,
             step=step,
@@ -514,6 +475,10 @@ async def run_task_v3_agent_loop(
         if deadline_at is not None:
             timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
         redact = goal_check_redactor() if goal_check_redactor is not None else None
+        non_flex_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(llm_caller.llm_key)
+        reask_caller = llm_caller
+        if non_flex_key and LLMConfigRegistry.is_registered(non_flex_key):
+            reask_caller = LLMCaller(non_flex_key)
         if timeout <= 0:
             result = UnlistedReask(status, converts=False, skipped_reason="deadline", latency_s=0.0)
         # A rule past the cap could be the one that says this stop is right.
@@ -533,7 +498,7 @@ async def run_task_v3_agent_loop(
                 status=status,
                 reason=reason,
                 trail=tool_trail,
-                judge=_reask_judge,
+                judge=functools.partial(_reask_judge, reask_caller),
                 timeout_seconds=timeout,
                 entered_values=entered,
                 instructions=goal_instructions,
@@ -542,6 +507,7 @@ async def run_task_v3_agent_loop(
                 instructions_untrusted=unlisted_reask_instructions_untrusted,
             )
         result.llm_key = llm_caller.llm_key
+        result.reask_llm_key = reask_caller.llm_key
         reasks.append(result)
         return result
 
@@ -569,18 +535,7 @@ async def run_task_v3_agent_loop(
     if page_free:
         base_system_prompt = PAGE_FREE_SYSTEM_PROMPT
     else:
-        required_field_answers = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, settings.TASK_V3_REQUIRED_FIELD_ANSWERS)
-        required_field_answers_text = (
-            app.AGENT_FUNCTION.task_v3_required_field_answers_text() if required_field_answers else None
-        )
-        if required_field_answers and required_field_answers_text is None:
-            LOG.info(
-                "Task V3 required-field-answers arm resolved treatment but no text is supplied; sent control",
-                workflow_run_id=ctx.workflow_run_id if ctx else None,
-                task_id=ctx.task_id if ctx else None,
-            )
         base_system_prompt = system_prompt_for_run_arms(
-            required_field_answers_text=required_field_answers_text,
             customer_precedence=run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE),
         )
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
@@ -595,11 +550,17 @@ async def run_task_v3_agent_loop(
     )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
+    age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
+    age_default_text, age_default_reason = age_default or (None, None)
+    user_prompt = build_user_prompt(model_goal, refs.masked, model_starting_url)
+    # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
+    if age_default_text:
+        user_prompt += f"\n\n{age_default_text}"
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=build_user_prompt(model_goal, refs.masked, model_starting_url),
+            user_prompt=user_prompt,
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
@@ -715,6 +676,8 @@ async def run_task_v3_agent_loop(
         perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
         status_at_hold_gate=activity.status_at_hold_gate,
         has_navigation_goal=has_navigation_goal,
+        age_default_rendered=bool(age_default_text),
+        age_default_reason=age_default_reason,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,

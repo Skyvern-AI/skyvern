@@ -16,7 +16,6 @@ import {
   ExitFullScreenIcon,
 } from "@radix-ui/react-icons";
 
-import { CopyButton } from "@/components/CopyButton";
 import { PaneErrorBoundary } from "@/components/PaneErrorBoundary";
 import { useLogging } from "@/hooks/useLogging";
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
@@ -38,7 +37,7 @@ import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import {
   CopilotActiveDot,
   CopilotPaneControls,
-  CopilotRecordingStatus,
+  CopilotPaneStatus,
 } from "./CopilotPaneHeader";
 import {
   EditorPaneBlockSearch,
@@ -110,50 +109,8 @@ type PaneReorder = {
   onMove: (direction: -1 | 1) => void;
 };
 
-function RunPaneLabel({
-  label,
-  runId,
-  dragHint,
-}: {
-  label: string;
-  runId: string;
-  dragHint: string;
-}) {
-  return (
-    <span className="group/runlabel inline-flex min-w-0 items-center text-xs font-medium text-foreground">
-      {/* Must not wrap: the header is a fixed h-11 row, so a second line of
-          "Run: wr_…" overflows it and squeezes the control cluster. */}
-      <span
-        className="inline-block min-w-0 truncate group-focus-within/runlabel:hidden group-hover/runlabel:hidden"
-        title={dragHint}
-      >
-        {label}
-      </span>
-      <span
-        className="hidden min-w-0 truncate group-focus-within/runlabel:inline-block group-hover/runlabel:inline-block"
-        title={`Run: ${runId}`}
-      >
-        Run: {runId}
-      </span>
-      <span
-        className={cn(
-          "inline-flex w-0 overflow-hidden opacity-0 transition-all",
-          "group-hover/runlabel:ml-1 group-hover/runlabel:w-5 group-hover/runlabel:opacity-100",
-          "group-focus-within/runlabel:ml-1 group-focus-within/runlabel:w-5 group-focus-within/runlabel:opacity-100",
-        )}
-      >
-        <CopyButton
-          value={runId}
-          className="h-5 w-5 shrink-0 p-0.5 text-muted-foreground hover:text-foreground"
-        />
-      </span>
-    </span>
-  );
-}
-
 export function StudioPane({
   id,
-  runId,
   open,
   order,
   flex,
@@ -171,8 +128,6 @@ export function StudioPane({
   children,
 }: {
   id: StudioPaneId;
-  // The inspected run id, so the run pane's label can read "Run: wr_…".
-  runId?: string | null;
   open: boolean;
   order: number | undefined;
   flex: string | undefined;
@@ -193,10 +148,7 @@ export function StudioPane({
   children: ReactNode;
 }) {
   const { icon: Icon } = STUDIO_PANE_META[id];
-  const label = paneLabel(id, runId);
-  // The run id shows in the visible header label only; the region, header,
-  // drag hint, and close control take the stable accessible name so a run
-  // switch never renames them for screen readers.
+  const label = paneLabel(id);
   const accessibleLabel = paneAccessibleName(id);
   const paneRef = useRef<HTMLElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
@@ -364,20 +316,12 @@ export function StudioPane({
           <Icon className="size-3.5 text-muted-foreground" aria-hidden />
           {iconBadge}
         </span>
-        {id === "overview" && runId ? (
-          <RunPaneLabel
-            label={label}
-            runId={runId}
-            dragHint={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
-          />
-        ) : (
-          <span
-            className="min-w-0 truncate text-xs font-medium text-foreground"
-            title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
-          >
-            {label}
-          </span>
-        )}
+        <span
+          className="min-w-0 truncate text-xs font-medium text-foreground"
+          title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
+        >
+          {label}
+        </span>
         <StudioPaneCompactContext.Provider value={compact}>
           {headerExtras}
           <span className="min-w-0 flex-1" />
@@ -1018,7 +962,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     const index = panes.indexOf(id);
     return {
       id,
-      runId,
       chromeless: embedded,
       open: index >= 0 && visiblePanes.includes(id),
       // Panes take even slots and the dividers between them take odd slots.
@@ -1082,7 +1025,7 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <StudioPane
                 {...paneProps("copilot")}
-                headerExtras={<CopilotRecordingStatus />}
+                headerExtras={<CopilotPaneStatus />}
                 headerActions={<CopilotPaneControls />}
                 iconBadge={<CopilotActiveDot />}
               >

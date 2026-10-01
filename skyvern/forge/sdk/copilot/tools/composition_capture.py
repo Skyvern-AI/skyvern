@@ -107,6 +107,7 @@ from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
+    _evidence_list_len,
     _mark_post_run_page_observed,
 )
 
@@ -1097,6 +1098,7 @@ def store_post_run_page_evidence(
         run_browser_session_id=run_browser_session_id,
         matched=source_browser_session_id == run_browser_session_id,
         granted=stamped.get("observed_after_workflow_run") is True,
+        key_value_relation_count=_evidence_list_len(stamped, "key_value_relations"),
     )
     if current_url and not stamped.get("current_url"):
         stamped["current_url"] = current_url

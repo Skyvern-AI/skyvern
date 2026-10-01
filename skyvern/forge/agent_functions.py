@@ -74,6 +74,10 @@ from skyvern.forge.sdk.services import (
     sftp_service,
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
+from skyvern.forge.sdk.services.request_principal import (
+    BearerIdentityResolution,
+    BearerIdentityStatus,
+)
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
@@ -944,10 +948,26 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+@dataclass(frozen=True)
+class DownloadRecoveryRemap:
+    """Bounded outcome of a download-recovery ``remap``.
+
+    ``locator`` is the retry target on the pinned page, or ``None`` when recovery must not click.
+    ``resolution`` names how the locator was found (``cached_css`` or ``fresh_scrape``) and is set only
+    when ``locator`` is present. ``reason`` is a bounded, non-sensitive rejection code when ``locator``
+    is ``None`` so the single structured log line can distinguish sub-outcomes without leaking URLs,
+    query parameters, or customer data.
+    """
+
+    locator: Locator | None
+    resolution: str | None = None
+    reason: str | None = None
+
+
 class DownloadRecoveryHook(Protocol):
     def matches_failure(self, response: Response) -> bool: ...
 
-    async def remap(self, page: Page) -> Locator | None: ...
+    async def remap(self, page: Page) -> DownloadRecoveryRemap: ...
 
 
 class AgentFunction:
@@ -974,9 +994,9 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
-    # (fill text, self-screen bullet) for the v3 required-field-answers arm's treatment prompt. OSS
-    # supplies none, so a run in that arm's treatment renders the control prompt.
-    def task_v3_required_field_answers_text(self) -> tuple[str, str] | None:
+    # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
+    # the run's payload. OSS supplies no default.
+    def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
@@ -1125,6 +1145,10 @@ class AgentFunction:
         """
         return None
 
+    def get_standard_tier_twin_llm_key(self, llm_key: str | None) -> str | None:
+        """Like get_non_flex_llm_key, but also covers flex routers the manual-run handler swap must leave alone."""
+        return None
+
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
         """Return a provider-fallback router twin for the given LLM key, or None if none exists.
 
@@ -1258,7 +1282,14 @@ class AgentFunction:
         under them; OSS has no runner, so its budget is unknown rather than unlimited."""
         return None
 
-    def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
+    def redact_codeblock_parameter_values(
+        self,
+        value: Any,
+        parameters: dict[str, Any],
+        *,
+        max_disclosure_chars: int | None = None,
+        max_disclosure_nodes: int | None = None,
+    ) -> Any:
         """Cloud overrides this with the runner's canonical parameter scrubber."""
         return value
 
@@ -2944,6 +2975,10 @@ class AgentFunction:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
         return None
 
+    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+        """Return a verified bearer identity or why it could not be resolved."""
+        return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
+
     async def on_workflow_saved(
         self,
         organization_id: str,
@@ -2957,6 +2992,15 @@ class AgentFunction:
         created_via: str | None = None,
     ) -> None:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
+        return
+
+    async def on_workflow_updated_by_user(
+        self,
+        organization_id: str,
+        user_id: str | None,
+        workflow: Workflow,
+    ) -> None:
+        """Fired after the update-agent routes save a new version. Overrides must be best-effort and never raise."""
         return
 
     async def on_workflow_run_completed(

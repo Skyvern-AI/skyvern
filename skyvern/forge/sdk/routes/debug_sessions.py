@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 import typing as t
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -437,7 +438,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     if claimed_prewarm:
         return debug_session
 
-    LOG.info(
+    LOG.debug(
         "Existing debug session found",
         debug_session_id=debug_session.debug_session_id,
         browser_session_id=debug_session.browser_session_id,
@@ -550,7 +551,7 @@ async def new_debug_session(
     )
 
     if completed_debug_sessions and settings.ENV != "local":
-        closeable_browser_sessions: list[PersistentBrowserSession] = []
+        closeable_browser_sessions: list[tuple[PersistentBrowserSession, str]] = []
 
         for debug_session in completed_debug_sessions:
             try:
@@ -562,7 +563,7 @@ async def new_debug_session(
                 browser_session = None
 
             if browser_session and browser_session.completed_at is None:
-                closeable_browser_sessions.append(browser_session)
+                closeable_browser_sessions.append((browser_session, debug_session.debug_session_id))
 
         LOG.info(
             f"Closing browser {len(closeable_browser_sessions)} browser session(s)",
@@ -573,17 +574,21 @@ async def new_debug_session(
 
         def handle_close_browser_session_error(
             browser_session_id: str,
+            debug_session_id: str,
             organization_id: str,
             task: asyncio.Task,
         ) -> None:
             if task.exception():
                 LOG.error(
-                    f"Failed to close session: {task.exception()}",
+                    "Failed to close browser session for debug session",
                     browser_session_id=browser_session_id,
+                    debug_session_id=debug_session_id,
                     organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    error=str(task.exception()),
                 )
 
-        for browser_session in closeable_browser_sessions:
+        for browser_session, debug_session_id in closeable_browser_sessions:
             LOG.info(
                 "Closing existing browser session for debug session",
                 browser_session_id=browser_session.persistent_browser_session_id,
@@ -604,6 +609,7 @@ async def new_debug_session(
                 partial(
                     handle_close_browser_session_error,
                     browser_session.persistent_browser_session_id,
+                    debug_session_id,
                     current_org.organization_id,
                 )
             )
@@ -624,13 +630,29 @@ async def new_debug_session(
     )
     proxy_location = runtime_proxy_location(workflow.proxy_location)
 
-    new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+    browser_start_started_at = time.monotonic()
+    try:
+        new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=current_org.organization_id,
+            timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+            proxy_location=proxy_location,
+            wait_for_startup=settings.ENV != "local",
+            needs_live_view=True,
+            created_by=current_user_id,
+        )
+    except Exception:
+        LOG.exception(
+            "Debug session browser startup failed",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        raise
+    LOG.info(
+        "Debug session browser ready",
         organization_id=current_org.organization_id,
-        timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=proxy_location,
-        wait_for_startup=settings.ENV != "local",
-        needs_live_view=True,
-        created_by=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+        browser_session_id=new_browser_session.persistent_browser_session_id,
+        duration_seconds=time.monotonic() - browser_start_started_at,
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(

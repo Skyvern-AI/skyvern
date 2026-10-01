@@ -46,6 +46,11 @@ class WorkflowBlockEngineRouteReason(StrEnum):
     flag_bucket_treatment = "flag_bucket_treatment"
     flag_bucket_control = "flag_bucket_control"
     new_self_serve_workflow_default = "new_self_serve_workflow_default"
+    # A workflow born at or after TASK_V3_CHOSEN_ENGINE_CUTOFF, never randomized: at least one block
+    # left its engine unset and runs on v3 (``new_workflow_v3_default``), or every block's engine was
+    # chosen and is honored as written (``chosen_engine``).
+    new_workflow_v3_default = "new_workflow_v3_default"
+    chosen_engine = "chosen_engine"
     ineligible = "ineligible"
     disabled = "disabled"
     flag_undefined = "flag_undefined"
@@ -80,6 +85,8 @@ class WorkflowBlockEngineArmDecision:
 
     route_reason: WorkflowBlockEngineRouteReason | None = None
     billing_tier: BillingTier | None = None
+    # An explicit skyvern_v1 on a block is a pin, not a routable default (see Block.resolve_engine).
+    honors_chosen_engine: bool = False
 
 
 NO_ARM_DECISION = WorkflowBlockEngineArmDecision()
@@ -144,15 +151,14 @@ def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-async def _workflow_is_new_for_v3_default(workflow_permanent_id: str | None, organization_id: str | None) -> bool:
-    """Whether this permanent id was born at or after the v3-default cutoff.
+async def _workflow_birth(workflow_permanent_id: str | None, organization_id: str | None) -> datetime | None:
+    """When this permanent id was born, in UTC, or None when that could not be read.
 
-    Never raises and never answers True on a read it could not complete: the rule can only add
-    treatment, so any doubt has to leave the run on the arm the A/B would have given it.
+    Never raises, and None satisfies no cutoff: both cutoff rules take a run out of the A/B, so any
+    doubt has to leave the run on the arm the A/B would have given it.
     """
-    cutoff = settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF
-    if cutoff is None or not workflow_permanent_id or not organization_id:
-        return False
+    if not workflow_permanent_id or not organization_id:
+        return None
     try:
         # The earliest version's timestamp, deleted versions included, is when the permanent id was
         # born. Reading the version this run executes would instead enrol every long-lived workflow
@@ -160,18 +166,30 @@ async def _workflow_is_new_for_v3_default(workflow_permanent_id: str | None, org
         born_at = await app.DATABASE.workflows.get_workflow_permanent_id_created_at(
             workflow_permanent_id, organization_id
         )
-        if born_at is None:
-            return False
-        # Inside the try with the read: a rule that raised here would reach the resolver's catch-all
-        # and send the run to control, which is a different arm than the A/B would have given it.
-        return _as_utc(born_at) >= _as_utc(cutoff)
+        # Inside the try with the read: a conversion that raised here would reach the resolver's
+        # catch-all and send the run to control, a different arm than the A/B would have given it.
+        return None if born_at is None else _as_utc(born_at)
     except Exception:
         LOG.warning(
-            "Failed to read the workflow's birth timestamp for the Task V3 default rule",
+            "Failed to read the workflow's birth timestamp for a Task V3 cutoff rule",
             workflow_permanent_id=workflow_permanent_id,
             exc_info=True,
         )
-        return False
+        return None
+
+
+def _born_at_or_after(born_at: datetime | None, cutoff: datetime | None) -> bool:
+    return born_at is not None and cutoff is not None and born_at >= _as_utc(cutoff)
+
+
+def _is_kept_workflow_run(workflow_status: WorkflowStatus, trigger_type: WorkflowRunTriggerType | None) -> bool:
+    # An auto_generated running version is a per-call workflow the login, download_files, credential
+    # test-login and SDK endpoints mint and run in one request, and enrolling those would move standing
+    # API traffic rather than the workflows a customer keeps; the birth version's status would be the
+    # wrong test, because the prompt box writes version 1 as auto_generated and the editor save that
+    # keeps it writes the next as published. The job-recipe endpoints are per-call too but build a
+    # published definition, so only their trigger kind excludes them.
+    return workflow_status != WorkflowStatus.auto_generated and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
 
 
 async def _ab_flag_puts_run_in_treatment(
@@ -213,6 +231,7 @@ async def resolve_workflow_block_engine_arm(
     workflow_status: WorkflowStatus,
     trigger_type: WorkflowRunTriggerType | None,
     ineligibility_reason: V3AbIneligibleReason | None,
+    takes_default_engine: bool | None,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -227,6 +246,13 @@ async def resolve_workflow_block_engine_arm(
     ``settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF`` takes v3 without the percentage being
     consulted, so those runs are marked ``new_self_serve_workflow_default`` for every per-arm read to
     exclude. No flag gates the rule: ``DISABLE_TASK_V3`` or unsetting the cutoff turns it off.
+
+    A workflow of any tier born at or after ``settings.TASK_V3_CHOSEN_ENGINE_CUTOFF`` skips the A/B
+    and the rule above: every block's chosen engine is honored and an unset one runs on v3.
+    ``takes_default_engine`` (see ``block.takes_default_engine``) says whether any block left its
+    engine unset, or is None when the run has no engine to choose. The rule does not require A/B
+    eligibility, since a pinned block no longer keeps the run's unset blocks on v1, and so covers a
+    script run's uncached blocks and AI fallback.
 
     ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
     the run was launched. Together they are what separates a workflow a customer keeps from the
@@ -247,11 +273,27 @@ async def resolve_workflow_block_engine_arm(
         if context.workflow_block_engine_resolved_run_id == workflow_run_id:
             return
         override: RunEngine | None = None
+        honors_chosen_engine = False
         run_is_eligible = ineligibility_reason is None
         billing_tier: BillingTier | None = None
         route_reason = WorkflowBlockEngineRouteReason.ineligible
+        chosen_engine_candidate = (
+            settings.TASK_V3_CHOSEN_ENGINE_CUTOFF is not None
+            and takes_default_engine is not None
+            and _is_kept_workflow_run(workflow_status, trigger_type)
+        )
+        # Both cutoff rules compare the same birth timestamp, so it is read at most once per run.
+        birth_reads: list[datetime | None] = []
+
+        async def born_at_or_after(cutoff: datetime | None) -> bool:
+            if cutoff is None:
+                return False
+            if not birth_reads:
+                birth_reads.append(await _workflow_birth(workflow_permanent_id, organization_id))
+            return _born_at_or_after(birth_reads[0], cutoff)
+
         try:
-            if run_is_eligible:
+            if run_is_eligible or chosen_engine_candidate:
                 # The kill switch, shared with the dispatch gate via task_v3_disabled so both
                 # evaluations use the same cache key, wins over the experiment and over the
                 # new-workflow default below. A kill flipped mid-run still takes effect at dispatch
@@ -260,27 +302,27 @@ async def resolve_workflow_block_engine_arm(
                 # when someone flips this, and this lock is held throughout, so the kill switch must
                 # not queue behind that call.
                 if await task_v3_disabled(workflow_run_id, organization_id):
-                    route_reason = WorkflowBlockEngineRouteReason.disabled
-                else:
+                    if run_is_eligible:
+                        route_reason = WorkflowBlockEngineRouteReason.disabled
+                elif chosen_engine_candidate and await born_at_or_after(settings.TASK_V3_CHOSEN_ENGINE_CUTOFF):
+                    honors_chosen_engine = True
+                    if takes_default_engine:
+                        override = RunEngine.skyvern_v3
+                        route_reason = WorkflowBlockEngineRouteReason.new_workflow_v3_default
+                    else:
+                        route_reason = WorkflowBlockEngineRouteReason.chosen_engine
+                elif run_is_eligible:
                     # billing_tier rides along so a release condition can hold enterprise and
                     # self-serve at different percentages. Deliberately not passed to
                     # task_v3_disabled: that flag's two callers must build identical provider cache
                     # keys, see its docstring.
                     billing_tier = await _billing_tier_for_arm(organization_id)
                     # The tier, the status and the trigger are checked first, so anything that
-                    # cannot use the rule pays for no workflow read. An auto_generated running
-                    # version is a per-call workflow the login, download_files, credential
-                    # test-login and SDK endpoints mint and run in one request, and enrolling those
-                    # would move standing API traffic rather than the workflows a customer keeps;
-                    # the birth version's status would be the wrong test, because the prompt box
-                    # writes version 1 as auto_generated and the editor save that keeps it writes
-                    # the next as published. The job-recipe endpoints are per-call too but build a
-                    # published definition, so only their trigger kind excludes them.
+                    # cannot use the rule pays for no workflow read.
                     takes_new_workflow_default = (
                         billing_tier == BillingTier.SELF_SERVE
-                        and workflow_status != WorkflowStatus.auto_generated
-                        and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
-                        and await _workflow_is_new_for_v3_default(workflow_permanent_id, organization_id)
+                        and _is_kept_workflow_run(workflow_status, trigger_type)
+                        and await born_at_or_after(settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF)
                     )
                     if takes_new_workflow_default:
                         # A workflow born at or after the cutoff runs its task blocks on v3 by
@@ -312,10 +354,12 @@ async def resolve_workflow_block_engine_arm(
                 exc_info=True,
             )
             override = None
+            honors_chosen_engine = False
             route_reason = WorkflowBlockEngineRouteReason.flag_error
         decision = WorkflowBlockEngineArmDecision(
             route_reason=route_reason,
             billing_tier=billing_tier,
+            honors_chosen_engine=honors_chosen_engine,
         )
         context.workflow_block_engine_override = override
         context.workflow_block_engine_arm_decision = decision
@@ -349,6 +393,43 @@ def workflow_block_engine_override(workflow_run_id: str | None) -> RunEngine | N
     if context is None or context.workflow_block_engine_resolved_run_id != workflow_run_id:
         return None
     return context.workflow_block_engine_override
+
+
+def run_honors_chosen_engine(workflow_run_id: str | None) -> bool:
+    if not workflow_run_id:
+        return False
+    context = skyvern_context.current()
+    if context is None or context.workflow_block_engine_resolved_run_id != workflow_run_id:
+        return False
+    decision = context.workflow_block_engine_arm_decision
+    return decision is not None and decision.honors_chosen_engine
+
+
+async def effective_default_engine(workflow_permanent_id: str, organization_id: str) -> RunEngine | None:
+    """The engine a block with no chosen engine runs on in this workflow, or None when routing decides it.
+
+    Mirrors the resolver's chosen-engine rule for the editor; the per-call exclusions do not apply to
+    a workflow someone opens there.
+    """
+    cutoff = settings.TASK_V3_CHOSEN_ENGINE_CUTOFF
+    if cutoff is None or isinstance(app.EXPERIMENTATION_PROVIDER, NoOpExperimentationProvider):
+        return None
+    if _born_at_or_after(await _workflow_birth(workflow_permanent_id, organization_id), cutoff):
+        return RunEngine.skyvern_v3
+    return None
+
+
+async def unset_engine_routes_as_v1(workflow_permanent_id: str, organization_id: str) -> bool:
+    """Whether an unset block engine and skyvern-1.0 route alike in this workflow.
+
+    False when the workflow's birth cannot be read, although routing then still treats them alike: this errs
+    toward a caller comparing definitions seeing a change, so a cached script is regenerated, not reused stale.
+    """
+    cutoff = settings.TASK_V3_CHOSEN_ENGINE_CUTOFF
+    if cutoff is None or isinstance(app.EXPERIMENTATION_PROVIDER, NoOpExperimentationProvider):
+        return True
+    born_at = await _workflow_birth(workflow_permanent_id, organization_id)
+    return born_at is not None and not _born_at_or_after(born_at, cutoff)
 
 
 def resolved_workflow_block_engine_arm_attribution(workflow_run_id: str | None) -> WorkflowBlockEngineArmAttribution:

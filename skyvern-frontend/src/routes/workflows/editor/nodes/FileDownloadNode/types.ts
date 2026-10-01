@@ -57,7 +57,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   disableCache: false,
-  engine: RunEngine.SkyvernV1,
+  engine: null,
   model: null,
   downloadTimeout: null,
   downloadTarget: "website",

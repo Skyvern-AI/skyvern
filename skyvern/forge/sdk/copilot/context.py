@@ -1300,8 +1300,12 @@ class CopilotContext(AgentContext):
     # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
     # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
     dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
+    # Whether the latest recorded run-tool result created a run row; None until one is recorded.
+    last_test_run_started: bool | None = None
     # The files the last recorded worker run published, keyed by that run's id.
     delivered_output_files: tuple[str, list[DeliveredOutputFile]] | None = None
+    # Producers a dispatched run was seeded with and never ran; their values belong to another run.
+    seeded_only_labels_by_run_id: dict[str, frozenset[str]] = field(default_factory=dict)
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None

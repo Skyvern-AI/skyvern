@@ -556,10 +556,6 @@ class Settings(BaseSettings):
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
-    # Swap in the fill-rule text an AgentFunction supplies (task_v3_required_field_answers_text); with no
-    # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the
-    # flag of the same name, read through run_arm_enabled().
-    TASK_V3_REQUIRED_FIELD_ANSWERS: bool = False
     # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
     # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
     TASK_V3_CUSTOMER_PRECEDENCE: bool = False
@@ -595,6 +591,11 @@ class Settings(BaseSettings):
     # which covers the job recipe endpoints because those build a published definition. Enrolled runs
     # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
+    # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
+    # task block's chosen engine and run a block with no engine on Task V3, outside WORKFLOW_TASK_V3_AB.
+    # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
+    # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
+    TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -1082,7 +1083,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", mode="before")
+    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", "TASK_V3_CHOSEN_ENGINE_CUTOFF", mode="before")
     @classmethod
     def _task_v3_default_engine_workflow_cutoff_off_sentinels(cls, value: Any) -> Any:
         # This setting is the rule's settings-side kill path, and blanking an already-set env var is

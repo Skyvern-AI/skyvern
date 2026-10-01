@@ -88,6 +88,11 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, SignedOutPageObservation
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+    from skyvern.forge.sdk.copilot.repair_origin_run import (
+        OriginOutputRefusal,
+        OriginOutputRefusalDetail,
+        OriginOutputSnapshot,
+    )
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -697,6 +702,12 @@ class AgentContext:
         default=(), repr=False
     )
     repair_origin_is_copilot_run: bool = False
+    # Block outputs the same run recorded, or why they cannot be used; loaded only when a run was named.
+    repair_origin_outputs: OriginOutputSnapshot | OriginOutputRefusal | None = field(default=None, repr=False)
+    repair_origin_outputs_run_id: str | None = None
+    # Set by the planner, consumed and cleared by the run it planned, like frontier_resume_session_id.
+    frontier_origin_reused_labels: list[str] = field(default_factory=list)
+    frontier_origin_output_refusal: OriginOutputRefusalDetail | None = None
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the

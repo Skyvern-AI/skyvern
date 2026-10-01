@@ -240,7 +240,9 @@ class TestWorkflowRoutesThreadUser:
         data = WorkflowRequest(json_definition=_yaml_request())
 
         with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=MagicMock())
+            saved = MagicMock()
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=saved)
+            mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
             await update_workflow(
                 data=data,
                 workflow_id="wpid_1",
@@ -248,6 +250,7 @@ class TestWorkflowRoutesThreadUser:
                 user_id="u_456",
             )
             kwargs = mock_app.WORKFLOW_SERVICE.create_workflow_from_request.await_args.kwargs
+            mock_app.AGENT_FUNCTION.on_workflow_updated_by_user.assert_awaited_once_with("o_123", "u_456", saved)
 
         assert kwargs.get("created_by") == "u_456"
         assert kwargs.get("edited_by") == "u_456"
@@ -288,7 +291,9 @@ class TestWorkflowRoutesThreadUser:
         )
 
         with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=MagicMock())
+            saved = MagicMock()
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=saved)
+            mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
             await update_workflow_legacy(
                 request=raw_request,
                 workflow_id="wpid_1",
@@ -296,6 +301,7 @@ class TestWorkflowRoutesThreadUser:
                 user_id="u_456",
             )
             kwargs = mock_app.WORKFLOW_SERVICE.create_workflow_from_request.await_args.kwargs
+            mock_app.AGENT_FUNCTION.on_workflow_updated_by_user.assert_awaited_once_with("o_123", "u_456", saved)
 
         assert kwargs.get("created_by") == "u_456"
         assert kwargs.get("edited_by") == "u_456"

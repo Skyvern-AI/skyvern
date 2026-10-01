@@ -2,7 +2,7 @@ import { CheckIcon } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
 import type { QuestionInteraction } from "../workflowCopilotTypes";
 import { hasAnswer } from "./questionAnswers";
-import { MAX_KEYED_CHOICES } from "./QuestionTray";
+import { MAX_KEYED_CHOICES } from "./keyedChoice";
 
 const TYPED_BUBBLE =
   "max-w-full self-start whitespace-pre-wrap break-words rounded-[10px] border border-border bg-slate-elevation4 dark:border-white/5 px-2.5 py-1.5 text-[12.5px] leading-[1.45] text-foreground";

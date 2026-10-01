@@ -71,6 +71,7 @@ from skyvern.exceptions import (
     SkyvernHTTPException,
     UnrecognizedWorkflowParameters,
     WorkflowAttemptDispatchSuperseded,
+    WorkflowHasNoBlocks,
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRetryAttemptLookupError,
@@ -122,6 +123,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     engine_arm_log_value,
     resolve_workflow_block_engine_arm,
     resolved_workflow_block_engine_arm_attribution,
+    unset_engine_routes_as_v1,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -166,6 +168,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    _ENGINE_INERT_BLOCK_TYPES,
     BaseTaskBlock,
     Block,
     BlockTypeVar,
@@ -187,6 +190,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     compute_conditional_scopes,
     get_all_blocks,
     resolve_conditional_merge_edges,
+    takes_default_engine,
     v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -217,6 +221,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     is_adaptive_caching,
     resolve_reuse_browser_session,
     should_acquire_reused_session,
+    start_hold_reason,
 )
 from skyvern.forge.sdk.workflow.private_settings import (
     resolve_cdp_connect_headers,
@@ -340,6 +345,7 @@ from skyvern.services.webhook_delivery import (
 from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-exported; several tests import it from this module
     BLOCK_TYPES_THAT_SHOULD_BE_CACHED,
     create_script_version_from_review,
+    engine_only_loop_child_types,
     is_block_type_cacheable,
 )
 from skyvern.utils.contained_effects import contained_effect
@@ -1105,14 +1111,6 @@ def _request_to_start_seconds(workflow_run: WorkflowRun) -> float | None:
     return (workflow_run.started_at.replace(tzinfo=UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
 
 
-def _start_hold(workflow_run: WorkflowRun) -> str:
-    if workflow_run.sequential_key:
-        return "sequential"
-    if workflow_run.depends_on_workflow_run_id:
-        return "dependency"
-    return "none"
-
-
 def _failure_attribution_log_fields(workflow_run: WorkflowRun, status: WorkflowRunStatus) -> dict[str, str | None]:
     if status == WorkflowRunStatus.completed:
         return {"primary_infra_component": None, "primary_failure_category": None, "attribution_evidence_source": None}
@@ -1429,7 +1427,13 @@ class ReusedSessionBelowLifetimeFloor(Exception):
         self.shortfall = shortfall
 
 
-def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
+def workflow_definitions_differ(previous: WorkflowDefinition, current: WorkflowDefinition) -> bool:
+    return _get_workflow_definition_core_data(previous) != _get_workflow_definition_core_data(current)
+
+
+def _get_workflow_definition_core_data(
+    workflow_definition: WorkflowDefinition, *, unset_engine_is_v1: bool = True
+) -> dict[str, Any]:
     """
     This function dumps the workflow definition and removes the irrelevant data to the definition, like created_at and modified_at fields inside:
     - list of blocks
@@ -1478,6 +1482,15 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
             if current_obj.get("block_type") == BlockType.CODE.value:
                 for field in code_block_annotation_fields:
                     current_obj.pop(field, None)
+            # A definition stored before the engine became optional holds skyvern-1.0 where a re-save
+            # of the same blocks leaves it unset. The two route alike on an engine-inert block and
+            # before the chosen-engine cutoff; past it, unset means v3 and skyvern-1.0 is a pin.
+            if (
+                "block_type" in current_obj
+                and current_obj.get("engine") in (None, RunEngine.skyvern_v1.value)
+                and (unset_engine_is_v1 or current_obj["block_type"] in _ENGINE_INERT_BLOCK_TYPES)
+            ):
+                current_obj.pop("engine", None)
 
             # Add all nested dictionaries and lists to queue for processing
             for value in current_obj.values():
@@ -3322,6 +3335,7 @@ class WorkflowService:
         shares_parent_browser: bool = False,
         server_owned_browser_type: str | None = None,
         created_by: str | None = None,
+        reject_empty_workflow: bool = False,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3352,6 +3366,8 @@ class WorkflowService:
             if workflow is None:
                 LOG.warning(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
                 raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
+            if reject_empty_workflow and not workflow.workflow_definition.blocks:
+                raise WorkflowHasNoBlocks(workflow_permanent_id=workflow_permanent_id)
             workflow_id = workflow.workflow_id
             if workflow_request.proxy_location is None and workflow.proxy_location is not None:
                 workflow_request.proxy_location = workflow.proxy_location
@@ -6632,7 +6648,7 @@ class WorkflowService:
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             block_labels=block_labels,
-            block_outputs=block_outputs,
+            block_output_labels=list(block_outputs or ()),
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
 
@@ -7821,6 +7837,7 @@ class WorkflowService:
                 workflow_status=workflow.status,
                 trigger_type=workflow_run.trigger_type,
                 ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
+                takes_default_engine=takes_default_engine(all_blocks),
             )
         else:
             LOG.warning(
@@ -8124,7 +8141,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 block_cnt=len(blocks),
                 block_labels=block_labels,
-                block_outputs=block_outputs,
+                block_output_labels=list(block_outputs or ()),
             )
 
         else:
@@ -8610,11 +8627,14 @@ class WorkflowService:
                 # This fires both when the block requires_agent (first run) and when
                 # cached code failed and agent fallback re-ran the conditional
                 # (fallback_episode_id is set when the script path failed).
+                # A block that routed despite a failed branch evaluation is still
+                # `completed`, but that branch has no result for the reviewer to learn.
                 if (
                     is_script_run
                     and (block_requires_agent or attempt.fallback_episode_id)
                     and workflow_run_block_result.status == BlockStatus.completed
                     and branch_metadata
+                    and not branch_metadata.get("evaluation_error")
                     and is_adaptive_caching(workflow, workflow_run)
                 ):
                     await self._record_conditional_agent_episode(
@@ -8840,8 +8860,10 @@ class WorkflowService:
         # bypassing _execute_single_block. Recursively walk all nesting levels
         # so deeply nested blocks (e.g., file_download inside a double-nested
         # loop) get cached functions generated.
+        # Skip engine-only loops: their script never runs, so queueing an unexecuted branch child regenerates every run.
         if (
             isinstance(block, (ForLoopBlock, WhileLoopBlock))
+            and is_block_type_cacheable(block)
             and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
             and workflow_run_block_result.status in cacheable_statuses
         ):
@@ -8902,6 +8924,7 @@ class WorkflowService:
                 in_cache=block.label in script_blocks_by_label,
                 disable_cache=block.disable_cache,
                 requires_agent=block_requires_agent,
+                engine_only_child_types=sorted(child_type.value for child_type in engine_only_loop_child_types(block)),
             )
 
         fallback_episode_id: str | None = None
@@ -11145,8 +11168,13 @@ class WorkflowService:
         current_definition: dict[str, Any] = {}
         new_definition: dict[str, Any] = {}
         if previous_valid_workflow:
-            current_definition = _get_workflow_definition_core_data(previous_valid_workflow.workflow_definition)
-            new_definition = _get_workflow_definition_core_data(workflow_definition)
+            unset_engine_is_v1 = await unset_engine_routes_as_v1(workflow.workflow_permanent_id, organization_id)
+            current_definition = _get_workflow_definition_core_data(
+                previous_valid_workflow.workflow_definition, unset_engine_is_v1=unset_engine_is_v1
+            )
+            new_definition = _get_workflow_definition_core_data(
+                workflow_definition, unset_engine_is_v1=unset_engine_is_v1
+            )
             has_changes = current_definition != new_definition
 
             # Log definition changes for debugging cache invalidation issues
@@ -12906,7 +12934,12 @@ class WorkflowService:
                     else latest_attempt is not None and is_retry_pending(status, now, latest_attempt)
                 ),
                 organization_id=workflow_run.organization_id,
-                start_hold=_start_hold(workflow_run),
+                debug_session_id=workflow_run.debug_session_id,
+                copilot_session_id=workflow_run.copilot_session_id,
+                start_hold=start_hold_reason(
+                    sequential_key=workflow_run.sequential_key,
+                    depends_on_workflow_run_id=workflow_run.depends_on_workflow_run_id,
+                ),
                 backup_queue=app.AGENT_FUNCTION.is_backup_queue_organization(workflow_run.organization_id),
                 run_with=workflow_run.run_with,
                 ai_fallback=workflow_run.ai_fallback,
@@ -16297,6 +16330,7 @@ class WorkflowService:
         LOG.info(
             "Creating workflow from request",
             organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id or new_workflow_permanent_id,
             title=title,
         )
         if new_workflow_permanent_id:
@@ -16558,7 +16592,7 @@ class WorkflowService:
             if new_workflow_id:
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             raise
-        except Exception as e:
+        except Exception:
             if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
                 await app.DATABASE.browser_recordings.detach_from_workflow_version(
                     recording_id=recording_id_to_attach,
@@ -16567,13 +16601,20 @@ class WorkflowService:
                 )
             if new_workflow_id:
                 LOG.error(
-                    f"Failed to create workflow from request, deleting workflow {new_workflow_id}",
+                    "Failed to create workflow from request, deleting workflow",
                     organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=new_workflow_id,
                 )
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             else:
-                LOG.exception(f"Failed to create workflow from request, title: {title}")
-            raise e
+                LOG.exception(
+                    "Failed to create workflow from request",
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    title=title,
+                )
+            raise
 
     async def _refresh_workflow_schedule_runtime_limits(
         self,

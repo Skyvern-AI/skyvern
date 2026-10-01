@@ -50,6 +50,7 @@ def _trust_snapshot(ctx: AgentContext) -> dict[str, Any]:
         "verified_prefix_block_end_session_id": ctx.verified_prefix_block_end_session_id,
         "verified_prefix_terminal_label": ctx.verified_prefix_terminal_label,
         "frontier_resume_session_id": ctx.frontier_resume_session_id,
+        "repair_origin_outputs_run_id": ctx.repair_origin_outputs_run_id,
         "frontier_start_provenance": ctx.frontier_start_provenance,
         "last_full_workflow_test_ok": ctx.last_full_workflow_test_ok,
         "last_requested_block_labels": list(ctx.last_requested_block_labels or []),

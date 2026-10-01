@@ -8270,7 +8270,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   });
 
   it("keeps Accept withheld until every Turn off for the chat settles, not just the first", async () => {
-    historyResponse.data.auto_accept = true;
     await renderChat();
     await submit("add a step");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -8278,6 +8277,34 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
       streamCalls[0]!.resolve();
     });
+    // Arm auto-accept the way a user does, not by seeding the row: an Always accept goes through
+    // setAutoAcceptFromWrite and bumps the write counter, which a seeded history read never does.
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? Promise.resolve({ data: proposedWorkflowPayload() })
+        : Promise.resolve({}),
+    );
+    historyResponse.data.auto_accept = true;
+    await openAcceptMenu();
+    await act(async () => {
+      clickAlwaysAccept();
+    });
+    expect(
+      await screen.findByRole("button", { name: /Auto-accepting/ }),
+    ).toBeTruthy();
+
+    // The next turn stages for review, so the gate is back while auto-accept is still on.
+    await submit("add another step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(
+        proposalResponse("Second untested draft.", { turn_id: "turn-2" }),
+      );
+      streamCalls[1]!.resolve();
+    });
+    expect(await screen.findByRole("button", { name: "Review" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+
     const heldDisables: Array<(value: unknown) => void> = [];
     cancelPost.mockImplementation((path: string) =>
       path === "/workflow/copilot/disable-auto-accept"
@@ -8316,7 +8343,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   });
 
   it("gives the gate its Accept back when Turn off fails", async () => {
-    historyResponse.data.auto_accept = true;
+    // Armed by a real Always accept, so the write counter is in the state a user would leave it.
     await renderChat();
     await submit("add a step");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -8324,6 +8351,27 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
       streamCalls[0]!.resolve();
     });
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? Promise.resolve({ data: proposedWorkflowPayload() })
+        : Promise.resolve({}),
+    );
+    historyResponse.data.auto_accept = true;
+    await openAcceptMenu();
+    await act(async () => {
+      clickAlwaysAccept();
+    });
+    await submit("add another step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(
+        proposalResponse("Second untested draft.", { turn_id: "turn-2" }),
+      );
+      streamCalls[1]!.resolve();
+    });
+    expect(await screen.findByRole("button", { name: "Review" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
+
     let failTurnOff: (reason: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
       path === "/workflow/copilot/disable-auto-accept"

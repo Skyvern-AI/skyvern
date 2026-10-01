@@ -498,7 +498,7 @@ async def test_failed_click_wrapper_reuses_registered_and_codeblock_redaction_bo
     page_payload["page_title"] = f"Account for {credential_secret}"
     page_payload["forms"][0]["submit_controls"][0]["text"] = f"Continue with {credential_secret} and {parameter_secret}"
 
-    def redact_codeblock_parameters(value: Any, parameters: dict[str, Any]) -> Any:
+    def redact_codeblock_parameters(value: Any, parameters: dict[str, Any], **_budget: object) -> Any:
         assert parameters == {"account": parameter_secret}
         return value.replace(parameter_secret, "[REDACTED_PARAMETER]") if isinstance(value, str) else value
 

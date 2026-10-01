@@ -21,6 +21,7 @@ from skyvern.core.script_generations.transform_workflow_run import (
 )
 from skyvern.forge.sdk.workflow.service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.schemas.workflows import BlockType
+from skyvern.services.workflow_script_service import is_block_type_cacheable
 
 
 class TestForLoopInCacheableBlocks:
@@ -463,6 +464,44 @@ class TestForLoopScriptExecution:
 
         # Should have values = '' (empty string), not None
         assert "values = ''" in code or 'values = ""' in code
+
+    def test_loop_holding_a_conditional_is_not_cacheable(self) -> None:
+        """Loop codegen emits every child in list order, so a cached loop would run both branches."""
+        forloop_block = {
+            "block_type": "for_loop",
+            "label": "loop_1",
+            "loop_variable_reference": "rows",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "cond_1",
+                    "branch_conditions": [
+                        {
+                            "criteria": {"criteria_type": "jinja2_template", "expression": "{{ current_value.ok }}"},
+                            "next_block_label": "branch_a_http",
+                        },
+                        {"is_default": True, "next_block_label": "branch_b_http"},
+                    ],
+                },
+                {
+                    "block_type": "http_request",
+                    "label": "branch_a_http",
+                    "method": "GET",
+                    "url": "https://example.com/a",
+                },
+                {
+                    "block_type": "http_request",
+                    "label": "branch_b_http",
+                    "method": "GET",
+                    "url": "https://example.com/b",
+                },
+            ],
+        }
+
+        loop_code = cst.Module(body=[_build_for_loop_statement("loop_1", forloop_block)]).code
+
+        assert "branch_a_http" in loop_code and "branch_b_http" in loop_code
+        assert is_block_type_cacheable(forloop_block) is False
 
 
 class TestForLoopScriptCompilation:

@@ -53,9 +53,7 @@ vi.mock("./ui/select", () => {
 
 describe("RunEngineSelector", () => {
   test("hides Yutori Navigator by default", () => {
-    render(
-      <RunEngineSelector value={RunEngine.SkyvernV1} onChange={() => {}} />,
-    );
+    render(<RunEngineSelector value={null} onChange={() => {}} />);
 
     expect(screen.queryByText("Yutori Navigator")).toBeNull();
   });
@@ -88,39 +86,60 @@ describe("RunEngineSelector", () => {
     expect(screen.getAllByText("Enterprise").length).toBeGreaterThan(0);
   });
 
-  test("selecting Skyvern 3.0 calls onChange with skyvern-3.0", () => {
+  test("selecting Default or Skyvern 3.0 calls onChange with null or skyvern-3.0", () => {
     const onChange = vi.fn();
     render(
       <RunEngineSelector
-        value={RunEngine.SkyvernV1}
+        value={RunEngine.SkyvernV2}
         onChange={onChange}
         availableEngines={[RunEngine.SkyvernV1, RunEngine.SkyvernV3]}
       />,
     );
 
     fireEvent.click(screen.getByText("Skyvern 3.0"));
+    fireEvent.click(screen.getByText("Default"));
 
-    expect(onChange).toHaveBeenCalledWith(RunEngine.SkyvernV3);
+    expect(onChange.mock.calls).toEqual([[RunEngine.SkyvernV3], [null]]);
   });
 
-  test("falls back to Default (Skyvern 1.0, routable) when value is null", () => {
-    render(<RunEngineSelector value={null} onChange={() => {}} />);
+  test.each([null, RunEngine.SkyvernV3])(
+    "labels Default with no hint when the effective default is %s",
+    (effectiveDefaultEngine) => {
+      const { container } = render(
+        <RunEngineSelector
+          value={null}
+          onChange={() => {}}
+          effectiveDefaultEngine={effectiveDefaultEngine}
+        />,
+      );
 
-    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
-  });
+      const defaultItem = screen
+        .getAllByRole("button")
+        .filter((button) => button.textContent?.includes("Default"));
+      expect(defaultItem.map((button) => button.textContent)).toEqual([
+        "Default",
+        "Default",
+      ]);
+      expect(container.textContent).not.toMatch(/routing|runs on/i);
+    },
+  );
 
-  test("renders Default with no badge for Skyvern 1.0", () => {
-    render(
-      <RunEngineSelector value={RunEngine.SkyvernV1} onChange={() => {}} />,
+  test("offers Skyvern 1.0 as Legacy only where the workflow can pin it", () => {
+    const { unmount } = render(
+      <RunEngineSelector value={null} onChange={() => {}} />,
     );
-
-    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
-    expect(
-      screen.getAllByText(
-        /follows routing; most new self-serve workflows run on 3\.0/,
-      ),
-    ).not.toHaveLength(0);
     expect(screen.queryByText("Skyvern 1.0")).toBeNull();
+    unmount();
+
+    render(
+      <RunEngineSelector
+        value={null}
+        onChange={() => {}}
+        effectiveDefaultEngine={RunEngine.SkyvernV3}
+      />,
+    );
+    expect(screen.getByText("Skyvern 1.0")).toBeTruthy();
+    expect(screen.getByText("Legacy")).toBeTruthy();
   });
 
   test("marks Skyvern 3.0 as Recommended", () => {

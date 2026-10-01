@@ -6,6 +6,7 @@ import { NodeBaseData } from "../types";
 
 export type TerminateNodeData = NodeBaseData & {
   reason: string;
+  errorCode: string;
 };
 
 export type TerminateNode = Node<TerminateNodeData, "terminate">;
@@ -15,6 +16,7 @@ export const terminateNodeDefaultData: TerminateNodeData = {
   editable: true,
   label: "",
   reason: "",
+  errorCode: "",
   continueOnFailure: false,
   model: null,
 } as const;

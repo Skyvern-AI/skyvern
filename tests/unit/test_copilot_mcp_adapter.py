@@ -56,6 +56,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 )
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
+from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
@@ -99,7 +100,7 @@ def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: p
     encoded = quote(secret, safe="")
     seen_parameters: list[dict[str, Any]] = []
 
-    def redact(value: Any, parameters: dict[str, Any]) -> Any:
+    def redact(value: Any, parameters: dict[str, Any], **_budget: object) -> Any:
         seen_parameters.append(parameters)
 
         def walk(node: Any) -> Any:
@@ -160,12 +161,63 @@ def test_a_driver_navigation_code_survives_a_scrubbed_value_that_spells_part_of_
     rescrubbed = mcp_adapter.scrub_model_facing_tool_result(ctx, flattened, tool_name="skyvern_navigate")
     assert rescrubbed["nav_error_code"] == flattened["nav_error_code"]
 
-    # A scrub that fails closed stays empty: a code written into it would turn a failed call into a success.
     register_secret_scrub_value(ctx, "target")
     fail_closed = mcp_adapter.scrub_model_facing_tool_result(
         ctx, {**flattened, "target": {"page": 0}}, tool_name="skyvern_navigate"
     )
-    assert fail_closed == {}
+    assert mcp_adapter.is_redaction_withheld(fail_closed) and fail_closed["ok"] is False
+    assert "nav_error_code" not in fail_closed and "ERR_TUNNEL" not in str(fail_closed)
+
+
+@pytest.mark.parametrize("size_is_registered", [False, True])
+def test_a_withheld_result_keeps_its_disposition_across_rescrubs_and_logs_once(size_is_registered: bool) -> None:
+    ctx = make_copilot_ctx()
+    register_secret_scrub_value(ctx, "data")
+    raw = {"ok": True, "data": {"result": "signed-in page text"}}
+    size = len(json.dumps(raw, ensure_ascii=False))
+    if size_is_registered:
+        register_secret_scrub_value(ctx, str(size))
+    outcome = mcp_adapter._browser_call_outcome_from_mapping(
+        raw_tool_name="skyvern_evaluate", source_browser_session_id=None, raw_result=raw
+    )
+
+    with capture_logs() as logs:
+        first = mcp_adapter.scrub_model_facing_tool_result(ctx, raw, tool_name="skyvern_evaluate")
+        withheld_outcome = outcome.with_raw_result(first)
+        projected = mcp_adapter._project_browser_call_outcome(withheld_outcome, display_tool_name="evaluate")
+        second = mcp_adapter.scrub_model_facing_tool_result(ctx, projected, tool_name="skyvern_evaluate")
+
+    assert first == second and mcp_adapter.is_redaction_withheld(second)
+    assert (withheld_outcome.ok, withheld_outcome.payload_omitted, withheld_outcome.error_kind) == (False, True, "tool")
+    assert "signed-in page text" not in json.dumps([first, projected, second])
+    assert (str(size) in json.dumps(second)) is not size_is_registered
+    assert [log["event"] for log in logs if log["event"] == "copilot_model_facing_result_withheld"] == [
+        "copilot_model_facing_result_withheld"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_stub_browser_session")
+async def test_structured_evidence_reports_a_withheld_read_by_its_reason() -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_withheld_evidence")
+    register_secret_scrub_value(ctx, "data")
+    ctx.discovery_mcp_server = _make_server(
+        ctx,
+        {"ok": True, "data": {"result": json.dumps({"text": "signed-in page text"})}},
+        SchemaOverlay(requires_browser=True),
+        alias_map={"evaluate": "skyvern_evaluate"},
+    )
+    try:
+        evidence, error = await _composition_get_structured_evidence_result(
+            ctx, inspected_url="https://example.test/", current_url="https://example.test/"
+        )
+    finally:
+        clear_session_scrub_values(ctx.browser_session_id)
+
+    assert evidence is None
+    assert error is not None and error.startswith("structured page evidence was withheld: Result withheld")
+    assert "could not be redacted safely" in error and "too large" not in error
+    assert "returned an error" not in error and "signed-in" not in error
 
 
 @pytest.mark.parametrize(
@@ -213,7 +265,7 @@ def test_the_model_facing_scrub_reads_the_run_parameters_before_restoring_a_code
     """A redaction parameter never registered with the exact-value scrubber is still redacted, so the
     restore has to consult it too or it hands back what the parameter pass was hiding."""
 
-    def redact(value: object, parameters: dict[str, object]) -> object:
+    def redact(value: object, parameters: dict[str, object], **_budget: object) -> object:
         secret = str(next(iter(parameters.values())))
 
         def walk(node: object) -> object:
@@ -3076,6 +3128,90 @@ async def test_schedule_tools_always_target_the_chat_workflow(tool_name: str, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("browser_tools_available", [True, False])
+async def test_run_list_is_offered_without_a_workflow_id_and_with_a_status_filter(
+    browser_tools_available: bool,
+) -> None:
+    tools, _ = await _listed_tools(browser_tools_available=browser_tools_available)
+
+    properties = tools["list_workflow_runs"].inputSchema["properties"]
+    assert "workflow_id" not in properties
+    assert "search_key" not in properties
+    assert "error_code" not in properties
+    assert "status" in properties
+    assert "workflow_id" not in tools["list_workflow_runs"].inputSchema.get("required", [])
+
+
+@pytest.mark.asyncio
+async def test_run_list_always_targets_the_chat_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"runs": []}})
+
+    await server.call_tool("list_workflow_runs", {"workflow_id": "wpid_foreign", "status": ["terminated"]})
+
+    assert server._client.calls == [
+        ("skyvern_workflow_run_list", {"workflow_id": "wpid_chat", "status": ["terminated"]}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_list_shows_the_model_only_the_fields_that_pick_a_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    run = {
+        "run_id": "wr_1",
+        "status": "terminated",
+        "created_at": "2026-09-24T19:30:00Z",
+        "trigger_type": "scheduled",
+        "copilot_session_id": None,
+        "run_type": "workflow_run",
+        "failure_reason": "Login rejected for password hunter2-unseen",
+        "output_summary": {"present": True, "scalar_preview": {"api_token": "hunter2-unseen"}},
+        "artifact_summary": {"downloaded_file_names": ["hunter2-unseen.pdf"]},
+        "run_with": "agent",
+    }
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"runs": [run], "count": 1, "has_more": False}})
+
+    result = await server.call_tool("list_workflow_runs", {"status": ["terminated"]})
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["data"]["runs"] == [
+        {"run_id": "wr_1", "status": "terminated", "created_at": "2026-09-24T19:30:00Z", "trigger_type": "scheduled"}
+    ]
+    assert "hunter2-unseen" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args", "data"),
+    [
+        (
+            "list_workflow_runs",
+            {"status": ["terminated"]},
+            {"runs": [{"run_id": "wr_1", "failure_reason": "password hunter2-unseen"}]},
+        ),
+        (
+            "get_workflow_schedule",
+            {"workflow_schedule_id": "wfs_1"},
+            {"workflow_schedule_id": "wfs_1", "parameters": {"password": "hunter2-unseen"}},
+        ),
+    ],
+)
+async def test_a_crashed_stored_value_filter_withholds_the_result(
+    tool_name: str, args: dict[str, Any], data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": data})
+    server._overlays[tool_name] = replace(server._overlays[tool_name], post_hook=_crash)
+
+    result = await server.call_tool(tool_name, args)
+
+    assert result.isError is True
+    text = " ".join(content.text for content in result.content)
+    assert "withheld" in text
+    assert "hunter2-unseen" not in text
+
+
+@pytest.mark.asyncio
 async def test_schedule_create_is_refused_while_the_turn_holds_an_unsaved_proposal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3532,7 +3668,7 @@ class TestPageStateOnBrowserResults:
 
     @skip_no_browser
     @pytest.mark.asyncio
-    async def test_a_result_the_scrub_empties_stays_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_result_the_scrub_withholds_stays_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_scrub_emptied")
         register_secret_scrub_value(ctx, "error")
         try:
@@ -3544,4 +3680,4 @@ class TestPageStateOnBrowserResults:
             clear_session_scrub_values(ctx.browser_session_id)
 
         assert result.isError is True
-        assert result.content == []
+        assert "redaction_withheld" in result.content[0].text and "timed out" not in result.content[0].text

@@ -172,8 +172,37 @@ class TestModelResolver:
                 "2025-04-01-preview",
                 {"model_name": "azure/gpt-5.6-terra"},
             ),
-            ("gpt-5.6-terra", None, None, None, None),
+            ("gpt-5.6-terra", None, None, None, {}),
         ]
+
+    @pytest.mark.parametrize("model_name", ["openai/responses/gpt-6-sol", "azure/responses/gpt-6-sol"])
+    def test_responses_route_effort_passes_litellms_parameter_check(
+        self, monkeypatch: pytest.MonkeyPatch, model_name: str
+    ) -> None:
+        from litellm.utils import get_optional_params
+
+        from skyvern.schemas.llm import LLMConfig
+
+        config = LLMConfig(
+            model_name=model_name,
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            reasoning_effort="medium",
+            pin_reasoning_effort=True,
+        )
+        handler = _install_config(monkeypatch, config, "GPT6_TEST")
+        _, run_config, _, _ = resolve_model_config(handler)
+        assert run_config.model_settings is not None and run_config.model_settings.extra_args is not None
+        extra_args = run_config.model_settings.extra_args
+
+        provider, bare_model = model_name.split("/responses/")
+        get_optional_params(
+            model=bare_model,
+            custom_llm_provider=provider,
+            reasoning_effort=extra_args["reasoning_effort"],
+            allowed_openai_params=extra_args.get("allowed_openai_params"),
+        )
 
     def test_router_config_no_main_group_match_falls_back_to_first_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig

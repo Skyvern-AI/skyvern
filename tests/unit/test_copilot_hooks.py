@@ -915,10 +915,10 @@ class TestMCPToolOverlayCompleteness:
             "disable_workflow_schedule",
             "cancel_workflow_schedule",
             "delete_workflow_schedule",
+            "list_workflow_runs",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
-        assert "skyvern_workflow_run_list" not in alias_map.values()
         assert "query" in tools_module._build_skyvern_mcp_overlays()["list_org_workflows"].hide_params
 
     def test_every_alias_has_overlay(self) -> None:

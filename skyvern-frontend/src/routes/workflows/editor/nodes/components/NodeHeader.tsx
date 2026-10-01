@@ -25,6 +25,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import {
@@ -269,6 +270,7 @@ function NodeHeader({
   type,
 }: Props) {
   const log = useLogging();
+  const postHog = usePostHog();
   const mode = useWorkflowEditorMode();
   const workflowPermanentId = useWorkflowPermanentId();
   const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
@@ -399,6 +401,7 @@ function NodeHeader({
   });
 
   const runBlock = useMutation({
+    mutationKey: ["runBlock"],
     mutationFn: async (opts?: {
       codeGen: boolean;
       parameterOverrides?: Record<string, unknown>;
@@ -547,7 +550,12 @@ function NodeHeader({
         "/run/workflows/blocks",
         body,
       );
-      return { response, mergedParameters };
+      return {
+        response,
+        mergedParameters,
+        organizationId: workflow.organization_id,
+        blockType: type,
+      };
     },
     onSuccess: (result) => {
       if (!result?.response) {
@@ -565,7 +573,13 @@ function NodeHeader({
         return;
       }
 
-      const { response, mergedParameters } = result;
+      const { response, mergedParameters, organizationId, blockType } = result;
+
+      postHog.capture("builder.block.run", {
+        org_id: organizationId,
+        workflow_permanent_id: workflowPermanentId,
+        block_type: blockType,
+      });
 
       if (workflowPermanentId) {
         useDebuggerLastRunValuesStore
@@ -644,6 +658,7 @@ function NodeHeader({
   });
 
   const cancelBlock = useMutation({
+    mutationKey: ["cancelBlock"],
     mutationFn: async () => {
       if (!debugSession) {
         log.error("Cancel block: missing debug session", {

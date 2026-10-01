@@ -1,7 +1,7 @@
 import asyncio
 import copy
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -71,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.page_derived_templates import RootClass, classify_roots
+from skyvern.schemas.workflows import BlockStatus
 from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
 from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
 from skyvern.utils.strings import generate_random_string
@@ -96,6 +97,18 @@ def _normalize_credential_totp_identifier(value: object) -> str | None:
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
+
+BLOCK_OUTCOME_FAILURE_REASON_MAX_CHARS = 2000
+
+
+@dataclass(frozen=True)
+class BlockOutcome:
+    """How a block ended, in one shape for every block type. A block that never ran has no record."""
+
+    status: BlockStatus
+    error_codes: list[str]
+    failure_reason: str | None
+
 
 jinja_sandbox_env = SandboxedEnvironment()
 
@@ -322,6 +335,8 @@ class WorkflowRunContext:
         # workflow definition in two places (SKY-9147).
         self._block_workflow_system_prompts: dict[str, str | None] = {}
         self.blocks_metadata: dict[str, BlockMetadata] = {}
+        # Kept apart from values and blocks_metadata so no template or branch-evaluation snapshot can see it.
+        self.block_outcomes: dict[str, BlockOutcome] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
@@ -502,6 +517,19 @@ class WorkflowRunContext:
         if label is None:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
+
+    def record_block_outcome(
+        self, label: str, status: BlockStatus, error_codes: Sequence[str], failure_reason: str | None
+    ) -> None:
+        if failure_reason is not None:
+            # Mask before cutting: a cut can leave the head of a secret in the stored reason.
+            failure_reason = str(self.mask_secrets_in_data(failure_reason))[:BLOCK_OUTCOME_FAILURE_REASON_MAX_CHARS]
+        self.block_outcomes[label] = BlockOutcome(
+            status=status, error_codes=list(error_codes), failure_reason=failure_reason
+        )
+
+    def get_block_outcome(self, label: str) -> BlockOutcome | None:
+        return self.block_outcomes.get(label)
 
     def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
         """Record the effective ``workflow_system_prompt`` a block resolved to.
