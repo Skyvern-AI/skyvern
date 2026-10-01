@@ -47,7 +47,7 @@ console.log(session.browser_session_id); // pbs_abc123
 |-------|------|-------------|
 | `browser_session_id` | `str` | Unique ID. Starts with `pbs_`. |
 | `status` | `str \| None` | Current session status. |
-| `browser_address` | `str \| None` | CDP address for connecting to the browser. |
+| `browser_address` | `str \| None` | CDP address for connecting to the browser. Must be an `http`, `https`, `ws`, or `wss` URL with a resolvable host that passes network policy. Invalid or blocked addresses return a 422 validation error. |
 | `app_url` | `str \| None` | Link to the live browser view in the Cloud UI. |
 | `timeout` | `int \| None` | Configured timeout in minutes. |
 | `started_at` | `datetime \| None` | When the session became ready. |
