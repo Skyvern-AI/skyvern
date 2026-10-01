@@ -4,8 +4,10 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from time import time as current_time
 from types import SimpleNamespace
+from typing import Annotated
 from unittest.mock import MagicMock
 
+import httpx
 import jwt
 import pytest
 from fastapi import Depends, FastAPI, HTTPException, WebSocket
@@ -27,7 +29,12 @@ from skyvern.forge.sdk.services.org_auth_service import (
     _get_api_key_debug_fields,
     _normalize_api_key_with_flags,
 )
-from skyvern.forge.sdk.services.request_principal import BearerIdentity, get_request_principal
+from skyvern.forge.sdk.services.request_principal import (
+    BearerIdentity,
+    BearerIdentityResolution,
+    BearerIdentityStatus,
+    get_request_principal,
+)
 
 
 def test_authenticated_org_age_is_cached_for_lines_that_only_name_the_org() -> None:
@@ -1115,14 +1122,16 @@ class _StubIdentityProvider(AgentFunction):
     def __init__(self) -> None:
         self.resolved: list[tuple[str, str]] = []
 
-    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentity | None:
+    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
         self.resolved.append((bearer_token, organization_id))
         if bearer_token == "stale-bearer":
             raise HTTPException(status_code=403, detail="Auth token is expired")
         if bearer_token == "broken-bearer":
             raise RuntimeError("identity provider lookup failed")
         identity = {"admin-bearer": _ADMIN, "member-bearer": _MEMBER, "roleless-bearer": _ROLELESS}.get(bearer_token)
-        return BearerIdentity(**identity) if identity else None
+        if identity:
+            return BearerIdentityResolution(BearerIdentity(**identity), BearerIdentityStatus.verified)
+        return BearerIdentityResolution(None, BearerIdentityStatus.organization_mismatch)
 
 
 def _principal_app() -> FastAPI:
@@ -1136,6 +1145,12 @@ def _principal_app() -> FastAPI:
     @fastapi_app.post("/org")
     async def org(_: Organization = Depends(org_auth_service.get_current_org)) -> dict[str, str | None] | None:
         return principal()
+
+    @fastapi_app.post("/stable-response")
+    async def stable_response(
+        _: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    ) -> dict[str, str]:
+        return {"result": "unchanged"}
 
     @fastapi_app.post("/credential")
     async def credential(
@@ -1167,6 +1182,13 @@ def _principal_app() -> FastAPI:
         __: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     ) -> dict[str, str | None] | None:
         return principal()
+
+    @fastapi_app.post("/credential-and-user")
+    async def credential_and_user(
+        current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+        user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+    ) -> dict[str, object]:
+        return {"organization_id": current_org.organization_id, "user_id": user_id, "principal": principal()}
 
     @fastapi_app.post("/anonymous")
     async def anonymous() -> dict[str, str | None] | None:
@@ -1361,6 +1383,154 @@ async def test_two_auth_dependencies_on_one_route_resolve_the_bearer_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bearer_organization_id", "expected_conflict"),
+    [("org-bearer-authority", True), ("org-ui-session", False)],
+    ids=["different-orgs", "same-org"],
+)
+async def test_credential_route_principal_conflict_tracks_organization_or_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_request_log: MagicMock,
+    bearer_organization_id: str,
+    expected_conflict: bool,
+) -> None:
+    headers, _, identity_provider = await _principal_credentials(monkeypatch, "ui_session", "Bearer admin-bearer")
+    bearer_organization = _make_org(bearer_organization_id)
+
+    async def authenticate(_token: str, _attribution_header: str | None = None) -> Organization:
+        return bearer_organization
+
+    async def authenticate_user(_token: str) -> str:
+        return "user_admin"
+
+    monkeypatch.setattr(org_auth_service.app, "authentication_function", authenticate)
+    monkeypatch.setattr(org_auth_service.app, "authenticate_user_function", authenticate_user)
+
+    with TestClient(_principal_app()) as client:
+        response = client.post("/credential-and-user", headers=headers)
+
+    expected_principal = {
+        "organization_id": bearer_organization.organization_id,
+        "auth_kind": "bearer",
+        **_ADMIN,
+    }
+    assert response.status_code == 200
+    assert response.json() == {
+        "organization_id": bearer_organization.organization_id,
+        "user_id": None,
+        "principal": expected_principal,
+    }
+    assert identity_provider.resolved == [("admin-bearer", bearer_organization.organization_id)]
+    log = raw_request_log.info.call_args.kwargs
+    assert log["organization_id"] == bearer_organization.organization_id
+    assert log["user_id"] == "user_admin"
+    assert log["principal_resolution_conflict"] is expected_conflict
+
+
+@pytest.mark.asyncio
+async def test_credential_route_principal_is_stable_when_raw_request_logging_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers, _, identity_provider = await _principal_credentials(monkeypatch, "ui_session", "Bearer admin-bearer")
+    bearer_organization = _make_org("org-ui-session")
+
+    async def authenticate(_token: str, _attribution_header: str | None = None) -> Organization:
+        return bearer_organization
+
+    async def authenticate_user(_token: str) -> str:
+        return "user_admin"
+
+    monkeypatch.setattr(org_auth_service.app, "authentication_function", authenticate)
+    monkeypatch.setattr(org_auth_service.app, "authenticate_user_function", authenticate_user)
+    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", False)
+
+    with TestClient(_principal_app()) as client:
+        response = client.post("/credential-and-user", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "organization_id": bearer_organization.organization_id,
+        "user_id": None,
+        "principal": {
+            "organization_id": bearer_organization.organization_id,
+            "auth_kind": "bearer",
+            **_ADMIN,
+        },
+    }
+    assert identity_provider.resolved == [("admin-bearer", bearer_organization.organization_id)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_principal_resolutions_keep_one_canonical_result(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_request_log: MagicMock,
+) -> None:
+    identity_provider = _StubIdentityProvider()
+    first_lookup_started = asyncio.Event()
+    release_first_lookup = asyncio.Event()
+
+    async def resolve_identity(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+        identity_provider.resolved.append((bearer_token, organization_id))
+        if bearer_token == "admin-bearer":
+            first_lookup_started.set()
+            await release_first_lookup.wait()
+            return BearerIdentityResolution(BearerIdentity(**_ADMIN), BearerIdentityStatus.verified)
+        return BearerIdentityResolution(BearerIdentity(**_MEMBER), BearerIdentityStatus.verified)
+
+    monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", identity_provider)
+    monkeypatch.setattr(identity_provider, "resolve_bearer_identity", resolve_identity)
+    fastapi_app = _principal_app()
+
+    @fastapi_app.post("/concurrent-principals")
+    async def concurrent_principals() -> list[dict[str, object]]:
+        first_task = asyncio.create_task(
+            request_principal.resolve_request_principal("org-a", bearer_token="admin-bearer")
+        )
+        await asyncio.wait_for(first_lookup_started.wait(), timeout=1)
+        second_task = asyncio.create_task(
+            request_principal.resolve_request_principal("org-a", bearer_token="member-bearer")
+        )
+        await asyncio.sleep(0)
+        release_first_lookup.set()
+        first, second = await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1)
+        return [asdict(first), asdict(second)]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
+        response = await client.post("/concurrent-principals")
+
+    expected = {
+        "organization_id": "org-a",
+        "auth_kind": "bearer",
+        **_ADMIN,
+    }
+    assert response.status_code == 200
+    assert response.json() == [expected, expected]
+    assert identity_provider.resolved == [("admin-bearer", "org-a")]
+    assert raw_request_log.info.call_args.kwargs["user_id"] == "user_admin"
+    assert raw_request_log.info.call_args.kwargs["principal_resolution_conflict"] is True
+
+
+@pytest.mark.asyncio
+async def test_fallback_principal_is_recomputed_when_its_resolution_key_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity_provider = _StubIdentityProvider()
+    monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", identity_provider)
+    context_token = request_principal._request_principal.set(None)
+    try:
+        first = await request_principal.resolve_request_principal("org-a", bearer_token="admin-bearer")
+        second = await request_principal.resolve_request_principal("org-b", bearer_token="member-bearer")
+    finally:
+        request_principal._request_principal.reset(context_token)
+
+    assert first.organization_id == "org-a"
+    assert first.user_id == "user_admin"
+    assert second.organization_id == "org-b"
+    assert second.user_id == "user_member"
+    assert identity_provider.resolved == [("admin-bearer", "org-a"), ("member-bearer", "org-b")]
+
+
+@pytest.mark.asyncio
 async def test_caller_context_with_a_bearer_alone_resolves_the_identity_once(
     monkeypatch: pytest.MonkeyPatch,
     raw_request_log: MagicMock,
@@ -1384,9 +1554,9 @@ async def test_a_hanging_identity_lookup_cannot_hold_up_an_authenticated_request
         monkeypatch, "api", "Bearer admin-bearer"
     )
 
-    async def hang(bearer_token: str, organization_id: str) -> BearerIdentity | None:
+    async def hang(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
         await asyncio.Event().wait()
-        return None
+        return BearerIdentityResolution(None, BearerIdentityStatus.lookup_failed)
 
     monkeypatch.setattr(identity_provider, "resolve_bearer_identity", hang)
     monkeypatch.setattr(request_principal, "BEARER_IDENTITY_TIMEOUT_SECONDS", 0.05)
@@ -1396,6 +1566,58 @@ async def test_a_hanging_identity_lookup_cannot_hold_up_an_authenticated_request
 
     assert response.status_code == 200
     assert response.json() == {"organization_id": organization_id, "auth_kind": "api_key", **_NO_USER}
+    assert raw_request_log.info.call_args.kwargs["bearer_identity_status"] == "lookup_timed_out"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("authorization", "identity_provider", "expected_reason"),
+    [
+        (None, "configured", "no_bearer"),
+        ("Bearer stale-bearer", "configured", "invalid_bearer"),
+        ("Bearer bearer-of-another-organization", "configured", "organization_mismatch"),
+        ("Bearer admin-bearer", "unconfigured", "identity_provider_unconfigured"),
+        ("Bearer broken-bearer", "configured", "lookup_failed"),
+    ],
+    ids=["no-bearer", "stale-bearer", "foreign-organization", "no-identity-provider", "lookup-failed"],
+)
+async def test_raw_request_records_why_a_bearer_user_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_request_log: MagicMock,
+    authorization: str | None,
+    identity_provider: str,
+    expected_reason: str,
+) -> None:
+    headers, _, _ = await _principal_credentials(monkeypatch, "api", authorization)
+    if identity_provider == "unconfigured":
+        monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", AgentFunction())
+
+    with TestClient(_principal_app()) as client:
+        response = client.post("/org", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["user_id"] is None
+    assert response.json()["org_role"] is None
+    assert raw_request_log.info.call_args.kwargs["bearer_identity_status"] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_unexpected_identity_lookup_failure_is_logged_without_rejecting_request(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_request_log: MagicMock,
+) -> None:
+    lookup_log = MagicMock()
+    monkeypatch.setattr(request_principal, "LOG", lookup_log, raising=False)
+    headers, organization_id, _ = await _principal_credentials(monkeypatch, "api", "Bearer broken-bearer")
+
+    with TestClient(_principal_app()) as client:
+        response = client.post("/org", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {"organization_id": organization_id, "auth_kind": "api_key", **_NO_USER}
+    assert raw_request_log.info.call_args.kwargs["bearer_identity_status"] == "lookup_failed"
+    lookup_log.warning.assert_called_once()
+    assert lookup_log.warning.call_args.kwargs["exc_info"] is True
 
 
 @pytest.mark.asyncio
