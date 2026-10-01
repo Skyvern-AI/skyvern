@@ -323,10 +323,10 @@ function WorkflowPage() {
             </Button>
           </div>
         </div>
-        <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
         {WorkflowAnalyticsPanel ? (
           <WorkflowAnalyticsPanel workflowPermanentId={workflowPermanentId} />
         ) : null}
+        <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
       </header>
       <div className="space-y-4">
         <header>
