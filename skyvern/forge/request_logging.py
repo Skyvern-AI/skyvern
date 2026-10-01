@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sys
 import time
 import typing
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 import structlog
@@ -92,9 +93,17 @@ class _RequestIdentity:
     organization_name: str | None = None
     org_age: int | None = None
     principal: RequestPrincipal | None = None
+    principal_resolution_key: tuple[str, bytes | None] | None = None
+    principal_resolution_conflict: bool = False
+    bearer_identity_status: str | None = None
+    principal_resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
+
+
+def get_request_principal_state() -> _RequestIdentity | None:
+    return _request_identity.get()
 
 
 def set_request_organization(
@@ -112,6 +121,9 @@ def set_request_organization(
     if identity is None:
         return
     if organization_id:
+        if identity.principal is not None and organization_id != identity.principal.organization_id:
+            identity.principal_resolution_conflict = True
+            return
         identity.organization_id = organization_id
     if organization_name:
         identity.organization_name = organization_name
@@ -119,17 +131,27 @@ def set_request_organization(
         identity.org_age = org_age
 
 
-def set_request_principal(principal: RequestPrincipal) -> None:
+def set_request_principal(
+    principal: RequestPrincipal,
+    resolution_key: tuple[str, bytes | None],
+    bearer_identity_status: str,
+) -> None:
     identity = _request_identity.get()
-    if identity is not None:
+    if identity is None:
+        return
+    if identity.principal is None:
         identity.principal = principal
+        identity.principal_resolution_key = resolution_key
+        identity.bearer_identity_status = bearer_identity_status
+    elif identity.principal_resolution_key != resolution_key:
+        identity.principal_resolution_conflict = True
 
 
-def _identity_log_fields() -> dict[str, str | int | None]:
+def _identity_log_fields() -> dict[str, str | int | bool | None]:
     identity = _request_identity.get()
     if identity is None:
         return {}
-    fields: dict[str, str | int | None] = {}
+    fields: dict[str, str | int | bool | None] = {}
     if identity.organization_id:
         fields["organization_id"] = identity.organization_id
     if identity.organization_name:
@@ -142,6 +164,8 @@ def _identity_log_fields() -> dict[str, str | int | None]:
         fields["user_id"] = identity.principal.user_id
         fields["org_role"] = identity.principal.org_role
         fields["org_role_claim"] = identity.principal.org_role_claim
+        fields["bearer_identity_status"] = identity.bearer_identity_status
+        fields["principal_resolution_conflict"] = identity.principal_resolution_conflict
     return fields
 
 
@@ -317,11 +341,11 @@ def log_raw_request_exception(status_code: int) -> None:
 
 
 async def log_raw_request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    _request_identity.set(_RequestIdentity())
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 
     start_time = time.monotonic()
-    _request_identity.set(_RequestIdentity())
     try:
         body_bytes = await request.body()
     except ClientDisconnect:
