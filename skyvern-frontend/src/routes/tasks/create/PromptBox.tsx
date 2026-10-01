@@ -96,7 +96,7 @@ const exampleCases = [
     hint: "finditparts.com",
     label: "Add a product to cart",
     prompt:
-      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Your goal is COMPLETE when you\'re on the cart page and the specified product is in the cart. Extract all product quantity information from the cart page. Do not attempt to checkout.',
+      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Extract all product quantity information from the cart page. Do not attempt to checkout.',
     icon: <CartIcon className="size-6" />,
   },
   {
