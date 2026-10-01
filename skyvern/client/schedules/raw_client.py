@@ -143,11 +143,11 @@ class RawSchedulesClient:
         self,
         workflow_permanent_id: str,
         *,
+        timezone: str,
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
         run_at: typing.Optional[dt.datetime] = OMIT,
-        timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         name: typing.Optional[str] = OMIT,
@@ -155,19 +155,24 @@ class RawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[WorkflowScheduleResponse]:
         """
+        Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times.
+
         Parameters
         ----------
         workflow_permanent_id : str
 
+        timezone : str
+
         cron_expression : typing.Optional[str]
 
         interval_seconds : typing.Optional[int]
+            Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression.
 
         first_fire_at : typing.Optional[dt.datetime]
+            First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation.
 
         run_at : typing.Optional[dt.datetime]
-
-        timezone : str
+            Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires.
 
         enabled : typing.Optional[bool]
 
@@ -239,6 +244,8 @@ class RawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[WorkflowScheduleResponse]:
         """
+        Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, parameters, enabled state, and next upcoming run times.
+
         Parameters
         ----------
         workflow_permanent_id : str
@@ -289,11 +296,11 @@ class RawSchedulesClient:
         workflow_permanent_id: str,
         workflow_schedule_id: str,
         *,
+        timezone: str,
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
         run_at: typing.Optional[dt.datetime] = OMIT,
-        timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         name: typing.Optional[str] = OMIT,
@@ -301,21 +308,26 @@ class RawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[WorkflowScheduleResponse]:
         """
+        Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. Returns the updated schedule and its next upcoming run times.
+
         Parameters
         ----------
         workflow_permanent_id : str
 
         workflow_schedule_id : str
 
+        timezone : str
+
         cron_expression : typing.Optional[str]
 
         interval_seconds : typing.Optional[int]
+            Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression.
 
         first_fire_at : typing.Optional[dt.datetime]
+            First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation.
 
         run_at : typing.Optional[dt.datetime]
-
-        timezone : str
+            Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires.
 
         enabled : typing.Optional[bool]
 
@@ -546,6 +558,8 @@ class RawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[WorkflowScheduleResponse]:
         """
+        Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule.
+
         Parameters
         ----------
         workflow_permanent_id : str
@@ -714,11 +728,11 @@ class AsyncRawSchedulesClient:
         self,
         workflow_permanent_id: str,
         *,
+        timezone: str,
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
         run_at: typing.Optional[dt.datetime] = OMIT,
-        timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         name: typing.Optional[str] = OMIT,
@@ -726,19 +740,24 @@ class AsyncRawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[WorkflowScheduleResponse]:
         """
+        Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times.
+
         Parameters
         ----------
         workflow_permanent_id : str
 
+        timezone : str
+
         cron_expression : typing.Optional[str]
 
         interval_seconds : typing.Optional[int]
+            Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression.
 
         first_fire_at : typing.Optional[dt.datetime]
+            First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation.
 
         run_at : typing.Optional[dt.datetime]
-
-        timezone : str
+            Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires.
 
         enabled : typing.Optional[bool]
 
@@ -810,6 +829,8 @@ class AsyncRawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[WorkflowScheduleResponse]:
         """
+        Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, parameters, enabled state, and next upcoming run times.
+
         Parameters
         ----------
         workflow_permanent_id : str
@@ -860,11 +881,11 @@ class AsyncRawSchedulesClient:
         workflow_permanent_id: str,
         workflow_schedule_id: str,
         *,
+        timezone: str,
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
         run_at: typing.Optional[dt.datetime] = OMIT,
-        timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         name: typing.Optional[str] = OMIT,
@@ -872,21 +893,26 @@ class AsyncRawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[WorkflowScheduleResponse]:
         """
+        Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. Returns the updated schedule and its next upcoming run times.
+
         Parameters
         ----------
         workflow_permanent_id : str
 
         workflow_schedule_id : str
 
+        timezone : str
+
         cron_expression : typing.Optional[str]
 
         interval_seconds : typing.Optional[int]
+            Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression.
 
         first_fire_at : typing.Optional[dt.datetime]
+            First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation.
 
         run_at : typing.Optional[dt.datetime]
-
-        timezone : str
+            Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires.
 
         enabled : typing.Optional[bool]
 
@@ -1109,7 +1135,6 @@ class AsyncRawSchedulesClient:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-
     async def cancel(
         self,
         workflow_permanent_id: str,
@@ -1118,6 +1143,8 @@ class AsyncRawSchedulesClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[WorkflowScheduleResponse]:
         """
+        Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule.
+
         Parameters
         ----------
         workflow_permanent_id : str

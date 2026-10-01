@@ -17,6 +17,11 @@ describe("Schedules", () => {
                     workflow_permanent_id: "workflow_permanent_id",
                     workflow_title: "workflow_title",
                     cron_expression: "cron_expression",
+                    interval_seconds: 1,
+                    first_fire_at: "2024-01-15T09:30:00Z",
+                    run_at: "2024-01-15T09:30:00Z",
+                    dispatch_status: "pending",
+                    workflow_run_id: "workflow_run_id",
                     timezone: "timezone",
                     enabled: true,
                     parameters: { key: "value" },
@@ -47,6 +52,11 @@ describe("Schedules", () => {
                     workflow_permanent_id: "workflow_permanent_id",
                     workflow_title: "workflow_title",
                     cron_expression: "cron_expression",
+                    interval_seconds: 1,
+                    first_fire_at: "2024-01-15T09:30:00Z",
+                    run_at: "2024-01-15T09:30:00Z",
+                    dispatch_status: "pending",
+                    workflow_run_id: "workflow_run_id",
                     timezone: "timezone",
                     enabled: true,
                     parameters: {
@@ -88,6 +98,11 @@ describe("Schedules", () => {
                     organization_id: "organization_id",
                     workflow_permanent_id: "workflow_permanent_id",
                     cron_expression: "cron_expression",
+                    interval_seconds: 1,
+                    first_fire_at: "2024-01-15T09:30:00Z",
+                    run_at: "2024-01-15T09:30:00Z",
+                    dispatch_status: "pending",
+                    workflow_run_id: "workflow_run_id",
                     timezone: "timezone",
                     enabled: true,
                     parameters: { key: "value" },
@@ -116,6 +131,11 @@ describe("Schedules", () => {
                     organization_id: "organization_id",
                     workflow_permanent_id: "workflow_permanent_id",
                     cron_expression: "cron_expression",
+                    interval_seconds: 1,
+                    first_fire_at: "2024-01-15T09:30:00Z",
+                    run_at: "2024-01-15T09:30:00Z",
+                    dispatch_status: "pending",
+                    workflow_run_id: "workflow_run_id",
                     timezone: "timezone",
                     enabled: true,
                     parameters: {
@@ -153,13 +173,18 @@ describe("Schedules", () => {
     test("create (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { cron_expression: "cron_expression", timezone: "timezone" };
+        const rawRequestBody = { timezone: "timezone" };
         const rawResponseBody = {
             schedule: {
                 workflow_schedule_id: "workflow_schedule_id",
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: { key: "value" },
@@ -182,7 +207,6 @@ describe("Schedules", () => {
             .build();
 
         const response = await client.schedules.create("workflow_permanent_id", {
-            cron_expression: "cron_expression",
             timezone: "timezone",
         });
         expect(response).toEqual({
@@ -191,6 +215,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: {
@@ -210,7 +239,7 @@ describe("Schedules", () => {
     test("create (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { cron_expression: "cron_expression", timezone: "timezone" };
+        const rawRequestBody = { timezone: "timezone" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
@@ -223,7 +252,6 @@ describe("Schedules", () => {
 
         await expect(async () => {
             return await client.schedules.create("workflow_permanent_id", {
-                cron_expression: "cron_expression",
                 timezone: "timezone",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
@@ -239,6 +267,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: { key: "value" },
@@ -266,6 +299,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: {
@@ -303,13 +341,18 @@ describe("Schedules", () => {
     test("update (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { cron_expression: "cron_expression", timezone: "timezone" };
+        const rawRequestBody = { timezone: "timezone" };
         const rawResponseBody = {
             schedule: {
                 workflow_schedule_id: "workflow_schedule_id",
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: { key: "value" },
@@ -332,7 +375,6 @@ describe("Schedules", () => {
             .build();
 
         const response = await client.schedules.update("workflow_permanent_id", "workflow_schedule_id", {
-            cron_expression: "cron_expression",
             timezone: "timezone",
         });
         expect(response).toEqual({
@@ -341,6 +383,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: {
@@ -360,7 +407,7 @@ describe("Schedules", () => {
     test("update (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { cron_expression: "cron_expression", timezone: "timezone" };
+        const rawRequestBody = { timezone: "timezone" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
@@ -373,7 +420,6 @@ describe("Schedules", () => {
 
         await expect(async () => {
             return await client.schedules.update("workflow_permanent_id", "workflow_schedule_id", {
-                cron_expression: "cron_expression",
                 timezone: "timezone",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
@@ -426,6 +472,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: { key: "value" },
@@ -453,6 +504,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: {
@@ -497,6 +553,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: { key: "value" },
@@ -524,6 +585,11 @@ describe("Schedules", () => {
                 organization_id: "organization_id",
                 workflow_permanent_id: "workflow_permanent_id",
                 cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
                 timezone: "timezone",
                 enabled: true,
                 parameters: {
@@ -555,6 +621,87 @@ describe("Schedules", () => {
 
         await expect(async () => {
             return await client.schedules.disable("workflow_permanent_id", "workflow_schedule_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("cancel (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = {
+            schedule: {
+                workflow_schedule_id: "workflow_schedule_id",
+                organization_id: "organization_id",
+                workflow_permanent_id: "workflow_permanent_id",
+                cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
+                timezone: "timezone",
+                enabled: true,
+                parameters: { key: "value" },
+                temporal_schedule_id: "temporal_schedule_id",
+                name: "name",
+                description: "description",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+            next_runs: ["2024-01-15T09:30:00Z"],
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id/cancel")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.schedules.cancel("workflow_permanent_id", "workflow_schedule_id");
+        expect(response).toEqual({
+            schedule: {
+                workflow_schedule_id: "workflow_schedule_id",
+                organization_id: "organization_id",
+                workflow_permanent_id: "workflow_permanent_id",
+                cron_expression: "cron_expression",
+                interval_seconds: 1,
+                first_fire_at: "2024-01-15T09:30:00Z",
+                run_at: "2024-01-15T09:30:00Z",
+                dispatch_status: "pending",
+                workflow_run_id: "workflow_run_id",
+                timezone: "timezone",
+                enabled: true,
+                parameters: {
+                    key: "value",
+                },
+                temporal_schedule_id: "temporal_schedule_id",
+                name: "name",
+                description: "description",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+                deleted_at: "2024-01-15T09:30:00Z",
+            },
+            next_runs: ["2024-01-15T09:30:00Z"],
+        });
+    });
+
+    test("cancel (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id/cancel")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.schedules.cancel("workflow_permanent_id", "workflow_schedule_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 });
