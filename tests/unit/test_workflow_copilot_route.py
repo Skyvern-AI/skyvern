@@ -1021,6 +1021,92 @@ async def test_turning_off_auto_accept_mid_turn_keeps_the_pending_review_and_gat
     assert after_turn.proposed_workflow_metadata.owner_turn_id == "turn-b"
 
 
+@pytest.mark.asyncio
+async def test_turning_auto_accept_on_mid_turn_does_not_apply_the_draft_this_turn_staged_for_review(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mid-turn opt-in only applies to the next turn; this one staged for review."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    monkeypatch.setattr(app, "CACHE", None)
+    canonical = MagicMock()
+    canonical.model_dump.return_value = {"title": "Canonical"}
+    canonical_fingerprint = workflow_content_fingerprint({"title": "Canonical"})
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
+    )
+    organization = SimpleNamespace(organization_id="org-1")
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    chat_id = chat.workflow_copilot_chat_id
+    await repo.publish_workflow_copilot_candidate(
+        "org-1",
+        chat_id,
+        proposal={"title": "Pending review", "_copilot_yaml": "title: Pending review\n"},
+        owner_turn_id="turn-a",
+        canonical_fingerprint=canonical_fingerprint,
+        canonical_title="Pending review",
+        disposition="review_untested",
+        expected_owner_turn_id=None,
+        expected_revision=None,
+    )
+    # The turn starts with auto-accept off, which is what it told the model.
+    turn_start_chat = await repo.get_workflow_copilot_chat_by_id(
+        organization_id="org-1", workflow_copilot_chat_id=chat_id
+    )
+    assert turn_start_chat is not None and turn_start_chat.auto_accept is not True
+
+    # Mid-turn the user clicks Always accept on the gate the previous turn left on screen.
+    await repo.update_workflow_copilot_chat("org-1", chat_id, auto_accept=True)
+
+    await repo.publish_workflow_copilot_candidate(
+        "org-1",
+        chat_id,
+        proposal={"title": "Verified fix", "_copilot_yaml": "title: Verified fix\n"},
+        owner_turn_id="turn-b",
+        canonical_fingerprint=canonical_fingerprint,
+        canonical_title="Verified fix",
+        disposition="auto_applicable",
+        expected_owner_turn_id="turn-a",
+        expected_revision=1,
+    )
+    updated_workflow = MagicMock(title="Verified fix")
+    updated_workflow.model_dump.return_value = {"title": "Verified fix"}
+    agent_result = AgentResult(
+        user_response="Fixed it.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        proposal_owner_turn_id="turn-b",
+        proposal_revision=1,
+        narrative_payload=_narrative_payload(),
+    )
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=turn_start_chat,
+        organization_id="org-1",
+        original_workflow=SimpleNamespace(workflow_id="wf-canonical"),
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    frame = stream.send.await_args.args[0]
+    assert isinstance(frame, WorkflowCopilotStreamResponseUpdate)
+    assert frame.updated_workflow is not None
+    assert frame.workflow_applied is False
+    after_turn = await workflow_copilot_chat_history(
+        credential_recovery_token=None, workflow_copilot_chat_id=chat_id, organization=organization
+    )
+    # The opt-in stands for the next turn; it just did not reach back into this one.
+    assert after_turn.auto_accept is True
+    assert after_turn.proposed_workflow_metadata is not None
+    assert after_turn.proposed_workflow_metadata.owner_turn_id == "turn-b"
+
+
 def test_chat_history_serves_a_saved_envelope_back_untouched() -> None:
     now = datetime.now(UTC)
     payload = {
