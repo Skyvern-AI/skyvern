@@ -121,9 +121,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.frontier_provenance_dump import frontier_dump_root, trust_snapshot, write_packet
-from skyvern.forge.sdk.copilot.narration import _TERMINAL_BLOCK_STATUSES, NarratorState
-from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
-from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
+from skyvern.forge.sdk.copilot.narration import _TERMINAL_BLOCK_STATUSES, NarratorState, narrator_poll_tick
 from skyvern.forge.sdk.copilot.nav_attribution import (
     block_nav_error_codes,
     driver_nav_code_positions,
@@ -4082,11 +4080,8 @@ async def _run_blocks_and_collect_debug(
         stagnation_enabled = not _any_quiet_block_requested(ctx, labels_that_may_execute, workflow=runtime_workflow)
         budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
 
-        # Mid-tool narrator bridge: feed block-status changes and step-level
-        # heartbeats into NarratorState so the narration ticker keeps emitting
-        # while a long workflow run is in flight.
-        narrator_state: NarratorState | None = getattr(ctx, "narrator_state", None)
-        narrator_enabled = narrator_state is not None and narration_handler_available()
+        narrator_state: NarratorState | None = ctx.narrator_state
+        progress_enabled = narrator_state is not None and ctx.stream is not None
         seen_block_states: dict[str, str] = {}
         prior_block_ts: datetime | None = initial_block_ts
         last_block_fetch_monotonic = 0.0
@@ -4096,8 +4091,8 @@ async def _run_blocks_and_collect_debug(
 
                 run, step_ts, block_ts = await _read_progress_sources(ctx, workflow_run.workflow_run_id)
 
-                if narrator_enabled:
-                    assert narrator_state is not None  # narrator_enabled implies non-None
+                if progress_enabled:
+                    assert narrator_state is not None
                     tick_result = await narrator_poll_tick(
                         narrator_state,
                         current_block_ts=block_ts,

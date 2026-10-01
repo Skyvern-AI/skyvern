@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import time
@@ -31,7 +32,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.config import AuthoringCapability, BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, USER_FACING_REASON_SCHEMA, CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import (
     await_pending_credential_pause,
     credential_pause_transport_ready,
@@ -2177,6 +2178,23 @@ def _with_page_state(tool: FunctionTool) -> FunctionTool:
     return dataclasses.replace(tool, on_invoke_tool=invoke_with_page_state)
 
 
+def _with_action_reason(tool: FunctionTool) -> FunctionTool:
+    schema = copy.deepcopy(tool.params_json_schema)
+    schema.setdefault("properties", {})[USER_FACING_REASON_PARAM] = dict(USER_FACING_REASON_SCHEMA)
+
+    async def invoke(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
+        try:
+            ordinary = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return await tool.on_invoke_tool(ctx, arguments)
+        if isinstance(ordinary, dict):
+            ordinary.pop(USER_FACING_REASON_PARAM, None)
+            arguments = json.dumps(ordinary)
+        return await tool.on_invoke_tool(ctx, arguments)
+
+    return dataclasses.replace(tool, params_json_schema=schema, strict_json_schema=False, on_invoke_tool=invoke)
+
+
 def copilot_native_tools(
     *,
     supports_question_tool: bool,
@@ -2196,5 +2214,5 @@ def copilot_native_tools(
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
         elif tool.name in _PAGE_STATE_TOOL_NAMES:
             tool = _with_page_state(tool)
-        tools.append(tool)
+        tools.append(_with_action_reason(tool))
     return tools

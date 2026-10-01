@@ -105,6 +105,7 @@ from skyvern.forge.sdk.db.exceptions import (
     DuplicateCopilotTurnError,
     NotFoundError,
 )
+from skyvern.forge.sdk.forge_log import _generated_log_value
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -198,14 +199,18 @@ def _workflow_copilot_ingress_log_fields(message: str) -> dict[str, int]:
 
 
 @contextmanager
-def bind_copilot_session_id(chat_id: str | None) -> Iterator[None]:
+def _bind_copilot_session_id(chat_id: str | WorkflowCopilotChat | None) -> Iterator[None]:
     # In-place mutation (not scoped()) preserves request-scoped fields the FastAPI middleware wrote.
     ctx = skyvern_context.current()
     if ctx is None or chat_id is None:
         yield
         return
     prev = ctx.copilot_session_id
-    ctx.copilot_session_id = chat_id
+    ctx.copilot_session_id = (
+        _generated_log_value("copilot_session_id", chat_id.workflow_copilot_chat_id)
+        if isinstance(chat_id, WorkflowCopilotChat)
+        else chat_id
+    )
     try:
         yield
     finally:
@@ -2777,7 +2782,7 @@ async def _new_copilot_chat_post(
                     artifacts=artifacts,
                 )
 
-            with bind_copilot_session_id(chat.workflow_copilot_chat_id):
+            with _bind_copilot_session_id(chat):
                 agent_result = await run_copilot_agent(
                     stream=stream,
                     organization_id=organization.organization_id,

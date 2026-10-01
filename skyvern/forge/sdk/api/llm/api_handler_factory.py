@@ -8,6 +8,7 @@ import time
 import warnings
 from asyncio import CancelledError
 from json import JSONDecodeError
+from types import MappingProxyType
 from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
 
 import litellm
@@ -35,7 +36,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_h
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_direct_copilot_model_usage,
+    _emit_direct_copilot_model_usage,
 )
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
@@ -69,6 +70,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
+from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value, is_generated_log_field
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -845,7 +847,7 @@ def _emit_copilot_model_usage_for_response(
 ) -> None:
     try:
         provider_name = _response_provider(response)
-        emit_direct_copilot_model_usage(
+        _emit_direct_copilot_model_usage(
             _copilot_model_usage_event(
                 response,
                 request_model=request_model,
@@ -1065,7 +1067,7 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
     chain = [llm_config.main_model_group, *fallback_groups]
     fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
 
-    return litellm.Router(
+    router = litellm.Router(
         model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
         redis_host=llm_config.redis_host,
         redis_port=llm_config.redis_port,
@@ -1087,6 +1089,16 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
         set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
         enable_pre_call_checks=True,
     )
+    # LiteLLM's Deployment validation removes str subclasses. Keep source identities
+    # on the router that owns these deployments, including across cached-config changes.
+    router._skyvern_model_group_provenance = MappingProxyType(
+        {
+            str(model.model_name): model.model_name
+            for model in llm_config.model_list
+            if is_generated_log_field("model_name", model.model_name)
+        }
+    )
+    return router
 
 
 # Cache routers by llm_key so concurrent LLMCaller instances (v3 builds one per run) share a single
@@ -1199,7 +1211,11 @@ class LLMAPIHandlerFactory:
     def _served_model_group(router: Any, response: Any) -> str | None:
         """Resolve the litellm deployment group that served a router response, or None
         when unavailable (direct litellm.acompletion paths, test doubles)."""
-        return getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+        group = getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+        provenance = getattr(router, "_skyvern_model_group_provenance", None)
+        if isinstance(group, str) and isinstance(provenance, MappingProxyType):
+            return provenance.get(group, group)
+        return group
 
     @staticmethod
     def _deployment_service_tier(deployment: Any) -> str | None:
@@ -2535,28 +2551,32 @@ class LLMAPIHandlerFactory:
                     LLM_CALL_DURATION_MESSAGE,
                     reasoning_effort=_effective_reasoning_effort(parameters),
                     llm_key=llm_key,
-                    model=model_used,
+                    model=_model_log_value("model", model_used),
                     # `model_used` is the router group, identical for the flex and fallback legs;
                     # without the served deployment the split between them is invisible.
-                    served_model_group=served_model_group,
+                    served_model_group=_model_log_value("served_model_group", served_model_group),
                     **llm_fallback_log_fields(llm_config, llm_served_fallback_outcome(llm_config, served_model_group)),
                     service_tier_source=service_tier_source,
                     prompt_name=prompt_name,
-                    duration_seconds=duration_seconds,
-                    llm_duration_seconds=llm_duration_seconds,
+                    duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                    llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
                     workflow_run_id=context.workflow_run_id if context else None,
                     task_id=context.task_id if context else None,
-                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    llm_cost=llm_cost if llm_cost > 0 else None,
-                    image_count=image_count if image_count > 0 else None,
-                    image_tokens=image_tokens if image_tokens > 0 else None,
-                    image_cost=image_cost if image_cost > 0 else None,
+                    input_tokens=_generated_log_value("input_tokens", prompt_tokens if prompt_tokens > 0 else None),
+                    output_tokens=_generated_log_value(
+                        "output_tokens", completion_tokens if completion_tokens > 0 else None
+                    ),
+                    reasoning_tokens=_generated_log_value(
+                        "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
+                    ),
+                    cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
+                    image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                    image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                    image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
@@ -3183,22 +3203,26 @@ class LLMAPIHandlerFactory:
                     reasoning_effort=_effective_reasoning_effort(active_parameters),
                     llm_key=llm_key,
                     prompt_name=prompt_name,
-                    model=llm_config.model_name,
-                    duration_seconds=duration_seconds,
-                    llm_duration_seconds=llm_duration_seconds,
+                    model=_model_log_value("model", llm_config.model_name),
+                    duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                    llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
                     workflow_run_id=context.workflow_run_id if context else None,
                     task_id=context.task_id if context else None,
-                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    llm_cost=llm_cost if llm_cost > 0 else None,
-                    image_count=image_count if image_count > 0 else None,
-                    image_tokens=image_tokens if image_tokens > 0 else None,
-                    image_cost=image_cost if image_cost > 0 else None,
+                    input_tokens=_generated_log_value("input_tokens", prompt_tokens if prompt_tokens > 0 else None),
+                    output_tokens=_generated_log_value(
+                        "output_tokens", completion_tokens if completion_tokens > 0 else None
+                    ),
+                    reasoning_tokens=_generated_log_value(
+                        "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
+                    ),
+                    cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
+                    image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                    image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                    image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
@@ -4001,30 +4025,30 @@ class LLMCaller:
                 reasoning_effort=_effective_reasoning_effort(active_parameters),
                 llm_key=self.llm_key,
                 prompt_name=prompt_name,
-                model=self.llm_config.model_name,
-                duration_seconds=duration_seconds,
-                llm_duration_seconds=llm_duration_seconds,
+                model=_model_log_value("model", self.llm_config.model_name),
+                duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
-                reasoning_tokens=call_stats.reasoning_tokens
-                if call_stats and call_stats.reasoning_tokens is not None
-                else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
-                image_count=image_count if image_count > 0 else None,
-                image_tokens=image_tokens if image_tokens > 0 else None,
-                image_cost=image_cost if image_cost > 0 else None,
+                input_tokens=_generated_log_value("input_tokens", call_stats.input_tokens if call_stats else None),
+                output_tokens=_generated_log_value("output_tokens", call_stats.output_tokens if call_stats else None),
+                reasoning_tokens=_generated_log_value(
+                    "reasoning_tokens", call_stats.reasoning_tokens if call_stats else None
+                ),
+                cached_tokens=_generated_log_value("cached_tokens", call_stats.cached_tokens if call_stats else None),
+                llm_cost=_generated_log_value("llm_cost", call_stats.llm_cost if call_stats else None),
+                image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
                 # `model` above is the router group, identical for the flex and standard legs;
                 # without the served deployment the split between them is invisible.
-                served_model_group=served_model_group,
+                served_model_group=_model_log_value("served_model_group", served_model_group),
                 **llm_fallback_log_fields(
                     self.llm_config, llm_served_fallback_outcome(self.llm_config, served_model_group)
                 ),

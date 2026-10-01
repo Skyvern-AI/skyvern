@@ -56,7 +56,6 @@ from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTI
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
-from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
 )
@@ -2130,12 +2129,4 @@ async def run_with_enforcement(
             current_input = (
                 extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )
-        # Signal the narrator that the agent is re-entering the loop after an
-        # enforcement correction. stream_to_sse creates the state on the first
-        # pass; on later passes we poke the transition latch directly so the
-        # next narration (produced after the next tool round-trip) can describe
-        # the course-correction.
-        narrator_state = getattr(ctx, "narrator_state", None)
-        if narrator_state is not None:
-            narrator_state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
         iteration += 1

@@ -202,7 +202,6 @@ from skyvern.forge.taskv3.run_arms import (
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
     HUMANIZED_INPUT_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -2316,13 +2315,6 @@ class ForgeAgent:
             # Once for the whole run, before anything reads it: the tool list is built from these reads,
             # and a value that could change afterwards would leave it describing a different run than the
             # one executing.
-            await resolve_run_arm(
-                context,
-                TYPE_COORDINATE_CLICK_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_TYPE_COORDINATE_CLICK,
-            )
             await resolve_run_arm(
                 context,
                 DATE_SEGMENT_AIM_FLAG,

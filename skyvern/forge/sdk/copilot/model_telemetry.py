@@ -40,7 +40,7 @@ from openai.types.responses.response_function_call_output_item_list_param import
 
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_copilot_model_usage,
+    _emit_copilot_model_usage,
     normalize_gen_ai_provider,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import (
@@ -233,7 +233,7 @@ def _log_model_call_usage(
         if telemetry.served_provider
         else _otel_provider_name(billing_model, base_url)
     )
-    emit_copilot_model_usage(
+    _emit_copilot_model_usage(
         CopilotModelUsageEvent(
             request_model=model,
             response_model=telemetry.response_model,
@@ -254,7 +254,7 @@ def _log_model_call_usage(
 
 
 @contextlib.contextmanager
-def model_call_telemetry_scope(
+def _model_call_telemetry_scope(
     model_call_index: int,
     *,
     model: str | None = None,
@@ -506,7 +506,7 @@ class CopilotLitellmModel(LitellmModel):
         prompt: Any | None = None,
     ) -> ModelResponse:
         attach_tool_surface_to_pending_capture(tools)
-        with model_call_telemetry_scope(
+        with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
@@ -538,7 +538,7 @@ class CopilotLitellmModel(LitellmModel):
         prompt: Any | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         attach_tool_surface_to_pending_capture(tools)
-        with model_call_telemetry_scope(
+        with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,

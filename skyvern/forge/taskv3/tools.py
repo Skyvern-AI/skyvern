@@ -85,7 +85,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
@@ -5917,8 +5916,8 @@ _COLLATERAL_VALUES_JS = (
 )
 
 
-# How type put the caret in a field: a checked click, focus() alone, or an unchecked press at its centre.
-_Reach = Literal["click", "focus", "point"]
+# How type put the caret in a field: a checked click, or focus() alone.
+_Reach = Literal["click", "focus"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
@@ -14026,38 +14025,6 @@ def build_browser_tools(
             return True
         return False
 
-    async def _click_at_box_centre(page: Any, selector: str) -> bool:
-        # No actionability or hit-target check: the press lands on whatever paints at the field's centre,
-        # which for a sub-pixel input is the display layer the probe has just ruled its own skin. Some
-        # segment widgets move their section cursor only on a trusted pointer event, so focus() alone
-        # leaves the keys rendering in the display while the input stays empty.
-        top = _current_page()
-        try:
-            # bounding_box() is relative to the main viewport even for an element inside a frame.
-            box = await page.locator(selector).first.bounding_box(timeout=2000)
-            width, height = await top.evaluate("() => [innerWidth, innerHeight]")
-            if not box:
-                return False
-            x = box["x"] + box["width"] / 2
-            y = box["y"] + box["height"] / 2
-            if not (0 <= x < width and 0 <= y < height):
-                return False
-            realm = page if _acted_realm else None
-            while realm is not None and realm.parent_frame is not None:
-                # A frame clips its content, so a point outside its element lands on the parent page.
-                frame_box = await (await realm.frame_element()).bounding_box()
-                if not frame_box or not (
-                    frame_box["x"] <= x < frame_box["x"] + frame_box["width"]
-                    and frame_box["y"] <= y < frame_box["y"] + frame_box["height"]
-                ):
-                    return False
-                realm = realm.parent_frame
-            await page.evaluate("() => { window.__tv3_doc = 1; }")
-            await input_dispatch.click_at(top, x, y)
-        except Exception:
-            return False
-        return True
-
     async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> _Reach:
         # focus() needs no hit target, so it stands in for a click refused only by the viewport check.
         # A widget that hands the caret to another segment would take the keys there, so a caret that
@@ -14068,32 +14035,14 @@ def build_browser_tools(
         # not tell a fill from a query; with no click to reach its rows, keep the error.
         if await _declares_a_list(page, selector):
             raise exc
-        reach: _Reach = "focus"
-        if run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, settings.TASK_V3_TYPE_COORDINATE_CLICK) and (
-            await _click_at_box_centre(page, selector)
-        ):
-            reach = "point"
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=1000)
-            except Exception:
-                pass
-            try:
-                same_document = bool(await page.evaluate("() => window.__tv3_doc === 1"))
-            except Exception:
-                same_document = False
-            if not same_document:
-                # The press followed a link: the selector may match something on the destination.
-                raise exc
         try:
-            # Still focused explicitly: the press need not move the caret, and the display it landed on
-            # may have no handler that forwards focus to the input.
             await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
             held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
             held = None
         if held is not True:
             raise exc
-        return reach
+        return "focus"
 
     async def _focus_for_typing(
         page: Any, selector: str, *, focus_fallback: bool = False
@@ -16500,34 +16449,55 @@ def build_browser_tools(
             # suggestion, which this path never clicks, so its raw text is no fill either. The poll's
             # wait also lets a widget that clears a rejected entry on a timer do so before the read.
             reacted = await _await_suggestion_rows(page, selector, text, rounds=8, any_region=True) is not None
-            if not reacted and reach == "point":
-                # Look for a slow list BEFORE leaving the field: Tab closes it. Tab is what commits a
-                # segment widget's assembled value, so the read-back comes after it.
+            if not reacted:
+                # Look for a slow list BEFORE leaving the field: Tab closes it. A segment widget commits
+                # its assembled value only on blur, so a read-back taken before the Tab reads it empty.
                 await asyncio.sleep(0.3)
                 reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
-                if not reacted:
-                    try:
-                        await input_dispatch.press(_current_page(), None, "Tab")
-                    except Exception:
-                        pass
-                    held = await _read_field_value(page, selector)
-                    landed = _typed_text_landed(held, text)
-                    LOG.info(
-                        "taskv3 type coordinate click fallback", landed=landed, page_changed=bool(held) and not landed
+            if not reacted:
+                try:
+                    planted = await page.evaluate("() => { window.__tv3_doc = 1; return true; }") is True
+                except Exception:
+                    planted = False
+                try:
+                    await input_dispatch.press(_current_page(), None, "Tab")
+                    await page.wait_for_load_state("domcontentloaded", timeout=1000)
+                except Exception:
+                    pass
+                try:
+                    same_document = planted and bool(await page.evaluate("() => window.__tv3_doc === 1"))
+                except Exception:
+                    same_document = False
+                if not same_document:
+                    # Leaving the field submitted or navigated, or the check could not run: the selector may
+                    # match something else now, so nothing is read back.
+                    return ToolResult.error(
+                        f"typed into {selector}, then the page navigated, or could not be checked, when focus "
+                        "left the field -- the field may not hold the text. Re-observe before doing anything else.",
+                        data={"navigated": True, "page_state_changed": True},
                     )
-                    if landed:
-                        return ToolResult.ok(f"typed into {selector}")
-                    if held:
-                        # No restore: Tab already committed the page's value to the widget, and fill() fires no
-                        # blur, so taking the input back would leave the input and the widget disagreeing.
-                        return await _value_changed_by_page_error(page, selector, text, held, echo=not text_is_secret)
-            elif not reacted and _typed_text_landed(await _read_field_value(page, selector), text):
-                # The read-back costs a pause anyway, so spend it looking once more: a list slower than
-                # the poll would otherwise read as "no list" while its uncommitted query sits in the
-                # field. Slower than this is a bounded residual, not something a longer wait fixes.
-                await asyncio.sleep(0.3)
-                if await _find_suggestion_rows(page, selector, text, any_region=True) is None:
+                held = await _read_field_value(page, selector)
+                landed = _typed_text_landed(held, text)
+                siblings_moved = len(collateral)
+                LOG.info(
+                    "taskv3 type focus fallback",
+                    landed=landed,
+                    page_changed=bool(held) and not landed,
+                    siblings_moved=siblings_moved,
+                )
+                if landed and siblings_moved:
+                    # The keys reached the target, so the siblings are not ours to take back -- but a
+                    # segment that took the first key of the next one's value must not pass as filled.
+                    return ToolResult.ok(
+                        f"typed into {selector}; {siblings_moved} other field(s) in the same group changed "
+                        "while it was typed -- re-observe them before relying on them"
+                    )
+                if landed:
                     return ToolResult.ok(f"typed into {selector}")
+                if held:
+                    # No restore: Tab already committed the page's value to the widget, and fill() fires no
+                    # blur, so taking the input back would leave the input and the widget disagreeing.
+                    return await _value_changed_by_page_error(page, selector, text, held, echo=not text_is_secret)
             # Collateral is ours only when the keystrokes demonstrably went nowhere near the target, and
             # there are two ways that shows: the target still holds what it held before, or it is empty
             # because this call cleared it and nothing landed after. A target holding anything ELSE took
@@ -16556,9 +16526,8 @@ def build_browser_tools(
                 )
             return ToolResult.error(
                 f"typed into {selector}, but it does not hold the typed text afterwards — the field is NOT "
-                "filled and may hold part of it. It sits outside the viewport and could only be "
-                + ("clicked at its position" if reach == "point" else "focused, not clicked")
-                + "; re-observe and fill it through the control the page shows instead",
+                "filled and may hold part of it. It sits outside the viewport and could only be focused, not "
+                "clicked; re-observe and fill it through the control the page shows instead",
                 data={"release_own_list": True},
             )
         if pick.suggestion is None and pick.candidates:

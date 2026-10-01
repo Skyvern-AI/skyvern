@@ -24,7 +24,7 @@ from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     authoring_capability_from_policy,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, USER_FACING_REASON_SCHEMA, CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
@@ -2311,7 +2311,7 @@ def _block_schema_banned_types_note(
 def _build_skyvern_mcp_overlays(
     capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
 ) -> dict[str, SchemaOverlay]:
-    return {
+    overlays = {
         "get_workflow_knowledge": SchemaOverlay(
             description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
             description_suffix=_block_schema_banned_types_note(capability),
@@ -2620,3 +2620,12 @@ def _build_skyvern_mcp_overlays(
             "remove that schedule, then list schedules to confirm it is gone."
         ),
     }
+
+    for name in get_skyvern_mcp_alias_map():
+        overlays.setdefault(name, SchemaOverlay())
+    for overlay in overlays.values():
+        overlay.copilot_params = {
+            **overlay.copilot_params,
+            USER_FACING_REASON_PARAM: dict(USER_FACING_REASON_SCHEMA),
+        }
+    return overlays

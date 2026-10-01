@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias
 
+from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value
+
 UsageScalar: TypeAlias = str | int | float
 CacheMode: TypeAlias = Literal["implicit", "explicit"]
 
@@ -118,12 +120,18 @@ class CopilotModelUsageEvent:
         return fields
 
 
-def emit_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> None:
-    logger.info("Copilot model usage", **event.log_fields())
+def _emit_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> None:
+    fields = event.log_fields()
+    for key, value in fields.items():
+        if key in {"gen_ai.request.model", "gen_ai.response.model"} and isinstance(value, str):
+            fields[key] = _model_log_value(key, value)
+        elif key != "copilot.prompt_name":
+            fields[key] = _generated_log_value(key, value)
+    logger.info("Copilot model usage", **fields)
 
 
-def emit_direct_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> bool:
+def _emit_direct_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> bool:
     if not is_workflow_copilot_prompt_name(event.prompt_name):
         return False
-    emit_copilot_model_usage(event, logger=logger)
+    _emit_copilot_model_usage(event, logger=logger)
     return True

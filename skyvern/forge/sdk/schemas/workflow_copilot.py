@@ -19,7 +19,7 @@ from pydantic import (
 
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
@@ -721,6 +721,8 @@ class WorkflowCopilotStreamErrorUpdate(BaseModel):
 
 
 class WorkflowCopilotToolCallUpdate(BaseModel):
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
@@ -739,6 +741,9 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
+    activity_started_at: datetime | None = None
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )

@@ -1079,14 +1079,13 @@ async def _update_workflow_block(
             failure_reason=failure_reason,
             output=final_output,
             ai_fallback_triggered=ai_fallback_triggered,
-            error_codes=error_codes,
         )
 
         # The row carries the block label even when the caller passed none (a cached wait block).
         if updated_block.label:
             try:
                 app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id).record_block_outcome(
-                    updated_block.label, status, updated_block.error_codes or [], failure_reason
+                    updated_block.label, status, error_codes or [], failure_reason
                 )
             except Exception:
                 LOG.warning(
