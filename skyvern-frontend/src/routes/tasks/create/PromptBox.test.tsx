@@ -440,7 +440,7 @@ describe("PromptBox", () => {
 
     fireEvent.change(textarea, { target: { value: "Keep my agent prompt" } });
     act(() =>
-      ref.current?.focusAndPrefillExample("contact_us_forms", "finditparts"),
+      ref.current?.focusAndPrefillExample("add_employee", "finditparts"),
     );
     expect((textarea as HTMLTextAreaElement).value).toBe(
       "Keep my agent prompt",
@@ -732,7 +732,7 @@ describe("PromptBox", () => {
     const textarea = promptInput() as HTMLTextAreaElement;
     const cases = [
       ["finditparts", "finditparts.com"],
-      ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
+      ["add_employee", "opensource-demo.orangehrmlive.com"],
       ["extractIntegrationsFromGong", "Gong integrations page"],
       ["AAPLStockPrice", "google finance"],
     ] as const;

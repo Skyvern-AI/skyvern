@@ -443,7 +443,13 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   timestamp: string;
 }
 
+export type ActivityBucket =
+  | { kind: "design" }
+  | { kind: "block"; workflow_run_block_id: string };
+
 export interface WorkflowCopilotToolCallUpdate {
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
   type: "tool_call";
   tool_name: string;
   display_label?: string | null;
@@ -464,6 +470,9 @@ export interface CodeWriteDiff {
 }
 
 export interface WorkflowCopilotToolResultUpdate {
+  activity_started_at?: string | null;
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
   type: "tool_result";
   tool_name: string;
   display_label?: string | null;

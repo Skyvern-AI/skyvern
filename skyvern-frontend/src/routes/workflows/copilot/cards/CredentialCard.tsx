@@ -45,6 +45,7 @@ import {
   type AttentionTrayPresentation,
 } from "./AttentionTray";
 import { TURN_ROW_INSET } from "./cardLayout";
+import { useDemoLoginGuide } from "@/hooks/useDemoLoginGuide";
 
 // Union of both a request-policy-time classifier's real reason tokens and a
 // mid-build run-failure reason that isn't emitted by any shipped backend
@@ -764,6 +765,10 @@ function CredentialAskCard({
     countdownActive,
   );
   const disabled = countdownActive && expired;
+  useDemoLoginGuide(
+    frame.login_page_urls?.[0],
+    !resolvedOutcome && mode !== "auto-bound" && !disabled,
+  );
 
   const credentialGetter = useCredentialGetter();
   const [orgCredentials, setOrgCredentials] = useState<OrgCredentialList>({
@@ -1048,6 +1053,7 @@ function CredentialAskCard({
             size="sm"
             disabled={disabled}
             onClick={() => onConnect(undefined)}
+            data-tour="credential-connect"
           >
             Connect credential
           </Button>

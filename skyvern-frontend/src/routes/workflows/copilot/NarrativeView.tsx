@@ -309,6 +309,22 @@ function AttemptsBadge({ attempts }: { attempts?: number }) {
 }
 
 function ActivityRow({ entry }: { entry: ActivityEntry }) {
+  return (
+    <div data-tool-call-id={toolCallIdOf(entry)}>
+      {entry.reason === undefined ? null : (
+        <p
+          data-testid="copilot-reason"
+          className="mb-1 whitespace-pre-wrap text-[12px] leading-[1.5]"
+        >
+          {entry.reason}
+        </p>
+      )}
+      <ActivityActionRow entry={entry} />
+    </div>
+  );
+}
+
+function ActivityActionRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
       <FSubRow
@@ -1654,9 +1670,12 @@ function FActivityLogRow({
   // the string stays in flow, transparent, so the line never grows and later evidence stays put.
   const reasonNode =
     row.reason === null ? null : (
-      <p
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
         data-testid="copilot-reason"
-        className="mb-px mt-2 break-words text-[13px] leading-[1.55] text-foreground [overflow-wrap:anywhere] dark:text-slate-200"
+        className={`mb-px mt-2 break-words text-left text-[13px] leading-[1.55] text-foreground [overflow-wrap:anywhere] dark:text-slate-200 ${open || row.kind === null ? "" : "line-clamp-2"}`}
       >
         {row.reason.slice(0, reasonShown)}
         <span
@@ -1668,7 +1687,7 @@ function FActivityLogRow({
         <span className="text-transparent">
           {row.reason.slice(reasonShown)}
         </span>
-      </p>
+      </button>
     );
 
   // A block its run call ran reads as one card in that call's place, and the
@@ -1964,7 +1983,12 @@ function FActivityLogRow({
   const body = <>{segments}</>;
 
   return (
-    <div className="flex flex-col">
+    <div
+      className="flex flex-col"
+      data-tool-call-id={
+        row.entries.length === 1 ? toolCallIdOf(row.entries[0]!) : undefined
+      }
+    >
       {reasonNode}
       {hasDetail ? (
         <button

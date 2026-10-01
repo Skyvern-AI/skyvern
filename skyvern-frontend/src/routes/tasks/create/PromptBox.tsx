@@ -100,10 +100,10 @@ const exampleCases = [
     icon: <CartIcon className="size-6" />,
   },
   {
-    key: "contact_us_forms",
-    hint: "canadahvac.com",
-    label: "Fill a contact us form",
-    prompt: `Go to https://canadahvac.com/contact-hvac-canada. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. Here's the user information: {"name":"John Doe","email":"john.doe@gmail.com","phone":"123-456-7890","message":"Hello, I have a question about your services."}`,
+    key: "add_employee",
+    hint: "orangehrmlive.com",
+    label: "Log into an HR portal and add an employee",
+    prompt: `Make a workflow that logs into OrangeHRM at https://opensource-demo.orangehrmlive.com/web/index.php/auth/login using my saved OrangeHRM credential. Then go to PIM, click Add, and add a new employee with first name {{first_name}} and last name {{last_name}}. Keep the auto-filled Employee Id and leave "Create Login Details" off.`,
     icon: <EnvelopeClosedIcon className="size-6" />,
   },
   {
@@ -901,12 +901,9 @@ function PromptBoxImpl(
           ) : null}
         </div>
         <section className="mt-9 w-full max-w-[60rem] md:mt-16">
-          <div className="mb-3 flex flex-col gap-1 md:mb-3.5 md:flex-row md:items-baseline md:justify-between">
-            <h2 className="text-sm font-semibold">Try an example</h2>
-            <p className="text-[13px] text-muted-foreground">
-              Pick one to load it into the prompt, edit it, then run.
-            </p>
-          </div>
+          <h2 className="mb-3 text-sm font-semibold md:mb-3.5">
+            Try an example
+          </h2>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 sm:gap-3 lg:grid-cols-3">
             {exampleCases.map((example) => (
               <ExampleCasePill

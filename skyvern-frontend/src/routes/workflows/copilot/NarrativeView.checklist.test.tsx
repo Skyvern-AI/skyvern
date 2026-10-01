@@ -583,15 +583,15 @@ describe("NarrativeView — activity log", () => {
     ]);
   });
 
-  it("a narration about its step reads above it and stays when the step folds", () => {
+  it("unowned legacy narration stays standalone when the neighboring step folds", () => {
     render(<NarrativeView turn={narratedBrowseTurn(0)} />);
 
-    expect(document.querySelectorAll("[data-activity-row-id]")).toHaveLength(1);
+    expect(document.querySelectorAll("[data-activity-row-id]")).toHaveLength(2);
     const reason = screen.getByTestId("copilot-reason");
     expect(reason.textContent).toContain(REASON);
     expect(
       reason.compareDocumentPosition(stepLines()[0]!) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
+        Node.DOCUMENT_POSITION_PRECEDING,
     ).toBeTruthy();
 
     fireEvent.click(stepLines()[0]!);
