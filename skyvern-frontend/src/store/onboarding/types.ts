@@ -181,6 +181,7 @@ export type QuestionnaireStateV1 = {
 
 export type OnboardingState = {
   tour_completed_at: string | null;
+  studio_tour_completed_at: string | null;
   modal_dismissed_at: string | null;
   first_save_at: string | null;
   first_run_at: string | null;

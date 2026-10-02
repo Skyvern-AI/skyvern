@@ -97,6 +97,7 @@ function codeBlock(goalNeedsRegeneration: boolean | null): AppNode {
       dataSchema: "null",
       userOwnedGoal: true,
       goalNeedsRegeneration,
+      codeEditedByHand: null,
       model: null,
     },
   } as AppNode;
@@ -128,6 +129,39 @@ describe("getWorkflowErrors", () => {
     } as AppNode;
 
     expect(getWorkflowErrors([apiAuthored])).toEqual([]);
+  });
+
+  test("a hand code edit holds no save and survives load, save and export", () => {
+    const stored = {
+      block_type: "code",
+      label: "read_total",
+      code: "return {'total': 1}",
+      parameters: [],
+      error_code_mapping: null,
+      prompt: "Read the total",
+      user_owned_goal: true,
+      code_edited_by_hand: true,
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([stored], SETTINGS, true);
+    const source = {
+      title: "Source",
+      description: null,
+      is_saved_task: false,
+      status: null,
+      run_with: "agent",
+      workflow_definition: { parameters: [], blocks: [stored] },
+    } as unknown as WorkflowApiResponse;
+
+    expect(getWorkflowErrors(nodes)).toEqual([]);
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      code_edited_by_hand: true,
+    });
+    expect(convert(source).workflow_definition.blocks[0]).toMatchObject({
+      code_edited_by_hand: true,
+    });
   });
 
   test("saves once the code has been rebuilt from the Goal", () => {

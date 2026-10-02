@@ -29,6 +29,12 @@ type Props = {
 
 const engineOptions: Array<EngineOption & { value: RunEngine }> = [
   {
+    value: RunEngine.SkyvernV3,
+    label: "Skyvern 3.0",
+    badge: "Recommended",
+    badgeVariant: "success",
+  },
+  {
     value: RunEngine.SkyvernV1,
     label: "Skyvern 1.0",
     badge: "Legacy",
@@ -39,12 +45,6 @@ const engineOptions: Array<EngineOption & { value: RunEngine }> = [
     label: "Skyvern 2.0",
     badge: "Legacy",
     badgeVariant: "default",
-  },
-  {
-    value: RunEngine.SkyvernV3,
-    label: "Skyvern 3.0",
-    badge: "Recommended",
-    badgeVariant: "success",
   },
   {
     value: RunEngine.OpenaiCua,

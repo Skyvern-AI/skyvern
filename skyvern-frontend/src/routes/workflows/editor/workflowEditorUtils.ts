@@ -91,7 +91,11 @@ import {
   codeBlockNodeDefaultData,
   type CodeBlockNodeData,
 } from "./nodes/CodeBlockNode/types";
-import type { PendingGoalChange } from "@/store/useCopilotActionStore";
+import type {
+  CodeEditedBlock,
+  GoalSuggestion,
+  PendingGoalChange,
+} from "@/store/useCopilotActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -1047,6 +1051,7 @@ function convertToNode(
                 : JSON.stringify(block.data_schema, null, 2),
           userOwnedGoal: block.user_owned_goal ?? null,
           goalNeedsRegeneration: block.goal_needs_regeneration ?? null,
+          codeEditedByHand: block.code_edited_by_hand ?? null,
         },
       };
     }
@@ -3463,6 +3468,7 @@ function getWorkflowBlock(
         data_schema: JSONSafeOrStringAllowArrays(node.data.dataSchema),
         user_owned_goal: node.data.userOwnedGoal,
         goal_needs_regeneration: node.data.goalNeedsRegeneration,
+        code_edited_by_hand: node.data.codeEditedByHand,
       };
     }
     case "dataExport": {
@@ -5018,6 +5024,7 @@ function convertBlocksToBlockYAML(
           data_schema: block.data_schema,
           user_owned_goal: block.user_owned_goal,
           goal_needs_regeneration: block.goal_needs_regeneration,
+          code_edited_by_hand: block.code_edited_by_hand,
         };
         return blockYaml;
       }
@@ -5356,6 +5363,7 @@ function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
         previousGoal: node.data.goalBeforeEdit
           ? (node.data.goalBeforeEdit.prompt ?? "")
           : null,
+        ...(node.data.codeEditedByHand === true && { codeEditedByHand: true }),
       });
     }
   }
@@ -5369,6 +5377,82 @@ function goalChangeUndoPatch(
     return null;
   }
   return { ...data.goalBeforeEdit, goalBeforeEdit: null };
+}
+
+// The person's new Goal describes the code they edited by hand, so neither needs to change.
+function keepCodeWithGoalPatch(
+  data: CodeBlockNodeData,
+): Partial<CodeBlockNodeData> | null {
+  if (!goalChangeIsPending(data) || data.codeEditedByHand !== true) {
+    return null;
+  }
+  return {
+    goalNeedsRegeneration: false,
+    codeEditedByHand: false,
+    goalBeforeEdit: null,
+  };
+}
+
+function codeEditedNoticeIsShown(data: CodeBlockNodeData): boolean {
+  return data.codeEditedByHand === true && !goalChangeIsPending(data);
+}
+
+// A suggestion is offered only for the exact code and Goal it was written from.
+function freshGoalSuggestion(
+  data: CodeBlockNodeData,
+  suggestion: GoalSuggestion | undefined,
+): string | null {
+  if (
+    !suggestion ||
+    !codeEditedNoticeIsShown(data) ||
+    suggestion.forCode !== data.code ||
+    suggestion.forGoal !== (data.prompt ?? "")
+  ) {
+    return null;
+  }
+  return suggestion.goal;
+}
+
+function codeEditedBlocksOf(
+  nodes: Array<AppNode>,
+  suggestions: Record<string, GoalSuggestion>,
+): Array<CodeEditedBlock> {
+  const blocks: Array<CodeEditedBlock> = [];
+  for (const node of nodes) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      node.data.editable &&
+      codeEditedNoticeIsShown(node.data)
+    ) {
+      blocks.push({
+        label: node.data.label,
+        goal: node.data.prompt ?? "",
+        suggestedGoal: freshGoalSuggestion(
+          node.data,
+          suggestions[node.data.label],
+        ),
+      });
+    }
+  }
+  return blocks;
+}
+
+function acceptGoalSuggestionPatch(
+  data: CodeBlockNodeData,
+  suggestion: GoalSuggestion | undefined,
+): Partial<CodeBlockNodeData> | null {
+  const goal = freshGoalSuggestion(data, suggestion);
+  if (goal === null) {
+    return null;
+  }
+  return {
+    prompt: goal,
+    userOwnedGoal: true,
+    goalNeedsRegeneration: false,
+    codeEditedByHand: false,
+    goalBeforeEdit: null,
+  };
 }
 
 // The undo record is editor-only, so a graph rebuilt from saved form drops it; keep it on a block
@@ -5901,6 +5985,11 @@ export {
   getWorkflowBlocks,
   goalChangeIsPending,
   goalChangeUndoPatch,
+  keepCodeWithGoalPatch,
+  codeEditedNoticeIsShown,
+  freshGoalSuggestion,
+  codeEditedBlocksOf,
+  acceptGoalSuggestionPatch,
   blockRunErrors,
   withGoalUndoRecordsFrom,
   pendingGoalChangesOf,

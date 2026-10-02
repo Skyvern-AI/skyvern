@@ -19,11 +19,11 @@ function getIntentExampleKey(
 ): ExamplePromptKey {
   switch (intent) {
     case "fill_forms":
-      return "contact_us_forms";
+      return "add_employee";
     case "job_applications":
       return "job_application";
     case "extract_data":
-      return "extractIntegrationsFromGong";
+      return "extractIntegrationsFromSkyvern";
     case "monitor_website":
       return "AAPLStockPrice";
     default:

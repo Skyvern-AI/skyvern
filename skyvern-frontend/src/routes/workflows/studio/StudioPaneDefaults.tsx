@@ -139,7 +139,6 @@ export function StudioPaneDefaultsProvider({
         setState(latestRef.current);
       }
       const firstRun = useStudioFirstRunStore.getState();
-      if (!firstRun.coachMarkSeen) firstRun.markCoachMarkSeen();
       const width = stageElRef.current?.clientWidth ?? 0;
       if (
         width > 0 &&

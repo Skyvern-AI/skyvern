@@ -77,6 +77,7 @@ import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath, workflowRunDetailPath } from "./studioNavigation";
 import { TableSearchInput } from "@/components/TableSearchInput";
+import { WORKFLOW_RUN_SEARCH_FIELDS_HINT } from "@/util/runSearch";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
@@ -378,7 +379,8 @@ function WorkflowPage() {
                     params.set("page", "1");
                     setSearchParams(params, { replace: true });
                   }}
-                  placeholder="Search runs by input..."
+                  placeholder="Search by run ID, input, credential..."
+                  title={WORKFLOW_RUN_SEARCH_FIELDS_HINT}
                   className="w-48 lg:w-72"
                 />
                 {taggingEnabled ? (

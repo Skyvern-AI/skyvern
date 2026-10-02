@@ -14,6 +14,7 @@ import {
   type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { compactLocalDateTime } from "@/util/timeFormat";
 
 import { RunSummaryStrip } from "./RunSummaryStrip";
 
@@ -62,16 +63,21 @@ describe("RunSummaryStrip duration", () => {
   test("shows a single elapsed chip for a finalized run", () => {
     renderStrip(makeRun());
     expect(durationChip("Ran for 5m 0s")).toBeTruthy();
+    expect(
+      screen.getByText(
+        `Created ${compactLocalDateTime("2026-06-30T23:59:00Z")}`,
+      ),
+    ).toBeTruthy();
     expect(screen.queryByText(/^Started /)).toBeNull();
     expect(screen.queryByText(/^Finished /)).toBeNull();
   });
 
-  test("hovering/focusing the chip breaks down all four run times", async () => {
+  test("the duration tooltip adds queue/start/finish without repeating Created", async () => {
     renderStrip(makeRun());
     fireEvent.focus(durationChip("Ran for 5m 0s"));
     const tooltip = await screen.findByRole("tooltip");
     const breakdown = within(tooltip);
-    expect(breakdown.getByText(/Created /)).toBeTruthy();
+    expect(breakdown.queryByText(/Created /)).toBeNull();
     expect(breakdown.getByText(/Queued /)).toBeTruthy();
     expect(breakdown.getByText(/Started /)).toBeTruthy();
     expect(breakdown.getByText(/Finished /)).toBeTruthy();

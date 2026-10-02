@@ -142,6 +142,25 @@ describe("RunEngineSelector", () => {
     expect(screen.getByText("Legacy")).toBeTruthy();
   });
 
+  test("lists Skyvern 3.0 right after Default, above Skyvern 1.0", () => {
+    render(
+      <RunEngineSelector
+        value={null}
+        onChange={() => {}}
+        effectiveDefaultEngine={RunEngine.SkyvernV3}
+      />,
+    );
+
+    const [, ...items] = screen.getAllByRole("button");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "Default",
+      "Skyvern 3.0Recommended",
+      "Skyvern 1.0Legacy",
+      "OpenAI CUAEnterprise",
+      "Anthropic CUAEnterprise",
+    ]);
+  });
+
   test("marks Skyvern 3.0 as Recommended", () => {
     render(
       <RunEngineSelector

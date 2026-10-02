@@ -90,6 +90,7 @@ import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
 import { TagFilterControl } from "@/routes/workflows/components/tagging/TagFilterControl";
 import { useRunTagFilterParam } from "@/routes/workflows/hooks/useRunTagFilterParam";
 import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { RUN_HISTORY_SEARCH_FIELDS_HINT } from "@/util/runSearch";
 import {
   SelectionCheckboxCell,
   SelectionHeaderCheckboxCell,
@@ -653,7 +654,8 @@ function RunHistory() {
                   params.set("page", "1");
                   setSearchParams(params, { replace: true });
                 }}
-                placeholder="Search by run ID or input..."
+                placeholder="Search by run ID, input, credential..."
+                title={RUN_HISTORY_SEARCH_FIELDS_HINT}
                 className="w-48 lg:w-72"
               />
               {taggingEnabled ? (
