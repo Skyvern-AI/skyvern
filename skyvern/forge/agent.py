@@ -196,7 +196,6 @@ from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
-    CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
@@ -2240,8 +2239,6 @@ class ForgeAgent:
             DEFAULT_DEADLINE_SECONDS,
             MAX_TOKENS_CEILING,
             MIN_ACTION_STEPS,
-            USER_INSTRUCTIONS_END,
-            USER_INSTRUCTIONS_LABEL,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
@@ -2321,18 +2318,6 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DATE_SEGMENT_AIM,
-            )
-            await resolve_run_arm(
-                context,
-                CUSTOMER_PRECEDENCE_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_CUSTOMER_PRECEDENCE,
-                properties={
-                    "workflow_permanent_id": task.workflow_permanent_id
-                    or context.workflow_permanent_id
-                    or "not_workflow"
-                },
             )
             await resolve_run_arm(
                 context,
@@ -2417,29 +2402,20 @@ class ForgeAgent:
             "terminate_criterion": task.terminate_criterion,
         }
 
-        def _compose_goal(fields: dict[str, str | None], page_data_note: bool = False) -> str:
-            return compose_goal(
-                fields["navigation_goal"] or "",
-                GoalDirectives(
-                    data_extraction_goal=fields["data_extraction_goal"],
-                    extracted_information_schema=task.extracted_information_schema,
-                    complete_criterion=fields["complete_criterion"],
-                    terminate_criterion=fields["terminate_criterion"],
-                    # Validation only: that is the task type whose criteria a decision-maker weighs against
-                    # each other in both engines, and the only one this was measured on (SKY-16193).
-                    criteria_precedence=task.task_type == TaskType.validation,
-                    framing=framing,
-                    block_context_section=block_context_section,
-                    page_data_note=page_data_note,
-                    code_progress=recovery_code_progress,
-                ),
-            )
-
-        goal = _compose_goal(goal_fields)
-        # The precedence arm grants the goal and criteria the user's authority; a value a page produced must
-        # not share it. The goal judge reads this same goal, so it too sees page values as quoted data.
-        customer_precedence_on = not page_free_validation and run_arm_enabled(
-            CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE
+        goal = compose_goal(
+            goal_fields["navigation_goal"] or "",
+            GoalDirectives(
+                data_extraction_goal=goal_fields["data_extraction_goal"],
+                extracted_information_schema=task.extracted_information_schema,
+                complete_criterion=goal_fields["complete_criterion"],
+                terminate_criterion=goal_fields["terminate_criterion"],
+                # Validation only: that is the task type whose criteria a decision-maker weighs against
+                # each other in both engines, and the only one this was measured on (SKY-16193).
+                criteria_precedence=task.task_type == TaskType.validation,
+                framing=framing,
+                block_context_section=block_context_section,
+                code_progress=recovery_code_progress,
+            ),
         )
         block_renders = task_block.page_derived_renders if task_block is not None else {}
         page_derived_renders = {
@@ -2458,14 +2434,6 @@ class ForgeAgent:
             if workflow_run_context is not None and task.workflow_system_prompt
             else {}
         )
-        if customer_precedence_on and presented_fields:
-            goal = _compose_goal(
-                {
-                    name: shown.text if (shown := presented_fields.get(name)) else value
-                    for name, value in goal_fields.items()
-                },
-                page_data_note=any(shown.spans for shown in presented_fields.values()),
-            )
         if presented_fields or system_prompt_page_roots:
             withheld = {
                 name: shown.reason or shown.presentation
@@ -2490,12 +2458,10 @@ class ForgeAgent:
                 "taskv3 page-derived template",
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
-                customer_precedence_arm=customer_precedence_on,
                 page_derived_fields=sorted(name for name, roots in root_classes.items() if roots),
                 root_classes=root_classes,
                 presentation={name: shown.presentation for name, shown in presented_fields.items()},
                 span_count=sum(shown.spans for shown in presented_fields.values()),
-                customer_precedence_withheld="page_derived_unmarked" if withheld else None,
                 withheld_reasons=withheld,
             )
 
@@ -3047,16 +3013,7 @@ class ForgeAgent:
                 captcha_tools, captcha_guidance = build_captcha_tools(
                     task, _page_provider, organization_id=organization.organization_id
                 )
-            # Page-free runs never get the precedence paragraph, so the label would have nothing to refer to.
             workflow_system_guidance = task.workflow_system_prompt
-            # A prompt that reads a page-derived value keeps control semantics: it is not presented as the user's.
-            if (
-                workflow_system_guidance
-                and not page_free_validation
-                and run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE)
-                and not system_prompt_page_roots
-            ):
-                workflow_system_guidance = USER_INSTRUCTIONS_LABEL + workflow_system_guidance + USER_INSTRUCTIONS_END
             block_type = str(task_block.block_type) if task_block is not None else None
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
             goal_judge: GoalJudge | None = None
