@@ -1003,6 +1003,9 @@ async def test_spent_grant_caught_at_the_step_gate_reports_the_granting_cap() ->
     assert "turn budget" in outcome.reason
 
 
+_REACHED_TARGET = {"page_transitioned": True}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("single_action_block", [True, False], ids=["single_action", "multi_action"])
 @pytest.mark.parametrize("cap", ["step_cap", "runaway"])
@@ -1013,7 +1016,11 @@ async def test_single_action_block_completes_when_its_step_cap_refuses_a_follow_
     # A single-action block's contract is one action; a follow-up its step cap refused is not the block
     # failing. Every other budget exit, and any block that never landed its action, stays budget_exhausted.
     click_calls: list[tuple[str, dict[str, Any]]] = []
-    click = (_recording_tool if acted else _erroring_tool)("click", click_calls, billable=True)
+    click = (
+        _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
+        if acted
+        else _erroring_tool("click", click_calls, billable=True)
+    )
     caps: dict[str, Any] = {"max_action_steps": 1} if cap == "step_cap" else {"max_turns": 1}
     script = [[("click", {})], [("click", {})], [("click", {})]]
     outcome, _ = await _run(script, [click, make_finish_tool()], single_action_block=single_action_block, **caps)
@@ -1028,6 +1035,62 @@ async def test_single_action_block_completes_when_its_step_cap_refuses_a_follow_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("url_changed", [False, True], ids=["url_unchanged", "url_changed"])
+@pytest.mark.parametrize("reported_by", ["click", "navigate"])
+async def test_single_action_block_completes_on_the_step_cap_only_when_its_action_moved_the_page(
+    url_changed: bool, reported_by: str
+) -> None:
+    # A click that succeeds without moving the page (a no-op control, a typed username before the login submits)
+    # is no sign the block is done. Navigate reports the move inside its action outcome.
+    data = (
+        {"page_transitioned": url_changed}
+        if reported_by == "click"
+        else {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "page_transitioned": url_changed}}
+    )
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, billable=True, ok_data=data)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(script, [click, make_finish_tool()], single_action_block=True, max_action_steps=1)
+
+    assert outcome.status == ("completed" if url_changed else "budget_exhausted")
+    if not url_changed:
+        assert outcome.cap_trip == "Reached the maximum steps (1)"
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_that_landed_on_an_error_page_is_no_evidence_for_the_step_cap_completion() -> None:
+    dead_end = {
+        ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/gone", "page_transitioned": True, "http_status": 404}
+    }
+    nav_calls: list[tuple[str, dict[str, Any]]] = []
+    nav = _recording_tool("navigate", nav_calls, billable=True, ok_data=dead_end)
+    script = [[("navigate", {})], [("navigate", {})], [("navigate", {})]]
+    outcome, _ = await _run(script, [nav, make_finish_tool()], single_action_block=True, max_action_steps=1)
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforce"])
+async def test_a_contradicting_goal_check_vetoes_the_step_cap_completion_only_under_enforce(enforce: bool) -> None:
+    # A URL change can land on the wrong page; the finish gate's goal check catches it, and its shadow arm logs
+    # without changing the outcome.
+    goal_check, verdicts = _scripted_goal_check("not_achieved")
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool(goal_check=goal_check, goal_check_enforce=enforce)],
+        single_action_block=True,
+        max_action_steps=1,
+    )
+
+    assert verdicts
+    assert outcome.status == ("budget_exhausted" if enforce else "completed")
+
+
+@pytest.mark.asyncio
 async def test_single_action_block_completion_refused_by_a_finish_guard_stays_budget_exhausted() -> None:
     # The block's completion is offered through the finish tool, so a guard that would refuse the model's own
     # finish(completed) refuses it too, and the model is told why on its granted final turn.
@@ -1037,7 +1100,7 @@ async def test_single_action_block_completion_refused_by_a_finish_guard_stays_bu
         return refusal if status == "completed" else None
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", click_calls, billable=True)
+    click = _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
     script = [[("click", {})], [("click", {})], [("click", {})]]
     outcome, caller = await _run(
         script,
@@ -1064,7 +1127,7 @@ async def test_single_action_block_completion_is_offered_once_even_when_its_guar
         return "the submission is still pending" if len(offers) == 1 else None
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", click_calls, billable=True)
+    click = _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
     script = [[("click", {})], [("click", {})], [("click", {})]]
     outcome, _ = await _run(
         script,
@@ -10913,7 +10976,7 @@ async def test_every_covered_row_carries_the_branch_the_control_count_and_the_la
     """Every `covered` message logs as one `tool_error_class`, so the only way to size the split
     was to pull step archives and classify the prose. The count and the layer kind are separate
     facets because neither recovers the other: the named branch spans "eight controls listed" and
-    "no controls were found on it", and a zero count spans a real overlay whose controls were
+    "no named controls", and a zero count spans a real overlay whose controls were
     dropped and a probe that named the hit element itself, where there is nothing to dismiss."""
 
     async def covered(args: dict[str, Any]) -> ToolResult:

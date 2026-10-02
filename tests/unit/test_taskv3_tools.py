@@ -21217,7 +21217,59 @@ async def test_covered_error_message_when_the_occluding_layer_has_no_controls_at
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
-        assert "no controls were found on it" in r.content, r.content
+        assert "no named controls" in r.content, r.content
+
+
+_DIALOG_WHOSE_ONLY_CLOSE_IS_AN_ONCLICK_ICON_HTML = """
+<input id="city" type="text" style="width:200px;height:30px">
+<div id="trial" role="dialog" aria-label="Start your trial" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">
+  <div class="modal-close" onclick="this.closest('[role=dialog]').remove()" style="width:24px;height:24px;background:#000"></div>
+  <p>Unlock every feature.</p>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_icon_only_onclick_close_is_named_and_clicking_it_clears_the_field() -> None:
+    async with _content_page(_DIALOG_WHOSE_ONLY_CLOSE_IS_AN_ONCLICK_ICON_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        minted = re.search(r'\[data-tv3-close="[^"]+"\]', r.content)
+        assert minted, r.content
+        closed = await _tool(tools, "click").handler({"selector": minted.group(0)})
+        assert closed.status == "ok", closed.content
+        typed = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert typed.status == "ok", typed.content
+
+
+_DIALOG_FULL_OF_ONCLICK_WRAPPERS_AND_ROWS_HTML = (
+    """
+<input id="city" type="text" style="width:200px;height:30px">
+<div id="picker" role="dialog" aria-label="Choose a plan" onclick="void 0" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">
+  <div id="card-a" onclick="void 0"><button id="pick-a">Pick A</button></div>
+  <div id="card-b" onclick="void 0"><button id="pick-b">Pick B</button></div>
+"""
+    + "".join(f'  <div id="row-{i}" onclick="void 0">Row {i}</div>\n' for i in range(6))
+    + """  <div id="icon-close" onclick="void 0" style="width:24px;height:24px;background:#000"></div>
+  <button id="footer-close" onclick="void 0">Close</button>
+</div>
+"""
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_onclick_wrappers_and_rows_neither_flood_the_list_nor_crowd_out_an_icon_close() -> None:
+    async with _content_page(_DIALOG_FULL_OF_ONCLICK_WRAPPERS_AND_ROWS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        assert r.content.count("#footer-close") == 1 and "#pick-a" in r.content, r.content
+        assert "#card-a" not in r.content and "#card-b" not in r.content, r.content
+        assert "#icon-close" in r.content, r.content
+        assert sum(f"#row-{i}" in r.content for i in range(6)) <= 1, r.content
 
 
 class _CoveredProbeFakePage(_TypeaheadFakePage):
@@ -21347,7 +21399,7 @@ async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hi
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
-        assert "no controls were found on it" in r.content, r.content
+        assert "get_html" not in r.content, r.content
         recorded = taskv3_loop._COVERED_LAYER.get() or {}
         assert recorded == {"branch": "named", "controls": 0, "layer_kind": "hit_fallback"}, recorded
 
@@ -21356,7 +21408,7 @@ async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hi
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
-        assert "no controls were found on it" in r.content, r.content
+        assert "no named controls" in r.content, r.content
         recorded = taskv3_loop._COVERED_LAYER.get() or {}
         assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
 
