@@ -392,6 +392,19 @@ async def check_credential_pause_resumable(
     _validate_pending_pause(record, resume_token)
 
 
+async def _record_turn_resumed(organization_id: str, chat_id: str, turn_id: str) -> None:
+    # Reconcile reads the pause before the turn marker, so stamping first leaves no instant where a
+    # resumed turn shows neither a live pause nor a resume and can be reclaimed as abandoned.
+    try:
+        await app.DATABASE.workflow_params.record_pending_copilot_turn_credential_resume(
+            organization_id=organization_id,
+            workflow_copilot_chat_id=chat_id,
+            turn_id=turn_id,
+        )
+    except Exception:
+        LOG.warning("Could not record the credential pause resume on the turn marker", exc_info=True)
+
+
 async def resolve_credential_pause(
     cache: Any,
     *,
@@ -414,6 +427,7 @@ async def resolve_credential_pause(
     """
     active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
     lock_key = _credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)
+    await _record_turn_resumed(organization_id, workflow_copilot_chat_id, turn_id)
     async with cache.get_lock(lock_key):
         record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
         ttl = _credential_pause_record_ttl(settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
@@ -574,6 +588,8 @@ async def finish_manual_sign_in(
 ) -> bool:
     """Settle a Done claim; False means the claim was lost and the caller must discard the profile."""
     active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
+    if signed_in is not None:
+        await _record_turn_resumed(organization_id, workflow_copilot_chat_id, turn_id)
     async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
         record = _decode_active_pause(await cache.get(active_key))
         if record is None or record.status != "resolving" or record.claim_id != claim.claim_id:
@@ -1023,6 +1039,7 @@ async def _run_credential_pause(
                 if waited is not None:
                     break
                 # The waiter's last look can race a sign-in start or a Done claim; settle that under the lock.
+                await _record_turn_resumed(organization_id, chat_id, turn_id)
                 settled = await _invalidate_active_pause_record(keep_live=True)
                 if isinstance(settled, str):
                     wait_seconds = await _seconds_left_on_pause(ctx, resume_token)
@@ -1038,14 +1055,7 @@ async def _run_credential_pause(
         # Can't act on a rescued resolution mid-unwind, only avoid corrupting state.
         await _invalidate_active_pause_record()
         raise
-    try:
-        await app.DATABASE.workflow_params.record_pending_copilot_turn_credential_resume(
-            organization_id=organization_id,
-            workflow_copilot_chat_id=chat_id,
-            turn_id=turn_id,
-        )
-    except Exception:
-        LOG.warning("Could not record the credential pause resume on the turn marker", exc_info=True)
+    await _record_turn_resumed(organization_id, chat_id, turn_id)
 
     if resolution is None and not invalidated:
         invalidated_resolution = await _invalidate_active_pause_record()

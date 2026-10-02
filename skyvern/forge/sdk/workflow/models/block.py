@@ -11039,7 +11039,9 @@ class DownloadToS3Block(Block):
         uri = None
         try:
             uri = self._get_s3_uri(uploads_organization_id, workflow_run_id)
-            await self._upload_file_to_s3(uri, file_path, cleanup_file=not self.url.startswith("/"))
+            input_path = parse_uri_to_path(self.url) if urlparse(self.url).scheme == "file" else self.url
+            is_original_file = os.path.isabs(input_path) and os.path.realpath(input_path) == os.path.realpath(file_path)
+            await self._upload_file_to_s3(uri, file_path, cleanup_file=not is_original_file)
         except Exception as e:
             LOG.error("DownloadToS3Block Failed to upload file to S3", uri=uri, error=str(e))
             raise e

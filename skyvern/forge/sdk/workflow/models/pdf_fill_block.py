@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
+from urllib.parse import urlparse
 
 import aiofiles
 import pdfplumber
@@ -26,7 +27,8 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     download_file,
     get_path_for_workflow_download_directory,
-    validate_local_file_path,
+    parse_uri_to_path,
+    resolve_local_or_download_file,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -245,13 +247,15 @@ class PdfFillBlock(Block):
         # a user-supplied local path is never deleted.
         if settings.ENV == "local" and os.path.exists(self.file_url):
             return self.file_url, False
-        if self.file_url.startswith("/"):
+        parsed_url = urlparse(self.file_url)
+        if self.file_url.startswith("/") or parsed_url.scheme == "file":
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
-            resolved = validate_local_file_path(self.file_url, run_id)
-            if not os.path.isfile(resolved):
-                raise FileNotFoundError(f"Local file not found: {self.file_url}")
-            return resolved, False
+            resolved = await resolve_local_or_download_file(self.file_url, run_id, organization_id)
+            is_temp = parsed_url.scheme == "file" and os.path.realpath(resolved) != os.path.realpath(
+                parse_uri_to_path(self.file_url)
+            )
+            return resolved, is_temp
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
