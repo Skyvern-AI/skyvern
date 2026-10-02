@@ -61,6 +61,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "delete_block",
     "list_credentials",
     "list_integrations",
+    "read_google_sheet",
     "run_blocks_and_collect_debug",
     "test_workflow_from_blank_browser",
     "get_run_results",

@@ -25,6 +25,19 @@ def _integrity_error(constraint_name: str) -> IntegrityError:
     )
 
 
+def _organization_snapshot() -> SimpleNamespace:
+    return SimpleNamespace(
+        slug="before",
+        webhook_callback_url=None,
+        max_steps_per_run=None,
+        max_steps_per_workflow_run=None,
+        max_retries_per_step=None,
+        artifact_url_expiry_seconds=None,
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
+
+
 @pytest.mark.parametrize(
     ("organization_name", "organization_id", "expected"),
     [
@@ -230,13 +243,18 @@ async def test_update_organization_returns_conflict_for_duplicate_slug(
     monkeypatch.setattr(
         agent_protocol.app,
         "DATABASE",
-        SimpleNamespace(organizations=SimpleNamespace(update_organization=update_organization)),
+        SimpleNamespace(
+            organizations=SimpleNamespace(
+                get_organization=AsyncMock(return_value=_organization_snapshot()),
+                update_organization=update_organization,
+            )
+        ),
     )
 
     with pytest.raises(HTTPException) as exc_info:
         await agent_protocol.update_organization(
             OrganizationUpdate(slug="taken"),
-            current_org=SimpleNamespace(organization_id="o_123", webhook_callback_url=None),
+            current_org=SimpleNamespace(organization_id="o_123", slug="before", webhook_callback_url=None),
         )
 
     assert exc_info.value.status_code == 409
@@ -252,13 +270,18 @@ async def test_update_organization_reraises_unrelated_integrity_error(monkeypatc
     monkeypatch.setattr(
         agent_protocol.app,
         "DATABASE",
-        SimpleNamespace(organizations=SimpleNamespace(update_organization=update_organization)),
+        SimpleNamespace(
+            organizations=SimpleNamespace(
+                get_organization=AsyncMock(return_value=_organization_snapshot()),
+                update_organization=update_organization,
+            )
+        ),
     )
 
     with pytest.raises(IntegrityError) as exc_info:
         await agent_protocol.update_organization(
             OrganizationUpdate(slug="available"),
-            current_org=SimpleNamespace(organization_id="o_123", webhook_callback_url=None),
+            current_org=SimpleNamespace(organization_id="o_123", slug="before", webhook_callback_url=None),
         )
 
     assert exc_info.value is error
@@ -280,7 +303,7 @@ async def test_update_organization_rejects_explicit_slug_clear(monkeypatch: pyte
     with pytest.raises(HTTPException) as exc_info:
         await agent_protocol.update_organization(
             OrganizationUpdate(slug=None),
-            current_org=SimpleNamespace(organization_id="o_123", webhook_callback_url=None),
+            current_org=SimpleNamespace(organization_id="o_123", slug="before", webhook_callback_url=None),
         )
 
     assert exc_info.value.status_code == 400

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -1422,7 +1423,9 @@ async def test_capture_settlement_failure_uses_protected_block_failure_path(monk
     monkeypatch.setattr(CodeBlock, "_invalidate_stale_output_on_failure", AsyncMock())
     monkeypatch.setattr(CodeBlock, "build_block_result", build_result)
 
-    result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
+    # structlog's unconfigured default renderer cannot format the failure log's list-valued `stack`.
+    with capture_logs():
+        result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
 
     assert result.failure_reason == "CodeBlock execution failed."
     assert build_result.await_args.kwargs["workflow_run_block_id"] == "wrb_successor"
