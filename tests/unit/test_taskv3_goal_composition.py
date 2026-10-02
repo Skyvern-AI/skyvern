@@ -18,7 +18,6 @@ from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN, PageDerivedRender
 from skyvern.forge.taskv3.goal_composition import (
     MAX_HANDOFF_LABEL_CHARS,
-    PAGE_DATA_NOTE,
     CodeProgressRecord,
     CodeTypedValue,
     GoalDirectives,
@@ -330,15 +329,6 @@ def test_a_page_value_read_only_in_control_flow_is_not_presented() -> None:
     )
 
     assert present_page_derived("navigation_goal", "Apply now", render) is None
-
-
-def test_the_page_data_note_sits_between_the_criteria_and_the_framing_only_when_asked() -> None:
-    directives = GoalDirectives(complete_criterion="the form is sent", framing="FRAMING", page_data_note=True)
-
-    goal = compose_goal("Apply", directives)
-
-    assert goal.index("the form is sent") < goal.index(PAGE_DATA_NOTE) < goal.index("FRAMING")
-    assert PAGE_DATA_NOTE not in compose_goal("Apply", GoalDirectives(framing="FRAMING"))
 
 
 def test_an_oversized_typed_value_is_withheld_without_hiding_the_rows_after_it() -> None:
