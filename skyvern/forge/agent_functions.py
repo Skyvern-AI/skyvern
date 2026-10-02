@@ -78,6 +78,7 @@ from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityResolution,
     BearerIdentityStatus,
     RequestPrincipal,
+    get_request_principal,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -122,7 +123,7 @@ LOG = structlog.get_logger()
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """Safe, bounded metadata for a customer-initiated write; never include values or request bodies."""
+    """Ids and field names for a customer-initiated write; never secrets or request bodies. A tag's id is its text."""
 
     organization_id: str
     action: str
@@ -131,6 +132,21 @@ class AuditEvent:
     changed_fields: tuple[str, ...] = ()
     related_resource_ids: tuple[str, ...] = ()
     auth_kind: str | None = None
+
+
+async def record_request_audit_event(
+    organization_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    *,
+    changed_fields: tuple[str, ...] = (),
+    related_resource_ids: tuple[str, ...] = (),
+) -> None:
+    await app.AGENT_FUNCTION.record_audit_event(
+        get_request_principal(),
+        AuditEvent(organization_id, action, resource_type, resource_id, changed_fields, related_resource_ids),
+    )
 
 
 EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30

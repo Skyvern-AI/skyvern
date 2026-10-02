@@ -580,10 +580,10 @@ class OrganizationsRepository(BaseRepository):
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-    ) -> None:
-        """Invalidate all existing tokens of a specific type for an organization."""
+    ) -> int:
+        """Invalidate all existing tokens of a specific type for an organization; returns how many were valid."""
         async with self.Session() as session:
-            await session.execute(
+            result = await session.execute(
                 update(OrganizationAuthTokenModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(token_type=token_type)
@@ -591,6 +591,7 @@ class OrganizationsRepository(BaseRepository):
                 .values(valid=False)
             )
             await session.commit()
+            return result.rowcount
 
     @db_operation("invalidate_org_auth_token")
     async def invalidate_org_auth_token(

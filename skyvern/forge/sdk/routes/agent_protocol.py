@@ -42,7 +42,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.agent_functions import AuditEvent
+from skyvern.forge.agent_functions import AuditEvent, record_request_audit_event
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
@@ -1657,6 +1657,9 @@ async def create_folder(
         title=data.title,
         description=data.description,
     )
+    await record_request_audit_event(
+        current_org.organization_id, "workflow_folder.create", "workflow_folder", folder_model.folder_id
+    )
     workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder_model.folder_id,
         organization_id=current_org.organization_id,
@@ -1836,6 +1839,17 @@ async def update_folder(
     if not folder:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
+    changed_fields = tuple(
+        name for name, value in (("title", data.title), ("description", data.description)) if value is not None
+    )
+    if changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "workflow_folder.update",
+            "workflow_folder",
+            folder.folder_id,
+            changed_fields=changed_fields,
+        )
     workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
@@ -1873,14 +1887,22 @@ async def delete_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict:
     analytics.capture("skyvern-oss-folder-delete")
-    success = await app.DATABASE.folders.soft_delete_folder(
+    deleted_workflow_ids = await app.DATABASE.folders.soft_delete_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
         delete_workflows=delete_workflows,
     )
-    if not success:
+    if deleted_workflow_ids is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "workflow_folder.delete",
+        "workflow_folder",
+        folder_id,
+        changed_fields=("delete_workflows",) if delete_workflows else (),
+        related_resource_ids=tuple(deleted_workflow_ids),
+    )
     return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
 
@@ -1920,6 +1942,14 @@ async def update_workflow_folder(
                 status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found"
             )
 
+        await record_request_audit_event(
+            current_org.organization_id,
+            "workflow.update",
+            "workflow",
+            workflow.workflow_permanent_id,
+            changed_fields=("folder_id",),
+            related_resource_ids=(workflow.folder_id,) if workflow.folder_id else (),
+        )
         return workflow
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -1976,22 +2006,24 @@ async def _apply_tag_changes_with_retry(
     label_sets: list[str] | None = None,
     label_deletes: list[str] | None = None,
     colors: dict[str, str] | None = None,
-) -> None:
+) -> bool:
     """Wrap ``apply_tag_changes`` with one IntegrityError retry: concurrent
-    same-identity SETs race the partial UNIQUE; last-write-wins, else 409."""
+    same-identity SETs race the partial UNIQUE; last-write-wins, else 409.
+    Returns whether any tag changed."""
     for attempt in range(2):
         try:
-            await app.DATABASE.tags.apply_tag_changes(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-                sets=sets,
-                deletes=deletes,
-                context=context,
-                label_sets=label_sets,
-                label_deletes=label_deletes,
-                colors=colors,
+            return bool(
+                await app.DATABASE.tags.apply_tag_changes(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    sets=sets,
+                    deletes=deletes,
+                    context=context,
+                    label_sets=label_sets,
+                    label_deletes=label_deletes,
+                    colors=colors,
+                )
             )
-            return
         except IntegrityError:
             if attempt == 0:
                 await asyncio.sleep(random.uniform(0.01, 0.05))
@@ -2000,6 +2032,7 @@ async def _apply_tag_changes_with_retry(
                 status_code=http_status.HTTP_409_CONFLICT,
                 detail="Tag write conflicted with a concurrent update; please retry",
             )
+    return False
 
 
 async def _apply_run_tag_changes_with_retry(
@@ -2012,22 +2045,23 @@ async def _apply_run_tag_changes_with_retry(
     label_sets: list[str] | None = None,
     label_deletes: list[str] | None = None,
     colors: dict[str, str] | None = None,
-) -> None:
+) -> bool:
     """Wrap ``apply_run_tag_changes`` with the same concurrency behavior as
     workflow tags. Org-mismatch is mapped to the route-level 404 contract."""
     for attempt in range(2):
         try:
-            await app.DATABASE.tags.apply_run_tag_changes(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                sets=sets,
-                deletes=deletes,
-                context=context,
-                label_sets=label_sets,
-                label_deletes=label_deletes,
-                colors=colors,
+            return bool(
+                await app.DATABASE.tags.apply_run_tag_changes(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    sets=sets,
+                    deletes=deletes,
+                    context=context,
+                    label_sets=label_sets,
+                    label_deletes=label_deletes,
+                    colors=colors,
+                )
             )
-            return
         except RunTagWorkflowRunMismatch as e:
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
@@ -2041,6 +2075,7 @@ async def _apply_run_tag_changes_with_retry(
                 status_code=http_status.HTTP_409_CONFLICT,
                 detail="Tag write conflicted with a concurrent update; please retry",
             )
+    return False
 
 
 async def _rename_tag_value_with_retry(
@@ -2128,7 +2163,7 @@ async def apply_workflow_tags(
     grouped_deletes: set[str] = {d.key for d in data.tags_to_delete if d.key is not None}
     label_deletes: list[str] = [d.value for d in data.tags_to_delete if d.key is None and d.value is not None]
     try:
-        await _apply_tag_changes_with_retry(
+        tags_changed = await _apply_tag_changes_with_retry(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
             sets=grouped_sets,
@@ -2142,6 +2177,10 @@ async def apply_workflow_tags(
         # Cap-breach is the only ValueError surfaced; treat as 422 (user input).
         raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow.update", "workflow", workflow_permanent_id, changed_fields=("tags",)
+        )
     return await _build_tags_response(workflow_permanent_id, organization_id)
 
 
@@ -2178,13 +2217,17 @@ async def delete_workflow_tag(
     await _assert_workflow_in_org(workflow_permanent_id, organization_id)
 
     write_ctx = _tag_write_context_from_caller(caller)
-    await _apply_tag_changes_with_retry(
+    tags_changed = await _apply_tag_changes_with_retry(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
         sets={},
         deletes={key},
         context=write_ctx,
     )
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow.update", "workflow", workflow_permanent_id, changed_fields=("tags",)
+        )
     return await _build_tags_response(workflow_permanent_id, organization_id)
 
 
@@ -2321,7 +2364,7 @@ async def apply_run_tags(
     grouped_deletes: set[str] = {d.key for d in data.tags_to_delete if d.key is not None}
     label_deletes: list[str] = [d.value for d in data.tags_to_delete if d.key is None and d.value is not None]
     try:
-        await _apply_run_tag_changes_with_retry(
+        tags_changed = await _apply_run_tag_changes_with_retry(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             sets=grouped_sets,
@@ -2334,6 +2377,10 @@ async def apply_run_tags(
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow_run.update", "workflow_run", workflow_run_id, changed_fields=("tags",)
+        )
     return await _build_run_tags_response(workflow_run_id, organization_id)
 
 
@@ -2367,13 +2414,17 @@ async def delete_run_tag(
     _validate_path_key(key)
 
     write_ctx = _tag_write_context_from_caller(caller)
-    await _apply_run_tag_changes_with_retry(
+    tags_changed = await _apply_run_tag_changes_with_retry(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
         sets={},
         deletes={key},
         context=write_ctx,
     )
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow_run.update", "workflow_run", workflow_run_id, changed_fields=("tags",)
+        )
     return await _build_run_tags_response(workflow_run_id, organization_id)
 
 
@@ -2521,6 +2572,7 @@ async def update_tag_key(
     )
     if row is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
+    await record_request_audit_event(organization_id, "tag.update", "tag", row.key, changed_fields=("description",))
     # Populate the real count so PATCH and GET /tag-keys agree (the ORM row
     # has no count attribute, so model_validate would default it to 0).
     counts = await app.DATABASE.tags.count_active_workflows_per_key(organization_id=organization_id)
@@ -2559,6 +2611,7 @@ async def delete_tag_key(
     )
     if delete_result is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
+    await record_request_audit_event(organization_id, "tag.delete", "tag", key)
     return TagKeyDeleteResponse(
         key=key,
         removed_from_workflow_count=delete_result.removed_from_workflow_count,
@@ -2632,6 +2685,7 @@ async def create_tag_value(
         )
     except TagValueAlreadyExists as e:
         raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    await record_request_audit_event(current_org.organization_id, "tag.create", "tag", f"{row.key}:{row.value}")
     return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=0)
 
 
@@ -2671,6 +2725,9 @@ async def update_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
+    await record_request_audit_event(
+        organization_id, "tag.update", "tag", f"{row.key}:{row.value}", changed_fields=("color",)
+    )
     count = await app.DATABASE.tags.count_active_workflows_for_value(
         organization_id=organization_id, key=row.key, value=row.value
     )
@@ -2720,6 +2777,14 @@ async def rename_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
+    await record_request_audit_event(
+        caller.organization.organization_id,
+        "tag.update",
+        "tag",
+        f"{result.key}:{result.value}",
+        changed_fields=("value",),
+        related_resource_ids=(f"{key}:{data.value}",),
+    )
     return TagValueRenameResponse(
         key=result.key,
         value=result.value,
@@ -2766,6 +2831,7 @@ async def delete_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
+    await record_request_audit_event(organization_id, "tag.delete", "tag", f"{key}:{data.value}")
     return TagValueDeleteResponse(
         key=key,
         value=data.value,
@@ -5461,11 +5527,19 @@ async def set_workflow_template_status(
     Template status is stored at the workflow_permanent_id level (not per-version),
     meaning all versions of a workflow share the same template status.
     """
-    return await app.WORKFLOW_SERVICE.set_template_status(
+    result = await app.WORKFLOW_SERVICE.set_template_status(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         is_template=is_template,
     )
+    await record_request_audit_event(
+        current_org.organization_id,
+        "workflow.update",
+        "workflow",
+        workflow_permanent_id,
+        changed_fields=("is_template",),
+    )
+    return result
 
 
 @legacy_base_router.get(
