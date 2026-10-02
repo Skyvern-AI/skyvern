@@ -810,6 +810,10 @@ def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]
     )
 
 
+def _clipped_120(text: str | None) -> str | None:
+    return text[:117] + "..." if text is not None and len(text) > 120 else text
+
+
 def _compact_packet_for_aggregate_limit(
     packet: BuildTestEvidencePacket,
     notices: list[str],
@@ -933,6 +937,18 @@ def _compact_packet_for_aggregate_limit(
             "unfinished_items": _compacted(
                 packet.unfinished_items, 12, field_name="unfinished_items", notices=notices, keep="first"
             ),
+            "ai_fallback_blocks": [
+                block.model_copy(
+                    update={
+                        "failure_text": _clipped_120(block.failure_text),
+                        "recovery_failure_text": _clipped_120(block.recovery_failure_text),
+                    }
+                )
+                for block in _compacted(
+                    packet.ai_fallback_blocks or [], 6, field_name="ai_fallback_blocks", notices=notices, keep="last"
+                )
+            ]
+            or None,
             "omission_notices": notices,
         }
     )
@@ -1491,6 +1507,7 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
                 "failure": failure,
                 "observed_block_end_urls": handoff_block_end_urls,
                 "omission_notices": notices,
+                "ai_fallback_blocks": None,
             }
         )
     )
@@ -1828,6 +1845,11 @@ def _structured_failure_summary_for_user(
 _NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"authority_denied"})
 
 
+def _is_unconfirmed_extension(result: dict[str, Any]) -> bool:
+    # The request may already have applied, so this outcome is neither a grant nor a failure.
+    return result.get("confirmed") is False and "session_readback" in result
+
+
 def user_facing_success(
     result: dict[str, Any],
     *,
@@ -1837,6 +1859,8 @@ def user_facing_success(
     activity stream. A raw ``ok=False`` still counts as success here when it's explained
     by a precondition/authority blocker signal — the agent was redirected, not broken."""
     if result.get("ok", True):
+        return True
+    if _is_unconfirmed_extension(result):
         return True
     # A run waiting on a human approval is the designed outcome of a human_interaction block, not a
     # break, so it must not stream with failure affect.
@@ -1953,6 +1977,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     def block_label(value: object) -> str:
         return sanitize_block_label_for_display(str(value)) if for_display else str(value)
 
+    if _is_unconfirmed_extension(result):
+        return "Requested more browser session time; not confirmed and not retried"
     if not result.get("ok", False):
         return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
@@ -2057,6 +2083,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"{summary} (timed out)" if result.get("timed_out") else summary
     if tool_name == "start_fresh_browser":
         return "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone"
+    if tool_name == "extend_browser_session":
+        return f"Extended the browser session by {result.get('granted_minutes')} minutes"
     if tool_name == "upload_attached_file":
         return f"Placed {result.get('filename')} ({result.get('size_bytes')} bytes) in the page's file input"
     if tool_name == "run_browser_code":
@@ -2170,6 +2198,8 @@ def format_tool_result_for_user(
     summarize_tool_result is parsed by context.merge_turn_summary for state
     extraction — rewriting it would corrupt agent state.
     """
+    if _is_unconfirmed_extension(result):
+        return summarize_tool_result(tool_name, result, for_display=True)
     if not result.get("ok", False):
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:

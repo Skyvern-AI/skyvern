@@ -42,7 +42,7 @@ from skyvern.forge.sdk.workflow.private_settings import (
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.proxy_location import GeoTarget
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, RunEngine
 from skyvern.schemas.workflows import (
     BlockYAML,
     BranchConditionYAML,
@@ -291,6 +291,13 @@ def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> d
             for parameter in parameters
             if not (isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.OUTPUT.value)
         ]
+        for parameter in workflow_definition["parameters"]:
+            if isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.CONTEXT.value:
+                source = parameter.get("source")
+                if isinstance(source, dict) and isinstance(source.get("key"), str):
+                    parameter["source_parameter_key"] = source["key"]
+                    parameter.pop("source")
+                    parameter.pop("value", None)
 
     blocks = workflow_definition.get("blocks")
     if isinstance(blocks, list):
@@ -1354,6 +1361,47 @@ def stored_workflow_yaml(copilot_ctx: Any) -> str:
         return latest
     stored = getattr(copilot_ctx, "workflow_yaml", None)
     return stored if isinstance(stored, str) else ""
+
+
+def preserve_untouched_block_configuration(
+    workflow_yaml: str, prior_definition: WorkflowDefinition | None, *, edited_label: str
+) -> str:
+    """Reverse known editor-export defaults without reverting explicit draft configuration."""
+    if prior_definition is None:
+        return workflow_yaml
+    prior_blocks = {
+        location.block["label"]: location.block
+        for location in workflow_block_locations({"workflow_definition": prior_definition.model_dump(mode="json")})
+    }
+    # ExtractionNode/types.ts initializes this schema when no export schema was authored.
+    export_schema_default = {"type": "array", "items": {"type": "object", "properties": {"value": {"type": "string"}}}}
+    for location in workflow_block_locations(safe_load_no_dates(workflow_yaml)):
+        block = location.block
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        prior = prior_blocks.get(label)
+        if label == edited_label or prior is None or prior.get("block_type") != block.get("block_type"):
+            continue
+        fields: dict[str, Any] = {}
+        # workflowEditorUtils.blockEngineForWorkflow omits V1 under the legacy default engine.
+        # V2/V3 are explicit pins: clearing either selects Default and must survive the repair.
+        if block.get("engine") is None and prior.get("engine") == RunEngine.skyvern_v1.value:
+            fields["engine"] = prior["engine"]
+        # The editor writes node.data.label as a task block's title.
+        if "title" in prior and block.get("title") == label and prior["title"] != label:
+            fields["title"] = prior["title"]
+        if (
+            block.get("block_type") == "extraction"
+            and not block.get("export_enabled")
+            and not prior.get("export_enabled")
+            and prior.get("export_data_schema") is None
+            and block.get("export_data_schema") == export_schema_default
+        ):
+            fields["export_data_schema"] = None
+        if fields:
+            workflow_yaml = _replace_block_fields_source(workflow_yaml, label, fields)
+    return workflow_yaml
 
 
 def stored_block_code(stored_yaml: str, label: str, *, allow_empty: bool = False) -> str | None:

@@ -21,6 +21,7 @@ from skyvern.forge.sdk.workflow.page_derived_templates import (
 from skyvern.forge.taskv3.handoff_redaction import sanitize_handoff_reason, sanitize_handoff_url
 from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, is_last_block
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.tasks import Task
@@ -89,23 +90,50 @@ def present_page_derived(field: str, row_value: str, render: PageDerivedRender |
 
 
 @dataclass(frozen=True)
-class CodeProgressRecord:
-    """A failed code block's step outline split at the step whose lines raised.
+class CodeTypedValue:
+    """A string literal the block's code types, and the selector or locator it types it into."""
 
-    Steps are in source order, so a loop or branch means ``before`` is not proof those steps ran.
-    """
+    line: int
+    target: str
+    value: str
+
+
+@dataclass(frozen=True)
+class CodeProgressRecord:
+    """A failed code block's step outline split at the step whose lines raised, if any, and the literals its code types.
+    Steps are in source order, so a loop or branch means ``before`` is not proof those steps ran."""
 
     before: tuple[str, ...]
-    failed_step: str
+    failed_step: str | None
     failed_line: int
     after: tuple[str, ...]
+    typed_values: tuple[CodeTypedValue, ...] = ()
 
 
 def render_code_progress_section(record: CodeProgressRecord) -> str:
+    """The outline without its typed rows; the engine appends those once it knows the request's room for them."""
     lines = [f"- Earlier in the code: {step}" for step in record.before]
-    lines.append(f"- Raised an error at line {record.failed_line}: {record.failed_step}")
+    failed = f": {record.failed_step}" if record.failed_step is not None else ""
+    lines.append(f"- Raised an error at line {record.failed_line}{failed}")
     lines.extend(f"- Later in the code: {step}" for step in record.after)
     return "Code outline (a record of this block's code in source order, not steps to perform):\n" + "\n".join(lines)
+
+
+def typed_value_rows(values: tuple[CodeTypedValue, ...], token_budget: int) -> list[str]:
+    """Rows in source order as far as `token_budget` allows; a row that does not fit is withheld whole and counted."""
+    budget = token_budget - count_tokens(f"\n- {len(values)} more typed values not listed")
+    rows: list[str] = []
+    for typed in values:
+        row = (
+            f"- Line {typed.line} types {json.dumps(typed.value, ensure_ascii=False)} into "
+            f"{json.dumps(typed.target, ensure_ascii=False)}"
+        )
+        cost = count_tokens(f"\n{row}")
+        if cost <= budget:
+            budget -= cost
+            rows.append(row)
+    withheld = len(values) - len(rows)
+    return [*rows, f"- {withheld} more typed values not listed"] if withheld else rows
 
 
 @dataclass(frozen=True)

@@ -202,7 +202,6 @@ from skyvern.forge.taskv3.run_arms import (
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
     HUMANIZED_INPUT_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -2318,13 +2317,6 @@ class ForgeAgent:
             # one executing.
             await resolve_run_arm(
                 context,
-                TYPE_COORDINATE_CLICK_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_TYPE_COORDINATE_CLICK,
-            )
-            await resolve_run_arm(
-                context,
                 DATE_SEGMENT_AIM_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
@@ -3229,6 +3221,7 @@ class ForgeAgent:
                 login_identifier_tokens=_login_identifier_tokens,
                 # A block that completes on a download is not done by its one action.
                 single_action_block=isinstance(task_block, ActionBlock) and not task_block.complete_on_download,
+                code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
         finally:
             if context and credential_parameter_key is not None:

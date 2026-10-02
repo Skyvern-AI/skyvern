@@ -2318,9 +2318,6 @@ def _build_narrative_payload(
             if not isinstance(label, str) or not label:
                 continue
             block_labels.append(label)
-    newest_attempt_by_label = {
-        attempt["label"]: attempt["workflowRunBlockId"] for attempt in ctx.narrative_block_attempts.values()
-    }
     for attempt in ctx.narrative_block_attempts.values():
         block_entry: NarrativeBlock = {
             "label": attempt["label"],
@@ -2328,11 +2325,7 @@ def _build_narrative_payload(
             "blockType": attempt["blockType"],
             "state": _block_ui_state(attempt["rawStatus"], drafted_fallback=False),
             "lastSeenIteration": attempt["lastSeenIteration"],
-            "activity": (
-                list(block_activity.get(attempt["label"], []))
-                if newest_attempt_by_label.get(attempt["label"]) == attempt["workflowRunBlockId"]
-                else []
-            ),
+            "activity": list(block_activity.get(attempt["workflowRunBlockId"], [])),
             "startedAt": attempt["startedAt"],
             "endedAt": attempt["endedAt"],
         }

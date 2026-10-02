@@ -4354,6 +4354,7 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
     originating_call_id: str | None = None,
+    block_scoped_authoring_prior_yaml: str | None = None,
 ) -> dict[str, Any]:
     def _blocked(block: AuthorTimeBlock) -> dict[str, Any]:
         _clear_code_authoring_repair_context(ctx)
@@ -4512,7 +4513,12 @@ async def _update_workflow(
 
     # Runs on every emission path, not only when the LLM consults the schema, and validates only the
     # blocks this turn introduces or changes.
-    authoring_validation = reject_authoring_violations(ctx, workflow_yaml, "_update_workflow")
+    authoring_validation = reject_authoring_violations(
+        ctx,
+        workflow_yaml,
+        "_update_workflow",
+        prior_workflow_yaml=block_scoped_authoring_prior_yaml,
+    )
     if authoring_validation.reject is not None:
         return _blocked(authoring_validation.reject)
     workflow_yaml = authoring_validation.workflow_yaml
@@ -4524,11 +4530,12 @@ async def _update_workflow(
         workflow_yaml, google_sheet_tab_resolution = await resolve_google_sheet_tabs_from_gid(workflow_yaml, ctx)
         # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
         # pass the scrub seam like any other submitted text.
+        goal_rewritten_labels = code_artifact_metadata_block_labels(ctx.submitted_code_artifact_metadata_snapshot)
         goal_carry = carry_user_owned_goals_in_yaml(
             workflow_yaml,
             prior_yaml=prior_yaml,
-            rebuilt_labels=code_artifact_metadata_block_labels(ctx.submitted_code_artifact_metadata_snapshot)
-            | set(params.get("_rebuilt_block_labels") or ()),
+            rebuilt_labels=goal_rewritten_labels | set(params.get("_rebuilt_block_labels") or ()),
+            goal_rewritten_labels=goal_rewritten_labels,
         )
         workflow_yaml = goal_carry.workflow_yaml
         # Ahead of both persistence and the context assignment below, so the row, the draft the

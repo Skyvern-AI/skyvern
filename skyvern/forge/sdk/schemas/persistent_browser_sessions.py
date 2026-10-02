@@ -19,6 +19,9 @@ class PersistentBrowserSessionStatus(StrEnum):
     retry = "retry"
 
 
+API_BROWSER_SESSION_CREATED_BY = "api"
+
+
 FINAL_STATUSES = (
     PersistentBrowserSessionStatus.completed,
     PersistentBrowserSessionStatus.failed,

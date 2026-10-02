@@ -19,7 +19,7 @@ from pydantic import (
 
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
@@ -721,6 +721,8 @@ class WorkflowCopilotStreamErrorUpdate(BaseModel):
 
 
 class WorkflowCopilotToolCallUpdate(BaseModel):
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
@@ -739,6 +741,9 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
+    activity_started_at: datetime | None = None
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )
@@ -1032,3 +1037,16 @@ class WorkflowYAMLConversionRequest(BaseModel):
 
 class WorkflowYAMLConversionResponse(BaseModel):
     workflow_definition: dict = Field(..., description="Converted workflow definition with blocks")
+
+
+class WorkflowCopilotGoalSuggestionRequest(BaseModel):
+    label: str = Field(..., max_length=256, description="Label of the code block whose Goal is suggested")
+    code: str = Field(..., max_length=200_000, description="The block's code as the person edited it")
+    current_goal: str = Field("", max_length=20_000, description="The block's Goal before the suggestion")
+    parameter_keys: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=500, description="Workflow parameters the block can read"
+    )
+
+
+class WorkflowCopilotGoalSuggestionResponse(BaseModel):
+    goal: str | None = Field(None, description="Suggested Goal written from the code; null when none was produced")

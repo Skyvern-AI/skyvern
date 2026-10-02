@@ -1106,6 +1106,10 @@ class CodeBlockYAML(BlockYAML):
         default=None,
         description="True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
     )
+    code_edited_by_hand: bool | None = Field(
+        default=None,
+        description="True when a person edited this block's code in the editor's code field since the Goal was last confirmed, so the Goal may no longer describe the code. Set by the editor; a value the copilot submits is ignored in favour of the stored one",
+    )
 
     @model_validator(mode="before")
     @classmethod

@@ -1250,11 +1250,11 @@ class _ProgressLedger:
         self.peak_actions_since_progress = max(self.peak_actions_since_progress, self.actions_since_progress)
 
 
-# Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
-# solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
-# complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
-# look while the page went on to show the submission confirmation. Trigger tools are the ones whose
-# page effects can land after their tool result; the window is in loop turns so intervening
+# Failure-evidence gate: finish(failed) and finish(terminated) shortly after a submit-class action or a
+# solve_captcha attempt are held for ONE evidence turn per fresh trigger, because submissions and
+# captcha protocols complete asynchronously — the sampled false-negative verdicts fired 2-7s after
+# the model's last look while the page went on to show the submission confirmation. Trigger tools
+# are the ones whose page effects can land after their tool result; the window is in loop turns so intervening
 # perception does NOT disarm it (the state can flip after the last observe while a protocol is in
 # flight). The true verdict-to-flip latency is unmeasured in the sampled replays: the quiescence
 # wait exits on the first stable fingerprint pair (so honest gated failures pay ~one sample), the
@@ -1477,6 +1477,8 @@ class ActivityRecency:
     tokens_remaining: int | None = None
     last_turn_tokens: int = 0
     last_trigger_turn: int | None = None
+    # Trigger actions can occur more than once in a model turn.
+    failure_evidence_trigger_generation: int = 0
     # True while one more read of some probe, returning what it last returned, would trip the stall
     # terminator: a deferral-forced observe must never be the snapshot that trips it. KNOWN LIMIT: a
     # run that reaches the edge and then stops reading that tool altogether leaves this true for the
@@ -2239,9 +2241,8 @@ def _navigate_record_fields(tool_name: str, args: dict[str, Any], result: ToolRe
     same_page = data.get("same_page")
     if isinstance(same_page, bool):
         fields["same_page"] = same_page
-    # Which fact the `committed_not_loaded` class is about on this row: a document that never became
-    # ready, or a readyState read that failed on a wedged renderer. Present only on that class, so a
-    # rate taken over it can exclude probe failures instead of silently mixing them in.
+    # Whether the readyState read failed; on `committed_not_loaded` it separates a document that never
+    # became ready from a renderer too busy to answer, so a rate query must filter by class.
     readiness_read_failed = data.get("readiness_read_failed")
     if isinstance(readiness_read_failed, bool):
         fields["readiness_read_failed"] = readiness_read_failed
@@ -2354,9 +2355,9 @@ def make_finish_tool(
     is capped at `deadline_at` (time.monotonic clock) and abandoned once `should_cancel` reports
     True, so probing cannot outlive the loop's own bounds.
 
-    The symmetric failure side: when `activity` reports recent submit-class/captcha activity, a
-    finish(failed) is held for ONE evidence turn (`max_failure_deferrals`, per run like the
-    completed-side cap, not per verdict attempt) — a quiescence wait
+    The symmetric non-completed side: when `activity` reports recent submit-class/captcha activity,
+    finish(failed) and finish(terminated) are held for ONE evidence turn (`max_failure_deferrals` per
+    fresh trigger, not per run or verdict attempt) — a quiescence wait
     bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
 
@@ -2365,8 +2366,8 @@ def make_finish_tool(
     run is still awaiting a code it has unspent polling budget for -- a give-up at one 120s slice of
     a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
     the callee (the budget shrinks under every productive hold) and refused here without the deadline
-    headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
-    ungated on both sides.
+    headroom to fund the blocking poll slice it asks for. Terminated verdicts otherwise follow the
+    same evidence gate as failed verdicts.
 
     `pending_marker` reports the text the page still shows the control in `submit_watch` as in
     flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
@@ -2384,6 +2385,7 @@ def make_finish_tool(
     the settle window, and a conversion whose identity changed or could not be read is refused, settled or not."""
     deferrals = 0
     failure_deferrals = 0
+    failure_deferral_trigger_generation: int | None = None
     goal_check_held = False
     reask_asked = False
 
@@ -2558,12 +2560,15 @@ def make_finish_tool(
         )
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, goal_check_held, reask_asked
+        nonlocal deferrals, failure_deferrals, failure_deferral_trigger_generation, goal_check_held, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
                 f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
             )
+        if activity is not None and activity.failure_evidence_trigger_generation != failure_deferral_trigger_generation:
+            failure_deferrals = 0
+            failure_deferral_trigger_generation = activity.failure_evidence_trigger_generation
         if (
             status == "completed"
             and pending_marker is not None
@@ -2759,7 +2764,7 @@ def make_finish_tool(
                         },
                     )
         if (
-            status == "failed"
+            status in ("failed", "terminated")
             and activity is not None
             and page_fingerprint is not None
             and failure_deferrals < max_failure_deferrals
@@ -2795,9 +2800,9 @@ def make_finish_tool(
                 pass  # unknown page state still defers: the model's re-observe is the evidence step
             if should_defer:
                 failure_deferrals += 1
-                LOG.info("taskv3 finish failure deferred for evidence", turn=activity.turn)
+                LOG.info("taskv3 finish failure deferred for evidence", status=status, turn=activity.turn)
                 return ToolResult.error(
-                    "failure verdict held for one evidence check: it follows recent page actions or "
+                    "non-completed verdict held for one evidence check: it follows recent page actions or "
                     "a captcha attempt whose effects can land after your last look — submissions and "
                     "captcha protocols often complete asynchronously, so the page may no longer show "
                     "the state this verdict was based on. Re-observe the page once (waiting briefly "
@@ -4827,6 +4832,7 @@ async def run_agent_tool_loop(
                     st.billable_actions.append(tool_name)
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
+                    activity.failure_evidence_trigger_generation += 1
                 if submit_watch is not None:
                     submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
                     if submit_selector is not None:

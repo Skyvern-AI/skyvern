@@ -5,6 +5,10 @@ from pydantic import BaseModel, ConfigDict
 
 from skyvern.schemas.runs import ProxyLocationInput
 
+PREWARM_BOUND_WORKFLOW_PERMANENT_ID = "debug-session-prewarm"
+PREWARM_PENDING_RUNNABLE_TYPE = "debug_session_prewarm_pending"
+PREWARM_DISPATCHED_RUNNABLE_TYPE = "debug_session_prewarm_dispatched"
+
 DebugSessionStatus = t.Literal["created", "completed"]
 
 

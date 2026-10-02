@@ -42,6 +42,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
@@ -120,7 +121,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.prompts import CreateFromPromptRequest
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
     ModelsResponse,
@@ -133,6 +134,7 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -908,12 +910,28 @@ async def create_workflow_legacy(
         # Override folder_id if provided as query parameter
         if folder_id is not None:
             workflow_create_request.folder_id = folder_id
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
             created_by=user_id,
             edited_by=user_id,
+            return_write_result=True,
         )
+        if changed_fields:
+            await app.AGENT_FUNCTION.record_audit_event(
+                get_request_principal(),
+                AuditEvent(
+                    organization_id=current_org.organization_id,
+                    action="workflow.create",
+                    resource_type="workflow",
+                    resource_id=workflow.workflow_permanent_id,
+                    changed_fields=changed_fields,
+                    related_resource_ids=(workflow_create_request.folder_id,)
+                    if workflow_create_request.folder_id
+                    else (),
+                ),
+            )
+        return workflow
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
@@ -1015,20 +1033,36 @@ async def create_workflow(
                 current_org.organization_id,
                 workflow_definition,
             )
-            return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
                 organization=current_org,
                 request=workflow_definition,
                 new_workflow_permanent_id=workflow_permanent_id,
                 created_by=user_id,
                 edited_by=user_id,
                 resolved_title=resolved_title,
+                return_write_result=True,
             )
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-            organization=current_org,
-            request=workflow_definition,
-            created_by=user_id,
-            edited_by=user_id,
-        )
+        else:
+            workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=current_org,
+                request=workflow_definition,
+                created_by=user_id,
+                edited_by=user_id,
+                return_write_result=True,
+            )
+        if changed_fields:
+            await app.AGENT_FUNCTION.record_audit_event(
+                get_request_principal(),
+                AuditEvent(
+                    organization_id=current_org.organization_id,
+                    action="workflow.create",
+                    resource_type="workflow",
+                    resource_id=workflow.workflow_permanent_id,
+                    changed_fields=changed_fields,
+                    related_resource_ids=(workflow_definition.folder_id,) if workflow_definition.folder_id else (),
+                ),
+            )
+        return workflow
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowCreationLockTimeout as exc:
@@ -1117,6 +1151,17 @@ async def create_workflow_from_prompt(
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
         raise FailedToCreateWorkflow(str(e))
+
+    await app.AGENT_FUNCTION.record_audit_event(
+        get_request_principal(),
+        AuditEvent(
+            organization_id=organization.organization_id,
+            action="workflow.create",
+            resource_type="workflow",
+            resource_id=workflow.workflow_permanent_id,
+            changed_fields=("user_prompt",),
+        ),
+    )
 
     return workflow.model_dump(by_alias=True)
 
@@ -1271,6 +1316,17 @@ async def import_workflow_from_pdf(
         created_by=user_id,
         edited_by=user_id,
     )
+    await app.AGENT_FUNCTION.record_audit_event(
+        get_request_principal(),
+        AuditEvent(
+            organization_id=current_org.organization_id,
+            action="workflow.create",
+            resource_type="workflow",
+            resource_id=empty_workflow.workflow_permanent_id,
+            changed_fields=("pdf_import",),
+            related_resource_ids=(folder_id,) if folder_id else (),
+        ),
+    )
 
     # Process PDF import in background (LLM call is the slow part)
     async def process_pdf_import() -> None:
@@ -1382,12 +1438,13 @@ async def update_workflow_legacy(
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
+            return_write_result=True,
         )
     except WorkflowDefinitionValidationException as e:
         log_save_rejected(e)
@@ -1407,7 +1464,18 @@ async def update_workflow_legacy(
             organization_id=current_org.organization_id,
         )
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
-    await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+    if changed_fields:
+        await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+        await app.AGENT_FUNCTION.record_audit_event(
+            get_request_principal(),
+            AuditEvent(
+                organization_id=current_org.organization_id,
+                action="workflow.update",
+                resource_type="workflow",
+                resource_id=workflow.workflow_permanent_id,
+                changed_fields=changed_fields,
+            ),
+        )
     return workflow
 
 
@@ -1470,12 +1538,13 @@ async def update_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
-        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
+            return_write_result=True,
         )
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
@@ -1492,7 +1561,18 @@ async def update_workflow(
             workflow_permanent_id=workflow_id,
         )
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
-    await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+    if changed_fields:
+        await app.AGENT_FUNCTION.on_workflow_updated_by_user(current_org.organization_id, user_id, workflow)
+        await app.AGENT_FUNCTION.record_audit_event(
+            get_request_principal(),
+            AuditEvent(
+                organization_id=current_org.organization_id,
+                action="workflow.update",
+                resource_type="workflow",
+                resource_id=workflow.workflow_permanent_id,
+                changed_fields=changed_fields,
+            ),
+        )
     return workflow
 
 
@@ -1533,7 +1613,20 @@ async def delete_workflow(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
-    await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
+    deleted_workflow_id = await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(
+        workflow_id, current_org.organization_id
+    )
+    if deleted_workflow_id is None:
+        return
+    await app.AGENT_FUNCTION.record_audit_event(
+        get_request_principal(),
+        AuditEvent(
+            organization_id=current_org.organization_id,
+            action="workflow.delete",
+            resource_type="workflow",
+            resource_id=deleted_workflow_id,
+        ),
+    )
 
 
 ################# Folder Endpoints #################
@@ -1611,7 +1704,6 @@ async def get_folder(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
     )
-
     return Folder(
         folder_id=folder.folder_id,
         organization_id=folder.organization_id,
@@ -1748,7 +1840,6 @@ async def update_folder(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
     )
-
     return Folder(
         folder_id=folder.folder_id,
         organization_id=folder.organization_id,
@@ -3489,29 +3580,28 @@ async def get_run_timeline(
 ) -> list[WorkflowRunTimeline]:
     analytics.capture("skyvern-oss-run-timeline-get")
     cap_output_values = caps_run_response_values(x_user_agent)
+    organization_id = current_org.organization_id
 
-    # Check if the run exists. Capped even though the response is discarded: building it
-    # uncapped walks and URL-refreshes the full output for nothing.
-    run_response = await run_service.get_run_response(
-        run_id, organization_id=current_org.organization_id, cap_output_values=cap_output_values
-    )
-    if not run_response:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Run not found {run_id}",
-        )
-
-    # Handle workflow runs directly
-    if run_response.run_type == RunType.workflow_run:
+    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
+    if not run:
+        # A task v2's own workflow run has no task_runs row.
+        task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(run_id, organization_id=organization_id)
+        if not task_v2:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail=f"Run not found {run_id}",
+            )
         return await _flatten_workflow_run_timeline(
-            current_org.organization_id, run_id, cap_output_values=cap_output_values
+            organization_id, run_id, cap_output_values=cap_output_values, task_v2=task_v2
         )
 
-    # Handle task_v2 runs by getting their associated workflow_run_id
-    if run_response.run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.observer.get_task_v2(
-            task_v2_id=run_id, organization_id=current_org.organization_id
-        )
+    # task_runs alone decides the run type; the run's own row is not re-read, so an orphaned task_runs row
+    # gets the timeline builder's answer (an empty list for a workflow run) or the 400, not a 404.
+    if run.task_run_type == RunType.workflow_run:
+        return await _flatten_workflow_run_timeline(organization_id, run_id, cap_output_values=cap_output_values)
+
+    if run.task_run_type == RunType.task_v2:
+        task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id=run_id, organization_id=organization_id)
         if not task_v2:
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
@@ -3525,13 +3615,12 @@ async def get_run_timeline(
             )
 
         return await _flatten_workflow_run_timeline(
-            current_org.organization_id, task_v2.workflow_run_id, cap_output_values=cap_output_values
+            organization_id, task_v2.workflow_run_id, cap_output_values=cap_output_values, task_v2=task_v2
         )
 
-    # Timeline not available for other run types
     raise HTTPException(
         status_code=http_status.HTTP_400_BAD_REQUEST,
-        detail=f"Timeline not available for run type {run_response.run_type}",
+        detail=f"Timeline not available for run type {run.task_run_type}",
     )
 
 
@@ -4225,6 +4314,27 @@ async def get_tasks(
     return ORJSONResponse([(await app.agent.build_task_response(task=task)).model_dump() for task in tasks])
 
 
+_RUN_IDENTIFIER_SEARCH_DESCRIPTION = (
+    "A complete browser profile ID, browser session ID or credential ID matches the run that used it "
+    "exactly (no substring match). A complete browser profile or browser session ID is matched against "
+    "those identifiers only, not the text fields. A credential ID matches when it is the run's "
+    "sequential credential, the credential the run selected from a pool or fell back to, or the "
+    "credential bound by a credential parameter on the run's workflow version when the run was created "
+    "and the run recorded no selection for it."
+)
+_RUN_SEARCH_KEY_DESCRIPTION = (
+    "Case-insensitive substring search across: workflow run ID, "
+    "parameter key, parameter description, run parameter value, "
+    "extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. "
+    "Soft-deleted parameter definitions are excluded from key/description matching. "
+    + _RUN_IDENTIFIER_SEARCH_DESCRIPTION
+)
+_WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION = (
+    _RUN_SEARCH_KEY_DESCRIPTION + " The workflow title and workflow permanent ID are matched as well."
+)
+_RUN_SEARCH_KEY_EXAMPLES = ["login_url", "wr_abc123", "bp_123456789", "cred_123456789"]
+
+
 @legacy_base_router.get(
     "/runs",
     tags=["agent"],
@@ -4245,13 +4355,8 @@ async def get_runs(
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
-        description=(
-            "Case-insensitive substring search across: workflow run ID, "
-            "parameter key, parameter description, run parameter value, "
-            "and extra HTTP headers. A run is returned if any of these fields match. "
-            "Soft-deleted parameter definitions are excluded from key/description matching."
-        ),
-        examples=["login_url", "credential_value", "wr_abc123"],
+        description=_RUN_SEARCH_KEY_DESCRIPTION,
+        examples=_RUN_SEARCH_KEY_EXAMPLES,
     ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
@@ -4368,8 +4473,14 @@ async def get_runs_v2(
     search_key: str | None = Query(
         None,
         min_length=3,
-        description="Case-insensitive substring search (min 3 chars for trigram index).",
-        examples=["login_url", "wr_abc123"],
+        description=(
+            "Case-insensitive substring search (min 3 chars for trigram index) across the run's title, "
+            "URL, run ID, agent (workflow) ID and inputs, plus a workflow run's webhook callback URL. "
+            + _RUN_IDENTIFIER_SEARCH_DESCRIPTION
+            + " Browser profile and credential IDs apply to workflow runs; a browser session ID also "
+            "matches a standalone task that used it."
+        ),
+        examples=_RUN_SEARCH_KEY_EXAMPLES,
     ),
     run_type: Annotated[list[RunType] | None, Query()] = None,
     workflow_permanent_id: Annotated[
@@ -4687,12 +4798,27 @@ async def run_workflow_legacy(
         "| Searched field | Description |\n"
         "|---|---|\n"
         "| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n"
+        "| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n"
+        "| Workflow **title** | The title of the workflow that ran |\n"
         "| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n"
         "| Parameter **description** | The `description` of any workflow parameter definition |\n"
         "| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n"
-        "| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\n"
+        "| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n"
+        "| `webhook_callback_url` | The webhook URL the run posts its result to |\n\n"
         "Soft-deleted parameter definitions are excluded from key/description matching. "
         "A run is returned if **any** of the fields above contain the search term.\n\n"
+        "A **complete** identifier also matches the run that used it, by exact equality:\n\n"
+        "| Identifier | Description |\n"
+        "|---|---|\n"
+        "| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n"
+        "| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n"
+        "| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n\n"
+        "A complete browser profile or browser session id is matched against those identifiers only, not "
+        "the text fields above. "
+        "A credential id matches a run when it is the run's sequential credential, the credential the run "
+        "selected from a pool or fell back to, or the credential bound by a credential parameter on the "
+        "run's workflow version when the run was created and the run recorded no selection for that "
+        "parameter. Other pool and fallback members the run did not use do not match.\n\n"
         "### error_code\n\n"
         "An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. "
         "A run matches if **any** of its tasks contains an error object with a matching `error_code` value. "
@@ -4734,13 +4860,8 @@ async def get_workflow_runs(
     search_key: str | None = Query(
         None,
         max_length=500,
-        description=(
-            "Case-insensitive substring search across: workflow run ID, "
-            "parameter key, parameter description, run parameter value, "
-            "and extra HTTP headers. A run is returned if any of these fields match. "
-            "Soft-deleted parameter definitions are excluded from key/description matching."
-        ),
-        examples=["login_url", "credential_value", "wr_abc123"],
+        description=_WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION,
+        examples=_RUN_SEARCH_KEY_EXAMPLES,
     ),
     error_code: str | None = Query(
         None,
@@ -4761,9 +4882,18 @@ async def get_workflow_runs(
 
     **search_key** performs a case-insensitive substring match across:
     - `workflow_run_id` — the unique run identifier
+    - `workflow_permanent_id` and the workflow **title**
     - Parameter **key** and **description** from workflow parameter definitions (soft-deleted parameters excluded)
     - Run parameter **value** — the actual value supplied when the run was created
     - `extra_http_headers` — searched as raw JSON text
+    - `webhook_callback_url` — the webhook URL the run posts its result to
+
+    A **complete** `browser_profile_id`, `browser_session_id` or credential ID matches the run that used
+    it by exact equality. A complete browser profile or browser session ID is matched against those
+    identifiers only, not the text fields above. A credential ID matches when it is the run's sequential
+    credential, the credential the run selected from a pool or fell back to, or the credential bound by a
+    credential parameter on the run's workflow version when the run was created and the run recorded no
+    selection for that parameter.
 
     **error_code** performs an exact match against the `error_code` field in the `errors`
     JSON array on each task. A run matches if *any* of its tasks has a matching error code.
@@ -4773,6 +4903,7 @@ async def get_workflow_runs(
     - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
     - Runs matching a parameter value: `?search_key=https://example.com`
     - Runs matching a run ID: `?search_key=wr_abc123`
+    - Runs that used a credential: `?search_key=cred_123456789`
     - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
@@ -4790,10 +4921,7 @@ _WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
     "List runs for a specific workflow.\n\n"
     "Supports filtering by **status**, **search_key**, and **error_code**. "
     "All filters are combined with **AND** logic.\n\n"
-    "### search_key\n\n"
-    "Case-insensitive substring search across: workflow run ID, "
-    "parameter key, parameter description, run parameter value, "
-    "and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n"
+    "### search_key\n\n" + _WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION + "\n\n"
     "### error_code\n\n"
     "Exact-match filter on the `error_code` field inside each task's `errors` JSON array. "
     "A run matches if any of its tasks contains an error with a matching `error_code`."
@@ -4861,13 +4989,8 @@ async def get_workflow_runs_by_id(
     search_key: str | None = Query(
         None,
         max_length=500,
-        description=(
-            "Case-insensitive substring search across: workflow run ID, "
-            "parameter key, parameter description, run parameter value, "
-            "and extra HTTP headers. A run is returned if any of these fields match. "
-            "Soft-deleted parameter definitions are excluded from key/description matching."
-        ),
-        examples=["login_url", "credential_value", "wr_abc123"],
+        description=_WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION,
+        examples=_RUN_SEARCH_KEY_EXAMPLES,
     ),
     error_code: str | None = Query(
         None,
@@ -4960,13 +5083,8 @@ async def get_workflow_runs_by_id_legacy(
     search_key: str | None = Query(
         None,
         max_length=500,
-        description=(
-            "Case-insensitive substring search across: workflow run ID, "
-            "parameter key, parameter description, run parameter value, "
-            "and extra HTTP headers. A run is returned if any of these fields match. "
-            "Soft-deleted parameter definitions are excluded from key/description matching."
-        ),
-        examples=["login_url", "credential_value", "wr_abc123"],
+        description=_WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION,
+        examples=_RUN_SEARCH_KEY_EXAMPLES,
     ),
     error_code: str | None = Query(
         None,
@@ -6076,14 +6194,17 @@ async def _flatten_workflow_run_timeline_recursive(
 
 
 async def _flatten_workflow_run_timeline(
-    organization_id: str, workflow_run_id: str, cap_output_values: bool = False
+    organization_id: str,
+    workflow_run_id: str,
+    cap_output_values: bool = False,
+    task_v2: TaskV2 | None = None,
 ) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
     """
 
-    # get task v2 by workflow run id
-    task_v2_obj = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+    # None means not looked up yet, not that the run has no task v2.
+    task_v2_obj = task_v2 or await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )

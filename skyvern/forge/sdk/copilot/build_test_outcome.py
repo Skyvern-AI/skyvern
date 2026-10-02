@@ -46,6 +46,8 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.utils.captcha_solver import ChallengeArm, ChallengePageState, ChallengeStatus
 
 LOG = structlog.get_logger()
 
@@ -328,6 +330,19 @@ class BuildTestPacketFailure(BaseModel):
     locator_observations: list[BuildTestPacketLocatorObservation] = Field(default_factory=list)
 
 
+class BuildTestPacketAiFallbackBlock(BaseModel):
+    """A block whose code failed and that the AI fallback then handled; ``failure_text`` is the code's own error."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str | None = None
+    status: str
+    task_id: str | None = None
+    failing_line: int | None = None
+    failure_text: str | None = None
+    recovery_failure_text: str | None = None
+
+
 class BuildTestPacketRegisteredOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -391,6 +406,46 @@ SolverResult = Literal["failed", "not_solved", "attempted", "not_attempted", "un
 SOLVER_RESULTS: frozenset[str] = frozenset(get_args(SolverResult))
 
 
+class SolverReceipt(BaseModel):
+    """The shared solver's own typed receipt for one ``solve_captcha`` call; ``vendor`` is never page text."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    status: ChallengeStatus
+    vendor: str | None = None
+    arm: ChallengeArm | None = None
+    page_state: ChallengePageState = "not_rechecked"
+
+
+def solver_receipt(value: object) -> SolverReceipt | None:
+    try:
+        return SolverReceipt.model_validate(value)
+    except ValidationError:
+        return None
+
+
+_UNFINISHED_BLOCK_STATUSES = frozenset(
+    {BlockStatus.failed.value, BlockStatus.terminated.value, BlockStatus.timed_out.value, BlockStatus.canceled.value}
+)
+
+
+def governing_solver_receipt(block_rows: Sequence[Mapping[str, object]]) -> SolverReceipt | None:
+    """The newest ``solve_captcha`` receipt in the last block that did not finish, so a completed finally block
+    after it never hides it; blocks are chronological and each trace is newest-first."""
+    stopped = next(
+        (row for row in reversed(block_rows) if str(row.get("status") or "").lower() in _UNFINISHED_BLOCK_STATUSES),
+        None,
+    )
+    trace = stopped.get("action_trace") if stopped is not None else None
+    if not isinstance(trace, list):
+        return None
+    solver_row = next(
+        (entry for entry in trace if isinstance(entry, Mapping) and entry.get("action") == ActionType.SOLVE_CAPTCHA),
+        None,
+    )
+    return solver_receipt(solver_row.get("challenge")) if solver_row is not None else None
+
+
 class SolverFacts(TypedDict):
     attempted: bool
     result: SolverResult
@@ -399,6 +454,7 @@ class SolverFacts(TypedDict):
 
 class SolverAttempt(SolverFacts, total=False):
     code_block: SolverFacts
+    receipt: dict[str, str | None]
 
 
 class ChallengeEffects(BaseModel):
@@ -414,6 +470,7 @@ class ChallengeEffects(BaseModel):
     solver_attempted: bool | None = None
     solver_result: SolverResult | None = None
     solver_failure: str | None = None
+    solver_receipt: SolverReceipt | None = None
     frame_hosts: list[str] | None = Field(default=None, max_length=MAX_CHALLENGE_FRAME_HOSTS)
 
 
@@ -474,6 +531,13 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
         else:
             outcome = "whether this run called `solve_captcha` is unresolved, so do not state either way"
         notices.append(f"challenge: {kind}; {availability}; {outcome}.")
+    receipt = challenge.solver_receipt if challenge is not None else None
+    if receipt is not None:
+        notices.append(
+            f"solver receipt: the newest `solve_captcha` call reported status `{receipt.status.value}`, vendor "
+            f"`{receipt.vendor or 'not identified'}`, arm `{receipt.arm or 'none'}`, and page state "
+            f"`{receipt.page_state}` after its last arm."
+        )
     if levers:
         names = ", ".join(lever.mechanism for lever in levers)
         notices.append(
@@ -655,6 +719,7 @@ class BuildTestEvidencePacket(BaseModel):
     challenge: ChallengeEffects | None = None
     levers: list[Lever] = Field(default_factory=list)
     challenge_notices: list[str] = Field(default_factory=list)
+    ai_fallback_blocks: list[BuildTestPacketAiFallbackBlock] | None = None
 
 
 class CodeSafetyRejectionFact(BaseModel):
@@ -733,6 +798,7 @@ class RecordedBuildTestOutcome(BaseModel):
     display_text: str = ""
     observed_page_value_excerpt: str = ""
     key_provenance: dict[str, str] = Field(default_factory=dict)
+    ai_fallback_blocks: list[BuildTestPacketAiFallbackBlock] | None = None
 
     @property
     def structural_key_payload(self) -> dict[str, object] | None:

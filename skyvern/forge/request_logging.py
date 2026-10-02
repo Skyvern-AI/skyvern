@@ -164,6 +164,7 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
         fields["user_id"] = identity.principal.user_id
         fields["org_role"] = identity.principal.org_role
         fields["org_role_claim"] = identity.principal.org_role_claim
+        fields["token_has_organization_claim"] = identity.principal.token_has_organization_claim
         fields["bearer_identity_status"] = identity.bearer_identity_status
         fields["principal_resolution_conflict"] = identity.principal_resolution_conflict
     return fields

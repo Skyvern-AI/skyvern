@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import structlog
@@ -70,6 +71,34 @@ class NarrativeDraft(TypedDict):
     summary: str | None
 
 
+USER_FACING_REASON_PARAM = "user_facing_reason"
+USER_FACING_REASON_SCHEMA = {
+    "type": ["string", "null"],
+    "description": (
+        "A short user-facing sentence explaining what this action is intended to accomplish. "
+        "This is displayed above this action while it runs; write it with the ordinary action arguments, "
+        "in product language without secrets. Null or absence is accepted when no useful explanation is available."
+    ),
+}
+
+
+def normalize_action_reason(value: Any) -> str | None:
+    """Untrusted JSON metadata never changes ordinary action validation."""
+    return value.strip() or None if isinstance(value, str) else None
+
+
+class DesignActivityBucket(TypedDict):
+    kind: Literal["design"]
+
+
+class BlockActivityBucket(TypedDict):
+    kind: Literal["block"]
+    workflow_run_block_id: str
+
+
+ActivityBucket = DesignActivityBucket | BlockActivityBucket
+
+
 # Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
 # present only for tool_call/tool_result and success only for tool_result.
 class NarrativeActivityEntry(TypedDict):
@@ -79,8 +108,9 @@ class NarrativeActivityEntry(TypedDict):
     toolName: NotRequired[str]
     displayLabel: NotRequired[str]
     success: NotRequired[bool]
-    # activeLabel reads while the step runs; outcomeLabel replaces it once
-    # finished. Absent when the narrator did not speak, leaving displayLabel.
+    reason: NotRequired[str]
+    activityStartedAt: NotRequired[str]
+    activityBucket: NotRequired[ActivityBucket]
     activeLabel: NotRequired[str]
     outcomeLabel: NotRequired[str]
     codeDiffs: NotRequired[list[CodeWriteDiff]]
@@ -392,7 +422,9 @@ class PageObstruction(BaseModel):
     text: str | None = None
     visual_location: str | None = None
     underlying_page_blocked: bool | None = None
+    intercepts_outside_control: bool | None = None
     visible_controls: list[PageObstructionControl] = Field(default_factory=list)
+    visible_controls_omitted: int | None = None
 
 
 SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP = 2500
@@ -1141,6 +1173,9 @@ class InFlightStreamToolCall:
     tool_name: str
     iteration: int
     display_label: str | None = None
+    reason: str | None = None
+    started_at: datetime | None = None
+    activity_bucket: ActivityBucket | None = None
 
 
 @dataclass
@@ -1246,6 +1281,9 @@ class CopilotContext(AgentContext):
     # the satisfying tool's tool_output event flushes; these carry what the
     # exit path needs to emit the missing TOOL_RESULT frame.
     in_flight_stream_tool_call: InFlightStreamToolCall | None = None
+    stream_tool_calls: dict[str, InFlightStreamToolCall] = field(default_factory=dict)
+    pending_stream_tool_call_ids: set[str] = field(default_factory=set)
+    goal_satisfied_tool_call_id: str | None = None
     goal_satisfied_tool_name: str | None = None
     goal_satisfied_tool_output: dict[str, Any] | None = None
     # Stashed by the write seam under the id of the tool call that produced it, and drained by

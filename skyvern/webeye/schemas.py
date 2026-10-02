@@ -13,6 +13,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    API_BROWSER_SESSION_CREATED_BY,
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
@@ -243,5 +244,7 @@ class BrowserSessionResponse(BaseModel):
             browser_type=browser_session.browser_type,
             browser_profile_id=browser_session.browser_profile_id,
             generate_browser_profile=browser_session.generate_browser_profile,
-            created_by=browser_session.created_by,
+            created_by=(
+                None if browser_session.created_by == API_BROWSER_SESSION_CREATED_BY else browser_session.created_by
+            ),
         )

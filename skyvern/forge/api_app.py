@@ -59,6 +59,7 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     fingerprint_token,
     regenerate_local_api_key,
 )
+from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
@@ -496,28 +497,77 @@ def create_api_app() -> FastAPI:
     # remove either as a "duplicate". ``include_in_schema=False`` keeps the OAuth
     # endpoints out of the public OpenAPI/Swagger surface — they're consumed by
     # the frontend, not by SDK users.
-    fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
-    fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
-    fastapi_app.include_router(microsoft_oauth_router, prefix="/v1/microsoft", include_in_schema=False)
-    fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
-    fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
-    fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
+    fastapi_app.include_router(
+        google_oauth_router, prefix="/v1/google", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        google_oauth_router,
+        prefix="/api/v1/google",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        microsoft_oauth_router,
+        prefix="/v1/microsoft",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        microsoft_oauth_router,
+        prefix="/api/v1/microsoft",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        google_sheets_router,
+        prefix="/v1/google/sheets",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        google_sheets_router,
+        prefix="/api/v1/google/sheets",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
     # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
     # the handler) and the org-scoped integration management routes. Same
     # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
-    fastapi_app.include_router(sms_inbound_router, prefix="/v1/sms", include_in_schema=False)
-    fastapi_app.include_router(sms_inbound_router, prefix="/api/v1/sms", include_in_schema=False)
-    fastapi_app.include_router(twilio_integration_router, prefix="/v1/integrations/twilio", include_in_schema=False)
-    fastapi_app.include_router(twilio_integration_router, prefix="/api/v1/integrations/twilio", include_in_schema=False)
+    fastapi_app.include_router(
+        sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        sms_inbound_router, prefix="/api/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        twilio_integration_router,
+        prefix="/v1/integrations/twilio",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        twilio_integration_router,
+        prefix="/api/v1/integrations/twilio",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
 
     # local dev endpoints
     if settings.ENV == "local":
-        fastapi_app.include_router(internal_auth.router, prefix="/v1")
-        fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
-        fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
-        fastapi_app.include_router(internal_llms.router, prefix="/v1")
-        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
-        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_auth.router, prefix="/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY])
+        fastapi_app.include_router(
+            internal_auth.router, prefix="/api/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(
+            internal_auth.router, prefix="/api/v2", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(internal_llms.router, prefix="/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY])
+        fastapi_app.include_router(
+            internal_llms.router, prefix="/api/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(
+            internal_llms.router, prefix="/api/v2", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
