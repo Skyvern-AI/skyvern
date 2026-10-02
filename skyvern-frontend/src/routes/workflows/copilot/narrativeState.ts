@@ -347,6 +347,9 @@ export interface ActivityEntry {
   // Server-computed line delta per code block this write changed. Absent on
   // every other row and on payloads from a backend that predates it.
   codeDiffs?: CodeWriteDiff[];
+  // A successful run_browser_code result's operations as display phrases,
+  // in order. Absent on every other row.
+  browserSteps?: string[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -577,7 +580,7 @@ export interface TurnWorkPlan {
   items: string[];
 }
 
-function parseWorkPlanItems(value: unknown): string[] | null {
+function parseStringList(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === "string")
     ? [...value]
     : null;
@@ -586,7 +589,7 @@ function parseWorkPlanItems(value: unknown): string[] | null {
 function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
-  const items = parseWorkPlanItems(o.items);
+  const items = parseStringList(o.items);
   return typeof o.toolCallId === "string" && o.toolCallId && items
     ? { toolCallId: o.toolCallId, items }
     : null;
@@ -772,6 +775,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
   extend_browser_session: "Extending the browser session",
+  run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
   add_block: "Adding block",
@@ -909,6 +913,7 @@ function buildActivityFromToolResult(
     success: event.success,
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
+    browserSteps: parseStringList(event.browser_steps) ?? undefined,
     reason: actionReason(event.reason),
     activityBucket: parseActivityBucket(event.activity_bucket),
     activityStartedAt: event.activity_started_at ?? undefined,
@@ -1516,7 +1521,7 @@ export function applyNarrativeEvent(
     }
 
     case "tool_result": {
-      const planItems = parseWorkPlanItems(event.work_plan);
+      const planItems = parseStringList(event.work_plan);
       const workPlan = planItems
         ? { toolCallId: event.tool_call_id, items: planItems }
         : prev.workPlan;
@@ -1685,6 +1690,7 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.activeLabel === "string" ? o.activeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
+      browserSteps: parseStringList(o.browserSteps) ?? undefined,
       id: o.id,
       reason: actionReason(o.reason),
       activityBucket: parseActivityBucket(o.activityBucket),
