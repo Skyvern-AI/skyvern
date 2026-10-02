@@ -551,9 +551,6 @@ class Settings(BaseSettings):
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
-    # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
-    # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
-    TASK_V3_CUSTOMER_PRECEDENCE: bool = False
     # Ask a separate judge model, before accepting finish(status=completed), whether the page and the
     # recent tool results contradict the goal (SKY-16928). On its own this is shadow mode: the verdict is
     # logged and the outcome never changes. With TASK_V3_GOAL_CHECK_ENFORCE also on, a contradicted

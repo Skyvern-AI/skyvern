@@ -17,7 +17,6 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 LOG = structlog.get_logger()
 
 DATE_SEGMENT_AIM_FLAG = "TASK_V3_DATE_SEGMENT_AIM"
-CUSTOMER_PRECEDENCE_FLAG = "TASK_V3_CUSTOMER_PRECEDENCE"
 EXTRACTION_REPORTS_FLAG = "TASK_V3_EXTRACTION_REPORTS"
 GOAL_CHECK_FLAG = "TASK_V3_GOAL_CHECK"
 GOAL_CHECK_ENFORCE_FLAG = "TASK_V3_GOAL_CHECK_ENFORCE"
@@ -25,9 +24,7 @@ HUMANIZED_INPUT_FLAG = "TASK_V3_HUMANIZED_INPUT"
 
 # Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The
 # PostHog preflight (scripts/check_run_arm_flags.py) reads this mapping to accept release conditions on them.
-RUN_ARM_EXTRA_PROPERTIES: dict[str, tuple[str, ...]] = {
-    CUSTOMER_PRECEDENCE_FLAG: ("workflow_permanent_id",),
-}
+RUN_ARM_EXTRA_PROPERTIES: dict[str, tuple[str, ...]] = {}
 
 
 def _pinned_arm(context: skyvern_context.SkyvernContext, flag: str, distinct_id: str) -> RunArm | None:
