@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol, TypedDict
 
-import aiohttp
 import httpx
 import structlog
 from cachetools import TTLCache
@@ -224,7 +223,7 @@ class TOTPVerificationResponse:
     """Normalized response shape for the TOTP verification seam.
 
     Decouples the seam contract from any specific HTTP client so the OSS
-    direct path (aiohttp) and the cloud proxy path (NATEgressProxyClient)
+    direct path (pinned httpx) and the cloud proxy path (NATEgressProxyClient)
     can both produce a response the helper consumes the same way.
     """
 
@@ -2665,15 +2664,28 @@ class AgentFunction:
         headers: dict[str, str],
         timeout_seconds: float = 30.0,
         organization_id: str | None = None,
+        resolved_ips: tuple[str, ...] | None = None,
+        method: str = "POST",
     ) -> TOTPVerificationResponse:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
-            async with session.post(url, data=payload, headers=headers) as response:
-                body = await response.text()
-                return TOTPVerificationResponse(
-                    status_code=response.status,
-                    body=body,
-                    headers=dict(response.headers),
+        # Redirects are left to the caller, which validates and pins each hop. httpx timeouts are per
+        # operation, so a slow-drip endpoint needs the outer cap to stay within the budget.
+        try:
+            async with asyncio.timeout(timeout_seconds), pinned_ip_client(resolved_ips) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    content=payload or None,
+                    headers=headers,
+                    timeout=httpx.Timeout(timeout_seconds),
                 )
+        except TimeoutError as e:
+            raise httpx.ReadTimeout(f"TOTP verification request exceeded {timeout_seconds}s") from e
+        return TOTPVerificationResponse(
+            status_code=response.status_code,
+            body=response.text,
+            # Original casing, as the earlier aiohttp path returned; otp_service's Content-Type gate is case-sensitive.
+            headers={key.decode("latin-1"): value.decode("latin-1") for key, value in response.headers.raw},
+        )
 
     async def upload_file_to_customer_storage(
         self,

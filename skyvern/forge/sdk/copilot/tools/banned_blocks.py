@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from skyvern.schemas.runs import RunEngine
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS
 
@@ -664,6 +665,7 @@ def _validator_relevant_fingerprint(block: Mapping[str, object]) -> tuple[object
     return (
         block_type,
         block.get("engine"),
+        bool(block.get("engine_pinned")),
         block.get("complete_on_download"),
         block.get("loop_variable_reference"),
         block.get("loop_over_parameter_key"),
@@ -838,25 +840,56 @@ class AuthoringValidation:
     workflow_yaml: str = ""
 
 
-def _prior_block_engines(prior_workflow_yaml: str | None) -> dict[str, str]:
-    """The engine each prior label already runs on."""
-    engines: dict[str, str] = {}
-    for label, block in _walk_labelled_blocks(_parse_workflow_blocks(prior_workflow_yaml) or []):
-        engine = block.get("engine")
-        if label is not None and isinstance(engine, str) and engine:
-            engines[label] = engine
-    return engines
+def _carry_engine_pins(blocks: list[Any], prior_blocks: Mapping[str, Mapping[str, object]]) -> bool:
+    """Keep a person's skyvern-1.0 pin on a block re-emitted at skyvern-1.0 without the marker."""
+    carried = False
+    for label, block in _walk_labelled_blocks(blocks):
+        prior = prior_blocks.get(label) if label is not None else None
+        if (
+            prior is not None
+            and prior.get("engine_pinned")
+            and isinstance(block, dict)
+            and block.get("engine") == RunEngine.skyvern_v1.value
+            and not block.get("engine_pinned")
+        ):
+            block["engine_pinned"] = True
+            carried = True
+    return carried
+
+
+def _strip_unearned_pins(blocks: list[Any], prior_blocks: Mapping[str, Mapping[str, object]]) -> bool:
+    """A marker survives only where the prior block already carried it at skyvern-1.0 and the block stays there.
+
+    The marker records a person's pick, so a model submission can keep one but never create one.
+    """
+    stripped = False
+    for label, block in _walk_labelled_blocks(blocks):
+        if not isinstance(block, dict) or "engine_pinned" not in block:
+            continue
+        prior = prior_blocks.get(label) if label is not None else None
+        earned = (
+            prior is not None
+            and prior.get("engine_pinned") is True
+            and prior.get("engine") == RunEngine.skyvern_v1.value
+            and block.get("engine") == RunEngine.skyvern_v1.value
+            and block.get("engine_pinned") is True
+        )
+        if not earned:
+            block.pop("engine_pinned")
+            stripped = True
+    return stripped
 
 
 def _pin_agent_block_engines(
     changed: list[tuple[str, Mapping[str, object]]],
-    prior_engines: Mapping[str, str],
+    prior_blocks: Mapping[str, Mapping[str, object]],
 ) -> bool:
     """Fill the engine on every changed agent-family block that names none.
 
-    A label the workflow already had keeps the engine it already ran on: omitting the field is how a
-    whole-document write carries a block it did not touch, not a request to move it to another
-    engine. Only a label the workflow did not have is pinned to Task V3.
+    A label the workflow already had keeps the engine it already ran on, and a person's skyvern-1.0
+    pin with it: omitting the field is how a whole-document write carries a block it did not touch,
+    and the prior is the editor's current draft, where a Default pick already has no engine. Only a
+    label the workflow did not have is pinned to Task V3.
     """
     pinned = False
     for label, block in changed:
@@ -864,8 +897,16 @@ def _pin_agent_block_engines(
         if not isinstance(raw_type, str) or not isinstance(block, dict):
             continue
         block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
-        if block_type in _AGENT_FAMILY_BLOCK_TYPES and not block.get("engine"):
-            block["engine"] = prior_engines.get(label, _TASK_V3_ENGINE)
+        if block_type not in _AGENT_FAMILY_BLOCK_TYPES or block.get("engine"):
+            continue
+        prior = prior_blocks.get(label)
+        if prior is None:
+            block["engine"] = _TASK_V3_ENGINE
+            pinned = True
+        elif isinstance(prior.get("engine"), str) and prior["engine"]:
+            block["engine"] = prior["engine"]
+            if prior.get("engine_pinned") and prior["engine"] == RunEngine.skyvern_v1.value:
+                block["engine_pinned"] = True
             pinned = True
     return pinned
 
@@ -891,6 +932,12 @@ def reject_authoring_violations(
         parsed = None
     definition = parsed.get("workflow_definition") if isinstance(parsed, dict) else None
     blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    prior_blocks = {
+        label: block
+        for label, block in _walk_labelled_blocks(_parse_workflow_blocks(prior_yaml) or [])
+        if label is not None
+    }
+    carried_pins = isinstance(blocks, list) and _carry_engine_pins(blocks, prior_blocks)
     changed = _changed_blocks_in(blocks, prior_yaml, capability) if isinstance(blocks, list) else []
     violations: list[AuthoringPolicyViolation] = []
     run_names = workflow_run_names(submitted_yaml)
@@ -902,13 +949,10 @@ def reject_authoring_violations(
     )
     if not violations:
         workflow_yaml = submitted_yaml
-        if isinstance(parsed, dict) and _pin_agent_block_engines(changed, _prior_block_engines(prior_yaml)):
+        filled_engines = _pin_agent_block_engines(changed, prior_blocks)
+        stripped_pins = isinstance(blocks, list) and _strip_unearned_pins(blocks, prior_blocks)
+        if isinstance(parsed, dict) and (carried_pins or filled_engines or stripped_pins):
             workflow_yaml = dump_workflow_yaml(parsed)
-        prior_blocks = {
-            label: block
-            for label, block in _walk_labelled_blocks(_parse_workflow_blocks(prior_yaml) or [])
-            if label is not None
-        }
         changed_ids = {id(block) for _label, block in changed}
         rewritten = [
             (label, block)

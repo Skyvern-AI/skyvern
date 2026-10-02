@@ -1941,6 +1941,10 @@ def _engine_is_unset(engine: RunEngine | None) -> bool:
     return engine is None
 
 
+def _engine_pin_is_unset(engine_pinned: bool) -> bool:
+    return not engine_pinned
+
+
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
@@ -1948,6 +1952,9 @@ class BaseTaskBlock(Block):
     # Left out of the dump when unset, so a stored definition stays readable by an image whose engine
     # field still rejects null (a rollout or a revert).
     engine: RunEngine | None = Field(default=None, exclude_if=_engine_is_unset)
+    # A person chose skyvern-1.0. Before the chosen-engine cutoff a stored skyvern-1.0 without this is
+    # usually the old editor's spelling of Default, so only a marked one is honored as a pin.
+    engine_pinned: bool = Field(default=False, exclude_if=_engine_pin_is_unset)
     complete_criterion: str | None = None
     complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
@@ -2039,7 +2046,7 @@ class BaseTaskBlock(Block):
         the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
         engine is honored as-authored, and a block the eligibility check never saw is left alone;
         neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
-        chosen engine, where an explicit skyvern_v1 is a pin too.
+        chosen engine or on a block whose skyvern_v1 a person pinned.
         """
         declared = self.engine or RunEngine.skyvern_v1
         if (
@@ -2053,7 +2060,7 @@ class BaseTaskBlock(Block):
         ):
             return declared
         if self.engine is not None and (
-            self.engine != RunEngine.skyvern_v1 or run_honors_chosen_engine(workflow_run_id)
+            self.engine != RunEngine.skyvern_v1 or self.engine_pinned or run_honors_chosen_engine(workflow_run_id)
         ):
             return self.engine
         return workflow_block_engine_override(workflow_run_id) or declared
@@ -15995,31 +16002,26 @@ class HttpRequestBlock(Block):
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
 
-    # Allowed directories for local file access (class variable, not a Pydantic field)
-    _allowed_dirs: ClassVar[list[str] | None] = None
     _confined_references: list[tuple[str, str | None, str, str]] = PrivateAttr(default_factory=list)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
-    @classmethod
-    def get_allowed_dirs(cls) -> list[str]:
-        """Get the list of allowed directories for local file access.
-        Computed once and cached for performance.
-        """
-        if cls._allowed_dirs is None:
-            allowed_dirs: list[str] = []
-            if settings.ARTIFACT_STORAGE_PATH:
-                allowed_dirs.append(os.path.abspath(settings.ARTIFACT_STORAGE_PATH))
-            if settings.VIDEO_PATH:
-                allowed_dirs.append(os.path.abspath(settings.VIDEO_PATH))
-            if settings.HAR_PATH:
-                allowed_dirs.append(os.path.abspath(settings.HAR_PATH))
-            if settings.LOG_PATH:
-                allowed_dirs.append(os.path.abspath(settings.LOG_PATH))
-            if settings.DOWNLOAD_PATH:
-                allowed_dirs.append(os.path.abspath(settings.DOWNLOAD_PATH))
-            cls._allowed_dirs = allowed_dirs
-        return cls._allowed_dirs or []
+    @staticmethod
+    def get_allowed_dirs(workflow_run_id: str, organization_id: str | None) -> list[str]:
+        run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
+        allowed_dirs = [
+            os.path.realpath(download_dir_path_for_run(run_id))
+            for run_id in dict.fromkeys((workflow_run_id, run_download_id))
+            if run_id
+        ]
+        if organization_id and settings.ARTIFACT_STORAGE_PATH:
+            artifact_root = settings.ARTIFACT_STORAGE_PATH
+            allowed_dirs += [
+                os.path.realpath(os.path.join(artifact_root, settings.ENV, organization_id)),
+                os.path.realpath(os.path.join(artifact_root, organization_id)),
+                os.path.realpath(os.path.join(artifact_root, "downloads", settings.ENV, organization_id)),
+            ]
+        return allowed_dirs
 
     def get_all_parameters(
         self,
@@ -16382,7 +16384,7 @@ class HttpRequestBlock(Block):
                 self.headers["Content-Type"] = "application/json"
 
         # Download files from HTTP URLs or S3 URIs if needed
-        # Also allow local files from allowed directories (ARTIFACT_STORAGE_PATH, VIDEO_PATH, HAR_PATH, LOG_PATH)
+        # Local files are allowed only inside this run's download dir or the org's local artifact dirs
         if self.files:
             downloaded_files: dict[str, str] = {}
             for field_name, file_path in self.files.items():
@@ -16413,26 +16415,17 @@ class HttpRequestBlock(Block):
                     file_path.startswith("s3://") or file_path.startswith("gs://") or file_path.startswith("azure://")
                 )
 
-                # Check if file is in allowed directories
                 is_allowed_local_file = False
-                if actual_file_path:
-                    # Convert to absolute path for comparison (handles both absolute and relative paths)
-                    abs_file_path = os.path.abspath(actual_file_path)
-
-                    # Get allowed directory paths (using class method for cached result)
-                    allowed_dirs = self.get_allowed_dirs()
-                    LOG.debug("HttpRequestBlock Allowed directories", allowed_dirs=allowed_dirs)
-
-                    # Check if file is within any allowed directory
-                    for allowed_dir in allowed_dirs:
-                        # Use os.path.commonpath to check if file is within allowed directory
+                if actual_file_path and not (is_url or is_managed_storage_uri):
+                    # realpath first so a symlink or ".." cannot point the containment check at another tree.
+                    resolved_file_path = os.path.realpath(actual_file_path)
+                    for allowed_dir in self.get_allowed_dirs(workflow_run_id, organization_id):
                         try:
-                            common_path = os.path.commonpath([abs_file_path, allowed_dir])
-                            if common_path == allowed_dir:
+                            if os.path.commonpath([resolved_file_path, allowed_dir]) == allowed_dir:
                                 is_allowed_local_file = True
+                                actual_file_path = resolved_file_path
                                 break
                         except ValueError:
-                            # Paths are on different drives (Windows) or incompatible
                             continue
 
                 # If not URL, managed storage URI, or allowed local file, reject
@@ -19209,7 +19202,7 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
             continue
-        if block.engine not in (None, RunEngine.skyvern_v1):
+        if block.engine not in (None, RunEngine.skyvern_v1) or _pins_v1(block):
             return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
             return V3AbIneligibleReason.unsupported_block
@@ -19219,6 +19212,15 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     if reroutable_blocks == 0:
         return V3AbIneligibleReason.no_reroutable_blocks
     return None
+
+
+def _pins_v1(block: BaseTaskBlock) -> bool:
+    return block.engine == RunEngine.skyvern_v1 and block.engine_pinned
+
+
+def pinned_v1_block_count(blocks: list[BlockTypeVar]) -> int:
+    """How many blocks of the flattened definition carry a person's skyvern-1.0 pin."""
+    return sum(1 for block in blocks if isinstance(block, BaseTaskBlock) and _pins_v1(block))
 
 
 def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:

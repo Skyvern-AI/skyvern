@@ -8955,6 +8955,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -9275,6 +9280,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -14503,6 +14514,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -14845,6 +14861,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "data_schema": {
             "anyOf": [
@@ -15264,6 +15286,11 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -15807,6 +15834,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "error_code_mapping": {
             "anyOf": [
@@ -18703,6 +18736,11 @@
             ],
             "default": "skyvern-1.0"
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -19522,6 +19560,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -19832,6 +19875,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -20348,6 +20397,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -20651,6 +20705,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "error_code_mapping": {
             "anyOf": [
@@ -24545,6 +24605,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -24850,6 +24915,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -27535,6 +27606,11 @@
             ],
             "default": "skyvern-1.0"
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -27984,6 +28060,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -28278,6 +28359,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [

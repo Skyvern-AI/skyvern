@@ -20,6 +20,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.exceptions import InvalidUrl
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -50,6 +51,8 @@ from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services import webhook_delivery as webhook_delivery_module
 from skyvern.services import webhook_service as replay_service
 from tests.unit.scoped_asyncio import ScopedAsyncio
+
+pytestmark = pytest.mark.usefixtures("public_dns")
 
 
 class _StatusResponse:
@@ -2272,20 +2275,25 @@ async def test_exhausted_webhook_attributes_real_connection_failures(
     resolver_error: int | None,
     expected: WebhookDeliveryStatus,
 ) -> None:
-    # Real httpx/httpcore/anyio build the exception chain; only this test loop's resolver is faked.
+    # Real httpx/httpcore/anyio build the exception chain. Delivery connects to the addresses the SSRF
+    # validator resolved, so its resolver is the one faked; the allowlisted host lets loopback stand in
+    # for a customer endpoint with nothing listening.
     svc, _build_response, update_run = webhook_service
-    ports = _closed_local_ports(2)
+    [port] = _closed_local_ports(1)
 
-    async def resolve(*_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
+    def resolve(*_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
         if resolver_error is not None:
             raise socket.gaierror(resolver_error, "synthetic resolver failure")
-        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port)) for port in ports]
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 0))]
 
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolve)
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", ["customer.example"])
     monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", AgentFunction().deliver_webhook)
     monkeypatch.setattr(webhook_delivery_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    run = _workflow_run()
+    run.webhook_callback_url = f"http://customer.example:{port}/hook"
 
-    await _assert_exhausted_outcome(svc, update_run, _workflow_run(), expected)
+    await _assert_exhausted_outcome(svc, update_run, run, expected)
 
 
 @pytest.mark.asyncio

@@ -213,6 +213,7 @@ export type TaskBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type Taskv2BlockYAML = BlockYAMLBase & {
@@ -232,6 +233,7 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type HumanInteractionBlockYAML = BlockYAMLBase & {
@@ -271,6 +273,7 @@ export type ActionBlockYAML = BlockYAMLBase & {
   totp_identifier?: string | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type NavigationBlockYAML = BlockYAMLBase & {
@@ -290,6 +293,7 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   model: WorkflowModel | null;
   include_action_history_in_verification: boolean;
 };
@@ -305,6 +309,7 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   export_enabled?: boolean;
   export_data_schema?: Record<string, unknown> | null;
   export_file_name?: string | null;
@@ -327,6 +332,7 @@ export type LoginBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type WaitBlockYAML = BlockYAMLBase & {
@@ -376,6 +382,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   totp_identifier?: string | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   download_timeout?: number | null;
 };
 

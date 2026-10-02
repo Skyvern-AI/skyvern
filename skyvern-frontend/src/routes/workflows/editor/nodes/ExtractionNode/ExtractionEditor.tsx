@@ -15,7 +15,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { RunEngineSelector } from "@/components/EngineSelector";
-import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { ModelSelector } from "@/components/ModelSelector";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -97,7 +96,6 @@ function ExtractionEditorBody({
   ];
   const { editable } = data;
   const update = useUpdate<ExtractionNodeData>({ id: blockId, editable });
-  const effectiveDefaultEngine = useEffectiveDefaultEngine();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(
@@ -285,7 +283,6 @@ function ExtractionEditorBody({
                   </Label>
                 </div>
                 <RunEngineSelector
-                  effectiveDefaultEngine={effectiveDefaultEngine}
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"

@@ -152,6 +152,8 @@ function legacyEngineSpans(text: string, blocks: unknown): Span[] | null {
       return null;
     }
     const spansBefore = spans.length;
+    // A marked skyvern-1.0 is a person's pick: keep it, and do not read it as new-editor evidence.
+    const pinned = block.get("engine_pinned") === true;
     for (const [index, pair] of block.items.entries()) {
       const { key, value } = pair;
       if (
@@ -159,6 +161,7 @@ function legacyEngineSpans(text: string, blocks: unknown): Span[] | null {
         key.value !== "engine" ||
         !isScalar(value) ||
         typeof value.value !== "string" ||
+        pinned ||
         blockEngineForWorkflow(value.value as RunEngine, null) !== null
       ) {
         continue;
@@ -197,6 +200,7 @@ function legacyEngineSpans(text: string, blocks: unknown): Span[] | null {
       ENGINE_BLOCK_TYPES.has(blockType) &&
       // Validation blocks were exported without an engine key until #16538, so there an absent key is no evidence.
       (block.has("engine") || blockType !== "validation") &&
+      !pinned &&
       spans.length === spansBefore
     ) {
       return null;

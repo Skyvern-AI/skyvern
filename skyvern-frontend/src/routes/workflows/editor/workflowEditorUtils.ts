@@ -2,6 +2,7 @@ import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
+import type { QueryClient } from "@tanstack/react-query";
 import {
   applyNodeChanges,
   applyEdgeChanges,
@@ -697,16 +698,81 @@ function declaredSmtpParameterKey(
   return parameter.key;
 }
 
-// A stored skyvern-1.0 is only a pin where the workflow honours chosen engines; elsewhere it is the
-// routed Default. `undefined` means the workflow's semantics are unknown, so the stored engine is kept.
+// A stored skyvern-1.0 is a pin where the workflow honours chosen engines or a person marked it; elsewhere
+// it is the routed Default. `undefined` means the workflow's semantics are unknown, so the engine is kept.
 function blockEngineForWorkflow(
   engine: RunEngine | null | undefined,
   effectiveDefaultEngine: RunEngine | null | undefined,
+  enginePinned: boolean = false,
 ): RunEngine | null {
-  if (engine === RunEngine.SkyvernV1 && effectiveDefaultEngine === null) {
+  if (
+    engine === RunEngine.SkyvernV1 &&
+    !enginePinned &&
+    effectiveDefaultEngine === null
+  ) {
     return null;
   }
   return engine ?? null;
+}
+
+// Only the detail GET computes effective_default_engine; save responses and version listings omit it. It is a
+// property of the workflow rather than the version, so the cached detail answers for any version of it.
+function workflowEffectiveDefaultEngine(
+  workflow: Pick<
+    WorkflowApiResponse,
+    "workflow_permanent_id" | "effective_default_engine"
+  >,
+  queryClient: QueryClient,
+): RunEngine | null | undefined {
+  if ("effective_default_engine" in workflow) {
+    return workflow.effective_default_engine;
+  }
+  return queryClient.getQueryData<WorkflowApiResponse>([
+    "workflow",
+    workflow.workflow_permanent_id,
+  ])?.effective_default_engine;
+}
+
+type EngineBearingBlock = {
+  engine: RunEngine | null;
+  engine_pinned?: boolean;
+};
+
+function blockEngineNodeData(
+  block: EngineBearingBlock,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  return {
+    engine: blockEngineForWorkflow(
+      block.engine,
+      effectiveDefaultEngine,
+      block.engine_pinned,
+    ),
+    enginePinned: block.engine_pinned ?? false,
+  };
+}
+
+// The marker is written only beside skyvern-1.0, and only when set, so an unmarked block's YAML is unchanged.
+function engineYAML(engine: RunEngine | null, enginePinned?: boolean) {
+  return {
+    engine,
+    ...(enginePinned &&
+      engine === RunEngine.SkyvernV1 && { engine_pinned: true }),
+  };
+}
+
+function blockEngineYAML(
+  block: EngineBearingBlock,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  return engineYAML(
+    blockEngineForWorkflow(
+      block.engine,
+      effectiveDefaultEngine,
+      block.engine_pinned,
+    ),
+    block.engine_pinned,
+  );
 }
 
 function convertToNode(
@@ -781,7 +847,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -829,7 +895,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -850,7 +916,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -875,7 +941,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           legacyV2Available: isV2Engine,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
@@ -925,7 +991,7 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           exportEnabled: block.export_enabled ?? false,
           exportDataSchema:
             block.export_data_schema == null
@@ -956,7 +1022,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -1000,7 +1066,7 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           downloadTimeout: block.download_timeout ?? null, // seconds
           downloadTarget: block.download_target ?? "website",
           path: block.path ?? "{{ workflow_run_id }}",
@@ -3183,7 +3249,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "taskv2": {
@@ -3209,7 +3275,7 @@ function getWorkflowBlock(
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "human_interaction": {
@@ -3249,7 +3315,7 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "navigation": {
@@ -3289,7 +3355,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
       };
@@ -3308,7 +3374,7 @@ function getWorkflowBlock(
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         // export_data_schema (like export_file_name/export_records below) is
         // saved regardless of export_enabled -- the backend already no-ops on
         // all three while export is off, and gating persistence here would
@@ -3342,7 +3408,7 @@ function getWorkflowBlock(
         terminate_criterion: node.data.terminateCriterion,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "wait": {
@@ -3380,7 +3446,7 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         download_timeout: node.data.downloadTimeout, // seconds
         ...(node.data.downloadTarget &&
           node.data.downloadTarget !== "website" && {
@@ -4759,7 +4825,7 @@ function convertBlocksToBlockYAML(
           disable_cache: block.disable_cache ?? false,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4784,7 +4850,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4836,7 +4902,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4846,7 +4912,7 @@ function convertBlocksToBlockYAML(
           block_type: "navigation",
           url: block.url,
           title: block.title,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           model: block.model,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
@@ -4877,7 +4943,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           export_enabled: block.export_enabled ?? false,
           export_data_schema: block.export_data_schema ?? null,
           export_file_name: block.export_file_name ?? null,
@@ -4903,7 +4969,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4939,7 +5005,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           download_timeout: null, // seconds
           ...(block.download_target &&
             block.download_target !== "website" && {
@@ -5957,6 +6023,7 @@ function getParentLoopSkipsOnFail(
 
 export {
   blockEngineForWorkflow,
+  workflowEffectiveDefaultEngine,
   containsJinjaReference,
   convert,
   convertEchoParameters,

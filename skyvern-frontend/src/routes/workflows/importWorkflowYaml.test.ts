@@ -233,6 +233,15 @@ describe("stripLegacyEngineFromYaml", () => {
     });
   });
 
+  it("keeps a marked skyvern-1.0 pin while stripping the unmarked legacy lines around it", () => {
+    const pinned =
+      "    - block_type: login\n      label: p\n      engine: skyvern-1.0\n      engine_pinned: true\n";
+    expect(stripLegacyEngineFromYaml(legacy + pinned)).toEqual({
+      yaml: withoutLegacy.join("\n") + pinned,
+      strippedLegacyEngines: true,
+    });
+  });
+
   it("strips a legacy export whose validation block predates its engine key", () => {
     const bare = "    - block_type: validation\n      label: g\n";
     expect(stripLegacyEngineFromYaml(legacy + bare)).toEqual({

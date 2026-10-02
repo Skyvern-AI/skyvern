@@ -10,10 +10,6 @@ const mockEmailCredentials = vi.hoisted(() => ({
   microsoft: vi.fn(),
 }));
 
-vi.mock("../../hooks/useEffectiveDefaultEngine", () => ({
-  useEffectiveDefaultEngine: () => null,
-}));
-
 vi.mock("@/hooks/useGoogleOAuthCredentials", async (importActual) => {
   const actual =
     await importActual<typeof import("@/hooks/useGoogleOAuthCredentials")>();

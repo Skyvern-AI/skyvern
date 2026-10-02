@@ -317,6 +317,9 @@ class Settings(BaseSettings):
     # also permits plaintext http:// endpoints, for self-hosted deployments pointing at an
     # object store on their own network (e.g. MinIO).
     ALLOW_S3_ENDPOINT_INTERNAL_HOSTS: bool = False
+    # Let SSRF-checked requests (webhooks, TOTP, downloads) use HTTP(S)_PROXY. A forward proxy resolves the host
+    # itself, so this gives up DNS-rebinding protection; enable only where egress must go through a proxy.
+    OUTBOUND_TRUST_ENV_PROXY: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
