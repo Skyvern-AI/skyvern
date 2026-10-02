@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import WorkflowScriptModel
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -242,12 +243,20 @@ async def create_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CreateScriptResponse:
     """Create a new script with optional files and metadata."""
-    return await script_service.create_script(
+    result = await script_service.create_script(
         organization_id=current_org.organization_id,
         workflow_id=data.workflow_id,
         run_id=data.run_id,
         files=data.files,
     )
+    await record_request_audit_event(
+        current_org.organization_id,
+        "script.create",
+        "script",
+        result.script_id,
+        related_resource_ids=(data.workflow_id,) if data.workflow_id else (),
+    )
+    return result
 
 
 @base_router.post(
@@ -261,11 +270,21 @@ async def deploy_cached_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> DeployCachedScriptResponse:
     """Validate or commit a cached script deployment."""
-    return await cached_script_deploy_service.deploy_cached_script(
+    result = await cached_script_deploy_service.deploy_cached_script(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         request=data,
     )
+    if result.script_was_created:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "script.update",
+            "script",
+            result.script_id,
+            changed_fields=("version",),
+            related_resource_ids=(workflow_permanent_id,),
+        )
+    return result
 
 
 @base_router.get(
@@ -677,6 +696,9 @@ async def deploy_script(
                 requires_agent=sb.requires_agent,
             )
 
+        await record_request_audit_event(
+            current_org.organization_id, "script.update", "script", new_script.script_id, changed_fields=("version",)
+        )
         return CreateScriptResponse(
             script_id=new_script.script_id,
             version=new_script.version,
@@ -1120,6 +1142,7 @@ async def delete_workflow_cache_key_value(
         workflow_permanent_id=workflow_permanent_id,
     )
 
+    await record_request_audit_event(current_org.organization_id, "script.delete", "workflow", workflow_permanent_id)
     LOG.info(
         "Deleted workflow cache key value",
         organization_id=current_org.organization_id,
@@ -1183,6 +1206,10 @@ async def clear_workflow_cache(
         workflow_permanent_id=workflow_permanent_id,
     )
 
+    if deleted_count:
+        await record_request_audit_event(
+            current_org.organization_id, "script.delete", "workflow", workflow_permanent_id
+        )
     LOG.info(
         "Cleared workflow cache",
         organization_id=current_org.organization_id,
@@ -1237,6 +1264,14 @@ async def pin_workflow_script(
     if not result:
         raise HTTPException(status_code=404, detail="No script found for the given cache key value")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "script.update",
+        "script",
+        result.script_id,
+        changed_fields=("is_pinned",),
+        related_resource_ids=(workflow_permanent_id,),
+    )
     return PinScriptResponse(
         workflow_permanent_id=workflow_permanent_id,
         cache_key_value=data.cache_key_value,
@@ -1284,6 +1319,14 @@ async def unpin_workflow_script(
     if not result:
         raise HTTPException(status_code=404, detail="No script found for the given cache key value")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "script.update",
+        "script",
+        result.script_id,
+        changed_fields=("is_pinned",),
+        related_resource_ids=(workflow_permanent_id,),
+    )
     return PinScriptResponse(
         workflow_permanent_id=workflow_permanent_id,
         cache_key_value=data.cache_key_value,
@@ -1413,6 +1456,14 @@ async def review_script_with_instructions(
         review_results=review_results,
     )
 
+    await record_request_audit_event(
+        organization_id,
+        "script.update",
+        "script",
+        new_script.script_id,
+        changed_fields=("version",),
+        related_resource_ids=(workflow_permanent_id,),
+    )
     LOG.info(
         "Script reviewed with user instructions",
         organization_id=organization_id,
