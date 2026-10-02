@@ -4084,6 +4084,12 @@ _LOOK_ENUM_JS = (
 
 _ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
 _CLOSE_ATTR_RE = re.compile(r' data-tv3-close="[^"]*"')
+# A withheld menu's rows carry a salted tag so no position can be guessed; printing it would hand the model one.
+_SALTED_MENU_ATTR_RE = re.compile(r'\s*data-tv3-menu="w[^"]*"')
+# Visible only: a closed menu's lingering rows are stale, not an open menu whose rows went unnumbered.
+_SALTED_MENU_SELECTOR = '[data-tv3-menu^="w"]:visible'
+# Every CSS spelling of a numbered menu tag: either quote, no quote, spaces inside, any case (HTML attribute names).
+_NUMBERED_MENU_SELECTOR_RE = re.compile(r'^\[\s*data-tv3-menu\s*=\s*(["\']?)\s*\d+\s*\1\s*\]$', re.IGNORECASE)
 _ACT_SELECTOR_PREFIX = '[data-tv3-act="'
 # Write the act-by-mark attribute on an element handle the caller already resolved (Playwright's
 # engine, which pierces open shadow). Returns whether the node is still connected; a detached handle
@@ -6909,19 +6915,54 @@ _FIND_MENU_JS = (
     if (!txt || txt.length > ROW_TEXT_MAX) return null;
     return { r, txt };
   };
+  // Role-less lists are grouped only on the trigger's own ARIA word: its aria-controls target, or —
+  // when it declares a listbox/combobox — the rows' nearest shared ancestor. A plain button gives
+  // no such word, and guessing would merge unrelated option sets on the page.
+  const trigDeclares = !!trigger && (/(^|\s)combobox(\s|$)/i.test(trigger.getAttribute('role') || '')
+    || (trigger.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox');
+  let controlled = null;
+  try {
+    // A plain toggle's aria-controls names a revealed panel, not a list: only a declared picker's
+    // aria-controls is read as its option container.
+    const cid = trigDeclares ? trigger.getAttribute('aria-controls') : null;
+    const root = trigger.getRootNode();
+    controlled = cid ? ((root && root.getElementById) ? root.getElementById(cid) : document.getElementById(cid)) : null;
+    if (controlled && controlled.getBoundingClientRect().height > 500) controlled = null;
+  } catch (e) { controlled = null; }
+  const controlledList = !!controlled && /^(|listbox|menu|tree|grid)$/.test(controlled.getAttribute('role') || '');
   const rows = [];
+  // Clickable rows left out of the menu (too long to be undeclared, or over the row caps), so a list they sit
+  // in is not whole. Only an element's OWN pointer counts: a container's cursor is inherited by its paragraphs.
+  const unreadLong = [];
+  const ownClickable = (el) => {
+    if (el.tagName === 'BUTTON' || el.tagName === 'A') return true;
+    try {
+      const up = el.parentElement;
+      return getComputedStyle(el).cursor === 'pointer' && !(up && getComputedStyle(up).cursor === 'pointer');
+    } catch (e) { return false; }
+  };
   for (const el of pScopeAll()) {
     if (reuse !== 'any' && (preHas(el) || focusHas(el))) continue;
     const tag = el.tagName;
     const box = rowBox(el);
-    if (!box) continue;
+    if (!box) {
+      if (arg.saltUnlisted && vis(el.getBoundingClientRect()) && (el.innerText || '').trim() && ownClickable(el)) unreadLong.push(el);
+      continue;
+    }
     const { r, txt } = box;
-    // A long row is an option only when the page declares one on it, in it or around it: an inherited
-    // pointer cursor otherwise makes every paragraph of a clickable popover read as a menu row.
+    // A long row is an option only where the page declares one on it, in it, around it, or by its list (a
+    // listbox/menu, or the list a combobox controls): a pointer cursor alone makes every paragraph a row.
     if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
       let declaresOption = false;
-      try { declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL); } catch (e) { declaresOption = false; }
-      if (!declaresOption) continue;
+      try {
+        declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
+          || !!composedClosest(el, '[role="listbox"],[role="menu"]')
+          || (controlledList && controlled !== el && pContains(controlled, el));
+      } catch (e) { declaresOption = false; }
+      if (!declaresOption) {
+        if (arg.saltUnlisted && ownClickable(el)) unreadLong.push(el);
+        continue;
+      }
     }
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
@@ -6942,20 +6983,6 @@ _FIND_MENU_JS = (
   // Group by parent AND grandparent so both flat menus (card > button*N) and nested ones
   // (ul > li > button) find their shared container.
   const groups = new Map();
-  // Role-less lists are grouped only on the trigger's own ARIA word: its aria-controls target, or —
-  // when it declares a listbox/combobox — the rows' nearest shared ancestor. A plain button gives
-  // no such word, and guessing would merge unrelated option sets on the page.
-  const trigDeclares = !!trigger && (/(^|\s)combobox(\s|$)/i.test(trigger.getAttribute('role') || '')
-    || (trigger.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox');
-  let controlled = null;
-  try {
-    // A plain toggle's aria-controls names a revealed panel, not a list: only a declared picker's
-    // aria-controls is read as its option container.
-    const cid = trigDeclares ? trigger.getAttribute('aria-controls') : null;
-    const root = trigger.getRootNode();
-    controlled = cid ? ((root && root.getElementById) ? root.getElementById(cid) : document.getElementById(cid)) : null;
-    if (controlled && controlled.getBoundingClientRect().height > 500) controlled = null;
-  } catch (e) { controlled = null; }
   // parentElement is null at a shadow boundary (a ShadowRoot is not an Element), so a menu whose
   // rows are written straight into the root -- root.innerHTML = '<div role="option">...' -- would
   // group under nothing and never be found. The host stands in for the boundary.
@@ -7147,15 +7174,21 @@ _FIND_MENU_JS = (
     listed.length = 0;
     for (const c of best.g) listed.push({ leaves: [c], reason: 'single_row_pieces' });
   }
+  const longUnread = unreadLong.some((el) => pContains(best.p, el) && !best.g.some((c) => pContains(el, c.el) || pContains(c.el, el)));
+  const withheld = listed.find((e) => e.reason) || (longUnread ? { reason: 'long_row_unread' } : null);
   pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
+  // A withheld note lists no rows, so a numbered tag could only be clicked by guessing a position. `saltUnlisted`
+  // callers salt those tags (still read by the click-commit checks; get_html strips them, _SALTED_MENU_ATTR_RE).
+  // One salt per document, so a rescan of an unchanged menu writes the same tags (the page fingerprint hashes them).
+  if (withheld && arg.saltUnlisted && !window.__tv3_menu_salt) window.__tv3_menu_salt = 'w' + Math.random().toString(36).slice(2, 8) + '-';
+  const salt = withheld && arg.saltUnlisted ? window.__tv3_menu_salt : '';
   let n = 0;
   const tagOf = new Map();
   for (const c of best.g) {
     n++;
-    c.el.setAttribute('data-tv3-menu', String(n));
+    c.el.setAttribute('data-tv3-menu', salt + String(n));
     tagOf.set(c, n);
   }
-  const withheld = listed.find((e) => e.reason);
   const options = [];
   for (const e of listed) {
     if (options.length >= 15) break;
@@ -7327,9 +7360,11 @@ _MENU_OPTION_TEXTS_JS = (
     } catch (e) { /* attributes unreadable: no veto values */ }
     // The nearest tagged ancestor, so a caller can tell a node nested inside another candidate from a sibling.
     const outer = el.parentElement ? composedClosest(el.parentElement, '[data-tv3-' + attr + ']') : null;
+    // A withheld menu's tags carry a random prefix (see _FIND_MENU_JS): the position is the trailing number.
+    const num = (e) => parseInt(String(e.getAttribute('data-tv3-' + attr)).split('-').pop(), 10);
     return {
-      n: parseInt(el.getAttribute('data-tv3-' + attr), 10),
-      inside: outer ? parseInt(outer.getAttribute('data-tv3-' + attr), 10) : null,
+      n: num(el),
+      inside: outer ? num(outer) : null,
       text: (el.innerText || el.textContent || '').trim(),
       nav: nav,
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
@@ -10200,7 +10235,9 @@ def _menu_mark_parts(options: list[dict[str, Any]], cap: int, text_cap: int = _M
     return parts
 
 
-_MENU_WITHHOLD_REASONS = frozenset({"declared_row_over_caps", "bare_text_beside", "single_row_pieces"})
+_MENU_WITHHOLD_REASONS = frozenset(
+    {"declared_row_over_caps", "bare_text_beside", "single_row_pieces", "long_row_unread"}
+)
 
 
 def _menu_note_fields(found: dict[str, Any]) -> dict[str, Any]:
@@ -12985,6 +13022,7 @@ def build_browser_tools(
         # token belongs to the element, not the number -- but it is ours, not the page's, and it
         # costs truncation budget the model needs for real markup.
         html = _ACT_ATTR_RE.sub("", html)
+        html = _SALTED_MENU_ATTR_RE.sub("", html)
         html = _mask_refs(html)
         scoped = bool(selector)
         windowed = _window(html, offset, lambda end, total: _markup_cut(end, total, scoped=scoped))
@@ -13378,6 +13416,10 @@ def build_browser_tools(
         menu_note_census.update(_menu_note_fields(found))
         return _menu_open_note(found, selector, clicked_row=clicked_row)
 
+    async def _click_menu_scan(page: Any, arg: dict[str, Any]) -> Any:
+        # Every menu the click tool reports goes through here, so a withheld one never keeps guessable numbers.
+        return await page.evaluate(_FIND_MENU_JS, {**arg, "saltUnlisted": True})
+
     async def _click_reaction(
         page: Any, selector: str, pre: dict[str, Any], url_before: str, *, doc_planted: bool
     ) -> tuple[str | None, str | None]:
@@ -13464,7 +13506,7 @@ def build_browser_tools(
                 # "committed" from "expanded" and the child rows can -- a cascading click that opened
                 # them committed nothing yet.
                 try:
-                    found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+                    found = await _click_menu_scan(page, await _probe_arg(page, selector))
                 except Exception:
                     return None
                 if isinstance(found, dict) and found.get("count"):
@@ -13481,7 +13523,7 @@ def build_browser_tools(
                 deadline = time.monotonic() + 2.4
                 while True:
                     try:
-                        found = await page.evaluate(_FIND_MENU_JS, {"sel": selector, "el": None, "cascade": True})
+                        found = await _click_menu_scan(page, {"sel": selector, "el": None, "cascade": True})
                     except Exception:
                         return None
                     if isinstance(found, dict) and found.get("count"):
@@ -13591,7 +13633,7 @@ def build_browser_tools(
                 after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return None, None
-            found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+            found = await _click_menu_scan(page, await _probe_arg(page, selector))
             if isinstance(found, dict) and found.get("count"):
                 return _menu_note(found, selector), None
             if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
@@ -13600,10 +13642,17 @@ def build_browser_tools(
                     'an option\'s [data-tv3-menu="N"] selector while the menu is open.'
                 ), None
             return None, None
-        found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+        found = await _click_menu_scan(page, await _probe_arg(page, selector))
         if isinstance(found, dict) and found.get("count"):
             return _menu_note(found, selector), None
         return None, None
+
+    async def _rows_unlisted(page: Any, selector: str) -> bool:
+        try:
+            return await _holders(page, selector) == 0 and await _holders(page, _SALTED_MENU_SELECTOR) > 0
+        except Exception:
+            # Unreadable: the click proceeds as it did before this check, through the marker path's own errors.
+            return False
 
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -13612,6 +13661,13 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("click needs a selector, or mark=N from the last look().")
+        if _NUMBERED_MENU_SELECTOR_RE.match(selector.strip()) and await _rows_unlisted(page, selector):
+            # Not a page change: the menu is still open, its rows were simply never numbered.
+            raise ToolRefusal(
+                f"{selector} names no row: the open menu's options could not be listed, so its rows have no "
+                "numbers. Re-observe and click the option you want by its ref.",
+                error_class="rows_unlisted",
+            )
         if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
             matches = await _marker_matches(page, selector)
             if matches == 0:
@@ -19280,8 +19336,16 @@ def build_browser_tools(
         between two documents on the model's behalf is the wrong-element commit in a new costume.
         """
         found: list[Any] = []
+        guessed_number = bool(_NUMBERED_MENU_SELECTOR_RE.match(selector.strip()))
+
+        async def _answers(realm: Any) -> bool:
+            if await _holders(realm, selector) > 0:
+                return True
+            # A realm whose menu was withheld salts its tags, but a guessed number still names one of its rows.
+            return guessed_number and await _holders(realm, _SALTED_MENU_SELECTOR) > 0
+
         try:
-            if await _holders(page, selector) > 0:
+            if await _answers(page):
                 found.append(page)
         except Exception:
             return page, None
@@ -19294,7 +19358,7 @@ def build_browser_tools(
         unreadable = 0
         for frame in frames:
             try:
-                if await _holders(frame, selector) > 0:
+                if await _answers(frame):
                     found.append(frame)
             except Exception:
                 # The page's own query already answered, so the selector is well formed and it is this

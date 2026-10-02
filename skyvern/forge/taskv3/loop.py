@@ -70,6 +70,8 @@ ToolErrorClass = Literal[
     "ref_not_in_latest",
     "stale_mark",
     "mark_not_in_latest",
+    # A guessed menu number on an open menu whose rows were withheld, so never numbered.
+    "rows_unlisted",
     # The target resolved, but the page will not let the act happen.
     "disabled",
     "not_editable",
@@ -2263,7 +2265,12 @@ def _menu_note_record_fields(tool_name: str, result: ToolResult | None) -> dict[
         if isinstance(rows, int) and not isinstance(rows, bool):
             fields["menu_rows"] = rows
         reason = data.get("withhold_reason")
-        if note == "withheld" and reason in ("declared_row_over_caps", "bare_text_beside", "single_row_pieces"):
+        if note == "withheld" and reason in (
+            "declared_row_over_caps",
+            "bare_text_beside",
+            "single_row_pieces",
+            "long_row_unread",
+        ):
             fields["withhold_reason"] = reason
     return fields
 
