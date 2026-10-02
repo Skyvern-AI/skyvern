@@ -55,6 +55,7 @@ def _recording_page(recorded_exception: Exception | None) -> MagicMock:
     page = MagicMock()
     page.last_recorded_exception.return_value = recorded_exception
     page.failure_nav_error_code.return_value = None
+    page.failure_document_receipt.return_value = None
     return page
 
 
@@ -161,6 +162,7 @@ async def test_attempt_self_heal_default_classification_uses_pinned_engine(
     monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
 
     result = await block._attempt_self_heal(
+        authored_code=None,
         exception=exception,
         failing_line=None,
         recording_page=_recording_page(None),

@@ -163,6 +163,8 @@ def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
         "get_org_workflow",
         "list_workflow_schedules",
         "get_workflow_schedule",
+        "list_browser_profiles",
+        "get_browser_profile",
         "list_workflow_runs",
     )
     assert withheld.alias_map == {name: aliases[name] for name in withheld.ordered_mcp_names}
@@ -271,7 +273,8 @@ async def test_the_advertised_tab_contract_is_closed_around_the_fields_it_offers
 
     tab_new = (await _advertised_schemas(ablation, registered))["skyvern_tab_new"]
 
-    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME}
+    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME, "user_facing_reason"}
+    assert "user_facing_reason" not in tab_new.get("required", [])
     assert tab_new["additionalProperties"] is False
     validator = Draft202012Validator(tab_new)
     assert validator.is_valid({"url": "https://example.com"})

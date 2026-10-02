@@ -547,6 +547,34 @@ async def test_accept_path_leaves_a_model_owned_goal_alone_when_a_prior_goal_dif
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata_rows", "expected"),
+    [
+        pytest.param([], True, id="code-only-write-keeps-the-hand-edit-flag"),
+        pytest.param([_rebuild_artifact_row()], None, id="a-declared-goal-clears-it"),
+    ],
+)
+async def test_a_hand_edited_model_owned_block_clears_its_flag_only_when_the_write_declares_its_goal(
+    monkeypatch: pytest.MonkeyPatch, metadata_rows: list[dict[str, object]], expected: bool | None
+) -> None:
+    prior = _code_yaml('return {"output": {"status": "pending"}}', prompt="Check the order status").replace(
+        "    code: |", "    code_edited_by_hand: true\n    code: |"
+    )
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": _code_yaml(_REBUILT_CODE), "code_artifact_metadata": metadata_rows},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block.get("code_edited_by_hand") is expected
+
+
+@pytest.mark.asyncio
 async def test_a_scrub_value_inside_a_stored_goal_never_reaches_the_persisted_yaml(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

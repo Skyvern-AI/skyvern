@@ -45,16 +45,18 @@ from skyvern.forge.taskv3.engine import (
     PAGE_FREE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     coerce_v3_parameters,
+    model_input_token_limit,
     run_task_v3_agent_loop,
     system_prompt_for_run_arms,
     taskv3_runaway_backstops,
 )
 from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS, UNLISTED_REASK_PROMPT_NAME
-from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
+from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE, CodeTypedValue
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
     NAV_DEAD_END_GUARD,
+    PERCEPTION_RETAIN_CHARS_HIGH,
     LoopOutcome,
     SemanticCommitStats,
     ToolResult,
@@ -65,6 +67,8 @@ from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import CUSTOMER_PRECEDENCE_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
+from skyvern.utils.token_counter import count_tokens
 from tests.unit.helpers import fallback_receipts
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
@@ -2811,3 +2815,129 @@ async def test_a_flex_runs_goal_check_stays_on_the_judge_it_was_given(monkeypatc
     assert outcome.goal_check is not None
     assert len(prompts) == 1
     assert built == []
+
+
+async def _captured_request(
+    monkeypatch: pytest.MonkeyPatch, caller: _ScriptedCaller, values: tuple[CodeTypedValue, ...]
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    goal = "Fill the form\n\nCode outline (a record of this block's code in source order, not steps to perform):\n- x"
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal=goal, code_typed_values=values
+    )
+    return captured
+
+
+def _router(*entries: tuple[dict[str, Any], dict[str, Any]]) -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name=f"m{n}", litellm_params=params, model_info=info)
+            for n, (params, info) in enumerate(entries)
+        ],
+        main_model_group="m0",
+    )
+
+
+def test_a_router_entry_is_limited_by_its_base_model() -> None:
+    expected = litellm.get_model_info(model="azure/gpt-4.1")["max_input_tokens"]
+
+    limit = model_input_token_limit(_router(({"model": "azure/opaque-deployment"}, {"base_model": "azure/gpt-4.1"})))
+
+    assert limit == expected
+
+
+def test_an_unknown_router_model_counts_as_the_one_request_ceiling_not_the_known_ones_limit() -> None:
+    limit = model_input_token_limit(
+        _router(
+            ({"model": "known"}, {"max_input_tokens": 1_000_000}),
+            ({"model": "not-a-model-litellm-knows"}, {}),
+        )
+    )
+
+    assert limit == PROMPT_HARD_CEILING_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_typed_values_reach_the_acting_model_but_never_the_goal_judge() -> None:
+    judge_prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        judge_prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Fill the form\n\nCode outline (a record of this block's code in source order, not steps to perform):",
+        goal_judge=judge,
+        goal_check_enforce=True,
+        code_typed_values=(CodeTypedValue(line=2, target="#name", value="Zephyrine Quill"),),
+    )
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert '"Zephyrine Quill" into "#name"' in user_prompt
+    assert len(judge_prompts) == 1
+    assert "Zephyrine Quill" not in judge_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_a_typed_value_far_past_a_page_read_reaches_the_request_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_value = " ".join(f"word{n}" for n in range(6000))
+
+    request = await _captured_request(
+        monkeypatch, _ScriptedCaller([]), (CodeTypedValue(line=2, target="#notes", value=long_value),)
+    )
+
+    assert json.dumps(long_value) in request["user_prompt"]
+    assert "not listed" not in request["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 60_000
+    caller = _ScriptedCaller([])
+    caller.llm_config = LLMRouterConfig(
+        model_name="router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="primary", litellm_params={"model": "primary"}, model_info={"max_input_tokens": 400_000}
+            ),
+            LLMRouterModelConfig(
+                model_name="fallback", litellm_params={"model": "fallback"}, model_info={"max_input_tokens": limit}
+            ),
+        ],
+        main_model_group="primary",
+    )
+    chunk = " ".join(f"word{n}" for n in range(4000))
+    values = tuple(CodeTypedValue(line=n, target=f"#f{n}", value=chunk) for n in range(1, 21))
+
+    request = await _captured_request(monkeypatch, caller, values)
+    user_prompt = request["user_prompt"]
+    rows = [line for line in user_prompt.split("\n") if line.startswith("- Line ")]
+    sent = (
+        count_tokens(request["system_prompt"])
+        + count_tokens(user_prompt)
+        + count_tokens(json.dumps([tool.to_openai_tool() for tool in request["tools"]]))
+        + PERCEPTION_RETAIN_CHARS_HIGH // 4
+    )
+
+    assert 0 < len(rows) < len(values)
+    assert all(row.endswith(f'into "#f{n}"') and json.dumps(chunk) in row for n, row in enumerate(rows, start=1))
+    assert f"- {len(values) - len(rows)} more typed values not listed" in user_prompt
+    assert sent <= limit

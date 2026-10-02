@@ -582,12 +582,16 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     chat = SimpleNamespace(
         organization_id="org-1",
         workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
         proposed_workflow=None,
         auto_accept=True,
     )
     original_workflow = fake_workflow(workflow_id="wf-canonical")
     updated_workflow = MagicMock()
     updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    # This route test uses intentionally partial workflow doubles; changed-field
+    # behavior is covered with persisted Workflow models in the cloud audit tests.
+    monkeypatch.setattr(workflow_copilot_route, "workflow_changed_fields", lambda *_: ("title",))
     agent_result = AgentResult(
         user_response="done",
         updated_workflow=updated_workflow,
@@ -598,6 +602,8 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     )
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     stream = MagicMock(send=AsyncMock(return_value=True))
+    audit_writer = AsyncMock()
+    monkeypatch.setattr(workflow_copilot_route.app.AGENT_FUNCTION, "record_audit_event", audit_writer)
 
     await workflow_copilot_route._finalise_normal_turn(
         stream=stream,
@@ -611,6 +617,11 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
     assert response_frame.workflow_applied is True
+    audit_writer.assert_awaited_once()
+    _principal, event = audit_writer.await_args.args
+    assert event.action == "workflow.update"
+    assert event.resource_id == "wpid-1"
+    assert event.changed_fields == ("title",)
 
     persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
         "narrative_payload"
@@ -3494,6 +3505,9 @@ async def test_proposed_workflow_cleared_on_restore(
     organization: SimpleNamespace,
 ) -> None:
     captured = install_fake_create(monkeypatch)
+    # These proposal doubles deliberately omit persisted workflow fields; this
+    # test covers proposal clearing, not audit diff semantics.
+    monkeypatch.setattr(workflow_copilot_route, "workflow_changed_fields", lambda *_: ())
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -4596,7 +4610,7 @@ async def test_proposal_header_secrets_stay_server_side_across_endpoints(
         "PERSISTENT_SESSIONS_MANAGER",
         SimpleNamespace(get_session=AsyncMock(return_value=SimpleNamespace())),
     )
-    save = AsyncMock(return_value=original)
+    save = AsyncMock(return_value=(original, ("workflow_definition",)))
     monkeypatch.setattr(
         app,
         "WORKFLOW_SERVICE",
@@ -4932,7 +4946,7 @@ async def test_apply_releases_the_candidate_claim_when_post_create_clear_fails(
     monkeypatch.setattr(
         app,
         "WORKFLOW_SERVICE",
-        SimpleNamespace(create_workflow_from_request=AsyncMock(return_value=candidate)),
+        SimpleNamespace(create_workflow_from_request=AsyncMock(return_value=(candidate, ("workflow_definition",)))),
     )
 
     result = await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
@@ -7000,7 +7014,7 @@ async def test_accept_writes_the_live_title_when_the_row_was_renamed_after_publi
     monkeypatch.setattr(
         app.DATABASE, "workflows", SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=live))
     )
-    create_workflow = AsyncMock(return_value=live)
+    create_workflow = AsyncMock(return_value=(live, ("workflow_definition",)))
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(create_workflow_from_request=create_workflow))
 
     await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
