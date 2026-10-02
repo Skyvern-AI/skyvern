@@ -223,6 +223,9 @@ export interface WorkflowCopilotChatHistoryMessage {
         // turn_start frame carries, so a client can correlate a row to its own send.
         copilot_turn_id?: string | null;
         terminal_reason?: string | null;
+        // Set on every interrupted row the server serves, since no late reply replaces
+        // a stored row. Absent only from a backend that still replaced rows.
+        interrupted_row_final?: boolean;
       })
     | null;
   narrative_payload?: Record<string, unknown> | null;

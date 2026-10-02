@@ -374,6 +374,12 @@ const RECOVERY_POLL_STEADY_MS = 30_000;
 const RECOVERY_POLL_BUDGET_MS = 1_500_000;
 const CANONICAL_READ_TIMEOUT_MS = 5_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
+// Only an older backend writes an interrupted row a late reply may still replace.
+const isReplaceableInterruptedRow = (
+  outcome: WorkflowCopilotChatHistoryMessage["turn_outcome"],
+): boolean =>
+  outcome?.terminal_reason === INTERRUPTED_TERMINAL_REASON &&
+  outcome.interrupted_row_final !== true;
 const SEND_FAILED_MESSAGE = "Sorry, I encountered an error. Please try again.";
 // A severed stream is usually the client losing the network, so recovery reads
 // fail too. Few enough that an offline user gets the plain failure back in
@@ -1492,6 +1498,9 @@ type CanonicalRecovery = {
   retryApply?: () => Promise<boolean>;
   rollback?: TurnSnapshot;
   restoreRollback?: boolean;
+  // An interrupted turn commits canonical only if its process died between commit and reply, so a
+  // canonical change is not credited to Copilot; the editor loads it either way.
+  endedInterrupted?: boolean;
   waitingForUnlock: boolean;
   yaml: { draft: string; entrySnapshot: string } | null;
 };
@@ -3999,7 +4008,8 @@ export function WorkflowCopilotChat({
                 (recoveredNarrative?.draft || ownsChatProposal),
               );
               const recoveredStatus: RecordingRefinementStatus = interrupted
-                ? holdingReservation
+                ? holdingReservation ||
+                  !isReplaceableInterruptedRow(row.turn_outcome)
                   ? "failed"
                   : "working"
                 : isCancelledRefinementTurn(
@@ -4046,10 +4056,8 @@ export function WorkflowCopilotChat({
                 autoAcceptWritesBeforeRead,
               );
             }
-            // An interrupted row can be replaced by the still-running finalizer.
-            if (
-              row.turn_outcome?.terminal_reason !== INTERRUPTED_TERMINAL_REASON
-            ) {
+            // A replaceable interrupted row can be superseded by the still-running finalizer.
+            if (!isReplaceableInterruptedRow(row.turn_outcome)) {
               if (!schedulesRefreshed) {
                 schedulesRefreshed = true;
                 void queryClient.invalidateQueries({
@@ -4068,6 +4076,8 @@ export function WorkflowCopilotChat({
                   canonicalRecovery.awaitingTurnId === rowTurnId
                 ) {
                   canonicalRecovery.terminalConfirmed = true;
+                  canonicalRecovery.endedInterrupted =
+                    reason === INTERRUPTED_TERMINAL_REASON;
                   canonicalRecovery.restoreRollback ||=
                     isCancelledRefinementTurn(reason, narrative) ||
                     narrative?.terminal === "error" ||
@@ -4076,6 +4086,7 @@ export function WorkflowCopilotChat({
                         "cancelled",
                         "error",
                         "copilot_recoverable_failure",
+                        INTERRUPTED_TERMINAL_REASON,
                       ].includes(reason));
                   canonicalReadAttempted = true;
                   await reconcileCanonicalWorkflowRef.current?.(
@@ -4385,7 +4396,7 @@ export function WorkflowCopilotChat({
         data.chat_history.flatMap((message) =>
           message.sender === "ai" &&
           message.turn_outcome?.copilot_turn_id &&
-          message.turn_outcome.terminal_reason !== INTERRUPTED_TERMINAL_REASON
+          !isReplaceableInterruptedRow(message.turn_outcome)
             ? [message.turn_outcome.copilot_turn_id]
             : [],
         ),
@@ -5190,6 +5201,7 @@ export function WorkflowCopilotChat({
         if (pending) {
           if (
             !canonicalUnchanged &&
+            !pending.endedInterrupted &&
             pending.rollback?.snapshot &&
             (pending.rollback.titlePersisted ||
               pending.rollback.workflowPersisted)
