@@ -49,6 +49,7 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunA
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
 )
+from skyvern.forge.sdk.db.repositories.workflow_run_groups import WorkflowRunGroupsRepository
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.db.utils import (
@@ -410,6 +411,7 @@ class AgentDB(BaseAlchemyDB):
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error
         )
+        self.workflow_run_groups = WorkflowRunGroupsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credentials = CredentialRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credential_folders = CredentialFoldersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.otp = OTPRepository(self.Session, debug_enabled, self.is_retryable_error)

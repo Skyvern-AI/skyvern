@@ -84,6 +84,7 @@ SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 HEAL_EPISODE_PREFIX = "he"
 HEAL_PROPOSAL_PREFIX = "hp"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
+WORKFLOW_RUN_GROUP_PREFIX = "wrg"
 TAG_EVENT_PREFIX = "tge"
 RUN_TAG_EVENT_PREFIX = "rtge"
 TAG_KEY_PREFIX = "tkey"
@@ -390,6 +391,11 @@ def generate_heal_proposal_id() -> str:
 def generate_workflow_schedule_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_SCHEDULE_PREFIX}_{int_id}"
+
+
+def generate_workflow_run_group_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_RUN_GROUP_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############

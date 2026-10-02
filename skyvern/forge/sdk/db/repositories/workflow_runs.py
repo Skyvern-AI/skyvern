@@ -365,6 +365,23 @@ async def _has_serialized_publication_identity(
     return serialized_publication
 
 
+async def _first_queued_at(
+    session: AsyncSession, workflow_run: WorkflowRunModel, *, sequential_credential_id: str | None = None
+) -> datetime:
+    """A serialized run takes the next org-wide queue ticket; the caller must hold its publication-lane locks."""
+    if await _has_serialized_publication_identity(
+        session,
+        workflow_run,
+        browser_session_id=workflow_run.browser_session_id,
+        browser_address=workflow_run.browser_address,
+        sequential_credential_id=sequential_credential_id,
+    ):
+        return await _allocate_serialized_queue_ticket(
+            session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run.workflow_run_id
+        )
+    return naive_utc_now()
+
+
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
 
@@ -1005,25 +1022,9 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    serialized_publication = await _has_serialized_publication_identity(
-                        session,
-                        workflow_run,
-                        browser_session_id=workflow_run.browser_session_id,
-                        browser_address=workflow_run.browser_address,
-                        sequential_credential_id=sequential_credential_id,
+                    workflow_run.queued_at = await _first_queued_at(
+                        session, workflow_run, sequential_credential_id=sequential_credential_id
                     )
-                    if serialized_publication:
-                        # The caller holds every composed publication-lane lock until this transaction
-                        # commits. Advance beyond every active serialized ticket in the organization,
-                        # so all composed lanes share one comparable clock even when database transaction
-                        # time or an application host clock moved backwards.
-                        workflow_run.queued_at = await _allocate_serialized_queue_ticket(
-                            session,
-                            organization_id=workflow_run.organization_id,
-                            workflow_run_id=workflow_run_id,
-                        )
-                    else:
-                        workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
                     workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
@@ -1216,19 +1217,16 @@ class WorkflowRunsRepository(BaseRepository):
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        only_from: Sequence[WorkflowRunStatus] | None = None,
+        job_id: str | None = None,
+        depends_on_workflow_run_id: str | None = None,
     ) -> WorkflowRun | None:
-        """Transition a workflow run to ``status`` only if it is not already in a
-        terminal state. Returns the updated row, or ``None`` when the row was
-        already terminal (or missing). Implemented as a single conditional
-        ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
-        finalization write cannot be clobbered by a late cancel.
-
-        Mirrors the timestamp side effects of :meth:`update_workflow_run`:
-        ``finished_at`` is stamped on terminal transitions and ``started_at``
-        is stamped on the first ``running`` transition (preserving any
-        existing value via ``COALESCE``).
-        """
-        non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
+        cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
+        :meth:`update_workflow_run`."""
+        non_terminal = [
+            s.value for s in WorkflowRunStatus if not s.is_final() and (only_from is None or s in only_from)
+        ]
         now = naive_utc_now()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
@@ -1243,6 +1241,10 @@ class WorkflowRunsRepository(BaseRepository):
             values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
+        if job_id:
+            values["job_id"] = job_id
+        if depends_on_workflow_run_id:
+            values["depends_on_workflow_run_id"] = depends_on_workflow_run_id
         # The reopen/reset path clears attribution when it returns the row to `created`, so a
         # later terminal transition starts from SQL NULL and this COALESCE fills the freshly
         # derived document; on any row that already carries one it preserves the first writer.
@@ -1260,6 +1262,14 @@ class WorkflowRunsRepository(BaseRepository):
             )
 
         async with self.Session() as session:
+            if status == WorkflowRunStatus.queued:
+                workflow_run = (
+                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+                ).first()
+                if workflow_run is not None and workflow_run.queued_at is None:
+                    values["queued_at"] = func.coalesce(
+                        WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
+                    )
             result = await session.execute(
                 update(WorkflowRunModel)
                 .where(
@@ -1966,21 +1976,7 @@ class WorkflowRunsRepository(BaseRepository):
             if workflow_run is None:
                 return False
             if workflow_run.status == WorkflowRunStatus.created:
-                queued_at = workflow_run.queued_at
-                if queued_at is None:
-                    serialized_publication = await _has_serialized_publication_identity(
-                        session,
-                        workflow_run,
-                        browser_session_id=workflow_run.browser_session_id,
-                        browser_address=workflow_run.browser_address,
-                    )
-                    queued_at = (
-                        await _allocate_serialized_queue_ticket(
-                            session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run_id
-                        )
-                        if serialized_publication
-                        else now
-                    )
+                queued_at = workflow_run.queued_at or await _first_queued_at(session, workflow_run)
                 # A cancel committed since the caller's read must win: the status predicate re-evaluates
                 # against the latest committed row.
                 moved = await session.execute(

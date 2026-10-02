@@ -45,6 +45,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
@@ -67,6 +68,7 @@ from skyvern.services.cleanup_service import (
     stop_cleanup_scheduler,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
     stop_workflow_schedule_scheduler,
@@ -408,6 +410,12 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # task group which is required for handling MCP requests.
     mcp_app = getattr(fastapi_app.state, "mcp_starlette_app", None)
     retry_recovery_task = asyncio.create_task(_recover_pending_retries(), name="workflow-retry-recovery")
+    # Cloud runs this sweep from its own periodic task loop.
+    group_recovery_task = (
+        asyncio.create_task(run_workflow_run_group_recovery_loop(), name="workflow-run-group-recovery")
+        if isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
+        else None
+    )
     try:
         if mcp_app:
             async with mcp_app.lifespan(mcp_app):
@@ -418,7 +426,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
             yield
     finally:
         retry_recovery_task.cancel()
-        await asyncio.gather(retry_recovery_task, return_exceptions=True)
+        if group_recovery_task is not None:
+            group_recovery_task.cancel()
+        await asyncio.gather(
+            retry_recovery_task, *([group_recovery_task] if group_recovery_task else []), return_exceptions=True
+        )
         # The initial pass starts the periodic sweep even when cancelled; stop it so the loop can drain.
         await AsyncExecutorFactory.get_executor().stop_retry_recovery()
 

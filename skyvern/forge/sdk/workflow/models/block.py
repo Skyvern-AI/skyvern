@@ -18571,18 +18571,11 @@ class WorkflowTriggerBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    async def _check_trigger_depth(self, workflow_run_id: str) -> int:
-        """Check the nesting depth of workflow triggers to prevent infinite recursion.
-
-        Note: This depth guard walks the parent_workflow_run_id chain, which is only
-        populated for synchronous triggers. For async (fire-and-forget) dispatch, the
-        parent may have already completed before the child runs, so circular async
-        chains (A->B->A) are only blocked while A is still running. A full
-        visited-workflow guard would require persistent state and is left as a future
-        enhancement.
-        """
+    async def _check_trigger_depth(self, workflow_run_id: str) -> str:
+        """Return the root run of the parent_workflow_run_id chain, raising past MAX_TRIGGER_DEPTH. An async child's
+        parent may finish first, so a circular async chain (A->B->A) is blocked only while A is still running."""
         depth = 0
-        current_run_id: str | None = workflow_run_id
+        current_run_id = workflow_run_id
         while current_run_id:
             if depth >= self.MAX_TRIGGER_DEPTH:
                 raise InvalidWorkflowDefinition(
@@ -18594,7 +18587,7 @@ class WorkflowTriggerBlock(Block):
                 break
             current_run_id = run.parent_workflow_run_id
             depth += 1
-        return depth
+        return current_run_id
 
     def _render_template_value(
         self,
@@ -18817,9 +18810,16 @@ class WorkflowTriggerBlock(Block):
 
         # 2. Check recursion depth
         try:
-            await self._check_trigger_depth(workflow_run_id)
+            root_workflow_run_id = await self._check_trigger_depth(workflow_run_id)
         except InvalidWorkflowDefinition as e:
             return await _fail(str(e))
+        if (
+            not self.wait_for_completion or self.browser_session_id
+        ) and await app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id(root_workflow_run_id):
+            return await _fail(
+                "A workflow run group child cannot trigger a workflow without waiting for it"
+                " or into a supplied browser session"
+            )
 
         # 3. Get the organization
         if not organization_id:

@@ -986,6 +986,9 @@ class Settings(BaseSettings):
     """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
     RETRY_DISPATCH_GRACE_SECONDS: int = Field(default=600, ge=600)
     """OSS dispatch claim grace; the executor also enforces the retry lease takeover minimum."""
+    WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
+    """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
+    dispatch of already-submitted groups continue."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
