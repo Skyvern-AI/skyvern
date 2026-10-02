@@ -2162,6 +2162,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "list_integrations":
         return f"Found {data.get('count', 0)} connected integration(s)"
+    if tool_name == "read_google_sheet":
+        rows = data.get("connections")
+        opened = (
+            sum(1 for row in rows if isinstance(row, dict) and row.get("status") == "opened")
+            if isinstance(rows, list)
+            else 0
+        )
+        if not opened:
+            return "No connection opened the Google Sheet"
+        if data.get("values_error"):
+            return f"Opened the Google Sheet through {opened} connection(s), but could not read its values"
+        return f"Read the Google Sheet through {opened} connection(s)"
     if tool_name == "get_block_schema":
         if "block_types" in data:
             return f"Listed {data.get('count', '?')} block types"

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.sms import SMSLifecycleLockTimeout
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -449,6 +450,12 @@ async def _enable_twilio_phone_number_locked(
             connected_config = await app.DATABASE.sms.create_sms_config(
                 organization_id=organization_id, mode="connected", webhook_secret=secrets.token_urlsafe(32)
             )
+            await record_request_audit_event(
+                organization_id,
+                "twilio.create",
+                "twilio_sms_config",
+                connected_config[0].sms_config_id,
+            )
         config, webhook_secret = connected_config
         inbound_url = _inbound_url(config.sms_config_id, webhook_secret)
         current_sms_url = _current_sms_url(provider_number)
@@ -536,6 +543,14 @@ async def _enable_twilio_phone_number_locked(
                     )
                 raise
 
+        await record_request_audit_event(
+            organization_id,
+            "twilio.create" if registered is None else "twilio.update",
+            "twilio_phone_number",
+            saved.phone_number_id,
+            changed_fields=("status",),
+        )
+
         try:
             await _shielded(client.update_inbound_sms_config(request.phone_number_sid, inbound_url, "POST", ""))
         except BaseException as error:
@@ -553,7 +568,15 @@ async def _enable_twilio_phone_number_locked(
             if isinstance(error, TwilioApiError):
                 raise _twilio_api_http_exception(error) from None
             raise
-        return await _finalize_phone_number(saved.phone_number_id, organization_id, status="active")
+        phone_number = await _finalize_phone_number(saved.phone_number_id, organization_id, status="active")
+        await record_request_audit_event(
+            organization_id,
+            "twilio.update",
+            "twilio_phone_number",
+            phone_number.phone_number_id,
+            changed_fields=("status",),
+        )
+        return phone_number
 
 
 @twilio_integration_router.post(
@@ -571,6 +594,18 @@ async def create_twilio_credential(
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id
     async with _organization_sms_lifecycle_lock(organization_id):
+        try:
+            credential_exists = await app.DATABASE.organizations.has_valid_org_auth_token(
+                organization_id,
+                OrganizationAuthTokenType.twilio_credential,
+            )
+        except Exception:
+            credential_exists = None
+            LOG.warning(
+                "Failed to read Twilio credential state for audit classification",
+                organization_id=organization_id,
+                exc_info=True,
+            )
         active_number_count = await _active_connected_phone_count(organization_id)
         if active_number_count:
             existing_credential = await _get_credential(organization_id)
@@ -591,6 +626,13 @@ async def create_twilio_credential(
             token_type=OrganizationAuthTokenType.twilio_credential,
             token=request.credential,
             encrypted_method=EncryptMethod.AES,
+        )
+        await record_request_audit_event(
+            organization_id,
+            "twilio.create" if credential_exists is False else "twilio.update",
+            "twilio_credential",
+            organization_id,
+            changed_fields=("account_sid", "auth_token", "api_key_sid"),
         )
         return _safe_credential(request.credential)
 
@@ -634,10 +676,17 @@ async def delete_twilio_credential(
                 status_code=409,
                 detail="Disable all connected Twilio phone numbers before disconnecting Twilio",
             )
-        await app.DATABASE.organizations.invalidate_org_auth_tokens(
+        invalidated = await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=organization_id,
             token_type=OrganizationAuthTokenType.twilio_credential,
         )
+        if invalidated:
+            await record_request_audit_event(
+                organization_id,
+                "twilio.delete",
+                "twilio_credential",
+                organization_id,
+            )
         return {"success": True}
 
 
@@ -756,6 +805,13 @@ async def _disable_twilio_phone_number_locked(
             )
             if staged_row is None:
                 raise HTTPException(status_code=404, detail="Phone number not found")
+            await record_request_audit_event(
+                organization_id,
+                "twilio.update",
+                "twilio_phone_number",
+                registered.phone_number_id,
+                changed_fields=("status",),
+            )
 
         if registered.provider_number_sid and client is not None:
             try:
@@ -817,7 +873,15 @@ async def _disable_twilio_phone_number_locked(
                             if isinstance(error, TwilioApiError):
                                 raise _twilio_api_http_exception(error) from None
                             raise
-        return await _finalize_phone_number(registered.phone_number_id, organization_id, status="disabled")
+        phone_number = await _finalize_phone_number(registered.phone_number_id, organization_id, status="disabled")
+        await record_request_audit_event(
+            organization_id,
+            "twilio.update",
+            "twilio_phone_number",
+            phone_number.phone_number_id,
+            changed_fields=("status",),
+        )
+        return phone_number
 
 
 @twilio_integration_router.post("/sms-configs", response_model=SMSConfigCreated)
@@ -833,6 +897,12 @@ async def create_sms_config(
             organization_id=organization_id,
             mode=request.mode,
             webhook_secret=secrets.token_urlsafe(32),
+        )
+        await record_request_audit_event(
+            organization_id,
+            "twilio.create",
+            "twilio_sms_config",
+            config.sms_config_id,
         )
         return SMSConfigCreated(
             **config.model_dump(),
@@ -874,7 +944,14 @@ async def delete_sms_config(
         )
         if active_phone_count > 0:
             raise HTTPException(status_code=409, detail="SMS configuration still has active phone numbers")
-        await app.DATABASE.sms.delete_sms_config(sms_config_id, organization_id)
+        deleted = await app.DATABASE.sms.delete_sms_config(sms_config_id, organization_id)
+        if deleted:
+            await record_request_audit_event(
+                organization_id,
+                "twilio.delete",
+                "twilio_sms_config",
+                sms_config_id,
+            )
         return {"success": True}
 
 
@@ -906,12 +983,19 @@ async def register_manual_phone_number(
         registered = await _get_registered_phone_number(phone_number, organization_id)
         _require_twilio_provider(registered)
         if registered is None:
-            return await app.DATABASE.sms.create_phone_number(
+            phone = await app.DATABASE.sms.create_phone_number(
                 organization_id=organization_id,
                 sms_config_id=sms_config_id,
                 phone_number=phone_number,
                 provider="twilio",
             )
+            await record_request_audit_event(
+                organization_id,
+                "twilio.create",
+                "twilio_phone_number",
+                phone.phone_number_id,
+            )
+            return phone
         if (
             registered.status != "disabled"
             or registered.provider_number_sid is not None
@@ -926,4 +1010,11 @@ async def register_manual_phone_number(
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="Phone number not found")
+        await record_request_audit_event(
+            organization_id,
+            "twilio.update",
+            "twilio_phone_number",
+            updated.phone_number_id,
+            changed_fields=("sms_config_id", "status"),
+        )
         return updated

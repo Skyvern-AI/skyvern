@@ -268,6 +268,23 @@ class OrganizationsRepository(BaseRepository):
             remember_organization_created_at(organization.organization_id, organization.created_at)
             return Organization.model_validate(organization)
 
+    @db_operation("has_valid_org_auth_token")
+    async def has_valid_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> bool:
+        """Check token existence without decrypting its secret payload."""
+        async with self.Session() as session:
+            token_id = await session.scalar(
+                select(OrganizationAuthTokenModel.id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .filter_by(valid=True)
+                .limit(1)
+            )
+            return token_id is not None
+
     @overload
     async def get_valid_org_auth_token(
         self,

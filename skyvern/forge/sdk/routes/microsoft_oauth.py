@@ -7,6 +7,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
     CreateMicrosoftOAuthCallbackRequest,
@@ -219,6 +220,24 @@ async def microsoft_oauth_callback(
     except microsoft_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    if not prior_state_known or prior_state in {
+        microsoft_oauth_service.STATE_ACTIVE,
+        microsoft_oauth_service.STATE_ERROR,
+    }:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "microsoft_oauth.update",
+            "microsoft_oauth_credential",
+            credential.id,
+        )
+    else:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "microsoft_oauth.create",
+            "microsoft_oauth_credential",
+            credential.id,
+        )
+
     if not prior_state_known:
         LOG.warning(
             "Skipping Microsoft integration lifecycle analytics because prior credential state is unknown",
@@ -322,6 +341,13 @@ async def rename_microsoft_oauth_credential(
     )
     if updated is None:
         raise HTTPException(status_code=404, detail="Credential not found")
+    await record_request_audit_event(
+        current_org.organization_id,
+        "microsoft_oauth.update",
+        "microsoft_oauth_credential",
+        credential_id,
+        changed_fields=("credential_name",),
+    )
     return MicrosoftOAuthCredentialResponse(credential=updated)
 
 
@@ -339,3 +365,9 @@ async def delete_microsoft_oauth_credential(
     )
     if not revoked:
         raise HTTPException(status_code=404, detail="Credential not found")
+    await record_request_audit_event(
+        current_org.organization_id,
+        "microsoft_oauth.delete",
+        "microsoft_oauth_credential",
+        credential_id,
+    )
