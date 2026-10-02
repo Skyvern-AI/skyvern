@@ -80,7 +80,6 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    EXTRACTION_REPORTS_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
@@ -493,18 +492,10 @@ async def test_execute_task_v3_passes_the_workflow_system_prompt_to_a_page_free_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("variant", "framed"), [("treatment", True), ("control", False)])
-async def test_execute_task_v3_tells_an_extraction_block_to_report_only_in_the_treatment_arm(
-    monkeypatch: pytest.MonkeyPatch, variant: str, framed: bool
-) -> None:
-    # The arm must be RESOLVED before the goal is composed: a deleted resolve call, or a render keyed on the
-    # wrong flag, leaves every run on control with the composition tests still green (SKY-16398).
-    monkeypatch.setattr(settings, "TASK_V3_EXTRACTION_REPORTS", False)
-    provider = AsyncMock(return_value=variant)
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
+async def test_execute_task_v3_tells_an_extraction_block_it_only_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The framing must reach the goal the loop is given, not only render_block_context (SKY-16398).
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[], extracted_output={"status": None})
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
         task_block=_make_block(ExtractionBlock, data_extraction_goal="the license status"),
@@ -513,8 +504,7 @@ async def test_execute_task_v3_tells_an_extraction_block_to_report_only_in_the_t
         data_extraction_goal="the license status",
     )
 
-    assert ("This block only reads the page" in loop_mock.await_args.kwargs["goal"]) is framed
-    assert loop_mock.context.run_arms[EXTRACTION_REPORTS_FLAG] == (task.workflow_run_id, variant)
+    assert "This block only reads the page" in loop_mock.await_args.kwargs["goal"]
 
 
 @pytest.mark.asyncio

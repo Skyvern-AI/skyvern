@@ -869,8 +869,8 @@ async def test_branch_eval_synthetic_block_honors_v3_override(scoped_context: Sk
 
 @pytest.mark.asyncio
 async def test_branch_eval_synthetic_block_gets_no_extraction_report_framing(scoped_context: SkyvernContext) -> None:
-    """The branch evaluator's block follows the run's arm and has no navigation goal, so without its marker the
-    TASK_V3_EXTRACTION_REPORTS framing ("absent fields are null, finish completed") would reach it. Its own prompt
+    """The branch evaluator's block has no navigation goal, so without its marker the extraction-report
+    framing ("absent fields are null, finish completed") would reach it. Its own prompt
     judges conditions from their text, and a null result parses as False: a silently wrong branch (SKY-16398)."""
     scoped_context.workflow_block_engine_resolved_run_id = "wr_branch_eval_framing"
     scoped_context.workflow_block_engine_override = RunEngine.skyvern_v3
@@ -902,7 +902,7 @@ async def test_branch_eval_synthetic_block_gets_no_extraction_report_framing(sco
     (block,) = captured
     now = datetime.now(UTC)
     task = make_task(now, make_organization(now), navigation_goal=None, data_extraction_goal=block.data_extraction_goal)
-    assert render_block_context(task, block, None, extraction_reports=True) == render_block_context(task, block, None)
+    assert "This block only reads the page" not in render_block_context(task, block, None)[0]
 
 
 @pytest.mark.asyncio
