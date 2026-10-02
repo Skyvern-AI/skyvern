@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import structlog
 from sqlalchemy import and_, delete, false, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -852,18 +853,36 @@ class ArtifactsRepository(BaseRepository):
         if not task_ids:
             return []
         async with self.Session() as session:
-            query = (
-                select(ArtifactModel)
-                .distinct(ArtifactModel.task_id)
-                .where(
-                    ArtifactModel.task_id.in_(task_ids),
-                    ArtifactModel.artifact_type.in_(artifact_types),
-                )
-                .order_by(ArtifactModel.task_id, ArtifactModel.created_at.desc())
-            )
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+            filters = [
+                ArtifactModel.task_id.in_(task_ids),
+                ArtifactModel.artifact_type.in_(artifact_types),
+            ]
             if organization_id is not None:
-                query = query.where(
+                filters.append(
                     or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
+                )
+            if dialect_name == "sqlite":
+                # SQLite has no DISTINCT ON (SQLAlchemy silently drops it there, returning every
+                # matching artifact), so rank each task's artifacts newest-first and keep the first.
+                ranked = (
+                    select(
+                        ArtifactModel,
+                        func.row_number()
+                        .over(partition_by=ArtifactModel.task_id, order_by=ArtifactModel.created_at.desc())
+                        .label("rank"),
+                    )
+                    .where(*filters)
+                    .subquery()
+                )
+                latest = aliased(ArtifactModel, ranked)
+                query = select(latest).where(ranked.c.rank == 1).order_by(latest.task_id, latest.created_at.desc())
+            else:
+                query = (
+                    select(ArtifactModel)
+                    .distinct(ArtifactModel.task_id)
+                    .where(*filters)
+                    .order_by(ArtifactModel.task_id, ArtifactModel.created_at.desc())
                 )
             artifacts = (await session.scalars(query)).all()
             return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]

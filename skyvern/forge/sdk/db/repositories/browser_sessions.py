@@ -846,6 +846,10 @@ class BrowserSessionsRepository(BaseRepository):
         """
         ts = to_naive_utc(last_activity_at) if last_activity_at is not None else naive_utc_now()
         async with self.Session() as session:
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+            # SQLite has no GREATEST(); its multi-argument max() is equivalent here because
+            # coalesce() guarantees neither argument is NULL.
+            greatest = func.max if dialect_name == "sqlite" else func.greatest
             await session.execute(
                 update(PersistentBrowserSessionModel)
                 .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
@@ -853,9 +857,7 @@ class BrowserSessionsRepository(BaseRepository):
                 # Monotonic write: touches are fire-and-forget from the proxy, so an out-of-order
                 # commit must never move last_activity_at backward and shorten a live lease.
                 .values(
-                    last_activity_at=func.greatest(
-                        func.coalesce(PersistentBrowserSessionModel.last_activity_at, ts), ts
-                    )
+                    last_activity_at=greatest(func.coalesce(PersistentBrowserSessionModel.last_activity_at, ts), ts)
                 )
             )
             await session.commit()
