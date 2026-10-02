@@ -10194,7 +10194,21 @@ async (__tv3TextArgs) => {
     rec.ref = typeof r === 'number' ? r : null;
   }
   __OBSERVE_TEXT_DELTA__
-  const payload = JSON.stringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  // A page-defined toJSON (legacy libraries put one on Array.prototype) encodes every array as a string. It is
+  // lifted for this one synchronous call so page code never runs; the replacer runs after toJSON and hands
+  // back the holder's own value, so even one the page made non-configurable never reaches the payload.
+  const _ownStringify = (value) => {
+    const protos = [Array.prototype, Object.prototype];
+    const saved = protos.map((p) => Object.getOwnPropertyDescriptor(p, 'toJSON'));
+    // Kept in place when it could not be put back (non-configurable, or a non-extensible prototype).
+    const kept = protos.map((p, i) => !!saved[i] && !(saved[i].configurable && Object.isExtensible(p)));
+    protos.forEach((p, i) => { if (saved[i] && !kept[i]) delete p.toJSON; });
+    // A kept toJSON still runs before the replacer; if it throws, the reading is refused rather than the evaluate.
+    try { return JSON.stringify(value, kept.some(Boolean) ? function (k) { return this[k]; } : undefined); } catch (e) { return 'null'; } finally {
+      protos.forEach((p, i) => { if (saved[i] && !kept[i]) Object.defineProperty(p, 'toJSON', saved[i]); });
+    }
+  };
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -11374,6 +11388,41 @@ class _RealmChangedDuringRead(Exception):
     """A realm's document was replaced between the two identity samples bracketing its read."""
 
 
+class _RealmUnreadable(Exception):
+    """A realm's reading is not the shape observe builds, so nothing in it can be paired or merged."""
+
+
+def _realm_reading(raw: Any) -> dict[str, Any]:
+    # Reachable only when the page replaced JSON.stringify itself: every other shape the script can emit is fixed.
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        raise _RealmUnreadable("reading is not JSON") from None
+    if not isinstance(data, dict):
+        raise _RealmUnreadable(f"reading is a {type(data).__name__}")
+    iframes = data.get("iframes")
+    lists = {key: data.get(key) for key in ("elements", "text", "textFull")}
+    if isinstance(iframes, dict):
+        lists["iframes.entries"] = iframes.get("entries")
+    elif iframes is not None:
+        raise _RealmUnreadable(f"iframes is a {type(iframes).__name__}")
+    for key, value in lists.items():
+        if (value is not None or key in data) and not isinstance(value, list):
+            raise _RealmUnreadable(f"{key} is a {type(value).__name__}")
+    for key in ("elements", "iframes.entries"):
+        if not all(isinstance(e, dict) for e in lists.get(key) or []):
+            raise _RealmUnreadable(f"{key} holds a non-record entry")
+    if not all(isinstance(t, str) for t in lists["text"] or []) or not all(
+        t is None or isinstance(t, str) for t in lists["textFull"] or []
+    ):
+        raise _RealmUnreadable("text holds a non-string entry")
+    for key in _OBSERVE_SUMMED_KEYS:
+        count = data.get(key) or 0
+        if not isinstance(count, (int, float)) or not math.isfinite(count):
+            raise _RealmUnreadable(f"{key} is a {type(data.get(key)).__name__}")
+    return data
+
+
 class _Observation(NamedTuple):
     """One reading of the page, spanning its main frame and the child frames observe could read."""
 
@@ -11939,8 +11988,17 @@ def build_browser_tools(
         after = await _realm_document_id(target)
         if after != before:
             raise _RealmChangedDuringRead(f"realm changed during the read: {before!r} -> {after!r}")
-        data = json.loads(raw) if isinstance(raw, str) else raw
-        inline = data.pop("textDelta", None) if isinstance(data, dict) else None
+        try:
+            data = _realm_reading(raw)
+        except _RealmUnreadable:
+            for handle in handles:
+                if handle is not None:
+                    try:
+                        await handle.dispose()
+                    except Exception:
+                        pass
+            raise
+        inline = data.pop("textDelta", None)
         if text_args is not None:
             # Cleared on every main-frame attempt: a retry on a replacement document that yields no text
             # must not leave the previous document's text to be recorded as this one's.
@@ -11998,7 +12056,10 @@ def build_browser_tools(
             if isinstance(result, BaseException):
                 # One frame that will not answer costs its own contents and nothing else, and is
                 # counted so the digest can say a region went unread rather than imply it was empty.
-                LOG.debug("taskv3 observe could not read a child frame", exc_info=result)
+                if isinstance(result, _RealmUnreadable):
+                    LOG.info("taskv3 observe skipped a child frame", reason=str(result))
+                else:
+                    LOG.debug("taskv3 observe could not read a child frame", exc_info=result)
                 unreadable += 1
                 continue
             frame_data, frame_handles, frame_document = result
@@ -12043,7 +12104,13 @@ def build_browser_tools(
             return error
         # Bound the whole acquisition -- the digest AND the handles behind it -- so a wedged page
         # can't hang the turn indefinitely on a later round trip the first bound never covered.
-        observation = await asyncio.wait_for(_read_observation(page), timeout=30)
+        try:
+            observation = await asyncio.wait_for(_read_observation(page), timeout=30)
+        except _RealmUnreadable as exc:
+            LOG.warning("taskv3 observe could not read the page", reason=str(exc))
+            return ToolResult.error(
+                "observe could not read this page's controls; use look or get_html to read it instead"
+            )
         data, handles, owners = observation.data, observation.handles, observation.owners
         elements = data.get("elements", [])
         if len(handles) != len(elements):
