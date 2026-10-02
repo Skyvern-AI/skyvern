@@ -406,7 +406,9 @@ class AgentDB(BaseAlchemyDB):
             db_engine=self.engine,
             sqlite_workflow_creation_lock=self._sqlite_workflow_creation_lock,
         )
-        self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflow_params = WorkflowParametersRepository(
+            self.Session, debug_enabled, self.is_retryable_error, db_engine=self.engine
+        )
         self.workflow_run_attempts = WorkflowRunAttemptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error

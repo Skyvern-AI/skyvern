@@ -7,10 +7,10 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Awaitable, Coroutine, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, cast, get_args
+from typing import Any, Literal, TypeVar, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
@@ -190,6 +190,7 @@ ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
 }
 
 LOG = structlog.get_logger()
+_T = TypeVar("_T")
 
 
 async def _resolve_copilot_agent_handler(
@@ -1175,6 +1176,23 @@ def _is_interrupted_recovery_row(message: WorkflowCopilotChatMessage) -> bool:
     return message.turn_outcome is not None and message.turn_outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
 
 
+async def _claim_turn_finalisation(chat: WorkflowCopilotChat, turn_id: str) -> bool:
+    """Whether the live turn still owns its post-agent writes; False once reconcile has claimed it."""
+    claim = await app.DATABASE.workflow_params.claim_pending_copilot_turn_for_finalisation(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        turn_id=turn_id,
+    )
+    if claim == "reconciling":
+        return False
+    if claim == "claimed":
+        return True
+    # Reconcile drops the marker only after writing its interrupted row, so a missing marker
+    # beside that row means reconcile already finished this turn.
+    existing = await _assistant_row_for_turn(chat, turn_id)
+    return existing is None or not _is_interrupted_recovery_row(existing)
+
+
 async def _clear_pending_turn(chat: WorkflowCopilotChat, turn_id: str) -> None:
     # A failed clear is self-healing: the reconcile pass sees the turn already
     # answered, skips recovery and retries the clear.
@@ -1251,46 +1269,7 @@ async def _persist_turn_messages(
 
     assistant_message: WorkflowCopilotChatMessage | None = None
     existing = await _assistant_row_for_turn(chat, turn_id) if turn_id is not None else None
-    superseding_recovery = (
-        existing is not None
-        and _is_interrupted_recovery_row(existing)
-        and turn_outcome is not None
-        and turn_outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON
-    )
-    if existing is not None and superseding_recovery and turn_outcome is not None:
-        replacement_updates: dict[str, str] = {}
-        if (
-            turn_outcome.user_message_id is None
-            and existing.turn_outcome is not None
-            and existing.turn_outcome.user_message_id is not None
-        ):
-            replacement_updates["user_message_id"] = existing.turn_outcome.user_message_id
-        if (
-            turn_outcome.request_cancel_token is None
-            and existing.turn_outcome is not None
-            and existing.turn_outcome.request_cancel_token is not None
-        ):
-            replacement_updates["request_cancel_token"] = existing.turn_outcome.request_cancel_token
-        if replacement_updates:
-            turn_outcome = turn_outcome.model_copy(update=replacement_updates)
-        # Recovery reached this turn first and wrote an interrupted row. The turn then finished,
-        # so its real reply is the truth and replaces that row rather than being dropped.
-        LOG.info(
-            "Copilot turn finished after being recovered; replacing the interrupted row with its reply",
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            turn_id=turn_id,
-        )
-        assistant_message = await asyncio.shield(
-            app.DATABASE.workflow_params.replace_workflow_copilot_chat_message(
-                organization_id=chat.organization_id,
-                workflow_copilot_chat_message_id=existing.workflow_copilot_chat_message_id,
-                content=assistant_content,
-                global_llm_context=global_llm_context,
-                turn_outcome=turn_outcome,
-                narrative_payload=narrative_payload,
-            )
-        )
-    elif existing is not None:
+    if existing is not None:
         LOG.info(
             "Copilot turn already has an assistant row; skipping duplicate persist",
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -1377,6 +1356,7 @@ def _interrupted_turn_outcome(
         ),
         copilot_effective_mode=effective_mode,
         copilot_code_available=code_available or False,
+        interrupted_row_final=True,
     )
 
 
@@ -2286,7 +2266,7 @@ async def _new_copilot_chat_post(
         cancel_watcher: asyncio.Task[None] | None = None
         current_code_available = False
         turn_index = 0
-        effective_mode = _effective_copilot_build_mode(chat_request)
+        effective_mode: PersistedCopilotComposerMode | None = _effective_copilot_build_mode(chat_request)
         prior_turn_outcome: TurnOutcome | None = None
 
         def capture_code_mode_opt_out_after_persist() -> None:
@@ -2300,6 +2280,48 @@ async def _new_copilot_chat_post(
                 organization_id=organization.organization_id,
                 turn_id=turn_id,
             )
+
+        # Released in the route's finally, after every post-agent write, so reconcile cannot mark the
+        # row final while this handler can still write.
+        finalisation_fence = contextlib.AsyncExitStack()
+        ownership_claim: list[asyncio.Future[bool]] = []
+        post_agent_writes: list[asyncio.Future[Any]] = []
+
+        async def claim_turn_ownership() -> bool:
+            if chat is None or not turn_started:
+                return True
+            await finalisation_fence.enter_async_context(
+                app.DATABASE.workflow_params.hold_copilot_turn_finalisation(chat.workflow_copilot_chat_id, turn_id)
+            )
+            owned = await _claim_turn_finalisation(chat, turn_id)
+            if not owned:
+                LOG.info(
+                    "Copilot turn finished after reconcile claimed it; leaving its interrupted row final",
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    turn_id=turn_id,
+                )
+            return owned
+
+        def turn_still_owned() -> Awaitable[bool]:
+            # One claim per handler: a second concurrent acquire of the lock would wait on this one.
+            if not ownership_claim:
+                ownership_claim.append(asyncio.ensure_future(claim_turn_ownership()))
+            return asyncio.shield(ownership_claim[0])
+
+        async def turn_owned_or_left_to_reconcile() -> bool:
+            # For error arms with nothing else to report: an unclaimed marker stays for reconcile.
+            try:
+                return await turn_still_owned()
+            except Exception:
+                LOG.warning("Could not claim the copilot turn's finalisation", turn_id=turn_id, exc_info=True)
+                return False
+
+        def tracked_write(write: Coroutine[Any, Any, _T]) -> Awaitable[_T]:
+            # Shielded writes outlive a cancelled handler; the finally waits for them before releasing the lock.
+            task = asyncio.ensure_future(write)
+            post_agent_writes.append(task)
+            return asyncio.shield(task)
 
         async def _emit_unpersisted_failure(
             failure: RecoverableFailure,
@@ -2348,7 +2370,17 @@ async def _new_copilot_chat_post(
             nonlocal failure_kind_for_log, route_exit, terminal_frame_emitted, turn_outcome_for_log
             route_exit = "error"
             failure_kind_for_log = failure_kind
-            if any(isinstance(item, DatabaseConnectionUnavailableError) for item in iter_exception_chain(exc)):
+            database_down = any(
+                isinstance(item, DatabaseConnectionUnavailableError) for item in iter_exception_chain(exc)
+            )
+            claim_failure: Exception | None = None
+            if not database_down:
+                try:
+                    if not await turn_still_owned():
+                        return
+                except Exception as error:
+                    claim_failure = error
+            if database_down or claim_failure is not None:
                 # Rolling the workflow back and writing the reply are both database work, against a
                 # database that just exhausted a full reconnection budget. Report what is already
                 # known rather than spending more of the caller's wait on writes that cannot land;
@@ -2372,7 +2404,7 @@ async def _new_copilot_chat_post(
                 await _emit_unpersisted_failure(
                     failure,
                     failure_kind=failure_kind,
-                    writer_exc=exc,
+                    writer_exc=claim_failure or exc,
                 )
                 return
             restored = chat is not None and _should_restore_persisted_workflow(
@@ -2453,7 +2485,7 @@ async def _new_copilot_chat_post(
                     else chat_request.model_copy(update={"message": UNSCREENED_MESSAGE_PLACEHOLDER})
                 )
                 try:
-                    await asyncio.shield(
+                    await tracked_write(
                         _finalise_normal_turn(
                             stream=stream,
                             chat=chat,
@@ -2860,25 +2892,39 @@ async def _new_copilot_chat_post(
                 # carrying ``workflow_was_persisted`` so rollback proceeds normally.
                 # Nobody pressed Stop on a cancellation the user never asked for, so
                 # that turn is recorded as interrupted rather than as their intent.
-                await _persist_cancel_turn(
-                    stream=stream,
-                    chat=chat,
-                    organization_id=organization.organization_id,
-                    original_workflow=original_workflow,
-                    user_message=chat_request.message,
-                    agent_result=agent_result,
-                    audio_artifact_id=chat_request.audio_artifact_id,
-                    turn_id=turn_id,
-                    keep_pending_proposal=chat_request.keep_pending_proposal,
-                    user_row_already_persisted=turn_started,
-                    sender=_turn_opener_sender(chat_request),
-                    record_as_interrupted=not user_cancel_observed[0],
-                    cancel_source=user_cancel_source[0],
-                    effective_mode=effective_mode,
-                    code_available=current_code_available,
-                    request_cancel_token=chat_request.cancel_token,
-                )
-                terminal_frame_emitted = True
+                # Set before the shielded write for the same reason as the success path below.
+                finalise_started = True
+                cancelled_agent_result = agent_result
+
+                async def persist_cancel_if_owned() -> bool:
+                    nonlocal terminal_frame_emitted
+                    if not await turn_still_owned():
+                        return False
+                    await _persist_cancel_turn(
+                        stream=stream,
+                        chat=chat,
+                        organization_id=organization.organization_id,
+                        original_workflow=original_workflow,
+                        user_message=chat_request.message,
+                        agent_result=cancelled_agent_result,
+                        audio_artifact_id=chat_request.audio_artifact_id,
+                        turn_id=turn_id,
+                        keep_pending_proposal=chat_request.keep_pending_proposal,
+                        user_row_already_persisted=turn_started,
+                        sender=_turn_opener_sender(chat_request),
+                        record_as_interrupted=not user_cancel_observed[0],
+                        cancel_source=user_cancel_source[0],
+                        effective_mode=effective_mode,
+                        code_available=current_code_available,
+                        request_cancel_token=chat_request.cancel_token,
+                    )
+                    # Set inside the shield: a cancelled handler skips the line after its await,
+                    # and the finally would send a second, false terminal frame.
+                    terminal_frame_emitted = True
+                    return True
+
+                if not await tracked_write(persist_cancel_if_owned()):
+                    return
                 capture_code_mode_opt_out_after_persist()
                 LOG.info(
                     "Workflow copilot agent turn cancelled",
@@ -2892,21 +2938,30 @@ async def _new_copilot_chat_post(
 
             # Atomic finalisation — a late cancel that fires here cannot tear
             # the success-path writes apart mid-way (no half-written turn,
-            # no duplicate user/AI rows).
+            # no duplicate user/AI rows). The ownership claim sits inside the
+            # shield for the same reason.
             finalise_started = True
-            await asyncio.shield(
-                _finalise_normal_turn(
+            finalised_agent_result = agent_result
+
+            async def finalise_if_owned() -> bool:
+                nonlocal terminal_frame_emitted
+                if not await turn_still_owned():
+                    return False
+                await _finalise_normal_turn(
                     stream=stream,
                     chat=chat,
                     organization_id=organization.organization_id,
                     original_workflow=original_workflow,
                     chat_request=chat_request,
-                    agent_result=agent_result,
+                    agent_result=finalised_agent_result,
                     turn_id=turn_id,
                     user_row_already_persisted=turn_started,
                 )
-            )
-            terminal_frame_emitted = True
+                terminal_frame_emitted = True
+                return True
+
+            if not await tracked_write(finalise_if_owned()):
+                return
             capture_code_mode_opt_out_after_persist()
             route_exit = "completed"
         except HTTPException as exc:
@@ -2924,9 +2979,13 @@ async def _new_copilot_chat_post(
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 exc_info=exc.status_code >= 500,
             )
-            if chat is not None and _should_restore_persisted_workflow(
-                chat.auto_accept,
-                agent_result,
+            if (
+                chat is not None
+                and _should_restore_persisted_workflow(
+                    chat.auto_accept,
+                    agent_result,
+                )
+                and await turn_owned_or_left_to_reconcile()
             ):
                 try:
                     await _restore_workflow_definition(original_workflow, organization.organization_id)
@@ -2958,12 +3017,14 @@ async def _new_copilot_chat_post(
         except asyncio.CancelledError:
             route_exit = "cancelled"
             turn_outcome_for_log = agent_result.turn_outcome if agent_result is not None else None
+            if not await turn_owned_or_left_to_reconcile():
+                raise
             if chat is not None and _should_restore_persisted_workflow(
                 chat.auto_accept,
                 agent_result,
             ):
                 try:
-                    await asyncio.shield(_restore_workflow_definition(original_workflow, organization.organization_id))
+                    await tracked_write(_restore_workflow_definition(original_workflow, organization.organization_id))
                 except Exception:
                     LOG.warning(
                         "Workflow restore failed inside cancel-error handler",
@@ -2975,7 +3036,7 @@ async def _new_copilot_chat_post(
                 # the agent_result.cancelled branch above couldn't run.
                 # _persist_cancel_turn skips rollback when agent_result is None.
                 try:
-                    await asyncio.shield(
+                    await tracked_write(
                         _persist_cancel_turn(
                             stream=stream,
                             chat=chat,
@@ -3037,7 +3098,7 @@ async def _new_copilot_chat_post(
                         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                         turn_id=turn_id,
                     ):
-                        await asyncio.shield(
+                        await tracked_write(
                             _persist_interrupted_turn(
                                 chat,
                                 turn_id,
@@ -3067,6 +3128,24 @@ async def _new_copilot_chat_post(
             )
         finally:
             try:
+                # A cancelled handler reaches here while its shielded writes still run. A further cancel
+                # must not cut the wait short, or the lock drops under a live write; it is re-raised below.
+                cancelled_while_waiting = False
+                for pending_write in (*ownership_claim, *post_agent_writes):
+                    while not pending_write.done():
+                        try:
+                            await asyncio.shield(pending_write)
+                        except asyncio.CancelledError:
+                            cancelled_while_waiting = cancelled_while_waiting or not pending_write.done()
+                        except Exception:
+                            break
+                try:
+                    await finalisation_fence.aclose()
+                except Exception:
+                    with contained_effect("copilot turn finalisation lock release failure", turn_id=turn_id):
+                        LOG.warning(
+                            "Could not release the copilot turn finalisation lock", turn_id=turn_id, exc_info=True
+                        )
                 if cancel_watcher is not None and not cancel_watcher.done():
                     cancel_watcher.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3090,6 +3169,8 @@ async def _new_copilot_chat_post(
                             browser_session_id,
                             reason=BrowserSessionCloseReason.user_requested,
                         )
+                if cancelled_while_waiting:
+                    raise asyncio.CancelledError
             finally:
                 with contained_effect("copilot turn outcome log"):
                     LOG.info(
@@ -4431,13 +4512,21 @@ def convert_to_history_messages(
             feedback=getattr(message, "feedback", None),
             audio_artifact_id=message.audio_artifact_id,
             attached_files=message.attached_files,
-            turn_outcome=message.turn_outcome,
+            turn_outcome=_served_turn_outcome(message.turn_outcome),
             created_at=message.created_at,
             modified_at=getattr(message, "modified_at", message.created_at),
             narrative_payload=message.narrative_payload,
         )
         for message in messages
     ]
+
+
+def _served_turn_outcome(outcome: TurnOutcome | None) -> TurnOutcome | None:
+    # Nothing in this backend replaces a stored assistant row, so an interrupted row written before
+    # the flag existed is final too; serving it unflagged would hold the chat's save lock forever.
+    if outcome is None or outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON or outcome.interrupted_row_final:
+        return outcome
+    return outcome.model_copy(update={"interrupted_row_final": True})
 
 
 @base_router.post("/workflow/copilot/suggest-goal", include_in_schema=False)
