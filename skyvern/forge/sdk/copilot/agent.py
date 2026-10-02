@@ -2166,6 +2166,11 @@ def _make_agent_result(
                 pause_payload = {"outcome": pause_outcome}
                 if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
                     pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
+                signed_in_profile_id = (
+                    ctx.request_policy.credential_pause_signed_in_profile_id if ctx.request_policy else None
+                )
+                if pause_outcome == "signed_in" and signed_in_profile_id:
+                    pause_payload["browserProfileId"] = signed_in_profile_id
                 if ctx.credential_pause_anchor_tool_call_id:
                     pause_payload["anchorToolCallId"] = ctx.credential_pause_anchor_tool_call_id
                 payload_updates["credentialPause"] = pause_payload

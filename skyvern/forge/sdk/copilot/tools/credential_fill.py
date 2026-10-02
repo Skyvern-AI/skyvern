@@ -736,6 +736,16 @@ async def _request_credential(
                 "parameter placeholder in the draft and do not ask again this turn."
             ),
         }
+    if resolution.signed_in is not None:
+        return {
+            "ok": True,
+            "status": "signed_in",
+            "site": resolution.signed_in.site,
+            "browser_profile_id": resolution.signed_in.browser_profile_id,
+            "browser_profile_name": defang_card_text(resolution.signed_in.profile_name),
+            "cookie_count": resolution.signed_in.cookie_count,
+            "credential_provided": False,
+        }
     if resolution.action == "connected" and credential is None:
         return {
             "ok": True,

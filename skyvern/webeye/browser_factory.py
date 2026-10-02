@@ -91,7 +91,11 @@ from skyvern.webeye.display_recorder import (
     release_started_display_recording,
 )
 from skyvern.webeye.playwright_input import register_playwright_input_context
-from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
+from skyvern.webeye.session_cookies import (
+    restore_banked_cookies,
+    restore_session_cookies,
+    restore_signin_cookies,
+)
 
 LOG = structlog.get_logger()
 
@@ -820,6 +824,7 @@ class BrowserContextFactory:
                     organization_id=kwargs.get("organization_id"),
                 )
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
+            await restore_signin_cookies(browser_context, browser_artifacts.browser_session_dir)
             # After session cookies so a verified-login heal (banked by the credential living-profile
             # engine) wins over the profile's own older session cookies on a key clash. Gated on the
             # engine kill-switch so a rollback also stops applying previously banked login state.

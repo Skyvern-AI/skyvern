@@ -31,6 +31,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse, question_wait_is_live
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
@@ -47,11 +48,17 @@ from skyvern.forge.sdk.copilot.context import (
     merge_approved_credentials_into_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.credential_pause import (
+    MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS,
     CredentialPauseRejection,
+    SignedInProfile,
     check_credential_pause_resumable,
+    claim_manual_sign_in,
     credential_pause_is_active,
+    finish_manual_sign_in,
     pending_credential_requests,
     resolve_credential_pause,
+    sign_in_site,
+    start_manual_sign_in,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
@@ -108,6 +115,10 @@ from skyvern.forge.sdk.db.exceptions import (
     NotFoundError,
 )
 from skyvern.forge.sdk.forge_log import _generated_log_value
+from skyvern.forge.sdk.routes.browser_profiles import (
+    _hard_delete_created_profile_after_store_failure,
+    create_profile_from_running_session,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -135,6 +146,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSummary,
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotCredentialResponseRequest,
+    WorkflowCopilotCredentialResponseResult,
     WorkflowCopilotDisableAutoAcceptRequest,
     WorkflowCopilotGoalSuggestionRequest,
     WorkflowCopilotGoalSuggestionResponse,
@@ -4104,13 +4116,69 @@ async def workflow_copilot_cancel(
     )
 
 
+async def _resolve_manual_sign_in(
+    cache: BaseCache, organization_id: str, response_request: WorkflowCopilotCredentialResponseRequest
+) -> WorkflowCopilotCredentialResponseResult:
+    pause_ids = {
+        "organization_id": organization_id,
+        "workflow_copilot_chat_id": response_request.workflow_copilot_chat_id,
+        "turn_id": response_request.turn_id,
+    }
+    claim = await claim_manual_sign_in(cache, resume_token=response_request.resume_token, **pause_ids)
+    site = sign_in_site(claim.sign_in.login_urls)
+    signed_in: SignedInProfile | None = None
+    save_failed = False
+    try:
+        profile, cookie_count = await asyncio.wait_for(
+            create_profile_from_running_session(
+                organization_id=organization_id,
+                browser_session_id=claim.sign_in.browser_session_id,
+                login_urls=claim.sign_in.login_urls,
+                name=claim.sign_in.profile_name,
+                description="Saved when you signed in yourself from the Copilot credential card.",
+            ),
+            MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS,
+        )
+        if profile is not None:
+            signed_in = SignedInProfile(
+                browser_profile_id=profile.browser_profile_id,
+                profile_name=profile.name,
+                site=site,
+                cookie_count=cookie_count,
+            )
+    except Exception:
+        save_failed = True
+        LOG.warning("copilot_credential_pause_sign_in_save_failed", exc_info=True)
+    if not await finish_manual_sign_in(cache, claim=claim, signed_in=signed_in, **pause_ids):
+        if signed_in is not None:
+            await _hard_delete_created_profile_after_store_failure(
+                organization_id=organization_id, browser_profile_id=signed_in.browser_profile_id
+            )
+            try:
+                await app.STORAGE.delete_browser_profile(
+                    organization_id=organization_id, profile_id=signed_in.browser_profile_id, hard_delete=True
+                )
+            except Exception:
+                LOG.warning("Failed to delete an unclaimed sign-in profile's stored cookies", exc_info=True)
+        raise CredentialPauseRejection(status_code=status.HTTP_409_CONFLICT, detail="Credential pause already resolved")
+    if signed_in is None:
+        return WorkflowCopilotCredentialResponseResult(
+            result="save_failed" if save_failed else "no_sign_in_found", host=site
+        )
+    return WorkflowCopilotCredentialResponseResult(
+        result="signed_in", host=site, browser_profile_id=signed_in.browser_profile_id
+    )
+
+
 @base_router.post(
-    "/workflow/copilot/credential-response", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
+    "/workflow/copilot/credential-response",
+    include_in_schema=False,
+    response_model=WorkflowCopilotCredentialResponseResult,
 )
 async def workflow_copilot_credential_response(
     response_request: WorkflowCopilotCredentialResponseRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
-) -> None:
+) -> WorkflowCopilotCredentialResponseResult:
     """Resume a turn paused on ``credential_required`` with the user's card response.
 
     The resume path is not authorized by org auth + ``turn_id`` alone: the caller
@@ -4120,6 +4188,8 @@ async def workflow_copilot_credential_response(
     503 when ``app.CACHE`` is absent, 422 when ``action="connected"`` omits a
     ``credential_id``, 404 when that ID doesn't resolve in this organization or no
     active pause matches, 403 on a bad token, and 409 once the pause is consumed.
+    ``signing_in`` restarts the countdown once; ``signed_in`` saves the live browser's sign-in as a
+    profile and answers ``no_sign_in_found`` (no cookies for the site) or ``save_failed`` without resuming.
     """
     cache = getattr(app, "CACHE", None)
     if cache is None:
@@ -4140,6 +4210,21 @@ async def workflow_copilot_credential_response(
             turn_id=response_request.turn_id,
             resume_token=response_request.resume_token,
         )
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+
+    try:
+        if response_request.action == "signing_in":
+            expires_at = await start_manual_sign_in(
+                cache,
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=response_request.workflow_copilot_chat_id,
+                turn_id=response_request.turn_id,
+                resume_token=response_request.resume_token,
+            )
+            return WorkflowCopilotCredentialResponseResult(result="accepted", expires_at=expires_at)
+        if response_request.action == "signed_in":
+            return await _resolve_manual_sign_in(cache, organization.organization_id, response_request)
     except CredentialPauseRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
 
@@ -4168,6 +4253,7 @@ async def workflow_copilot_credential_response(
         )
     except CredentialPauseRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    return WorkflowCopilotCredentialResponseResult(result="accepted")
 
 
 @base_router.post(

@@ -970,6 +970,10 @@ class RequestPolicy:
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
     persisted_workflow_browser_profile_id: str | None = None
+    # The profile saved from the user's own sign-in on this turn's credential card, and its site. It may
+    # seed this turn's test runs before Accept saves it as the workflow's pick.
+    credential_pause_signed_in_profile_id: str | None = None
+    credential_pause_signed_in_site: str | None = None
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)

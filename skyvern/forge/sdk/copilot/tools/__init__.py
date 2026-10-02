@@ -995,10 +995,12 @@ async def request_credential_tool(
     credential_id: str | None = None,
     rejected_by_site: bool = False,
 ) -> str:
-    """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
+    """Ask the user, in chat, how to sign in to a sign-in page: add or pick a saved credential, or
+    sign in themselves in the live browser and save that sign-in as a browser profile.
 
     Use this instead of a prose question when a login still needs selection or setup, including
-    a sign-in page discovered while navigating. Reuse the user's existing choice, the saved
+    a sign-in page discovered while navigating, or a saved browser profile whose sign-in no longer
+    reaches past the sign-in page. Reuse the user's existing choice, the saved
     workflow's binding, or an unambiguous website match without asking again when it can fill.
     `login_page_url` is the absolute HTTP(S) sign-in URL shown on the card; selecting a credential
     authorizes it for that site. `reason` is one sentence explaining why the login is needed.
@@ -1010,7 +1012,9 @@ async def request_credential_tool(
     comes back `updated` once they save; re-run the sign-in then.
     The call waits for the user's answer and comes back `connected` with the credential
     to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
-    carries. Each turn allows one ask to pick a login and one ask to update a chosen credential.
+    carries. It comes back `signed_in` when the user signed in themselves in the live browser:
+    no credential was provided, and the result names the browser profile that saved the sign-in.
+    Each turn allows one ask to pick a login and one ask to update a chosen credential.
     """
     copilot_ctx = ctx.context
     arguments = {
@@ -1175,7 +1179,8 @@ async def run_blocks_tool(
     Block labels must match labels in the saved workflow.
     A run that starts at the first block opens a fresh browser loaded with the saved browser
     profile, if any, that a normal run of the saved workflow would load. A profile that is only
-    staged in a proposal is not loaded until the workflow is saved with it.
+    staged in a proposal is not loaded until the workflow is saved with it, except the profile the
+    user saved by signing in from the credential card this turn: a draft that selects it loads it now.
 
     If an existing saved block can establish the state you need, run that
     block unchanged before scouting the resulting page. In particular, a saved
