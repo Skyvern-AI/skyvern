@@ -483,6 +483,8 @@ export interface WorkflowCopilotToolResultUpdate {
   code_diffs?: CodeWriteDiff[] | null;
   // The plan a successful set_work_plan stored. Absent on every other tool.
   work_plan?: string[] | null;
+  // A successful run_browser_code call's operations as display phrases.
+  browser_steps?: string[] | null;
   detail?: string | null;
   timestamp?: string | null;
 }

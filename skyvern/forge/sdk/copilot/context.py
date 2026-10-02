@@ -114,6 +114,7 @@ class NarrativeActivityEntry(TypedDict):
     activeLabel: NotRequired[str]
     outcomeLabel: NotRequired[str]
     codeDiffs: NotRequired[list[CodeWriteDiff]]
+    browserSteps: NotRequired[list[str]]
     id: str
     # Server clock read for the event this entry describes, shared with the SSE
     # update so a rehydrated row renders the same elapsed the live row did.

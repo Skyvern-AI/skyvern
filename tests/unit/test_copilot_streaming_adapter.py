@@ -841,6 +841,45 @@ async def test_a_stored_work_plan_outlives_its_row_being_capped_away() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_code_steps_ride_the_result_event_and_its_saved_row() -> None:
+    def tool_output(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+        out_item = MagicMock(spec=RunItem)
+        out_item.raw_item = {"call_id": call_id}
+        out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+        return RunItemStreamEvent(name="tool_output", item=out_item)
+
+    operations = [{"operation": "goto", "status": "ok"}, {"operation": "click", "status": "ok", "selector": "#next"}]
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("b1", "run_browser_code"),
+        tool_output("b1", {"ok": True, "operations": operations}),
+        _tool_called_event("b2", "run_browser_code"),
+        tool_output("b2", {"ok": False, "error": "boom", "operations": operations}),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = _new_ctx()
+
+    await stream_to_sse(result, stream, ctx)
+
+    steps = ["Opened a page", "clicked '#next'"]
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [p.browser_steps for p in tool_results] == [steps, None]
+    rows = {row["id"]: row for row in ctx.narrator_state.design_activity}
+    assert rows["tr-b1"]["browserSteps"] == steps
+    assert "browserSteps" not in rows["tr-b2"]
+
+
+@pytest.mark.asyncio
 async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() -> None:
     diffs = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n-old\n+new"}]
 
