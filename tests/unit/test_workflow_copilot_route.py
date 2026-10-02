@@ -32,6 +32,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import credential_pause
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
@@ -122,6 +123,7 @@ from tests.unit.copilot_route_test_support import (
     terminal_narrative_payload,
 )
 from tests.unit.services.test_browser_recording_code_first import draft_for, make_click, make_input, make_url_change
+from tests.unit.test_copilot_credential_pause import _FakeCache
 
 
 @pytest.fixture
@@ -6078,6 +6080,46 @@ async def test_reconcile_leaves_a_turn_that_just_resumed_from_a_credential_pause
     await repo.record_pending_copilot_turn_credential_resume("org", chat_id, "turn-a")
     abandoned_before = datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
     assert not await repo.claim_pending_copilot_turn("org", chat_id, "turn-a", abandoned_before)
+
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(
+        await repo.get_workflow_copilot_chat_by_id("org", chat_id), "org"
+    )
+
+    assert [m for m in await repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"] == []
+    chat = await repo.get_workflow_copilot_chat_by_id("org", chat_id)
+    assert await workflow_copilot_route._claim_turn_finalisation(chat, "turn-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["connected", "skip", "signed_in"])
+async def test_reconcile_between_a_card_answer_and_the_waiter_leaves_the_turn(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """An answer consumes the pause before the waiter wakes; a history read in that gap must not take the turn."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    cache = _FakeCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    chat_id = await _start_abandoned_turn(repo, "turn-a")
+    token = credential_pause._new_resume_token()
+    sign_in = credential_pause.ManualSignIn(
+        browser_session_id="pbs_debug", login_urls=["https://portal.example.com/login"], profile_name="Sign-in"
+    )
+    cache.store[credential_pause.credential_pause_active_key("org", chat_id, "turn-a")] = (
+        credential_pause._encode_active_pause(token, datetime.now(UTC) + timedelta(minutes=5), manual_sign_in=sign_in)
+    )
+    ids = {"organization_id": "org", "workflow_copilot_chat_id": chat_id, "turn_id": "turn-a"}
+    if answer == "signed_in":
+        claim = await credential_pause.claim_manual_sign_in(cache, resume_token=token, **ids)
+        profile = credential_pause.SignedInProfile(
+            browser_profile_id="bp_signed_in", profile_name="Sign-in", site="portal.example.com", cookie_count=1
+        )
+        assert await credential_pause.finish_manual_sign_in(cache, claim=claim, signed_in=profile, **ids)
+    else:
+        await credential_pause.resolve_credential_pause(
+            cache, resume_token=token, action=answer, credential_id="cred_1", **ids
+        )
+    assert await credential_pause.credential_pause_is_active("org", chat_id, "turn-a") is False
 
     await workflow_copilot_route._reconcile_interrupted_copilot_turns(
         await repo.get_workflow_copilot_chat_by_id("org", chat_id), "org"

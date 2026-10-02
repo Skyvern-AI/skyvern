@@ -129,6 +129,112 @@ async def test_resolve_local_file_inside_run_download_dir(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
+async def test_resolve_local_file_uri_inside_run_download_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = "wr_local"
+    path = _run_file(tmp_path, monkeypatch, run_id, name="file with space.txt")
+
+    assert await files.resolve_local_or_download_file(path.as_uri(), run_id) == str(path.resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["another_run", "symlink_escape", "missing_run_id"])
+async def test_resolve_file_uri_rejects_out_of_scope_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    downloads_dir = tmp_path / "downloads"
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(downloads_dir))
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(files, "REPO_ROOT_DIR", str(tmp_path))
+
+    current_run_file = downloads_dir / "wr_local" / "current.txt"
+    current_run_file.parent.mkdir(parents=True)
+    current_run_file.write_text("current run")
+    other_run_file = downloads_dir / "wr_other" / "other.txt"
+    other_run_file.parent.mkdir()
+    other_run_file.write_text("other run")
+    escaped_file = current_run_file.parent / "escape.txt"
+    escaped_file.symlink_to(other_run_file)
+
+    if case == "another_run":
+        uri, run_id = other_run_file.as_uri(), "wr_local"
+    elif case == "symlink_escape":
+        uri, run_id = escaped_file.as_uri(), "wr_local"
+    else:
+        uri, run_id = current_run_file.as_uri(), None
+
+    with pytest.raises(PermissionError):
+        await files.resolve_local_or_download_file(uri, run_id)
+
+
+@pytest.mark.asyncio
+async def test_resolve_managed_local_upload_under_download_root_uses_storage_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    downloads_dir = tmp_path / "downloads"
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(downloads_dir))
+    monkeypatch.setattr(settings, "ENV", "local")
+    storage = LocalStorage(artifact_path=str(downloads_dir))
+    uri, _ = await storage.save_legacy_file(
+        organization_id="org-1", filename="input.csv", fileObj=io.BytesIO(b"row_id,url\n")
+    )
+    row = SimpleNamespace(file_id="file_1", storage_uri=uri, expires_at=None)
+
+    async def get_uploaded_file_by_storage_uri(*, storage_uri: str, organization_id: str) -> SimpleNamespace | None:
+        return row if (storage_uri, organization_id) == (uri, "org-1") else None
+
+    async def get_uploaded_file(*, file_id: str, organization_id: str) -> SimpleNamespace | None:
+        return row if (file_id, organization_id) == ("file_1", "org-1") else None
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(
+            uploaded_files=SimpleNamespace(
+                get_uploaded_file_by_storage_uri=get_uploaded_file_by_storage_uri,
+                get_uploaded_file=get_uploaded_file,
+            )
+        ),
+    )
+
+    path = await files.resolve_local_or_download_file(uri, "wr_1", organization_id="org-1")
+
+    assert Path(path).read_bytes() == b"row_id,url\n"
+    with pytest.raises(PermissionError):
+        await files.resolve_local_or_download_file(uri, "wr_1", organization_id="org-2")
+
+
+@pytest.mark.asyncio
+async def test_resolve_org_download_snapshot_nested_under_download_root_uses_legacy_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    downloads_dir = tmp_path / "downloads"
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(downloads_dir))
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(files, "_LOCAL_DOWNLOAD_ROOTS", set())
+    artifact_root = downloads_dir / "artifact-store"
+    storage = LocalStorage(artifact_path=str(artifact_root))
+    source = artifact_root / "downloads" / "local" / "org-1" / "wr_1" / "source.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"saved run download")
+    uri = source.as_uri()
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(uploaded_files=SimpleNamespace(get_uploaded_file_by_storage_uri=AsyncMock(return_value=None))),
+    )
+
+    resolved = await files.resolve_local_or_download_file(uri, "wr_1", organization_id="org-1")
+
+    assert resolved == str(source.resolve())
+    assert Path(resolved).read_bytes() == b"saved run download"
+    with pytest.raises(PermissionError):
+        await files.resolve_local_or_download_file(uri, "wr_1", organization_id="org-2")
+
+
+@pytest.mark.asyncio
 async def test_resolve_local_file_rejects_outside_run_download_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
