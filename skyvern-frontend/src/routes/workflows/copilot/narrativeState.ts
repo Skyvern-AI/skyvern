@@ -437,7 +437,7 @@ export interface TurnNarrativeState {
   // Resolved pause outcome, from the credentialPause narrative signal.
   // "declined" means the pause engaged but never sent a frame, so no card.
   credentialPause: {
-    outcome: "connected" | "skipped" | "timeout" | "declined";
+    outcome: "connected" | "skipped" | "timeout" | "declined" | "signed_in";
     credentialId: string | null;
     // The tool call whose row was newest when the card was raised. Absent on
     // turns recorded before it was stamped.
@@ -564,7 +564,8 @@ export function parseCredentialPause(
     outcome !== "connected" &&
     outcome !== "skipped" &&
     outcome !== "timeout" &&
-    outcome !== "declined"
+    outcome !== "declined" &&
+    outcome !== "signed_in"
   ) {
     return null;
   }

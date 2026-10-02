@@ -4,6 +4,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  searchWithoutRun,
   searchWithRunSwitched,
   useSwitchStudioRun,
 } from "./runSwitchNavigation";
@@ -40,6 +41,14 @@ function pathRunWrapperFor(entry: string) {
 
 beforeEach(() => {
   navigate.mockClear();
+});
+
+describe("searchWithoutRun", () => {
+  it("drops the inspected run and its selection but keeps the pane layout", () => {
+    expect(
+      searchWithoutRun("?panes=browser&wr=wr_1&wrs=copilot&active=b1&bl=x"),
+    ).toBe("?panes=browser");
+  });
 });
 
 describe("searchWithRunSwitched system focus", () => {
