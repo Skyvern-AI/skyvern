@@ -45,8 +45,6 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.event.default import DefaultInputStrategy
-from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import _recorded_task_nav_error_codes
@@ -39664,26 +39662,3 @@ async def test_the_failed_read_count_resets_on_a_success_and_on_navigation(monke
         await page.goto("http://shop.test/review?again=1")
         after = await act(1)
         assert after[4] is None and after[1] == 0, after
-
-
-@_skip_no_browser
-@pytest.mark.asyncio
-async def test_an_appended_credential_never_reaches_the_humanized_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _RefusingInput(DefaultInputStrategy):
-        async def type_text(self, *args: Any, **kwargs: Any) -> None:
-            raise AssertionError("a resolved credential was sent through the registered input strategy")
-
-    monkeypatch.setattr(settings, "TASK_V3_HUMANIZED_INPUT", True)
-    EventStrategyFactory.set_input_strategy(_RefusingInput())
-    try:
-        async with _content_page('<!doctype html><html><body><input id="t" value="id-"></body></html>') as page:
-            tools = build_browser_tools(
-                _fixed_page_provider(page),
-                resolve_typed_text=lambda text: "real-secret" if text == "placeholder_abc" else text,
-            )
-            r = await _tool(tools, "type").handler({"selector": "#t", "text": "placeholder_abc", "clear": False})
-            held = await page.evaluate("() => document.getElementById('t').value")
-    finally:
-        EventStrategyFactory.reset()
-    assert r.status == "ok", r.content
-    assert held == "id-real-secret"

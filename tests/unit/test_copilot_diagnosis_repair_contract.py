@@ -3475,6 +3475,8 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
     )
     run_workflow = SimpleNamespace(
         organization_id=ctx.organization_id,
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
         workflow_definition=SimpleNamespace(
             parameters=[output_parameter],
             blocks=[SimpleNamespace(label="open_result", block_type="CODE", output_parameter=output_parameter)],

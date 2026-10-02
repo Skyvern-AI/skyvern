@@ -921,15 +921,17 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         modified_at=now,
     )
     workflow = SimpleNamespace(
-        workflow_definition={
-            "blocks": [
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
+        workflow_definition=SimpleNamespace(
+            blocks=[
                 {
                     "label": "click_submit",
                     "block_type": "code",
                     "code": 'await page.locator("#submit").click()',
                 }
             ]
-        }
+        ),
     )
     database = SimpleNamespace(
         workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)),

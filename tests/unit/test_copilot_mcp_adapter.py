@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote, urlparse
 
 import pytest
+import yaml
 from agents.mcp.util import MCPUtil
 from agents.tool_context import ToolContext
 from fastmcp import FastMCP
@@ -25,7 +27,7 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError
 from skyvern.forge.sdk.copilot.mcp_adapter import (
@@ -61,7 +63,14 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _FOR_LOOP_EXAMPLE,
+    _FOR_LOOP_GUIDANCE,
+    _FOR_LOOP_PROPERTY_DESCRIPTIONS,
+    _build_skyvern_mcp_overlays,
+    get_skyvern_mcp_alias_map,
+)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -3744,3 +3753,56 @@ async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> No
         assert original == {"block_type": "code"}
     finally:
         await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    names = ("get_block_schema", "get_workflow_knowledge")
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name] for name in names},
+        allowlist=frozenset(aliases[name] for name in names),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        tools = {tool.name: tool for tool in await server.list_tools()}
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            tool = MCPUtil.to_function_tool(tools[name], server, convert_schemas_to_strict=False)
+            tc = ToolContext(context=ctx, tool_name=name, tool_call_id=f"{name}-call", tool_arguments="{}")
+            output = await tool.on_invoke_tool(tc, json.dumps(arguments))
+            return json.loads(output["text"])["data"]
+
+        schema_data = await call("get_block_schema", {"block_type": "for_loop"})
+        knowledge = (await call("get_workflow_knowledge", {"topics": ["for_loop_block"]}))["sections"]["for_loop_block"]
+    finally:
+        await server.cleanup()
+
+    schema = schema_data["schema"]
+    properties = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]["properties"]
+    assert {name: properties[name]["description"] for name in _FOR_LOOP_PROPERTY_DESCRIPTIONS} == (
+        _FOR_LOOP_PROPERTY_DESCRIPTIONS
+    )
+    assert schema_data["example"] == _FOR_LOOP_EXAMPLE
+    producer, loop = schema_data["example"]["blocks"]
+    assert loop["loop_over_parameter_key"] == f"{producer['label']}_output"
+    assert "loop_variable_reference" not in loop
+    assert knowledge["content"] == _FOR_LOOP_GUIDANCE
+    assert all(description in _FOR_LOOP_GUIDANCE for description in _FOR_LOOP_PROPERTY_DESCRIPTIONS.values())
+    assert yaml.safe_load(_FOR_LOOP_GUIDANCE.partition("the list):\n")[2]) == _FOR_LOOP_EXAMPLE
+    assert {"loop_over_parameter_key", "loop_variable_reference"} <= set(properties)
+
+    both_inputs = {
+        "block_type": "for_loop",
+        "label": "visit_each_row",
+        "loop_over_parameter_key": "parse_rows_output",
+        "loop_variable_reference": "current_value",
+        "loop_blocks": [{"block_type": "goto_url", "label": "open_row_url", "url": "{{ current_value.url }}"}],
+    }
+    submitted = copy.deepcopy(both_inputs)
+    assert _block_authoring_violations(submitted, AGENT_BLOCKS_ONLY) == []
+    assert submitted == both_inputs
