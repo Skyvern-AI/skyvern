@@ -84,7 +84,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "start_fresh_browser": "Starting a fresh browser",
     "extend_browser_session": "Extending the browser session",
     "upload_attached_file": "Attaching your file to the page",
-    "run_browser_code": "Running browser code",
+    "run_browser_code": "Working in the browser",
     "edit_block": "Editing block",
     "add_block": "Adding block",
     "delete_block": "Deleting block",
@@ -149,6 +149,7 @@ def build_tool_result_activity(
     timestamp: datetime,
     display_label: str | None = None,
     code_diffs: list[CodeWriteDiff] | None = None,
+    browser_steps: list[str] | None = None,
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
@@ -165,6 +166,8 @@ def build_tool_result_activity(
     }
     if code_diffs:
         entry["codeDiffs"] = code_diffs
+    if browser_steps:
+        entry["browserSteps"] = browser_steps
     return entry
 
 

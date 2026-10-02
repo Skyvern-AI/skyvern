@@ -764,6 +764,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         None,
         description="The plan a successful set_work_plan stored, as stored. None for every other tool",
     )
+    browser_steps: list[str] | None = Field(
+        None,
+        description="A successful run_browser_code call's reported operations as display phrases, in order",
+    )
     detail: str | None = Field(
         None,
         description=(

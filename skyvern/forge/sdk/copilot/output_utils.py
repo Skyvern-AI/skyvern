@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import itertools
 import json
 import re
 import unicodedata
@@ -1959,6 +1960,79 @@ def _workflow_write_phrase(data: dict[str, Any]) -> str:
     return "Staged a workflow draft" if data.get("persistence") else "Workflow updated"
 
 
+_BROWSER_CODE_OPERATION_PHRASES = {
+    "goto": "opened a page",
+    "go_back": "went back",
+    "reload": "reloaded the page",
+    "click": "clicked",
+    "dblclick": "double-clicked",
+    "fill": "filled",
+    "type": "typed into",
+    "press": "pressed a key",
+    "check": "checked",
+    "uncheck": "unchecked",
+    "select_option": "selected an option",
+    "hover": "hovered",
+    "count": "counted",
+    "text_content": "read",
+    "inner_text": "read",
+    "inner_html": "read",
+    "all_text_contents": "read",
+    "all_inner_texts": "read",
+    "get_attribute": "read",
+    "input_value": "read",
+    "is_visible": "checked visibility of",
+    "content": "read the page",
+    "title": "read the title",
+    "evaluate": "ran a page script",
+    "wait_for_selector": "waited for",
+    "wait_for": "waited for",
+    "wait_for_url": "waited for navigation",
+    "wait_for_load_state": "waited for the page to load",
+    "wait_for_timeout": "waited",
+    "search_web": "searched the web",
+    "solve_captcha": "ran the CAPTCHA solver",
+    "click_and_download": "downloaded a file",
+    "click_and_wait_for_popup": "opened a popup",
+}
+_MAX_BROWSER_CODE_SELECTOR_CHARS = 40
+
+
+def browser_code_steps_for_user(tool_name: str, result: dict[str, Any]) -> list[str] | None:
+    """A successful run_browser_code call's reported operations as phrases, e.g. ``["Opened a page", "read ×10"]``."""
+    if tool_name != "run_browser_code" or result.get("ok") is not True:
+        return None
+    operations = result.get("operations")
+    if not isinstance(operations, list):
+        return None
+    facts = [op for op in operations if isinstance(op, dict) and isinstance(op.get("operation"), str)]
+    steps: list[str] = []
+    for name, group in itertools.groupby(facts, key=lambda op: op["operation"]):
+        run = list(group)
+        step = _BROWSER_CODE_OPERATION_PHRASES.get(name, name.replace("_", " "))
+        selectors = {op.get("selector") for op in run}
+        selector = next(iter(selectors)) if len(selectors) == 1 else None
+        if isinstance(selector, str) and selector.strip():
+            # Model-authored; collapsed and clamped so one long selector cannot take over the row.
+            shown = " ".join(selector.split())
+            if len(shown) > _MAX_BROWSER_CODE_SELECTOR_CHARS:
+                shown = shown[: _MAX_BROWSER_CODE_SELECTOR_CHARS - 1] + "…"
+            step += f" '{shown}'"
+        if len(run) > 1:
+            step += f" ×{len(run)}"
+        if any(op.get("status") == "failed" for op in run):
+            step += " (failed)"
+        steps.append(step)
+    if not steps:
+        return None
+    omitted = result.get("operations_omitted")
+    if isinstance(omitted, int) and omitted > 0:
+        # Only the first operations are listed, so the true last action is unknown.
+        steps.append(f"{omitted} more operation(s)")
+    steps[0] = steps[0][:1].upper() + steps[0][1:]
+    return steps
+
+
 _PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
     "solved": "Challenge solver reported the challenge solved",
     "typed": "Challenge solver typed the CAPTCHA image's text",
@@ -2092,6 +2166,10 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         count = len(operations) if isinstance(operations, list) else 0
         url = result.get("current_url")
         summary = f"Ran browser code ({count} operation(s))"
+        # Only the display form changes: context.merge_turn_summary parses "Ran browser code ... at <url>".
+        steps = browser_code_steps_for_user(tool_name, result) if for_display else None
+        if steps:
+            summary = " → ".join(steps)
         return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
     return "OK"
 
