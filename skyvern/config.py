@@ -278,6 +278,8 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
+    WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True

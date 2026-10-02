@@ -26,6 +26,7 @@ from skyvern.webeye import display_recorder as dr
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
+from skyvern.webeye.profile_cookie_merge import write_signin_cookies
 
 
 @pytest.mark.asyncio
@@ -167,6 +168,27 @@ async def test_create_browser_context_gates_playwright_video_on_acquired_recorde
     await BrowserContextFactory.create_browser_context(playwright=object())
 
     assert listener.called is expect_listener
+
+
+@pytest.mark.asyncio
+async def test_factory_restores_sign_in_seed_with_banked_cookies_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    write_signin_cookies(str(tmp_path), [{"name": "sid", "value": "1", "domain": "portal.example.com", "path": "/"}])
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+
+    async def _creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        return context, BrowserArtifacts(browser_session_dir=str(tmp_path)), None
+
+    _factory_harness(monkeypatch)
+    BrowserContextFactory.register_type("test-signin-seed", _creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-signin-seed")
+
+    await BrowserContextFactory.create_browser_context(playwright=object())
+
+    assert [c["name"] for c in context.add_cookies.await_args.args[0]] == ["sid"]
+    factory_module.restore_banked_cookies.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -432,7 +432,17 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The tool call whose activity row was newest when the pause was raised, so
   // the card renders there. Absent against a backend that predates it.
   anchor_tool_call_id?: string | null;
+  // The live browser the user may sign in to themselves; absent when the card does not offer it.
+  sign_in_browser_session_id?: string | null;
+  signing_in?: boolean;
   timestamp: string;
+}
+
+export interface WorkflowCopilotCredentialResponseResult {
+  result: "accepted" | "signed_in" | "no_sign_in_found" | "save_failed";
+  expires_at?: string | null;
+  host?: string | null;
+  browser_profile_id?: string | null;
 }
 
 export interface WorkflowCopilotCredentialPauseResolvedUpdate {
@@ -440,9 +450,10 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   turn_id: string;
   workflow_copilot_chat_id: string;
   resume_token: string;
-  outcome: "connected" | "skipped" | "not_admitted";
+  outcome: "connected" | "skipped" | "not_admitted" | "signed_in";
   credential_id: string | null;
   name: string | null;
+  browser_profile_id?: string | null;
   timestamp: string;
 }
 

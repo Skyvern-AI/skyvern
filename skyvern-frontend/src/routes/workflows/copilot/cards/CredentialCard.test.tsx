@@ -26,6 +26,7 @@ import {
   CredentialCard,
   type CredentialPauseHistorical,
   type CredentialRequiredReason,
+  type ManualSignInOffer,
 } from "./CredentialCard";
 
 const { getClientMock, credsData, credsFail, clientGet } = vi.hoisted(() => {
@@ -332,6 +333,99 @@ describe("CredentialCard callbacks", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
     expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("CredentialCard sign in myself", () => {
+  const signIn = (overrides: Partial<ManualSignInOffer> = {}) => ({
+    busy: false,
+    onStart: vi.fn(),
+    onDone: vi.fn(),
+    ...overrides,
+  });
+
+  it("offers signing in yourself only when the chat passes an offer", () => {
+    const offer = signIn();
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        signIn={offer}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sign in myself" }));
+    expect(offer.onStart).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Sign in myself" })).toBeNull();
+  });
+
+  it("while signing in, Done finishes, Cancel skips, and a Done that found nothing says so", () => {
+    const offer = signIn({ notFoundHost: "portal.example.com" });
+    const onSkip = vi.fn();
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ signing_in: true })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={onSkip}
+        signIn={offer}
+      />,
+    );
+    expect(
+      screen.getAllByText(/No sign-in found for portal\.example\.com/),
+    ).not.toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(offer.onDone).toHaveBeenCalledTimes(1);
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+  });
+
+  it("says when a Done could not save the sign-in, not that none was found", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ signing_in: true })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        signIn={signIn({
+          saveFailed: true,
+          notFoundHost: "portal.example.com",
+        })}
+      />,
+    );
+    expect(screen.getAllByText(/Couldn't save your sign-in/)).not.toHaveLength(
+      0,
+    );
+    expect(screen.queryByText(/No sign-in found/)).toBeNull();
+  });
+
+  it("renders a signed-in receipt naming the saved profile", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        resolvedOutcome={{ outcome: "signed_in", name: "Sign-in for portal" }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Signed in, saved as 'Sign-in for portal'"),
+    ).toBeTruthy();
   });
 });
 

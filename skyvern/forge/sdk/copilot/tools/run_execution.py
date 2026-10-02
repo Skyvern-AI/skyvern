@@ -3997,9 +3997,15 @@ async def _run_blocks_and_collect_debug(
             if seed_approval_error is not None:
                 return {"ok": False, "error": seed_approval_error}
         if preview is not None and preview[1] == BrowserSeedSource.picked:
-            # A draft can name any profile in the org; only the saved workflow's pick at turn start is settled.
-            saved_pick = ctx.request_policy.persisted_workflow_browser_profile_id if ctx.request_policy else None
-            if preview[0] != saved_pick:
+            # A draft can name any profile in the org; only the saved workflow's pick at turn start, or the
+            # profile the user's own sign-in saved on this turn's card, is settled.
+            policy = ctx.request_policy
+            settled_picks = (
+                {policy.persisted_workflow_browser_profile_id, policy.credential_pause_signed_in_profile_id} - {None}
+                if policy
+                else set()
+            )
+            if preview[0] not in settled_picks:
                 return {"ok": False, "error": _UNSAVED_BROWSER_PROFILE_PICK_ERROR}
         if preview is not None:
             seed_profile_id, browser_seed_source = preview

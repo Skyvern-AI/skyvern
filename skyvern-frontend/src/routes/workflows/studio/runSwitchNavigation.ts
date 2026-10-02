@@ -47,6 +47,21 @@ export function searchWithRunSwitched(
   return toReadableSearch(params);
 }
 
+// Point the studio back at its live browser: drop the inspected run and its per-run selection.
+export function searchWithoutRun(search: string): string {
+  const params = new URLSearchParams(search);
+  for (const key of [
+    "wr",
+    SYSTEM_RUN_FOCUS_PARAM,
+    "active",
+    "bl",
+    "iteration",
+  ]) {
+    params.delete(key);
+  }
+  return toReadableSearch(params);
+}
+
 /**
  * Switch the studio's inspected run from a user action (e.g. the Past Runs
  * list). The single place run-switch navigation lives, so surfaces that touch

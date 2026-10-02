@@ -532,8 +532,21 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
     resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
-    action: Literal["connected", "skip"] = Field(..., description="The user's response to the credential card")
+    action: Literal["connected", "skip", "signing_in", "signed_in"] = Field(
+        ...,
+        description=(
+            "The user's response to the credential card: 'signing_in' when they start signing in themselves in "
+            "the live browser, 'signed_in' when they finish"
+        ),
+    )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+
+
+class WorkflowCopilotCredentialResponseResult(BaseModel):
+    result: Literal["accepted", "signed_in", "no_sign_in_found", "save_failed"]
+    expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
+    host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
@@ -971,10 +984,14 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     anchor_tool_call_id: str | None = Field(
         None, description="Tool call whose activity row was newest when the pause was raised"
     )
+    sign_in_browser_session_id: str | None = Field(
+        None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
+    )
+    signing_in: bool = Field(False, description="The user has started signing in themselves")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
-CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted"]
+CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted", "signed_in"]
 
 
 class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
@@ -988,7 +1005,10 @@ class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
         ..., description="The waiter's final verdict, after admission; never the raw POSTed action"
     )
     credential_id: str | None = Field(None, description="The connected credential; set only when connected")
-    name: str | None = Field(None, description="Display name of the connected credential; set only when connected")
+    name: str | None = Field(
+        None, description="Display name of the connected credential, or of the profile saved from a sign-in"
+    )
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
