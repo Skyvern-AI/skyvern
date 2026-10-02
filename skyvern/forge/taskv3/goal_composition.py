@@ -245,7 +245,6 @@ def render_block_context(
     handoff_enabled: bool = False,
     previous_block: PreviousBlockHandoff | None = None,
     selected_block_labels: list[str] | None = None,
-    extraction_reports: bool = False,
 ) -> tuple[str, str]:
     """Return ``(framing, section)`` for a block task; both are ``""`` for a bare task.
 
@@ -297,8 +296,7 @@ def render_block_context(
     elif task_block is not None and task.task_type == TaskType.action:
         pieces.append("This is a single, focused action: perform it and finish.")
     elif (
-        extraction_reports
-        and task_block is not None
+        task_block is not None
         and task_block.block_type == BlockType.EXTRACTION
         and not task_block.is_internal_evaluation
         and not task.navigation_goal

@@ -196,7 +196,6 @@ from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
     resolve_run_arm,
@@ -2317,13 +2316,6 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DATE_SEGMENT_AIM,
             )
-            await resolve_run_arm(
-                context,
-                EXTRACTION_REPORTS_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_EXTRACTION_REPORTS,
-            )
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
         page_free_validation = bool(
@@ -2376,7 +2368,6 @@ class ForgeAgent:
             handoff_enabled=handoff_enabled,
             previous_block=previous_block,
             selected_block_labels=context.run_block_labels if context else None,
-            extraction_reports=run_arm_enabled(EXTRACTION_REPORTS_FLAG, settings.TASK_V3_EXTRACTION_REPORTS),
         )
         # Surface the customer's completion/termination criteria (trusted task config, like the navigation
         # goal). Withhold a complete_criterion flagged untrusted (LLM-derived from page content) so it can't be

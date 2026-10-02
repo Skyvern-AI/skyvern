@@ -17,7 +17,6 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 LOG = structlog.get_logger()
 
 DATE_SEGMENT_AIM_FLAG = "TASK_V3_DATE_SEGMENT_AIM"
-EXTRACTION_REPORTS_FLAG = "TASK_V3_EXTRACTION_REPORTS"
 GOAL_CHECK_FLAG = "TASK_V3_GOAL_CHECK"
 GOAL_CHECK_ENFORCE_FLAG = "TASK_V3_GOAL_CHECK_ENFORCE"
 

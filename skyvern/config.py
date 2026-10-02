@@ -556,10 +556,6 @@ class Settings(BaseSettings):
     TASK_V3_GOAL_CHECK_ENFORCE: bool = False
     # The judge's model. Unset means the judge never runs; there is no fallback to another model.
     TASK_V3_GOAL_CHECK_LLM_KEY: str | None = None
-    # Tell a block with no navigation goal that it reports what the page shows -- absent fields as null,
-    # finished completed -- as v1's single extract action does (SKY-16398). Force-on term only: runs are
-    # randomized per run by the flag of the same name, read through run_arm_enabled().
-    TASK_V3_EXTRACTION_REPORTS: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
