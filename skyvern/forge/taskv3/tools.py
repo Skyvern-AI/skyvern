@@ -346,14 +346,15 @@ def _escape_tags_in_text(text: str) -> str:
 
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
 # click menu probe, data-tv3-act by act-by-mark (written on the look-resolved element at act time and
-# kept for the life of the document, so the submit watch can still resolve it turns later). Each
+# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-close by
+# the covered probe for an unmarked onclick close. Each
 # exists only where we set it, so one that matches nothing now cannot reappear without a fresh
 # observe / menu-opening click / look.
 _TV3_MARKER_SELECTOR_RE = re.compile(
-    r'^\[data-tv3(?:(?:-menu|-act)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+    r'^\[data-tv3(?:(?:-menu|-act|-close)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
 )
 # Any v3 marker inside a selector, including one observe composed a host-anchored selector around.
-_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg)?="')
+_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-close)?="')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -4082,6 +4083,7 @@ _LOOK_ENUM_JS = (
 )
 
 _ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
+_CLOSE_ATTR_RE = re.compile(r' data-tv3-close="[^"]*"')
 _ACT_SELECTOR_PREFIX = '[data-tv3-act="'
 # Write the act-by-mark attribute on an element handle the caller already resolved (Playwright's
 # engine, which pierces open shadow). Returns whether the node is still connected; a detached handle
@@ -4801,6 +4803,7 @@ _TYPE_TARGET_PROBE_JS = (
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
+  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
 
   // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
   // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
@@ -5750,14 +5753,12 @@ _TYPE_TARGET_PROBE_JS = (
     // The role list mirrors observe()'s own _WIDGET_ROLES answer to "is this a control?" (minus the
     // form-field roles observe treats as fillable, not actionable), so a consent switch or a
     // role=menuitem Close action is not omitted just because it isn't a <button>.
-    const found = deepAll(
-      layer,
-      'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
+    const controlSel = 'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
       + 'input[type="reset"],[role="button"],'
       + '[role="checkbox"],[role="radio"],[role="combobox"],[role="option"],[role="menuitem"],'
       + '[role="menuitemcheckbox"],[role="menuitemradio"],[role="listbox"],[role="switch"],'
-      + '[role="spinbutton"],[role="tab"]'
-    );
+      + '[role="spinbutton"],[role="tab"]';
+    const found = deepAll(layer, controlSel);
     // A disabled control cannot be the thing to click -- recommending one wastes a click timeout on
     // a target Playwright will refuse, and can crowd the real dismisser out of the eight-slot cap.
     // :disabled (not the .disabled IDL property) is what the browser actually uses to decide this,
@@ -5788,7 +5789,35 @@ _TYPE_TARGET_PROBE_JS = (
     // motivating bug with more words. Keep both ends: the first few for context, the last few
     // because that is where a footer actually lives.
     const truncated = allControls.length > 8;
-    const controls = truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls;
+    // An icon-only close is often a bare <div onclick>, which no tag or role above names. Only a leaf
+    // handler counts (a row, card or body handler wraps other controls), and at most two are added
+    // after the named ones, so a list of row handlers cannot displace the layer's own controls.
+    const leaves = [];
+    for (const c of deepAll(layer, '[onclick]').slice(0, 200)) {
+      if (c === layer || c === el || !visible(c) || isDisabled(c)) continue;
+      if (c.matches && c.matches(controlSel)) continue;
+      if (c.contains(el) || c.querySelector('[onclick],' + controlSel)) continue;
+      if (c.parentElement && c.parentElement.closest(controlSel)) continue;
+      const label = boundedClean(ownName(c) || c.textContent || (c.getAttribute && c.getAttribute('title')) || '', 60);
+      leaves.push({ c, label });
+    }
+    // An icon close has no text, so unlabeled leaves go first; a run of labelled rows cannot fill the slots ahead of it.
+    leaves.sort((a, b) => (a.label ? 1 : 0) - (b.label ? 1 : 0));
+    // Fresh per probe, so a selector an earlier probe printed matches nothing rather than another element.
+    const closeNonce = Math.random().toString(36).slice(2, 7);
+    const onclickControls = [];
+    for (const { c, label } of leaves) {
+      if (onclickControls.length >= 2) break;
+      let csel = idSelector(c) || markerSelector(c);
+      if (!csel) {
+        // A close that appeared after the last observe carries no marker, so the probe names it itself.
+        const key = closeNonce + '-' + onclickControls.length;
+        try { c.setAttribute('data-tv3-close', key); csel = '[data-tv3-close="' + key + '"]'; } catch (e) { continue; }
+      }
+      onclickControls.push({ selector: csel, label });
+    }
+    const controls = (truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls)
+      .concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
     out.occluder.layerKind = layerKind;
@@ -12948,6 +12977,7 @@ def build_browser_tools(
         # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
         # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
+        html = _CLOSE_ATTR_RE.sub("", html)
         html = _COLLATERAL_ATTR_RE.sub("", html)
         html = _DATE_SEGMENT_ATTR_RE.sub("", html)
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
@@ -13113,10 +13143,7 @@ def build_browser_tools(
         layer_desc = f'"{name}"' if name else "a layer"
         if layer_selector:
             layer_desc = f"{layer_desc} ({layer_selector})"
-        if parts:
-            controls_desc = "; ".join(parts)
-        else:
-            controls_desc = "re-observe — no controls were found on it"
+        controls_desc = "; ".join(parts) if parts else "none named"
         if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
         if branch == "challenge":
@@ -13131,6 +13158,23 @@ def build_browser_tools(
                 "itself sits in, takes the pointer at the field's position. Do not try to dismiss it; it "
                 'holds the field. Click [data-tv3-catcher="1"] to activate the field, then retry '
                 f"{selector}.",
+                error_class="covered",
+            )
+        if not parts and (occluder or {}).get("layerKind") == "hit_fallback":
+            # The walk qualified no layer and named the element drawn at the field's position (a value cell, an
+            # option row), so there is no dialog to close.
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, an element drawn over it rather than a dialog, so it "
+                f"cannot be {verb}{also}. Re-observe and reach the field another way.",
+                error_class="covered",
+            )
+        if not parts:
+            # The probe names controls by tag, role and inline onclick; a close wired by a script listener is
+            # none of those, so an empty list is no evidence the layer has no way out.
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
+                "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
+                f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
                 error_class="covered",
             )
         return ToolResult.error(

@@ -3203,6 +3203,8 @@ class LoopState:
     # A single-action block's completion is offered through the finish tool at most once: a guard that
     # holds a verdict only once would pass a second offer the model never saw it hold.
     block_completion_offered: bool = False
+    # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
+    block_action_transitioned: bool = False
 
 
 async def run_agent_tool_loop(
@@ -4287,23 +4289,34 @@ async def run_agent_tool_loop(
                         and not st.block_completion_offered
                     ):
                         st.block_completion_offered = True
-                        block_reason = (
-                            f"performed the block's action ({st.billable_actions[0]}); "
-                            "a further action was past the block's step limit"
+                        LOG.info(
+                            "taskv3 block completion evidence",
+                            url_changed=st.block_action_transitioned,
+                            billable_actions=st.billable_actions,
                         )
-                        # Through the real handler, so every guard on a completed verdict still applies.
-                        try:
-                            block_finish = await finish_spec.handler({"status": "completed", "reason": block_reason})
-                        except Exception:
-                            LOG.warning("taskv3 block completion finish raised", exc_info=True)
-                            block_finish = ToolResult.error("")
-                        if activity is not None:
-                            activity.held_verdict_batch_skip = False
-                        if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
-                            st.outcome = LoopOutcome("completed", block_reason)
-                            break
-                        if block_finish.status == "error":
-                            block_refusal = block_finish.content
+                        # A successful action that moved nothing (a no-op click, a username typed before the
+                        # login submits) is no sign the block is done; the finish gate's goal check, under enforce,
+                        # still vetoes a URL change that landed on the wrong page.
+                        if st.block_action_transitioned:
+                            block_reason = (
+                                f"performed the block's action ({st.billable_actions[0]}); "
+                                "a further action was past the block's step limit"
+                            )
+                            # Through the real handler, so every guard on a completed verdict still applies.
+                            try:
+                                block_finish = await finish_spec.handler(
+                                    {"status": "completed", "reason": block_reason}
+                                )
+                            except Exception:
+                                LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                                block_finish = ToolResult.error("")
+                            if activity is not None:
+                                activity.held_verdict_batch_skip = False
+                            if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
+                                st.outcome = LoopOutcome("completed", block_reason)
+                                break
+                            if block_finish.status == "error":
+                                block_refusal = block_finish.content
                     # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
                     # away once the final turn is granted: a billable dispatch on the granted turn still
                     # hits it, which is the honest exit the grant exists to produce.
@@ -4830,6 +4843,13 @@ async def run_agent_tool_loop(
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
+                    # click reports it at the top level, navigate inside its action outcome. A navigation that
+                    # landed on an error page moved the URL without doing the block's action.
+                    if not _outcome_reports_failure(round_outcome) and (
+                        result_data.get("page_transitioned") is True
+                        or (round_outcome or {}).get("page_transitioned") is True
+                    ):
+                        st.block_action_transitioned = True
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
                     activity.failure_evidence_trigger_generation += 1
