@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
+    LoopInputs,
     append_omission_notice,
     coerce_block_action_observations,
     coerce_block_end_urls,
@@ -67,6 +68,7 @@ _INTERNAL_RUN_OUTCOME_RECORDED_KEY = "_copilot_internal_run_outcome_recorded"
 _INTERNAL_GOAL_PATH_OMISSIONS_KEY = "_copilot_internal_goal_path_omissions"
 _BASE64_IMAGE_OMITTED_MESSAGE = "[base64 image omitted — screenshot was taken successfully]"
 BUILD_TEST_PACKET_KEY = "build_test_packet"
+LOOP_INPUTS_KEY = "loop_inputs"
 
 _BUILD_TEST_PACKET_MAX_CHARS = 47_000
 _BUILD_TEST_WORKFLOW_MAX_CHARS = 30_000
@@ -95,6 +97,22 @@ _BUILD_TEST_LOCATOR_CANDIDATE_MAX_ITEMS = 6
 _BUILD_TEST_LOCATOR_SELECTOR_MAX_CHARS = 240
 _BUILD_TEST_OBSTRUCTION_VALUE_MAX_CHARS = 240
 _BUILD_TEST_IDENTITY_LABEL_MAX_CHARS = 2_048
+_LOOP_INPUT_MAX_CHARS = {
+    "workflow_run_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "workflow_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "workflow_permanent_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].block_label": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].enclosing_loop_label": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].loop_over_parameter_key": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].producer_block_label": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].producer_output_parameter_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].loop_variable_reference": 200,
+}
+# The exact notices bounded_loop_inputs emits; the handoff cannot re-derive them from already-shortened values.
+LOOP_INPUT_OMISSION_NOTICES = frozenset(
+    f"loop_inputs.{field_name} shortened at {max_chars} characters."
+    for field_name, max_chars in _LOOP_INPUT_MAX_CHARS.items()
+)
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_PREFIX = b"\xff\xd8\xff"
@@ -787,6 +805,40 @@ def _bounded_packet_page_state(
     return page_state.model_copy(update=updates)
 
 
+def bounded_loop_inputs(loop_inputs: LoopInputs, notices: list[str]) -> LoopInputs:
+    def bounded(value: str | None, field_name: str) -> str | None:
+        return _bounded_packet_string(
+            value,
+            field_name=f"loop_inputs.{field_name}",
+            max_chars=_LOOP_INPUT_MAX_CHARS[field_name],
+            notices=notices,
+        )
+
+    loops = [
+        loop.model_copy(
+            update={
+                "block_label": bounded(loop.block_label, "loops[].block_label"),
+                "enclosing_loop_label": bounded(loop.enclosing_loop_label, "loops[].enclosing_loop_label"),
+                "loop_over_parameter_key": bounded(loop.loop_over_parameter_key, "loops[].loop_over_parameter_key"),
+                "producer_block_label": bounded(loop.producer_block_label, "loops[].producer_block_label"),
+                "producer_output_parameter_id": bounded(
+                    loop.producer_output_parameter_id, "loops[].producer_output_parameter_id"
+                ),
+                "loop_variable_reference": bounded(loop.loop_variable_reference, "loops[].loop_variable_reference"),
+            }
+        )
+        for loop in loop_inputs.loops
+    ]
+    return loop_inputs.model_copy(
+        update={
+            "workflow_run_id": bounded(loop_inputs.workflow_run_id, "workflow_run_id"),
+            "workflow_id": bounded(loop_inputs.workflow_id, "workflow_id"),
+            "workflow_permanent_id": bounded(loop_inputs.workflow_permanent_id, "workflow_permanent_id"),
+            "loops": loops,
+        }
+    )
+
+
 def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]) -> BuildTestEvidencePacket:
     return packet.model_copy(
         update={
@@ -808,6 +860,20 @@ def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]
             ),
             "omission_notices": notices,
         }
+    )
+
+
+def _compact_loop_inputs(packet: BuildTestEvidencePacket, notices: list[str]) -> BuildTestEvidencePacket:
+    loop_inputs = packet.run.loop_inputs
+    if not isinstance(loop_inputs, LoopInputs):
+        return packet
+    loops = _compacted(loop_inputs.loops, 6, field_name="run.loop_inputs.loops", notices=notices, keep="first")
+    if not (dropped := len(loop_inputs.loops) - len(loops)):
+        return packet
+    loops_omitted = (loop_inputs.loops_omitted or 0) + dropped
+    compacted = loop_inputs.model_copy(update={"loops": loops, "loops_omitted": loops_omitted})
+    return packet.model_copy(
+        update={"run": packet.run.model_copy(update={"loop_inputs": compacted}), "omission_notices": notices}
     )
 
 
@@ -1356,6 +1422,11 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                 max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                 notices=notices,
             ),
+            "loop_inputs": (
+                bounded_loop_inputs(loop_inputs, notices)
+                if isinstance(loop_inputs := projected.run.loop_inputs, LoopInputs)
+                else loop_inputs
+            ),
         }
     )
     screenshot = projected.screenshot.model_copy(
@@ -1374,6 +1445,9 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
         # Repeated per-block facts give way before the workflow readback the repair turn needs more.
         projected = _compact_block_fact_maps(projected, notices)
+        serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+    if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
+        projected = _compact_loop_inputs(projected, notices)
         serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS and projected.canonical_workflow_yaml is not None:
         excess = len(serialized) - _BUILD_TEST_PACKET_MAX_CHARS
@@ -1404,11 +1478,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
 
 
 def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
-    # This handoff rebuilds its own notices, so it carries forward only the mint-time fact it cannot
+    # This handoff rebuilds its own notices, so it carries forward only the mint-time facts it cannot
     # reconstruct; adopting the recorded list wholesale would relay run-supplied prose to the model.
     notices: list[str] = []
     if OBSERVED_BLOCK_END_URLS_WITHHELD in packet.omission_notices:
         notices.append(OBSERVED_BLOCK_END_URLS_WITHHELD)
+    notices.extend(notice for notice in packet.omission_notices if notice in LOOP_INPUT_OMISSION_NOTICES)
     if packet.canonical_workflow_yaml is None:
         notices.append("canonical_workflow_yaml omitted: no persisted workflow readback was recorded.")
     if packet.run.workflow_run_id is None:
@@ -1672,6 +1747,8 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             # and values registered for secret scrubbing during finalization.
             data.pop("action_observations", None)
             data.pop("action_trace_summary", None)
+            data.pop(LOOP_INPUTS_KEY, None)
+            data.pop("loop_inputs_omission_notices", None)
             data.pop("observed_block_end_urls", None)
             data.pop("per_block_action_observations", None)
             data.pop("block_fact_omission_notices", None)

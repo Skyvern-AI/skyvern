@@ -20,7 +20,6 @@ DATE_SEGMENT_AIM_FLAG = "TASK_V3_DATE_SEGMENT_AIM"
 EXTRACTION_REPORTS_FLAG = "TASK_V3_EXTRACTION_REPORTS"
 GOAL_CHECK_FLAG = "TASK_V3_GOAL_CHECK"
 GOAL_CHECK_ENFORCE_FLAG = "TASK_V3_GOAL_CHECK_ENFORCE"
-HUMANIZED_INPUT_FLAG = "TASK_V3_HUMANIZED_INPUT"
 
 # Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The
 # PostHog preflight (scripts/check_run_arm_flags.py) reads this mapping to accept release conditions on them.
@@ -96,12 +95,3 @@ def run_arm_enabled(flag: str, forced: bool) -> bool:
         return False
     pin = context.run_arms.get(flag)
     return pin is not None and pin[1] == "treatment"
-
-
-def current_run_arm(flag: str) -> RunArm | None:
-    """The arm pinned for ``flag`` on the current run, or None when it was never resolved."""
-    context = skyvern_context.current()
-    if context is None:
-        return None
-    pin = context.run_arms.get(flag)
-    return pin[1] if pin is not None else None

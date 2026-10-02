@@ -64,6 +64,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketRunBrowser,
     BuildTestPacketScreenshot,
     BuildTestPacketUnfinishedItem,
+    LoopInputFact,
+    LoopInputs,
+    LoopInputsUnavailable,
+    LoopSelectedInput,
     RecordedBuildTestOutcome,
     SolverAttempt,
     append_omission_notice,
@@ -141,6 +145,8 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     BUILD_TEST_PACKET_KEY,
+    LOOP_INPUTS_KEY,
+    bounded_loop_inputs,
     build_run_blocks_response,
     iter_failure_reasons,
     labelled_block_names,
@@ -240,7 +246,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, get_all_blocks
+from skyvern.forge.sdk.workflow.models.block import (
+    BlockTypeVar,
+    CodeBlock,
+    ForLoopBlock,
+    WhileLoopBlock,
+    get_all_blocks,
+)
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RECORDED_FAILURE_RESPONSE_MAX_CHARS
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -249,6 +261,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowRun,
     WorkflowRunOutputParameter,
@@ -1775,6 +1788,138 @@ def _execution_source_facts(
     }
 
 
+_LOOP_INPUTS_MAX_LOOPS = 20
+_LOOP_VALUES_COUNTS_MAX_ROWS = 10
+
+
+def loop_selected_input(block: ForLoopBlock) -> LoopSelectedInput:
+    """Mirrors ForLoopBlock.get_loop_over_parameter_values: a truthy reference wins over loop_over."""
+    if block.loop_variable_reference:
+        return "loop_variable_reference"
+    if block.loop_over is not None:
+        return "loop_over_parameter_key"
+    return "none"
+
+
+def loop_definition_facts(workflow: Workflow) -> LoopInputs | None:
+    producers_by_id, producers_by_key = _workflow_output_parameter_indexes(workflow)
+    loops: list[LoopInputFact] = []
+
+    def visit(blocks: Sequence[BlockTypeVar], enclosing_loop_label: str | None) -> None:
+        for block in blocks:
+            if isinstance(block, ForLoopBlock):
+                loop_over = block.loop_over
+                reference = block.loop_variable_reference
+                # The converter replaces loop_over with the parameter a reference names, losing the authored key.
+                if loop_over is not None and reference and loop_over.key == reference.strip(" {}"):
+                    loop_over = None
+                # A loop_over saved by an older version keeps that version's id; the executor resolves it by key.
+                producer = (
+                    producers_by_id.get(loop_over.output_parameter_id) or producers_by_key.get(loop_over.key, {})
+                    if isinstance(loop_over, OutputParameter)
+                    else {}
+                )
+                loops.append(
+                    LoopInputFact(
+                        block_label=block.label,
+                        enclosing_loop_label=enclosing_loop_label,
+                        loop_over_parameter_key=loop_over.key if loop_over is not None else None,
+                        producer_block_label=producer.get("block_label"),
+                        producer_output_parameter_id=producer.get("output_parameter_id"),
+                        loop_variable_reference=reference,
+                        selected_input=loop_selected_input(block),
+                    )
+                )
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
+                visit(block.loop_blocks, block.label)
+
+    visit(workflow.workflow_definition.blocks, None)
+    if not loops:
+        return None
+    return LoopInputs(
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        version=workflow.version,
+        loops=loops[:_LOOP_INPUTS_MAX_LOOPS],
+        loops_omitted=len(loops) - _LOOP_INPUTS_MAX_LOOPS if len(loops) > _LOOP_INPUTS_MAX_LOOPS else None,
+    )
+
+
+def with_loop_observations(
+    definitions: LoopInputs, workflow_run_id: str, rows: Sequence[WorkflowRunBlock]
+) -> LoopInputs:
+    """A row whose loop_values was never written reports not_recorded; a loop with no row in this run (never
+    reached, or seeded from an earlier run) carries no observations."""
+    loops: list[LoopInputFact] = []
+    for loop in definitions.loops:
+        loop_rows = [row for row in rows if row.block_type == BlockType.FOR_LOOP and row.label == loop.block_label]
+        if not loop_rows:
+            loops.append(loop)
+            continue
+        counts: list[int | Literal["not_recorded"]] = [
+            len(row.loop_values) if row.loop_values is not None else "not_recorded" for row in loop_rows
+        ]
+        omitted = len(counts) - _LOOP_VALUES_COUNTS_MAX_ROWS
+        loops.append(
+            loop.model_copy(
+                update={
+                    "run_rows": len(loop_rows),
+                    "loop_values_counts": counts[-_LOOP_VALUES_COUNTS_MAX_ROWS:],
+                    "loop_values_counts_omitted": omitted if omitted > 0 else None,
+                }
+            )
+        )
+    return definitions.model_copy(update={"workflow_run_id": workflow_run_id, "loops": loops})
+
+
+def _loop_definitions_or_unavailable(workflow: Workflow) -> LoopInputs | LoopInputsUnavailable | None:
+    try:
+        return loop_definition_facts(workflow)
+    except Exception:
+        LOG.warning("Loop input definition facts unavailable", workflow_id=workflow.workflow_id, exc_info=True)
+        return LoopInputsUnavailable()
+
+
+def _observed_loop_inputs(
+    definitions: LoopInputs | LoopInputsUnavailable, workflow_run_id: str, rows: Sequence[WorkflowRunBlock]
+) -> tuple[LoopInputs | LoopInputsUnavailable, list[str]]:
+    if isinstance(definitions, LoopInputsUnavailable):
+        return definitions, []
+    notices: list[str] = []
+    try:
+        return bounded_loop_inputs(with_loop_observations(definitions, workflow_run_id, rows), notices), notices
+    except Exception:
+        LOG.warning("Loop input observations unavailable", workflow_run_id=workflow_run_id, exc_info=True)
+        return LoopInputsUnavailable(), []
+
+
+def _attach_loop_inputs(
+    data: dict[str, Any], execution: _RunExecution, workflow_run_id: str, rows: Sequence[WorkflowRunBlock]
+) -> None:
+    if execution.loop_definitions is None:
+        return
+    loop_inputs, notices = _observed_loop_inputs(execution.loop_definitions, workflow_run_id, rows)
+    data[LOOP_INPUTS_KEY] = loop_inputs.model_dump(mode="json", exclude_none=True)
+    if notices:
+        data["loop_inputs_omission_notices"] = notices
+
+
+def _read_run_loop_inputs(
+    run_workflow: Workflow | None, run_created_at: datetime, workflow_run_id: str, rows: Sequence[WorkflowRunBlock]
+) -> tuple[LoopInputs | LoopInputsUnavailable | None, list[str]]:
+    loop_definitions = _loop_definitions_or_unavailable(run_workflow) if run_workflow is not None else None
+    # A saved version can be overwritten in place after the run; a test version is only ever soft-deleted.
+    if run_workflow is None or (
+        run_workflow.created_by != COPILOT_TEST_WORKFLOW_CREATOR
+        and _as_utc(run_workflow.modified_at) > _as_utc(run_created_at)
+    ):
+        ran_loop = loop_definitions is not None or any(row.block_type == BlockType.FOR_LOOP for row in rows)
+        return (LoopInputsUnavailable() if ran_loop else None), []
+    if loop_definitions is None:
+        return None, []
+    return _observed_loop_inputs(loop_definitions, workflow_run_id, rows)
+
+
 @dataclass(frozen=True)
 class CopilotExecutionSnapshot:
     """One provenance-closed workflow definition and the rows a run binds against."""
@@ -1812,6 +1957,7 @@ class _RunExecution:
     dispatched_to_worker: bool = False
     dispatched_input_values: dict[str, Any] = dataclass_field(default_factory=dict, repr=False)
     recorded_settings: OriginExecutionSettings | None = dataclass_field(default=None, repr=False)
+    loop_definitions: LoopInputs | LoopInputsUnavailable | None = None
 
     def __post_init__(self) -> None:
         # Runtime blocks render templates in place. The receipt must keep the authored
@@ -4033,6 +4179,8 @@ async def _run_blocks_and_collect_debug(
 
     if dispatch_workflow is not None:
         snapshot = _materialized_execution_snapshot(snapshot, dispatch_workflow)
+    # Read before execution: a natural-language loop reference is rewritten on the block while it runs.
+    execution.loop_definitions = _loop_definitions_or_unavailable(snapshot.workflow)
 
     if execution.recorded_settings is not None:
         # Persistence owns model/header/profile-key settings; the attached browser owns
@@ -4592,6 +4740,7 @@ async def _run_blocks_and_collect_debug(
                     run_ok=False,
                     page_evidence=_same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id),
                 )
+                _attach_loop_inputs(result["data"], execution, workflow_run.workflow_run_id, watchdog_block_rows)
                 _attach_block_fact_projection(
                     result["data"],
                     watchdog_block_rows,
@@ -4777,6 +4926,7 @@ async def _run_blocks_and_collect_debug(
             result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
         if not run_ok and run and getattr(run, "failure_category", None):
             result_data["failure_category"] = run.failure_category
+        _attach_loop_inputs(result_data, execution, workflow_run.workflow_run_id, run_block_rows)
         _attach_block_fact_projection(
             result_data,
             run_block_rows,
@@ -5127,6 +5277,11 @@ async def _get_run_results(
     }
     if run_workflow is not None and workflow_run_id == ctx.proposal_workflow_run_id:
         result_data["execution_source"] = _execution_source_facts(run_workflow, provenance="staged")
+    loop_inputs, loop_input_notices = _read_run_loop_inputs(run_workflow, run.created_at, workflow_run_id, blocks)
+    if loop_inputs is not None:
+        result_data[LOOP_INPUTS_KEY] = loop_inputs.model_dump(mode="json", exclude_none=True)
+    if loop_input_notices:
+        result_data["loop_inputs_omission_notices"] = loop_input_notices
     _attach_block_fact_projection(
         result_data,
         blocks,
@@ -7180,6 +7335,7 @@ def build_test_evidence_packet(
     if not action_observations:
         omission_notices.append(ACTION_OBSERVATIONS_EMPTY)
     omission_notices.extend(_packet_string_list(data.get("block_fact_omission_notices")))
+    omission_notices.extend(_packet_string_list(data.get("loop_inputs_omission_notices")))
     observed_block_end_urls = coerce_block_end_urls(data.get("observed_block_end_urls"), omission_notices)
     per_block_action_observations = coerce_block_action_observations(
         data.get("per_block_action_observations"), omission_notices
@@ -7327,6 +7483,7 @@ def build_test_evidence_packet(
         executed_block_labels=executed_labels,
         run=BuildTestPacketRun(
             execution_source=data.get("execution_source"),
+            loop_inputs=data.get(LOOP_INPUTS_KEY),
             browser_start=data.get("browser_start"),
             workflow_run_id=run_id,
             browser_session_id=_packet_string(data.get("browser_session_id")),

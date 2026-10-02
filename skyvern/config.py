@@ -542,10 +542,6 @@ class Settings(BaseSettings):
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
     TASK_V3_DATE_SEGMENT_AIM: bool = False
-    # Send Task V3's clicks, typing and scrolls through EventStrategyFactory, as v1 does, so a run follows
-    # whatever USE_EVENT_STRATEGIES registered. Force-on term only: runs are randomized per run by
-    # the flag of the same name, read through run_arm_enabled(HUMANIZED_INPUT_FLAG, ...). Off: plain Playwright.
-    TASK_V3_HUMANIZED_INPUT: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is

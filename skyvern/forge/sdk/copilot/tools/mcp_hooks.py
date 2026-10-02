@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
+import yaml
 from pydantic import JsonValue
 
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
@@ -553,6 +554,77 @@ PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
 }
 
 
+_FOR_LOOP_PROPERTY_DESCRIPTIONS = {
+    "loop_over_parameter_key": (
+        "A workflow parameter key, or an earlier block's `<label>_output` when that output is itself the list. "
+        "To loop over an earlier block's output, set this key and leave `loop_variable_reference` unset. "
+        "Ignored whenever `loop_variable_reference` is non-empty."
+    ),
+    "loop_variable_reference": (
+        "A block label (also tried as `<label>.extracted_information`, `<label>.extracted_information.results` "
+        "and `<label>.results`), dotted path or template expression for the list. When non-empty it overrides "
+        "`loop_over_parameter_key`, even when both are set; a value that resolves to nothing is read as a "
+        "natural-language description of the list. `current_value` exists only inside a running for_loop's "
+        "`loop_blocks` (a while_loop leaves it unset), so name it here only in a loop nested inside an outer "
+        "for_loop."
+    ),
+}
+
+_FOR_LOOP_EXAMPLE: dict[str, JsonValue] = {
+    "parameters": [{"parameter_type": "workflow", "key": "rows_file", "workflow_parameter_type": "file_url"}],
+    "blocks": [
+        {
+            "block_type": "file_url_parser",
+            "label": "parse_rows",
+            "file_url": "{{ rows_file }}",
+            "file_type": "csv",
+            "next_block_label": "visit_each_row",
+        },
+        {
+            "block_type": "for_loop",
+            "label": "visit_each_row",
+            "loop_over_parameter_key": "parse_rows_output",
+            "loop_blocks": [{"block_type": "goto_url", "label": "open_row_url", "url": "{{ current_value.url }}"}],
+        },
+    ],
+}
+
+
+_FOR_LOOP_GUIDANCE = "\n".join(
+    [
+        "Purpose: Iterate over a list and run `loop_blocks` once per item. A for_loop reads exactly one input.",
+        "",
+        f"- loop_over_parameter_key: {_FOR_LOOP_PROPERTY_DESCRIPTIONS['loop_over_parameter_key']}",
+        f"- loop_variable_reference: {_FOR_LOOP_PROPERTY_DESCRIPTIONS['loop_variable_reference']}",
+        (
+            "- loop_blocks (required): the blocks run for each item, chained with next_block_label. Inside them "
+            "{{ current_value }} (also {{ current_item }}) is the current item and {{ current_index }} its position."
+        ),
+        "- complete_if_empty: true completes the loop successfully when the list is empty.",
+        "",
+        "Example - loop over a parser's rows (the parser's output is the list):",
+        yaml.safe_dump(_FOR_LOOP_EXAMPLE, sort_keys=False).rstrip(),
+    ]
+)
+
+
+def _apply_for_loop_schema_guidance(data: dict[str, Any]) -> None:
+    schema = data.get("schema")
+    if (
+        isinstance(schema, dict)
+        and isinstance(ref := schema.get("$ref"), str)
+        and isinstance(schema.get("$defs"), dict)
+    ):
+        # ForLoopBlockYAML nests blocks recursively, so its JSON schema is a $ref into $defs.
+        schema = schema["$defs"].get(ref.removeprefix("#/$defs/"))
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if isinstance(properties, dict):
+        for name, description in _FOR_LOOP_PROPERTY_DESCRIPTIONS.items():
+            if isinstance(properties.get(name), dict):
+                properties[name] = {**properties[name], "description": description}
+    data["example"] = copy.deepcopy(_FOR_LOOP_EXAMPLE)
+
+
 async def _get_block_schema_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -563,6 +635,8 @@ async def _get_block_schema_post_hook(
     capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
     if isinstance(data, dict):
+        if data.get("block_type") == "for_loop":
+            _apply_for_loop_schema_guidance(data)
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
             for banned in _copilot_banned_block_types(ctx):
@@ -686,12 +760,16 @@ async def _get_workflow_knowledge_post_hook(
 ) -> dict[str, Any]:
     capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
-    if isinstance(data, dict) and capability.code_blocks and capability.agent_blocks:
-        sections = data.get("sections")
-        if isinstance(sections, dict):
-            choosing = sections.get("choosing_a_block")
-            if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
-                choosing["content"] = f"{AUTHORING_FAMILY_GUIDANCE}\n\n{choosing['content']}"
+    sections = data.get("sections") if isinstance(data, dict) else None
+    if not isinstance(sections, dict):
+        return result
+    for_loop = sections.get("for_loop_block")
+    if isinstance(for_loop, dict):
+        for_loop["content"] = _FOR_LOOP_GUIDANCE
+    if capability.code_blocks and capability.agent_blocks:
+        choosing = sections.get("choosing_a_block")
+        if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
+            choosing["content"] = f"{AUTHORING_FAMILY_GUIDANCE}\n\n{choosing['content']}"
     return result
 
 
