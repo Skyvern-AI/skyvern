@@ -394,10 +394,14 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     )
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
     credential = _make_credential()
+    record_resume = AsyncMock()
     monkeypatch.setattr(
         credential_pause_module.app,
         "DATABASE",
-        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
+        SimpleNamespace(
+            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential])),
+            workflow_params=SimpleNamespace(record_pending_copilot_turn_credential_resume=record_resume),
+        ),
     )
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
 
@@ -407,6 +411,8 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     resume_msgs = await maybe_credential_pause(ctx, _fake_result(), stream, config)
 
     assert resume_msgs is not None
+    # Reconcile measures abandonment from this stamp, so a resumed turn is not recovered as dead.
+    record_resume.assert_awaited_with(organization_id="org-1", workflow_copilot_chat_id="chat-1", turn_id="turn-1")
     assert ctx.credential_pause_outcome == "connected"
     assert ctx.request_policy.resolved_credentials == [credential]
     assert ctx.request_policy.allow_run_blocks is True

@@ -21,6 +21,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -62,10 +64,11 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChat,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
 )
 from tests.unit._copilot_workflow_fakes import fake_workflow
-from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
+from tests.unit.copilot_route_test_support import install_fake_create, no_finalisation_fence, setup_new_copilot_mocks
 
 
 class _FakeCache:
@@ -1274,10 +1277,13 @@ async def test_watcher_reports_the_gesture_the_cancel_named() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("claim", ["claimed", "reconciling"])
 async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_raises(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, claim: str
 ) -> None:
-    """task.cancel() without user_cancel_observed[0] -> an interrupted row, never a user-cancel row."""
+    """task.cancel() without user_cancel_observed[0] -> an interrupted row, never a user-cancel row.
+
+    Once reconcile owns the turn, its row is the only one; the drain must not write another."""
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -1325,6 +1331,8 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
         start_copilot_turn=AsyncMock(
             return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
         ),
+        claim_pending_copilot_turn_for_finalisation=AsyncMock(return_value=claim),
+        hold_copilot_turn_finalisation=no_finalisation_fence,
         clear_pending_copilot_turn=AsyncMock(),
     )
     app.DATABASE.workflow_params = workflow_params
@@ -1360,10 +1368,14 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
     contents = [c.kwargs.get("content") for c in insert_calls]
     assert MINIMAL_CANCEL_STOP not in contents
     interrupted = [content for content in contents if content and "interrupted" in content.lower()]
+    if claim == "reconciling":
+        assert interrupted == []
+        return
     assert len(interrupted) == 1
     assert "wpid-1" in interrupted[0]
     written = insert_calls[-1].kwargs
     assert written["turn_outcome"].terminal_reason == INTERRUPTED_TERMINAL_REASON
+    assert written["turn_outcome"].interrupted_row_final is True
     assert written["narrative_payload"]["terminalMessage"] == written["content"]
 
 
@@ -1481,6 +1493,88 @@ async def test_cancel_during_shielded_finalisation_does_not_write_a_second_row(
     contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
     interrupted = [content for content in contents if content and "interrupted" in content.lower()]
     assert interrupted == [], f"finalisation owns this turn's row; got a competing write: {interrupted}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stall", ["claim", "finalise", "error recovery", "cancelled result"])
+async def test_a_drained_handler_keeps_the_finalisation_lock_until_its_shielded_writes_finish(
+    monkeypatch: pytest.MonkeyPatch, stall: str
+) -> None:
+    """Releasing on the cancel would let reconcile mark the row final while the finalise still writes,
+    and a cancel during the ownership claim must not turn a finished turn into an interrupted one."""
+    captured = install_fake_create(monkeypatch)
+    chat = _make_chat(auto_accept=False)
+    agent_result = AgentResult(
+        user_response="Here is your workflow.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        cancelled=stall == "cancelled result",
+        turn_outcome=None,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, _make_original_workflow(), agent_result)
+    events: list[str] = []
+    stalled = asyncio.Event()
+    may_continue = asyncio.Event()
+
+    @asynccontextmanager
+    async def recording_fence(*_: object) -> AsyncIterator[None]:
+        if stall == "claim":
+            stalled.set()
+            await may_continue.wait()
+        events.append("locked")
+        try:
+            yield
+        finally:
+            events.append("released")
+
+    async def slow_finalise(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        if stall in ("finalise", "error recovery", "cancelled result"):
+            stalled.set()
+            await may_continue.wait()
+        events.append("finalise done")
+
+    workflow_params.hold_copilot_turn_finalisation = recording_fence
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot._finalise_normal_turn", slow_finalise)
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot._persist_cancel_turn", slow_finalise)
+    if stall == "error recovery":
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
+            AsyncMock(side_effect=RuntimeError("agent failed")),
+        )
+    monkeypatch.setattr(app._inst, "CACHE", None, raising=False)
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    await workflow_copilot_chat_post(
+        request, _make_chat_request(cancel_token=None), SimpleNamespace(organization_id="org-1")
+    )
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler_task = asyncio.create_task(captured["handler"](stream))
+    await stalled.wait()
+    # A client disconnect then a drain: the second cancel lands while the release waits.
+    for _ in range(2):
+        handler_task.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert "released" not in events
+    may_continue.set()
+    with pytest.raises(asyncio.CancelledError):
+        await handler_task
+
+    assert events == ["locked", "finalise done", "released"]
+    contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
+    assert not [content for content in contents if content and "interrupted" in content.lower()]
+    if stall != "error recovery":
+        sent_errors = [
+            call.args[0].error
+            for call in stream.send.await_args_list
+            if isinstance(call.args[0], WorkflowCopilotStreamErrorUpdate)
+        ]
+        assert "The assistant didn't finish this turn. Please try again." not in sent_errors
 
 
 @pytest.mark.asyncio
