@@ -8,7 +8,6 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { RunEngineSelector } from "@/components/EngineSelector";
-import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -80,7 +79,6 @@ function ActionEditorBody({
   ];
   const { editable } = data;
   const update = useUpdate<ActionNodeData>({ id: blockId, editable });
-  const effectiveDefaultEngine = useEffectiveDefaultEngine();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
@@ -188,7 +186,6 @@ function ActionEditorBody({
                   <HelpTooltip content={helpTooltips["action"]["engine"]} />
                 </div>
                 <RunEngineSelector
-                  effectiveDefaultEngine={effectiveDefaultEngine}
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"

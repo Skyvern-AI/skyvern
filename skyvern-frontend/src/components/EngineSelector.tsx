@@ -24,7 +24,6 @@ type Props = {
   onChange: (value: RunEngine | null) => void;
   className?: string;
   availableEngines?: Array<RunEngine>;
-  effectiveDefaultEngine?: RunEngine | null;
 };
 
 const engineOptions: Array<EngineOption & { value: RunEngine }> = [
@@ -83,12 +82,8 @@ function RunEngineSelector({
   onChange,
   className,
   availableEngines,
-  effectiveDefaultEngine = null,
 }: Props) {
-  // Without a chosen-engine default, a skyvern-1.0 block is the routed Default, so it cannot be pinned.
-  const engines = (availableEngines ?? defaultEngines).filter(
-    (engine) => engine !== RunEngine.SkyvernV1 || effectiveDefaultEngine,
-  );
+  const engines = availableEngines ?? defaultEngines;
   const visibleEngines =
     value && !engines.includes(value) ? [...engines, value] : engines;
   const options: Array<EngineOption> = [
