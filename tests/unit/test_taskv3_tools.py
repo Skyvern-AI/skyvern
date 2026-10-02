@@ -10,6 +10,7 @@ import ast
 import asyncio
 import contextlib
 import html
+import html as html_lib
 import inspect
 import itertools
 import json
@@ -9502,6 +9503,12 @@ _CUSTOM_OPTION_ROW_JS = """(txt, onPick) => {
         pytest.param(_PLAIN_OPTION_ROW_JS, _LONG_MENU_OPTIONS, id="role-option-rows"),
         pytest.param(_CUSTOM_OPTION_ROW_JS, _LONG_MENU_OPTIONS, id="custom-option-element"),
         pytest.param(_PLAIN_OPTION_ROW_JS, _SHARED_PREFIX_MENU_OPTIONS, id="answers-alike-until-past-60-chars"),
+        # No role in the row at all: only the listbox around it declares what it is.
+        pytest.param(
+            _CUSTOM_OPTION_ROW_JS.replace("row.appendChild(aria);", ""),
+            _LONG_MENU_OPTIONS,
+            id="roleless-row-in-a-listbox",
+        ),
     ],
 )
 async def test_dom_a_menu_lists_an_option_whose_caption_is_long_and_it_commits(
@@ -9521,6 +9528,116 @@ async def test_dom_a_menu_lists_an_option_whose_caption_is_long_and_it_commits(
         picked = await click.handler({"selector": '[data-tv3-menu="1"]'})
         assert picked.status == "ok", picked.content
         assert await page.evaluate("() => window.__picked") == options[0]
+
+
+# A combobox whose aria-controls list holds option components with no role anywhere in the row: each caption
+# sits a few wrappers deep and the row inherits a pointer cursor. Only the list declares what its rows are.
+_CONTROLLED_LIST_COMBOBOX_HTML = """
+<!doctype html><html><body style="margin:0;font:13px sans-serif">
+  <input id="combo" role="combobox" aria-haspopup="listbox" aria-controls="menu-q1" aria-expanded="false"
+         style="position:absolute;top:40px;left:40px;width:420px;height:28px">
+  <script>
+    window.__picked = null;
+    const OPTIONS = __OPTIONS__;
+    const SHADOW = __SHADOW__;
+    const combo = document.getElementById('combo');
+    combo.addEventListener('click', () => {
+      if (document.getElementById('menu-q1')) return;
+      const list = document.createElement('div');
+      list.id = 'menu-q1';
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:760px;background:#fff;border:1px solid #ccc');
+      for (const txt of OPTIONS) {
+        const row = document.createElement('x-select-option');
+        row.setAttribute('style', 'display:block;padding:4px 6px;cursor:pointer');
+        row.innerHTML = '<div><div><x-typo><x-truncate></x-truncate></x-typo></div></div>';
+        row.querySelector('x-truncate').textContent = txt;
+        if (SHADOW) row.attachShadow({ mode: 'open' }).innerHTML = '<slot></slot><div role="option"></div>';
+        row.addEventListener('click', () => { window.__picked = txt; combo.value = txt; list.remove(); });
+        list.appendChild(row);
+      }
+      if (SHADOW) list.setAttribute('role', 'listbox');
+      document.body.appendChild(list);
+      combo.setAttribute('aria-expanded', 'true');
+    });
+  </script>
+</body></html>
+"""
+
+
+def _numbered_menu_tags(page: Any) -> Any:
+    return page.evaluate(
+        "() => Array.from(document.querySelectorAll('[data-tv3-menu]'))"
+        ".filter((e) => /^\\d+$/.test(e.getAttribute('data-tv3-menu'))).length"
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "shadow"),
+    [
+        pytest.param(_LONG_MENU_OPTIONS, False, id="long-first-caption"),
+        # The production shape: a listbox whose option components draw an empty role=option in their own shadow
+        # root, beside the slotted caption rather than around it.
+        pytest.param(_LONG_MENU_OPTIONS, True, id="long-first-caption-beside-a-shadow-option"),
+        pytest.param(("Yes", "No", "Prefer not to say"), False, id="short-captions"),
+    ],
+)
+async def test_dom_a_long_caption_in_a_comboboxs_controlled_list_keeps_every_menu_number_in_page_order(
+    options: tuple[str, ...], shadow: bool
+) -> None:
+    # The long caption was dropped as an undeclared paragraph, so the rows after it took its numbers and
+    # [data-tv3-menu="1"] committed the second option.
+    html = _CONTROLLED_LIST_COMBOBOX_HTML.replace("__OPTIONS__", json.dumps(list(options))).replace(
+        "__SHADOW__", json.dumps(shadow)
+    )
+    async with _content_page(html) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#combo"})
+        assert opened.status == "ok", opened.content
+        assert [text for _, text in _menu_note_entries(opened.content)] == list(options), opened.content
+        picked = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => window.__picked") == options[0]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_long_paragraph_in_a_panel_a_combobox_controls_is_not_a_menu_row() -> None:
+    # Only a list the combobox controls declares its rows; a help panel's long clickable paragraph is not an option,
+    # and since it may be one the finder cannot read, the menu is withheld rather than listed without it.
+    html = (
+        _CONTROLLED_LIST_COMBOBOX_HTML.replace("__OPTIONS__", json.dumps(["Alpha", "Beta"]))
+        .replace("__SHADOW__", "false")
+        .replace(
+            "document.body.appendChild(list);",
+            "list.setAttribute('role', 'region'); const p = document.createElement('div');"
+            " p.setAttribute('style', 'cursor:pointer;padding:4px 6px');"
+            " p.textContent = 'Need help choosing? Read the guidance on how each of these answers is used later on.';"
+            " list.appendChild(p); document.body.appendChild(list);",
+        )
+    )
+    async with _content_page(html) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#combo"})
+    assert _menu_note_entries(opened.content) == [], opened.content
+    assert (opened.data or {}).get("withhold_reason") == "long_row_unread", opened.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_native_select_lists_and_commits_a_long_option_by_its_label() -> None:
+    html = (
+        '<!doctype html><html><body><select id="s"><option value="">Choose</option>'
+        + "".join(f'<option value="v{i}">{text}</option>' for i, text in enumerate(_LONG_MENU_OPTIONS))
+        + "</select></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        assert _LONG_MENU_OPTIONS[0] in observed.content, observed.content
+        r = await _tool(tools, "select_option").handler({"selector": "#s", "label": _LONG_MENU_OPTIONS[0]})
+        assert r.status == "ok", r.content
+        assert await page.evaluate("() => document.getElementById('s').value") == "v0"
 
 
 # Rows whose text starts with '~' are rendered hidden, as a filtering widget hides what it filtered out.
@@ -9691,13 +9808,164 @@ async def test_dom_a_menu_note_lists_no_rows_it_cannot_read_whole() -> None:
     # fragments as options. The note sends the model to observe instead.
     html = _two_line_menu_html(_TWO_LINE_OPTIONS, declared=False)
     async with _content_page(html) as page:
-        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        # Nothing was listed, so no row may be reachable by guessing its position.
+        assert await _numbered_menu_tags(page) == 0
+        guessed = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert guessed.status == "error" and await page.evaluate("() => window.__picked") is None, guessed.content
     # The page-text delta after the note quotes the page itself; only the note must not list fragments.
     note = opened.content[: (opened.data or {}).get("delta_at", len(opened.content))]
     assert "could not be read as whole rows" in note, opened.content
     assert "opened a menu of" not in note, opened.content
     assert "Account:" not in note, opened.content
     assert (opened.data or {}).get("withhold_reason") == "bare_text_beside", opened.data
+
+
+# Every valid CSS spelling (an unquoted number is not a valid identifier, so the page refuses it as invalid).
+_GUESSED_MENU_NUMBER_SPELLINGS = (
+    '[data-tv3-menu="2"]',
+    "[data-tv3-menu='2']",
+    '[ data-tv3-menu = "2" ]',
+    '[DATA-TV3-MENU="2"]',
+)
+_MENU_TAGS_JS = (
+    "() => Array.from(document.querySelectorAll('[data-tv3-menu]')).map((e) => e.getAttribute('data-tv3-menu'))"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_withheld_menus_rows_answer_only_to_their_own_tag_and_no_output_prints_it() -> None:
+    # A withheld menu's rows keep a tag so the click commit check still names the pick, but the tag is salted:
+    # a guessed number matches nothing, and no output the model reads may print the salted tag back.
+    html = _two_line_menu_html(_TWO_LINE_OPTIONS, declared=False)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert "could not be read as whole rows" in opened.content, opened.content
+        tag = await page.evaluate("() => document.querySelector('[data-tv3-menu]').getAttribute('data-tv3-menu')")
+        salt = tag.rsplit("-", 1)[0]
+        assert not tag.isdigit() and salt, tag
+        outputs = [opened.content]
+        for name, args in (
+            ("observe", {}),
+            ("look", {}),
+            ("get_html", {"format": "html"}),
+            ("get_html", {"selector": "#list", "format": "html"}),
+            ("get_html", {"format": "text"}),
+        ):
+            outputs.append(str((await _tool(tools, name).handler(args)).content))
+        for guess in _GUESSED_MENU_NUMBER_SPELLINGS:
+            guessed = await click.handler({"selector": guess})
+            # The menu is still open, so the refusal must not read as a page change (that resets the stall nudges).
+            assert guessed.error_class == "rows_unlisted", guessed.content
+            assert not (guessed.data or {}).get("page_state_changed"), guessed.data
+            outputs.append(guessed.content)
+        for out in outputs:
+            assert salt not in out, out
+        # A rescan of the unchanged menu writes the same tags, so the page fingerprint does not churn.
+        before = await page.evaluate(_MENU_TAGS_JS)
+        await page.evaluate(
+            taskv3_tools._FIND_MENU_JS, {"sel": "#trigger", "el": None, "reuse": "any", "saltUnlisted": True}
+        )
+        assert await page.evaluate(_MENU_TAGS_JS) == before
+        # A hidden menu's leftover salted rows are stale, not an open menu with unnumbered rows.
+        await page.evaluate("() => { document.getElementById('list').style.display = 'none'; }")
+        hidden_guess = await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert hidden_guess.error_class != "rows_unlisted", hidden_guess.content
+        await page.evaluate("() => { document.getElementById('list').style.display = ''; }")
+        picked = await click.handler({"selector": f'[data-tv3-menu="{tag}"]'})
+        assert "Selected option" in picked.content, picked.content
+        assert await page.evaluate("() => window.__picked") is not None
+
+
+def _pointer_rows(*texts: str) -> str:
+    return "".join(
+        f'<div style="cursor:pointer;padding:3px 6px" onclick="window.__picked = this.textContent">{t}</div>'
+        for t in texts
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "listed"),
+    [
+        # Nothing declares the long first row, so it cannot be listed; a note listing the other two as the whole
+        # menu would number them 1 and 2 and send a pick of the first row to the second.
+        pytest.param(_pointer_rows(_LONG_MENU_OPTIONS[0], "Visa required", "Visa later"), [], id="long-clickable-row"),
+        pytest.param(
+            '<p style="margin:2px 6px">'
+            + _LONG_MENU_OPTIONS[0]
+            + "</p>"
+            + _pointer_rows("Visa required", "Visa later"),
+            ["Visa required", "Visa later"],
+            id="long-paragraph-that-is-not-a-row",
+        ),
+        # Over the row caps, so dropped before the long-row check: still a row the list leaves out.
+        pytest.param(
+            _pointer_rows("Unrestricted " * 18, "Visa required", "Visa later"), [], id="row-over-the-row-caps"
+        ),
+    ],
+)
+async def test_dom_a_popover_with_a_long_undeclared_row_is_withheld_not_listed_short(
+    body: str, listed: list[str]
+) -> None:
+    async with _content_page(_popover_html(body)) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert [text for _, text in _menu_note_entries(opened.content)] == listed, opened.content
+        if listed:
+            return
+        assert (opened.data or {}).get("withhold_reason") == "long_row_unread", opened.data
+        assert await _numbered_menu_tags(page) == 0
+        guessed = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert guessed.error_class == "rows_unlisted", guessed.content
+        assert await page.evaluate("() => window.__picked") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_pointer_container_with_a_long_help_paragraph_still_lists_its_rows() -> None:
+    # The container's pointer cursor is inherited by its help paragraph; that alone must not withhold the menu.
+    body = (
+        '<p style="margin:2px 6px">'
+        + _LONG_MENU_OPTIONS[0]
+        + "</p>"
+        + "".join(
+            f'<div style="padding:3px 6px" onclick="window.__picked = this.textContent">{t}</div>'
+            for t in ("Alpha", "Beta", "Gamma")
+        )
+    )
+    async with _content_page(_popover_html(body, "cursor:pointer;")) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert [text for _, text in _menu_note_entries(opened.content)] == ["Alpha", "Beta", "Gamma"], opened.content
+        await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert await page.evaluate("() => window.__picked") == "Beta"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_guessed_menu_number_stays_ambiguous_beside_a_child_frames_leftover_tag() -> None:
+    # The page's withheld rows are salted, so a guessed "2" no longer matches there; a leftover "2" in a child
+    # frame must not become the only match and take the click.
+    frame_row = '<div data-tv3-menu="2" onclick="parent.__frame_clicked = true">Leftover</div>'
+    html = _two_line_menu_html(_TWO_LINE_OPTIONS, declared=False).replace(
+        "<script>",
+        f'<iframe srcdoc="{html_lib.escape(frame_row)}" style="position:absolute;top:400px"></iframe><script>',
+        1,
+    )
+    async with _content_page(html) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert "could not be read as whole rows" in opened.content, opened.content
+        for guess in _GUESSED_MENU_NUMBER_SPELLINGS:
+            guessed = await click.handler({"selector": guess})
+            assert guessed.status == "error", (guess, guessed.content)
+            assert await page.evaluate("() => window.__frame_clicked === undefined && window.__picked === null"), guess
 
 
 @_skip_no_browser
@@ -9715,6 +9983,7 @@ async def test_dom_a_lone_option_of_two_pieces_is_still_tagged_leaf_by_leaf() ->
         assert (opened.data or {}).get("withhold_reason") == "single_row_pieces", opened.data
         assert opened.data["menu_rows"] == 1, opened.data
         assert await page.evaluate("() => document.querySelectorAll('[data-tv3-menu]').length") == 2
+        assert await _numbered_menu_tags(page) == 0
 
 
 @_skip_no_browser
@@ -9810,11 +10079,20 @@ async def test_dom_a_roleless_popover_lists_its_clickable_rows_apart(
             "<div><button>Copy</button> Ctrl+C</div><div><button>Paste</button> Ctrl+V</div>",
             id="button-beside-a-shortcut-hint",
         ),
+        pytest.param(
+            "".join(
+                f'<div role="option" style="height:100px"><div style="cursor:pointer">{name}</div>'
+                f'<div style="cursor:pointer">{name} account</div></div>'
+                for name in ("Northwind", "Contoso")
+            ),
+            id="declared-row-over-the-caps",
+        ),
     ],
 )
 async def test_dom_a_menu_note_withholds_leaves_beside_bare_text_since_it_may_be_their_identifier(body: str) -> None:
     async with _content_page(_popover_html(body)) as page:
         opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+        assert await _numbered_menu_tags(page) == 0
     assert "could not be read as whole rows" in opened.content, opened.content
     assert "opened a menu of" not in opened.content, opened.content
 

@@ -30,6 +30,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
+from skyvern.forge.taskv3 import tools as taskv3_tools_module
 from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.goal_check import GoalVerdict
@@ -13195,3 +13196,9 @@ async def test_goal_check_enforce_asks_once_per_finish_and_logs_the_recheck_fiel
     assert first["second_verdict"] is None
     assert first["would_fail"] is None
     assert first["second_latency_s"] is None
+
+
+@pytest.mark.parametrize("reason", sorted(taskv3_tools_module._MENU_WITHHOLD_REASONS))
+def test_every_menu_withhold_reason_reaches_the_call_record(reason: str) -> None:
+    result = ToolResult.ok("menu", data={"menu_note": "withheld", "menu_rows": 3, "withhold_reason": reason})
+    assert loop_module._menu_note_record_fields("click", result).get("withhold_reason") == reason
