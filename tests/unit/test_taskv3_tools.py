@@ -5044,6 +5044,95 @@ async def test_observe_a_frames_radio_group_keeps_its_marker_beside_the_pages_ow
     assert [("(no question found)" in line) for line in radio_lines] == [True, False, True, False], r.content
 
 
+def _two_realm_page(page_script: str, frame_script: str) -> str:
+    frame = f"<script>{frame_script}</script><button>Frame action</button>".replace('"', "'")
+    return (
+        f"<!doctype html><html><body><script>{page_script}</script><button>Page action</button>"
+        f'<iframe srcdoc="{frame}" width="400" height="200"></iframe></body></html>'
+    )
+
+
+# Legacy libraries define Array.prototype.toJSON, and JSON.stringify calls it on every array it meets.
+_LEGACY_TOJSON = "Array.prototype.toJSON = function () { return 'legacy'; };"
+# Non-configurable, so nothing can lift it; and one encoding each array as JSON text, as a library's own encoder does.
+_PINNED_TOJSON = "Object.defineProperty(Array.prototype, 'toJSON', { value: function () { return 'legacy'; } });"
+_PINNED_JSON_TOJSON = (
+    "let busy = false; Object.defineProperty(Array.prototype, 'toJSON', { value: function () {"
+    " if (busy) return Array.from(this); busy = true;"
+    " try { return JSON.stringify(this); } finally { busy = false; } } });"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page_script,frame_script",
+    [
+        (_LEGACY_TOJSON, ""),
+        ("", _LEGACY_TOJSON),
+        (_LEGACY_TOJSON, _LEGACY_TOJSON),
+        (_PINNED_TOJSON, _PINNED_TOJSON),
+        ("", _PINNED_JSON_TOJSON),
+        # Lifted, so it never runs; pinned, it would throw out of the stringify and lose the realm.
+        ("Array.prototype.toJSON = function () { throw new Error('legacy'); };", ""),
+        # JSON.stringify never consults these for the payload's primitives, and the payload holds no Date.
+        ("String.prototype.toJSON = Date.prototype.toJSON = function () { return 'legacy'; };", ""),
+        ("Object.prototype.toJSON = function () { return 'legacy'; };", _LEGACY_TOJSON),
+        # Non-extensible, so the property could not be put back: it stays in place and the replacer covers it.
+        (_LEGACY_TOJSON + " Object.preventExtensions(Array.prototype);", ""),
+    ],
+)
+async def test_observe_reads_realms_whose_page_defines_array_tojson(page_script: str, frame_script: str) -> None:
+    descriptors = (
+        "() => [Array.prototype, Object.prototype, String.prototype].map((p) => {"
+        " const d = Object.getOwnPropertyDescriptor(p, 'toJSON'); if (!d) return null;"
+        " if (!window.__fixtureToJSON) window.__fixtureToJSON = new Map(); const m = window.__fixtureToJSON;"
+        " if (!m.has(p)) m.set(p, d.value);"
+        " return [m.get(p) === d.value, d.enumerable, d.writable, d.configurable]; })"
+    )
+    async with _live_page(_two_realm_page(page_script, frame_script)) as page:
+        before = await page.evaluate(descriptors)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        after = await page.evaluate(descriptors)
+    assert r.status == "ok", r.content
+    assert "Page action" in r.content and "Frame action" in r.content, r.content
+    # The page gets back its own function under its own descriptor (only its key order may change).
+    assert after == before
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reading",
+    [
+        "'legacy'",
+        "real('legacy')",
+        "real({elements: 'legacy'})",
+        "real({elements: null})",
+        "real({elements: 5})",
+        "real({elements: [1]})",
+        "real({elements: [], iframes: {entries: 'x'}})",
+        "real({elements: [], dropped: 'x'})",
+        "real({elements: [], text: [1]})",
+        "real({elements: [], text: [], textFull: [1]})",
+        "real({elements: [], dropped: 1}).replace('1', 'NaN')",
+        # What a pinned toJSON that throws does to the call.
+        "(() => { throw new Error('legacy'); })()",
+    ],
+)
+async def test_observe_skips_an_unreadable_frame_and_refuses_an_unreadable_page_without_raising(reading: str) -> None:
+    # A page that replaces JSON.stringify itself decides what observe's reading of that realm says.
+    script = f"const real = JSON.stringify; JSON.stringify = function () {{ return {reading}; }};"
+    async with _live_page(_two_realm_page("", script)) as page:
+        frame_skipped = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert frame_skipped.status == "ok", frame_skipped.content
+    assert "Page action" in frame_skipped.content and "Frame action" not in frame_skipped.content
+    async with _live_page(_two_realm_page(script, "")) as page:
+        page_refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert page_refused.status == "error"
+    assert "could not read this page" in page_refused.content
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_a_radio_groups_description_never_puts_its_marker_mid_group() -> None:
