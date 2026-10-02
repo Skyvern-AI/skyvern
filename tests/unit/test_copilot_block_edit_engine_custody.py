@@ -12,7 +12,7 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock, ExtractionBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.schemas.runs import RunEngine
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 DRAFT = """title: Repair
@@ -156,6 +156,41 @@ def test_nested_untouched_producer_engine_is_preserved() -> None:
     restored = preserve_untouched_block_configuration(dump_workflow_yaml(draft), prior, edited_label="repair")
     nested = safe_load_no_dates(restored)["workflow_definition"]["blocks"][0]["loop_blocks"][0]
     assert nested["engine"] == RunEngine.skyvern_v1.value
+
+
+def test_a_marker_on_a_non_v1_saved_block_does_not_pin_a_draft_v1() -> None:
+    from skyvern.forge.sdk.copilot.workflow_yaml import preserve_untouched_block_configuration
+
+    prior = _definition(RunEngine.skyvern_v3)
+    prior.blocks[0].engine_pinned = True
+    draft = DRAFT.replace("      label: extract_value", "      label: extract_value\n      engine: skyvern-1.0")
+    restored = preserve_untouched_block_configuration(draft, prior, edited_label="repair")
+    producer = safe_load_no_dates(restored)["workflow_definition"]["blocks"][0]
+    assert not producer.get("engine_pinned")
+
+
+def test_untouched_pinned_skyvern_v1_keeps_its_pin() -> None:
+    from skyvern.forge.sdk.copilot.workflow_yaml import preserve_untouched_block_configuration
+
+    prior = _definition(RunEngine.skyvern_v1)
+    prior.blocks[0].engine_pinned = True
+    draft = safe_load_no_dates(DRAFT)
+    draft["workflow_definition"]["blocks"][0]["engine"] = RunEngine.skyvern_v1.value
+    restored = preserve_untouched_block_configuration(dump_workflow_yaml(draft), prior, edited_label="repair")
+    producer = safe_load_no_dates(restored)["workflow_definition"]["blocks"][0]
+    assert producer["engine"] == RunEngine.skyvern_v1.value
+    assert producer["engine_pinned"] is True
+
+
+def test_default_pick_on_pinned_skyvern_v1_is_not_re_pinned() -> None:
+    from skyvern.forge.sdk.copilot.workflow_yaml import preserve_untouched_block_configuration
+
+    prior = _definition(RunEngine.skyvern_v1)
+    prior.blocks[0].engine_pinned = True
+    restored = preserve_untouched_block_configuration(DRAFT, prior, edited_label="repair")
+    producer = safe_load_no_dates(restored)["workflow_definition"]["blocks"][0]
+    assert "engine" not in producer
+    assert not producer.get("engine_pinned")
 
 
 @pytest.mark.parametrize(

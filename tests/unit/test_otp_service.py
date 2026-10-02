@@ -359,6 +359,7 @@ def _patch_totp_url_response(
     monkeypatch.setattr(otp_service, "_post_totp_verification_url", post_totp_verification_url)
 
 
+@pytest.mark.usefixtures("public_dns")
 class TestGetOtpValueFromUrl:
     @pytest.mark.asyncio
     async def test_returns_totp_from_valid_json_verification_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2035,6 +2036,7 @@ class TestTryGenerateTotpFromCredential:
             assert try_generate_totp_from_credential("wr_test") is None
 
 
+@pytest.mark.usefixtures("public_dns")
 class TestPostTotpVerificationUrlSeam:
     """`_post_totp_verification_url` must route through app.AGENT_FUNCTION so the
     cloud override can egress via the NAT proxy (static IP), like webhook/file-upload."""

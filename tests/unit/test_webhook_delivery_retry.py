@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -18,6 +17,9 @@ from skyvern.services.webhook_delivery import (
     format_no_response_failure_reason,
     is_retryable_status,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+pytestmark = pytest.mark.usefixtures("public_dns")
 
 _STDLIB_ASYNCIO_SLEEP = asyncio.sleep
 
@@ -47,7 +49,7 @@ def fake_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _sleep(delay: float) -> None:
         recorded.append(delay)
 
-    monkeypatch.setattr("skyvern.services.webhook_delivery.asyncio", SimpleNamespace(sleep=_sleep))
+    monkeypatch.setattr("skyvern.services.webhook_delivery.asyncio", ScopedAsyncio(sleep=_sleep))
     return recorded
 
 
