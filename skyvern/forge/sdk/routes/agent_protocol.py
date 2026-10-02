@@ -232,6 +232,22 @@ from skyvern.webeye.real_browser_manager import runtime_supports_browser_type_se
 
 LOG = structlog.get_logger()
 
+# Every OrganizationUpdate input has one corresponding persisted organization field.
+ORGANIZATION_UPDATE_AUDIT_FIELD_MAP = {
+    "slug": "slug",
+    "max_steps_per_run": "max_steps_per_run",
+    "max_steps_per_workflow_run": "max_steps_per_workflow_run",
+    "clear_max_steps_per_workflow_run": "max_steps_per_workflow_run",
+    "max_retries_per_step": "max_retries_per_step",
+    "webhook_callback_url": "webhook_callback_url",
+    "artifact_url_expiry_seconds": "artifact_url_expiry_seconds",
+    "clear_artifact_url_expiry_seconds": "artifact_url_expiry_seconds",
+    "default_llm_key": "default_llm_key",
+    "clear_default_llm_key": "default_llm_key",
+    "default_secondary_llm_key": "default_secondary_llm_key",
+    "clear_default_secondary_llm_key": "default_secondary_llm_key",
+}
+
 FORCE_TASK_V1_MAX_STEPS = 25
 
 _create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
@@ -5752,6 +5768,13 @@ async def reset_workflow_browser_profile(
             message="Failed to clear the persisted browser profile. Please retry the reset operation.",
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
         ) from exc
+    await record_request_audit_event(
+        current_org.organization_id,
+        "workflow.update",
+        "workflow",
+        workflow_permanent_id,
+        changed_fields=("saved_browser_profile",),
+    )
 
 
 @legacy_base_router.post(
@@ -5924,6 +5947,18 @@ async def update_organization(
                 detail=f"{field_name} must reference a valid custom LLM for this organization",
             )
 
+    stored_org = await app.DATABASE.organizations.get_organization(current_org.organization_id)
+    comparison_org = stored_org or current_org
+    changed_fields: set[str] = set()
+    for request_field, organization_field in ORGANIZATION_UPDATE_AUDIT_FIELD_MAP.items():
+        requested_value = getattr(org_update, request_field)
+        if request_field.startswith("clear_"):
+            changed = requested_value and getattr(comparison_org, organization_field) is not None
+        else:
+            changed = requested_value is not None and requested_value != getattr(comparison_org, organization_field)
+        if changed:
+            changed_fields.add(organization_field)
+
     try:
         updated = await app.DATABASE.organizations.update_organization(
             current_org.organization_id,
@@ -5950,6 +5985,14 @@ async def update_organization(
         ) from exc
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)
+    if changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "organization.settings.update",
+            "organization",
+            current_org.organization_id,
+            changed_fields=tuple(sorted(changed_fields)),
+        )
     return updated
 
 

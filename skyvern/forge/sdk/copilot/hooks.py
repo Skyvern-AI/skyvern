@@ -214,6 +214,17 @@ class CopilotRunHooks(RunHooksBase):
                 ]
                 activity_entry["integrations"] = integrations
 
+            if tool_name == "read_google_sheet" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                rows = data.get("connections", []) if isinstance(data, dict) else []
+                activity_entry["opened_connection_ids"] = [
+                    row["connection_id"]
+                    for row in (rows if isinstance(rows, list) else [])
+                    if isinstance(row, dict)
+                    and row.get("status") == "opened"
+                    and isinstance(row.get("connection_id"), str)
+                ]
+
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 blocks = data.get("blocks", []) if isinstance(data, dict) else []

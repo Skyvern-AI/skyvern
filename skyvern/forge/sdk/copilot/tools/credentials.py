@@ -648,12 +648,7 @@ async def _approve_server_verified_google_sheet_bindings(
 
     # Citation is judged against every visible row, the same set author time sees, so a longer
     # sibling name in the error state still shadows the shorter one; only active rows are eligible.
-    eligible = [
-        connection
-        for connection in visible_connections
-        if connection.state == google_oauth_service.STATE_ACTIVE
-        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
-    ]
+    eligible = _eligible_sheets_connections(visible_connections)
     eligible_ids = {connection.id for connection in eligible}
     return [
         connection_id
@@ -667,6 +662,18 @@ async def _approve_server_verified_google_sheet_bindings(
 
 
 def _same_turn_listed_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
+    # A connection the server just used to open the sheet is one it would have listed, so it counts as listed.
+    opened = {
+        connection_id
+        for activity in tool_activity
+        if activity.get("tool") == "read_google_sheet" and isinstance(activity.get("opened_connection_ids"), list)
+        for connection_id in activity["opened_connection_ids"]
+        if isinstance(connection_id, str)
+    }
+    return _latest_listing_google_sheet_ids(tool_activity) | opened
+
+
+def _latest_listing_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
     for activity in reversed(tool_activity):
         if activity.get("tool") != "list_integrations":
             continue

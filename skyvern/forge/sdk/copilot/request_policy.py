@@ -67,6 +67,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -965,6 +966,8 @@ class RequestPolicy:
     # The ordinary user message or accepted interactive response each URL came from, so a release
     # records truthful provenance without retaining or logging the response text.
     user_site_url_sources: dict[str, SiteURLSource] = field(default_factory=dict)
+    # Spreadsheet ids from every URL the user wrote, not one per origin: two sheets share an origin.
+    user_provided_spreadsheet_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
@@ -4181,6 +4184,13 @@ def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> l
     return _accepted_question_response_url_texts(interaction)
 
 
+def _spreadsheet_id_in_url(url: str) -> str | None:
+    try:
+        return extract_spreadsheet_id(url)
+    except ValueError:
+        return None
+
+
 def _project_user_provided_sites(
     policy: RequestPolicy,
     url_texts: Sequence[_SiteURLText],
@@ -4191,12 +4201,18 @@ def _project_user_provided_sites(
     if reset:
         policy.user_provided_site_urls = []
         policy.user_site_url_sources = {}
+        policy.user_provided_spreadsheet_ids = []
     seen_origins = {parts[2] for url in policy.user_provided_site_urls if (parts := _url_parts(url)) is not None}
     for item in url_texts:
         for candidate in URL_CANDIDATE_RE.findall(item.text):
             cleaned = candidate.rstrip(".,;:!?")
             parts = _url_parts(cleaned)
-            if parts is None or parts[2] in seen_origins:
+            if parts is None:
+                continue
+            spreadsheet_id = _spreadsheet_id_in_url(cleaned)
+            if spreadsheet_id is not None and spreadsheet_id not in policy.user_provided_spreadsheet_ids:
+                policy.user_provided_spreadsheet_ids.append(spreadsheet_id)
+            if parts[2] in seen_origins:
                 continue
             seen_origins.add(parts[2])
             policy.user_provided_site_urls.append(cleaned)

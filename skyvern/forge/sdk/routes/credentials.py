@@ -2617,14 +2617,15 @@ async def update_credential_folder(
     if not folder:
         raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
 
+    changed_fields = tuple(
+        name for name, value in (("title", data.title), ("description", data.description)) if value is not None
+    )
     await record_request_audit_event(
         current_org.organization_id,
         "credential_folder.update",
         "credential_folder",
         folder.folder_id,
-        changed_fields=tuple(
-            name for name, value in (("title", data.title), ("description", data.description)) if value is not None
-        ),
+        changed_fields=changed_fields,
     )
     credential_count = await app.DATABASE.credential_folders.get_credential_folder_credential_count(
         folder_id=folder.folder_id,

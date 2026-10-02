@@ -200,6 +200,7 @@ from .guardrails import (
 )
 from .integrations import (
     _list_integrations,
+    _read_google_sheet,
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
@@ -1132,6 +1133,44 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     result = await _list_integrations(arguments, copilot_ctx)
     record_tool_step_result_for_ctx(copilot_ctx, "list_integrations", arguments, result)
     sanitized = sanitize_tool_result_for_llm("list_integrations", result)
+    return json.dumps(sanitized)
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override="read_google_sheet")
+async def read_google_sheet_tool(
+    ctx: RunContextWrapper,
+    spreadsheet_url: str,
+    connection_id: str | None = None,
+    range: str | None = None,
+) -> str:
+    """Read a Google spreadsheet through the organization's connected Google accounts, without a
+    browser or a workflow run. Read-only; returns values, never tokens or formulas.
+
+    `spreadsheet_url` must be a Google Sheets URL the user wrote in this chat; any other
+    spreadsheet is not read. With `connection_id` omitted, every active Sheets-scoped connection
+    is tried. `connections` reports one row per connection with `connection_id`, `name`,
+    `email_address` and a `status`: `opened` (the connection reads this spreadsheet), `no_access`
+    (the account cannot see this spreadsheet), `token_unavailable` (no access token could be
+    minted for the connection), `error` (the attempt failed; see `reason`), or `not_eligible`
+    (the given `connection_id` is not an active Sheets-scoped connection).
+
+    When a connection opened the spreadsheet the result also has `title`, `tabs` (each with
+    `title`, `gid`, `row_count`, `column_count`), `read_through` (the connection the values came
+    from) and `values` for `range`. `range` is A1 notation; with it omitted, `values` holds the
+    first rows of the tab named by the URL's `gid` (the first tab when the URL has none).
+    `truncated` is true when rows, columns or cell text were cut to fit.
+    """
+    copilot_ctx = ctx.context
+    arguments: dict[str, Any] = {"spreadsheet_url": spreadsheet_url, "connection_id": connection_id, "range": range}
+    authority_error = _authority_tool_error(copilot_ctx, "read_google_sheet")
+    if authority_error:
+        result = {"ok": False, "error": authority_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "read_google_sheet", arguments, result)
+        return json.dumps(result)
+
+    result = await _read_google_sheet(arguments, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "read_google_sheet", arguments, result)
+    sanitized = sanitize_tool_result_for_llm("read_google_sheet", result)
     return json.dumps(sanitized)
 
 
@@ -2160,6 +2199,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     list_credentials_tool,
     list_integrations_tool,
+    read_google_sheet_tool,
     get_organization_usage_quota_tool,
     run_blocks_tool,
     test_workflow_from_blank_browser_tool,
