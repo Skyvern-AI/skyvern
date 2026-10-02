@@ -2668,7 +2668,9 @@ def make_finish_tool(
                     "the page was still rendering, or could not be verified as settled, when you "
                     "called finish. Wait for it to settle, re-observe, confirm the goal's effect is "
                     "present in the loaded content (not a loading indicator or empty container), "
-                    "then finish again."
+                    f"then finish again. This check holds a finish at most {max_settle_deferrals} times, so a page "
+                    "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
+                    "report failure."
                 )
         if status == "completed" and goal_check is not None:
             try:

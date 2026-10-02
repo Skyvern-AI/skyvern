@@ -268,6 +268,7 @@ async def run_task_v3_agent_loop(
     resolve_totp_placeholder: TotpPlaceholderResolver | None = None,
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    settle_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     completion_probe: CompletionProbe | None = None,
@@ -532,7 +533,7 @@ async def run_task_v3_agent_loop(
         return result
 
     finish_tool = make_finish_tool(
-        page_fingerprint=None if page_free else page_fingerprint,
+        page_fingerprint=None if page_free else (settle_fingerprint or page_fingerprint),
         max_settle_deferrals=max_settle_deferrals,
         pending_marker=None if page_free else pending_marker,
         submit_watch=None if page_free else submit_watch,
