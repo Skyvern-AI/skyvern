@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     _sanitize_failure_text,
+    browser_code_steps_for_user,
     build_run_blocks_response,
     format_tool_result_for_user,
     iter_failure_reasons,
@@ -1650,6 +1651,37 @@ class TestFormatToolResultForUser:
             },
         )
         assert agent_summary == "Ran browser code (2 operation(s)) at https://example.com/members?page=3"
+
+    def test_format_tool_result_for_user_describes_browser_code_steps(self) -> None:
+        result = {
+            "ok": True,
+            "current_url": "https://example.com/jobs",
+            "operations": [
+                {"operation": "goto", "status": "ok"},
+                {"operation": "wait_for_selector", "status": "ok", "selector": ".job"},
+                *({"operation": "text_content", "status": "ok", "selector": f".job:nth({i})"} for i in range(10)),
+                {"operation": "click", "status": "failed", "selector": "#next"},
+                {"operation": "screenshot", "status": "ok"},
+            ],
+        }
+        assert browser_code_steps_for_user("run_browser_code", {**result, "operations_omitted": 3}) == [
+            "Opened a page",
+            "waited for '.job'",
+            "read ×10",
+            "clicked '#next' (failed)",
+            "screenshot",
+            "3 more operation(s)",
+        ]
+        assert format_tool_result_for_user("run_browser_code", result) == (
+            "Opened a page → waited for '.job' → read ×10 → clicked '#next' (failed) → screenshot"
+            " at https://example.com/jobs"
+        )
+        assert summarize_tool_result("run_browser_code", result) == (
+            "Ran browser code (14 operation(s)) at https://example.com/jobs"
+        )
+        assert format_tool_result_for_user("run_browser_code", {"ok": True, "operations": []}) == (
+            "Ran browser code (0 operation(s))"
+        )
 
 
 class TestUserFacingSuccess:
