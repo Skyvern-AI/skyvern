@@ -15345,6 +15345,52 @@ describe("editor-state rollback lifecycle", () => {
       useWorkflowHasChangesStore.getState().saveGeneration,
     ).toBeGreaterThan(0);
   });
+  async function interruptStagedTurn(canonical: unknown) {
+    const call = await stage();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    vi.useFakeTimers();
+    await act(async () => call.reject(new Error("Connection dropped")));
+    historyResponse.data.request_turn_id = "turn-1";
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "This turn was interrupted before it could finish.",
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "interrupted",
+          interrupted_row_final: true,
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+  }
+  it("does not credit Copilot with a canonical change it never made when its turn was interrupted", async () => {
+    await renderChat();
+    await interruptStagedTurn({
+      ...proposedWorkflowPayload(),
+      workflow_id: "wf_saved",
+      version: 2,
+    });
+
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "The draft could not be restored" }),
+    );
+  });
+  it("restores the pre-turn editor when an interrupted turn left canonical untouched", async () => {
+    const restore = vi
+      .fn<(snapshot: EditorStateSnapshot) => RestoreResult>()
+      .mockImplementation(restoreLive);
+    await renderChat({ onRestore: restore });
+    await interruptStagedTurn(saveData.workflow);
+
+    expect(restore).toHaveBeenCalledOnce();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
   it("reports a stale-workflow refusal during rollback and retains the reservation", async () => {
     changesState.hasChanges = true;
     const restore = vi

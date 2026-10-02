@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import re
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,9 +19,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -63,6 +66,7 @@ from skyvern.forge.sdk.copilot.interruption import (
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump_workflow_yaml
+from skyvern.forge.sdk.db.agent_db import _build_engine
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import (
@@ -6002,10 +6006,10 @@ async def test_a_turn_that_never_started_keeps_its_attachments_on_the_recovery_r
 
 
 @pytest.mark.asyncio
-async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping_its_reply(
+async def test_an_interrupted_row_stored_before_the_final_flag_is_served_final(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recovery can reach a slow-but-live turn first; when that turn finishes, its reply is the truth."""
+    """Nothing replaces stored rows anymore, so an unflagged one must not hold the chat's save lock forever."""
     chat = _make_persisted_chat([])
     store, _ = _install_reconcile_store(monkeypatch, chat)
     store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
@@ -6014,34 +6018,111 @@ async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping
         INTERRUPTED_TERMINAL_MESSAGE,
         TurnOutcome(
             response_kind=ResponseKind.RECOVER,
-            reason_code=INTERRUPTED_TERMINAL_REASON,
             terminal_reason=INTERRUPTED_TERMINAL_REASON,
             copilot_turn_id="turn-a",
-            user_message_id="wccm-0",
-            request_cancel_token="cancel-turn-a",
         ),
     )
 
-    await _persist_turn_messages(
-        chat=chat,
-        turn_id="turn-a",
+    response = await _load_history()
+
+    outcome = response.chat_history[-1].turn_outcome
+    assert outcome is not None
+    assert outcome.interrupted_row_final is True
+
+
+async def _start_abandoned_turn(repo: WorkflowParametersRepository, turn_id: str) -> str:
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    await repo.start_copilot_turn(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        pending_turn=CopilotPendingTurn(
+            turn_id=turn_id,
+            started_at=datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS + 60),
+        ),
         user_message="build me a scraper",
-        audio_artifact_id=None,
-        user_row_already_persisted=True,
-        sender=WorkflowCopilotChatSender.USER,
-        assistant_content="Here is your workflow.",
-        global_llm_context=None,
-        turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
-        narrative_payload=None,
+    )
+    return chat.workflow_copilot_chat_id
+
+
+@pytest.mark.asyncio
+async def test_a_turn_finishing_after_reconcile_claimed_it_cannot_write(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reconcile's interrupted row is final: the still-live turn loses its claim mid-recovery and after."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    mid_chat_id = await _start_abandoned_turn(repo, "turn-mid")
+    assert await repo.claim_pending_copilot_turn("org", mid_chat_id, "turn-mid", datetime.now(UTC))
+    mid_chat = await repo.get_workflow_copilot_chat_by_id("org", mid_chat_id)
+    assert not await workflow_copilot_route._claim_turn_finalisation(mid_chat, "turn-mid")
+
+    chat_id = await _start_abandoned_turn(repo, "turn-done")
+    chat = await repo.get_workflow_copilot_chat_by_id("org", chat_id)
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(chat, "org")
+
+    [row] = [m for m in await repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"]
+    assert row.turn_outcome is not None
+    assert row.turn_outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
+    assert row.turn_outcome.interrupted_row_final is True
+    assert not await workflow_copilot_route._claim_turn_finalisation(chat, "turn-done")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_a_turn_that_just_resumed_from_a_credential_pause(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two credential pauses outlast the abandon window from the turn's start while it is still working."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    chat_id = await _start_abandoned_turn(repo, "turn-a")
+    await repo.record_pending_copilot_turn_credential_resume("org", chat_id, "turn-a")
+    abandoned_before = datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
+    assert not await repo.claim_pending_copilot_turn("org", chat_id, "turn-a", abandoned_before)
+
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(
+        await repo.get_workflow_copilot_chat_by_id("org", chat_id), "org"
     )
 
-    assert len(store.assistant_messages) == 1
-    assert store.assistant_messages[0].content == "Here is your workflow."
-    outcome = store.assistant_messages[0].turn_outcome
-    assert outcome is not None
-    assert outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON
-    assert outcome.user_message_id == "wccm-0"
-    assert outcome.request_cancel_token == "cancel-turn-a"
+    assert [m for m in await repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"] == []
+    chat = await repo.get_workflow_copilot_chat_by_id("org", chat_id)
+    assert await workflow_copilot_route._claim_turn_finalisation(chat, "turn-a")
+
+
+@pytest_asyncio.fixture(params=["sqlite", "postgres"])
+async def fence_repo(
+    request: pytest.FixtureRequest, sqlite_engine: AsyncEngine
+) -> AsyncIterator[WorkflowParametersRepository]:
+    if request.param == "sqlite":
+        yield WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session, db_engine=sqlite_engine)
+        return
+    if make_url(str(settings.DATABASE_STRING)).get_backend_name() != "postgresql":
+        pytest.skip("requires PostgreSQL")
+    engine = _build_engine(settings.DATABASE_STRING)
+    try:
+        yield WorkflowParametersRepository(BaseAlchemyDB(engine).Session, db_engine=engine)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_waits_for_a_finalising_handler_and_answers_once_its_lock_is_gone(
+    fence_repo: WorkflowParametersRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled handler keeps its lock and so its turn; a dead one's connection takes the lock with it."""
+    monkeypatch.setattr(app.DATABASE, "workflow_params", fence_repo)
+    chat_id = await _start_abandoned_turn(fence_repo, "turn-a")
+
+    async def reconcile() -> list[WorkflowCopilotChatMessage]:
+        chat = await fence_repo.get_workflow_copilot_chat_by_id("org", chat_id)
+        await workflow_copilot_route._reconcile_interrupted_copilot_turns(chat, "org")
+        return [m for m in await fence_repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"]
+
+    async with fence_repo.hold_copilot_turn_finalisation(chat_id, "turn-a"):
+        assert await reconcile() == []
+
+    [row] = await reconcile()
+    assert row.turn_outcome is not None
+    assert row.turn_outcome.interrupted_row_final is True
 
 
 def test_reconcile_threshold_outlasts_the_turn_enforcement_ceiling() -> None:
@@ -6096,6 +6177,58 @@ async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
 
     assert app.DATABASE.workflow_params.start_copilot_turn.await_count == 1
     app.DATABASE.workflow_params.clear_pending_copilot_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["finished", "cancelled", "errored"])
+async def test_a_turn_reconcile_claimed_leaves_canonical_and_its_row_alone(
+    monkeypatch: pytest.MonkeyPatch, api_key_request: MagicMock, copilot_stream: MagicMock, ending: str
+) -> None:
+    """Rolling canonical back now could overwrite a save the user made once the interrupted row unlocked it."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="Here is your workflow.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        authoring_barred=False,
+        resolved_model=None,
+        turn_outcome=None,
+        cancelled=ending == "cancelled",
+        has_staged_proposal=False,
+    )
+    restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_params.claim_pending_copilot_turn_for_finalisation.return_value = "reconciling"
+    if ending == "errored":
+        monkeypatch.setattr(
+            workflow_copilot_route, "run_copilot_agent", AsyncMock(side_effect=RuntimeError("late failure"))
+        )
+    created_rows = workflow_params.create_workflow_copilot_chat_message.await_count
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    restore_mock.assert_not_awaited()
+    workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+    assert workflow_params.create_workflow_copilot_chat_message.await_count == created_rows
+    workflow_params.clear_pending_copilot_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -891,7 +891,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     });
   }
 
-  function interruptedHistory(): HistoryData {
+  function interruptedHistory(final = false): HistoryData {
     return historyWithRow({
       sender: "ai",
       content: interruptedText,
@@ -901,6 +901,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
         response_kind: "recover",
         terminal_reason: "interrupted",
         copilot_turn_id: turnId,
+        ...(final ? { interrupted_row_final: true } : {}),
       },
     });
   }
@@ -2788,6 +2789,26 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
     await advance(30_000);
     expect(historyQueue).toHaveLength(0);
+  });
+
+  it("releases the save hold on the first read of an interrupted row the server marked final", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    const readsBeforeRow = workflowGets.length;
+
+    await advance(2_000);
+    await resolveNextHistory(interruptedHistory(true));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(renderedText()).toContain(interruptedText);
+    expect(renderedText()).not.toContain(
+      "Could not confirm whether Copilot saved changes",
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(workflowGets.length).toBeGreaterThan(readsBeforeRow);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
   it("rechecks canonical after the terminal row despite unsaved edits", async () => {

@@ -700,6 +700,14 @@ async def _run_credential_pause(
         # Can't act on a rescued resolution mid-unwind, only avoid corrupting state.
         await _invalidate_active_pause_record()
         raise
+    try:
+        await app.DATABASE.workflow_params.record_pending_copilot_turn_credential_resume(
+            organization_id=organization_id,
+            workflow_copilot_chat_id=chat_id,
+            turn_id=turn_id,
+        )
+    except Exception:
+        LOG.warning("Could not record the credential pause resume on the turn marker", exc_info=True)
 
     if resolution is None:
         resolution = await _invalidate_active_pause_record()

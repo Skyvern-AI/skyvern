@@ -149,6 +149,9 @@ class CopilotPendingTurn(BaseModel):
     copilot_code_available: bool = False
     user_message_id: str | None = None
     recovering_at: datetime | None = None
+    # A credential pause stops the turn's budget clock, so reconcile measures abandonment from here
+    # too, as it does from a resolved question.
+    credential_resumed_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
     # never wrote canonical, so it owns no write to roll back.
     canonical_write_fingerprint: str | None = None
