@@ -265,7 +265,7 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
     # v1 runs a block with no navigation goal as ONE extract action that returns nulls for whatever the page does
     # not show and completes; workflows branch on those nulls. v3 was told neither what such a block is for nor
     # what finishing it means, so it failed the block whenever an earlier block had not reached the data
-    # (SKY-16398). Present on exactly v1's predicate, only in the treatment arm.
+    # (SKY-16398). Present on exactly v1's predicate.
     now = datetime.now(UTC)
     org = make_organization(now)
     extraction_only = make_task(now, org, navigation_goal=None, data_extraction_goal="the license status")
@@ -273,10 +273,9 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
         label="blk", output_parameter=output_param("blk"), data_extraction_goal="the license status"
     )
 
-    treated, _ = render_block_context(extraction_only, block, None, extraction_reports=True)
-    control, _ = render_block_context(extraction_only, block, None, extraction_reports=False)
+    framing, _ = render_block_context(extraction_only, block, None)
 
-    added = [p for p in treated.split("\n\n") if p not in control.split("\n\n")]
+    added = [p for p in framing.split("\n\n") if p.startswith("This block only reads the page")]
     assert len(added) == 1, added
     assert "null" in added[0]
     assert "status=completed" in added[0]
@@ -286,8 +285,6 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
     assert "read from the page" in added[0]
     assert "never invent" in added[0]
     assert "current date" in added[0]
-    # The control render is what shipped before the arm existed.
-    assert control == render_block_context(extraction_only, block, None)[0]
 
     out_of_predicate = [
         make_task(now, org, navigation_goal="Search for the record", data_extraction_goal="the license status"),
@@ -295,15 +292,11 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
         make_task(now, org, navigation_goal=None, data_extraction_goal="x", task_type=TaskType.validation),
     ]
     for task in out_of_predicate:
-        assert render_block_context(task, block, None, extraction_reports=True) == render_block_context(
-            task, block, None
-        )
+        assert "This block only reads the page" not in render_block_context(task, block, None)[0]
     # A task block carrying only an extraction goal keeps its fill tools, so it is not told it only reads.
-    assert render_block_context(extraction_only, _make_block("blk"), None, extraction_reports=True) == (
-        render_block_context(extraction_only, _make_block("blk"), None)
-    )
+    assert "This block only reads the page" not in render_block_context(extraction_only, _make_block("blk"), None)[0]
     # A bare task has no workflow to route its nulls, so it gets no block framing at all.
-    assert render_block_context(extraction_only, None, None, extraction_reports=True) == ("", "")
+    assert render_block_context(extraction_only, None, None) == ("", "")
 
 
 def test_a_page_value_cannot_close_its_own_span() -> None:
