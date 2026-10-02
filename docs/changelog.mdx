@@ -113,6 +113,16 @@ keywords:
 - **Simplified Onboarding Emails** — Added a Day-1 email introducing Copilot, simplified the Welcome email to two steps, and stopped sending "no successful run yet" nudges to team accounts.
 - **Welcome Questionnaire for New Sign-Ups** — New sign-ups now land directly on the welcome questionnaire instead of briefly landing on Home first.
 - **Clearer Insurance Quote Example** — The Home page's insurance quote example now reads as plain text instead of a JSON blob.
+- **Clearer Extraction Results** — Skyvern 3.0 extraction-only blocks now always report exactly what's on the page, marking any missing field as null. ([#8771](https://github.com/Skyvern-AI/skyvern/pull/8771))
+- **Instant Welcome Email** — New signups now get the Welcome email right after their first app load, instead of waiting up to an hour.
+- **Clearer Copilot Loop Debugging** — Workflow Copilot now shows which input a for_loop block actually used, with recorded row counts, making a failed loop easier to debug.
+- **Readable Copilot Browser-Code Steps** — Copilot's browser-code tool calls now list the steps the code performed, like "Opened a page → clicked next → read ×10," instead of just "Ran browser code."
+- **Clearer Blocked Code-Block Errors** — Copilot now explains which value caused a blocked code block and how earlier outputs reach code, instead of a generic error.
+- **Visible Page-Load Failures in Code Blocks** — A CodeBlock wait-timeout error now shows the page load failure that caused it, instead of just the timeout.
+- **More Complete Copilot Repairs** — Copilot's automatic repairs now see icon-only controls, like expanders and chevrons, even when their selector isn't unique on the page.
+- **Starter-Prompt Onboarding Email** — New signups now get an email with three starter prompts — collecting website data, downloading invoices, and filling out a form — to help them get going.
+- **Readable Copilot Tables** — Copilot replies now render Markdown tables, headings, quotes, and dividers properly instead of as unstyled text.
+- **Search Runs by More Identifiers** — Run History and run search can now find runs by browser profile ID, browser session ID, credential ID, or webhook callback URL, not just run ID or inputs.
 
 ## Bug fixes
 
@@ -168,6 +178,16 @@ keywords:
 - Fixed the code block AI fallback running during Copilot build tests and editor block runs, hiding real code regressions; run details now show which block it rescued and why the code failed.
 - Fixed a Terminate block's custom error code or reason being able to leak a referenced secret's value.
 - Fixed task runs occasionally being marked failed or terminated right after a successful form submission.
+- Fixed Skyvern 3.0 refusing to finish a task when the page had a live countdown, clock, or rotating headline.
+- Fixed Skyvern 3.0 losing its view of the page entirely on sites that define their own `toJSON`, instead of reading the page correctly. ([#8770](https://github.com/Skyvern-AI/skyvern/pull/8770))
+- Fixed Skyvern 3.0 occasionally picking the wrong row from a long dropdown or menu due to a shifted or guessed row number. ([#8767](https://github.com/Skyvern-AI/skyvern/pull/8767))
+- Fixed a single-action step sometimes being marked complete before its action actually took effect, which could carry the run onto the wrong next page.
+- Fixed Skyvern 3.0 missing icon-only close buttons on overlays and incorrectly reporting that no controls were found. ([#8766](https://github.com/Skyvern-AI/skyvern/pull/8766))
+- Fixed Copilot's automatic repair discarding the notice that a full-screen overlay, like a consent banner, was blocking the page.
+- Fixed Skyvern 3.0 on slow-loading pages misjudging whether the page had actually finished loading.
+- Fixed Skyvern 3.0 incorrectly reporting a search-and-select field as empty when a single result committed automatically.
+- Fixed Skyvern 3.0 clicking the wrong control when its screen-reader label differed from its visible text.
+- Fixed Copilot failing before sending any request on certain Anthropic and Bedrock models.
 
 </Update>
 
