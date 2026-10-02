@@ -13698,7 +13698,6 @@ def build_browser_tools(
                 )
         else:
             await _require_single_target(page, selector)
-        await input_dispatch.approach(page, selector)
         pre: dict[str, Any] | None = None
         try:
             pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
@@ -14430,7 +14429,6 @@ def build_browser_tools(
         # held value, and only with its own list known closed; every other field acts and verifies the click.
         if not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY:
             return False
-        await input_dispatch.approach(page, selector)
         try:
             if not await page.evaluate(_OWN_LIST_CLOSED_JS, await _probe_arg(page, selector)):
                 return False
@@ -15221,7 +15219,6 @@ def build_browser_tools(
         collateral: list[list[str]] | None = None,
         query: str | None = None,
         press_enter: bool = False,
-        secret: bool = False,
     ) -> tuple[_TypeaheadPick, str | None, str | None, _Reach]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM BEFORE the focus click, not just before typing: a widget that opens its full list on
@@ -15236,7 +15233,6 @@ def build_browser_tools(
         # Same reason: fill()/type() below open the widget's own list (aria-expanded=true) for the rest
         # of this attempt, and ownCommittedSurface reads nothing while it is open.
         pre_own = await _own_surface_text(page, selector)
-        await input_dispatch.approach(page, selector)
         try:
             await page.evaluate(_PRESNAPSHOT_JS)
         except Exception:
@@ -15267,9 +15263,7 @@ def build_browser_tools(
         # Clearing an empty multi-value input sends Delete, which removes the field's last chip.
         if not (pre_value == "" and await _holds_own_chips(page, selector)):
             await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
-        await input_dispatch.type_keys(
-            page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed), secret=secret, replace=True
-        )
+        await input_dispatch.type_keys(page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
         if collateral:
             collateral[:] = await _collateral_moved_while_typing(page, collateral)
         if not presnapshot_ok or reach != "click":
@@ -16200,7 +16194,7 @@ def build_browser_tools(
                 held = await box.input_value(timeout=1000)
                 if not held:
                     # v1's fallback: a box that drops a programmatic value may still take the key.
-                    await input_dispatch.type_keys(page, box, char, timeout=1000, secret=secret)
+                    await input_dispatch.type_keys(page, box, char, timeout=1000)
                     held = await box.input_value(timeout=1000)
             except Exception:
                 held = None
@@ -16454,9 +16448,7 @@ def build_browser_tools(
                     at_end = False
                 if at_end:
                     # page.type() would focus the field again, and a fresh focus puts the caret back at the start.
-                    sent = await _type_keys_before_deadline(
-                        text, press_end=at_end == "end_key", secret=text != args.get("text", "")
-                    )
+                    sent = await _type_keys_before_deadline(text, press_end=at_end == "end_key")
                     if sent < len(text):
                         progress = (
                             "partway" if text != args.get("text", "") else f"after {sent} of {len(text)} characters"
@@ -16468,9 +16460,7 @@ def build_browser_tools(
                             error_class="text_not_held",
                         )
                 else:
-                    await input_dispatch.type_keys(
-                        page, selector, text, timeout=_typing_timeout_ms(text), secret=text != args.get("text", "")
-                    )
+                    await input_dispatch.type_keys(page, selector, text, timeout=_typing_timeout_ms(text))
                 not_held = await _appended_text_not_held(
                     field, selector, text, before, text_is_secret=text != args.get("text", "")
                 )
@@ -16519,7 +16509,7 @@ def build_browser_tools(
             await handle.dispose()
         return element
 
-    async def _type_keys_before_deadline(text: str, *, press_end: bool, secret: bool) -> int:
+    async def _type_keys_before_deadline(text: str, *, press_end: bool) -> int:
         # One key at a time: a single keyboard.type(text) keeps typing in the browser after its caller stops
         # waiting, into whatever field the next action focuses. The keyboard is the page's; a frame has none.
         top = _current_page()
@@ -16534,7 +16524,7 @@ def build_browser_tools(
             if remaining <= 0:
                 return sent
             try:
-                await asyncio.wait_for(input_dispatch.type_keys(top, None, key, secret=secret), remaining)
+                await asyncio.wait_for(input_dispatch.type_keys(top, None, key), remaining)
             except asyncio.TimeoutError:
                 return sent
         return len(text)
@@ -16629,7 +16619,7 @@ def build_browser_tools(
         collateral: list[list[str]] = []
         try:
             pick, pre_value, pre_own, reach = await _type_and_commit(
-                page, selector, text, rounds=3, focus_fallback=True, collateral=collateral, secret=text_is_secret
+                page, selector, text, rounds=3, focus_fallback=True, collateral=collateral
             )
         except _FieldCovered as exc:
             return _covered_error(exc.selector, exc.occluder)
@@ -16888,7 +16878,6 @@ def build_browser_tools(
             pre_anchor_closed = None
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
-            await input_dispatch.approach(page, selector)
             try:
                 await page.evaluate(_PRESNAPSHOT_JS)
             except Exception:
@@ -17951,9 +17940,7 @@ def build_browser_tools(
                     # PREVIOUS query left on screen as pre-existing, and a widget that keeps its row
                     # nodes across a re-search would then have no reaction to show at all.
                     await page.evaluate(_PRESNAPSHOT_JS)
-                    await input_dispatch.type_keys(
-                        page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung), replace=True
-                    )
+                    await input_dispatch.type_keys(page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung))
                 except Exception:
                     return []
                 rung_pick = await _commit_typeahead(

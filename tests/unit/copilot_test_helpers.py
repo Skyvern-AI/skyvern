@@ -270,7 +270,11 @@ def install_get_run_results_harness(
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
     pool = [harness_run("wr-1", status=run_status), *(other_runs or [])]
-    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=workflow_parameters or []))
+    workflow = SimpleNamespace(
+        created_by=None,
+        modified_at=HARNESS_RUN_CREATED_AT,
+        workflow_definition=SimpleNamespace(parameters=workflow_parameters or [], blocks=[]),
+    )
 
     async def get_workflow_run(workflow_run_id: str, organization_id: str | None = None) -> SimpleNamespace | None:
         return next(

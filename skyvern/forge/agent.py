@@ -185,7 +185,6 @@ from skyvern.forge.sdk.workflow.models.credential_release import CredentialRelea
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
-from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_PROMPT_NAME,
     PRE_JUDGE_SKIP_REASONS,
@@ -200,7 +199,6 @@ from skyvern.forge.taskv3.run_arms import (
     EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
-    HUMANIZED_INPUT_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -2326,15 +2324,6 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_EXTRACTION_REPORTS,
             )
-            await resolve_run_arm(
-                context,
-                HUMANIZED_INPUT_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_HUMANIZED_INPUT,
-            )
-            # Here as well as on the loop's finish line, so a run whose loop raises still records its profile.
-            LOG.info("Task V3 humanized input resolved", **input_dispatch.arm_fields())
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
         page_free_validation = bool(

@@ -1069,7 +1069,11 @@ async def test_origin_registry_recovers_when_a_later_terminal_read_finds_the_han
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
     )
-    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[]))
+    workflow = SimpleNamespace(
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
+        workflow_definition=SimpleNamespace(parameters=[], blocks=[]),
+    )
     monkeypatch.setattr(
         run_execution_module,
         "app",

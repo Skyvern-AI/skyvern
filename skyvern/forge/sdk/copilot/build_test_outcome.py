@@ -205,6 +205,43 @@ class BuildTestPacketRunBrowser(BaseModel):
     note: str
 
 
+LoopSelectedInput = Literal["loop_variable_reference", "loop_over_parameter_key", "none"]
+
+
+class LoopInputFact(BaseModel):
+    """One for_loop's declared input in the executed definition, and the loop_values its run rows recorded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str
+    enclosing_loop_label: str | None = None
+    loop_over_parameter_key: str | None = None
+    producer_block_label: str | None = None
+    producer_output_parameter_id: str | None = None
+    loop_variable_reference: str | None = None
+    selected_input: LoopSelectedInput
+    run_rows: int | None = None
+    loop_values_counts: list[int | Literal["not_recorded"]] | None = None
+    loop_values_counts_omitted: int | None = None
+
+
+class LoopInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_run_id: str | None = None
+    workflow_id: str
+    workflow_permanent_id: str
+    version: int
+    loops: list[LoopInputFact]
+    loops_omitted: int | None = None
+
+
+class LoopInputsUnavailable(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    executed_definition: Literal["unavailable"] = "unavailable"
+
+
 class BuildTestPacketRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -214,6 +251,7 @@ class BuildTestPacketRun(BaseModel):
     browser: BuildTestPacketRunBrowser | None = None
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
+    loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
 
 
 class BuildTestPacketPageState(BaseModel):

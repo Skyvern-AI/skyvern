@@ -37,7 +37,6 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
-from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_TIMEOUT_SECONDS,
@@ -712,7 +711,6 @@ async def run_task_v3_agent_loop(
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,
-        **input_dispatch.arm_fields(),
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a
         # per-run indexed event and makes the join to block_type free instead of a second lookup.
