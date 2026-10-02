@@ -1386,8 +1386,21 @@ def preserve_untouched_block_configuration(
         fields: dict[str, Any] = {}
         # workflowEditorUtils.blockEngineForWorkflow omits V1 under the legacy default engine.
         # V2/V3 are explicit pins: clearing either selects Default and must survive the repair.
-        if block.get("engine") is None and prior.get("engine") == RunEngine.skyvern_v1.value:
+        # The current editor exports a pin as skyvern-1.0 plus the marker, so a pinned block with no engine is a
+        # Default pick and must not be re-pinned.
+        if (
+            block.get("engine") is None
+            and prior.get("engine") == RunEngine.skyvern_v1.value
+            and not prior.get("engine_pinned")
+        ):
             fields["engine"] = prior["engine"]
+        if (
+            prior.get("engine_pinned")
+            and prior.get("engine") == RunEngine.skyvern_v1.value
+            and block.get("engine") == RunEngine.skyvern_v1.value
+            and not block.get("engine_pinned")
+        ):
+            fields["engine_pinned"] = True
         # The editor writes node.data.label as a task block's title.
         if "title" in prior and block.get("title") == label and prior["title"] != label:
             fields["title"] = prior["title"]

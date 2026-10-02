@@ -94,6 +94,11 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
     return reverse_mapping
 
 
+ENGINE_PINNED_DESCRIPTION = (
+    "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
+)
+
+
 class _LLMSelectionBlock(Protocol):
     label: str
     model: dict[str, Any] | None
@@ -842,6 +847,7 @@ class TaskBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | str | None = None
@@ -1251,6 +1257,7 @@ class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -1266,6 +1273,7 @@ class ActionBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     selector: str | None = None
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
@@ -1289,6 +1297,7 @@ class NavigationBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1314,6 +1323,7 @@ class ExtractionBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1334,6 +1344,7 @@ class LoginBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -1441,6 +1452,7 @@ class FileDownloadBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None

@@ -10,8 +10,12 @@ from pydantic import AfterValidator, AnyHttpUrl, HttpUrl, ValidationError, Valid
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException, UnresolvableHost
+from skyvern.utils.pinned_transport import PinnedIPTransport, is_blocked_ip, normalize_ip
 
 SAFE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+BLOCKED_HOST_ALLOWLIST_HINT = (
+    "The host is blocked by SSRF protection. Self-hosted deployments can add the host to ALLOWED_HOSTS."
+)
 MAX_SAFE_REDIRECTS = 10
 
 # getaddrinfo codes that mean the resolver answered "this name has no address", as opposed to
@@ -24,22 +28,6 @@ _NO_SUCH_HOST_DNS_ERRNOS = frozenset(
 _BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
 _BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
 _LOCAL_BROWSER_HOSTNAMES = frozenset({"localhost", "host.docker.internal"})
-_BLOCKED_IP_NETWORKS = tuple(
-    ipaddress.ip_network(network)
-    for network in (
-        "127.0.0.0/8",
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "169.254.0.0/16",
-        "100.64.0.0/10",
-        "::1/128",
-        "fc00::/7",
-    )
-)
-_BLOCKED_METADATA_IPS = frozenset(
-    ipaddress.ip_address(ip) for ip in ("169.254.169.254", "100.100.100.200", "fd00:ec2::254")
-)
 
 
 def strip_query_params(url: str) -> str:
@@ -206,23 +194,6 @@ def _normalize_host(host: str) -> str:
     return (host[1:-1] if host.startswith("[") and host.endswith("]") else host).strip().lower().rstrip(".")
 
 
-def _normalize_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        return ip.ipv4_mapped
-    return ip
-
-
-def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    ip = _normalize_ip(ip)
-    if ip in _BLOCKED_METADATA_IPS:
-        return True
-    if any(ip.version == network.version and ip in network for network in _BLOCKED_IP_NETWORKS):
-        return True
-    return bool(
-        ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved or ip.is_multicast or ip.is_unspecified
-    )
-
-
 def is_allowed_local_browser_host(host: str) -> bool:
     if settings.ENV != "local":
         return False
@@ -242,7 +213,7 @@ def _is_allowed_host(host: str) -> bool:
     normalized = _normalize_host(host)
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:
-        ip = _normalize_ip(ipaddress.ip_address(normalized))
+        ip = normalize_ip(ipaddress.ip_address(normalized))
     except ValueError:
         ip = None
     except Exception:
@@ -286,7 +257,7 @@ def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
         return True
 
     if ip is not None:
-        return _is_blocked_ip(ip)
+        return is_blocked_ip(ip)
 
     if not resolve_dns:
         return False
@@ -322,8 +293,8 @@ def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
         raise BlockedHost(host=host)
 
     if ip is not None:
-        normalized_ip = _normalize_ip(ip)
-        if not allowed and _is_blocked_ip(normalized_ip):
+        normalized_ip = normalize_ip(ip)
+        if not allowed and is_blocked_ip(normalized_ip):
             raise BlockedHost(host=host)
         return (str(normalized_ip),)
 
@@ -339,10 +310,10 @@ def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
         if not ip_str:
             continue
         try:
-            resolved_ip = _normalize_ip(ipaddress.ip_address(ip_str))
+            resolved_ip = normalize_ip(ipaddress.ip_address(ip_str))
         except ValueError:
             continue
-        if not allowed and _is_blocked_ip(resolved_ip):
+        if not allowed and is_blocked_ip(resolved_ip):
             raise BlockedHost(host=host)
         resolved_ip_str = str(resolved_ip)
         if resolved_ip_str not in resolved_ips:
@@ -516,41 +487,17 @@ def validate_redirect_url(url: str, location: str) -> str:
     return validate_redirect_url_with_resolved_ips(url, location)[0]
 
 
-class _PinnedIPTransport(httpx.AsyncHTTPTransport):
-    """Connect only to already-validated IPs, keeping SNI, Host, and cert verification on the hostname.
-
-    httpx resolves again at connect time, so a rebinding host can answer with a private
-    address after validation passed. Addresses are tried in resolution order so a host
-    whose first address is unreachable still behaves like an unpinned client.
-    """
-
-    def __init__(self, resolved_ips: tuple[str, ...], **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._resolved_ips = resolved_ips
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        original_url = request.url
-        request.extensions = {**request.extensions, "sni_hostname": original_url.host}
-        last_index = len(self._resolved_ips) - 1
-        for index, ip in enumerate(self._resolved_ips):
-            request.url = original_url.copy_with(host=ip)
-            try:
-                return await super().handle_async_request(request)
-            except (httpx.ConnectError, httpx.ConnectTimeout):
-                if index == last_index:
-                    raise
-        raise httpx.ConnectError(f"No validated address for {original_url.host} could be reached")
-
-
 def pinned_ip_client(resolved_ips: tuple[str, ...] | None, **kwargs: Any) -> httpx.AsyncClient:
     """Client pinned to the IPs a caller already validated, so DNS cannot be re-answered at connect time.
 
     Pass the IPs from `validate_fetch_url_with_resolved_ips`. Without them this is a plain
-    client with no rebinding protection.
+    client with no rebinding protection. Environment proxies are ignored unless OUTBOUND_TRUST_ENV_PROXY
+    is set, because a forward proxy re-resolves the host and the pin no longer applies.
     """
     if not resolved_ips:
         return httpx.AsyncClient(**kwargs)
-    return httpx.AsyncClient(transport=_PinnedIPTransport(resolved_ips), **kwargs)
+    transport = PinnedIPTransport(resolved_ips, trust_env=kwargs.get("trust_env", settings.OUTBOUND_TRUST_ENV_PROXY))
+    return httpx.AsyncClient(transport=transport, **kwargs)
 
 
 def encode_url(url: str) -> str:

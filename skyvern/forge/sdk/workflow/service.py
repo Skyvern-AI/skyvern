@@ -186,11 +186,13 @@ from skyvern.forge.sdk.workflow.models.block import (
     SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
+    V3AbIneligibleReason,
     WebSearchBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
+    pinned_v1_block_count,
     resolve_conditional_merge_edges,
     takes_default_engine,
     v3_ab_ineligibility_reason,
@@ -7890,6 +7892,7 @@ class WorkflowService:
         # share an arm. Covers the DAG executor too, which this method delegates to.
         current_context = skyvern_context.current()
         if current_context:
+            ineligibility_reason = v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run)
             await resolve_workflow_block_engine_arm(
                 current_context,
                 workflow_run_id=workflow_run_id,
@@ -7897,8 +7900,14 @@ class WorkflowService:
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 workflow_status=workflow.status,
                 trigger_type=workflow_run.trigger_type,
-                ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
+                ineligibility_reason=ineligibility_reason,
                 takes_default_engine=takes_default_engine(all_blocks),
+                # Counted only when the pin is what left the A/B, so pinned_v1_engine never labels another reason.
+                pinned_v1_blocks=(
+                    pinned_v1_block_count(all_blocks)
+                    if ineligibility_reason == V3AbIneligibleReason.pinned_engine
+                    else 0
+                ),
             )
         else:
             LOG.warning(
