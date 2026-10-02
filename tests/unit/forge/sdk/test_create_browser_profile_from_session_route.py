@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +26,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_profile_utils import operator_profile_generation, write_operator_profile_marker
+from skyvern.webeye.profile_cookie_merge import SIGNIN_COOKIES_FILENAME
 
 _default_profile_template_candidates = browser_profiles_route._default_browser_profile_template_candidates
 
@@ -83,12 +87,18 @@ def _build_client(
         rate_limit_submit_run=AsyncMock(),
         get_workflow_browser_session_storage_key=AsyncMock(return_value="wp_1"),
         engine_enabled=AsyncMock(return_value=True),
+        observe_session=AsyncMock(),
+        release_observed_session=AsyncMock(),
     )
 
     forge_app.set_app(
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(is_browser_memory_engine_enabled_for_org=mocks.engine_enabled),
             RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=mocks.rate_limit_submit_run),
+            PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(
+                get_observer_browser_state=mocks.observe_session,
+                release_observer_browser_state=mocks.release_observed_session,
+            ),
             WORKFLOW_SERVICE=SimpleNamespace(
                 get_workflow_browser_session_storage_key=mocks.get_workflow_browser_session_storage_key,
             ),
@@ -420,6 +430,49 @@ def test_create_empty_profile_rolls_back_when_archive_store_fails(monkeypatch: p
     assert response.status_code == 500
     mocks.hard_delete_db_profile.assert_awaited_once_with("bp_new", organization_id="org_oss")
     mocks.delete_db_profile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_running_session_profile_dates_a_taken_name_instead_of_overwriting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session()
+    mocks.observe_session.return_value = _running_browser(
+        [{"name": "sid", "value": "1", "domain": "portal.example.com", "path": "/"}],
+        page_url="https://portal.example.com/members",
+    )
+    duplicate = IntegrityError("insert", {}, Exception("duplicate"))
+    mocks.create_profile.side_effect = [duplicate, duplicate, _profile()]
+
+    profile, _count = await browser_profiles_route.create_profile_from_running_session(
+        organization_id="org_oss",
+        browser_session_id="pbs_1",
+        login_urls=["https://portal.example.com/login"],
+        name="Sign-in for portal.example.com",
+        description=None,
+    )
+
+    assert profile == _profile()
+    names = [call.kwargs["name"] for call in mocks.create_profile.await_args_list]
+    stamp = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
+    assert names[0] == "Sign-in for portal.example.com"
+    assert re.fullmatch(rf"Sign-in for portal\.example\.com \({stamp}\)", names[1])
+    assert re.fullmatch(rf"Sign-in for portal\.example\.com \({stamp} [0-9a-f]{{4}}\)", names[2])
+    mocks.store_profile.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_empty_profile_rolls_back_when_a_timeout_cancels_the_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, mocks = _build_client(monkeypatch)
+    mocks.store_profile.side_effect = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await browser_profiles_route._create_empty_profile(organization_id="org_oss", name="n", description=None)
+
+    mocks.hard_delete_db_profile.assert_awaited_once_with("bp_new", organization_id="org_oss")
 
 
 def test_create_empty_profile_preserves_store_error_when_rollback_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -883,3 +936,135 @@ async def test_persisted_state_dir_exports_engine_sink_for_picked_plain(monkeypa
         await retrieve_persisted_workflow_browser_state_dir(organization_id="o", workflow=workflow, workflow_run=run)
         is None
     )
+
+
+def _running_browser(cookies: list[dict], page_url: str) -> SimpleNamespace:
+    context = SimpleNamespace(cookies=AsyncMock(return_value=cookies), close=AsyncMock())
+    page = SimpleNamespace(url=page_url)
+    return SimpleNamespace(browser_context=context, get_working_page=AsyncMock(return_value=page), close=AsyncMock())
+
+
+def _capture_signin_seed(mocks: SimpleNamespace) -> list[list[dict]]:
+    seeds: list[list[dict]] = []
+
+    async def _store(*, organization_id: str, profile_id: str, directory: str) -> None:
+        seeds.append(json.loads((Path(directory) / SIGNIN_COOKIES_FILENAME).read_text()))
+
+    mocks.store_profile.side_effect = _store
+    return seeds
+
+
+@pytest.mark.asyncio
+async def test_running_session_profile_saves_sign_in_cookies_and_leaves_session_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session(proxy_location=ProxyLocation.RESIDENTIAL_ISP, proxy_session_id="ps_1")
+    browser = _running_browser(
+        [
+            {"name": "sid", "value": "1", "domain": "portal.example.com", "path": "/"},
+            {"name": "member", "value": "2", "domain": "members.example.com", "path": "/"},
+            {"name": "ad", "value": "3", "domain": "tracker.example.org", "path": "/"},
+        ],
+        page_url="https://members.example.com/home",
+    )
+    mocks.observe_session.return_value = browser
+    seeds = _capture_signin_seed(mocks)
+
+    profile, count = await browser_profiles_route.create_profile_from_running_session(
+        organization_id="org_oss",
+        browser_session_id="pbs_1",
+        login_urls=["https://portal.example.com/login"],
+        name="Sign-in for portal.example.com",
+        description=None,
+    )
+
+    assert (profile, count) == (_profile(), 2)
+    assert [c["name"] for c in seeds[0]] == ["sid", "member"]
+    assert mocks.create_profile.await_args.kwargs["proxy_session_id"] == "ps_1"
+    mocks.release_observed_session.assert_awaited_once_with("pbs_1", browser)
+    browser.get_working_page.assert_awaited_once_with(prune_excess_pages=False)
+    browser.close.assert_not_awaited()
+    browser.browser_context.close.assert_not_awaited()
+    mocks.retrieve_profile.assert_not_awaited()
+    mocks.delete_profile_blob.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("login_urls", "page_url"),
+    [
+        (["https://app.example.com/login"], "https://accounts.example.net/signin/consent"),
+        (["https://app.example.com/login", "https://accounts.example.net/o/oauth2"], "https://app.example.com/home"),
+    ],
+)
+async def test_running_session_profile_keeps_only_the_named_sites_cookies(
+    monkeypatch: pytest.MonkeyPatch, login_urls: list[str], page_url: str
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session()
+    mocks.observe_session.return_value = _running_browser(
+        [
+            {"name": "app_sid", "value": "1", "domain": "app.example.com", "path": "/"},
+            {"name": "SID", "value": "2", "domain": ".example.net", "path": "/"},
+        ],
+        page_url=page_url,
+    )
+    seeds = _capture_signin_seed(mocks)
+
+    await browser_profiles_route.create_profile_from_running_session(
+        organization_id="org_oss",
+        browser_session_id="pbs_1",
+        login_urls=login_urls,
+        name="Sign-in for app.example.com",
+        description=None,
+    )
+
+    assert [c["name"] for c in seeds[0]] == ["app_sid"]
+
+
+@pytest.mark.asyncio
+async def test_running_session_profile_raises_when_the_live_browser_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session()
+    mocks.observe_session.return_value = None
+
+    with pytest.raises(RuntimeError, match="not reachable"):
+        await browser_profiles_route.create_profile_from_running_session(
+            organization_id="org_oss",
+            browser_session_id="pbs_1",
+            login_urls=["https://portal.example.com/login"],
+            name="Sign-in for portal.example.com",
+            description=None,
+        )
+
+    mocks.create_profile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_running_session_profile_without_matching_cookie_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session()
+    browser = _running_browser(
+        [{"name": "ad", "value": "3", "domain": "tracker.example.org", "path": "/"}],
+        page_url="https://portal.example.com/login",
+    )
+    mocks.observe_session.return_value = browser
+
+    result = await browser_profiles_route.create_profile_from_running_session(
+        organization_id="org_oss",
+        browser_session_id="pbs_1",
+        login_urls=["https://portal.example.com/login"],
+        name="Sign-in for portal.example.com",
+        description=None,
+    )
+
+    assert result == (None, 0)
+    mocks.create_profile.assert_not_awaited()
+    mocks.store_profile.assert_not_awaited()
+    mocks.release_observed_session.assert_awaited_once_with("pbs_1", browser)
+    browser.browser_context.close.assert_not_awaited()
