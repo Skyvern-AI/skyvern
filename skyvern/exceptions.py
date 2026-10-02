@@ -141,6 +141,23 @@ class SkyvernHTTPException(SkyvernException):
         super().__init__(message)
 
 
+class WorkflowPinnedByRunGroup(SkyvernHTTPException):
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"Workflow version {workflow_id} is running as a workflow run group, so it cannot be edited in place "
+            "until that group finishes. Save the change as a new version instead.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
+class WorkflowChangedSinceReview(SkyvernHTTPException):
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"Workflow version {workflow_id} changed after it was reviewed, so the group was not submitted.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
 _BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
 # Patterns that indicate a browser session connection failure (e.g. CDP WebSocket errors).

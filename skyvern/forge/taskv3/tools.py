@@ -6946,7 +6946,8 @@ _FIND_MENU_JS = (
     const tag = el.tagName;
     const box = rowBox(el);
     if (!box) {
-      if (arg.saltUnlisted && vis(el.getBoundingClientRect()) && (el.innerText || '').trim() && ownClickable(el)) unreadLong.push(el);
+      // innerText walks the subtree, so it runs after the cheaper checks that reject most containers.
+      if (arg.saltUnlisted && vis(el.getBoundingClientRect()) && ownClickable(el) && (el.innerText || '').trim()) unreadLong.push(el);
       continue;
     }
     const { r, txt } = box;

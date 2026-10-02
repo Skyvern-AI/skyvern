@@ -65,6 +65,7 @@ def _workflow_run(
     extra_http_headers: dict[str, str] | None = None,
     workflow_schedule_id: str | None = None,
     copilot_session_id: str | None = None,
+    start_fresh_browser: bool | None = None,
 ) -> WorkflowRun:
     now = datetime.now(timezone.utc)
     return WorkflowRun(
@@ -86,6 +87,7 @@ def _workflow_run(
         extra_http_headers=extra_http_headers,
         workflow_schedule_id=workflow_schedule_id,
         copilot_session_id=copilot_session_id,
+        start_fresh_browser=start_fresh_browser,
         trigger_type=WorkflowRunTriggerType.api,
         created_at=now,
         modified_at=now,
@@ -269,6 +271,7 @@ async def _run_fallback_retry(
     flag_enabled: bool = True,
     flag_error: Exception | None = None,
     run_tags: dict[str, str] | None = None,
+    run_group_item: object | None = None,
 ) -> tuple[str | None, AsyncMock, MagicMock]:
     captured: dict[str, object] = {}
 
@@ -297,6 +300,7 @@ async def _run_fallback_retry(
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=block_scoped)
         mock_app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers = _strip_marker_header
         mock_app.DATABASE.debug.has_block_run_for_workflow_run = AsyncMock(return_value=False)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=run_group_item)
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=_workflow(parameters))
         if retried_by_results is not None:
             mock_app.DATABASE.workflow_runs.get_workflow_run_retried_by = AsyncMock(side_effect=retried_by_results)
@@ -409,6 +413,24 @@ async def test_mixed_triggers_advance_each_parameter_from_its_own_prior_selectio
     assert kwargs["fallback_attempt"] == 2
     assert kwargs["workflow_request"].data["login_cred"] == "cred_a_fb2"
     assert kwargs["workflow_request"].data["backup_cred"] == "cred_b_fb1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_group_item", [False, True])
+async def test_a_run_group_child_never_starts_a_fallback_run(is_group_item: bool) -> None:
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}], start_fresh_browser=True)
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run,
+        parameters=[_credential_parameter(fallback_credential_ids=["cred_fb1"])],
+        run_group_item=SimpleNamespace(workflow_run_group_id="wrg_1") if is_group_item else None,
+    )
+
+    if is_group_item:
+        assert result is None
+        run_workflow_mock.assert_not_awaited()
+    else:
+        assert result == "wr_retry"
 
 
 @pytest.mark.asyncio
