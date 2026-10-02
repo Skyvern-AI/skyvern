@@ -705,6 +705,12 @@ async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_f
     from skyvern.forge.taskv3.loop import LoopOutcome
 
     captured: list[object] = []
+    finish_samplers: list[object] = []
+    real_make = engine_mod.make_finish_tool
+
+    def _capture_finish(*args: Any, **kwargs: Any) -> Any:
+        finish_samplers.append(kwargs.get("page_fingerprint"))
+        return real_make(*args, **kwargs)
 
     async def _capture(**kwargs: object) -> LoopOutcome:
         captured.append(kwargs.get("page_fingerprint"))
@@ -713,21 +719,23 @@ async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_f
     async def fingerprint() -> str | None:
         return "markup-1"
 
+    async def settle() -> str | None:
+        return "markup-#"
+
+    monkeypatch.setattr(engine_mod, "make_finish_tool", _capture_finish)
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="x",
-        page_fingerprint=fingerprint,
-    )
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="x",
-        page_fingerprint=fingerprint,
-        page_free=True,
-    )
-    assert captured == [fingerprint, None]
+    for settle_sampler, page_free in ((None, False), (settle, False), (settle, True)):
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([]),
+            goal="x",
+            page_fingerprint=fingerprint,
+            settle_fingerprint=settle_sampler,
+            page_free=page_free,
+        )
+    assert captured == [fingerprint, fingerprint, None]
+    # The settle gate reads the tick-masked sampler when one is given; stall telemetry keeps the raw one.
+    assert finish_samplers == [fingerprint, settle, None]
 
 
 @pytest.mark.asyncio

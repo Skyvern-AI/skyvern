@@ -24593,6 +24593,105 @@ async def test_acting_on_a_new_mark_does_not_read_as_a_page_change() -> None:
         assert await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS) == after
 
 
+_TICK = "t.textContent = String(Number(t.textContent) - 1)"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "html,mutations,settled",
+    [
+        # A countdown is a ticker once it has been seen rewriting itself twice.
+        ("<p>Session expires in <span id=t>3600</span> s</p>", [_TICK, _TICK, _TICK], True),
+        # The settle check's 0.7s pair often falls between two ticks; a still sample must not demote the ticker.
+        ("<p>Session expires in <span id=t>3600</span> s</p>", [_TICK, _TICK, ""], True),
+        # A carousel cycles through texts it has shown before.
+        (
+            "<h2 id=t>First story</h2>",
+            ["t.textContent = 'Second story'", "t.textContent = 'First story'", "t.textContent = 'Second story'"],
+            True,
+        ),
+        # A ticker's change to a text it has never shown (a progress counter ending in a word) still blocks.
+        (
+            "<p id=t>Loading 12%</p>",
+            [
+                "t.textContent = 'Loading 47%'",
+                "t.textContent = 'Loading 63%'",
+                "t.textContent = 'Loading 81%'",
+                "t.textContent = 'Saved'",
+            ],
+            False,
+        ),
+        # A tracked ticker cleared to empty inside the pair still blocks.
+        ("<p>Session expires in <span id=t>3600</span> s</p>", [_TICK, _TICK, _TICK, "t.textContent = ''"], False),
+        # Two rewrites make a ticker, not one: a value that changed before both samples of the pair still blocks.
+        ("<p id=t>0.00</p>", ["t.textContent = '0.50'", "t.textContent = '1.25'"], False),
+        # A value that loads once never becomes a ticker, so a load during the wait still blocks.
+        ("<p>Balance <span id=t>0.00</span></p>", ["", "", "t.textContent = '1,234.56'"], False),
+        # A status line moves only when acted on, with still samples between, so its third change still blocks.
+        (
+            "<p id=t>Step 1 of 3</p>",
+            ["t.textContent = 'Step 2 of 3'", "", "t.textContent = 'Step 3 of 3'", "", "t.textContent = 'Submitted'"],
+            False,
+        ),
+        # A status line that toggled in a burst is a ticker only briefly: two still samples demote it.
+        (
+            "<p id=t>Ready</p>",
+            [
+                "t.textContent = 'Busy'",
+                "t.textContent = 'Done'",
+                "t.textContent = 'Busy'",
+                "t.textContent = 'Done'",
+                "",
+                "",
+                "t.textContent = 'Busy'",
+            ],
+            False,
+        ),
+        (
+            "<p id=t>Writing</p>",
+            [
+                "t.textContent = 'Writing the▍'",
+                "t.textContent = 'Writing the answer▍'",
+                "t.textContent = 'Writing the answer now▍'",
+                "t.textContent = 'Writing the answer now done▍'",
+            ],
+            False,
+        ),
+        # Text streaming into a node appends; it is never a ticker.
+        ("<p id=t>The</p>", ["t.textContent += ' answer'", "t.textContent += ' is'", "t.textContent += ' 42'"], False),
+        (
+            "<p><span id=t>3600</span><ul id=l></ul></p>",
+            [_TICK, _TICK, _TICK + "; l.append(document.createElement('li'))"],
+            False,
+        ),
+        (
+            "<p><span id=t>3600</span><b id=b style='width: 1px'>x</b></p>",
+            [_TICK, _TICK, _TICK + "; b.style.width = '9px'"],
+            False,
+        ),
+    ],
+)
+async def test_the_settle_fingerprint_ignores_tickers_but_not_rendering(
+    html: str, mutations: list[str], settled: bool
+) -> None:
+    from skyvern.forge.agent import _PAGE_FINGERPRINT_PROBE_JS
+
+    async with _content_page(html) as page:
+        samples = [await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, True)]
+        raw_before = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, False)
+        for mutate in mutations:
+            await page.evaluate(
+                "() => { const t = document.getElementById('t'), l = document.getElementById('l');"
+                f" const b = document.getElementById('b'); {mutate}; }}"
+            )
+            samples.append(await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, True))
+        raw_after = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, False)
+    # The settle check's own two samples are the last two; earlier ones are the run's history.
+    assert (samples[-2] == samples[-1]) is settled
+    assert raw_before != raw_after  # the unmasked fingerprint, which page-change telemetry reads, still moves
+
+
 # A payload URL long enough to hit observe's per-field display caps (label 140, value 100,
 # placeholder 60). Masking is by provenance over the WHOLE URL, so a cap applied before the masker
 # runs leaves a truncated URL the masker cannot recognise -- and the signing tail with it.

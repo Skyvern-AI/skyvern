@@ -2869,7 +2869,8 @@ async def test_execute_task_v3_atomic_block_ceiling_pinned_to_its_own_cap(monkey
 class _AdvancingFormPage(_FakePage):
     """Every action advances the form, so the next observe is fresh page-change evidence."""
 
-    async def evaluate(self, _js: str) -> str:
+    # Takes the probe's argument, as Playwright's evaluate does, so the real settle sampler reads this page.
+    async def evaluate(self, _js: str, _arg: Any = None) -> str:
         raw = await super().evaluate(_js)
         if "document.readyState" in _js:
             return raw
@@ -5073,6 +5074,37 @@ async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch
 
     assert first == "main-hash:100:10\nframe-rendering"
     assert second != first
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_settle_fingerprint_masks_ticks_and_page_fingerprint_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    main_frame = object()
+    child = MagicMock()
+    child.parent_frame = main_frame
+    child.is_detached = MagicMock(return_value=False)
+    host = MagicMock()
+    host.is_visible = AsyncMock(return_value=True)
+    host.dispose = AsyncMock()
+    child.frame_element = AsyncMock(return_value=host)
+    child.evaluate = AsyncMock(side_effect=lambda _js, mask=None: "frame-masked" if mask else "frame-raw")
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.main_frame = main_frame
+    pinned.frames = [main_frame, child]
+    pinned.evaluate = AsyncMock(side_effect=lambda _js, mask=None: "masked" if mask else "raw")
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        working_page=pinned,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert await loop_mock.await_args.kwargs["settle_fingerprint"]() == "masked\nframe-masked"
+    assert await loop_mock.await_args.kwargs["page_fingerprint"]() == "raw\nframe-raw"
 
 
 @pytest.mark.asyncio
