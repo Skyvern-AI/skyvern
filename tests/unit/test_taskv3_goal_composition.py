@@ -20,10 +20,12 @@ from skyvern.forge.taskv3.goal_composition import (
     MAX_HANDOFF_LABEL_CHARS,
     PAGE_DATA_NOTE,
     CodeProgressRecord,
+    CodeTypedValue,
     GoalDirectives,
     compose_goal,
     present_page_derived,
     render_block_context,
+    typed_value_rows,
 )
 from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff
 from tests.unit._taskv3_block_fakes import PLAIN_URL
@@ -337,6 +339,22 @@ def test_the_page_data_note_sits_between_the_criteria_and_the_framing_only_when_
 
     assert goal.index("the form is sent") < goal.index(PAGE_DATA_NOTE) < goal.index("FRAMING")
     assert PAGE_DATA_NOTE not in compose_goal("Apply", GoalDirectives(framing="FRAMING"))
+
+
+def test_an_oversized_typed_value_is_withheld_without_hiding_the_rows_after_it() -> None:
+    values = (
+        CodeTypedValue(line=1, target="#notes", value=" ".join(f"word{n}" for n in range(5000))),
+        CodeTypedValue(line=2, target="#name", value="Ada"),
+        CodeTypedValue(line=3, target="#email", value="ada@example.test"),
+    )
+
+    rows = typed_value_rows(values, token_budget=500)
+
+    assert rows == [
+        '- Line 2 types "Ada" into "#name"',
+        '- Line 3 types "ada@example.test" into "#email"',
+        "- 1 more typed values not listed",
+    ]
 
 
 def test_the_code_outline_is_one_labelled_section_after_everything_else_and_only_when_given() -> None:

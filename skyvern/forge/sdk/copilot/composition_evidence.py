@@ -2026,55 +2026,61 @@ def _clickable_controls_html(
     controls: list[dict[str, Any]] = []
     seen_selectors = set(used_selectors)
     seen_text: set[str] = set()
+    seen_textless_selectors: set[str] = set()
 
     def factual_entry(node: Any, entry: dict[str, Any]) -> dict[str, Any]:
         return _attach_node_evidence(entry, _element_address_evidence(node))
+
+    def collect(node: Any) -> None:
+        tag_name = str(node.name or "").lower()
+        if tag_name in {"script", "style", "noscript"}:
+            return
+        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
+            return
+        text = _schema_text(_clickable_control_text(node), 120)
+        selector = _clickable_control_selector(node)
+        state = {
+            **({"disabled": True} if _control_disabled(node) else {}),
+            **_html_disclosure_facts(node, controlled_region_visibility),
+        }
+        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
+            controls.append(
+                factual_entry(node, {"text": text, "selector": _bounded_selector(selector), "tag": tag_name, **state})
+            )
+            seen_selectors.add(selector)
+            if text:
+                seen_text.add(text)
+            return
+        if not text:
+            if not selector or selector in seen_textless_selectors:
+                return
+            controls.append(factual_entry(node, {"text": "", "tag": tag_name, **state}))
+            seen_textless_selectors.add(selector)
+            return
+        if text in seen_text:
+            return
+        controls.append(factual_entry(node, {"text": text, "tag": tag_name, **state}))
+        seen_text.add(text)
 
     try:
         candidates = soup.select('button, [role="button"], [data-action]')
     except Exception:
         candidates = soup.find_all("button")
+    role_matched = {id(node) for node in candidates}
     for node in candidates:
         if len(controls) >= _MAX_CLICKABLE_CONTROLS:
             break
-        tag_name = str(node.name or "").lower()
-        if tag_name in {"script", "style", "noscript"}:
+        collect(node)
+    try:
+        focusable = soup.select('[tabindex]:not([tabindex^="-"])')
+    except Exception:
+        focusable = []
+    for node in focusable:
+        if len(controls) >= _MAX_CLICKABLE_CONTROLS:
+            break
+        if id(node) in role_matched or _schema_text(_clickable_control_text(node), 120):
             continue
-        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
-            continue
-        text = _schema_text(_clickable_control_text(node), 120)
-        selector = _clickable_control_selector(node)
-        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
-            controls.append(
-                factual_entry(
-                    node,
-                    {
-                        "text": text,
-                        "selector": _bounded_selector(selector),
-                        "tag": tag_name,
-                        **({"disabled": True} if _control_disabled(node) else {}),
-                        **_html_disclosure_facts(node, controlled_region_visibility),
-                    },
-                )
-            )
-            seen_selectors.add(selector)
-            if text:
-                seen_text.add(text)
-            continue
-        if not text or text in seen_text:
-            continue
-        controls.append(
-            factual_entry(
-                node,
-                {
-                    "text": text,
-                    "tag": tag_name,
-                    **({"disabled": True} if _control_disabled(node) else {}),
-                    **_html_disclosure_facts(node, controlled_region_visibility),
-                },
-            )
-        )
-        seen_text.add(text)
+        collect(node)
     return controls
 
 
@@ -3967,8 +3973,9 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
             entry["disabled"] = True
         if isinstance(item.get("visible"), bool):
             entry["visible"] = item["visible"]
-        if entry.get("selector") or entry.get("text"):
-            controls.append(_attach_structured_disclosure_facts(_attach_node_evidence(entry, item), item))
+        entry = _attach_node_evidence(entry, item)
+        if entry.get("selector") or entry.get("text") or entry.get("selector_candidates"):
+            controls.append(_attach_structured_disclosure_facts(entry, item))
     return controls
 
 

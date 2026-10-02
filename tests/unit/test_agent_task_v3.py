@@ -67,7 +67,7 @@ from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
-from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE, CodeProgressRecord
+from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE, CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_GUARD,
@@ -82,7 +82,6 @@ from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
@@ -188,7 +187,6 @@ async def _run_execute_task_v3(
         # runs before any loop_raises, even when the loop goes on to raise).
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
-        loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
@@ -305,32 +303,6 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_buckets_the_type_coordinate_click_arm_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Bucketing by block (task_id) would give one workflow run several draws and inflate exposure.
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", False)
-    provider = AsyncMock(return_value="treatment")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_type_coordinate_click_reach",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id != task.task_id
-    assert loop_mock.type_coordinate_click_enabled_during_loop is True
-    assert loop_mock.context.run_arms[TYPE_COORDINATE_CLICK_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        TYPE_COORDINATE_CLICK_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
 
 
 @pytest.mark.asyncio
@@ -3241,8 +3213,13 @@ async def test_a_recovery_code_outline_reaches_the_model_goal_but_never_the_task
     monkeypatch: pytest.MonkeyPatch, customer_precedence: bool
 ) -> None:
     monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", customer_precedence)
+    typed = (CodeTypedValue(line=3, target="#account", value="ACCT-4417"),)
     record = CodeProgressRecord(
-        before=("open the portal",), failed_step="click the invoices tab", failed_line=2, after=("download",)
+        before=("open the portal",),
+        failed_step="click the invoices tab",
+        failed_line=2,
+        after=("download",),
+        typed_values=typed,
     )
 
     _step, task, loop_mock, _post = await _run_execute_task_v3(
@@ -3260,8 +3237,10 @@ async def test_a_recovery_code_outline_reaches_the_model_goal_but_never_the_task
     assert goal.startswith("(This goal contains a value of unverified origin") is customer_precedence
     assert goal.count("Code outline") == 1
     assert goal.endswith("- Later in the code: download")
+    assert loop_mock.await_args.kwargs["code_typed_values"] == typed
     assert task.navigation_goal == "Download the latest invoice"
     assert "Code outline" not in str(loop_mock.update_task_kwargs)
+    assert "ACCT-4417" not in str(loop_mock.update_task_kwargs)
 
 
 @pytest.mark.asyncio

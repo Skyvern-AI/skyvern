@@ -14,7 +14,7 @@ import urllib.parse
 import uuid
 from collections import deque
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
@@ -161,7 +161,7 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements_tracked,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
-from skyvern.utils.url_validators import validate_fetch_url
+from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds, validate_fetch_url
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -204,7 +204,12 @@ from skyvern.webeye.actions.responses import (
 from skyvern.webeye.browser_artifacts import ActionDownloadObservation, DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
-from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
+from skyvern.webeye.browser_factory import (
+    initialize_download_dir,
+    read_download_failure,
+    resolve_artifact_path,
+    was_download_cancelled_by_skyvern,
+)
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
@@ -399,6 +404,7 @@ DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
 # slow-but-real download has the whole grace to arrive on its own before we spend the single retry.
 # Clamped to the grace, so a short grace still fires the retry inside the existing wait.
 DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS = 15.0
+LARGE_DOWNLOAD_LOG_THRESHOLD_BYTES = 100 * 1024 * 1024
 # Synchronous FileDownloadBlock false-click start-signal detection window: how long to wait for a first local
 # download signal (a new .crdownload/final file) before giving up, so a legitimate non-download popup is not
 # held for the whole download budget. Widened by an operator-set popup grace (up to its 60s setting cap); the
@@ -470,6 +476,72 @@ class _ProviderPollPhase:
             materialized_file_delta=self._materialized_file_delta,
             elapsed_seconds=(time.monotonic() - self._started_at) if self._started_at is not None else 0.0,
         )
+
+
+class _DownloadProgressSampler:
+    def __init__(self, download_dir: Path, attempt_started_at: datetime | None, baseline_identities: set[str]) -> None:
+        self._download_dir = download_dir
+        self._attempt_started_at = attempt_started_at
+        self._baseline_identities = baseline_identities
+        self._partial_sizes: dict[str, int] = {}
+        self.first_observed_at: float | None = None
+        self.last_growth_at: float | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def last_observed_bytes(self) -> int | None:
+        return sum(self._partial_sizes.values()) if self._partial_sizes else None
+
+    def observe(self, files: list[str]) -> None:
+        observed_at = time.monotonic()
+        for file in files:
+            if (
+                not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+                or _normalize_download_identity(file) in self._baseline_identities
+                or urllib.parse.urlparse(file).scheme
+            ):
+                continue
+            try:
+                size = Path(file).stat().st_size
+            except OSError:
+                continue
+            previous_size = self._partial_sizes.get(file, 0)
+            self._partial_sizes[file] = size
+            if self.first_observed_at is None:
+                self.first_observed_at = observed_at
+            if size > previous_size:
+                self.last_growth_at = observed_at
+
+    def start_if_partial_seen(self, files: list[str]) -> None:
+        self.observe(files)
+        if self._partial_sizes and self._task is None:
+            self._task = asyncio.create_task(self._sample())
+
+    async def _sample(self) -> None:
+        while True:
+            files = list_files_in_directory(self._download_dir, attempt_started_at=self._attempt_started_at)
+            self.observe(files)
+            await asyncio.sleep(DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS)
+
+    async def aclose(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+
+def _abort_evidence(download: Download, sampler: _DownloadProgressSampler, now_monotonic: float) -> dict[str, object]:
+    return {
+        "last_observed_bytes": sampler.last_observed_bytes,
+        "seconds_since_last_growth": now_monotonic - sampler.last_growth_at
+        if sampler.last_growth_at is not None
+        else None,
+        "transfer_elapsed_s": now_monotonic - sampler.first_observed_at
+        if sampler.first_observed_at is not None
+        else None,
+        "url_origin": redacted_url_origin(download.url),
+        "signed_url_ttl_remaining_s": signed_url_ttl_remaining_seconds(download.url, datetime.now(UTC)),
+        "cancel_origin": "skyvern_timeout" if was_download_cancelled_by_skyvern(download) else "unknown",
+    }
 
 
 async def _provider_poll_and_measure(
@@ -5289,6 +5361,7 @@ class ActionHandler:
             for file in await _list_download_signal_files(capture_session_into=session_download_baseline)
         }
         list_files_before = list(signal_file_identities_before)
+        sampler = _DownloadProgressSampler(download_dir, attempt_started_at, signal_file_identities_before)
         LOG.info(
             "Number of files in download directory before action",
             num_downloaded_files_before=len(list_files_before),
@@ -5541,6 +5614,7 @@ class ActionHandler:
                                     break
 
                             list_files_after = await _list_download_signal_files()
+                            sampler.start_if_partial_seen(list_files_after)
                             local_signal_delta = {
                                 _download_signal_identity(file) for file in list_files_after
                             } - signal_file_identities_before
@@ -5870,10 +5944,29 @@ class ActionHandler:
                     )
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
+                successful_download_bytes = 0
+                for filename in downloaded_file_names:
+                    try:
+                        successful_download_bytes += (download_dir / filename).stat().st_size
+                    except OSError:
+                        pass
+                if successful_download_bytes >= LARGE_DOWNLOAD_LOG_THRESHOLD_BYTES:
+                    transfer_started_at = (
+                        sampler.first_observed_at or download_event_captured_at or download_wait_started_at
+                    )
+                    LOG.info(
+                        "Large browser download completed",
+                        bytes_downloaded=successful_download_bytes,
+                        transfer_elapsed_s=time.monotonic() - transfer_started_at,
+                        url_origin=(
+                            redacted_url_origin(captured_download.url) if captured_download is not None else "unknown"
+                        ),
+                    )
             elif (
                 captured_download is not None
                 and (aborted_reason := await read_download_failure(captured_download)) is not None
             ):
+                evidence = _abort_evidence(captured_download, sampler, time.monotonic())
                 # The partial file appearing is what credited download_triggered, and the browser
                 # deletes it on abort, so the settle above reads an aborted transfer as a completed
                 # one. Without this the action reports success with no file and the agent retries
@@ -5883,6 +5976,7 @@ class ActionHandler:
                     workflow_run_id=task.workflow_run_id,
                     download_dir=download_dir,
                     failure=aborted_reason,
+                    **evidence,
                 )
                 results[-1] = ActionFailure(
                     Exception(f"{DOWNLOAD_ABORTED_FAILURE_MESSAGE} (browser reported: {aborted_reason})"),
@@ -5917,6 +6011,7 @@ class ActionHandler:
             # Close the provider polling phase exactly once if it ever started; a no-op otherwise.
             with contained_effect("provider download polling lifecycle exit"):
                 provider_poll_phase.finish()
+            await sampler.aclose()
             await _close_eager_capture_then_teardown_retention(
                 eager_blob_capture,
                 page,
@@ -6199,7 +6294,10 @@ class ActionHandler:
             )
             actions_result.append(ActionFailure(e))
         except Exception as e:
-            LOG.exception("Unhandled exception in action handler", action=action)
+            if is_driver_timeout_error(e):
+                LOG.warning("Browser timeout while handling action", action=action, exc_info=True)
+            else:
+                LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
         finally:
             tool_result_content = ""

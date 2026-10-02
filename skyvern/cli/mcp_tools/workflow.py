@@ -1630,7 +1630,15 @@ async def skyvern_workflow_run_list(
     page: Annotated[int, Field(description="Page number (1-based)", ge=1)] = 1,
     page_size: Annotated[int, Field(description="Results per page", ge=1, le=100)] = 10,
     status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
-    search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
+    search_key: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Search workflow run IDs, parameters, headers and webhook callback URLs; a complete "
+                "browser profile, browser session or credential ID matches the runs that used it"
+            )
+        ),
+    ] = None,
     error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
     include_child_runs: Annotated[
         bool,

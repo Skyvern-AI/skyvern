@@ -16,6 +16,9 @@ from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.debug_sessions import (
+    PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+    PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    PREWARM_PENDING_RUNNABLE_TYPE,
     DebugLoginBlockCompatibility,
     DebugSession,
     DebugSessionPrewarmRequest,
@@ -34,9 +37,6 @@ from skyvern.forge.sdk.workflow.service import (
 from skyvern.schemas.proxy_location import runtime_proxy_location
 
 LOG = structlog.get_logger()
-PREWARM_BOUND_WORKFLOW_PERMANENT_ID = "debug-session-prewarm"
-PREWARM_PENDING_RUNNABLE_TYPE = "debug_session_prewarm_pending"
-PREWARM_DISPATCHED_RUNNABLE_TYPE = "debug_session_prewarm_dispatched"
 BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM"
 
 

@@ -43,6 +43,7 @@ const baseData: CodeBlockNodeData = {
   dataSchema: "null",
   userOwnedGoal: null,
   goalNeedsRegeneration: null,
+  codeEditedByHand: null,
   model: null,
 };
 
@@ -646,6 +647,29 @@ describe("CodeBlockEditor for a code-first block", () => {
     });
   });
 
+  test("a Goal typed after a hand code edit offers Keep my code, which keeps both", () => {
+    node.data = { ...pendingGoalData, codeEditedByHand: true };
+    renderEditor();
+
+    expect(screen.getByTestId("goal-change-banner").textContent).toContain(
+      "The code was also edited by hand",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Keep my code" }));
+
+    expect(updateNodeData).toHaveBeenLastCalledWith("cb1", {
+      goalNeedsRegeneration: false,
+      codeEditedByHand: false,
+      goalBeforeEdit: null,
+    });
+  });
+
+  test("a pending change without a hand code edit offers no Keep my code", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+
+    expect(screen.queryByRole("button", { name: "Keep my code" })).toBeNull();
+  });
+
   test("a pending change with no record of the old goal offers Apply but no Undo", () => {
     node.data = { ...pendingGoalData, goalBeforeEdit: undefined };
     renderEditor();
@@ -756,15 +780,29 @@ describe("CodeBlockEditor for a code-first block", () => {
 
     expect(updateNodeData).toHaveBeenCalledWith("cb1", {
       code: "await page.goto(url)",
+      codeEditedByHand: true,
       goalNeedsRegeneration: false,
       goalBeforeEdit: null,
     });
   });
 
-  test("editing the code of a block with no pending change writes only the code", () => {
+  test("a hand edit to the code of a block with a Goal records that the code changed", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor();
     switchToCode();
+
+    fireEvent.change(screen.getByTestId("code-editor"), {
+      target: { value: "await page.goto(url)" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      code: "await page.goto(url)",
+      codeEditedByHand: true,
+    });
+  });
+
+  test("a hand edit to the code of a block without a Goal writes only the code", () => {
+    renderEditor();
 
     fireEvent.change(screen.getByTestId("code-editor"), {
       target: { value: "await page.goto(url)" },
@@ -800,6 +838,130 @@ describe("CodeBlockEditor for a code-first block", () => {
 
     expect(screen.getByText("Code Input")).toBeTruthy();
     expect(screen.queryByText(/Steps \(/)).toBeNull();
+  });
+});
+
+describe("CodeBlockEditor after a hand code edit", () => {
+  const codeEditedData = {
+    ...baseData,
+    ...codeFirstData,
+    code: "return {'total': 1, 'currency': 'USD'}",
+    codeEditedByHand: true,
+  };
+  const actions = {
+    updateGoal: vi.fn(),
+    keepGoal: vi.fn(),
+    acceptGoal: vi.fn(),
+  };
+
+  beforeEach(() => {
+    node.data = { ...codeEditedData };
+    actions.updateGoal.mockClear();
+    actions.keepGoal.mockClear();
+    actions.acceptGoal.mockClear();
+    useCopilotActionStore.setState(actions);
+  });
+
+  test("in the code view the banner sits below the code so typing does not shift the editor", () => {
+    renderEditor();
+    switchToCode();
+
+    expect(
+      screen
+        .getByTestId("code-editor")
+        .compareDocumentPosition(screen.getByTestId("goal-change-banner")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  test("the banner says the Goal may be out of date and offers Update Goal and Keep Goal", () => {
+    renderEditor();
+
+    expect(screen.getByTestId("goal-change-banner").textContent).toContain(
+      "Code changed — Goal may be out of date",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update Goal" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep Goal" }));
+
+    expect(actions.updateGoal).toHaveBeenCalledWith("code_block");
+    expect(actions.keepGoal).toHaveBeenCalledWith("code_block");
+    expect(updateNodeData).not.toHaveBeenCalled();
+  });
+
+  test("a suggestion for the current code and Goal is shown for acceptance", () => {
+    useCopilotActionStore.setState({
+      goalSuggestions: {
+        code_block: {
+          forCode: codeEditedData.code,
+          forGoal: "Open {{ url }}",
+          goal: "The order page shows its total and currency.",
+        },
+      },
+    });
+    renderEditor();
+
+    expect(
+      screen.getByText("The order page shows its total and currency."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+
+    expect(actions.acceptGoal).toHaveBeenCalledWith("code_block");
+  });
+
+  test.each([
+    ["the code changed after it was requested", { forCode: "print(2)" }],
+    ["the Goal changed after it was requested", { forGoal: "Open the page" }],
+  ])("a suggestion is not offered when %s", (_, stale) => {
+    useCopilotActionStore.setState({
+      goalSuggestions: {
+        code_block: {
+          forCode: codeEditedData.code,
+          forGoal: "Open {{ url }}",
+          goal: "The order page shows its total and currency.",
+          ...stale,
+        },
+      },
+    });
+    renderEditor();
+
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Update Goal" })).toBeTruthy();
+  });
+
+  test.each([
+    ["generating", { generatingBlockLabel: "code_block" }],
+    [
+      "queued",
+      {
+        generatingBlockLabel: "other",
+        queuedBuilds: [{ blockLabel: "code_block", prompt: "Open {{ url }}" }],
+      },
+    ],
+  ])(
+    "Update Goal and Keep Goal are disabled while the block is %s",
+    (_, state) => {
+      useCopilotActionStore.setState(state);
+      renderEditor();
+
+      for (const name of ["Update Goal", "Keep Goal"]) {
+        expect(
+          (screen.getByRole("button", { name }) as HTMLButtonElement).disabled,
+        ).toBe(true);
+      }
+    },
+  );
+
+  test("a pending Goal change shows its own banner instead", () => {
+    node.data = {
+      ...codeEditedData,
+      userOwnedGoal: true,
+      goalNeedsRegeneration: true,
+    };
+    renderEditor();
+
+    expect(screen.getByTestId("goal-change-banner").textContent).toContain(
+      "Goal changed — not applied yet",
+    );
   });
 });
 
@@ -1024,6 +1186,7 @@ describe("code block goal ownership serialization", () => {
             ...baseData,
             userOwnedGoal: true,
             goalNeedsRegeneration: true,
+            codeEditedByHand: true,
           },
         },
       ],
@@ -1033,6 +1196,7 @@ describe("code block goal ownership serialization", () => {
     expect(saved).toMatchObject({
       user_owned_goal: true,
       goal_needs_regeneration: true,
+      code_edited_by_hand: true,
     });
   });
 });

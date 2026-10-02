@@ -538,11 +538,6 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
-    # When type's click is refused only by the viewport check (a sub-pixel input under its own display
-    # layer), press the mouse at the field's centre before focusing, then Tab and read the value back
-    # (SKY-16501). Force-on term only: runs are randomized per run by the flag of the same name, read
-    # through run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, ...). Off: the field is reached by focus() alone.
-    TASK_V3_TYPE_COORDINATE_CLICK: bool = False
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).

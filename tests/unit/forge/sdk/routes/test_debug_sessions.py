@@ -22,6 +22,7 @@ async def test_prewarm_debug_session_dispatches_an_unattached_live_browser() -> 
     app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
     app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched = AsyncMock(return_value=True)
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=browser_session)
 
     with patch.object(debug_sessions_mod, "app", app_mock):
@@ -33,6 +34,7 @@ async def test_prewarm_debug_session_dispatches_an_unattached_live_browser() -> 
 
     assert result.status_code == 202
     assert result.body == b""
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access.assert_not_awaited()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_awaited_once_with(
         organization_id="org_123",
         timeout_minutes=debug_sessions_mod.settings.DEBUG_SESSION_TIMEOUT_MINUTES,
@@ -513,6 +515,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
     app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=True)
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
 
     with (
         patch.object(debug_sessions_mod, "app", app_mock),
@@ -525,6 +528,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         )
 
     assert result is created_debug_session
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access.assert_not_awaited()
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session.assert_not_awaited()
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_awaited_once_with(

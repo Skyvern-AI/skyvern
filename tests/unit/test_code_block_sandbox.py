@@ -29,6 +29,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import skyvern.forge.sdk.copilot.code_block_security as code_block_security
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
@@ -4427,8 +4428,8 @@ class TestInertSlotRenderIsTheSpliceReference:
                 id="authored-alias-consumed-by-value",
             ),
             pytest.param(
-                "__skyvern_slot__ = page.context\nresult = await {{ alias }}.cookies()\n",
-                {"alias": "__skyvern_slot__"},
+                "__skyvern_slot__0 = page.context\nresult = await {{ alias }}.cookies()\n",
+                {"alias": "__skyvern_slot__0"},
                 True,
                 id="value-equal-to-the-inert-marker",
             ),
@@ -4461,6 +4462,36 @@ class TestInertSlotRenderIsTheSpliceReference:
         errors = rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code)
         assert bool(errors) is expect_refused, (authored, block.code)
 
+    @pytest.mark.parametrize(
+        ("template", "values", "named_expression", "names_json"),
+        [
+            pytest.param(
+                "data = json.loads({{ sheet | tojson }})\n",
+                {"sheet": {"rows": None, "cells": [{"bold": True}]}},
+                "{{ sheet | tojson }}",
+                True,
+                id="tojson-output-pasted-as-python",
+            ),
+            pytest.param(
+                "x = {{ a }}\ny = {{ b }}\n",
+                {"a": 1, "b": _EXFIL},
+                "{{ b }}",
+                False,
+                id="second-slot-carries-code",
+            ),
+        ],
+    )
+    def test_refusal_names_the_slot_that_carried_code(
+        self, template: str, values: dict[str, object], named_expression: str, names_json: bool
+    ) -> None:
+        block = self._block(template)
+
+        authored = block.render_code_with_reference(FakeWorkflowRunContext(values=values))
+
+        [error] = rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code)
+        assert f"`{named_expression}`" in error
+        assert ("rendered JSON" in error) is names_json
+
     def test_reference_render_does_not_consume_what_the_real_render_consumed(self) -> None:
         block = self._block("{% set item = items.pop() %}result = {{ item }}\n")
         context = FakeWorkflowRunContext(values={"items": [7]})
@@ -4481,7 +4512,7 @@ class TestInertSlotRenderIsTheSpliceReference:
             block.format_potential_template_parameters(FakeWorkflowRunContext(values={}))
 
     def test_slot_form_the_rewrite_misses_is_rejected_by_the_parse(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(block_module, "_JINJA_PRINT_SLOT_RE", re.compile(r"(?!x)(x)(y)"))
+        monkeypatch.setattr(code_block_security, "_PRINT_SLOT_RE", re.compile(r"(?!x)(x)(y)"))
         block = self._block("result = {% print exfil %}\n")
 
         assert block.render_code_with_inert_slots(block.code, FakeWorkflowRunContext(values={"exfil": "1"})) is None

@@ -1123,6 +1123,141 @@ async def test_navigate_reports_a_ready_document_whose_load_never_fired_in_budge
 
 
 @pytest.mark.asyncio
+async def test_navigate_reports_a_ready_document_whose_readystate_read_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-16647, from staging: the page this whole design targets is ad-heavy, so its main thread is
+    # exactly the thread the readyState evaluate has to run on — and on six of six staging runs that
+    # evaluate could not complete inside its reserve. The domcontentloaded wait had already RETURNED,
+    # so the document was ready and the tool knew it; deriving the class from the read instead threw
+    # that away and told the model the state was unknown, stopping the rest of its batch.
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    page, tools = _readiness_tools(monkeypatch, "interactive")
+    page_evaluate = page.evaluate
+
+    async def _load_starves(state: str = "load", timeout: float | None = None) -> None:
+        page.calls.append(("wait_for_load_state", {"state": state, "timeout": timeout}))
+        if state == "load":
+            await asyncio.sleep((timeout or 0) / 1000)
+            raise _PlaywrightTimeout(f"Timeout {timeout}ms exceeded")
+
+    async def _busy_main_thread(js: str) -> Any:
+        if "document.readyState" in js:
+            await asyncio.Event().wait()
+        return await page_evaluate(js)
+
+    page.wait_for_load_state = _load_starves  # type: ignore[assignment]
+    page.evaluate = _busy_main_thread  # type: ignore[assignment]
+    r = await asyncio.wait_for(
+        _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"}), timeout=15
+    )
+    assert r.status == "ok", r.content
+    # The wait is what witnessed the level, and a read that cannot answer does not take it back.
+    assert r.ok_class == "document_ready"
+    assert [wait["state"] for wait in _load_state_waits(page)] == ["domcontentloaded", "load"]
+    assert "the document is ready" in r.content and "could not be read" not in r.content
+    assert "act on what has rendered, or wait for the rest" in r.content
+    # The model may act on what parsed, so the rest of its batch still runs.
+    assert (r.data or {}).get("readiness_incomplete") is None
+    # The read still failed, and the index still counts that — it just no longer decides the class.
+    assert (r.data or {}).get("readiness_read_failed") is True
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_the_document_that_is_there_over_a_stale_wait_witness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A wait's witness belongs to the document it was witnessed ON, and that document can be gone by the
+    # time this returns: A commits, fires domcontentloaded, then replaces itself client-side (meta
+    # refresh, location.replace, a consent or bot interstitial, an auth hop, a framework bootstrap). B
+    # commits, the frame's fired-lifecycle set is cleared, the load wait re-arms on B and times out, and
+    # the readyState read answers for B: "loading". readyState is monotonic within one document, so a
+    # reading BELOW the witness can only mean the witnessed document was replaced — the report has to
+    # follow the read. RED with a rank guard that lets the read only RAISE the witness: the stale
+    # `domcontentloaded` stands, the tool reports `document_ready` with no `readiness_incomplete`, and
+    # the batch queued behind this navigate runs against a document that is still parsing.
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    page, tools = _readiness_tools(monkeypatch, "interactive")
+
+    async def _swaps_document_after_domcontentloaded(state: str = "load", timeout: float | None = None) -> None:
+        page.calls.append(("wait_for_load_state", {"state": state, "timeout": timeout}))
+        if state == "domcontentloaded":
+            return
+        page.ready_state = "loading"
+        raise _PlaywrightTimeout(f"Timeout {timeout}ms exceeded")
+
+    page.wait_for_load_state = _swaps_document_after_domcontentloaded  # type: ignore[assignment]
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert r.status == "ok", r.content
+    assert r.ok_class == "committed_not_loaded"
+    assert "the document was not ready" in r.content
+    # The batch stops here: the rest of it was queued against a document that is no longer the one the
+    # wait witnessed, and the model has to read that before it acts again.
+    assert (r.data or {}).get("readiness_incomplete") is True
+    # The read ANSWERED, so this class's two facts stay told apart and a probe-failure rate over it is
+    # not inflated by a swap.
+    assert (r.data or {}).get("readiness_read_failed") is False
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_a_replacement_document_the_load_wait_already_witnessed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The same staleness one level up, and the quieter half of it: A fires load too, so the witness is
+    # `load` and the report carries no settling note at all — then A replaces itself and the read answers
+    # "interactive" for B. The model is told the page is still fetching instead of being handed a
+    # finished one. RED with a rank guard: `loaded`, and a bare "navigated to ..." line.
+    page, tools = _readiness_tools(monkeypatch, "complete")
+
+    async def _swaps_document_after_load(state: str = "load", timeout: float | None = None) -> None:
+        page.calls.append(("wait_for_load_state", {"state": state, "timeout": timeout}))
+        if state == "load":
+            page.ready_state = "interactive"
+
+    page.wait_for_load_state = _swaps_document_after_load  # type: ignore[assignment]
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+    assert r.status == "ok", r.content
+    assert r.ok_class == "document_ready"
+    assert "the document is ready" in r.content and "still loading its scripts and resources" in r.content
+    # A ready document is still one the model may act on, so the batch behind it runs.
+    assert (r.data or {}).get("readiness_incomplete") is None
+
+
+@pytest.mark.asyncio
+async def test_navigate_does_not_read_an_advisory_waits_timeout_as_the_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The raw-CDP engine's wait_for_load_state returns NORMALLY when the level was never reached,
+    # having spent the whole deadline first. Taking a return as evidence regardless would report every
+    # navigation on that engine as further along than the page got — here, a document still parsing as
+    # `document_ready`, with the batch behind it left to run against it.
+    # The readyState read never answers here, so the class rests on the waits alone: this is the arm
+    # where the deadline guard is the only thing between an advisory timeout and a false witness.
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    page, tools = _readiness_tools(monkeypatch, "loading")
+    page_evaluate = page.evaluate
+
+    async def _advisory(state: str = "load", timeout: float | None = None) -> None:
+        page.calls.append(("wait_for_load_state", {"state": state, "timeout": timeout}))
+        await asyncio.sleep((timeout or 0) / 1000)
+
+    async def _busy_main_thread(js: str) -> Any:
+        if "document.readyState" in js:
+            await asyncio.Event().wait()
+        return await page_evaluate(js)
+
+    page.wait_for_load_state = _advisory  # type: ignore[assignment]
+    page.evaluate = _busy_main_thread  # type: ignore[assignment]
+    r = await asyncio.wait_for(
+        _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"}), timeout=15
+    )
+    assert r.status == "ok", r.content
+    assert r.ok_class == "committed_not_loaded"
+    assert (r.data or {}).get("readiness_incomplete") is True
+    assert (r.data or {}).get("readiness_read_failed") is True
+
+
+@pytest.mark.asyncio
 async def test_navigate_reports_a_document_that_never_became_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     # A parser-blocking entry bundle starves domcontentloaded too: the response committed and nothing
     # else happened inside the budget. Still a page STATE the model can act on — observe or wait — not
@@ -2261,6 +2396,10 @@ class _TypeaheadFakePage:
             if self._suggestion is None:
                 return None
             return {"count": 1, "options": [{"n": 1, "text": self._suggestion.get("text")}], "declared": True}
+        # The expand-row (category) finder: this fake has no category rows. Routed ahead of the gate below,
+        # whose marker the finder's visible-text helper also contains.
+        if "const cats = [];" in js:
+            return None
         # The typeable-vs-open-list gate the shared commit path runs before typing. This fake models a
         # real typeahead <input>, so it is typeable unless its field type is one an <input> cannot type
         # into — mirroring _ANCHOR_TYPEABLE_JS's NONTEXT set.
@@ -12400,7 +12539,7 @@ async def test_a_control_whose_name_a_later_marking_rewrote_is_not_listed_under_
         r = await _tool(tools, "observe").handler({})
         assert "'Pay now'" not in r.content, r.content
         again = await _tool(tools, "observe").handler({})
-        assert re.search(r"^ref=\d+ button/button 'Delete account'$", again.content, re.M), again.content
+        assert re.search(r"^ref=\d+ button/button 'Delete account' shows='Go'$", again.content, re.M), again.content
 
 
 @_skip_no_browser
@@ -12676,14 +12815,12 @@ _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
 @pytest.mark.parametrize(
     "template", [_SEGMENTED_DATE_HTML, _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML], ids=["unclickable", "skinned-subpixel"]
 )
-@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
 async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_land(
-    misroute: str, text: str, template: str, coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
+    misroute: str, text: str, template: str
 ) -> None:
-    # Reaching the field by focus() alone, or by a press no hit test checked, proves nothing about the
-    # keystrokes. A success here would turn today's loud failure into a date that reads as filled and is not.
+    # Reaching the field by focus() alone proves nothing about the keystrokes. A success here would turn
+    # today's loud failure into a date that reads as filled and is not.
     # A raised error is the loud outcome too: the tool wrapper turns it into a tool error.
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
     html = template + f"<script>{misroute}</script>"
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -12693,9 +12830,9 @@ async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_
             assert "outside of the viewport" in str(exc), exc
         else:
             assert r.status == "error", r.content
-            if coordinate_click and text != text.strip() and template is _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML:
-                # Only the on-screen sub-pixel field is pressed. That path Tabs out, so the widget has
-                # committed its trimmed value: it is reported and left in place, not taken back.
+            if text != text.strip():
+                # The focus path Tabs out, so the widget has committed its trimmed value: it is reported
+                # and left in place, not taken back.
                 assert "holds '2023'" in r.content, r.content
                 assert await page.eval_on_selector("#year", "el => el.value") == "2023"
                 return
@@ -13795,13 +13932,11 @@ _ECHO_SCRIPT = (
         "skinned-subpixel-declared-slow-rows",
     ],
 )
-@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
 async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as_filled(
-    template: str, aria: str, delay_ms: int, echo: str, coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
+    template: str, aria: str, delay_ms: int, echo: str
 ) -> None:
     # A field that DECLARES a list is refused before it is focused, so the page must be untouched:
     # asserting only the verdict cannot tell that guard from a later one reaching the same answer.
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
     declares = bool(aria)
     async with _content_page(template.format(aria=aria, delay_ms=delay_ms, echo=echo)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -13879,35 +14014,79 @@ _SEGMENTED_DATE_TRUSTED_PRESS_HTML = """
 
 @_skip_no_browser
 @pytest.mark.asyncio
-@pytest.mark.parametrize("coordinate_click", [False, True], ids=["focus", "press"])
-async def test_type_fills_a_segment_that_takes_keys_only_after_a_trusted_press(
-    coordinate_click: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", coordinate_click)
+async def test_type_reports_a_segment_that_takes_keys_only_after_a_trusted_press_as_not_filled() -> None:
+    # No path presses the pointer, so the digits show in the display and the field stays empty: honestly refused.
     async with _content_page(_SEGMENTED_DATE_TRUSTED_PRESS_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
-        if not coordinate_click:
-            # focus() alone: the digits show in the display and the field stays empty, so it is refused.
-            assert r.status == "error", r.content
-            assert "NOT filled" in r.content, r.content
-            assert await page.eval_on_selector("#year", "el => el.value") == ""
-            return
+        assert r.status == "error", r.content
+        assert "NOT filled" in r.content, r.content
+        assert await page.eval_on_selector("#year", "el => el.value") == ""
+        assert await page.eval_on_selector("#month", "el => el.value") == ""
+
+
+# The same widget with its keys accepted on focus alone: the input fills, and the widget commits on blur.
+_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
+    "let armed = false;", "let armed = true;"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_tabs_out_of_a_focused_segment_so_the_widget_commits_it() -> None:
+    async with _content_page(_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
         assert r.status == "ok", r.content
-        assert await page.eval_on_selector("#year", "el => el.value") == "2023"
         assert await page.evaluate("() => window.__committedYear") == "2023"
         assert await page.eval_on_selector("#month", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reads_nothing_back_when_the_navigation_check_cannot_be_planted() -> None:
+    # The sentinel refuses to be set once the field holds focus, so whether the Tab navigated is unknown.
+    blocker = (
+        "<script>let v; Object.defineProperty(window, '__tv3_doc', {configurable: true, get() { return v; },"
+        " set(x) { if (document.activeElement && document.activeElement.id === 'year') throw new Error('no');"
+        " v = x; }});</script>"
+    )
+    async with _content_page(_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML + blocker) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "error", r.content
+        assert "could not be checked" in r.content, r.content
+
+
+# The year's first key also lands in the month, as the production section widget does when the month is
+# filled before the year.
+_SEGMENTED_DATE_FIRST_DIGIT_BLEED_HTML = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+    "year.value += e.key;",
+    'if (!year.value) { const m = document.getElementById("month"); m.value = e.key; } year.value += e.key;',
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_never_reports_a_clean_fill_when_a_sibling_segment_took_a_key() -> None:
+    async with _content_page(_SEGMENTED_DATE_FIRST_DIGIT_BLEED_HTML) as page:
+        await page.eval_on_selector("#month", "el => { el.value = '03'; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        assert "1 other field(s) in the same group changed" in r.content, r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "2"
 
 
 _COMMIT_ON_BLUR = 'year.addEventListener("blur", () => { window.__committedYear = year.value; });'
 
 
 def _segment_reformatting_on_blur(reformat: str) -> str:
-    html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
+    html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
         _COMMIT_ON_BLUR,
         'year.addEventListener("blur", () => { ' + reformat + " window.__committedYear = year.value; });",
     )
-    assert html != _SEGMENTED_DATE_TRUSTED_PRESS_HTML
+    assert html != _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML
     return html
 
 
@@ -13927,9 +14106,8 @@ def _segment_reformatting_on_blur(reformat: str) -> str:
     ids=["zero-pad", "century", "clamp", "unrelated", "trim"],
 )
 async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_text(
-    reformat: str, typed: str, held: str, monkeypatch: pytest.MonkeyPatch
+    reformat: str, typed: str, held: str
 ) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
     async with _content_page(_segment_reformatting_on_blur(reformat)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": typed})
@@ -13943,8 +14121,7 @@ async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_t
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("secret", ["typed-credential", "one-time-code-box"])
-async def test_type_does_not_echo_a_changed_value_it_may_not_show(secret: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
+async def test_type_does_not_echo_a_changed_value_it_may_not_show(secret: str) -> None:
     html = _segment_reformatting_on_blur('year.value = year.value + "9";')
     text = "4417"
     resolve = None
@@ -14071,13 +14248,13 @@ async def test_type_stops_when_the_forced_click_navigates_away() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_type_stops_when_leaving_the_focused_segment_navigates_away() -> None:
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
-    start_html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML.replace(
-        "if (e.isTrusted) armed = true;", 'if (e.isTrusted) location.href = "/elsewhere";'
+    start_html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+        _COMMIT_ON_BLUR, 'year.addEventListener("blur", () => { location.href = "/elsewhere"; });'
     )
+    assert start_html != _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         try:
@@ -14093,12 +14270,12 @@ async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: 
             await page.route("**/*", _serve)
             await page.goto("http://segment.test/start")
             tools = build_browser_tools(_fixed_page_provider(page))
-            try:
-                r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
-            except Exception as exc:
-                assert "outside of the viewport" in str(exc), exc
-            else:
-                assert r.status == "error", r.content
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            assert r.status == "error", r.content
+            assert "navigated, or could not be checked, when focus" in r.content, r.content
+            assert (r.data or {}).get("page_state_changed") is True, r.data
+            # Nothing may act on the destination: a list cleanup there would press Escape on a page nobody observed.
+            assert not (r.data or {}).get("release_own_list"), r.data
             assert page.url.endswith("/elsewhere"), page.url
             assert await page.eval_on_selector("#year", "el => el.value") == ""
         finally:
@@ -14109,16 +14286,12 @@ async def test_type_stops_when_the_coordinate_press_navigates_away(monkeypatch: 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("origin", ["same", "cross"])
 @pytest.mark.parametrize("placement", ["inside", "clipped"])
-async def test_type_presses_a_framed_segment_only_where_its_frame_shows_it(
-    origin: str, placement: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The press is a main-page mouse event, so it must land in frame-offset coordinates. A field the frame
-    # clips (fixed below the frame's 120px height) has its centre over the parent page, where a
-    # page-wide decoy would take the press instead.
+async def test_type_never_presses_the_parent_page_over_a_framed_segment(origin: str, placement: str) -> None:
+    # A field the frame clips (fixed below the frame's 120px height) has its centre over the parent page,
+    # where a page-wide decoy would take any pointer press. Focus reaches the field without one.
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", True)
-    frame_html = _SEGMENTED_DATE_TRUSTED_PRESS_HTML
+    frame_html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML
     decoy = ""
     if placement == "clipped":
         frame_html = frame_html.replace(
@@ -14149,14 +14322,10 @@ async def test_type_presses_a_framed_segment_only_where_its_frame_shows_it(
             await frame.wait_for_selector("#year", state="attached")
             tools = build_browser_tools(_fixed_page_provider(page))
             r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
-            if placement == "inside":
-                assert r.status == "ok", r.content
-                assert await frame.evaluate("() => window.__committedYear") == "2023"
-                return
             assert await page.evaluate("() => window.__decoyPressed") is None
-            assert r.status == "error", r.content
-            assert "could only be focused, not clicked" in r.content, r.content
-            assert await frame.eval_on_selector("#year", "el => el.value") == ""
+            # Pins today's base path: it types into a framed field even where the parent page covers it.
+            assert r.status == "ok", r.content
+            assert await frame.evaluate("() => window.__committedYear") == "2023"
         finally:
             await browser.close()
 
@@ -17624,6 +17793,129 @@ async def test_looks_bracketed_legend_number_is_not_an_address_the_selector_argu
         assert await page.evaluate("() => window.hits") == []
 
 
+_SHOWN_TEXT_PAGE = """
+<div>Group <select id="group"><option>All</option></select>
+  <button id="groupView" aria-label="Apply" style="background:#06c;color:#fff">View</button></div>
+<div>Month <select id="month"><option>May</option></select>
+  <button id="monthView" aria-label="Apply scopes" style="background:#06c;color:#fff">View</button></div>
+<div><button id="pay">Pay</button>
+  <button id="toolbarView" disabled style="background:#06c;color:#fff">View</button></div>
+<a id="docs" href="#docs" aria-label="Open the support center">Help</a>
+<button id="close" aria-label="Close dialog">close</button>
+<button id="preview" aria-label="Preview">View</button>
+<button id="gear" aria-label="Settings"><svg width="16" height="16"></svg></button>
+<div role="combobox" tabindex="0" aria-label="Notes" aria-expanded="false">typed note</div>
+<div role="button" tabindex="0" contenteditable="true" aria-label="Rename">typed name</div>
+<label for="next">Continue to payment</label><button id="next">Next</button>
+<span id="row3">Row 3</span><button id="del" aria-labelledby="row3 del">Delete</button>
+<span id="exportName">Export the report</span><button id="export" aria-labelledby="exportName">Download</button>
+<a href="#card" aria-label="Item 1">Blue widget, two-pack, ships in three days, free returns within a month</a>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_control_whose_name_differs_from_its_visible_text_shows_the_model_both() -> None:
+    # Three buttons all read "View" on screen; two carry an aria-label that does not. Named by the
+    # aria-label alone, the only control the model can match to "click View" is the third one.
+    async with _content_page(_SHOWN_TEXT_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        looked = await _tool(tools, "look").handler({})
+
+    lines = {
+        name: next(line for line in observed.content.splitlines() if f" {name}" in line)
+        for name in (
+            "'Apply'",
+            "'Apply scopes'",
+            "'View'",
+            "'Open the support center'",
+            "'Close dialog'",
+            "'Settings'",
+            "'Preview'",
+            "'Notes'",
+            "'Rename'",
+            "'Item 1'",
+            "'Export the report'",
+            "'Continue to payment'",
+            "'Row 3'",
+        )
+    }
+    assert "shows='View'" in lines["'Apply'"], observed.content
+    assert "shows='View'" in lines["'Apply scopes'"], observed.content
+    assert "shows='Help'" in lines["'Open the support center'"], observed.content
+    assert "shows='View'" in lines["'Preview'"], observed.content
+    assert "shows='Download'" in lines["'Export the report'"], observed.content
+    assert "shows='Next'" in lines["'Continue to payment'"], observed.content
+    # Judged against the label printed, which takes the first aria-labelledby id only.
+    assert "shows='Delete'" in lines["'Row 3'"], observed.content
+    # Nothing to add where the visible text is the name already, part of it, or absent; where the
+    # contents are typed or data, not a caption; or where they are a whole card, not a caption.
+    for same in ("'View'", "'Close dialog'", "'Settings'", "'Notes'", "'Rename'", "'Item 1'"):
+        assert "shows=" not in lines[same], observed.content
+    legend = looked.content.splitlines()
+    assert any("'Apply'" in line and "shows='View'" in line for line in legend), looked.content
+    assert not any("'Close dialog'" in line and "shows=" in line for line in legend), looked.content
+    assert not any("'Download'" in line and "shows=" in line for line in legend), looked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_visible_text_a_reading_adds_is_bounded_across_frames_and_says_what_it_left_off() -> None:
+    from skyvern.forge.taskv3.tools import SHOWN_TEXT_TOTAL_CAP  # noqa: PLC0415
+
+    def cards(prefix: str, count: int) -> str:
+        return "".join(
+            f'<a href="#{prefix}{i}" aria-label="{prefix} item {i}">Caption for card {prefix}{i:03d}</a> '
+            for i in range(count)
+        )
+
+    frames = "".join(
+        f"""<iframe style="width:900px;height:150px" srcdoc='{cards(f"f{n}", 20)}'></iframe>""" for n in range(3)
+    )
+    # The main frame alone stays under the cap; only the frames together can pass it.
+    async with _content_page(cards("m", 10) + frames) as page:
+        await page.wait_for_function(
+            "() => [...document.querySelectorAll('iframe')].every((f) => f.contentDocument && f.contentDocument.querySelector('a'))"
+        )
+        observed = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    # look marks the main frame only, so its budget needs a main frame past the cap.
+    async with _content_page(cards("m", 60)) as page:
+        looked = await _tool(build_browser_tools(_fixed_page_provider(page)), "look").handler({})
+    # observe prints a zero-width character as a six-character escape, and the budget is what is printed.
+    zero_width = "".join(f'<a href="#z{i}" aria-label="Zone {i}">G\u200bo\u200b {i}</a> ' for i in range(80))
+    async with _content_page(zero_width) as page:
+        escaped = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    printed = re.findall(r" shows='[^']*'", escaped.content)
+    assert printed and sum(len(p) for p in printed) <= SHOWN_TEXT_TOTAL_CAP, escaped.content
+
+    assert "'f2 item 0'" in observed.content, observed.content
+    for result in (observed, looked):
+        shown = re.findall(r" shows='([^']*)'", result.content)
+        assert shown, result.content
+        assert sum(len(f" shows='{t}'") for t in shown) <= SHOWN_TEXT_TOTAL_CAP, result.content
+        assert re.search(r"^\(shows= left off \d+ more control", result.content, re.M), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_category_menu_item_whose_name_differs_from_its_text_shows_both() -> None:
+    from skyvern.forge.taskv3.tools import _FIND_CATEGORIES_JS, _menu_mark_parts  # noqa: PLC0415
+
+    async with _content_page(
+        """<input id="q" style="width:300px">
+        <div role="menu">
+          <div role="menuitem" aria-haspopup="true" aria-label="Expand region one" style="width:300px">North</div>
+          <div role="menuitem" aria-haspopup="true" style="width:300px">South</div>
+        </div>"""
+    ) as page:
+        found = await page.evaluate(_FIND_CATEGORIES_JS, {"field": "#q"})
+
+    parts = _menu_mark_parts(found["categories"], 8, 80)
+    assert any("'Expand region one' shows='North'" in p for p in parts), parts
+    assert any(p.endswith("'South'") for p in parts), parts
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_the_address_observe_prints_is_byte_identical_to_the_argument_the_tools_accept() -> None:
@@ -18755,6 +19047,7 @@ _CONSENT_WALL_HTML = """
     <button id="accept-all">Accept All Cookies</button>
     <button data-tv3="t7">Cookie Settings</button>
     <button aria-label="Close">×</button>
+    <button id="later" aria-label="Dismiss the banner">Remind me "later"</button>
   </div>
 </div>
 """
@@ -18771,6 +19064,8 @@ async def test_type_under_a_consent_wall_names_the_layer_and_its_controls() -> N
         assert "#accept-all" in r.content and "Accept All Cookies" in r.content, r.content
         assert '[data-tv3="t7"]' in r.content and "Cookie Settings" in r.content, r.content
         assert "Close" in r.content, r.content
+        assert '#later "Dismiss the banner" shows "Remind me \\"later\\""' in r.content, r.content
+        assert '"Close" shows' not in r.content, r.content
         assert await page.eval_on_selector("#city", "el => el.value") == ""
 
 

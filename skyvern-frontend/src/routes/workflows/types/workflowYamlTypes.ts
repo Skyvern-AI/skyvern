@@ -389,6 +389,7 @@ export type CodeBlockYAML = BlockYAMLBase & {
   data_schema?: CodeBlockDataSchema;
   user_owned_goal?: boolean | null;
   goal_needs_regeneration?: boolean | null;
+  code_edited_by_hand?: boolean | null;
 };
 
 export type TextPromptBlockYAML = BlockYAMLBase & {

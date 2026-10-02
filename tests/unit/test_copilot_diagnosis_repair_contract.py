@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import textwrap
@@ -14,6 +15,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.cli.mcp_tools.blocks import WORKFLOW_KNOWLEDGE_TOPIC_HEADERS
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime_authoring_repair
 from skyvern.forge.sdk.copilot.agent import (
@@ -30,6 +32,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     challenge_notices,
     recorded_outcome_from_run_blocks_result,
+    solver_receipt,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     _RECORDABLE_CHALLENGE_FRAME_HOSTS,
@@ -63,7 +66,11 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import _PACKET_NOTICE_CAP, latest_diagnosis_contract_satisfies_goal
-from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, project_direct_test_handoff_packet_for_llm
+from skyvern.forge.sdk.copilot.output_utils import (
+    BUILD_TEST_PACKET_KEY,
+    project_direct_test_handoff_packet_for_llm,
+    sanitize_tool_result_for_llm,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
@@ -94,6 +101,8 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
 
@@ -6325,3 +6334,160 @@ def test_the_update_lever_is_read_from_the_workflow_the_run_executed_not_a_later
     )
 
     assert _update_lever_ids(contract) == ["cred_bound"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("vendor", "status"), [("datadome", "unsolved"), ("perimeterx", "unsupported")])
+async def test_a_build_test_that_met_a_hard_block_hands_the_model_the_solver_receipt(
+    monkeypatch: pytest.MonkeyPatch, vendor: str, status: str
+) -> None:
+    receipt = {"status": status, "vendor": vendor, "arm": "vendor_handler", "page_state": "challenged"}
+    rows = [
+        Action(
+            action_type=ActionType.SOLVE_CAPTCHA,
+            status=ActionStatus.failed,
+            task_id="tsk_probe",
+            step_id="stp_probe",
+            response="CodeBlockCaptchaError",
+            output={"code_line": 3, "challenge": receipt},
+        ),
+        Action(
+            action_type=ActionType.GOTO_URL,
+            status=ActionStatus.completed,
+            task_id="tsk_probe",
+            step_id="stp_probe",
+            output={"code_line": 1},
+        ),
+    ]
+    monkeypatch.setattr(
+        app,
+        "DATABASE",
+        SimpleNamespace(tasks=SimpleNamespace(get_recent_actions_for_tasks=AsyncMock(return_value=rows))),
+    )
+    now = datetime.now(UTC)
+    block = WorkflowRunBlock(
+        workflow_run_block_id="wrb_probe",
+        workflow_run_id="wr_probe",
+        organization_id="o_probe",
+        task_id="tsk_probe",
+        label="search",
+        block_type=BlockType.CODE,
+        status="failed",
+        created_at=now,
+        modified_at=now,
+    )
+    results: list[dict[str, Any]] = [
+        {"label": "search", "block_type": "CODE", "status": "failed", "task_id": "tsk_probe"}
+    ]
+    await run_execution_module._attach_action_traces([block], results, "o_probe", include_completed=True)
+    result: dict[str, Any] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_probe",
+            "overall_status": "failed",
+            "blocks": results,
+            SOLVER_ATTEMPT_KEY: run_execution_module._capture_solver_facts_and_strip_traces(results),
+        },
+    }
+    ctx = _ctx()
+
+    finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+        recorded_outcome=recorded_outcome_from_run_blocks_result(result),
+    )
+
+    packet = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)["data"][BUILD_TEST_PACKET_KEY]
+    assert packet["challenge"]["solver_receipt"] == receipt
+    notices = " ".join(packet["challenge_notices"])
+    assert vendor in notices
+    assert status in notices
+
+
+_PX_UNSOLVED = {"status": "unsolved", "vendor": "perimeterx", "arm": "vendor_handler", "page_state": "challenged"}
+_PX_SOLVED = {"status": "solved", "vendor": "perimeterx", "arm": "vendor_handler", "page_state": "clear"}
+
+
+def _receipt_block(label: str, status: str, receipt: dict[str, str] | None = None) -> dict[str, Any]:
+    row = {"action": "solve_captcha", "status": "completed", "challenge": receipt} if receipt else None
+    return {
+        "label": label,
+        "block_type": "CODE",
+        "status": status,
+        "action_trace": [row] if row else [{"action": "goto_url", "status": "completed"}],
+    }
+
+
+@pytest.mark.parametrize("source", ["trace", "carried"])
+@pytest.mark.parametrize(
+    ("blocks", "expected"),
+    [
+        (
+            [_receipt_block("search", "failed", _PX_UNSOLVED), _receipt_block("cleanup", "completed", _PX_SOLVED)],
+            _PX_UNSOLVED,
+        ),
+        (
+            [_receipt_block("search", "failed", _PX_UNSOLVED), _receipt_block("cleanup", "failed", _PX_SOLVED)],
+            _PX_SOLVED,
+        ),
+        ([_receipt_block("search", "completed", _PX_UNSOLVED), _receipt_block("submit", "failed")], None),
+    ],
+    ids=["completed_finally_skipped", "failing_finally_governs", "last_failed_block_has_no_call"],
+)
+def test_the_packet_and_the_notice_read_the_same_governing_receipt(
+    source: str, blocks: list[dict[str, Any]], expected: dict[str, str] | None
+) -> None:
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = copy.deepcopy(blocks)
+    attempt = run_execution_module._capture_solver_facts_and_strip_traces(copy.deepcopy(blocks))
+    if source == "carried":
+        result["data"][SOLVER_ATTEMPT_KEY] = attempt
+
+    contract = _solver_contract(_ctx(), result)
+
+    packet_receipt = contract.challenge.solver_receipt if contract.challenge is not None else None
+    assert (packet_receipt.model_dump(mode="json") if packet_receipt else None) == expected
+    assert attempt.get("receipt") == expected
+
+
+def test_a_passed_run_reports_no_receipt_even_when_a_tolerated_block_met_a_hard_block() -> None:
+    result = _unwalled_run_result()
+    result["ok"] = True
+    result["data"]["overall_status"] = "completed"
+    result["data"]["blocks"] = [_receipt_block("optional", "failed", _PX_UNSOLVED)]
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert contract.challenge is None
+    assert contract.levers == []
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        _PX_UNSOLVED,
+        {**_PX_UNSOLVED, "page_state": "not_rechecked"},
+        {"status": "unsolved", "vendor": None, "arm": None, "page_state": "not_rechecked"},
+    ],
+    ids=["vendor_challenged", "vendor_not_rechecked", "ladder_timeout"],
+)
+def test_a_solver_receipt_is_reported_but_never_asserts_a_wall_by_itself(receipt: dict[str, str | None]) -> None:
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = [_receipt_block("search", "failed", receipt)]
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert contract.challenge is None or contract.challenge.basis != "run_wall"
+    if contract.challenge is not None:
+        assert contract.challenge.solver_receipt is not None
+
+
+@pytest.mark.parametrize("status", list(ChallengeStatus))
+def test_a_shared_solver_receipt_reads_back_whole_when_the_writer_adds_a_key(status: ChallengeStatus) -> None:
+    written = ChallengeOutcome(status, "perimeterx", "vendor_handler", "challenged").receipt()
+
+    receipt = solver_receipt({**written, "added_by_a_later_writer": "x"})
+
+    assert receipt is not None
+    assert receipt.model_dump(mode="json") == written

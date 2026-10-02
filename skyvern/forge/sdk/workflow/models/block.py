@@ -159,8 +159,8 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
-from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
-from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions
+from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
+from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions, code_typed_values
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
@@ -255,6 +255,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    DocumentFailureReceipt,
     RecordingPage,
     json_safe_recorder_output,
     user_code_line_from_exception,
@@ -287,7 +288,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
-from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
+from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.emails import EmailBodyFormat
@@ -1410,18 +1411,56 @@ class Block(BaseModel, abc.ABC):
         if not potential_template:
             return potential_template
 
+        try:
+            template = (env or jinja_sandbox_env).from_string(potential_template)
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
+
+        template_data = self._build_block_parameter_template_data(
+            workflow_run_context, force_include_secrets=force_include_secrets
+        )
+
+        # A caller whose environment decides for itself what an absent binding means renders instead of
+        # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict" and not skip_missing_variable_preflight:
+            if missing_variables := get_missing_variables(potential_template, template_data):
+                raise MissingJinjaVariables(
+                    template=potential_template,
+                    variables=missing_variables,
+                )
+
+        try:
+            rendered = template.render(template_data)
+        except SkyvernException:
+            raise
+        except Exception as exc:
+            raise FailedToFormatJinjaStyleParameter(
+                potential_template,
+                str(exc),
+                available_keys=get_available_keys(potential_template, template_data),
+            ) from exc
+        if page_derived_capture is not None:
+            page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
+        return rendered
+
+    def _build_block_parameter_template_data(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        *,
+        force_include_secrets: bool = False,
+        copy_block_metadata: bool = False,
+        include_workflow_run_summary: bool = True,
+    ) -> dict[str, Any]:
+        """Build the same namespace used to render this block's parameter templates."""
         # Security: only allow real secret values for non-LLM blocks (HttpRequestBlock, CodeBlock)
         is_safe_block_for_secrets = self.block_type in [
             BlockType.CODE,
             BlockType.HTTP_REQUEST,
         ]
 
-        try:
-            template = (env or jinja_sandbox_env).from_string(potential_template)
-        except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
-
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
+        if copy_block_metadata:
+            block_reference_data = block_reference_data.copy()
         template_data = workflow_run_context.values.copy()
 
         include_secrets = workflow_run_context.include_secrets_in_templates or force_include_secrets
@@ -1476,30 +1515,9 @@ class Block(BaseModel, abc.ABC):
             template_data["browser_session_id"] = workflow_run_context.browser_session_id or ""
 
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
-        template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
-
-        # A caller whose environment decides for itself what an absent binding means renders instead of
-        # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
-        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict" and not skip_missing_variable_preflight:
-            if missing_variables := get_missing_variables(potential_template, template_data):
-                raise MissingJinjaVariables(
-                    template=potential_template,
-                    variables=missing_variables,
-                )
-
-        try:
-            rendered = template.render(template_data)
-        except SkyvernException:
-            raise
-        except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(
-                potential_template,
-                str(exc),
-                available_keys=get_available_keys(potential_template, template_data),
-            ) from exc
-        if page_derived_capture is not None:
-            page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
-        return rendered
+        if include_workflow_run_summary:
+            template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
+        return template_data
 
     def _apply_workflow_system_prompt(
         self,
@@ -5085,6 +5103,7 @@ def _page_open_error_label(error: BaseException) -> str:
 _CODE_BLOCK_SESSION_DOWNLOAD_WAIT_SECONDS = 60
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS = 6
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_INTERVAL_SECONDS = 0.5
+_AUTHORING_RUN_LINEAGE_MAX_DEPTH = 10
 
 
 async def _code_block_solve_captcha_builtin(
@@ -5237,6 +5256,37 @@ def is_registered_secret(value: str, workflow_run_context: WorkflowRunContext) -
     literal. A code that *is* a secret is the one case where reporting it would store that secret.
     """
     return value in Block._registered_secret_values(workflow_run_context)
+
+
+def associated_navigation_output(
+    receipt: DocumentFailureReceipt, workflow_run_context: WorkflowRunContext, parameters: dict[str, Any]
+) -> dict[str, str | int | None]:
+    driver_code = receipt.driver_code
+    origin = (
+        _redact_codeblock_failure_text(
+            workflow_run_context.mask_secrets_in_data(receipt.origin), parameters, fallback=""
+        )
+        if receipt.origin
+        else None
+    )
+    return {
+        "attempt_id": receipt.attempt_id,
+        "origin": origin or None,
+        "driver_code": driver_code
+        if driver_code and not is_registered_secret(driver_code, workflow_run_context)
+        else None,
+        "response_status": receipt.response_status,
+        "relation": receipt.relation,
+    }
+
+
+def _context_navigation_output(
+    receipt: DocumentFailureReceipt | None, workflow_run_context: WorkflowRunContext, parameters: dict[str, Any]
+) -> dict[str, dict[str, str | int | None]]:
+    if receipt is None:
+        return {}
+    context = replace(receipt, relation="context")
+    return {"associated_navigation": associated_navigation_output(context, workflow_run_context, parameters)}
 
 
 def _redact_codeblock_failure_text(
@@ -6560,6 +6610,7 @@ class CodeBlock(Block):
     data_schema: dict[str, Any] | list | str | None = None
     user_owned_goal: bool | None = None
     goal_needs_regeneration: bool | None = None
+    code_edited_by_hand: bool | None = None
 
     BLOCKED_ATTRS: ClassVar[frozenset[str]] = CODE_BLOCK_BLOCKED_ATTRS
 
@@ -6915,15 +6966,14 @@ async def wrapper({default_args}):
         """The author's code under this run's template control flow, every value slot replaced by an inert name; None
         when the slotted template still emits a value or fails to render, which the caller treats as untrusted."""
         masked_code, masked_comments = mask_jinja_in_python_comments(source)
-        slotted = _JINJA_VALUE_SLOT_RE.sub(rf'{{{{\1 "{INERT_SLOT_NAME}" \2}}}}', masked_code)
-        slotted = _JINJA_PRINT_SLOT_RE.sub(rf'{{%\1 print "{INERT_SLOT_NAME}" \2%}}', slotted)
+        slotted, slot_expressions = slot_template(masked_code)
         try:
             if not _template_emits_only_inert_slots(slotted):
                 return None
             rendered = self.render_templatable_field("code", slotted, workflow_run_context)
         except Exception:
             return None
-        return restore_jinja_masked_comments(rendered, masked_comments)
+        return SlottedReference(restore_jinja_masked_comments(rendered, masked_comments), slot_expressions)
 
     async def _claim_session_download_artifacts(
         self,
@@ -7533,18 +7583,38 @@ async def wrapper({default_args}):
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
         return workflow_run_context.mask_secrets_in_data(self.prompt or "")
 
+    def _secret_free_typed_values(
+        self, *, workflow_run_context: WorkflowRunContext, authored_code: str | None
+    ) -> tuple[CodeTypedValue, ...]:
+        # Read off the inert-slot render so no templated value is taken for an authored literal; a line count that
+        # differs from the executed code means its line numbers would not match the failing line.
+        if authored_code is None or len(authored_code.splitlines()) != len((self.code or "").splitlines()):
+            return ()
+        typed_values: list[CodeTypedValue] = []
+        for line, target, value in code_typed_values(authored_code):
+            if self._contains_registered_secret(value, workflow_run_context) or self._contains_registered_secret(
+                target, workflow_run_context
+            ):
+                continue
+            typed_values.append(CodeTypedValue(line=line, target=target, value=value))
+        return tuple(typed_values)
+
     def _code_progress_record(
-        self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None
+        self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None, authored_code: str | None
     ) -> CodeProgressRecord | None:
         if failing_line is None:
             return None
+        typed_values = self._secret_free_typed_values(
+            workflow_run_context=workflow_run_context, authored_code=authored_code
+        )
         index = self._matched_step_index_for_failing_line(failing_line)
-        if index is None:
-            return None
         steps = self.steps or []
-        failed = steps[index]
-        if not failed.description:
-            return None
+        if index is None or not steps[index].description:
+            if not typed_values:
+                return None
+            return CodeProgressRecord(
+                before=(), failed_step=None, failed_line=failing_line, after=(), typed_values=typed_values
+            )
 
         def masked(chunk: list[CodeBlockStep]) -> tuple[str, ...]:
             return tuple(
@@ -7553,9 +7623,10 @@ async def wrapper({default_args}):
 
         return CodeProgressRecord(
             before=masked(steps[:index]),
-            failed_step=workflow_run_context.mask_secrets_in_data(failed.description),
+            failed_step=workflow_run_context.mask_secrets_in_data(steps[index].description),
             failed_line=failing_line,
             after=masked(steps[index + 1 :]),
+            typed_values=typed_values,
         )
 
     async def _record_unregistered_download_intent(
@@ -7616,6 +7687,31 @@ async def wrapper({default_args}):
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
         return workflow is not None and await code_block_ai_fallback_flag_enabled(workflow.organization_id)
+
+    async def _is_authoring_run(self, workflow_run_id: str, organization_id: str) -> bool | None:
+        """Whether this run or an ancestor run is a Copilot build test or an editor block run; None when the
+        lineage cannot be read."""
+        run_id: str | None = workflow_run_id
+        for _ in range(_AUTHORING_RUN_LINEAGE_MAX_DEPTH):
+            if run_id is None:
+                return False
+            try:
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=run_id, organization_id=organization_id
+                )
+            except Exception:
+                LOG.warning("AI fallback run-kind lookup failed; not falling back", workflow_run_id=run_id)
+                return None
+            if workflow_run is None:
+                LOG.warning("AI fallback run-kind lookup found no run; not falling back", workflow_run_id=run_id)
+                return None
+            if workflow_run.copilot_session_id is not None or workflow_run.is_debug_session:
+                return True
+            run_id = workflow_run.parent_workflow_run_id
+        LOG.warning(
+            "AI fallback run lineage is deeper than expected; not falling back", workflow_run_id=workflow_run_id
+        )
+        return None
 
     def _is_healable_page_failure(
         self,
@@ -7713,6 +7809,7 @@ async def wrapper({default_args}):
         redaction_parameters: dict[str, Any] | None = None,
         trace: _HealAttemptTrace | None = None,
         failed_nav_error_code: str | None = None,
+        authored_code: str | None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
@@ -7942,7 +8039,9 @@ async def wrapper({default_args}):
                     recovery_credential_parameter_keys=login_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
                     recovery_code_progress=self._code_progress_record(
-                        workflow_run_context=workflow_run_context, failing_line=failing_line
+                        workflow_run_context=workflow_run_context,
+                        failing_line=failing_line,
+                        authored_code=authored_code,
                     ),
                 )
             finally:
@@ -8629,6 +8728,7 @@ async def wrapper({default_args}):
         redaction_parameters: dict[str, Any] | None = None,
         download_claim_outcome: DownloadClaimOutcome | None = None,
         failed_nav_error_code: str | None = None,
+        authored_code: str | None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -8878,6 +8978,7 @@ async def wrapper({default_args}):
                 redaction_parameters=resolved_redaction_parameters,
                 trace=trace,
                 failed_nav_error_code=failed_nav_error_code,
+                authored_code=authored_code,
             )
             recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
@@ -8904,6 +9005,32 @@ async def wrapper({default_args}):
                 credential_parameter_key=trace.credential_parameter_key,
             )
             return recovery_result
+
+        # A Copilot build test or editor block run must see the code's own failure, so the fallback never
+        # rescues it; an unreadable lineage also gets no fallback.
+        authoring_run = await self._is_authoring_run(workflow_run_id, organization_id)
+        if authoring_run is not False:
+            if authoring_run:
+                await self._write_heal_episode_safe(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                    engine="harness",
+                    status="skipped",
+                    skip_reason=HealSkipReason.authoring_run,
+                    parameter_binding_keys=parameter_binding_keys,
+                    exception_class=exception_class,
+                    failing_line=failing_line,
+                    matched_step_index=matched_step_index,
+                    failure_message=None,
+                    wall_clock_ms=None,
+                    action_count=None,
+                    output_obligation=OutputObligation.none,
+                )
+            return await _finalize_heal_result(None)
 
         if not self.prompt:
             await self._write_heal_episode_safe(
@@ -9221,7 +9348,11 @@ async def wrapper({default_args}):
             )
             if credential_release_guard.is_armed:
                 credential_release_guard.log_armed()
-            await recorder.create_task_and_step()
+            try:
+                await recorder.create_task_and_step()
+            except BaseException:
+                recorder.recording_page._detach_document_observers()
+                raise
             recording_page = recorder.recording_page
             # Bound before the try so the shared except arms can read it even when the secure path raises
             # before the inline claim is wired; a claim that never ran leaves it unarmed (outcome None).
@@ -9266,6 +9397,23 @@ async def wrapper({default_args}):
                     block_label=self.label,
                 )
                 if secure_code_block_result is not None:
+
+                    def scrub_secure_failure_fact(raw_value: str | None) -> str | None:
+                        if not isinstance(raw_value, str):
+                            return None
+                        masked_value = workflow_run_context.mask_secrets_in_data(raw_value)
+                        scrubbed_value = scrub_failure_reason(masked_value, fallback="")
+                        return (
+                            (
+                                "".join(
+                                    char for char in scrubbed_value if unicodedata.category(char)[0] != "C"
+                                ).strip()[:1000]
+                                or None
+                            )
+                            if scrubbed_value
+                            else None
+                        )
+
                     recorded = recorder.recorded_actions()
                     secure_failure = secure_code_block_result.failure
                     if (
@@ -9277,6 +9425,7 @@ async def wrapper({default_args}):
                             _code_block_failure_action(
                                 failing_line=secure_failure.failing_line,
                                 action_order=len(recorded),
+                                response=scrub_secure_failure_fact(secure_failure.failure_reason) or "",
                             )
                         )
                     await recorder.persist(recorded)
@@ -9298,22 +9447,6 @@ async def wrapper({default_args}):
                                 self._classify_secure_runner_failure(secure_failure), secure_nav_code
                             )
                         )
-
-                        def scrub_secure_failure_fact(raw_value: str | None) -> str | None:
-                            if not isinstance(raw_value, str):
-                                return None
-                            masked_value = workflow_run_context.mask_secrets_in_data(raw_value)
-                            scrubbed_value = scrub_failure_reason(masked_value, fallback="")
-                            return (
-                                (
-                                    "".join(
-                                        char for char in scrubbed_value if unicodedata.category(char)[0] != "C"
-                                    ).strip()[:1000]
-                                    or None
-                                )
-                                if scrubbed_value
-                                else None
-                            )
 
                         secure_failure_page_state = {
                             field: value
@@ -9372,6 +9505,10 @@ async def wrapper({default_args}):
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
                             if secure_failure_page_state:
                                 failure_output["failure_page_state"] = secure_failure_page_state
+                            if secure_failure.document_failure is not None:
+                                failure_output["associated_navigation"] = associated_navigation_output(
+                                    secure_failure.document_failure, workflow_run_context, serialized_parameter_values
+                                )
                             if secure_failure.denied_exception_class is not None:
                                 failure_output["runner_exception_class"] = secure_failure.denied_exception_class
                             await self.record_output_parameter_value(
@@ -9396,6 +9533,7 @@ async def wrapper({default_args}):
                             )
 
                         return await self._resolve_failure_with_heal(
+                            authored_code=authored_code,
                             exception=None,
                             failing_line=secure_failure.failing_line,
                             build_failure_result=build_secure_failure_result,
@@ -9681,15 +9819,26 @@ async def wrapper({default_args}):
                 download_dir_before=download_dir_before,
                 attempt_started_at=attempt_started_at,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             await recorder.persist(recorder.recorded_actions())
             await recorder.finalize(success=False)
-            return await self._failed_result_with_evidence(
-                failure_reason=scrub_failure_reason(
+            timeout_failure_reason = (
+                scrub_failure_reason(
                     "Failed to execute code block. Reason: TimeoutError: code block exceeded "
                     f"{settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS} seconds"
                 )
-                or "",
+                or ""
+            )
+            timeout_navigation = _context_navigation_output(
+                recording_page.failure_document_receipt(e), workflow_run_context, serialized_parameter_values
+            )
+            return await self._failed_result_with_evidence(
+                failure_reason=timeout_failure_reason,
+                output_parameter_value=(
+                    {**build_block_failure_output(timeout_failure_reason, []), **timeout_navigation}
+                    if timeout_navigation
+                    else None
+                ),
                 status=BlockStatus.failed,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
@@ -9733,6 +9882,11 @@ async def wrapper({default_args}):
                     declared_error.reasoning, serialized_parameter_values
                 )
                 failure_output = build_user_defined_error_output(declared_error_code, declared_reasoning)
+                failure_output.update(
+                    _context_navigation_output(
+                        recording_page.failure_document_receipt(e), workflow_run_context, serialized_parameter_values
+                    )
+                )
 
                 async def build_declared_failure_result() -> BlockResult:
                     download_aware_failure_output = await self._failure_output_with_downloads(
@@ -9761,6 +9915,7 @@ async def wrapper({default_args}):
                     )
 
                 return await self._resolve_failure_with_heal(
+                    authored_code=authored_code,
                     exception=e,
                     failing_line=failing_line,
                     build_failure_result=build_declared_failure_result,
@@ -9852,6 +10007,12 @@ async def wrapper({default_args}):
             # rather than read inside the deferred closure below. It comes from the recorder, never
             # from ``e``: authored code can rewrite the exception, or raise a fresh one, before it lands.
             inline_nav_code = recording_page.failure_nav_error_code(e)
+            inline_document_failure = recording_page.failure_document_receipt(e)
+            inline_associated_navigation = (
+                associated_navigation_output(inline_document_failure, workflow_run_context, serialized_parameter_values)
+                if inline_document_failure is not None
+                else None
+            )
             legacy_healable = self._is_healable_page_failure(
                 e,
                 recording_page,
@@ -9878,9 +10039,12 @@ async def wrapper({default_args}):
 
             async def build_legacy_failure_result() -> BlockResult:
                 failure_output = None
-                if inline_failure_page_state:
+                if inline_failure_page_state or inline_associated_navigation:
                     failure_output = build_block_failure_output(failure_reason, [])
-                    failure_output["failure_page_state"] = inline_failure_page_state
+                    if inline_failure_page_state:
+                        failure_output["failure_page_state"] = inline_failure_page_state
+                    if inline_associated_navigation:
+                        failure_output["associated_navigation"] = inline_associated_navigation
                 download_aware_failure_output = await self._failure_output_with_downloads(
                     engine="inline",
                     workflow_run_context=workflow_run_context,
@@ -9917,6 +10081,7 @@ async def wrapper({default_args}):
                 )
 
             return await self._resolve_failure_with_heal(
+                authored_code=authored_code,
                 exception=e,
                 failing_line=failing_line,
                 build_failure_result=build_legacy_failure_result,
@@ -17591,9 +17756,6 @@ def _align_branch_evaluations(
 
 # Pattern to find Jinja template blocks like {{ variable_name }}
 _JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}")
-# Value slots only; the delimiters and their whitespace-control markers stay so both renders trim identically.
-_JINJA_VALUE_SLOT_RE = re.compile(r"\{\{(-?).*?(-?)\}\}", re.DOTALL)
-_JINJA_PRINT_SLOT_RE = re.compile(r"\{%(-?)\s*print\b.*?(-?)%\}", re.DOTALL)
 
 
 def _template_context_snapshot(workflow_run_context: WorkflowRunContext) -> WorkflowRunContext:
@@ -17621,7 +17783,7 @@ def _template_emits_only_inert_slots(template_source: str) -> bool:
         for child in output.nodes:
             if isinstance(child, nodes.TemplateData):
                 continue
-            if not (isinstance(child, nodes.Const) and child.value == INERT_SLOT_NAME):
+            if not (isinstance(child, nodes.Const) and is_inert_slot(child.value)):
                 return False
     for filter_block in template.find_all(nodes.FilterBlock):
         for applied in (filter_block.filter, *filter_block.filter.find_all(nodes.Filter)):

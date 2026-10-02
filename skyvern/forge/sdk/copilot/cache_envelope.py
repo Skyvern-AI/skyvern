@@ -47,6 +47,10 @@ class CacheableSystemInstructions(str):
         instance.cache_namespace = cache_namespace
         return instance
 
+    # LiteLLM copies the system message for Anthropic and Bedrock; copy and pickle rebuild via __new__.
+    def __getnewargs_ex__(self) -> tuple[tuple[str, str], dict[str, str | None]]:
+        return (self.stable_prefix, self.dynamic_suffix), {"cache_namespace": self.cache_namespace}
+
 
 @dataclass(slots=True)
 class ExplicitCacheEnvelope:

@@ -981,6 +981,12 @@ class WorkflowRunAttemptModel(Base):
     __table_args__ = (
         Index("ix_workflow_run_attempts_organization_created_at", "organization_id", "created_at"),
         Index(
+            "ix_workflow_run_attempts_profile_run_lookup",
+            "browser_profile_id",
+            "workflow_run_id",
+            postgresql_where=text("browser_profile_id IS NOT NULL"),
+        ),
+        Index(
             "ix_workflow_run_attempts_pending_retries",
             "next_attempt_at",
             "workflow_run_id",
@@ -1018,6 +1024,7 @@ class WorkflowRunAttemptModel(Base):
     interim_side_effects_progress = Column(JSON, nullable=True)
     final_side_effects_progress = Column(JSON, nullable=True)
     pinned_browser_session_id = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=naive_utc_now, nullable=False)
@@ -1165,6 +1172,7 @@ class BitwardenCreditCardDataParameterModel(Base):
 
 class CredentialParameterModel(Base):
     __tablename__ = "credential_parameters"
+    __table_args__ = (Index("ix_credential_parameters_credential_workflow_lookup", "credential_id", "workflow_id"),)
 
     credential_parameter_id = Column(String, primary_key=True, default=generate_credential_parameter_id)
     workflow_id = Column(String, index=True, nullable=False)
@@ -1186,6 +1194,7 @@ class WorkflowRunCredentialSelectionModel(Base):
     __tablename__ = "workflow_run_credential_selections"
     __table_args__ = (
         UniqueConstraint("workflow_run_id", "parameter_key", name="uq_wrcs_workflow_run_parameter_key"),
+        Index("ix_wrcs_credential_run_lookup", "credential_id", "workflow_run_id"),
         Index(
             "idx_wrcs_lru_lookup",
             "organization_id",

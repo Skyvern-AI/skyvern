@@ -42,6 +42,7 @@ class BearerIdentity:
     # As found in the token, never normalized: the claim shapes spell one role differently.
     org_role: str | None = None
     org_role_claim: str | None = None
+    token_has_organization_claim: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class RequestPrincipal:
     user_id: str | None = None
     org_role: str | None = None
     org_role_claim: str | None = None
+    token_has_organization_claim: bool | None = None
 
 
 _ResolutionKey = tuple[str, str | None, bytes | None]
@@ -134,6 +136,7 @@ async def resolve_request_principal(
                 user_id=identity.user_id if identity else None,
                 org_role=identity.org_role if identity else None,
                 org_role_claim=identity.org_role_claim if identity else None,
+                token_has_organization_claim=identity.token_has_organization_claim if identity else None,
             )
             set_request_principal(principal, identity_key, identity_result.status.value)
             return principal
@@ -154,6 +157,7 @@ async def resolve_request_principal(
         user_id=identity.user_id if identity else None,
         org_role=identity.org_role if identity else None,
         org_role_claim=identity.org_role_claim if identity else None,
+        token_has_organization_claim=identity.token_has_organization_claim if identity else None,
     )
     _request_principal.set((resolution_key, principal, identity_result.status))
     return principal

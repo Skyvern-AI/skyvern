@@ -165,6 +165,7 @@ export function StudioPaneToggles() {
   return (
     <nav
       aria-label="Studio panes"
+      data-tour="studio-pane-toggles"
       className="flex shrink-0 items-center gap-1.5"
       onKeyDown={onKeyDown}
     >

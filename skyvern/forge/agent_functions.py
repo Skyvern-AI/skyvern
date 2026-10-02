@@ -5,7 +5,7 @@ import copy
 import hashlib
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -77,6 +77,7 @@ from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityResolution,
     BearerIdentityStatus,
+    RequestPrincipal,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -106,7 +107,7 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
-    from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import DocumentFailureReceipt, RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.forge.taskv3.loop import ToolSpec
@@ -118,9 +119,24 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """Safe, bounded metadata for a customer-initiated write; never include values or request bodies."""
+
+    organization_id: str
+    action: str
+    resource_type: str
+    resource_id: str | None
+    changed_fields: tuple[str, ...] = ()
+    related_resource_ids: tuple[str, ...] = ()
+    auth_kind: str | None = None
+
+
 EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
 EMAIL_OTP_MAX_RESULTS = 5
 EMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
+STANDALONE_BROWSER_SESSION_FEATURE_NAME = "standalone_browser_sessions"
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 
@@ -285,6 +301,8 @@ class CodeBlockEngineFailure:
     nav_error_code: str | None = None
     # The owned page the failing operation ran on; final_url stays the block's own page.
     receiver_url: str | None = None
+    # Unredacted; associated_navigation_output masks it where it is persisted.
+    document_failure: DocumentFailureReceipt | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -971,6 +989,18 @@ class DownloadRecoveryHook(Protocol):
 
 
 class AgentFunction:
+    async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
+        """OSS has no customer audit store; cloud overrides this best-effort hook."""
+        return None
+
+    async def authorize_request(
+        self,
+        principal: RequestPrincipal | None,
+        action: str,
+        resource: Mapping[str, object],
+    ) -> str | None:
+        return None
+
     def build_download_recovery(
         self, *, action: Action, scraped_page: ScrapedPage, page: Page
     ) -> DownloadRecoveryHook | None:
@@ -2978,6 +3008,14 @@ class AgentFunction:
     async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
         """Return a verified bearer identity or why it could not be resolved."""
         return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
+
+    async def mirror_organization_member(
+        self,
+        principal: RequestPrincipal,
+        *,
+        role_observed_at: datetime | None = None,
+    ) -> None:
+        pass
 
     async def on_workflow_saved(
         self,

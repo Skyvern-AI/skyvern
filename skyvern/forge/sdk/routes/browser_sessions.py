@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from skyvern import analytics
 from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
 from skyvern.forge import app
+from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAME
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
@@ -27,7 +28,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import API_BROWSER_SESSION_CREATED_BY, is_final_status
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
@@ -224,6 +225,10 @@ async def create_browser_session(
             detail="proxy_session_id is only supported with RESIDENTIAL_ISP proxy_location",
         )
 
+    await app.AGENT_FUNCTION.validate_enterprise_feature_access(
+        organization_id=current_org.organization_id,
+        feature_names={STANDALONE_BROWSER_SESSION_FEATURE_NAME},
+    )
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         url=browser_session_request.url,
@@ -235,7 +240,7 @@ async def create_browser_session(
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
         needs_live_view=browser_session_request.needs_live_view,
-        created_by=user_id,
+        created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
     )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning

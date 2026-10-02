@@ -155,7 +155,7 @@ class TestCacheInvalidation:
         annotated = make_code_block(
             "code1",
             steps=[CodeBlockStep(description="Open the page", action_type=ActionType.GOTO_URL)],
-        )
+        ).model_copy(update={"user_owned_goal": True, "goal_needs_regeneration": True, "code_edited_by_hand": True})
 
         core_data_plain = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[plain]))
         core_data_annotated = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[annotated]))
@@ -168,11 +168,12 @@ class TestCacheInvalidation:
         block = make_code_block(
             "code1",
             steps=[CodeBlockStep(description="Click go", action_type=ActionType.CLICK)],
-        )
+        ).model_copy(update={"user_owned_goal": True, "goal_needs_regeneration": True, "code_edited_by_hand": True})
         core_data = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[block]))
 
         for block_data in core_data.get("blocks", []):
-            assert "steps" not in block_data
+            for field in ("steps", "user_owned_goal", "goal_needs_regeneration", "code_edited_by_hand"):
+                assert field not in block_data
 
     def test_code_block_goal_change_still_detected(self) -> None:
         """A goal reprompt regenerates code and steps, so a goal edit must keep invalidating."""

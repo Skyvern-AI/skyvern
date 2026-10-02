@@ -5,6 +5,7 @@
 
 import { buildRevealOffsets } from "./actionReveal";
 import {
+  type ActivityBucket,
   BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
@@ -324,6 +325,8 @@ export function hasObservedBlockEvidence(block: BlockState): boolean {
 }
 
 export interface ActivityEntry {
+  reason?: string;
+  activityBucket?: ActivityBucket;
   kind: "tool_call" | "tool_result" | "narration";
   // Free-text label rendered as a one-line summary in the card body.
   text: string;
@@ -377,7 +380,14 @@ export type TurnResponseKind =
   | "refuse"
   | "recover";
 
+interface CallPresentation {
+  bucket: ActivityBucket;
+  reason?: string;
+  startedAt?: string;
+}
+
 export interface TurnNarrativeState {
+  callPresentations?: Record<string, CallPresentation>;
   turnId: string | null;
   turnIndex: number | null;
   responseType: CopilotResponseType | null;
@@ -470,6 +480,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
+  callPresentations: {},
   codegenProgress: null,
   lastRunOutcome: null,
   credentialPrompt: null,
@@ -751,12 +762,16 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   disable_workflow_schedule: "Pausing a schedule",
   delete_workflow_schedule: "Deleting a schedule",
   cancel_workflow_schedule: "Canceling a schedule",
+  list_browser_profiles: "Checking saved browser profiles",
+  get_browser_profile: "Reading a browser profile",
+  create_browser_profile: "Saving a browser profile",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
+  extend_browser_session: "Extending the browser session",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
   add_block: "Adding block",
@@ -799,6 +814,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   inspect_current_workflow: "other",
   list_integrations: "other",
   get_organization_usage_quota: "other",
+  extend_browser_session: "other",
   search_web: "other",
   list_org_workflows: "other",
   get_org_workflow: "other",
@@ -824,6 +840,27 @@ export function toolActivityDisplayLabel(toolName?: string | null): string {
   return ACTIVITY_TOOL_DISPLAY_LABELS[toolName] ?? "Working";
 }
 
+function actionReason(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseActivityBucket(value: unknown): ActivityBucket | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const bucket = value as Record<string, unknown>;
+  if (bucket.kind === "design") return { kind: "design" };
+  if (
+    bucket.kind === "block" &&
+    typeof bucket.workflow_run_block_id === "string" &&
+    bucket.workflow_run_block_id
+  ) {
+    return {
+      kind: "block",
+      workflow_run_block_id: bucket.workflow_run_block_id,
+    };
+  }
+  return undefined;
+}
+
 function buildActivityFromToolCall(
   event: WorkflowCopilotToolCallUpdate,
 ): ActivityEntry | null {
@@ -838,6 +875,9 @@ function buildActivityFromToolCall(
     iteration: event.iteration,
     toolName: event.tool_name,
     displayLabel,
+    reason: actionReason(event.reason),
+    activityBucket: parseActivityBucket(event.activity_bucket),
+    activityStartedAt: event.timestamp ?? undefined,
     id: `tc-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
   };
@@ -869,6 +909,9 @@ function buildActivityFromToolResult(
     success: event.success,
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
+    reason: actionReason(event.reason),
+    activityBucket: parseActivityBucket(event.activity_bucket),
+    activityStartedAt: event.activity_started_at ?? undefined,
     id: `tr-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
   };
@@ -983,19 +1026,16 @@ export function condenseActivityEntries(
       if (idx !== undefined) {
         callIndexById.delete(id!);
         const call = paired[idx];
-        const settled =
-          call?.timestamp === undefined
-            ? entry
-            : {
-                ...entry,
-                activityStartedAt: call.activityStartedAt ?? call.timestamp,
-              };
-        if (idx === paired.length - 1) {
-          paired[idx] = settled;
-        } else {
-          paired[idx] = null;
-          paired.push(settled);
-        }
+        const settled = {
+          ...entry,
+          reason: call ? call.reason : entry.reason,
+          activityBucket: call?.activityBucket ?? entry.activityBucket,
+          activityStartedAt:
+            call?.activityStartedAt ??
+            call?.timestamp ??
+            entry.activityStartedAt,
+        };
+        paired[idx] = settled;
       } else {
         // Its tool_call was evicted past the activity cap — keep the
         // result visible rather than silently dropping it.
@@ -1006,6 +1046,11 @@ export function condenseActivityEntries(
     paired.push(entry);
   }
   const ordered = paired.filter((e): e is ActivityEntry => e !== null);
+  ordered.sort((a, b) => {
+    const first = parseUtcIsoMs(a.activityStartedAt ?? a.timestamp);
+    const second = parseUtcIsoMs(b.activityStartedAt ?? b.timestamp);
+    return first !== null && second !== null ? first - second : 0;
+  });
 
   const condensed: (ActivityEntry | null)[] = [];
   let lastToolIdx = -1;
@@ -1019,24 +1064,13 @@ export function condenseActivityEntries(
       previousEndedMs === null ||
       currentStartedMs === null ||
       currentStartedMs >= previousEndedMs;
-    // Position alone can't tell a sentence spoken between two attempts from one
-    // spoken during the retry; the clock can, and an announced retry is its own step.
-    const announcedRetry =
-      previousEndedMs !== null &&
-      currentStartedMs !== null &&
-      condensed.slice(lastToolIdx + 1).some((between) => {
-        const spokenMs =
-          between?.kind === "narration"
-            ? parseUtcIsoMs(between.timestamp)
-            : null;
-        return (
-          spokenMs !== null &&
-          spokenMs >= previousEndedMs &&
-          spokenMs < currentStartedMs
-        );
-      });
+    const announcedRetry = condensed
+      .slice(lastToolIdx + 1)
+      .some((between) => between?.kind === "narration");
     if (
       prevTool &&
+      entry.reason === undefined &&
+      prevTool.reason === undefined &&
       entry.toolName !== undefined &&
       prevTool.toolName === entry.toolName &&
       (prevTool.displayLabel === undefined ||
@@ -1079,78 +1113,93 @@ function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
-function findActivityBlockIndex(blocks: BlockState[], entryId: string): number {
-  return blocks.findIndex((block) =>
-    block.activity.some((entry) => entry.id === entryId),
-  );
-}
-
 function appendActivity(
   blocks: BlockState[],
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
-  // Mirrors NarratorState._activity_bucket_label: narration renders inside the
-  // design step it explains, so it stays in design activity even mid-run.
-  if (entry.kind === "narration") {
+  const bucket = entry.activityBucket;
+  const index =
+    bucket?.kind === "block"
+      ? blocks.findIndex(
+          (block) => block.workflowRunBlockId === bucket.workflow_run_block_id,
+        )
+      : -1;
+  if (index === -1) {
     return {
       blocks,
-      designActivity: appendCapped(
-        designActivity,
-        entry,
-        MAX_DESIGN_ACTIVITY_ENTRIES,
-      ),
+      designActivity: designActivity.some((saved) => saved.id === entry.id)
+        ? designActivity
+        : appendCapped(designActivity, entry, MAX_DESIGN_ACTIVITY_ENTRIES),
     };
   }
-  // A run tool's result must rejoin its call's bucket. The run flips the active
-  // block between the call and the result, so routing the result to the live
-  // active block would split the call/result pair across buckets and it could
-  // never fold (mirrors the backend NarratorState._activity_bucket_label fix).
-  if (
-    entry.kind === "tool_result" &&
-    entry.toolName !== undefined &&
-    RUN_TOOLS.has(entry.toolName)
-  ) {
-    const callId = `tc-${toolCallIdOf(entry) ?? ""}`;
-    if (designActivity.some((e) => e.id === callId)) {
-      return {
-        blocks,
-        designActivity: appendCapped(
-          designActivity,
-          entry,
-          MAX_DESIGN_ACTIVITY_ENTRIES,
-        ),
-      };
-    }
-    const callBlockIdx = findActivityBlockIndex(blocks, callId);
-    if (callBlockIdx !== -1) {
-      const nextBlocks = blocks.slice();
-      const callBlock = nextBlocks[callBlockIdx]!;
-      nextBlocks[callBlockIdx] = {
-        ...callBlock,
-        activity: appendCapped(callBlock.activity, entry, MAX_ACTIVITY_ENTRIES),
-      };
-      return { blocks: nextBlocks, designActivity };
-    }
-  }
-  const activeIdx = blocks.findIndex((b) => b.state === "running");
-  if (activeIdx === -1) {
-    return {
-      blocks,
-      designActivity: appendCapped(
-        designActivity,
-        entry,
-        MAX_DESIGN_ACTIVITY_ENTRIES,
-      ),
-    };
-  }
-  const nextBlocks = blocks.slice();
-  const active = nextBlocks[activeIdx]!;
-  nextBlocks[activeIdx] = {
-    ...active,
-    activity: appendCapped(active.activity, entry, MAX_ACTIVITY_ENTRIES),
+  const next = blocks.slice();
+  const block = next[index]!;
+  next[index] = {
+    ...block,
+    activity: block.activity.some((saved) => saved.id === entry.id)
+      ? block.activity
+      : appendCapped(block.activity, entry, MAX_ACTIVITY_ENTRIES),
   };
-  return { blocks: nextBlocks, designActivity };
+  return { blocks: next, designActivity };
+}
+
+function appendToolActivity(prev: TurnNarrativeState, entry: ActivityEntry) {
+  const callId = toolCallIdOf(entry)!;
+  const known = prev.callPresentations?.[callId];
+  const active = prev.blocks.find((block) => block.state === "running");
+  const bucket =
+    known?.bucket ??
+    entry.activityBucket ??
+    (entry.kind === "tool_call" && active?.workflowRunBlockId
+      ? {
+          kind: "block" as const,
+          workflow_run_block_id: active.workflowRunBlockId,
+        }
+      : { kind: "design" as const });
+  const presentation: CallPresentation = known ?? {
+    bucket,
+    reason: entry.reason,
+    startedAt: entry.activityStartedAt ?? entry.timestamp,
+  };
+  const immutable = {
+    ...entry,
+    activityBucket: presentation.bucket,
+    reason: presentation.reason,
+    activityStartedAt: presentation.startedAt,
+  };
+  return {
+    ...appendActivity(prev.blocks, prev.designActivity, immutable),
+    callPresentations: { ...prev.callPresentations, [callId]: presentation },
+  };
+}
+
+function indexCallPresentations(
+  entries: ActivityEntry[],
+  blocks: BlockState[],
+): Record<string, CallPresentation> {
+  const index: Record<string, CallPresentation> = {};
+  const record = (entry: ActivityEntry, bucket: ActivityBucket) => {
+    const id = toolCallIdOf(entry);
+    if (id !== undefined && index[id] === undefined)
+      index[id] = {
+        bucket: entry.activityBucket ?? bucket,
+        reason: entry.reason,
+        startedAt: entry.activityStartedAt ?? entry.timestamp,
+      };
+  };
+  entries.forEach((entry) => record(entry, { kind: "design" }));
+  blocks.forEach((block) =>
+    block.activity.forEach((entry) =>
+      record(
+        entry,
+        block.workflowRunBlockId
+          ? { kind: "block", workflow_run_block_id: block.workflowRunBlockId }
+          : { kind: "design" },
+      ),
+    ),
+  );
+  return index;
 }
 
 function attachCodeDiffsToActivity(
@@ -1171,7 +1220,9 @@ function attachCodeDiffsToActivity(
     return { blocks, designActivity: nextDesignActivity };
   }
 
-  const blockIndex = findActivityBlockIndex(blocks, targetId);
+  const blockIndex = blocks.findIndex((block) =>
+    block.activity.some((entry) => entry.id === targetId),
+  );
   if (blockIndex === -1) return { blocks, designActivity };
 
   const nextBlocks = blocks.slice();
@@ -1451,15 +1502,15 @@ export function applyNarrativeEvent(
           codegenProgress: null,
         };
       }
-      const { blocks, designActivity } = appendActivity(
-        prev.blocks,
-        prev.designActivity,
+      const { blocks, designActivity, callPresentations } = appendToolActivity(
+        prev,
         entry,
       );
       return {
         ...prev,
         blocks,
         designActivity,
+        callPresentations,
         codegenProgress: null,
       };
     }
@@ -1471,15 +1522,15 @@ export function applyNarrativeEvent(
         : prev.workPlan;
       const entry = buildActivityFromToolResult(event);
       if (!entry) return { ...prev, workPlan };
-      const { blocks, designActivity } = appendActivity(
-        prev.blocks,
-        prev.designActivity,
+      const { blocks, designActivity, callPresentations } = appendToolActivity(
+        prev,
         entry,
       );
       return {
         ...prev,
         blocks,
         designActivity,
+        callPresentations,
         workPlan,
       };
     }
@@ -1635,6 +1686,12 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       id: o.id,
+      reason: actionReason(o.reason),
+      activityBucket: parseActivityBucket(o.activityBucket),
+      activityStartedAt:
+        typeof o.activityStartedAt === "string"
+          ? o.activityStartedAt
+          : undefined,
       timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
     });
   }
@@ -1890,6 +1947,10 @@ export function hydrateNarrativeFromPayload(
     draft,
     blocks: stoppedBlocks,
     designActivity: normalizeActivityEntries(payload.designActivity),
+    callPresentations: indexCallPresentations(
+      normalizeActivityEntries(payload.designActivity),
+      stoppedBlocks,
+    ),
     terminal,
     terminalMessage:
       typeof payload.terminalMessage === "string"

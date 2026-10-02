@@ -548,6 +548,7 @@ def block_yaml_to_block(
             data_schema=block_yaml.data_schema,
             user_owned_goal=block_yaml.user_owned_goal,
             goal_needs_regeneration=block_yaml.goal_needs_regeneration,
+            code_edited_by_hand=block_yaml.code_edited_by_hand,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(

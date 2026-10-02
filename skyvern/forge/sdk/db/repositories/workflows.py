@@ -1332,6 +1332,10 @@ class WorkflowsRepository(BaseRepository):
         round-trip.  That trade-off is deliberate — the alternative (sync
         every credential subclass's columns on every write) pulls a
         significant amount of orthogonal logic into this path.
+
+        The one exception is which ``credential_id`` each ``CredentialParameter``
+        key is bound to: run search dates those bindings by their
+        ``credential_parameters`` rows, so they are kept current here.
         """
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -1448,7 +1452,7 @@ class WorkflowsRepository(BaseRepository):
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], str | None]:
         """Soft-delete a workflow and its active schedules in a single DB transaction."""
         async with self.Session() as session:
             select_query = (
@@ -1477,7 +1481,10 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id is not None:
                 update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
-            await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+            workflow_result = await session.execute(
+                update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
+            )
+            deleted_workflow_id = workflow_result.scalars().first()
             recording_delete_query = update(BrowserRecordingModel).where(
                 BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
                 BrowserRecordingModel.deleted_at.is_(None),
@@ -1488,7 +1495,7 @@ class WorkflowsRepository(BaseRepository):
                 )
             await session.execute(recording_delete_query.values(deleted_at=deleted_at))
             await session.commit()
-            return schedule_ids
+            return schedule_ids, deleted_workflow_id
 
     @db_operation("add_workflow_template")
     async def add_workflow_template(

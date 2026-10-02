@@ -786,6 +786,7 @@ function PasswordCredentialContent({
         </div>
         <div className="relative w-full">
           <Input
+            data-tour="credential-username"
             value={username}
             onChange={(e) => updateValues({ username: e.target.value })}
             readOnly={valuesReadOnly}
@@ -822,6 +823,7 @@ function PasswordCredentialContent({
         ) : (
           <div className="relative w-full">
             <Input
+              data-tour="credential-password"
               className="pr-9"
               type={showPassword ? "text" : "password"}
               value={password}

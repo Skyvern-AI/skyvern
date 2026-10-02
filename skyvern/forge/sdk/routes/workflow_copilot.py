@@ -25,6 +25,7 @@ from skyvern.config import settings
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.goal_suggestion import suggest_goal_from_code
 from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_REASON,
     InterruptedTurnFacts,
@@ -105,6 +107,7 @@ from skyvern.forge.sdk.db.exceptions import (
     DuplicateCopilotTurnError,
     NotFoundError,
 )
+from skyvern.forge.sdk.forge_log import _generated_log_value
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -133,6 +136,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotCredentialResponseRequest,
     WorkflowCopilotDisableAutoAcceptRequest,
+    WorkflowCopilotGoalSuggestionRequest,
+    WorkflowCopilotGoalSuggestionResponse,
     WorkflowCopilotMessageFeedbackRequest,
     WorkflowCopilotMessageFeedbackResponse,
     WorkflowCopilotProcessingUpdate,
@@ -146,8 +151,10 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.workflows import (
@@ -198,14 +205,18 @@ def _workflow_copilot_ingress_log_fields(message: str) -> dict[str, int]:
 
 
 @contextmanager
-def bind_copilot_session_id(chat_id: str | None) -> Iterator[None]:
+def _bind_copilot_session_id(chat_id: str | WorkflowCopilotChat | None) -> Iterator[None]:
     # In-place mutation (not scoped()) preserves request-scoped fields the FastAPI middleware wrote.
     ctx = skyvern_context.current()
     if ctx is None or chat_id is None:
         yield
         return
     prev = ctx.copilot_session_id
-    ctx.copilot_session_id = chat_id
+    ctx.copilot_session_id = (
+        _generated_log_value("copilot_session_id", chat_id.workflow_copilot_chat_id)
+        if isinstance(chat_id, WorkflowCopilotChat)
+        else chat_id
+    )
     try:
         yield
     finally:
@@ -1713,9 +1724,10 @@ async def _finalise_normal_turn(
         # This turn no longer owns the candidate, so it has no standing to commit canonical state.
         _discard_superseded_proposal(agent_result)
 
+    applied_workflow = agent_result.updated_workflow
     if _should_commit_staged_workflow(chat.auto_accept, agent_result):
         try:
-            await _commit_staged_workflow(
+            applied_workflow = await _commit_staged_workflow(
                 organization_id=organization_id,
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat.workflow_permanent_id,
@@ -1805,6 +1817,23 @@ async def _finalise_normal_turn(
     browser_ablation_metadata = (
         agent_result.browser_ablation_metadata if isinstance(agent_result, AgentResult) else None
     )
+    changed_fields = (
+        workflow_changed_fields(original_workflow, applied_workflow)
+        if (workflow_applied or _staged_commit_landed()) and applied_workflow is not None
+        else ()
+    )
+    if changed_fields:
+        await app.AGENT_FUNCTION.record_audit_event(
+            get_request_principal(),
+            AuditEvent(
+                organization_id=organization_id,
+                action="workflow.update",
+                resource_type="workflow",
+                resource_id=chat.workflow_permanent_id,
+                changed_fields=changed_fields,
+            ),
+        )
+
     if isinstance(browser_ablation_metadata, dict):
         await stream.send(
             WorkflowCopilotBrowserAblationResponseUpdate(
@@ -1873,14 +1902,14 @@ async def _commit_staged_workflow(
     proposal: dict[str, Any] | None = None,
     metadata: CopilotProposalMetadata | None = None,
     clear_persisted_completion_contract: bool = False,
-) -> None:
+) -> Workflow | None:
     """Overwrite the current workflow version in place (auto-accept path).
 
     Manual Accept via /workflow/copilot/apply-proposed-workflow creates a new
     version instead. Field list must stay in lockstep with ``_update_workflow``.
     """
     if staged_workflow is None:
-        return
+        return None
     if proposal is not None:
         request = await _resolve_proposal_for_accept(
             proposal, organization_id=organization_id, workflow_permanent_id=staged_workflow.workflow_permanent_id
@@ -1909,7 +1938,7 @@ async def _commit_staged_workflow(
         organization_id=organization_id,
     )
     title = _accepted_workflow_title(staged_workflow.title, canonical, metadata)
-    await app.WORKFLOW_SERVICE.update_workflow_definition(
+    return await app.WORKFLOW_SERVICE.update_workflow_definition(
         workflow_id=workflow_id,
         organization_id=organization_id,
         title=title,
@@ -2777,7 +2806,7 @@ async def _new_copilot_chat_post(
                     artifacts=artifacts,
                 )
 
-            with bind_copilot_session_id(chat.workflow_copilot_chat_id):
+            with _bind_copilot_session_id(chat):
                 agent_result = await run_copilot_agent(
                     stream=stream,
                     organization_id=organization.organization_id,
@@ -4246,12 +4275,13 @@ async def workflow_copilot_apply_proposed_workflow(
             )
 
     try:
-        new_workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        new_workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
             request=yaml_request,
             workflow_permanent_id=chat.workflow_permanent_id,
             edited_by="copilot",
             validate_code_block_templates=False,
+            return_write_result=True,
         )
     except Exception:
         if metadata is not None and original_disposition is not None:
@@ -4319,6 +4349,17 @@ async def workflow_copilot_apply_proposed_workflow(
         workflow_permanent_id=chat.workflow_permanent_id,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
     )
+    if changed_fields:
+        await app.AGENT_FUNCTION.record_audit_event(
+            get_request_principal(),
+            AuditEvent(
+                organization_id=organization.organization_id,
+                action="workflow.update",
+                resource_type="workflow",
+                resource_id=chat.workflow_permanent_id,
+                changed_fields=changed_fields,
+            ),
+        )
     return new_workflow
 
 
@@ -4397,6 +4438,33 @@ def convert_to_history_messages(
         )
         for message in messages
     ]
+
+
+@base_router.post("/workflow/copilot/suggest-goal", include_in_schema=False)
+async def workflow_copilot_suggest_goal(
+    suggestion_request: WorkflowCopilotGoalSuggestionRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowCopilotGoalSuggestionResponse:
+    """Write a Goal from a hand-edited code block's code. Nothing is saved; the editor offers it for acceptance."""
+    try:
+        goal = await suggest_goal_from_code(
+            organization.organization_id,
+            label=suggestion_request.label,
+            code=suggestion_request.code,
+            current_goal=suggestion_request.current_goal,
+            parameter_keys=suggestion_request.parameter_keys,
+        )
+    except TimeoutError:
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Goal suggestion timed out")
+    except Exception as exc:
+        # A provider traceback can quote the prompt, which carries the block's code.
+        LOG.warning(
+            "copilot_goal_suggestion_failed",
+            organization_id=organization.organization_id,
+            exception_type=type(exc).__name__,
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Goal suggestion failed")
+    return WorkflowCopilotGoalSuggestionResponse(goal=goal)
 
 
 @base_router.post("/workflow/copilot/convert-yaml-to-blocks", include_in_schema=False)

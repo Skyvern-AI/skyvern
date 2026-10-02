@@ -1,8 +1,9 @@
 import ipaddress
 import socket
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from typing import Annotated, Any
-from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from pydantic import AfterValidator, AnyHttpUrl, HttpUrl, ValidationError, ValidationInfo
@@ -87,6 +88,43 @@ def redact_url_for_display(url: str | None) -> str | None:
     path_marker = parsed.path if parsed.path in {"", "/"} else "/…"
     query_marker = "?…" if "?" in url.partition("#")[0] else ""
     return f"{parsed.scheme}://{display_host}{path_marker}{query_marker}"
+
+
+def signed_url_ttl_remaining_seconds(url: str, now: datetime) -> float | None:
+    try:
+        query = dict(parse_qsl(urlparse(url).query, keep_blank_values=True))
+        expires_at: datetime | None = None
+        for prefix in ("X-Amz", "X-Goog"):
+            date_key = f"{prefix}-Date"
+            expires_key = f"{prefix}-Expires"
+            if date_key in query and expires_key in query:
+                signed_at = datetime.strptime(query[date_key], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+                expires_at = signed_at + timedelta(seconds=float(query[expires_key]))
+                break
+        if expires_at is None:
+            if "Expires" not in query or not any(
+                signer in query for signer in ("Signature", "AWSAccessKeyId", "Key-Pair-Id")
+            ):
+                return None
+            expires_epoch = float(query["Expires"])
+            if expires_epoch <= 1_000_000_000:
+                return None
+            expires_at = datetime.fromtimestamp(expires_epoch, tz=UTC)
+        return (expires_at - now).total_seconds()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def redacted_url_origin(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or parsed.hostname is None:
+            return "<redacted>"
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except (TypeError, ValueError):
+        return "<redacted>"
 
 
 def collapse_duplicate_www_prefix(url: str) -> str:

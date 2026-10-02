@@ -136,6 +136,7 @@ function response(
   return {
     onboarding_state: {
       tour_completed_at: null,
+      studio_tour_completed_at: null,
       modal_dismissed_at: null,
       first_save_at: null,
       first_run_at: null,

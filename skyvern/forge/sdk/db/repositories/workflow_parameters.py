@@ -33,6 +33,7 @@ from skyvern.forge.sdk.db.exceptions import (
     DuplicateCopilotTurnError,
     NotFoundError,
 )
+from skyvern.forge.sdk.db.id import generate_credential_parameter_id
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -491,7 +492,8 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_id: str,
         parameters: list[PARAMETER_TYPE],
     ) -> None:
-        """Reconcile persisted WorkflowParameter + OutputParameter rows against ``parameters``.
+        """Reconcile persisted WorkflowParameter + OutputParameter rows, and each CredentialParameter row's
+        ``credential_id`` binding, against ``parameters``.
 
         Preserves primary keys on in-place updates (workflow-run FKs reference
         them) and mutates each matched incoming parameter so its ID equals the
@@ -581,6 +583,49 @@ class WorkflowParametersRepository(BaseRepository):
                 continue
             if row.deleted_at is None:
                 row.deleted_at = now
+
+        desired_credentials = {p.key: p for p in parameters if isinstance(p, CredentialParameter)}
+        live_credential_rows = (
+            await session.scalars(
+                select(CredentialParameterModel)
+                .filter_by(workflow_id=workflow_id)
+                .where(CredentialParameterModel.deleted_at.is_(None))
+            )
+        ).all()
+        for row in live_credential_rows:
+            desired = desired_credentials.pop(row.key, None)
+            if desired is None:
+                row.deleted_at = now
+            elif row.credential_id != desired.credential_id:
+                # Run search dates a binding by its row, so the replaced credential stays as a closed row.
+                session.add(
+                    CredentialParameterModel(
+                        workflow_id=workflow_id,
+                        key=row.key,
+                        credential_id=row.credential_id,
+                        created_at=row.created_at,
+                        deleted_at=now,
+                    )
+                )
+                row.credential_id = desired.credential_id
+                row.created_at = now
+        for parameter in desired_credentials.values():
+            parameter_id = parameter.credential_parameter_id
+            if await session.get(CredentialParameterModel, parameter_id) is not None:
+                parameter_id = generate_credential_parameter_id()
+            session.add(
+                CredentialParameterModel(
+                    credential_parameter_id=parameter_id,
+                    workflow_id=workflow_id,
+                    key=parameter.key,
+                    description=parameter.description,
+                    credential_id=parameter.credential_id,
+                    credential_ids=parameter.credential_ids,
+                    selection_strategy=parameter.selection_strategy,
+                    fallback_credential_ids=parameter.fallback_credential_ids,
+                    fallback_trigger=parameter.fallback_trigger,
+                )
+            )
 
     @db_operation("get_workflow_output_parameters")
     async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:

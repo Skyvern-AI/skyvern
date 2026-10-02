@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +21,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy import select
 
 import skyvern.webeye.navigation as navigation_module
+from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE, FailedToNavigateToUrl
@@ -40,8 +42,10 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
+    DOCUMENT_FAILURE_ATTRIBUTE,
     RECORDED_FAILURE_CAPTURE_MAX_CHARS,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    DocumentFailureReceipt,
     PendingAction,
     PlaywrightInputDefaults,
     RecordingKeyboard,
@@ -81,6 +85,7 @@ from skyvern.webeye.playwright_input import (
     playwright_input_defaults_for_page,
     register_playwright_input_context,
 )
+from skyvern.webeye.skycdp.facade.network_events import NetworkRequest
 from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 
 
@@ -2293,12 +2298,15 @@ def _release_guard(allowed_url: str = "https://dash.example.com/account/login") 
 
 
 @pytest.mark.asyncio
-async def test_off_site_credential_fill_is_refused_before_release() -> None:
+@pytest.mark.parametrize("through_main_frame", [False, True])
+async def test_off_site_credential_fill_is_refused_before_release(through_main_frame: bool) -> None:
     fake = FakePage()
+    fake.main_frame = SimpleNamespace(locator=lambda selector: fake.inner)  # type: ignore[attr-defined]
     fake.inner.frame_url = "https://accounts.example.org/challenge/pwd"
     page = RecordingPage(fake, credential_release_guard=_release_guard())
+    owner = page.main_frame if through_main_frame else page
     with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
-        await page.locator('input[type="password"]').fill("Sup3rSecretPW!")
+        await owner.locator('input[type="password"]').fill("Sup3rSecretPW!")
     assert "login_credentials" in str(exc_info.value)
     assert re.search(r"https://example\.org", str(exc_info.value))
     assert not any(call.startswith("fill:") for call in fake.inner.calls)
@@ -3280,4 +3288,862 @@ async def test_a_cancelled_run_is_not_reported_as_a_navigation_verdict(monkeypat
     assert (
         await navigation_module.reported_nav_error_code(failure, "https://x.test/")
         == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    )
+
+
+class FakeDocumentRequest:
+    def __init__(
+        self,
+        url: str,
+        frame: FakeFrame,
+        *,
+        navigation: bool,
+        redirected_from: FakeDocumentRequest | None,
+        post_data: str | None,
+        headers: dict[str, str],
+    ) -> None:
+        self.url = url
+        self.frame = frame
+        self.redirected_from = redirected_from
+        self.post_data = post_data
+        self.headers = headers
+        self.failure: str | None = None
+        self._navigation = navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._navigation
+
+
+class DocumentEventPage(FakePage):
+    """Fires request/response/requestfailed in the order the driver does for one document request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_frame = FakeFrame("about:blank")
+        self.listeners: dict[str, list[Callable[[Any], None]]] = {}
+
+    def on(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.listeners[event].remove(handler)
+
+    def navigate(
+        self,
+        url: str,
+        *,
+        redirected_from: FakeDocumentRequest | None = None,
+        frame: FakeFrame | None = None,
+        navigation: bool = True,
+        status: int | None = None,
+        failure: str | None = None,
+        post_data: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FakeDocumentRequest:
+        request = FakeDocumentRequest(
+            url,
+            self.main_frame if frame is None else frame,
+            navigation=navigation,
+            redirected_from=redirected_from,
+            post_data=post_data,
+            headers=headers or {},
+        )
+        for handler in list(self.listeners.get("request", [])):
+            handler(request)
+        if status is not None:
+            for handler in list(self.listeners.get("response", [])):
+                handler(SimpleNamespace(request=request, status=status))
+        if failure is not None:
+            request.failure = failure
+            for handler in list(self.listeners.get("requestfailed", [])):
+                handler(request)
+        return request
+
+
+async def _submit_then_wait(
+    page: DocumentEventPage,
+    recording: RecordingPage,
+    during_submit: Callable[[DocumentEventPage], object],
+    *,
+    before_wait: Callable[[], Awaitable[object]] | None = None,
+    wait_error: BaseException | None = None,
+    page_level_wait: bool = False,
+) -> BaseException:
+    error = wait_error or PlaywrightTimeoutError("Locator.wait_for: Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        during_submit(page)
+
+    async def wait_for(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.inner.wait_for = wait_for  # type: ignore[method-assign]
+    page.wait_for_selector = wait_for  # type: ignore[attr-defined]
+    await recording.locator("button[type=submit]").click()
+    if before_wait is not None:
+        await before_wait()
+    with pytest.raises(type(error)) as caught:
+        if page_level_wait:
+            await recording.wait_for_selector("#welcome", timeout=5000)
+        else:
+            await recording.locator("#welcome").wait_for(timeout=5000)
+    return caught.value
+
+
+def _redirect_to_a_closed_connection(page: DocumentEventPage) -> None:
+    login = page.navigate(
+        "https://user:pw-secret@app.fixture.test:8443/login?token=query-secret",
+        status=302,
+        post_data="password=body-secret",
+        headers={"cookie": "sid=cookie-secret"},
+    )
+    page.navigate(
+        "https://app.fixture.test:8443/home?session=redirect-secret",
+        redirected_from=login,
+        failure="net::ERR_EMPTY_RESPONSE",
+    )
+
+
+_CLOSED_CONNECTION_RECEIPT = DocumentFailureReceipt(
+    attempt_id=1,
+    origin="https://app.fixture.test:8443",
+    driver_code="net::ERR_EMPTY_RESPONSE",
+    response_status=None,
+    relation="associated",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_text",
+    [
+        pytest.param("Timeout 5000ms exceeded. net::ERR_CONNECTION_REFUSED", id="text_names_another_code"),
+        pytest.param("Locator.wait_for: Timeout 5000ms exceeded.", id="text_names_no_code"),
+    ],
+)
+async def test_a_wait_behind_a_failed_redirected_document_carries_the_driver_receipt(wait_text: str) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    error = await _submit_then_wait(
+        page, recording, _redirect_to_a_closed_connection, wait_error=PlaywrightTimeoutError(wait_text)
+    )
+
+    receipt = recording.failure_document_receipt(error)
+
+    assert receipt == _CLOSED_CONNECTION_RECEIPT
+    assert recording.failure_nav_error_code(error) is None
+    serialized = json.dumps(asdict(receipt))
+    for leaked in ("pw-secret", "query-secret", "body-secret", "cookie-secret", "redirect-secret", "/home", "/login"):
+        assert leaked not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "method", "argument"),
+    [
+        ("page", "wait_for_selector", "#welcome"),
+        ("page", "wait_for_url", "**/home"),
+        ("page", "wait_for_load_state", "load"),
+        ("keyboard", "press", "Enter"),
+        ("keyboard", "type", "text"),
+        ("keyboard", "down", "Shift"),
+        ("frame", "wait_for_selector", "#welcome"),
+    ],
+)
+@pytest.mark.parametrize("document", ["failed", "healthy", "other_tab"])
+async def test_a_page_level_call_behind_a_failed_document_carries_the_receipt(
+    owner: str, method: str, argument: str, document: str
+) -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    recording._wrap_page(other_tab)
+    error = PlaywrightTimeoutError(f"{method}: Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        if document == "failed":
+            _redirect_to_a_closed_connection(page)
+        elif document == "healthy":
+            _redirect_to_a_healthy_document(page)
+        else:
+            _redirect_to_a_closed_connection(other_tab)
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    page.inner.click = click  # type: ignore[method-assign]
+    setattr({"page": page, "keyboard": page.keyboard, "frame": page.main_frame}[owner], method, fail)
+    await recording.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await getattr(
+            {"page": recording, "keyboard": recording.keyboard, "frame": recording.main_frame}[owner], method
+        )(argument)
+
+    assert recording.failure_document_receipt(error) == (_CLOSED_CONNECTION_RECEIPT if document == "failed" else None)
+    assert recording.failure_page(error) is None
+    assert recording.failure_nav_error_code(error) is None
+    recording._detach_document_observers()
+    assert not any(page.listeners.values()) and not any(other_tab.listeners.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait", ["frame", "context", "expect_popup"])
+async def test_a_wait_after_a_failed_locator_call_keeps_that_calls_failure(wait: str) -> None:
+    page = DocumentEventPage()
+    page.context = SimpleNamespace()
+    recording = RecordingPage(page, strategy_aware_typing=True)
+    error = PlaywrightTimeoutError("Locator.click: Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        raise error
+
+    async def settle(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.main_frame.wait_for_selector = settle  # type: ignore[attr-defined]
+    page.context.wait_for_event = settle
+    page.expect_popup = lambda **kwargs: _ExpectEvent(settle)  # type: ignore[attr-defined]
+    with pytest.raises(PlaywrightTimeoutError):
+        await recording.locator("#submit").click()
+    if wait == "frame":
+        await recording.main_frame.wait_for_selector("#done")
+    elif wait == "context":
+        await recording.context.wait_for_event("page")
+    else:
+        async with recording.expect_popup():
+            pass
+
+    assert recording.failure_locator(error) is page.inner
+    assert recording.failure_page(error) is page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["wait_for_selector", "click"])
+@pytest.mark.parametrize("failed_tab", ["own", "other"])
+async def test_an_element_handle_call_binds_the_receipt_of_the_page_that_produced_it(
+    call: str, failed_tab: str
+) -> None:
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    class ElementHandle:
+        __module__ = "playwright.async_api"
+
+        async def wait_for_selector(self, selector: str, **kwargs: Any) -> None:
+            raise error
+
+        async def click(self, **kwargs: Any) -> None:
+            raise error
+
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    recording._wrap_page(other_tab)
+
+    async def query_selector(selector: str) -> ElementHandle:
+        return ElementHandle()
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page if failed_tab == "own" else other_tab)
+
+    page.query_selector = query_selector  # type: ignore[attr-defined]
+    page.inner.click = click  # type: ignore[method-assign]
+    form = await recording.query_selector("form")
+    await recording.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await (form.wait_for_selector("#welcome") if call == "wait_for_selector" else form.click())
+
+    assert recording.failure_document_receipt(error) == (_CLOSED_CONNECTION_RECEIPT if failed_tab == "own" else None)
+
+
+class _ExpectEvent:
+    """Playwright's expect_* context: the wait is awaited on the way out, unless the body raised."""
+
+    def __init__(self, wait: Callable[[], Awaitable[None]]) -> None:
+        self._wait = wait
+
+    async def __aenter__(self) -> SimpleNamespace:
+        self._waiter = asyncio.ensure_future(self._wait())
+        return SimpleNamespace(value=self._waiter)
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        if exc_info[1] is not None:
+            self._waiter.cancel()
+            return
+        await self._waiter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape",
+    ["gather", "expect_navigation", "expect_response_value", "frame_expect_navigation", "context_wait_for_event"],
+)
+async def test_a_wait_started_before_its_trigger_carries_the_receipt(shape: str) -> None:
+    page = DocumentEventPage()
+    page.context = SimpleNamespace()
+    recording = RecordingPage(page, strategy_aware_typing=True)
+    triggered = asyncio.Event()
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+        triggered.set()
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await triggered.wait()
+        raise error
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    page.expect_navigation = lambda **kwargs: _ExpectEvent(wait_then_fail)  # type: ignore[attr-defined]
+    page.expect_response = lambda *args, **kwargs: _ExpectEvent(wait_then_fail)  # type: ignore[attr-defined]
+    page.main_frame.expect_navigation = lambda **kwargs: _ExpectEvent(wait_then_fail)
+    page.context.wait_for_event = wait_then_fail
+    submit = recording.locator("button[type=submit]")
+
+    with pytest.raises(PlaywrightTimeoutError):
+        if shape == "gather":
+            await asyncio.gather(recording.wait_for_url("**/home"), submit.click())
+        elif shape == "expect_navigation":
+            async with recording.expect_navigation():
+                await submit.click()
+        elif shape == "expect_response_value":
+            async with recording.expect_response("**/home") as info:
+                await submit.click()
+                await info.value
+        elif shape == "frame_expect_navigation":
+            async with recording.main_frame.expect_navigation():
+                await submit.click()
+        else:
+            await asyncio.gather(recording.context.wait_for_event("page"), submit.click())
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_an_in_flight_wait_never_claims_a_document_older_than_itself() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    released = asyncio.Event()
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await released.wait()
+        raise error
+
+    async def evaluate(*args: Any, **kwargs: Any) -> None:
+        released.set()
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    await recording.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await asyncio.gather(recording.wait_for_url("**/home"), recording.evaluate("1"))
+
+    receipt = recording.failure_document_receipt(error)
+    assert receipt is not None and receipt.relation == "context"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_level_wait", [False, True], ids=["locator_wait", "page_wait"])
+async def test_a_document_failing_after_the_wait_raised_still_binds_the_receipt(page_level_wait: bool) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    in_flight: list[FakeDocumentRequest] = []
+
+    async def evaluate(expression: str) -> None:
+        return None
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    error = await _submit_then_wait(
+        page,
+        recording,
+        lambda page: in_flight.append(page.navigate("https://app.fixture.test:8443/home")),
+        page_level_wait=page_level_wait,
+    )
+    assert recording.failure_document_receipt(error) is None
+    await recording.evaluate("1")
+    in_flight[0].failure = "net::ERR_EMPTY_RESPONSE"
+    for handler in page.listeners["requestfailed"]:
+        handler(in_flight[0])
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+    assert vars(error)[DOCUMENT_FAILURE_ATTRIBUTE] == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_wait_raises_then_failing_probe_binds_then_requestfailed_fires() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    in_flight: list[FakeDocumentRequest] = []
+
+    async def evaluate(expression: str) -> None:
+        raise PlaywrightError("Execution context was destroyed")
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    error = await _submit_then_wait(
+        page, recording, lambda page: in_flight.append(page.navigate("https://app.fixture.test:8443/home"))
+    )
+    assert recording.failure_document_receipt(error) is None
+    assert vars(error).get(DOCUMENT_FAILURE_ATTRIBUTE) is None
+    with pytest.raises(PlaywrightError):
+        await recording.evaluate("1")
+    in_flight[0].failure = "net::ERR_EMPTY_RESPONSE"
+    for handler in page.listeners["requestfailed"]:
+        handler(in_flight[0])
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+    assert vars(error)[DOCUMENT_FAILURE_ATTRIBUTE] == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_an_older_wait_failing_after_a_newer_one_leaves_the_newer_receipt_associated() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    released = asyncio.Event()
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await released.wait()
+        raise PlaywrightTimeoutError("wait_for_url: Timeout 5000ms exceeded.")
+
+    async def newer_call() -> BaseException:
+        try:
+            return await _submit_then_wait(page, recording, _redirect_to_a_closed_connection)
+        finally:
+            released.set()
+
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    older, newer = await asyncio.gather(recording.wait_for_url("**/home"), newer_call(), return_exceptions=True)
+
+    assert isinstance(older, PlaywrightTimeoutError) and isinstance(newer, PlaywrightTimeoutError)
+    assert recording.failure_document_receipt(newer) == _CLOSED_CONNECTION_RECEIPT
+    assert vars(older).get(DOCUMENT_FAILURE_ATTRIBUTE) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_waits_on_two_tabs_never_borrow_each_others_receipt() -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    other_recording = recording._wrap_page(other_tab)
+    released = asyncio.Event()
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await released.wait()
+        raise PlaywrightTimeoutError("wait_for_url: Timeout 5000ms exceeded.")
+
+    async def fail_behind_a_closed_connection(*args: Any, **kwargs: Any) -> None:
+        try:
+            _redirect_to_a_closed_connection(other_tab)
+            raise PlaywrightTimeoutError("wait_for_url: Timeout 5000ms exceeded.")
+        finally:
+            released.set()
+
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    other_tab.wait_for_url = fail_behind_a_closed_connection  # type: ignore[attr-defined]
+    own, foreign = await asyncio.gather(
+        recording.wait_for_url("**/home"), other_recording.wait_for_url("**/home"), return_exceptions=True
+    )
+
+    assert isinstance(own, PlaywrightTimeoutError) and isinstance(foreign, PlaywrightTimeoutError)
+    assert recording.failure_document_receipt(foreign) == _CLOSED_CONNECTION_RECEIPT
+    assert recording.failure_document_receipt(own) is None
+
+
+@pytest.mark.asyncio
+async def test_a_document_failure_without_a_driver_code_keeps_the_code_unknown() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+
+    error = await _submit_then_wait(
+        page,
+        recording,
+        lambda page: page.navigate("http://10.0.0.7/report", status=503, failure="connection closed"),
+    )
+
+    assert recording.failure_document_receipt(error) == DocumentFailureReceipt(
+        attempt_id=1, origin="http://10.0.0.7", driver_code=None, response_status=503, relation="associated"
+    )
+
+
+def _redirect_to_a_healthy_document(page: DocumentEventPage) -> None:
+    login = page.navigate("https://app.fixture.test/login", status=302)
+    page.navigate("https://app.fixture.test/home", redirected_from=login, status=200)
+
+
+def _failed_subresource(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/home", status=200)
+    page.navigate("https://cdn.fixture.test/app.js", navigation=False, failure="net::ERR_EMPTY_RESPONSE")
+
+
+def _failed_iframe_document(page: DocumentEventPage) -> None:
+    page.navigate(
+        "https://widget.fixture.test/",
+        frame=FakeFrame("https://widget.fixture.test/"),
+        failure="net::ERR_EMPTY_RESPONSE",
+    )
+
+
+def _superseded_failure(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/home", failure="net::ERR_EMPTY_RESPONSE")
+    page.navigate("https://app.fixture.test/retry", status=200)
+
+
+def _navigation_that_became_a_download(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/report.pdf", status=200, failure="net::ERR_ABORTED")
+
+
+def _cancelled_navigation(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/slow", failure="net::ERR_ABORTED")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "during_submit",
+    [
+        pytest.param(_redirect_to_a_healthy_document, id="redirect_then_200"),
+        pytest.param(_failed_subresource, id="subresource"),
+        pytest.param(_failed_iframe_document, id="iframe"),
+        pytest.param(_superseded_failure, id="superseded_by_a_new_document"),
+        pytest.param(_navigation_that_became_a_download, id="download"),
+        pytest.param(_cancelled_navigation, id="err_aborted"),
+        pytest.param(lambda page: None, id="no_document"),
+    ],
+)
+async def test_only_a_failed_main_document_on_the_waiting_page_is_reported(
+    during_submit: Callable[[DocumentEventPage], object],
+) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+
+    error = await _submit_then_wait(page, recording, during_submit)
+
+    assert recording.failure_document_receipt(error) is None
+    assert recording.failure_document_receipt(RuntimeError("net::ERR_EMPTY_RESPONSE")) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "method"), [("page", "goto"), ("page", "reload"), ("page", "go_back"), ("frame", "goto")]
+)
+async def test_a_failed_navigation_reports_its_own_code_and_no_document_receipt(
+    monkeypatch: pytest.MonkeyPatch, owner: str, method: str
+) -> None:
+    monkeypatch.setattr(navigation_module, "_unresolvable_navigation_host", AsyncMock(return_value=False))
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    error = PlaywrightError(f"Page.{method}: net::ERR_EMPTY_RESPONSE at https://app.fixture.test:8443/home")
+
+    async def navigate(*args: Any, **kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+        raise error
+
+    setattr(page if owner == "page" else page.main_frame, method, navigate)
+    with pytest.raises(PlaywrightError):
+        await getattr(recording if owner == "page" else recording.main_frame, method)(
+            *(["https://app.fixture.test:8443/login"] if method == "goto" else [])
+        )
+
+    assert recording.failure_nav_error_code(error) == "net::ERR_EMPTY_RESPONSE"
+    assert recording.failure_document_receipt(error) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["locator_wait_for", "locator_click", "expect_navigation", "expect_response_value"])
+async def test_a_call_cancelled_behind_a_failed_document_binds_the_receipt_on_every_path(shape: str) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    triggered = asyncio.Event()
+
+    async def submit(*args: Any, **kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+        triggered.set()
+
+    async def cancel(*args: Any, **kwargs: Any) -> None:
+        await triggered.wait()
+        raise asyncio.CancelledError()
+
+    page.inner.press = submit  # type: ignore[method-assign]
+    page.inner.wait_for = cancel  # type: ignore[method-assign]
+    page.inner.click = cancel  # type: ignore[method-assign]
+    page.expect_navigation = lambda **kwargs: _ExpectEvent(cancel)  # type: ignore[attr-defined]
+    page.expect_response = lambda *args, **kwargs: _ExpectEvent(cancel)  # type: ignore[attr-defined]
+    password = recording.locator("input[name=password]")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        if shape == "expect_navigation":
+            async with recording.expect_navigation():
+                await password.press("Enter")
+        elif shape == "expect_response_value":
+            async with recording.expect_response("**/home") as info:
+                await password.press("Enter")
+                await info.value
+        else:
+            await password.press("Enter")
+            await getattr(recording.locator("#welcome"), shape.removeprefix("locator_"))()
+
+    assert recording.failure_document_receipt(caught.value) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_a_document_that_failed_before_the_trigger_is_not_the_waits_cause() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    page.navigate("https://app.fixture.test/", failure="net::ERR_EMPTY_RESPONSE")
+
+    error = await _submit_then_wait(page, recording, lambda page: None)
+
+    receipt = recording.failure_document_receipt(error)
+    assert receipt is not None and receipt.relation == "context"
+
+
+@pytest.mark.asyncio
+async def test_a_sync_frame_query_between_trigger_and_wait_keeps_the_receipt_associated() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    page.main_frame.is_detached = lambda: False  # type: ignore[attr-defined]
+
+    async def touch_frames() -> None:
+        assert recording.main_frame.is_detached() is False
+
+    error = await _submit_then_wait(page, recording, _redirect_to_a_closed_connection, before_wait=touch_frames)
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_an_older_or_wrapped_document_failure_is_context_not_cause() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+
+    error = await _submit_then_wait(
+        page, recording, _redirect_to_a_closed_connection, before_wait=lambda: recording.wait_for_load_state()
+    )
+    older = recording.failure_document_receipt(error)
+    authored = recording.failure_document_receipt(RuntimeError("net::ERR_EMPTY_RESPONSE"))
+
+    assert older is not None and older.relation == "context"
+    assert authored is not None and authored.relation == "context"
+    await recording.wait_for_load_state()
+    assert recording.failure_document_receipt(RuntimeError("net::ERR_EMPTY_RESPONSE")) is None
+
+
+@pytest.mark.asyncio
+async def test_inline_block_output_carries_the_receipt_beside_the_unchanged_wait_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run(fail: bool) -> BlockResult:
+        page = DocumentEventPage()
+        origin = "https://tenant-secret.fixture.test:8443"
+
+        async def click(**kwargs: Any) -> None:
+            login = page.navigate(f"{origin}/login?token=query-secret", status=302)
+            if fail:
+                page.navigate(f"{origin}/home", redirected_from=login, failure="net::ERR_EMPTY_RESPONSE")
+            else:
+                page.navigate(f"{origin}/home", redirected_from=login, status=200)
+
+        async def wait_for(**kwargs: Any) -> None:
+            raise PlaywrightTimeoutError("Locator.wait_for: Timeout 5000ms exceeded.")
+
+        page.inner.click = click  # type: ignore[method-assign]
+        page.inner.wait_for = wait_for  # type: ignore[method-assign]
+        context = FakeWorkflowRunContext(secrets={"tenant": "tenant-secret"})
+        _patch_execute_environment(monkeypatch, page, context)
+        block = _make_code_block(
+            "await page.locator('button[type=submit]').click()\nawait page.locator('#welcome').wait_for(timeout=5000)"
+        )
+        return await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    result = await run(True)
+    control = await run(False)
+
+    assert result.status == BlockStatus.failed
+    assert (result.failure_reason, result.error_codes) == (control.failure_reason, control.error_codes)
+    output = result.output_parameter_value
+    assert isinstance(output, dict)
+    assert output["associated_navigation"] == {
+        "attempt_id": 1,
+        "origin": "https://*****.fixture.test:8443",
+        "driver_code": "net::ERR_EMPTY_RESPONSE",
+        "response_status": None,
+        "relation": "associated",
+    }
+    assert {key: value for key, value in output.items() if key != "associated_navigation"} == (
+        control.output_parameter_value
+    )
+    assert isinstance(control.output_parameter_value, dict)
+    assert "associated_navigation" not in control.output_parameter_value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("after_the_wait", "error_codes"),
+    [
+        pytest.param(
+            "    raise ErrorCode('LOGIN_FAILED', 'login page never loaded')\n", ["LOGIN_FAILED"], id="declared"
+        ),
+        pytest.param("    pass\nawait sleep(5)\n", [], id="block_timeout"),
+    ],
+)
+async def test_inline_declared_and_timeout_failures_carry_the_receipt_as_context(
+    monkeypatch: pytest.MonkeyPatch, after_the_wait: str, error_codes: list[str]
+) -> None:
+    page = DocumentEventPage()
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+
+    async def wait_for(**kwargs: Any) -> None:
+        raise PlaywrightTimeoutError("Locator.wait_for: Timeout 5000ms exceeded.")
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.inner.wait_for = wait_for  # type: ignore[method-assign]
+    _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    monkeypatch.setattr(settings, "CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS", 0.2)
+    block = _make_code_block(
+        "await page.locator('button[type=submit]').click()\n"
+        "try:\n"
+        "    await page.locator('#welcome').wait_for(timeout=5000)\n"
+        "except Exception:\n" + after_the_wait
+    )
+    block.error_code_mapping = {"LOGIN_FAILED": "The login page never loaded"}
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.status == BlockStatus.failed
+    assert result.error_codes == error_codes
+    assert isinstance(result.output_parameter_value, dict)
+    assert result.output_parameter_value["associated_navigation"] == {
+        **asdict(_CLOSED_CONNECTION_RECEIPT),
+        "relation": "context",
+    }
+    assert not any(page.listeners.values())
+
+
+@pytest.mark.asyncio
+async def test_a_block_cancelled_during_setup_leaves_no_document_listeners(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = DocumentEventPage()
+    mocks = _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    mocks["create_task_and_step"].side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _make_code_block("value = 1").execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    assert not any(page.listeners.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame_id", "expected"),
+    [
+        pytest.param(
+            "main-frame",
+            DocumentFailureReceipt(
+                attempt_id=1,
+                origin="https://app.fixture.test",
+                driver_code="net::ERR_EMPTY_RESPONSE",
+                response_status=None,
+                relation="associated",
+            ),
+            id="main_frame_id",
+        ),
+        pytest.param("unknown-frame", None, id="unknown_frame_id"),
+    ],
+)
+async def test_skycdp_document_requests_count_only_with_the_main_frame_id(
+    frame_id: str, expected: DocumentFailureReceipt | None
+) -> None:
+    page = DocumentEventPage()
+    page.main_frame.frame_id = "main-frame"
+    # An unknown frame id makes NetworkRequest.frame fall back to the main frame.
+    page._frames = {}
+    recording = RecordingPage(page)
+
+    def fail_document(page: DocumentEventPage) -> None:
+        request = NetworkRequest(
+            page,  # type: ignore[arg-type]
+            "request-1",
+            {"request": {"url": "https://app.fixture.test/home"}, "type": "Document", "frameId": frame_id},
+        )
+        assert request.frame is page.main_frame
+        for handler in page.listeners["request"]:
+            handler(request)
+        request.note_failure("net::ERR_EMPTY_RESPONSE")
+        for handler in page.listeners["requestfailed"]:
+            handler(request)
+
+    error = await _submit_then_wait(page, recording, fail_document)
+
+    assert recording.failure_document_receipt(error) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_on_another_tab_keeps_a_pending_receipt() -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    recording._wrap_page(other_tab)
+    in_flight: list[FakeDocumentRequest] = []
+
+    error = await _submit_then_wait(
+        page, recording, lambda page: in_flight.append(page.navigate("https://app.fixture.test:8443/home"))
+    )
+    other_tab.navigate("https://other.fixture.test/dashboard", status=200)
+    in_flight[0].failure = "net::ERR_EMPTY_RESPONSE"
+    for handler in page.listeners["requestfailed"]:
+        handler(in_flight[0])
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["locator_wait", "handle_click"])
+@pytest.mark.parametrize("frame", ["main", "child"])
+async def test_a_main_frame_locator_or_handle_behind_a_failed_document_carries_the_receipt(
+    shape: str, frame: str
+) -> None:
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    class ElementHandle:
+        __module__ = "playwright.async_api"
+
+        async def click(self, **kwargs: Any) -> None:
+            raise error
+
+    async def submit(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+
+    async def wait_for(**kwargs: Any) -> None:
+        raise error
+
+    async def query_selector(selector: str) -> ElementHandle:
+        return ElementHandle()
+
+    page = DocumentEventPage()
+    page.frames = [page.main_frame, FakeFrame("about:blank")]  # type: ignore[attr-defined]
+    raw_frame = page.frames[0 if frame == "main" else 1]  # type: ignore[attr-defined]
+    raw_frame.locator = lambda selector, **kwargs: page.inner
+    raw_frame.query_selector = query_selector
+    page.inner.click = submit  # type: ignore[method-assign]
+    page.inner.wait_for = wait_for  # type: ignore[method-assign]
+    recording = RecordingPage(page)
+    recorded_frame = recording.main_frame if frame == "main" else recording.frames[1]
+
+    handle = await recorded_frame.query_selector("#welcome")
+    await recorded_frame.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await (recorded_frame.locator("#welcome").wait_for(timeout=5000) if shape == "locator_wait" else handle.click())
+
+    assert recording.failure_document_receipt(error) == (_CLOSED_CONNECTION_RECEIPT if frame == "main" else None)
+    assert [action.action_type for action in recording.recorded_actions()] == (
+        [ActionType.CLICK] * (1 if shape == "locator_wait" else 2) if frame == "main" else []
     )

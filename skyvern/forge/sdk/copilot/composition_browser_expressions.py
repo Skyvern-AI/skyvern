@@ -1231,12 +1231,12 @@ for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.select
 for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
 const clickableControls = [];
 const seenClickableText = new Set();
-for (const el of document.querySelectorAll('button,[role="button" i],[data-action]')) {
-  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+const seenTextlessSelectors = new Set();
+const collectClickable = (el) => {
   const tag = (el.tagName || '').toLowerCase();
-  if (SKIP_TAGS.has(tag)) continue;
-  if (!elementVisible(el)) continue;
-  if (el.closest && el.closest('form')) continue;
+  if (SKIP_TAGS.has(tag)) return;
+  if (!elementVisible(el)) return;
+  if (el.closest && el.closest('form')) return;
   const text = clickableText(el);
   const selector = clickableSelector(el);
   let unique = false;
@@ -1245,13 +1245,30 @@ for (const el of document.querySelectorAll('button,[role="button" i],[data-actio
     clickableControls.push(Object.assign({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), tag: tag, disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
     usedClickableSelectors.add(selector);
     if (text) seenClickableText.add(text);
-    continue;
+    return;
   }
-  if (!text || seenClickableText.has(text)) continue;
+  if (!text) {
+    // Copies of a repeated textless control share one selector, so it is listed once and addressed by its candidates.
+    if (!selector || seenTextlessSelectors.has(selector)) return;
+    clickableControls.push(Object.assign({ text: '', tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
+    seenTextlessSelectors.add(selector);
+    return;
+  }
+  if (seenClickableText.has(text)) return;
   // No CSS selector singles this control out, which is the case the text rung exists for: reporting
   // the control with its text alone leaves the model nothing to address it by.
   clickableControls.push(Object.assign({ text: text, tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
   seenClickableText.add(text);
+};
+const CLICKABLE_ROLE_QUERY = 'button,[role="button" i],[data-action]';
+for (const el of document.querySelectorAll(CLICKABLE_ROLE_QUERY)) {
+  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+  collectClickable(el);
+}
+for (const el of document.querySelectorAll('[tabindex]:not([tabindex^="-"])')) {
+  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+  if (el.matches(CLICKABLE_ROLE_QUERY) || clickableText(el)) continue;
+  collectClickable(el);
 }
 
 const resultContainers = [];

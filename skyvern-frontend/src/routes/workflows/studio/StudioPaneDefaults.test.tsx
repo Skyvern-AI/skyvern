@@ -106,10 +106,7 @@ function addressText(): string {
 afterEach(cleanup);
 beforeEach(() => {
   localStorage.clear();
-  useStudioFirstRunStore.setState({
-    coachMarkSeen: false,
-    narrowNudgeSeen: false,
-  });
+  useStudioFirstRunStore.setState({ narrowNudgeSeen: false });
   toastMock.mockReset();
 });
 
@@ -390,12 +387,5 @@ describe("narrow-viewport nudge", () => {
     fireEvent.click(screen.getByText("toggle-overview"));
     expect(panesText()).toBe("copilot");
     expect(toastMock).not.toHaveBeenCalled();
-  });
-
-  test("a pane write marks the coach mark as learned", () => {
-    renderStudio({ stageWidth: 2000 });
-    expect(useStudioFirstRunStore.getState().coachMarkSeen).toBe(false);
-    fireEvent.click(screen.getByText("toggle-overview"));
-    expect(useStudioFirstRunStore.getState().coachMarkSeen).toBe(true);
   });
 });

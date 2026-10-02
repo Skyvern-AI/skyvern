@@ -11,9 +11,10 @@ import socket
 import subprocess
 import time
 import uuid
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
@@ -61,6 +62,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
 )
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
+from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds
 from skyvern.webeye.attach_only import forbid
 from skyvern.webeye.attach_only import is_enforcing as attach_only_enforcing
 from skyvern.webeye.browser_acquisition_sample import (
@@ -350,6 +352,15 @@ def _consume_abandoned_task_result(task: asyncio.Task) -> None:
 
 
 DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS = 5.0
+_DOWNLOADS_CANCELLED_BY_SKYVERN: weakref.WeakSet[Download] = weakref.WeakSet()
+
+
+def mark_download_cancelled_by_skyvern(download: Download) -> None:
+    _DOWNLOADS_CANCELLED_BY_SKYVERN.add(download)
+
+
+def was_download_cancelled_by_skyvern(download: Download) -> bool:
+    return download in _DOWNLOADS_CANCELLED_BY_SKYVERN
 
 
 async def read_download_failure(download: Download) -> str | None:
@@ -420,6 +431,7 @@ def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
     async def listen_to_download(download: Download) -> None:
+        download_started_at = time.monotonic()
         context = current()
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
         task_id = (context.task_id if context else None) or kwargs.get("task_id")
@@ -434,6 +446,7 @@ def set_download_file_listener(
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                 )
+                mark_download_cancelled_by_skyvern(download)
                 await download.cancel()
                 return
             file_path = Path(resolved_path)
@@ -506,6 +519,9 @@ def set_download_file_listener(
                     task_id=task_id,
                     failure=failure,
                     url=_redact_url_query(download.url),
+                    seconds_since_download_event=time.monotonic() - download_started_at,
+                    url_origin=redacted_url_origin(download.url),
+                    signed_url_ttl_remaining_s=signed_url_ttl_remaining_seconds(download.url, datetime.now(UTC)),
                 )
                 return
             LOG.exception(

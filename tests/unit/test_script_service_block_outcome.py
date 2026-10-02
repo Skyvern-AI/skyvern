@@ -92,7 +92,7 @@ async def test_cached_outcome_survives_output_parameter_failure(monkeypatch: pyt
     monkeypatch.setattr(
         app.DATABASE.observer,
         "update_workflow_run_block",
-        AsyncMock(return_value=SimpleNamespace(label="cached", error_codes=["picked"])),
+        AsyncMock(return_value=SimpleNamespace(label="cached", error_codes=["stale"])),
     )
     monkeypatch.setattr(
         script_service, "_record_output_parameter_value", AsyncMock(side_effect=RuntimeError("Output unavailable"))
@@ -105,6 +105,7 @@ async def test_cached_outcome_survives_output_parameter_failure(monkeypatch: pyt
     assert context.get_block_outcome("cached") == BlockOutcome(
         status=BlockStatus.failed, error_codes=["picked"], failure_reason="Failed"
     )
+    assert "error_codes" not in app.DATABASE.observer.update_workflow_run_block.await_args.kwargs
 
 
 @pytest.mark.asyncio

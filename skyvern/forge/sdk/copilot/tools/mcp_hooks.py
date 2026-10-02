@@ -24,7 +24,7 @@ from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     authoring_capability_from_policy,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, USER_FACING_REASON_SCHEMA, CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
@@ -2079,6 +2079,9 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "disable_workflow_schedule": "skyvern_schedule_disable",
         "cancel_workflow_schedule": "skyvern_schedule_cancel",
         "delete_workflow_schedule": "skyvern_schedule_delete",
+        "list_browser_profiles": "skyvern_browser_profile_list",
+        "get_browser_profile": "skyvern_browser_profile_get",
+        "create_browser_profile": "skyvern_browser_profile_create",
         "list_workflow_runs": "skyvern_workflow_run_list",
     }
 
@@ -2252,6 +2255,25 @@ def _workflow_schedule_overlay(
     )
 
 
+_CREATE_BROWSER_PROFILE_DESCRIPTION = (
+    "Save a new browser profile from a finished browser's cookies and storage, so later runs of a workflow "
+    "that selects it start with that state. The name must come from the user; if the user gave none, ask. "
+    "Names are unique in the organization, so list profiles with that name as search_key before creating. "
+    "Pass exactly one source. browser_session_id: a session started with generate_browser_profile that has "
+    "since closed; the profile holds that session's exact final state. workflow_run_id: a saved run of a "
+    "workflow that persists its browser session; the profile copies that workflow's latest saved browser "
+    "state at call time, not a snapshot of that run, so a later run of the workflow changes what is copied. "
+    "Say which source you used. "
+    "A 400 or 404 error means the source cannot be used: relay the service's reason. Closing a session is "
+    "the user's action; the user can also start a new capture with Create a Browser Profile on the Profiles "
+    "page under Browsers. A 409 means a profile with that name already exists and nothing was overwritten; "
+    "renaming or deleting it is the user's action. "
+    "After any failed create, list profiles with that name and report the error together with any profile "
+    "found (bp_ ID, created_at); say the profile was saved only when the create returned ok. "
+    "Creating a profile does not select it. Set the workflow's browser_profile_id only when the user asked, "
+    "and never to a profile found after a failed create unless the user confirms it. "
+    "In your reply give the bp_ ID and the name."
+)
 _EVALUATE_BASE_DESCRIPTION = (
     "Execute JavaScript in the browser and return the result. Use it to inspect DOM state and read "
     "values. JavaScript run here can also change the page, but only click, type_text, select_option "
@@ -2311,7 +2333,7 @@ def _block_schema_banned_types_note(
 def _build_skyvern_mcp_overlays(
     capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
 ) -> dict[str, SchemaOverlay]:
-    return {
+    overlays = {
         "get_workflow_knowledge": SchemaOverlay(
             description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
             description_suffix=_block_schema_banned_types_note(capability),
@@ -2619,4 +2641,27 @@ def _build_skyvern_mcp_overlays(
             "Delete a schedule by wfs_ ID; irreversible. Pass force=true only when the user clearly asked to "
             "remove that schedule, then list schedules to confirm it is gone."
         ),
+        "list_browser_profiles": SchemaOverlay(
+            description=(
+                "List this organization's saved browser profiles, each with its bp_ ID, name and created_at. "
+                "search_key matches a substring of the name or description. Profile names are unique in the "
+                "organization. Listing changes nothing."
+            ),
+        ),
+        "get_browser_profile": SchemaOverlay(
+            description="Read one saved browser profile by bp_ ID: its name, description and timestamps.",
+        ),
+        "create_browser_profile": SchemaOverlay(
+            description=_CREATE_BROWSER_PROFILE_DESCRIPTION,
+            requires_run_authority=True,
+        ),
     }
+
+    for name in get_skyvern_mcp_alias_map():
+        overlays.setdefault(name, SchemaOverlay())
+    for overlay in overlays.values():
+        overlay.copilot_params = {
+            **overlay.copilot_params,
+            USER_FACING_REASON_PARAM: dict(USER_FACING_REASON_SCHEMA),
+        }
+    return overlays

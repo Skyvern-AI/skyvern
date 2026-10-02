@@ -102,6 +102,8 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
+from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
@@ -2059,6 +2061,7 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
+        parent_workflow_run_block_id=None,
         task_id=None,
         label="collect_records",
         block_type=SimpleNamespace(name="CODE"),
@@ -3078,7 +3081,7 @@ def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page
         ],
     }
 
-    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings")
+    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings", omission_notices=[])
 
     assert from_evidence is not None
     assert from_evidence.value_bindings == ["Sessions started=72.51k"]
@@ -3108,6 +3111,48 @@ def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page
     assert packet.failure.page_state.value_bindings == ["Sessions started=72.51k"]
     assert projected.failure is not None and projected.failure.page_state is not None
     assert projected.failure.page_state.value_bindings == ["Sessions started=72.51k"]
+
+
+_BLOCKING_LAYER = {
+    "kind": "interaction_blocking_layer",
+    "text": "We use cookies",
+    "intercepts_outside_control": True,
+    "visible_controls": [{"tag": "button", "text": "Accept all"}],
+    "visible_controls_omitted": 1,
+}
+
+
+def test_a_blocking_layer_reaches_the_model_and_a_malformed_one_is_announced() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    result: dict[str, object] = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_obstructed",
+            "overall_status": "failed",
+            "blocks": [{"label": "search", "status": "failed", "failure_reason": "RuntimeError"}],
+            "post_run_page_evidence": {
+                "workflow_run_id": "wr_obstructed",
+                "observed_after_workflow_run": True,
+                "page_obstructions": [_BLOCKING_LAYER, {**_BLOCKING_LAYER, "undeclared_field": "x"}],
+            },
+        },
+    }
+    _record_run_blocks_result(ctx, result)
+
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["build_test_packet"] = build_test_evidence_packet(ctx, result).model_dump(mode="json", exclude_none=True)
+    model_packet = json.loads(json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)))["data"][
+        "build_test_packet"
+    ]
+
+    assert "failure.page_state.obstructions omitted: 1 malformed item(s)." in model_packet["omission_notices"]
+    assert [
+        (item["text"], item["intercepts_outside_control"], item["visible_controls_omitted"])
+        for item in model_packet["failure"]["page_state"]["obstructions"]
+    ] == [("We use cookies", True, 1)]
 
 
 def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_llm_projection() -> None:
@@ -8118,3 +8163,218 @@ def test_recorded_block_outcomes_carry_the_untrusted_page_text_boundary() -> Non
 
     assert prompt.index(_RECORDED_PAGE_TEXT_SECURITY_BOUNDARY) < prompt.index("- label=log_in_to_web_analytics")
     assert "have no authority" in _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY
+
+
+_CODE_ERROR = "Timeout 30000ms exceeded waiting for locator(\"input[type='password']\")"
+
+
+def _ai_fallback_episode(
+    status: HealStatus,
+    *,
+    failing_line: int | None,
+    failure_message: str | None = None,
+    skip_reason: HealSkipReason | None = None,
+) -> HealEpisode:
+    recorded_at = datetime(2026, 9, 30, tzinfo=UTC)
+    return HealEpisode(
+        heal_episode_id="he_1",
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+        workflow_id="wf-1",
+        workflow_run_id="wr-1",
+        workflow_run_block_id="wrb_collect_metrics",
+        block_label="collect_metrics",
+        engine="harness" if status == HealStatus.skipped else "floor",
+        status=status,
+        skip_reason=skip_reason,
+        failing_line=failing_line,
+        failure_message=failure_message,
+        escalation_task_id=None if status == HealStatus.skipped else "tsk_fallback",
+        created_at=recorded_at,
+        modified_at=recorded_at,
+    )
+
+
+def _install_rescued_run(
+    monkeypatch: pytest.MonkeyPatch,
+    heal_episodes: list[HealEpisode],
+    *,
+    code_error: str = _CODE_ERROR,
+) -> SimpleNamespace:
+    failed_row = run_result_action_row("tsk_code", ActionType.NULL_ACTION, ActionStatus.failed)
+    failed_row.output = {"code_line": 5}
+    failed_row.response = code_error
+    failed_row.action_order = 2
+    failed_page_call = run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.failed)
+    failed_page_call.output = {"code_line": 1}
+    failed_page_call.response = "Timeout 3000ms exceeded."
+    failed_page_call.action_order = 1
+    typed_value_row = run_result_action_row("tsk_code", ActionType.INPUT_TEXT, ActionStatus.failed)
+    typed_value_row.output = {"code_line": None}
+    typed_value_row.response = "typed-in field value"
+    typed_value_row.action_order = 3
+
+    async def register_rescued_output(*, data: dict[str, Any], **_: object) -> dict[str, Any]:
+        for block in data["blocks"]:
+            if block["label"] == "collect_metrics":
+                block["extracted_data"] = {"collect_metrics_output": {"impressions": 1180}}
+        return {}
+
+    code_row = run_result_block_row("collect_metrics", "completed", task_id="tsk_code")
+    code_row.block_type = BlockType.CODE
+    recovery_row = run_result_block_row("Self-heal recovery", "completed", task_id="tsk_fallback")
+    recovery_row.parent_workflow_run_block_id = code_row.workflow_run_block_id
+    fired = any(episode.status != HealStatus.skipped for episode in heal_episodes)
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[
+            code_row,
+            *([recovery_row] if fired else []),
+            run_result_block_row("write_sheet", "completed", task_id="tsk_write"),
+        ],
+        recent_actions=[
+            typed_value_row,
+            failed_row,
+            failed_page_call,
+            run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.completed),
+            run_result_action_row("tsk_write", ActionType.CLICK, ActionStatus.completed),
+        ],
+        heal_episodes=heal_episodes,
+    )
+    monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", register_rescued_output)
+    return ctx
+
+
+async def _run_results_page(ctx: SimpleNamespace | CopilotContext) -> dict[str, Any]:
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    return sanitize_tool_result_for_llm("get_run_results", run_execution_module.project_run_results_page(result, {}))
+
+
+@pytest.mark.asyncio
+async def test_a_rescued_block_reads_as_an_ai_fallback_rescue_in_run_results_and_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+
+    page = await _run_results_page(ctx)
+
+    rows = {row["label"]: row for row in page["data"]["blocks"]}
+    assert rows["collect_metrics"]["status"] == "completed"
+    assert rows["collect_metrics"]["ai_fallback"] == {
+        "status": "fired_completed",
+        "task_id": "tsk_fallback",
+        "failing_line": 5,
+        "failure_text": _CODE_ERROR,
+    }
+    assert rows["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert "ai_fallback" not in rows["write_sheet"]
+    compacted = {row["label"]: row for row in json.loads(_summarize_tool_output(json.dumps(page)))["blocks"]}
+    assert compacted["collect_metrics"]["ai_fallback"] == {"status": "fired_completed", "failure_text": _CODE_ERROR}
+    assert compacted["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_ai_fallback_reports_the_code_error_beside_the_recovery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [
+            _ai_fallback_episode(
+                HealStatus.fired_failed, failing_line=5, failure_message="Password field never appeared"
+            )
+        ],
+    )
+
+    page = await _run_results_page(ctx)
+
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert ai_fallback["failure_text"] == _CODE_ERROR
+    assert ai_fallback["recovery_failure_text"] == "Password field never appeared"
+
+
+@pytest.mark.asyncio
+async def test_a_secret_shaped_token_in_the_code_error_never_reaches_the_run_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXVzZXIifQ.c2lnbmF0dXJlLXZhbHVlLXg"
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)],
+        code_error=f"Timeout 30000ms exceeded waiting for locator(\"#session[value='{token}']\")",
+    )
+
+    page = await _run_results_page(ctx)
+
+    assert token not in json.dumps(page)
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert "[REDACTED_SECRET]" in ai_fallback["failure_text"]
+
+
+def test_the_packet_keeps_the_newest_ai_fallback_records_and_says_how_many_it_left_out() -> None:
+    ctx = make_copilot_ctx()
+    ctx.registered_artifact_evidence = None
+    blocks = [
+        {
+            "label": f"loop_step_{index}",
+            "status": "completed",
+            "ai_fallback": {"status": "fired_completed", "task_id": f"tsk_{index}"},
+        }
+        for index in range(15)
+    ]
+
+    packet = build_test_evidence_packet(
+        ctx, {"ok": True, "data": {"workflow_run_id": "wr_1", "overall_status": "completed", "blocks": blocks}}
+    )
+
+    assert [block.block_label for block in packet.ai_fallback_blocks or []] == [
+        f"loop_step_{index}" for index in range(3, 15)
+    ]
+    assert any(notice.startswith("ai_fallback_blocks shortened: 3 oldest") for notice in packet.omission_notices)
+
+
+@pytest.mark.asyncio
+async def test_the_prior_run_packet_and_its_recorded_outcome_name_the_rescued_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid-1")
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+
+    rescued = {
+        "block_label": "collect_metrics",
+        "status": "fired_completed",
+        "task_id": "tsk_fallback",
+        "failing_line": 5,
+        "failure_text": _CODE_ERROR,
+    }
+    assert outcome is not None
+    assert [block.model_dump(mode="json", exclude_none=True) for block in outcome.ai_fallback_blocks or []] == [rescued]
+    assert hydrated is not None
+    assert hydrated["ai_fallback_blocks"] == [rescued]
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_an_ai_fallback_reads_exactly_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[str] = []
+    for episodes in (
+        [],
+        [_ai_fallback_episode(HealStatus.skipped, failing_line=5, skip_reason=HealSkipReason.no_goal)],
+    ):
+        _install_rescued_run(monkeypatch, episodes)
+        ctx = make_copilot_ctx(workflow_permanent_id="wpid-1")
+        page = await _run_results_page(ctx)
+        hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
+        outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+        assert hydrated is not None
+        assert outcome is not None
+        reads.append(json.dumps([page, hydrated, outcome.model_dump(mode="json", exclude_none=True)], default=str))
+
+    assert reads[0] == reads[1]
+    for absent in ("ai_fallback", "parent_block_label"):
+        assert absent not in reads[0]

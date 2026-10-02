@@ -928,14 +928,22 @@ async def test_create_closes_its_session_when_a_sibling_installed_one_first(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("proxy_session_id", "proxy_kwargs"),
+    ("proxy_session_id", "proxy_kwargs", "workflow_proxy"),
     [
-        (None, {"inherit_profile_proxy": True}),
-        ("ps_pinned", {"proxy_session_id": "ps_pinned", "proxy_location": ProxyLocation.RESIDENTIAL_ISP}),
+        (None, {"inherit_profile_proxy": True}, None),
+        (None, {"inherit_profile_proxy": True, "proxy_location": ProxyLocation.NONE}, ProxyLocation.NONE),
+        (
+            "ps_pinned",
+            {"proxy_session_id": "ps_pinned", "proxy_location": ProxyLocation.RESIDENTIAL_ISP},
+            ProxyLocation.NONE,
+        ),
     ],
 )
 async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over_it(
-    monkeypatch: pytest.MonkeyPatch, proxy_session_id: str | None, proxy_kwargs: dict[str, object]
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_session_id: str | None,
+    proxy_kwargs: dict[str, object],
+    workflow_proxy: ProxyLocation | None,
 ) -> None:
     ready = MagicMock()
     ready.browser_context = _FakeBrowserContext()
@@ -948,7 +956,9 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
     ctx = _make_ctx()
 
     result = await ensure_build_test_browser_session(
-        ctx, seed=BuildTestBrowserSeed(browser_profile_id="bp_saved", proxy_session_id=proxy_session_id)
+        ctx,
+        seed=BuildTestBrowserSeed(browser_profile_id="bp_saved", proxy_session_id=proxy_session_id),
+        proxy_location=workflow_proxy,
     )
 
     assert result is None

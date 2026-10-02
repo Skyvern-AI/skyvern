@@ -28,7 +28,7 @@ type RunSummaryStripProps = {
 };
 
 /**
- * The Timeline view's one header: status, duration, counts, and the search
+ * The Timeline view's one header: status, run timing, counts, and the search
  * control on a single line. Run-level facts wrap under width pressure; the
  * trailing controls never move. The run id lives in the top bar's "View Run"
  * tab and the browser session/profile ids in the Inputs view.
@@ -74,6 +74,11 @@ export function RunSummaryStrip({
           <FailureCategoryBadge
             failureCategory={workflowRun.failure_category}
           />
+        ) : null}
+        {workflowRun.created_at ? (
+          <span className="whitespace-nowrap text-muted-foreground">
+            Created {compactLocalDateTime(workflowRun.created_at)}
+          </span>
         ) : null}
         {duration ? (
           <Tooltip>

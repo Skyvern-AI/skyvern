@@ -16,7 +16,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     ChallengeEffects,
     Lever,
     SolverFacts,
+    SolverReceipt,
     failed_block_bound_credential_ids,
+    governing_solver_receipt,
+    solver_receipt,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES,
@@ -380,6 +383,11 @@ def _solver_facts(blocks: list[Any], data: dict[str, Any], *, code_block_only: b
     return str(carried["result"]), _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX) or None
 
 
+def _governing_receipt(blocks: Sequence[Mapping[str, object]], data: dict[str, Any]) -> SolverReceipt | None:
+    record = data.get(SOLVER_ATTEMPT_KEY)
+    return solver_receipt(record.get("receipt")) if isinstance(record, dict) else governing_solver_receipt(blocks)
+
+
 def _same_run_challenge_frame_hosts(ctx: CopilotContext, data: dict[str, Any]) -> list[str]:
     """Vendor frame hosts from a packet observed after this very run, so a stale or foreign packet
     cannot report a wall this run did not reach."""
@@ -392,11 +400,12 @@ def _same_run_challenge_frame_hosts(ctx: CopilotContext, data: dict[str, Any]) -
 def _challenge_effects(
     ctx: CopilotContext, blocks: list[Any], categories: list[str], data: dict[str, Any], *, run_passed: bool
 ) -> ChallengeEffects | None:
-    """A run_wall record with solver facts when the run met a wall, a solver_call record when a code block's
-    solver call ran on a run that did not pass with no wall, a page_frames record when the final page merely
-    mounted a vendor frame, and None otherwise."""
+    """Classify a run's challenge evidence as run_wall, solver_call, page_frames, or None."""
     frame_hosts = _same_run_challenge_frame_hosts(ctx, data)
     result, failure = _solver_facts(blocks, data)
+    receipt = (
+        None if run_passed else _governing_receipt([block for block in blocks if isinstance(block, Mapping)], data)
+    )
     walled = any(category in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES for category in categories) or bool(
         ctx.last_test_anti_bot
     )
@@ -414,6 +423,7 @@ def _challenge_effects(
                 solver_attempted=True,
                 solver_result=code_result,
                 solver_failure=code_failure,
+                solver_receipt=receipt,
                 frame_hosts=frame_hosts or None,
             )
     if not walled:
@@ -426,6 +436,7 @@ def _challenge_effects(
         solver_attempted=None if result == "unresolved" else result in {"failed", "not_solved", "attempted"},
         solver_result=result,
         solver_failure=failure,
+        solver_receipt=receipt,
         frame_hosts=frame_hosts or None,
     )
 

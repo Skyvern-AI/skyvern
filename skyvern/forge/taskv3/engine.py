@@ -27,6 +27,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Collection
 
+import litellm
 import structlog
 
 from skyvern.config import settings
@@ -53,10 +54,11 @@ from skyvern.forge.taskv3.goal_check import (
     run_goal_check,
     run_unlisted_reask,
 )
-from skyvern.forge.taskv3.goal_composition import build_user_prompt
+from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
+    PERCEPTION_RETAIN_CHARS_HIGH,
     ActivityRecency,
     CompletionBlocker,
     CompletionProbe,
@@ -81,8 +83,11 @@ from skyvern.forge.taskv3.tools import (
     apply_blank_page_guard,
     build_browser_tools,
 )
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 from skyvern.schemas.workflows import BlockType
 from skyvern.services.otp_service import iter_totp_from_navigation_inputs
+from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
+from skyvern.utils.token_counter import approx_count_tokens, count_tokens
 
 LOG = structlog.get_logger()
 
@@ -223,6 +228,47 @@ def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | 
     return {"task_data": navigation_payload}
 
 
+def _known_input_limit(names: list[str]) -> int | None:
+    for name in names:
+        try:
+            limit = litellm.get_model_info(model=name).get("max_input_tokens")
+        except Exception:  # litellm raises a bare Exception for a model absent from its map
+            continue
+        if isinstance(limit, int):
+            return limit
+    return None
+
+
+def model_input_token_limit(llm_config: object) -> int | None:
+    """The smallest input limit across every model the config can dispatch to, router fallbacks included; a model
+    litellm does not know counts as `PROMPT_HARD_CEILING_TOKENS`, so it never inherits a known model's larger limit."""
+    if isinstance(llm_config, LLMRouterConfig):
+        candidates = [
+            (
+                entry.model_info.get("max_input_tokens"),
+                [
+                    name
+                    for name in (
+                        entry.model_info.get("base_model"),
+                        entry.model_info.get("model_name"),
+                        entry.litellm_params.get("model"),
+                    )
+                    if name
+                ],
+            )
+            for entry in llm_config.model_list
+        ]
+    elif isinstance(llm_config, LLMConfig):
+        candidates = [(None, [llm_config.model_name])]
+    else:
+        return None
+    limits = [
+        declared if isinstance(declared, int) else _known_input_limit(names) or PROMPT_HARD_CEILING_TOKENS
+        for declared, names in candidates
+    ]
+    return min(limits) if limits else None
+
+
 async def run_task_v3_agent_loop(
     *,
     page_provider: PageProvider,
@@ -287,6 +333,8 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
+    # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
+    code_typed_values: tuple[CodeTypedValue, ...] = (),
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -491,7 +539,7 @@ async def run_task_v3_agent_loop(
                 excluded={otp.value for otp in iter_totp_from_navigation_inputs(parameters)} if parameters else (),
             )
             result = await run_unlisted_reask(
-                # The goal as the loop's model read it; the re-ask fences it whole.
+                # The goal as the loop's model read it, minus code-typed rows; the re-ask fences it whole.
                 goal=model_goal,
                 complete_criterion=unlisted_reask_criteria[0],
                 terminate_criterion=unlisted_reask_criteria[1],
@@ -552,7 +600,23 @@ async def run_task_v3_agent_loop(
         system_prompt += OPAQUE_URL_GUIDANCE
     age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
     age_default_text, age_default_reason = age_default or (None, None)
-    user_prompt = build_user_prompt(model_goal, refs.masked, model_starting_url)
+    # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
+    # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
+    prompt_goal = model_goal
+    if code_typed_values:
+        # The goal is message 1 of every turn and an over-limit request is refused without retry, so typed rows get
+        # what the smallest dispatchable model's input limit leaves after the rest of the request, the tool schemas,
+        # and the page-read characters the loop retains (at approx_count_tokens' 4 characters per token).
+        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{age_default_text or ''}"
+        budget = (
+            (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
+            - count_tokens(system_prompt)
+            - count_tokens(rest)
+            - count_tokens(json.dumps([tool.to_openai_tool() for tool in tools]))
+            - approx_count_tokens("x" * PERCEPTION_RETAIN_CHARS_HIGH)
+        )
+        prompt_goal = "\n".join([model_goal, *typed_value_rows(code_typed_values, budget)])
+    user_prompt = build_user_prompt(prompt_goal, refs.masked, model_starting_url)
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
     if age_default_text:
         user_prompt += f"\n\n{age_default_text}"
