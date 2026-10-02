@@ -818,6 +818,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   validate_block: "other",
   inspect_current_workflow: "other",
   list_integrations: "other",
+  read_google_sheet: "other",
   get_organization_usage_quota: "other",
   extend_browser_session: "other",
   search_web: "other",
