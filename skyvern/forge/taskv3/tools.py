@@ -17778,6 +17778,9 @@ def build_browser_tools(
                     await input_dispatch.press(_current_page(), None, "Escape")
             except Exception:
                 pass
+            same = " ".join(pre_value.split()).casefold() == " ".join(matched.split()).casefold()
+            signal = "aria-selected" if multi_select else "input value" if same else "displayed text"
+            _log_already_selected(signal, _exact_tier_key(matched) == _exact_tier_key(value))
             return ToolResult.ok(f"{matched!r} was already selected for {selector}; left it as is")
         chosen_values: list[str] = []
         try:
@@ -17846,7 +17849,17 @@ def build_browser_tools(
         return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
 
     def _already_held_result(selector: str, value: str) -> ToolResult:
+        _log_already_selected("chip", True)
         return ToolResult.ok(f"{value!r} was already selected for {selector}; left it as is")
+
+    def _log_already_selected(signal: str, matched_exact: bool) -> None:
+        # No form values and no selector, which can quote one. tool_call_seq joins this line to its tool call.
+        LOG.info(
+            "taskv3 select left an already-selected value",
+            tool_call_seq=current_tool_call_seq(),
+            signal=signal,
+            matched_exact=matched_exact,
+        )
 
     def _surface_holds(matched: str, surface: str, value: str) -> bool:
         def norm(t: str) -> str:

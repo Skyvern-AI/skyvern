@@ -1990,6 +1990,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "turn",
         "batch_size",
         "batch_index",
+        "tool_call_seq",
         "action_key_hash",
         "snapshot_digest",
         "probe_first_time",
@@ -4619,6 +4620,8 @@ async def run_agent_tool_loop(
                 turn=st.turns,
                 batch_size=len(tool_calls),
                 batch_index=idx,
+                # What current_tool_call_seq() returned inside this call, so a tool's own lines join here.
+                tool_call_seq=st.total_tool_calls,
                 **cost_fields,
                 **observe_summary,
                 **navigate_fields,
