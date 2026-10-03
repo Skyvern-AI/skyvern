@@ -6,7 +6,7 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Literal, cast, overload
 from urllib.parse import urlparse
@@ -46,8 +46,11 @@ from skyvern.forge.sdk.api.llm.copilot_model_usage import (
 from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
+    anthropic_cached_system_blocks,
     build_explicit_cache_envelope,
+    model_chain,
 )
+from skyvern.forge.sdk.copilot.enforcement import stable_prefix_anchor
 from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
@@ -138,6 +141,8 @@ class CopilotModelCallTelemetry:
             cache_write = _usage_field(details, "cache_write_tokens")
             if cache_write is None:
                 cache_write = (getattr(details, "model_extra", None) or {}).get("cache_write_tokens")
+            if cache_write is None:
+                cache_write = _usage_field(details, "cache_creation_tokens")
             if isinstance(cache_write, int) and not isinstance(cache_write, bool):
                 self.cache_write_tokens = cache_write
 
@@ -409,9 +414,7 @@ def _is_gemini_model(model: str) -> bool:
 
 
 def _gemini_on_model_chain(model: str, model_settings: ModelSettings) -> bool:
-    fallbacks: list[str | dict[str, Any]] = (model_settings.extra_args or {}).get("fallbacks") or []
-    models = [hop["model"] if isinstance(hop, dict) else hop for hop in fallbacks]
-    return any(_is_gemini_model(candidate) for candidate in [model, *models])
+    return any(_is_gemini_model(candidate) for candidate in model_chain(model, model_settings))
 
 
 def _has_ref_key(value: object) -> bool:
@@ -629,8 +632,45 @@ class CopilotLitellmModel(LitellmModel):
                 stream,
             )
         else:
+            sent_instructions = str(system_instructions) if system_instructions is not None else None
+            anthropic_system_blocks = anthropic_cached_system_blocks(
+                model=self.model,
+                model_settings=model_settings,
+                system_instructions=system_instructions,
+            )
+            if anthropic_system_blocks is not None:
+                breakpoint_count = 1
+                anchor = stable_prefix_anchor(input) if isinstance(input, list) else None
+                if anchor is not None:
+                    anchor_messages = Converter.items_to_messages(
+                        input[: anchor + 1],
+                        base_url=self.base_url,
+                        preserve_thinking_blocks=model_settings.reasoning is not None
+                        and model_settings.reasoning.effort is not None,
+                        preserve_tool_output_all_content=True,
+                        model=self.model,
+                        should_replay_reasoning_content=self.should_replay_reasoning_content,
+                    )
+                    # The recent tool window is rewritten and frames are later replaced by a placeholder, so the marker
+                    # sits on the anchor before them; the count mirrors the SDK's tool-call split, with system at 0.
+                    rolling_index = len(self._fix_tool_message_ordering(anchor_messages))
+                    model_settings = replace(
+                        model_settings,
+                        extra_args={
+                            **(model_settings.extra_args or {}),
+                            "cache_control_injection_points": [{"location": "message", "index": rolling_index}],
+                        },
+                    )
+                    breakpoint_count += 1
+                # The SDK inserts system content verbatim, so a block list reaches LiteLLM as list-form system content.
+                sent_instructions = cast(str, anthropic_system_blocks)
+                telemetry = current_model_call_telemetry()
+                if telemetry is not None:
+                    telemetry.cache_mode = "explicit"
+                    telemetry.cache_breakpoint_count = breakpoint_count
+                    telemetry.cache_stable_prefix_chars = len(anthropic_system_blocks[0]["text"])
             result = await super()._fetch_response(
-                str(system_instructions) if system_instructions is not None else None,
+                sent_instructions,
                 input,
                 model_settings,
                 tools,

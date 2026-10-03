@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import structlog
 from agents.exceptions import MaxTurnsExceeded
+from agents.items import TResponseInputItem
 from agents.memory.session import Session
 from agents.model_settings import ModelSettings
 from agents.run import Runner
@@ -987,6 +988,30 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
         if _item_field(items[index], "type") == "function_call_output":
             unread.add(index)
     return unread
+
+
+def stable_prefix_anchor(items: Sequence[TResponseInputItem]) -> int | None:
+    """Return the index of the last tool output or real user message that precedes both the compaction window and
+    every unpruned screenshot. Later model calls resend every item up to that index unchanged."""
+    fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
+    fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
+    unstable = {
+        *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *unread_tool_output_indices(items),
+        *(
+            i
+            for i, item in enumerate(items)
+            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+        ),
+    }
+    for index in range(min(unstable, default=len(items)) - 1, -1, -1):
+        item = items[index]
+        if _item_field(item, "type") == "function_call_output" or (
+            _item_field(item, "role") == "user" and not is_synthetic_user_message(item)
+        ):
+            return index
+    return None
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
