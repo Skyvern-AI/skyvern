@@ -174,6 +174,87 @@ async def test_custom_llm_http_clients_do_not_follow_redirects(
         await retry_client.aclose()
 
 
+@pytest.mark.parametrize("server_key", [None, "server-key"])
+@pytest.mark.parametrize(
+    ("api_key", "extra_headers", "authorization"),
+    [
+        (None, {}, None),
+        ("configured-key", {}, "Bearer configured-key"),
+        (None, {"Authorization": "Bearer gateway-key", "X-API-Key": "header-key"}, "Bearer gateway-key"),
+    ],
+    ids=["keyless", "keyed", "custom-headers"],
+)
+@pytest.mark.asyncio
+async def test_custom_openai_requests_use_only_configured_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    server_key: str | None,
+    api_key: str | None,
+    extra_headers: dict[str, str],
+    authorization: str | None,
+) -> None:
+    if server_key:
+        monkeypatch.setenv("OPENAI_API_KEY", server_key)
+    else:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(litellm, "api_key", server_key)
+    monkeypatch.setattr(litellm, "openai_key", server_key)
+    llm_config = _build_llm_config(
+        CustomLLMConfig(
+            display_name="Custom endpoint",
+            provider="openai_compatible",
+            model_name="example-model",
+            api_base="https://llm.example.test/v1",
+            api_key=api_key,
+            extra_parameters={"extra_headers": extra_headers},
+        )
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(api_handler_factory, "validate_fetch_url", lambda url: url)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.0)
+    requests: list[httpx.Request] = []
+    clients: list[httpx.AsyncClient] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "example-model",
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": '{"ok": true}'}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    def create_http_client(**kwargs: Any) -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(api_handler_factory, "ForgeAsyncHttpxClientWrapper", create_http_client)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_credentials_test")
+    result = await handler(prompt="test", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    assert result == {"ok": True}
+    assert len(requests) == 1
+    assert str(requests[0].url) == "https://llm.example.test/v1/chat/completions"
+    assert requests[0].headers.get("Authorization") == authorization
+    for name, value in extra_headers.items():
+        assert requests[0].headers[name] == value
+    assert clients[0].follow_redirects is False
+    assert clients[0].is_closed is True
+
+
 @pytest.mark.parametrize("request_error", [None, RuntimeError("provider failed")], ids=["success", "failure"])
 @pytest.mark.asyncio
 async def test_custom_openrouter_client_is_scoped_to_request(
