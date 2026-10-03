@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "bootstrapComplete": true,
+  "approvedMediaOrigins": [
+    "https://dcbllm8dvghjo.cloudfront.net"
+  ],
+  "bootstrapHashLedger": "scripts/blog_content_bootstrap_hashes.json",
+  "publishedSlugLedger": "scripts/blog_content_published_slugs.txt"
+}
