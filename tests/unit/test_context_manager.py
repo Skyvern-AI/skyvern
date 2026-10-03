@@ -265,6 +265,9 @@ _FETCH_LINE_FIELDS = {
     "outcome",
     "failure_type",
     "duration_seconds",
+    "session_reused",
+    "login_seconds",
+    "lock_wait_seconds",
 }
 
 

@@ -455,6 +455,25 @@ async def test_run_command_scrubs_inherited_cli_output_modes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("subcommand", "noninteractive"), [("get", "true"), ("login", None)])
+async def test_run_command_never_lets_a_read_prompt(tmp_path, subcommand: str, noninteractive: str | None) -> None:
+    # A locked read that may prompt exits 0 with no output on a closed stdin and hangs on an open one;
+    # with BW_NOINTERACTION it fails with "Vault is locked.". Login stays interactive for its device prompt.
+    fake_cli = tmp_path / "bw"
+    fake_cli.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        "print(json.dumps({'noninteractive': os.environ.get('BW_NOINTERACTION'),"
+        " 'stdin_is_devnull': os.path.samestat(os.fstat(0), os.stat(os.devnull))}))\n"
+    )
+    fake_cli.chmod(0o755)
+
+    result = await BitwardenService.run_command([str(fake_cli), subcommand])
+
+    assert json.loads(result.stdout) == {"noninteractive": noninteractive, "stdin_is_devnull": True}
+
+
+@pytest.mark.asyncio
 async def test_unlock_never_echoes_raw_session_key_in_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # With an inherited BW_RAW, `bw unlock` prints the bare session key (the vault decryption key) on
     # stdout with no banner. The unlock failure path must never interpolate that stdout into an error.
@@ -580,11 +599,11 @@ async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.Mo
     )
 
     # Establishing the session and reading the item all run on the attempt's budget. No `bw logout`:
-    # the session is kept for the next run rather than torn down (SKY-14751).
+    # the session is kept for the next run rather than torn down (SKY-14751), and no `bw sync`: the
+    # login already ran a full one.
     assert budgets == {
         "bw login": 37,
         "bw unlock": 37,
-        "bw sync": 37,
         "bw get": 37,
     }
 
