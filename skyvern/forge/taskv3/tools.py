@@ -13237,6 +13237,11 @@ def build_browser_tools(
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
         _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
+        # The probe walks only the hit element and its ancestors, so this claims nothing about other layers.
+        unqualified = (
+            "That is the element drawn where the pointer lands; neither it nor anything containing it qualified "
+            "as a dialog, an overlay or a banner."
+        )
         if branch == "clipped":
             # A dismissal is the one instruction that cannot be carried out here: the dialog, overlay
             # and banner it would name are what this branch is entered BECAUSE the probe ruled out.
@@ -13271,11 +13276,20 @@ def build_browser_tools(
                 layer_desc = f"a layer ({layer_selector})"
             else:
                 layer_desc = "a layer"
-            return ToolResult.error(
+            invisible = (
                 f"{selector} is covered by {layer_desc} that is INVISIBLE — it intercepts clicks but paints "
-                f"nothing on screen, so you will not see it in a screenshot{also}. It is most likely a "
-                "leftover backdrop from a dialog or cookie banner that was already dismissed. Do not keep "
-                "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way.",
+                f"nothing on screen, so you will not see it in a screenshot{also}."
+            )
+            if (occluder or {}).get("layerKind") == "hit_fallback":
+                return ToolResult.error(
+                    f"{invisible} {unqualified} Re-observe and reach {selector} another way or act on a "
+                    "different control.",
+                    error_class="covered",
+                )
+            return ToolResult.error(
+                f"{invisible} It is most likely a leftover backdrop from a dialog or cookie banner that was "
+                "already dismissed. Do not keep trying to dismiss a visible overlay; press Escape, re-observe, "
+                "or reach the field another way.",
                 error_class="covered",
             )
         if branch == "unnamed":
@@ -13304,12 +13318,17 @@ def build_browser_tools(
                 f"{selector}.",
                 error_class="covered",
             )
-        if not parts and (occluder or {}).get("layerKind") == "hit_fallback":
-            # The walk qualified no layer and named the element drawn at the field's position (a value cell, an
-            # option row), so there is no dialog to close.
+        if (occluder or {}).get("layerKind") == "hit_fallback":
+            # The walk qualified no layer and named the element drawn at the target's position (a value cell, an
+            # option row), so any controls listed are what that element holds, not confirmed as a way to uncover the target.
+            found = (
+                f"Controls found on that element, not confirmed to uncover {selector}: {controls_desc}."
+                if parts
+                else "The probe named no controls on that element."
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, an element drawn over it rather than a dialog, so it "
-                f"cannot be {verb}{also}. Re-observe and reach the field another way.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {unqualified} "
+                f"{found} Re-observe and reach {selector} another way or act on a different control.",
                 error_class="covered",
             )
         if not parts:

@@ -22472,31 +22472,109 @@ _COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML = """
 <input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
 <span id="row" style="position:absolute;left:0;top:0;width:200px;height:30px;background:#fff">May</span>
 """
+_COVERED_BY_AN_UNQUALIFIED_ROW_WITH_A_CONTROL_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<div id="row" style="position:absolute;left:0;top:0;width:200px;height:30px;background:#fff">May
+  <button id="pick" style="position:absolute;right:0;top:0;width:30px;height:30px">Pick</button>
+</div>
+"""
+_COVERED_BY_AN_UNQUALIFIED_TRANSPARENT_ELEMENT_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<div id="row" style="position:absolute;left:0;top:0;width:200px;height:30px"></div>
+"""
+_UNQUALIFIED_ROW_OVER_A_DIALOG_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<div role="dialog" style="position:absolute;left:0;top:0;width:100%;height:100%;background:#eee">Notice</div>
+<div id="row" style="position:absolute;left:0;top:0;width:200px;height:30px;background:#fff">May
+  <button id="pick" style="position:absolute;right:0;top:0;width:30px;height:30px">Pick</button>
+</div>
+"""
+_COVER_REMEDY_WORDING = ("dismiss", "closes", "close the layer", "opens", "get_html", "Pick whichever")
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hit_element() -> None:
-    """Both shapes render the same sentence with the same empty controls list, so the message cannot
-    tell them apart -- and they are not the same event. One is an overlay whose controls the
-    enumeration did not name; the other has no overlay at all."""
-    async with _content_page(_COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML) as page:
-        taskv3_loop._COVERED_LAYER.set(None)
-        tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
-        assert r.status == "error", r.content
-        assert "get_html" not in r.content, r.content
-        recorded = taskv3_loop._COVERED_LAYER.get() or {}
-        assert recorded == {"branch": "named", "controls": 0, "layer_kind": "hit_fallback"}, recorded
+@pytest.mark.parametrize(
+    ("markup", "branch", "controls", "found"),
+    [
+        (_COVERED_BY_AN_UNQUALIFIED_VALUE_ROW_HTML, "named", 0, "The probe named no controls on that element."),
+        (
+            _COVERED_BY_AN_UNQUALIFIED_ROW_WITH_A_CONTROL_HTML,
+            "named",
+            1,
+            'not confirmed to uncover #city: #pick "Pick".',
+        ),
+        (_COVERED_BY_AN_UNQUALIFIED_TRANSPARENT_ELEMENT_HTML, "invisible", 0, "paints nothing on screen"),
+        (_UNQUALIFIED_ROW_OVER_A_DIALOG_HTML, "named", 1, 'not confirmed to uncover #city: #pick "Pick".'),
+    ],
+    ids=["no_controls", "one_control", "invisible", "row_over_a_dialog"],
+)
+async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hit_element(
+    markup: str, branch: str, controls: int, found: str
+) -> None:
+    for verb, args in (("click", {"selector": "#city"}), ("type", {"selector": "#city", "text": "x"})):
+        async with _content_page(markup) as page:
+            taskv3_loop._COVERED_LAYER.set(None)
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), verb).handler(args)
+            assert r.status == "error" and r.error_class == "covered", (verb, r.content)
+            assert "#city is covered by" in r.content and "(#row)" in r.content, (verb, r.content)
+            assert "containing it qualified" in r.content and "Nothing over it" not in r.content, (verb, r.content)
+            assert found in r.content, (verb, r.content)
+            assert "reach #city another way" in r.content, (verb, r.content)
+            assert not [w for w in _COVER_REMEDY_WORDING if w in r.content], (verb, r.content)
+            recorded = taskv3_loop._COVERED_LAYER.get() or {}
+            assert recorded == {"branch": branch, "controls": controls, "layer_kind": "hit_fallback"}, recorded
 
-    async with _content_page(_DIALOG_WITH_NO_CONTROLS_HTML) as page:
-        taskv3_loop._COVERED_LAYER.set(None)
+        async with _content_page(_DIALOG_WITH_NO_CONTROLS_HTML) as page:
+            taskv3_loop._COVERED_LAYER.set(None)
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), verb).handler(args)
+            assert r.status == "error", r.content
+            assert '#city is covered by "Loading" (#wizard8)' in r.content, r.content
+            assert "no named controls" in r.content and "get_html of #wizard8" in r.content, r.content
+            recorded = taskv3_loop._COVERED_LAYER.get() or {}
+            assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
+
+
+_DISMISSIBLE_DIALOG_BESIDE_A_COVERED_ROW_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<input id="state" type="text" style="position:absolute;left:0;top:200px;width:200px;height:30px">
+<span id="row" style="position:absolute;left:0;top:200px;width:200px;height:30px;background:#fff">May</span>
+<div id="notice" role="dialog" aria-label="Cookie notice" style="position:fixed;left:0;top:0;width:100%;height:80px;background:#fff">
+  <button id="notice-close" onclick="this.closest('[role=dialog]').remove()" style="position:absolute;right:10px;top:10px">Close</button>
+</div>
+"""
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_covered_result_preserves_real_dialog_recovery() -> None:
+    async with _content_page(_DISMISSIBLE_DIALOG_BESIDE_A_COVERED_ROW_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
-        assert r.status == "error", r.content
-        assert "no named controls" in r.content, r.content
-        recorded = taskv3_loop._COVERED_LAYER.get() or {}
-        assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
+        covered = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert covered.error_class == "covered", covered.content
+        assert '"Cookie notice" (#notice)' in covered.content, covered.content
+        assert '#notice-close "Close"' in covered.content, covered.content
+        assert "Pick whichever one actually closes or dismisses the layer" in covered.content, covered.content
+
+        sibling = await _tool(tools, "type").handler({"selector": "#state", "text": "Iowa"})
+        assert sibling.error_class == "covered", sibling.content
+        assert "containing it qualified" in sibling.content, sibling.content
+        assert await page.locator("#notice").count() == 1
+
+        closed = await _tool(tools, "click").handler({"selector": "#notice-close"})
+        assert closed.status == "ok", closed.content
+        assert await page.locator("#notice").count() == 0
+
+        typed = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert typed.status == "ok", typed.content
+        assert await page.locator("#city").input_value() == "Iowa City"
+
+        again = await _tool(tools, "type").handler({"selector": "#state", "text": "Iowa"})
+        assert again.error_class == "covered", again.content
+        assert await page.locator("#state").input_value() == ""
+        assert await page.locator("#row").count() == 1
 
 
 @_skip_no_browser
