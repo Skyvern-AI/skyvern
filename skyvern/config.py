@@ -457,10 +457,12 @@ class Settings(BaseSettings):
     # How long a cached vault may go without a `bw sync`. A miss forces a sync and one retry,
     # so this is the staleness ceiling for an *edit*, not for a newly created item.
     BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS: float = 60.0
-    # How long an unused session may keep an unlocked vault in memory and on disk before it is
-    # logged out. Long enough that a batch stays warm throughout, short enough that an idle pod is
-    # not sitting on someone's open vault. Set to 0 to keep sessions for the pod's lifetime.
+    # How long an unused session may keep an unlocked vault in memory and on disk before it is logged
+    # out (0 disables): long enough to keep a batch warm, short enough that an idle pod holds no open vault.
     BITWARDEN_SESSION_MAX_IDLE_SECONDS: float = 900.0
+    # Retires even a busy session after this long, ±15% per session (0 disables); each retirement costs a
+    # cold login. The periodic sync catches a revoked login sooner, so this only bounds an open vault's age.
+    BITWARDEN_SESSION_MAX_LIFETIME_SECONDS: float = 14400.0
     # Each `bw` invocation is a Node process costing real CPU and ~hundreds of MB. Bound how many
     # run at once so a burst of runs cannot starve the browsers sharing the pod.
     BITWARDEN_MAX_CONCURRENT_CLI_COMMANDS: int = 4
