@@ -116,8 +116,21 @@ def _looks_dynamic(value: str) -> bool:
 
 
 def _css_escape(s: str) -> str:
-    """Escape a string for use as a CSS ID selector."""
-    return re.sub(r'([!"#$%&\'()*+,./:;<=>?@[\\\]^`{|}~])', r"\\\1", s)
+    """Escape a string for use as a CSS ID selector (mirrors ``CSS.escape``)."""
+    if s == "-":
+        return "\\-"
+    escaped: list[str] = []
+    for index, char in enumerate(s):
+        # Whitespace and control characters, and a digit in a position where an
+        # identifier cannot start with one, need a hex escape ("\\31 " for "1").
+        leading_digit = char.isdigit() and char.isascii() and (index == 0 or (index == 1 and s[0] == "-"))
+        if char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F or leading_digit:
+            escaped.append(f"\\{ord(char):x} ")
+        elif char in "!\"#$%&'()*+,./:;<=>?@[\\]^`{|}~":
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+    return "".join(escaped)
 
 
 def _css_escape_attr(s: str) -> str:
