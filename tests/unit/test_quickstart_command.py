@@ -84,6 +84,11 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 def _set_home(monkeypatch, home: Path) -> None:
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    # Path.home()/os.path.expanduser('~') on Windows (py3.8+) reads USERPROFILE,
+    # not HOME, so tests that rely on env_paths' GLOBAL scope (~/.skyvern/...) or
+    # any other Path.home()-based lookup must patch both to redirect off the real
+    # user profile.
+    monkeypatch.setenv("USERPROFILE", str(home))
 
 
 def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_server) -> types.ModuleType:
@@ -252,7 +257,8 @@ print(json.dumps({"base_url": settings.SKYVERN_BASE_URL, "port": settings.PORT})
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=tmp_path,
-        env={**os.environ, "HOME": str(home)},
+        # USERPROFILE alongside HOME: Windows' Path.home() (py3.8+) reads USERPROFILE, not HOME.
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
         text=True,
         capture_output=True,
         check=True,
@@ -276,7 +282,8 @@ import json
 from skyvern.config import settings
 print(json.dumps({"base_url": settings.SKYVERN_BASE_URL, "port": settings.PORT}))
 """
-    env = {**os.environ, "HOME": str(home)}
+    # USERPROFILE alongside HOME: Windows' Path.home() (py3.8+) reads USERPROFILE, not HOME.
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
     for key in ("SKYVERN_BASE_URL", "PORT", "SKYVERN_ENV_INTENT", "SKYVERN_ENV_FILE"):
         env.pop(key, None)
     result = subprocess.run(
@@ -314,7 +321,8 @@ print(json.dumps({"config_imported_before_intent": config_imported_before_intent
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=tmp_path,
-        env={**os.environ, "HOME": str(home)},
+        # USERPROFILE alongside HOME: Windows' Path.home() (py3.8+) reads USERPROFILE, not HOME.
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
         text=True,
         capture_output=True,
         check=True,
@@ -379,6 +387,8 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # Path.home() on Windows (py3.8+) reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     for key in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", BACKEND_ENV_INTENT_ENV_VAR):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(_cli_bootstrap, "_RUNTIME_LOGGING_CONFIGURED", False)
@@ -512,6 +522,14 @@ def test_run_mcp_does_not_report_ready_when_serving_fails(monkeypatch) -> None:
     assert "mcp_boot_ready" not in info_events
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Local browser profile sweep relies on POSIX-only primitives (fcntl locks, "
+        "process groups, os.killpg) and sweep_local_browser_profiles_once_in_background() "
+        "is a no-op on win32 by design, so there is no background thread for this test to observe."
+    ),
+)
 def test_run_mcp_serves_without_waiting_for_sweep_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
     from skyvern.library import local_browser_profile
 
@@ -625,7 +643,8 @@ print(json.dumps(payload))
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=tmp_path,
-        env={**os.environ, "HOME": str(home)},
+        # USERPROFILE alongside HOME: Windows' Path.home() (py3.8+) reads USERPROFILE, not HOME.
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
         text=True,
         capture_output=True,
         check=True,
@@ -647,7 +666,8 @@ def test_setup_credentials_use_cloud_and_local_env_intents(tmp_path) -> None:
     project_env.write_text("SKYVERN_API_KEY=project-key\nSKYVERN_BASE_URL=http://project\n")
     global_env.write_text("SKYVERN_API_KEY=global-key\nSKYVERN_BASE_URL=http://global\n")
 
-    env = {**os.environ, "HOME": str(home)}
+    # USERPROFILE alongside HOME: Windows' Path.home() (py3.8+) reads USERPROFILE, not HOME.
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
     for key in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT", "SKYVERN_ENV_FILE"):
         env.pop(key, None)
 
