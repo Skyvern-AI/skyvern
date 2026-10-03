@@ -2608,7 +2608,7 @@ class LLMAPIHandlerFactory:
                 enrich_llm_span(mark_completed=False)
 
                 if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
+                    content = response.choices[0].message.content if response.choices and response.choices[0].message is not None else None
                     parsed_response = content or ""
                 else:
                     try:
@@ -3261,7 +3261,7 @@ class LLMAPIHandlerFactory:
                 enrich_llm_span(mark_completed=False)
 
                 if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
+                    content = response.choices[0].message.content if response.choices and response.choices[0].message is not None else None
                     parsed_response = content or ""
                 else:
                     try:
