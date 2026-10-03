@@ -27,7 +27,7 @@ for (const run of runs) {
 | `page` | `int` | No | Page number (1-indexed). |
 | `page_size` | `int` | No | Results per page. |
 | `status` | `RunStatus \| list[RunStatus]` | No | Filter by run status. |
-| `search_key` | `str` | No | Case-insensitive substring search (min 3 chars). |
+| `search_key` | `str` | No | Case-insensitive substring search (min 3 chars). Matches the run's title, URL, run ID, agent ID, inputs, and a workflow run's webhook callback URL. A complete browser profile ID (`bp_...`), browser session ID (`pbs_...`), or credential ID (`cred_...`) matches the runs that used it exactly. Browser profile and credential IDs apply to workflow runs. A browser session ID also matches standalone tasks. |
 | `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
 
 ### Returns `list[TaskRunListItem]`
