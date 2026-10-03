@@ -13,6 +13,22 @@ from skyvern.cli.console import console
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 
+def strip_quotes(val: str | None) -> str:
+    """Strip surrounding single or double quotes from a value, including nested pairs.
+
+    Args:
+        val: The input value or None.
+
+    Returns:
+        The unquoted value, or an empty string if val is None.
+    """
+    if val is None:
+        return ""
+    while len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return val
+
+
 def wait_for_docker_services(ui_port: int = 8080, api_port: int = 8000, timeout: int = 120) -> bool:
     """Poll until Docker Compose services are reachable. Returns True if ready."""
     start = time.monotonic()
