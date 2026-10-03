@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -11,22 +12,34 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import event
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from structlog.testing import capture_logs
+from structlog.types import EventDict
 
 from skyvern.forge import app
+from skyvern.forge.agent import _v3_failure_category
+from skyvern.forge.failure_classifier import (
+    CLASSIFIER_VERSION,
+    FailureCategory,
+    classify_from_failure_reason,
+    derive_failure_attribution,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     Base,
     CredentialModel,
+    CredentialParameterModel,
     OrganizationModel,
     PersistentBrowserSessionModel,
     TaskModel,
     TaskRunModel,
+    TaskV2Model,
     WorkflowModel,
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
@@ -37,10 +50,12 @@ from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
+from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 from skyvern.schemas.workflows import WorkflowRetryPolicy
@@ -133,6 +148,8 @@ def _workflow_run_model(
     organization_id: str = "org_test",
     sequential_credential_id: str | None = None,
     failure_category: list[dict[str, Any]] | None = None,
+    browser_profile_id: str | None = None,
+    webhook_callback_url: str | None = None,
 ) -> WorkflowRunModel:
     return WorkflowRunModel(
         workflow_run_id=workflow_run_id,
@@ -140,6 +157,8 @@ def _workflow_run_model(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
         browser_session_id=browser_session_id,
+        browser_profile_id=browser_profile_id,
+        webhook_callback_url=webhook_callback_url,
         debug_session_id=debug_session_id,
         status=status,
         sequential_key=sequential_key,
@@ -214,6 +233,21 @@ async def test_prepare_next_attempt_clears_only_server_assigned_browser_address(
         assert reopened is not None
         assert reopened.browser_address == expected_browser_address
         assert reopened.status == WorkflowRunStatus.queued.value
+
+
+@pytest.mark.asyncio
+async def test_routed_task_queue_reaches_the_run_but_never_its_api_payload(sqlite_db: AgentDB) -> None:
+    now = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id="wr_routed", queued_at=now))
+        await session.commit()
+
+    await sqlite_db.workflow_runs.update_workflow_run_routing("wr_routed", "fairness-patchright-1vcpu-4gb", "aws")
+
+    run = await sqlite_db.workflow_runs.get_workflow_run("wr_routed", "org_test")
+    assert run is not None
+    assert run.task_queue == "fairness-patchright-1vcpu-4gb"
+    assert "task_queue" not in run.model_dump()
 
 
 @pytest.mark.asyncio
@@ -401,6 +435,11 @@ async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
     assert selected == ("cred_b" if rotates else "cred_a")
     actual_seed = (reopened.browser_profile_id, reopened.browser_seed_source, reopened.browser_sink_profile_id)
     assert actual_seed == ((None, None, None) if resets_seed else ("bp_a", seed_source, "bp_sink_a"))
+    if resets_seed:
+        async with sqlite_db.Session() as session:
+            completed_attempt = await session.get(WorkflowRunAttemptModel, ("wr_seed", 1))
+        assert completed_attempt is not None
+        assert completed_attempt.browser_profile_id == "bp_a"
 
 
 @pytest.mark.asyncio
@@ -897,6 +936,1028 @@ async def test_batch_create_uses_add_all_flush_commit_not_refresh() -> None:
     assert all(p.created_at is not None for p in created)
 
 
+# ── Infra-failure attribution write path (SKY-16588) ──────────────────────────
+
+_ATTR_QUEUED_AT = datetime(2026, 9, 19, tzinfo=timezone.utc)
+
+
+async def _read_failure_attribution(sqlite_db: AgentDB, workflow_run_id: str) -> Any:
+    async with sqlite_db.Session() as session:
+        row = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).one()
+        return row.failure_attribution
+
+
+async def _failure_attribution_is_sql_null(sqlite_db: AgentDB, workflow_run_id: str) -> bool:
+    """SQL-grain check: distinguishes real SQL NULL from the JSON token 'null'.
+
+    ORM ``is None`` cannot tell them apart, but CDC/Redshift and ``IS NULL`` predicates can.
+    """
+    async with sqlite_db.Session() as session:
+        result = await session.execute(
+            text("SELECT failure_attribution IS NULL FROM workflow_runs WHERE workflow_run_id = :wr"),
+            {"wr": workflow_run_id},
+        )
+        return bool(result.scalar_one())
+
+
+_ATTRIBUTION_LEAK_CANARY = "SYNTHETIC_ATTRIBUTION_LEAK_CANARY"
+_EXPLICIT_PROXY_CATEGORY = [
+    {
+        "category": FailureCategory.PROXY_ERROR.value,
+        "confidence_float": 0.95,
+        "evidence_source": "exception_type",
+        "reasoning": _ATTRIBUTION_LEAK_CANARY,
+        "reason_code": _ATTRIBUTION_LEAK_CANARY,
+    }
+]
+
+
+def _assert_failure_classified_event(
+    logs: list[EventDict],
+    workflow_run_id: str,
+    resolved_category: list[dict] | None,
+    category_source: str,
+) -> dict[str, Any]:
+    events = [entry for entry in logs if entry["event"] == "Workflow run failure classified"]
+    assert len(events) == 1
+    event = events[0]
+    assert "failure_attribution" in event
+    attribution = event["failure_attribution"]
+    assert attribution == derive_failure_attribution(resolved_category)
+    assert {key: value for key, value in event.items() if key != "failure_attribution"} == {
+        "event": "Workflow run failure classified",
+        "log_level": "info",
+        "workflow_run_id": workflow_run_id,
+        "failure_category": resolved_category,
+        "primary_failure_category": resolved_category[0]["category"] if resolved_category else None,
+        "failure_category_source": category_source,
+    }
+    mandatory_keys = {
+        "schema_version",
+        "classifier_version",
+        "failure_category",
+        "primary_infra_component",
+        "evidence_source",
+        "heuristic_confidence",
+    }
+    assert set(attribution) in (mandatory_keys, mandatory_keys | {"reason_code"})
+    assert _ATTRIBUTION_LEAK_CANARY not in json.dumps(attribution, allow_nan=False)
+    return attribution
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, failure_reason, explicit_category, expected_component",
+    [
+        pytest.param(
+            WorkflowRunStatus.failed,
+            f"browser context closed {_ATTRIBUTION_LEAK_CANARY}",
+            _EXPLICIT_PROXY_CATEGORY,
+            "proxy",
+            id="failed-explicit",
+        ),
+        pytest.param(
+            WorkflowRunStatus.failed,
+            f"No proxy available {_ATTRIBUTION_LEAK_CANARY}",
+            None,
+            "proxy",
+            id="failed-automatic",
+        ),
+        pytest.param(WorkflowRunStatus.failed, None, None, "unattributed", id="failed-unattributed"),
+        pytest.param(
+            WorkflowRunStatus.terminated,
+            f"secure codeblock runner is unavailable {_ATTRIBUTION_LEAK_CANARY}",
+            None,
+            "codeblock",
+            id="terminated",
+        ),
+        pytest.param(
+            WorkflowRunStatus.timed_out,
+            f"heartbeat timeout {_ATTRIBUTION_LEAK_CANARY}",
+            None,
+            "worker",
+            id="timed-out",
+        ),
+    ],
+)
+async def test_terminal_failure_event_matches_persisted_attribution(
+    sqlite_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    status: WorkflowRunStatus,
+    failure_reason: str | None,
+    explicit_category: list[dict] | None,
+    expected_component: str,
+) -> None:
+    workflow_run_id = "wr_terminal_event"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        await session.commit()
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    service = workflow_service_module.WorkflowService()
+    # Exclude unrelated telemetry/hooks; classification, terminal CAS, and persistence stay real.
+    monkeypatch.setattr(service, "_after_workflow_run_status_write", AsyncMock())
+
+    with capture_logs() as logs:
+        if status == WorkflowRunStatus.timed_out:
+            result = await service.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+        elif status == WorkflowRunStatus.terminated:
+            result = await service.mark_workflow_run_as_terminated(
+                workflow_run_id, failure_reason, failure_category=explicit_category
+            )
+        else:
+            result = await service.mark_workflow_run_as_failed(
+                workflow_run_id, failure_reason, failure_category=explicit_category
+            )
+
+    resolved_category = (
+        explicit_category
+        if explicit_category is not None
+        else classify_from_failure_reason(failure_reason, fallback_to_unknown=status != WorkflowRunStatus.terminated)
+    )
+    attribution = _assert_failure_classified_event(
+        logs,
+        workflow_run_id,
+        resolved_category,
+        "inherited_from_task" if explicit_category is not None else "code_level",
+    )
+    assert attribution["primary_infra_component"] == expected_component
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) == attribution
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+    assert result.status == status
+    assert result.failure_category == resolved_category
+    assert result.failure_reason == failure_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_status", [WorkflowRunStatus.failed, WorkflowRunStatus.timed_out])
+async def test_late_failure_event_keeps_persisted_first_writer_attribution(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch, late_status: WorkflowRunStatus
+) -> None:
+    workflow_run_id = "wr_late_terminal_event"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        await session.commit()
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    service = workflow_service_module.WorkflowService()
+    monkeypatch.setattr(service, "_after_workflow_run_status_write", AsyncMock())
+
+    with capture_logs() as first_logs:
+        await service.mark_workflow_run_as_failed(
+            workflow_run_id, _ATTRIBUTION_LEAK_CANARY, failure_category=_EXPLICIT_PROXY_CATEGORY
+        )
+    winner = _assert_failure_classified_event(
+        first_logs, workflow_run_id, _EXPLICIT_PROXY_CATEGORY, "inherited_from_task"
+    )
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) == winner
+
+    late_reason = f"browser context closed {_ATTRIBUTION_LEAK_CANARY}"
+    with capture_logs() as late_logs:
+        if late_status == WorkflowRunStatus.timed_out:
+            result = await service.mark_workflow_run_as_timed_out(workflow_run_id, late_reason)
+        else:
+            result = await service.mark_workflow_run_as_failed(workflow_run_id, late_reason)
+    late_attribution = _assert_failure_classified_event(
+        late_logs, workflow_run_id, classify_from_failure_reason(late_reason, fallback_to_unknown=True), "code_level"
+    )
+    assert late_attribution != winner
+    assert result.status == WorkflowRunStatus.failed
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) == winner
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_write_persists_infra_attribution(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_failed",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+
+    failure_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        "wr_attr_failed",
+        status=WorkflowRunStatus.failed,
+        failure_reason="No proxy available for this run",
+        failure_category=failure_category,
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_failed")
+    assert doc is not None
+    assert doc["primary_infra_component"] == "proxy"
+    assert doc["failure_category"] == "PROXY_ERROR"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "exception_name", "reason_code", "evidence_source"),
+    [
+        ("Timeout exceeded on locator.wait_for", None, "locator_wait_for_timeout", "reason_code"),
+        ("Waiting for locator('#submit')", "TimeoutError", "locator_wait_for_timeout", "reason_code"),
+        (
+            "Secure CodeBlock runner is unavailable",
+            None,
+            "secure_codeblock_runner_unavailable",
+            "reason_code",
+        ),
+        (
+            "CodeBlock inputs exhausted the sandbox memory limit before the block started",
+            None,
+            "secure_codeblock_input_memory_limit",
+            "reason_code",
+        ),
+        (
+            "Secure CodeBlock runner failed before completing",
+            None,
+            "secure_codeblock_runner_internal",
+            "reason_code",
+        ),
+        ("Secure CodeBlock sandbox process exited", None, "secure_codeblock_sandbox_exited", "reason_code"),
+        (
+            "CodeBlock runner is already executing another CodeBlock",
+            None,
+            "secure_codeblock_runner_busy",
+            "reason_code",
+        ),
+        ("Captcha required", None, None, "keyword_only"),
+        (None, "NoProxyAvailable", None, "exception_type"),
+        ("Timeout while loading the page", None, None, "keyword_match"),
+    ],
+)
+async def test_classifier_provenance_round_trips_through_terminal_write(
+    sqlite_db: AgentDB,
+    reason: str | None,
+    exception_name: str | None,
+    reason_code: str | None,
+    evidence_source: str,
+) -> None:
+    workflow_run_id = "wr_attr_provenance"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    failure_reason = f"{reason or ''}; synthetic-private-marker"
+    category = classify_from_failure_reason(failure_reason, exception_name=exception_name)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_reason=failure_reason,
+        failure_category=category,
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["evidence_source"] == evidence_source
+    assert doc.get("reason_code") == reason_code
+    assert doc["classifier_version"] == CLASSIFIER_VERSION
+    encoded = json.dumps(doc, allow_nan=False)
+    assert json.loads(encoded) == doc
+    assert "synthetic-private-marker" not in encoded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome_status", ["budget_exhausted", "failed"])
+async def test_budget_exhaustion_producer_persists_non_infra_attribution(
+    sqlite_db: AgentDB, outcome_status: str
+) -> None:
+    workflow_run_id = "wr_attr_budget"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    outcome = LoopOutcome(status=outcome_status, reason="Unfinished", cap_trip="max_turns (40) reached")
+    category = _v3_failure_category(
+        outcome,
+        task_status=TaskStatus.failed,
+        failure_reason=outcome.reason,
+        completion_rejection=None,
+        missing_extraction=False,
+    )
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id, status=WorkflowRunStatus.failed, failure_category=category
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["failure_category"] == "BUDGET_EXHAUSTED"
+    assert doc["primary_infra_component"] == "non_infra"
+    assert doc["heuristic_confidence"] == 1.0
+    assert doc["evidence_source"] == "code_level"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_status", [WorkflowRunStatus.failed, WorkflowRunStatus.completed])
+async def test_stale_terminal_writer_updates_attribution_atomically(
+    sqlite_db: AgentDB,
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    late_status: WorkflowRunStatus,
+) -> None:
+    workflow_run_id = f"wr_attr_stale_{late_status.value}"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    snapshot_loaded = asyncio.Event()
+    winner_committed = asyncio.Event()
+    async with async_sessionmaker(sqlite_engine, expire_on_commit=False)() as stale_session:
+        original_scalars = stale_session.scalars
+
+        async def pause_after_read(*args: Any, **kwargs: Any) -> Any:
+            result = await original_scalars(*args, **kwargs)
+            snapshot_loaded.set()
+            await asyncio.wait_for(winner_committed.wait(), timeout=5)
+            return result
+
+        monkeypatch.setattr(stale_session, "scalars", pause_after_read)
+        stale_repository = WorkflowRunsRepository(
+            session_factory=lambda: stale_session, dialect_name=sqlite_engine.dialect.name
+        )
+        loser = asyncio.create_task(
+            stale_repository.update_workflow_run(
+                workflow_run_id,
+                status=late_status,
+                failure_reason="browser context closed",
+                failure_category=classify_from_failure_reason("browser context closed"),
+            )
+        )
+        try:
+            await asyncio.wait_for(snapshot_loaded.wait(), timeout=5)
+            await sqlite_db.workflow_runs.update_workflow_run(
+                workflow_run_id,
+                status=WorkflowRunStatus.failed,
+                failure_category=classify_from_failure_reason("No proxy available"),
+            )
+        finally:
+            winner_committed.set()
+            await asyncio.wait_for(loser, timeout=5)
+
+    async with sqlite_db.Session() as session:
+        row = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).one()
+        assert row.status == late_status
+        if late_status == WorkflowRunStatus.completed:
+            assert row.failure_attribution is None
+        else:
+            assert row.failure_attribution["primary_infra_component"] == "proxy"
+            assert row.failure_attribution["failure_category"] == "PROXY_ERROR"
+        assert row.failure_reason == "browser context closed"
+        assert row.failure_category[0]["category"] == "BROWSER_ERROR"
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id) == (
+        late_status == WorkflowRunStatus.completed
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supply_category", [True, False])
+async def test_final_write_fills_attribution_despite_stale_nonnull_snapshot(
+    sqlite_db: AgentDB,
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    supply_category: bool,
+) -> None:
+    # A legacy/no-attempt finalizer loads a row that still has attribution, then a concurrent
+    # reset clears it to SQL NULL before this write commits. The write must still fill a real
+    # document (via the flush-time COALESCE) rather than trusting its stale non-NULL snapshot.
+    workflow_run_id = "wr_attr_stale_reset"
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id=workflow_run_id,
+            queued_at=_ATTR_QUEUED_AT,
+            failure_category=classify_from_failure_reason("browser context closed"),
+        )
+        run.failure_attribution = {
+            "schema_version": 1,
+            "classifier_version": 2,
+            "failure_category": "BROWSER_ERROR",
+            "primary_infra_component": "browser",
+            "evidence_source": "exception_type",
+            "heuristic_confidence": 1.0,
+        }
+        session.add(run)
+        await session.commit()
+
+    snapshot_loaded = asyncio.Event()
+    reset_committed = asyncio.Event()
+    async with async_sessionmaker(sqlite_engine, expire_on_commit=False)() as stale_session:
+        original_scalars = stale_session.scalars
+
+        async def pause_after_read(*args: Any, **kwargs: Any) -> Any:
+            result = await original_scalars(*args, **kwargs)
+            snapshot_loaded.set()
+            await asyncio.wait_for(reset_committed.wait(), timeout=5)
+            return result
+
+        monkeypatch.setattr(stale_session, "scalars", pause_after_read)
+        stale_repository = WorkflowRunsRepository(
+            session_factory=lambda: stale_session, dialect_name=sqlite_engine.dialect.name
+        )
+        finalizer = asyncio.create_task(
+            stale_repository.update_workflow_run(
+                workflow_run_id,
+                status=WorkflowRunStatus.failed,
+                failure_reason="No proxy available",
+                failure_category=classify_from_failure_reason("No proxy available") if supply_category else None,
+            )
+        )
+        try:
+            await asyncio.wait_for(snapshot_loaded.wait(), timeout=5)
+            await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.created)
+            assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+            async with sqlite_db.Session() as session:
+                reset = await session.get(WorkflowRunModel, workflow_run_id)
+                assert reset.status == WorkflowRunStatus.created
+                assert reset.failure_category is None
+        finally:
+            reset_committed.set()
+            await asyncio.wait_for(finalizer, timeout=5)
+
+    async with sqlite_db.Session() as session:
+        row = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).one()
+        assert row.status == WorkflowRunStatus.failed
+        assert row.failure_attribution is not None
+        assert row.failure_attribution["primary_infra_component"] == ("proxy" if supply_category else "unattributed")
+        assert row.failure_attribution["failure_category"] == ("PROXY_ERROR" if supply_category else None)
+        if not supply_category:
+            assert row.failure_attribution["evidence_source"] == "none"
+            assert row.failure_attribution["heuristic_confidence"] == 0.0
+            assert (
+                await session.execute(
+                    text("SELECT failure_category IS NULL FROM workflow_runs WHERE workflow_run_id = :wr"),
+                    {"wr": workflow_run_id},
+                )
+            ).scalar_one()
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_completed_run_leaves_attribution_null(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_done",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        await session.commit()
+
+    await sqlite_db.workflow_runs.update_workflow_run("wr_attr_done", status=WorkflowRunStatus.completed)
+
+    assert await _read_failure_attribution(sqlite_db, "wr_attr_done") is None
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_completed_clears_stale_attribution(sqlite_db: AgentDB) -> None:
+    # A completed CAS winner via update_workflow_run_if_not_final (e.g. an old completion
+    # finalizer winning during a reset window) must clear any lingering attribution, matching
+    # update_workflow_run. Otherwise a completed run keeps a prior failure's attribution.
+    workflow_run_id = "wr_attr_ifnf_completed"
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id=workflow_run_id,
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.running.value,
+        )
+        run.failure_attribution = {
+            "schema_version": 1,
+            "classifier_version": 2,
+            "failure_category": "BROWSER_ERROR",
+            "primary_infra_component": "browser",
+            "evidence_source": "exception_type",
+            "heuristic_confidence": 1.0,
+        }
+        session.add(run)
+        await session.commit()
+
+    updated = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id=workflow_run_id,
+        status=WorkflowRunStatus.completed,
+    )
+    assert updated is not None
+
+    async with sqlite_db.Session() as session:
+        row = await session.get(WorkflowRunModel, workflow_run_id)
+        assert row.status == WorkflowRunStatus.completed.value
+        assert row.failure_attribution is None
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_late_completion_clears_existing_failure_attribution(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_late_completion"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_category=classify_from_failure_reason("No proxy available"),
+    )
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+    # Legacy runs without attempt rows fall back to the unconditional updater after this CAS loses.
+    assert (
+        await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id, status=WorkflowRunStatus.completed
+        )
+        is None
+    )
+    completed = await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.completed)
+
+    assert completed.status == WorkflowRunStatus.completed
+    assert completed.failure_category is not None
+    assert completed.failure_category[0]["category"] == "PROXY_ERROR"
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_canceled_if_not_final_writes_unattributed_document(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_canceled",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+
+    updated = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id="wr_attr_canceled",
+        status=WorkflowRunStatus.canceled,
+        failure_reason="canceled by operator",
+    )
+    assert updated is not None
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_canceled")
+    assert doc is not None
+    assert doc["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_cas_loser_cannot_change_attribution(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_cas",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+
+    failure_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    winner = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id="wr_attr_cas",
+        status=WorkflowRunStatus.failed,
+        failure_reason="No proxy available for this run",
+        failure_category=failure_category,
+    )
+    assert winner is not None
+
+    # The row is already terminal, so this late cancel is a no-op and must not clobber.
+    loser = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id="wr_attr_cas",
+        status=WorkflowRunStatus.canceled,
+    )
+    assert loser is None
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_cas")
+    assert doc["primary_infra_component"] == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_repair_strengthens_provisional_but_never_touches_a_finished_row(sqlite_db: AgentDB) -> None:
+    proxy_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+
+    # Unfinished (provisional) row from the bulk sweep: the repair strengthens the provisional
+    # unattributed to the typed derived attribution and stamps finished_at.
+    async with sqlite_db.Session() as session:
+        provisional = _workflow_run_model(
+            workflow_run_id="wr_attr_provisional",
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.timed_out.value,
+        )
+        provisional.failure_attribution = {"primary_infra_component": "unattributed"}
+        provisional.finished_at = None
+        session.add(provisional)
+        await session.commit()
+
+    result = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        "wr_attr_provisional", failure_reason="No proxy available", failure_category=proxy_category
+    )
+    assert result is not None
+    assert (await _read_failure_attribution(sqlite_db, "wr_attr_provisional"))["primary_infra_component"] == "proxy"
+
+    # Finished row (a genuine finalizer already stamped finished_at): the finished_at IS NULL
+    # guard makes the repair a no-op, so it never overwrites a genuine finalizer's document.
+    genuine = {
+        "schema_version": 1,
+        "classifier_version": 2,
+        "failure_category": "BROWSER_ERROR",
+        "primary_infra_component": "browser",
+        "evidence_source": "exception_type",
+        "heuristic_confidence": 0.9,
+    }
+    async with sqlite_db.Session() as session:
+        finished = _workflow_run_model(
+            workflow_run_id="wr_attr_finished",
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.timed_out.value,
+        )
+        finished.failure_attribution = genuine
+        finished.finished_at = _ATTR_QUEUED_AT
+        session.add(finished)
+        await session.commit()
+
+    no_op = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        "wr_attr_finished", failure_reason="timed out", failure_category=proxy_category
+    )
+    assert no_op is None
+    assert (await _read_failure_attribution(sqlite_db, "wr_attr_finished"))["primary_infra_component"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_late_update_workflow_run_cannot_replace_existing_attribution(sqlite_db: AgentDB) -> None:
+    proxy_doc = {
+        "schema_version": 1,
+        "classifier_version": 1,
+        "failure_category": "PROXY_ERROR",
+        "primary_infra_component": "proxy",
+        "evidence_source": "exception_type",
+        "heuristic_confidence": 0.9,
+    }
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id="wr_attr_late",
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.failed.value,
+        )
+        run.failure_attribution = proxy_doc
+        session.add(run)
+        await session.commit()
+
+    browser_category = classify_from_failure_reason(None, exception_name="TargetClosedError", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        "wr_attr_late",
+        status=WorkflowRunStatus.failed,
+        failure_category=browser_category,
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_late")
+    assert doc["primary_infra_component"] == "proxy"
+
+
+def test_failure_attribution_absent_from_customer_facing_serializers() -> None:
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun as LegacyWorkflowRun
+    from skyvern.schemas.runs import BaseRunResponse, BlockRunResponse, TaskRunResponse, WorkflowRunResponse
+
+    for model in (LegacyWorkflowRun, BaseRunResponse, TaskRunResponse, WorkflowRunResponse, BlockRunResponse):
+        assert "failure_attribution" not in model.model_fields, model.__name__
+
+
+async def _seed_failed_run_with_attribution(sqlite_db: AgentDB, workflow_run_id: str) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+    proxy_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_reason="No proxy available for this run",
+        failure_category=proxy_category,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_reopen_clears_stale_attribution(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_reopen"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status=WorkflowRunStatus.failed.value,
+                retry_decision="retry",
+                next_attempt_at=_ATTR_QUEUED_AT,
+            )
+        )
+        await session.commit()
+
+    preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+    assert preparation.status == "inserted"
+
+    async with sqlite_db.Session() as session:
+        reopened = await session.get(WorkflowRunModel, workflow_run_id)
+        assert reopened.status == WorkflowRunStatus.queued.value
+        assert reopened.failure_attribution is None
+    # SQL grain, not just ORM None: the reopen must store real SQL NULL, not JSON 'null'.
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    # A completed retry leaves it NULL; a differently-failed retry writes the new document.
+    await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.completed)
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) is None
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_retry_reopen_then_new_failure_writes_new_document(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_reopen_refail"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status=WorkflowRunStatus.failed.value,
+                retry_decision="retry",
+                next_attempt_at=_ATTR_QUEUED_AT,
+            )
+        )
+        await session.commit()
+    await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+
+    browser_category = classify_from_failure_reason(None, exception_name="TargetClosedError", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_category=browser_category,
+    )
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["primary_infra_component"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_fail_prepared_workflow_run_persists_unattributed_document(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_prepared"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.queued.value,
+            )
+        )
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    claimed = await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        attempt_number=1,
+        failure_reason="prepared attempt never started",
+    )
+    assert claimed is True
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc is not None
+    assert doc["primary_infra_component"] == "unattributed"
+
+    # Idempotent: a second call finds the row already terminal and does not change attribution.
+    again = await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        attempt_number=1,
+        failure_reason="prepared attempt never started",
+    )
+    assert again is False
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.asyncio
+async def test_fail_prepared_does_not_clobber_existing_attribution(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_prepared_existing"
+    proxy_doc = {
+        "schema_version": 1,
+        "classifier_version": 1,
+        "failure_category": "PROXY_ERROR",
+        "primary_infra_component": "proxy",
+        "evidence_source": "exception_type",
+        "heuristic_confidence": 0.9,
+    }
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id=workflow_run_id,
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.queued.value,
+        )
+        run.failure_attribution = proxy_doc
+        session.add(run)
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        attempt_number=1,
+        failure_reason="prepared attempt never started",
+    )
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_bulk_timeout_persists_provisional_attribution_then_repair_strengthens(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_bulk_timeout"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    # Bulk stuck-run cleanup persists a bounded provisional (unattributed) attribution atomically
+    # — never SQL NULL — so a stuck-run timeout is never left permanently unattributable if the
+    # per-run repair does not run. failure_category is cleared so the repair can fill it.
+    await sqlite_db.workflow_runs.bulk_update_workflow_runs(
+        [workflow_run_id],
+        status=WorkflowRunStatus.timed_out,
+    )
+    async with sqlite_db.Session() as session:
+        marked = await session.get(WorkflowRunModel, workflow_run_id)
+        assert marked.status == WorkflowRunStatus.timed_out.value
+        assert marked.failure_attribution["primary_infra_component"] == "unattributed"
+        assert marked.failure_category is None
+        assert marked.finished_at is None
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    # The repair runs only on the unfinished (provisional) row, so it safely strengthens the
+    # provisional unattributed to the typed timeout attribution and fills the category.
+    result = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        workflow_run_id,
+        failure_reason="activity timeout",
+        failure_category=classify_from_failure_reason("activity timeout", fallback_to_unknown=True),
+    )
+    assert result is not None
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["primary_infra_component"] == "worker"
+    async with sqlite_db.Session() as session:
+        repaired = await session.get(WorkflowRunModel, workflow_run_id)
+        assert repaired.failure_category[0]["category"] == "INFRASTRUCTURE_ERROR"
+
+    # Idempotent: the row is now finished, so a repeat repair is a no-op and cannot weaken it.
+    repeat = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        workflow_run_id,
+        failure_reason="activity timeout",
+        failure_category=None,
+    )
+    assert repeat is None
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "worker"
+
+
+@pytest.mark.asyncio
+async def test_reset_clear_wipes_reason_category_and_attribution_when_created(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_reset"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+    # reset_workflow_run first transitions the row to `created`, then calls this clear.
+    await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.created)
+
+    await sqlite_db.workflow_runs.clear_workflow_run_failure_reason(workflow_run_id, "org_test")
+
+    async with sqlite_db.Session() as session:
+        cleared = await session.get(WorkflowRunModel, workflow_run_id)
+        assert cleared.failure_reason is None
+        # failure_category is cleared too, so a later terminal transition on the reset run does
+        # not derive attribution from the stale category.
+        assert cleared.failure_category is None
+        assert cleared.failure_attribution is None
+    # SQL grain: a reset row must be SQL NULL so it never enters the Redshift projection.
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_update_to_created_clears_failure_state_and_closes_reset_window(sqlite_db: AgentDB) -> None:
+    # Reopening/resetting a run to `created` clears reason/category/attribution in the same update,
+    # so no stale document lingers on the non-terminal row. A later failure then derives fresh
+    # attribution (COALESCE onto SQL NULL) instead of retaining the previous attempt's document.
+    workflow_run_id = "wr_attr_created_clear"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.created)
+    async with sqlite_db.Session() as session:
+        reopened = await session.get(WorkflowRunModel, workflow_run_id)
+        assert reopened.status == WorkflowRunStatus.created.value
+        assert reopened.failure_reason is None
+        assert reopened.failure_category is None
+        assert reopened.failure_attribution is None
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_category=classify_from_failure_reason(
+            None, exception_name="TargetClosedError", fallback_to_unknown=True
+        ),
+    )
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["primary_infra_component"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_reset_clear_is_noop_when_a_finalizer_already_took_the_row(sqlite_db: AgentDB) -> None:
+    # A finalizer that raced in (created -> failed with fresh attribution) between the reset's
+    # status write and this clear must not be clobbered: the clear only fires on a `created` row.
+    workflow_run_id = "wr_attr_reset_raced"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    # Row is still `failed` (finalizer won the race), not `created`.
+    await sqlite_db.workflow_runs.clear_workflow_run_failure_reason(workflow_run_id, "org_test")
+
+    async with sqlite_db.Session() as session:
+        row = await session.get(WorkflowRunModel, workflow_run_id)
+        assert row.status == WorkflowRunStatus.failed.value
+        assert row.failure_attribution["primary_infra_component"] == "proxy"
+        assert row.failure_category is not None
+
+
+@pytest.mark.asyncio
+async def test_reopen_then_cas_cancel_writes_document_after_sql_null_clear(sqlite_db: AgentDB) -> None:
+    # End-to-end: fail (writes doc) -> reopen (SQL NULL) -> CAS cancel must COALESCE a new
+    # document in, which is only possible because the reopen stored SQL NULL, not JSON 'null'.
+    workflow_run_id = "wr_attr_reopen_cas"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status=WorkflowRunStatus.failed.value,
+                retry_decision="retry",
+                next_attempt_at=_ATTR_QUEUED_AT,
+            )
+        )
+        await session.commit()
+
+    await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    canceled = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id=workflow_run_id,
+        status=WorkflowRunStatus.canceled,
+        failure_reason="canceled after reopen",
+    )
+    assert canceled is not None
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc is not None
+    assert doc["primary_infra_component"] == "unattributed"
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
 @pytest.mark.asyncio
 async def test_batch_create_with_empty_list_returns_empty() -> None:
     """create_workflow_run_parameters with an empty list should short-circuit and return []."""
@@ -1041,6 +2102,411 @@ async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
     assert "extra_http_headers" in primary_where
     # Param search must not drag workflows.title into the primary query (no implicit FROM workflows).
     assert ".".join(("workflows", "title")) not in primary_where
+
+
+# SKY-15975: every run-level identifier a power user has in hand must find its run. Each term is
+# unique to exactly one seeded run, so an over-broad clause fails the same assertion an absent one does;
+# the pool and fallback workflows each carry a sibling run whose recorded selection replaced the
+# definition's credential, so matching the definition alone returns two runs and fails. wr_mentions_ids
+# only mentions a profile and a session id in its webhook URL, so a substring arm on those ids fails too.
+_RUN_IDENTIFIER_SEARCH_CASES = (
+    ("hooks.example.com/notify", "wr_webhook"),
+    ("bp_1001", "wr_profile"),
+    ("pbs_1002", "wr_session"),
+    ("cred_1003", "wr_sequential_credential"),
+    ("cred_1004", "wr_selected_credential"),
+    ("cred_1005", "wr_bound_credential"),
+    ("cred_1006", "wr_pool_primary"),
+    ("cred_1007", "wr_pool_member"),
+    ("cred_1008", "wr_fallback_primary"),
+    ("cred_1009", "wr_fallback_retry"),
+    ("cred_1010", "wr_selected_credential"),
+    ("pbs_1011", "wr_previous_session"),
+    ("pbs_1012", "wr_previous_session"),
+    ("bp_1015", "wr_previous_profile"),
+    ("cred_1016", "wr_two_parameters"),
+    ("cred_1017", "wr_two_parameters"),
+)
+
+
+def _credential_selection(workflow_run_id: str, credential_id: str) -> WorkflowRunCredentialSelectionModel:
+    return WorkflowRunCredentialSelectionModel(
+        organization_id="org_test",
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id="wpid_test",
+        parameter_key="login",
+        credential_id=credential_id,
+    )
+
+
+async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    workflow_ids = ("wf_test", "wf_single", "wf_pool", "wf_fallback", "wf_two_parameters")
+    bound_at = created_at - timedelta(days=1)
+    runs = [
+        _workflow_run_model(
+            workflow_run_id="wr_webhook",
+            queued_at=created_at,
+            webhook_callback_url="https://hooks.example.com/notify",
+        ),
+        _workflow_run_model(
+            workflow_run_id="wr_mentions_ids",
+            queued_at=created_at,
+            webhook_callback_url="https://hooks.example.com/bp_1001/pbs_1002",
+        ),
+        _workflow_run_model(workflow_run_id="wr_profile", queued_at=created_at, browser_profile_id="bp_1001"),
+        _workflow_run_model(workflow_run_id="wr_session", queued_at=created_at, browser_session_id="pbs_1002"),
+        _workflow_run_model(
+            workflow_run_id="wr_sequential_credential",
+            queued_at=created_at,
+            sequential_credential_id="cred_1003",
+        ),
+        _workflow_run_model(workflow_run_id="wr_selected_credential", queued_at=created_at),
+        _workflow_run_model(workflow_run_id="wr_previous_session", queued_at=created_at, browser_session_id="pbs_1013"),
+        _workflow_run_model(workflow_run_id="wr_previous_profile", queued_at=created_at, browser_profile_id="bp_1014"),
+        _workflow_run_model(workflow_run_id="wr_bound_credential", queued_at=created_at, workflow_id="wf_single"),
+        _workflow_run_model(workflow_run_id="wr_pool_primary", queued_at=created_at, workflow_id="wf_pool"),
+        _workflow_run_model(workflow_run_id="wr_pool_member", queued_at=created_at, workflow_id="wf_pool"),
+        _workflow_run_model(workflow_run_id="wr_fallback_primary", queued_at=created_at, workflow_id="wf_fallback"),
+        _workflow_run_model(workflow_run_id="wr_fallback_retry", queued_at=created_at, workflow_id="wf_fallback"),
+        _workflow_run_model(workflow_run_id="wr_two_parameters", queued_at=created_at, workflow_id="wf_two_parameters"),
+    ]
+
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                WorkflowModel(
+                    workflow_id=workflow_id,
+                    workflow_permanent_id="wpid_test",
+                    title="identifier fixture",
+                    workflow_definition={},
+                    version=version,
+                )
+                for version, workflow_id in enumerate(workflow_ids, start=1)
+            ]
+        )
+        session.add_all(runs)
+        await session.flush()
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id="wr_previous_profile",
+                attempt_number=1,
+                organization_id="org_test",
+                status="failed",
+                browser_profile_id="bp_1015",
+            )
+        )
+        if with_task_runs:
+            session.add_all(
+                [
+                    _task_run_model(
+                        run_id=run.workflow_run_id,
+                        created_at=created_at,
+                        workflow_permanent_id="wpid_test",
+                    )
+                    for run in runs
+                ]
+            )
+        session.add_all(
+            [
+                _credential_selection("wr_selected_credential", "cred_1004"),
+                _credential_selection("wr_selected_credential:attempt:1", "cred_1010"),
+                _credential_selection("wr_pool_primary", "cred_1006"),
+                _credential_selection("wr_pool_member", "cred_1007"),
+                _credential_selection("wr_fallback_retry", "cred_1009"),
+                _credential_selection("wr_two_parameters", "cred_1017"),
+            ]
+        )
+        session.add_all(
+            [
+                TaskModel(
+                    task_id="tsk_previous_session",
+                    organization_id="org_test",
+                    workflow_run_id="wr_previous_session",
+                    status="completed",
+                    browser_session_id="pbs_1011",
+                ),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_previous_session",
+                    organization_id="org_test",
+                    workflow_run_id="wr_previous_session",
+                    browser_session_id="pbs_1012",
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                CredentialParameterModel(
+                    workflow_id="wf_single", key="login", credential_id="cred_1005", created_at=bound_at
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_pool",
+                    key="login",
+                    credential_id="cred_1006",
+                    credential_ids=["cred_1006", "cred_1007"],
+                    created_at=bound_at,
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_fallback",
+                    key="login",
+                    credential_id="cred_1008",
+                    fallback_credential_ids=["cred_1009"],
+                    created_at=bound_at,
+                ),
+                # The selection above overrides only "login"; "backup_login" still binds the same credential.
+                CredentialParameterModel(
+                    workflow_id="wf_two_parameters", key="login", credential_id="cred_1016", created_at=bound_at
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_two_parameters", key="backup_login", credential_id="cred_1016", created_at=bound_at
+                ),
+            ]
+        )
+        await session.commit()
+
+
+@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_search_key_matches_run_identifiers(
+    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=True)
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+
+    assert {row["run_id"] for row in rows} == {expected_run_id}
+
+
+@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
+@pytest.mark.asyncio
+async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_run_identifiers(
+    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+) -> None:
+    # Covers the shared WorkflowRunModel filter behind the per-workflow runs table, /workflows/runs,
+    # and the orphan fallback leg of the global runs list.
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+
+    runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        search_key=search_key,
+    )
+
+    assert {run.workflow_run_id for run in runs} == {expected_run_id}
+
+
+@pytest.mark.asyncio
+async def test_credential_search_follows_an_in_place_definition_edit(sqlite_db: AgentDB) -> None:
+    # An in-place edit rebinds a workflow version without creating a new one, so each run has to match
+    # the credential its version was bound to when that run was created.
+    bound_at = datetime(2026, 7, 20, 12, 0)
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                WorkflowModel(
+                    workflow_id="wf_edited",
+                    organization_id="org_test",
+                    workflow_permanent_id="wpid_test",
+                    title="edited in place",
+                    workflow_definition={},
+                    version=1,
+                ),
+                CredentialParameterModel(
+                    credential_parameter_id="cp_login",
+                    workflow_id="wf_edited",
+                    key="login",
+                    credential_id="cred_2001",
+                    created_at=bound_at,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_before_edit", queued_at=bound_at + timedelta(hours=1), workflow_id="wf_edited"
+                ),
+            ]
+        )
+        await session.commit()
+
+    await sqlite_db.workflows.update_workflow_and_reconcile_definition_params(
+        workflow_id="wf_edited",
+        workflow_definition=WorkflowDefinition(
+            parameters=[
+                CredentialParameter(
+                    credential_parameter_id="cp_login",
+                    workflow_id="wf_edited",
+                    key="login",
+                    credential_id="cred_2002",
+                    created_at=bound_at,
+                    modified_at=bound_at,
+                )
+            ],
+            blocks=[],
+        ),
+    )
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_after_edit", queued_at=naive_utc_now() + timedelta(hours=1), workflow_id="wf_edited"
+            )
+        )
+        await session.commit()
+
+    for search_key, expected_run_id in (("cred_2001", "wr_before_edit"), ("cred_2002", "wr_after_edit")):
+        runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_test",
+            search_key=search_key,
+        )
+        assert {run.workflow_run_id for run in runs} == {expected_run_id}, search_key
+
+
+@pytest.mark.parametrize(
+    ("search_key", "expected_run_id"),
+    [("cred_1003", "wr_sequential_credential"), ("bp_1001", "wr_profile"), ("pbs_1002", "wr_session")],
+)
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_search_excludes_unmatched_standalone_tasks(
+    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    async with sqlite_db.Session() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_noise",
+                organization_id="org_test",
+                status="completed",
+                title="Unrelated task",
+                url="https://example.com/other",
+                created_at=datetime(2026, 7, 21, 12, 0),
+            )
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key=search_key, page_size=1)
+
+    assert [getattr(run, "workflow_run_id", None) for run in runs] == [expected_run_id]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_search_matches_standalone_browser_session(sqlite_db: AgentDB) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                TaskModel(
+                    task_id="tsk_session",
+                    organization_id="org_test",
+                    status="completed",
+                    browser_session_id="pbs_3001",
+                    url="https://example.com/session",
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+                TaskModel(
+                    task_id="tsk_noise",
+                    organization_id="org_test",
+                    status="completed",
+                    browser_session_id="pbs_3002",
+                    url="https://example.com/other",
+                    created_at=datetime(2026, 7, 21, 12, 0),
+                ),
+            ]
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key="pbs_3001", page_size=1)
+
+    assert [getattr(run, "task_id", None) for run in runs] == ["tsk_session"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_webhook_search_excludes_unmatched_standalone_tasks(sqlite_db: AgentDB) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    async with sqlite_db.Session() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_noise",
+                organization_id="org_test",
+                status="completed",
+                title="Unrelated task",
+                url="https://example.com/other",
+                created_at=datetime(2026, 7, 21, 12, 0),
+            )
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(
+        organization_id="org_test", search_key="hooks.example.com/notify", page_size=1
+    )
+
+    assert [getattr(run, "workflow_run_id", None) for run in runs] == ["wr_webhook"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_free_text_matches_standalone_task_title(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                TaskModel(
+                    task_id="tsk_match",
+                    organization_id="org_test",
+                    status="completed",
+                    title="Invoice check",
+                    url="https://example.com/invoice",
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+                TaskModel(
+                    task_id="tsk_noise",
+                    organization_id="org_test",
+                    status="completed",
+                    title="Unrelated task",
+                    url="https://example.com/other",
+                    created_at=datetime(2026, 7, 21, 12, 0),
+                ),
+            ]
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key="Invoice", page_size=1)
+
+    assert [getattr(run, "task_id", None) for run in runs] == ["tsk_match"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_search_key_matches_standalone_task_browser_session(sqlite_db: AgentDB) -> None:
+    # task_v1/task_v2 rows join workflow_runs as NULL, so their session id has to come from the task row.
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                _task_run_model(
+                    run_id="tsk_1", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v1"
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_1", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v2"
+                ),
+                _task_run_model(
+                    run_id="tsk_2", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v1"
+                ),
+                TaskModel(
+                    task_id="tsk_1", organization_id="org_test", status="completed", browser_session_id="pbs_3001"
+                ),
+                TaskModel(
+                    task_id="tsk_2", organization_id="org_test", status="completed", browser_session_id="pbs_3003"
+                ),
+                TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", browser_session_id="pbs_3002"),
+            ]
+        )
+        await session.commit()
+
+    for search_key, expected in (("pbs_3001", "tsk_1"), ("pbs_3002", "tsk_v2_1")):
+        rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+        assert {row["run_id"] for row in rows} == {expected}
 
 
 @pytest.mark.asyncio
@@ -2879,3 +4345,45 @@ async def test_recovery_paginates_stale_undecided_terminal_runs(sqlite_db: Agent
         *((f"wr_undecided_{index}", 1) for index in range(1, 5)),
         ("wr_undecided_7", 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sqlite_db: AgentDB) -> None:
+    now = datetime.now(tz=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id="wr_member",
+                    workflow_id="w_member",
+                    workflow_permanent_id="wpid_member",
+                    organization_id="org_test",
+                    status="completed",
+                    created_by="user_member",
+                ),
+                WorkflowRunModel(
+                    workflow_run_id="wr_task_v2",
+                    workflow_id="w_task_v2",
+                    workflow_permanent_id="wpid_task_v2",
+                    organization_id="org_test",
+                    status="completed",
+                    created_by="user_prompter",
+                ),
+                TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", workflow_run_id="wr_task_v2"),
+                _task_run_model(run_id="wr_member", created_at=now, workflow_permanent_id="wpid_member"),
+                _task_run_model(
+                    run_id="tsk_v2_1",
+                    created_at=now - timedelta(seconds=1),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test")
+
+    assert {row["run_id"]: row["created_by"] for row in rows} == {
+        "wr_member": "user_member",
+        "tsk_v2_1": "user_prompter",
+    }

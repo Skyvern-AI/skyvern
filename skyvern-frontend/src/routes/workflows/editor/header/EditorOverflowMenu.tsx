@@ -30,10 +30,14 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useProductTourStore } from "@/store/ProductTourStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowHasChangesStore,
+} from "@/store/WorkflowHasChangesStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
-import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
+import { SaveFailedError, useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
 import { CodeSubmenu } from "./CodeSubmenu";
 
@@ -101,10 +105,10 @@ export function EditorOverflowMenu({
 
   const disabled = isRecording || templateMutation.isPending || saving;
 
-  const handleTemplateToggle = () => {
+  const handleTemplateToggle = async () => {
     const newIsTemplate = !isTemplate;
     if (newIsTemplate) {
-      void onSave().catch(() => {});
+      await onSave();
     }
     templateMutation.mutate(newIsTemplate);
   };
@@ -166,7 +170,15 @@ export function EditorOverflowMenu({
               event.preventDefault();
               return;
             }
-            handleTemplateToggle();
+            void handleTemplateToggle().catch((error: unknown) => {
+              if (
+                error instanceof SaveRefusedError ||
+                error instanceof SaveStaleError ||
+                error instanceof SaveFailedError
+              )
+                return;
+              console.error("Failed to save workflow as template:", error);
+            });
           }}
         >
           {isTemplate ? "Remove from Templates" : "Save as Template"}

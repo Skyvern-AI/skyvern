@@ -95,9 +95,13 @@ def test_prepare_cli_runtime_loads_env_before_logger(monkeypatch, tmp_path) -> N
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
-    monkeypatch.delenv(BACKEND_ENV_INTENT_ENV_VAR, raising=False)
+    # prepare_cli_runtime writes os.environ directly, and delenv on an unset variable records nothing to undo,
+    # so each is set first to make teardown remove what the call loads.
+    for name in ("SKYVERN_API_KEY", BACKEND_ENV_INTENT_ENV_VAR):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     monkeypatch.setattr(cli_bootstrap, "_RUNTIME_LOGGING_CONFIGURED", False)
+    monkeypatch.setattr(cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
     monkeypatch.setitem(sys.modules, "skyvern.forge.sdk.forge_log", fake_forge_log)
 
     assert cli_bootstrap.prepare_cli_runtime(intent=EnvIntent.CLOUD) == project_env

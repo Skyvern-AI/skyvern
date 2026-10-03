@@ -1,54 +1,78 @@
 import { getClient } from "@/api/AxiosClient";
 import { isPaymentRequiredError } from "@/api/paymentRequired";
-import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
+import { Createv2TaskRequest } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import img from "@/assets/promptBoxBg.png";
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
-import { MessageIcon } from "@/components/icons/MessageIcon";
-import { TrophyIcon } from "@/components/icons/TrophyIcon";
-import { ProxySelector } from "@/components/ProxySelector";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { KeyValueInput } from "@/components/KeyValueInput";
-import { Switch } from "@/components/ui/switch";
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
 import {
+  ArrowUpIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  Cross2Icon,
+  EnvelopeClosedIcon,
   FileTextIcon,
+  GlobeIcon,
   GearIcon,
-  PaperPlaneIcon,
-  Pencil1Icon,
+  PlusIcon,
   ReloadIcon,
+  TextAlignLeftIcon,
+  UploadIcon,
+  VideoIcon,
 } from "@radix-ui/react-icons";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError, type AxiosResponse } from "axios";
 import {
   forwardRef,
   type ForwardedRef,
+  type KeyboardEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
   useImperativeHandle,
   useRef,
   useState,
 } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  generatePhoneNumber,
-  generateUniqueEmail,
-} from "../data/sampleTaskData";
+  CapabilityExamples,
+  JOB_APPLICATION_PROMPT,
+  SAMPLE_RESUME_PATH,
+  SAMPLE_RESUME_PUBLIC_URL,
+} from "./CapabilityExamples";
 import { ExampleCasePill } from "./ExampleCasePill";
+import { CyclingPlaceholderTextarea } from "./CyclingPlaceholderTextarea";
 import {
-  MAX_SCREENSHOT_SCROLLS_DEFAULT,
-  MAX_STEPS_DEFAULT,
-} from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+  AdvancedSettingsPopover,
+  ChangedSettingsChips,
+} from "./PromptBoxAdvancedSettings";
+import {
+  DEFAULT_TASK_RUN_SETTINGS,
+  type SettingsTab,
+  type TaskRunSettings,
+} from "./taskRunSettings";
+import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { HomeTelemetry, type AgentCreationAttempt } from "@/util/homeTelemetry";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
-import { TestWebhookDialog } from "@/components/TestWebhookDialog";
-import { ImprovePrompt } from "@/components/ImprovePrompt";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
@@ -57,84 +81,132 @@ import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { rememberDiscoverCopilotPrompt } from "@/routes/workflows/discoverCopilotHandoff";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
+// Most-clicked first; the grid order is the ranking users see.
 const exampleCases = [
   {
-    key: "finditparts",
-    label: "Add a product to cart",
-    prompt:
-      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Your goal is COMPLETE when you\'re on the cart page and the specified product is in the cart. Extract all product quantity information from the cart page. Do not attempt to checkout.',
-    icon: <CartIcon className="size-6" />,
-  },
-  {
     key: "job_application",
+    hint: "jobs.lever.co",
     label: "Apply for a job",
-    prompt: `Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply, fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully. Here's the user information: {"name":"John Doe","email":"${generateUniqueEmail()}","phone":"${generatePhoneNumber()}","resume_url":"https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf","cover_letter":"Generate a compelling cover letter for me"}`,
+    prompt: JOB_APPLICATION_PROMPT,
+    attachment: SAMPLE_RESUME_PATH,
     icon: <InboxIcon className="size-6" />,
   },
   {
+    key: "finditparts",
+    hint: "finditparts.com",
+    label: "Add a product to cart",
+    prompt:
+      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Extract all product quantity information from the cart page. Do not attempt to checkout.',
+    icon: <CartIcon className="size-6" />,
+  },
+  {
+    key: "add_employee",
+    hint: "orangehrmlive.com",
+    label: "Log into an HR portal and add an employee",
+    prompt: `Make a workflow that logs into OrangeHRM at https://opensource-demo.orangehrmlive.com/web/index.php/auth/login using my saved OrangeHRM credential. Then go to PIM, click Add, and add a new employee with first name {{first_name}} and last name {{last_name}}. Keep the auto-filled Employee Id and leave "Create Login Details" off.`,
+    icon: <EnvelopeClosedIcon className="size-6" />,
+  },
+  {
     key: "geico",
+    hint: "geico.com",
     label: "Get an insurance quote",
-    prompt: `Go to https://www.geico.com first. Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If you're on a page showing an auto insurance quote (with premium amounts), your goal is COMPLETE. Extract all quote information in JSON format including the premium amount, the timeframe for the quote. Here's the user information: {"licensed_at_age":19,"education_level":"HIGH_SCHOOL","phone_number":"8042221111","full_name":"Chris P. Bacon","past_claim":[],"has_claims":false,"spouse_occupation":"Florist","auto_current_carrier":"None","home_commercial_uses":null,"spouse_full_name":"Amy Stake","auto_commercial_uses":null,"requires_sr22":false,"previous_address_move_date":null,"line_of_work":null,"spouse_age":"1987-12-12","auto_insurance_deadline":null,"email":"chris.p.bacon@abc.com","net_worth_numeric":1000000,"spouse_gender":"F","marital_status":"married","spouse_licensed_at_age":20,"license_number":"AAAAAAA090AA","spouse_license_number":"AAAAAAA080AA","how_much_can_you_lose":25000,"vehicles":[{"annual_mileage":10000,"commute_mileage":4000,"existing_coverages":null,"ideal_coverages":{"bodily_injury_per_incident_limit":50000,"bodily_injury_per_person_limit":25000,"collision_deductible":1000,"comprehensive_deductible":1000,"personal_injury_protection":null,"property_damage_per_incident_limit":null,"property_damage_per_person_limit":25000,"rental_reimbursement_per_incident_limit":null,"rental_reimbursement_per_person_limit":null,"roadside_assistance_limit":null,"underinsured_motorist_bodily_injury_per_incident_limit":50000,"underinsured_motorist_bodily_injury_per_person_limit":25000,"underinsured_motorist_property_limit":null},"ownership":"Owned","parked":"Garage","purpose":"commute","vehicle":{"style":"AWD 3.0 quattro TDI 4dr Sedan","model":"A8 L","price_estimate":29084,"year":2015,"make":"Audi"},"vehicle_id":null,"vin":null}],"additional_drivers":[],"home":[{"home_ownership":"owned"}],"spouse_line_of_work":"Agriculture, Forestry and Fishing","occupation":"Customer Service Representative","id":null,"gender":"M","credit_check_authorized":false,"age":"1987-11-11","license_state":"Washington","cash_on_hand":"$10000–14999","address":{"city":"HOUSTON","country":"US","state":"TX","street":"9625 GARFIELD AVE.","zip":"77082"},"spouse_education_level":"MASTERS","spouse_email":"amy.stake@abc.com","spouse_added_to_auto_policy":true}`,
+    prompt: `Go to https://www.geico.com first. Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. Here's the details: full name: Chris P. Bacon, date of birth: 1987-11-11, gender: male, marital status: married, address: 9625 Garfield Ave., Houston, TX 77082, phone number: 804-222-1111, email: chris.p.bacon@abc.com, education: high school, occupation: Customer Service Representative, license state: Washington, license number: AAAAAAA090AA, licensed at age: 19, current auto carrier: none, past claims: none, requires SR-22: no, additional drivers: none, credit check authorized: no, home ownership: owned, net worth: $1,000,000, cash on hand: $10,000–14,999, how much I can afford to lose: $25,000, vehicle: 2015 Audi A8 L AWD 3.0 quattro TDI 4dr Sedan, vehicle price estimate: $29,084, vehicle ownership: owned, parked: garage, vehicle use: commute, annual mileage: 10,000, commute mileage: 4,000, bodily injury limit: $25,000 per person / $50,000 per incident, property damage limit: $25,000, collision deductible: $1,000, comprehensive deductible: $1,000, underinsured motorist bodily injury limit: $25,000 per person / $50,000 per incident, spouse name: Amy Stake, spouse date of birth: 1987-12-12, spouse gender: female, spouse education: masters, spouse occupation: Florist, spouse line of work: Agriculture, Forestry and Fishing, spouse email: amy.stake@abc.com, spouse license number: AAAAAAA080AA, spouse licensed at age: 20, add spouse to auto policy: yes`,
     icon: <FileTextIcon className="size-6" />,
   },
   {
-    key: "california_edd",
-    label: "Fill out CA's online EDD",
-    prompt: `Go to https://eddservices.edd.ca.gov/acctservices/AccountManagement/AccountServlet?Command=NEW_SIGN_UP. Navigate through the employer services online enrollment form. Terminate when the form is completed. Here's the needed information: {"username":"isthisreal1","password":"Password123!","first_name":"John","last_name":"Doe","pin":"1234","email":"${generateUniqueEmail()}","phone_number":"${generatePhoneNumber()}"}`,
-    icon: <Pencil1Icon className="size-6" />,
-  },
-  {
-    key: "contact_us_forms",
-    label: "Fill a contact us form",
-    prompt: `Go to https://canadahvac.com/contact-hvac-canada. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. Here's the user information: {"name":"John Doe","email":"john.doe@gmail.com","phone":"123-456-7890","message":"Hello, I have a question about your services."}`,
-    icon: <FileTextIcon className="size-6" />,
-  },
-  {
-    key: "hackernews",
-    label: "What's the top post on hackernews",
-    prompt: "Navigate to the Hacker News homepage and get the top 3 posts.",
-    icon: <MessageIcon className="size-6" />,
+    key: "extractIntegrationsFromSkyvern",
+    hint: "skyvern.com",
+    label: "Extract integrations from Skyvern",
+    prompt:
+      "Go to https://skyvern.com. Navigate to 'Resources' -> 'Integrations'. Extract the names and descriptions of all the supported integrations.",
+    icon: <GearIcon className="size-6" />,
   },
   {
     key: "AAPLStockPrice",
-    label: "Search for AAPL on Google Finance",
-    prompt:
-      'Go to google finance and find the "AAPL" stock price. COMPLETE when the search results for "AAPL" are displayed and the stock price is extracted.',
+    hint: "google.com/finance",
+    label: "Track Apple's stock price on Google Finance",
+    prompt: `Go to Google Finance and search for "AAPL" (Apple Inc., NASDAQ).
+Extract:
+- Current price
+- Change since previous close ($ and %)
+- Today's open, and the change since open ($ and %), calculated as current price minus open
+- Day high and low
+- Previous close
+- Market status (open, closed, pre-market or after-hours) and the timestamp shown
+- After-hours price, if shown
+Return the numbers as plain values with no $ or % symbols.`,
     icon: <GraphIcon className="size-6" />,
   },
+] as const;
+
+// Reached only through `/discover?focus=prompt&example=<key>` links; not shown in the example grid.
+const promptStarters = [
   {
-    key: "topRankedFootballTeam",
-    label: "Get the top ranked football team",
-    prompt:
-      "Navigate to the FIFA World Ranking page and identify the top ranked football team. Extract the name of the top ranked football team from the FIFA World Ranking page.",
-    icon: <TrophyIcon className="size-6" />,
+    key: "collect_website_data",
+    prompt: "Go to [page URL] and extract the product names and prices.",
   },
   {
-    key: "extractIntegrationsFromGong",
-    label: "Extract Integrations from Gong.io",
+    key: "download_invoices",
+    prompt: "Log in to [vendor portal] and download last month's invoices.",
+  },
+  {
+    key: "fill_out_form",
     prompt:
-      "Go to https://www.gong.io first. Navigate to the 'Integrations' page on the Gong website. Extract the names and descriptions of all integrations listed on the Gong integrations page. Ensure not to click on any external links or advertisements.",
-    icon: <GearIcon className="size-6" />,
+      "Open [form URL] and fill it with [details]. Stop before submitting.",
   },
 ] as const;
 
 type ExamplePromptKey = (typeof exampleCases)[number]["key"];
+type ExampleAttribution = { id: string; edited: boolean };
+
+const UPLOAD_RETENTION_DAYS = 30;
+// Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
+const MAX_HOME_ATTACHMENTS = 20;
+// A failed /customer load leaves the flag unknown for the whole session, so stop waiting and show the flag-off controls.
+const HANDOFF_FLAG_WAIT_MS = 3000;
+
+const HOW_IT_WORKS = [
+  {
+    title: "Describe",
+    body: "Write the task in plain language, with the site and the outcome you want.",
+    icon: <TextAlignLeftIcon className="size-[15px]" />,
+  },
+  {
+    title: "Skyvern drives a browser",
+    body: "It opens a real browser, navigates, types, clicks, and handles logins and 2FA.",
+    icon: <GlobeIcon className="size-[15px]" />,
+  },
+  {
+    title: "You get the result or data",
+    body: "A confirmation, a downloaded file, or structured JSON you can send anywhere.",
+    icon: <CheckIcon className="size-[15px]" />,
+  },
+];
 
 type PromptBoxProps = {
   enableCopilotHandoff?: boolean;
+  /** Hides the toolbar controls until `enableCopilotHandoff` is known (at most HANDOFF_FLAG_WAIT_MS), so they don't swap on load. */
+  handoffFlagLoading?: boolean;
+  /** Home-screen variant: no prompt improver and no advanced settings. */
+  minimal?: boolean;
+  /** Fires once an agent has been created from this prompt box. */
+  onAgentCreated?: () => void;
+  /** Rendered under the prompt input in the full (non-minimal) layout. */
+  secondaryAction?: ReactNode;
 };
 
 type PromptBoxHandle = {
-  focusAndPrefillExample: (key: ExamplePromptKey) => void;
+  /** Prefills `key`, or `fallback` when `key` is not a known example (e.g. from a URL). */
+  focusAndPrefillExample: (
+    key: string | null,
+    fallback: ExamplePromptKey,
+  ) => void;
+  /** Prefills the user's own words; never overwrites a prompt already typed. */
+  focusAndPrefillPrompt: (text: string) => void;
 };
 
-const HANDOFF_TITLE_MAX_LEN = 80;
-
-function deriveHandoffTitle(prompt: string): string {
-  const collapsed = prompt.replace(/\s+/g, " ").trim();
-  if (!collapsed) return "New Agent";
-  if (collapsed.length <= HANDOFF_TITLE_MAX_LEN) return collapsed;
-  return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
+function blankToNull(value: string | null): string | null {
+  return value?.trim() || null;
 }
 
 function buildBlankWorkflowRequest(
@@ -202,53 +274,231 @@ function showCreateErrorToast(title: string, error: unknown) {
 }
 
 function PromptBoxImpl(
-  { enableCopilotHandoff = false }: PromptBoxProps,
+  {
+    enableCopilotHandoff = false,
+    handoffFlagLoading = false,
+    minimal = false,
+    onAgentCreated,
+    secondaryAction,
+  }: PromptBoxProps,
   ref: ForwardedRef<PromptBoxHandle>,
 ) {
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
   const [prompt, setPrompt] = useState<string>("");
+  const [exampleAttribution, setExampleAttribution] = useState<
+    ExampleAttribution | undefined
+  >();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
-    null,
+  const [taskRunSettings, setTaskRunSettings] = useState<TaskRunSettings>(
+    DEFAULT_TASK_RUN_SETTINGS,
   );
-  const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
-    ProxyLocation.Residential,
+  const prewarmBrowserSession = useBrowserSessionPrewarm(
+    enableCopilotHandoff ? null : taskRunSettings.proxyLocation,
   );
-  const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
-  const [cdpAddress, setCdpAddress] = useState<string | null>(null);
-  const [generateScript, setGenerateScript] = useState(false);
-  const [publishWorkflow, setPublishWorkflow] = useState(false);
-  const [totpIdentifier, setTotpIdentifier] = useState("");
-  const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
-  const [maxScreenshotScrolls, setMaxScreenshotScrolls] = useState<
-    string | null
-  >(null);
+  useEffect(() => {
+    prewarmBrowserSession(prompt);
+  }, [prewarmBrowserSession, prompt]);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
-  const [dataSchema, setDataSchema] = useState<string | null>(null);
-  const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
+  const [advancedSettingsTab, setAdvancedSettingsTab] =
+    useState<SettingsTab>("run");
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
+  const [promptTouched, setPromptTouched] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
+  const [handoffFlagWaitExpired, setHandoffFlagWaitExpired] = useState(false);
+  useEffect(() => {
+    if (!handoffFlagLoading) return;
+    const timer = window.setTimeout(
+      () => setHandoffFlagWaitExpired(true),
+      HANDOFF_FLAG_WAIT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [handoffFlagLoading]);
+  const hideFlagControls = handoffFlagLoading && !handoffFlagWaitExpired;
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // file_id of the sample resume an example uploaded, so a user's own upload is never mistaken for it.
+  const exampleFileIdRef = useRef<string>();
   const { setAutoplay } = useAutoplayStore();
-  const [promptImprovalIsPending, setPromptImprovalIsPending] = useState(false);
   // react-query isPending only flips on the next render, so a same-frame
   // double-click can slip past it; the ref is the synchronous guard.
   const submitInFlightRef = useRef(false);
 
+  const updatePrompt = useCallback((value: string) => {
+    setPrompt(value);
+    setExampleAttribution((current) => {
+      if (!value.trim()) return undefined;
+      if (!current || current.edited) return current;
+      return { ...current, edited: true };
+    });
+  }, []);
+
   useImperativeHandle(ref, () => ({
-    focusAndPrefillExample: (key) => {
-      const examplePrompt =
-        exampleCases.find((example) => example.key === key)?.prompt ??
-        exampleCases[0].prompt;
-      setPrompt((current) => (current.trim() ? current : examplePrompt));
+    focusAndPrefillExample: (key, fallback) => {
+      const selectedExample =
+        exampleCases.find((example) => example.key === key) ??
+        promptStarters.find((starter) => starter.key === key) ??
+        exampleCases.find((example) => example.key === fallback) ??
+        exampleCases[0];
+      if (!prompt.trim()) {
+        cancelSpeech();
+        setPrompt(
+          withExampleAttachment(
+            selectedExample.prompt,
+            "attachment" in selectedExample
+              ? selectedExample.attachment
+              : undefined,
+          ),
+        );
+        setExampleAttribution({ id: selectedExample.key, edited: false });
+      }
+      textareaRef.current?.scrollIntoView?.({ block: "center" });
+      textareaRef.current?.focus({ preventScroll: true });
+    },
+    focusAndPrefillPrompt: (text) => {
+      if (!prompt.trim()) {
+        setPrompt(text);
+        setExampleAttribution(undefined);
+      }
       textareaRef.current?.scrollIntoView?.({ block: "center" });
       textareaRef.current?.focus({ preventScroll: true });
     },
   }));
 
+  const uploadDocumentMutation = useMutation({
+    mutationFn: async (source: File | string) => {
+      let file = source;
+      if (typeof file === "string") {
+        const response = await fetch(file);
+        if (!response.ok) {
+          throw new Error(`Failed to load ${file} (${response.status})`);
+        }
+        file = new File([await response.blob()], file.split("/").pop()!, {
+          type: "application/pdf",
+        });
+      }
+      const client = await getClient(credentialGetter);
+      const formData = new FormData();
+      formData.append("file", file);
+      // Bounded so an abandoned upload does not linger until the org retention policy.
+      formData.append("retention_days", String(UPLOAD_RETENTION_DAYS));
+      const result = await client.post<FormData, { data: { file_id: string } }>(
+        "/upload_file",
+        formData,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      );
+      return {
+        file_id: result.data.file_id,
+        filename: file.name,
+        size_bytes: file.size,
+        available: true,
+      } satisfies CopilotAttachedFile;
+    },
+    onSuccess: (attached, source) => {
+      if (typeof source === "string") {
+        exampleFileIdRef.current = attached.file_id;
+      }
+      HomeTelemetry.uploadDocumentFinished(true);
+      setAttachedFiles((current) =>
+        current.length >= MAX_HOME_ATTACHMENTS
+          ? current
+          : [...current, attached],
+      );
+      textareaRef.current?.focus();
+    },
+    onError: (error: unknown) => {
+      HomeTelemetry.uploadDocumentFinished(false);
+      showCreateErrorToast("Failed to upload file", error);
+    },
+  });
+
+  // Returns the prompt to load. Attachments only reach the copilot handoff path,
+  // so the plain task path gets the file's public URL in the prompt instead.
+  const withExampleAttachment = (prompt: string, path?: string) => {
+    if (!path) {
+      setAttachedFiles((current) =>
+        current.filter((file) => file.file_id !== exampleFileIdRef.current),
+      );
+      return prompt;
+    }
+    if (!enableCopilotHandoff) {
+      return `${prompt} The attached resume is at ${SAMPLE_RESUME_PUBLIC_URL}; download it from there.`;
+    }
+    if (attachedFiles.length >= MAX_HOME_ATTACHMENTS) {
+      toast({
+        variant: "destructive",
+        title: "Too many attachments",
+        description: "Remove an attachment to add the example's resume.",
+      });
+      return prompt;
+    }
+    // Starting the upload here (not after a fetch) flips isPending before the next render,
+    // which disables submit and the example buttons until the resume is attached.
+    if (
+      !attachedFiles.some((file) => file.file_id === exampleFileIdRef.current)
+    ) {
+      uploadDocumentMutation.mutate(path);
+    }
+    return prompt;
+  };
+
+  const recordTaskMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(buildBlankWorkflowRequest("Recorded Agent"));
+      const result = await client.post<string, AxiosResponse<unknown>>(
+        "/workflows",
+        yaml,
+        { headers: { "Content-Type": "text/plain" } },
+      );
+      if (!hasWorkflowShape(result.data)) {
+        throw new Error(
+          `workflow create returned an unexpected response shape (${describeResponseEnvelope(result)})`,
+        );
+      }
+      return result.data;
+    },
+    onSuccess: (workflow) => {
+      onAgentCreated?.();
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+      navigate(
+        workflowEditorPath(
+          workflow.workflow_permanent_id,
+          studioEnabled,
+          "?record=1",
+        ),
+      );
+    },
+    onError: (error: AxiosError) => {
+      showCreateErrorToast("Could not start recording", error);
+    },
+  });
+
   const generateWorkflowMutation = useMutation({
-    mutationFn: async ({ prompt }: { prompt: string }) => {
+    mutationFn: async ({
+      prompt,
+    }: {
+      prompt: string;
+      attempt: AgentCreationAttempt;
+    }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
+      const {
+        proxyLocation,
+        publishWorkflow,
+        generateScript,
+        maxStepsOverride,
+      } = taskRunSettings;
+      // The popover shows whitespace-only values as unchanged, so send them as unset.
+      const webhookCallbackUrl = blankToNull(
+        taskRunSettings.webhookCallbackUrl,
+      );
+      const maxScreenshotScrolls = blankToNull(
+        taskRunSettings.maxScreenshotScrolls,
+      );
+      const dataSchema = blankToNull(taskRunSettings.dataSchema);
+      const extraHttpHeaders = blankToNull(taskRunSettings.extraHttpHeaders);
+      const totpIdentifier = taskRunSettings.totpIdentifier.trim();
       const request: Record<string, unknown> = {
         user_prompt: prompt,
         webhook_callback_url: webhookCallbackUrl,
@@ -304,7 +554,12 @@ function PromptBoxImpl(
 
       return result.data;
     },
-    onSuccess: (workflow) => {
+    onSuccess: (workflow, { attempt }) => {
+      HomeTelemetry.agentCreationSucceeded(
+        attempt,
+        workflow.workflow_permanent_id,
+      );
+      onAgentCreated?.();
       toast({
         variant: "success",
         title: "Agent Created",
@@ -327,7 +582,8 @@ function PromptBoxImpl(
         workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
       );
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { attempt }) => {
+      HomeTelemetry.agentCreationFailed(attempt, error);
       showCreateErrorToast("Error creating agent from prompt", error);
     },
     onSettled: () => {
@@ -342,12 +598,14 @@ function PromptBoxImpl(
     }: {
       prompt: string;
       runWith: "agent" | "code";
+      attempt: AgentCreationAttempt;
     }) => {
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(
-        buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
+        // A default title lets Copilot name the agent from this prompt on its first turn.
+        buildBlankWorkflowRequest("New Agent", runWith),
       );
-      const result = await client.post<string, { data: WorkflowApiResponse }>(
+      const result = await client.post<string, AxiosResponse<unknown>>(
         "/workflows",
         yaml,
         {
@@ -356,9 +614,19 @@ function PromptBoxImpl(
           },
         },
       );
+      if (!hasWorkflowShape(result.data)) {
+        throw new Error(
+          `workflow create returned an unexpected response shape (${describeResponseEnvelope(result)})`,
+        );
+      }
       return { data: result.data, prompt };
     },
-    onSuccess: ({ data: workflow, prompt }) => {
+    onSuccess: ({ data: workflow, prompt }, { attempt }) => {
+      HomeTelemetry.agentCreationSucceeded(
+        attempt,
+        workflow.workflow_permanent_id,
+      );
+      onAgentCreated?.();
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
       // Only the studio handoff writes the recovery key. The legacy /build path
@@ -375,11 +643,16 @@ function PromptBoxImpl(
           "?via=discover",
         ),
         {
-          state: { copilotMessage: prompt },
+          state: {
+            copilotMessage: prompt,
+            copilotAttachedFiles:
+              attachedFiles.length > 0 ? attachedFiles : undefined,
+          },
         },
       );
     },
-    onError: (error: AxiosError) => {
+    onError: (error: AxiosError, { attempt }) => {
+      HomeTelemetry.agentCreationFailed(attempt, error);
       showCreateErrorToast("Error creating agent", error);
     },
     onSettled: () => {
@@ -388,331 +661,456 @@ function PromptBoxImpl(
   });
 
   const isSubmitting =
-    generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
+    generateWorkflowMutation.isPending ||
+    handoffWorkflowMutation.isPending ||
+    uploadDocumentMutation.isPending ||
+    recordTaskMutation.isPending;
 
   const {
     isSupported: isSpeechSupported,
     isListening: isSpeechListening,
     isHearingSpeech: isSpeechHearing,
     toggle: toggleSpeech,
+    cancel: cancelSpeech,
   } = useSpeechToTextField({
     value: prompt,
-    onChange: setPrompt,
-    enabled: !promptImprovalIsPending && !isSubmitting,
+    onChange: updatePrompt,
+    enabled: !isSubmitting,
   });
 
-  const submitPrompt = ({ prompt }: { prompt: string }) => {
+  const submitPrompt = ({
+    prompt,
+    attribution,
+  }: {
+    prompt: string;
+    attribution?: ExampleAttribution;
+  }) => {
     if (submitInFlightRef.current || isSubmitting) {
       return;
     }
     submitInFlightRef.current = true;
+    const source = attribution ? "example" : "typed";
+    const example = attribution?.id;
+    const exampleEdited = attribution?.edited;
+    const attempt = HomeTelemetry.agentCreationSubmitted({
+      source,
+      example,
+      exampleEdited,
+      handoff: enableCopilotHandoff,
+      variant: minimal ? "revamp" : "legacy",
+    });
+    HomeTelemetry.promptSubmitted({
+      attemptId: attempt.attemptId,
+      source,
+      example,
+      exampleEdited,
+      promptLength: prompt.length,
+      handoff: enableCopilotHandoff,
+    });
     if (enableCopilotHandoff) {
-      handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
+      handoffWorkflowMutation.mutate({
+        prompt,
+        runWith: "agent",
+        attempt,
+      });
       return;
     }
-    generateWorkflowMutation.mutate({ prompt });
+    generateWorkflowMutation.mutate({ prompt, attempt });
   };
 
-  return (
-    <div>
-      <div
-        className="rounded-sm py-[4.25rem]"
-        style={{
-          background: `url(${img}) 50% / cover no-repeat`,
-        }}
-      >
-        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
-          <span className="text-2xl">
+  const handlePromptKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // With no precise pointer (a phone) assume an on-screen keyboard, which has no Shift+Enter, so Return stays a
+    // newline and the send button submits. A tablet with a keyboard but no trackpad falls in this bucket too.
+    if (
+      e.key !== "Enter" ||
+      e.shiftKey ||
+      e.nativeEvent.isComposing ||
+      !window.matchMedia?.("(any-pointer: fine)").matches
+    ) {
+      return;
+    }
+    e.preventDefault();
+    if (prompt.trim()) {
+      submitPrompt({ prompt, attribution: exampleAttribution });
+    }
+  };
+
+  const attachmentChips =
+    attachedFiles.length > 0 ? (
+      <div className="flex flex-wrap gap-1.5 px-1 pt-2">
+        {attachedFiles.map((file) => (
+          <span
+            key={file.file_id}
+            className="inline-flex items-center gap-1.5 rounded-md border border-input bg-slate-elevation2 px-2 py-1 text-xs text-foreground"
+          >
+            <FileTextIcon aria-hidden="true" className="size-3.5" />
+            <span className="max-w-[16rem] truncate">{file.filename}</span>
+            <button
+              type="button"
+              aria-label={`Remove ${file.filename}`}
+              className="text-muted-foreground hover:text-foreground"
+              onClick={() =>
+                setAttachedFiles((current) =>
+                  current.filter((f) => f.file_id !== file.file_id),
+                )
+              }
+            >
+              <Cross2Icon aria-hidden="true" className="size-3" />
+            </button>
+          </span>
+        ))}
+      </div>
+    ) : null;
+
+  const fileInput = (
+    <input
+      ref={fileInputRef}
+      type="file"
+      className="hidden"
+      aria-label="Upload document"
+      onChange={(event) => {
+        const file = event.target.files?.[0];
+        if (file) {
+          uploadDocumentMutation.mutate(file);
+        }
+        event.target.value = "";
+      }}
+    />
+  );
+
+  const renderAddMenu = (sizeClassName: string) => (
+    <DropdownMenu
+      onOpenChange={(open) => {
+        if (open) HomeTelemetry.addMenuOpened();
+      }}
+    >
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Add files and more"
+                disabled={isSubmitting}
+                className={cn(
+                  "flex shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50",
+                  sizeClassName,
+                )}
+              >
+                {uploadDocumentMutation.isPending ||
+                recordTaskMutation.isPending ? (
+                  <ReloadIcon className="size-4 animate-spin" />
+                ) : (
+                  <PlusIcon aria-hidden="true" className="size-[18px]" />
+                )}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>Add files and more</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+      <DropdownMenuContent align="start">
+        {enableCopilotHandoff ? (
+          <DropdownMenuItem
+            disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
+            onSelect={() => {
+              HomeTelemetry.uploadDocumentSelected();
+              fileInputRef.current?.click();
+            }}
+          >
+            <UploadIcon className="mr-2 size-4" />
+            Upload document
+          </DropdownMenuItem>
+        ) : null}
+        <DropdownMenuItem
+          onSelect={() => {
+            HomeTelemetry.recordTaskSelected();
+            recordTaskMutation.mutate();
+          }}
+        >
+          <VideoIcon className="mr-2 size-4" />
+          Record task
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
+  if (!minimal) {
+    return (
+      <div className="relative isolate flex flex-col items-center pb-4 pt-12 md:pt-24">
+        {/* The artwork is translucent white: it reads as shading on the dark background and is inverted for light. */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[30rem] opacity-85 invert [mask-image:radial-gradient(closest-side,#000_35%,transparent_100%)] dark:opacity-100 dark:invert-0 md:h-[35rem]"
+          style={{
+            background: `url(${img}) 50% / cover no-repeat`,
+          }}
+        />
+        <div className="flex w-full max-w-[45rem] flex-col items-start text-left md:items-center md:text-center">
+          <span className="text-2xl font-semibold tracking-tight md:text-[1.875rem] md:leading-[2.375rem]">
             What task would you like to accomplish?
           </span>
-          <div className="flex w-full max-w-xl flex-col">
-            <div
-              className={cn(
-                "flex w-full items-center gap-2 rounded-xl border border-input bg-background py-2 pr-3 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10",
-                {
-                  "pointer-events-none opacity-50": promptImprovalIsPending,
-                },
-              )}
-            >
-              <SpeechInputButton
-                isSupported={isSpeechSupported}
-                isListening={isSpeechListening}
-                isHearingSpeech={isSpeechHearing}
-                disabled={promptImprovalIsPending || isSubmitting}
-                onToggle={toggleSpeech}
-                className="ml-2 h-9 w-9 border-0 bg-transparent shadow-none hover:bg-muted"
-                iconClassName="h-5 w-5"
-              />
-              <AutoResizingTextarea
-                ref={textareaRef}
-                id="discover-prompt-input"
-                className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                placeholder="Enter your prompt..."
-              />
-              <ImprovePrompt
-                isVisible={Boolean(prompt.trim())}
-                onBegin={() => {
-                  setPromptImprovalIsPending(true);
-                }}
-                onEnd={() => {
-                  setPromptImprovalIsPending(false);
-                }}
-                onImprove={(prompt) => setPrompt(prompt)}
-                prompt={prompt}
-                size="large"
-                useCase="new_workflow"
-              />
-              {!enableCopilotHandoff ? (
-                <button
-                  type="button"
-                  aria-label="Advanced settings"
-                  className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onClick={() => {
-                    setShowAdvancedSettings((value) => !value);
+          <p className="mt-2.5 text-[15px] leading-[22px] text-muted-foreground">
+            Describe it like you would to a colleague. Skyvern opens a browser
+            and does it.
+          </p>
+        </div>
+        <div className="mt-6 flex w-full max-w-[45rem] flex-col md:mt-9">
+          <div className="flex w-full flex-col rounded-2xl border border-input bg-background text-muted-foreground shadow-[0_12px_32px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] focus-within:border-foreground/20 focus-within:shadow-[0_0_0_4px_rgba(79,70,229,0.10),0_12px_32px_rgba(0,0,0,0.06)] dark:bg-slate-elevation1 dark:shadow-[0_12px_32px_rgba(0,0,0,0.35)] dark:focus-within:shadow-[0_0_0_4px_rgba(165,180,252,0.14),0_12px_32px_rgba(0,0,0,0.35)]">
+            <CyclingPlaceholderTextarea
+              ref={textareaRef}
+              id="discover-prompt-input"
+              className="max-h-[14rem] min-h-[6rem] resize-none overflow-y-auto border-0 bg-transparent px-5 pb-1.5 pt-[18px] text-base leading-6 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0 md:text-[15px]"
+              value={prompt}
+              onChange={(e) => updatePrompt(e.target.value)}
+              onKeyDown={handlePromptKeyDown}
+              onFocus={() => setPromptTouched(true)}
+              cycling={!promptTouched}
+            />
+            {enableCopilotHandoff ? (
+              <div className="px-5">{attachmentChips}</div>
+            ) : null}
+            <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
+              {!hideFlagControls && enableCopilotHandoff ? (
+                <>
+                  {renderAddMenu("size-11 md:size-9")}
+                  {fileInput}
+                </>
+              ) : null}
+              {!hideFlagControls ? (
+                <SpeechInputButton
+                  isSupported={isSpeechSupported}
+                  isListening={isSpeechListening}
+                  isHearingSpeech={isSpeechHearing}
+                  disabled={isSubmitting}
+                  onToggle={() => {
+                    HomeTelemetry.voiceToggled();
+                    setPromptTouched(true);
+                    toggleSpeech();
                   }}
-                >
-                  <GearIcon aria-hidden="true" className="size-5 shrink-0" />
-                </button>
+                  className="size-11 rounded-full border-0 bg-transparent md:size-9"
+                  iconClassName="h-[18px] w-[18px]"
+                />
+              ) : null}
+              {!hideFlagControls && !enableCopilotHandoff ? (
+                <AdvancedSettingsPopover
+                  settings={taskRunSettings}
+                  onChange={setTaskRunSettings}
+                  open={showAdvancedSettings}
+                  onOpenChange={(open) => {
+                    HomeTelemetry.advancedSettingsToggled(open);
+                    setShowAdvancedSettings(open);
+                  }}
+                  tab={advancedSettingsTab}
+                  onTabChange={setAdvancedSettingsTab}
+                  triggerClassName="size-11 rounded-full md:size-9"
+                />
               ) : null}
               <button
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
+                className="ml-auto flex size-11 shrink-0 items-center justify-center rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:opacity-50 md:size-9"
                 onClick={() => {
-                  submitPrompt({ prompt });
+                  submitPrompt({ prompt, attribution: exampleAttribution });
                 }}
               >
                 {isSubmitting ? (
                   <ReloadIcon className="size-4 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    aria-hidden="true"
-                    className="size-4 shrink-0"
-                  />
+                  <ArrowUpIcon aria-hidden="true" className="size-4" />
                 )}
               </button>
             </div>
-            {showAdvancedSettings ? (
-              <div className="rounded-b-lg px-2">
-                <div className="space-y-4 rounded-b-xl border border-t-0 border-input bg-background p-4 text-foreground shadow-sm">
-                  <header>Advanced Settings</header>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Webhook Callback URL</div>
-                      <div className="text-xs text-muted-foreground">
-                        The URL of a webhook endpoint to send the extracted
-                        information
-                      </div>
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      <Input
-                        className="w-full"
-                        value={webhookCallbackUrl ?? ""}
-                        onChange={(event) => {
-                          setWebhookCallbackUrl(event.target.value);
-                        }}
-                      />
-                      <TestWebhookDialog
-                        runType="task"
-                        runId={null}
-                        initialWebhookUrl={webhookCallbackUrl ?? undefined}
-                        trigger={
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            className="self-start"
-                            disabled={!webhookCallbackUrl}
-                          >
-                            Test Webhook
-                          </Button>
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Proxy Location</div>
-                      <div className="text-xs text-muted-foreground">
-                        Route Skyvern through one of our available proxies.
-                      </div>
-                    </div>
-                    <ProxySelector
-                      value={proxyLocation}
-                      onChange={setProxyLocation}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Session ID</div>
-                      <div className="text-xs text-muted-foreground">
-                        The ID of a persistent browser session
-                      </div>
-                    </div>
-                    <Input
-                      value={browserSessionId ?? ""}
-                      placeholder="pbs_xxx"
-                      onChange={(event) => {
-                        setBrowserSessionId(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Address</div>
-                      <div className="text-xs text-muted-foreground">
-                        The address of the Browser server to use for the task
-                        run.
-                      </div>
-                    </div>
-                    <Input
-                      value={cdpAddress ?? ""}
-                      placeholder="http://127.0.0.1:9222"
-                      onChange={(event) => {
-                        setCdpAddress(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">2FA Identifier</div>
-                      <div className="text-xs text-muted-foreground">
-                        The identifier for a 2FA code for this task.
-                      </div>
-                    </div>
-                    <Input
-                      value={totpIdentifier}
-                      onChange={(event) => {
-                        setTotpIdentifier(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Extra HTTP Headers</div>
-                      <div className="text-xs text-muted-foreground">
-                        Specify some self defined HTTP requests headers in Dict
-                        format
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <KeyValueInput
-                        value={extraHttpHeaders ?? ""}
-                        onChange={(val) =>
-                          setExtraHttpHeaders(
-                            val === null
-                              ? null
-                              : typeof val === "string"
-                                ? val || null
-                                : JSON.stringify(val),
-                          )
-                        }
-                        addButtonText="Add Header"
-                      />
-                    </div>
-                  </div>
+          </div>
+          {!enableCopilotHandoff ? (
+            <ChangedSettingsChips
+              settings={taskRunSettings}
+              onChange={setTaskRunSettings}
+              onEdit={(tab) => {
+                setAdvancedSettingsTab(tab);
+                setShowAdvancedSettings(true);
+              }}
+            />
+          ) : null}
+          {secondaryAction ? (
+            <div className="mt-3 flex md:justify-end">{secondaryAction}</div>
+          ) : null}
+        </div>
+        <section className="mt-9 w-full max-w-[60rem] md:mt-16">
+          <h2 className="mb-3 text-sm font-semibold md:mb-3.5">
+            Try an example
+          </h2>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 sm:gap-3 lg:grid-cols-3">
+            {exampleCases.map((example) => (
+              <ExampleCasePill
+                key={example.key}
+                icon={example.icon}
+                label={example.label}
+                hint={example.hint}
+                selected={
+                  exampleAttribution?.id === example.key &&
+                  !exampleAttribution.edited
+                }
+                disabled={isSubmitting}
+                onClick={() => {
+                  HomeTelemetry.exampleClicked({
+                    example: example.key,
+                    label: example.label,
+                  });
+                  cancelSpeech();
+                  setPrompt(
+                    withExampleAttachment(
+                      example.prompt,
+                      "attachment" in example ? example.attachment : undefined,
+                    ),
+                  );
+                  setExampleAttribution({ id: example.key, edited: false });
+                  textareaRef.current?.focus();
+                }}
+              />
+            ))}
+          </div>
+        </section>
+      </div>
+    );
+  }
 
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Generate Script</div>
-                      <div className="text-xs text-muted-foreground">
-                        Whether to generate scripts for this task run (on
-                        success).
-                      </div>
-                    </div>
-                    <Switch
-                      checked={generateScript}
-                      onCheckedChange={(checked) => {
-                        setGenerateScript(Boolean(checked));
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Publish Agent</div>
-                      <div className="text-xs text-muted-foreground">
-                        Whether to create an agent alongside this task run. Will
-                        also be created if "Generate Scripts" is true.
-                      </div>
-                    </div>
-                    <Switch
-                      checked={publishWorkflow}
-                      onCheckedChange={(checked) => {
-                        setPublishWorkflow(Boolean(checked));
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Steps Override</div>
-                      <div className="text-xs text-muted-foreground">
-                        The maximum number of steps to take for this task.
-                      </div>
-                    </div>
-                    <Input
-                      value={maxStepsOverride ?? ""}
-                      placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
-                      onChange={(event) => {
-                        setMaxStepsOverride(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Data Schema</div>
-                      <div className="text-xs text-muted-foreground">
-                        Specify the output data schema in JSON format
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <CodeEditor
-                        value={dataSchema ?? ""}
-                        onChange={(value) => setDataSchema(value || null)}
-                        language="json"
-                        minHeight="100px"
-                        maxHeight="500px"
-                        fontSize={8}
-                      />
-                    </div>
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Screenshot Scrolls</div>
-                      <div className="text-xs text-muted-foreground">
-                        {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
-                      </div>
-                    </div>
-                    <Input
-                      value={maxScreenshotScrolls ?? ""}
-                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
-                      onChange={(event) => {
-                        setMaxScreenshotScrolls(event.target.value);
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-            ) : null}
+  return (
+    <div className="relative mx-auto flex w-full max-w-2xl flex-col items-center px-4">
+      <div
+        className={cn("flex flex-col items-center text-center", {
+          "mb-6": minimal,
+          "mb-7": !minimal,
+        })}
+      >
+        <span className="text-2xl">What task would you like to do?</span>
+        {minimal ? (
+          <p className="mt-2 max-w-[47rem] text-[13.5px] text-muted-foreground">
+            Describe it like you would to a colleague. Skyvern opens a browser
+            and does it.
+            <button
+              type="button"
+              aria-expanded={showHowItWorks}
+              onClick={() =>
+                setShowHowItWorks((value) => {
+                  HomeTelemetry.howItWorksToggled(!value);
+                  return !value;
+                })
+              }
+              className="ml-1.5 inline-flex items-center gap-1 text-[13px] text-foreground/80 underline decoration-muted-foreground/60 underline-offset-[3px] hover:text-foreground"
+            >
+              How it works
+              <ChevronDownIcon
+                aria-hidden="true"
+                className={cn("size-3 transition-transform", {
+                  "rotate-180": showHowItWorks,
+                })}
+              />
+            </button>
+          </p>
+        ) : null}
+      </div>
+      <div className="flex w-full flex-col">
+        <div className="flex w-full flex-col rounded-xl border border-input bg-background p-2 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10">
+          <CyclingPlaceholderTextarea
+            ref={textareaRef}
+            id="discover-prompt-input"
+            className="max-h-[8rem] min-h-[4rem] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
+            value={prompt}
+            onChange={(e) => updatePrompt(e.target.value)}
+            onKeyDown={handlePromptKeyDown}
+            onFocus={() => setPromptTouched(true)}
+            cycling={!promptTouched}
+          />
+          {attachmentChips}
+          <div className="flex items-center gap-1 pt-2">
+            {renderAddMenu("size-8")}
+            {fileInput}
+            <div className="ml-auto flex items-center gap-1.5">
+              <SpeechInputButton
+                isSupported={isSpeechSupported}
+                isListening={isSpeechListening}
+                isHearingSpeech={isSpeechHearing}
+                disabled={isSubmitting}
+                onToggle={() => {
+                  HomeTelemetry.voiceToggled();
+                  setPromptTouched(true);
+                  toggleSpeech();
+                }}
+                className="h-8 w-8 rounded-full border-0 bg-transparent"
+                iconClassName="h-4 w-4"
+              />
+              <button
+                type="button"
+                aria-label="submit-prompt"
+                disabled={!prompt.trim() || isSubmitting}
+                className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:opacity-50"
+                onClick={() => {
+                  submitPrompt({ prompt, attribution: exampleAttribution });
+                }}
+              >
+                {isSubmitting ? (
+                  <ReloadIcon className="size-4 animate-spin" />
+                ) : (
+                  <ArrowUpIcon aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </div>
-      <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
-        {exampleCases.map((example) => {
-          return (
-            <ExampleCasePill
-              key={example.key}
-              icon={example.icon}
-              label={example.label}
-              disabled={isSubmitting}
-              onClick={() => {
-                submitPrompt({ prompt: example.prompt });
-              }}
-            />
-          );
-        })}
-      </div>
+      {minimal ? (
+        <div className="mt-[34px] flex w-[76rem] max-w-[calc(100vw-8rem)] flex-col items-center">
+          <CapabilityExamples
+            disabled={isSubmitting}
+            onSelect={(example) => {
+              HomeTelemetry.exampleClicked({
+                example: example.id,
+                capability: example.capability,
+                label: example.label,
+              });
+              cancelSpeech();
+              setPrompt(
+                withExampleAttachment(example.prompt, example.attachment),
+              );
+              setExampleAttribution({ id: example.id, edited: false });
+              setPromptTouched(true);
+              textareaRef.current?.focus();
+            }}
+            onPreview={(example) =>
+              HomeTelemetry.examplePreviewShown({
+                example: example.id,
+                capability: example.capability,
+                label: example.label,
+              })
+            }
+          />
+          {showHowItWorks ? (
+            <div className="mt-6 flex w-full max-w-[54rem] flex-col gap-3.5 rounded-xl border border-border/70 bg-slate-elevation1/60 px-[18px] py-4 md:flex-row md:items-stretch">
+              {HOW_IT_WORKS.map((step, index) => (
+                <div key={step.title} className="flex flex-1 gap-3.5">
+                  {index > 0 ? (
+                    <div
+                      aria-hidden="true"
+                      className="hidden w-px shrink-0 self-stretch bg-border/70 md:block"
+                    />
+                  ) : null}
+                  <div className="min-w-0">
+                    <div className="mb-1.5 text-indigo-300">{step.icon}</div>
+                    <h3 className="mb-1 text-[13px] font-semibold">
+                      {step.title}
+                    </h3>
+                    <p className="text-xs leading-normal text-muted-foreground">
+                      {step.body}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

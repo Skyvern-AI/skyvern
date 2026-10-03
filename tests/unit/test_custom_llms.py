@@ -45,6 +45,9 @@ class FakeOrganizationsRepository:
         self.updated_encrypted_methods: list[EncryptMethod | None] = []
         self.update_organization = AsyncMock()
 
+    async def get_organization(self, organization_id: str) -> Organization | None:
+        return None
+
     async def get_valid_org_auth_tokens(
         self,
         organization_id: str,
@@ -148,11 +151,14 @@ def fake_organizations(monkeypatch: pytest.MonkeyPatch) -> FakeOrganizationsRepo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("created_at", [datetime.now(timezone.utc), None], ids=["with-timestamp", "none-timestamp"])
 async def test_prepare_org_llm_runtime_creates_context_and_stamps_defaults(
     monkeypatch: pytest.MonkeyPatch,
+    created_at: datetime | None,
 ) -> None:
     organization = _org("o_runtime").model_copy(
         update={
+            "created_at": created_at,
             "default_llm_key": "CUSTOM_LLM_oat_smart",
             "default_secondary_llm_key": "CUSTOM_LLM_oat_fast",
         }
@@ -173,6 +179,7 @@ async def test_prepare_org_llm_runtime_creates_context_and_stamps_defaults(
     assert context.organization_id == organization.organization_id
     assert context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
     assert context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
+    assert context.org_age == (None if created_at is None else 0)
     get_organization.assert_awaited_once_with(organization.organization_id)
     load_configs.assert_awaited_once_with(database, organization.organization_id)
 

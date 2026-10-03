@@ -279,7 +279,6 @@ async def test_scaled_viewport_decline_emits_declined_outcome(monkeypatch: pytes
     [
         ("full_page", "ineligible_full_page"),
         ("firefox", "ineligible_browser"),
-        ("unknown_browser", "ineligible_browser"),
         ("skycdp", "ineligible_engine"),
     ],
 )
@@ -289,8 +288,6 @@ async def test_ineligible_paths_emit_decline_reason(kind: str, reason: str, monk
     page = _page()
     if kind == "firefox":
         page.context.browser.browser_type.name = "firefox"
-    elif kind == "unknown_browser":
-        page.context.browser = None
     selection = None
     if kind == "skycdp":
         selection = SimpleNamespace(

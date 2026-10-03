@@ -26,7 +26,6 @@ class TestAgentPromptRefusalClause:
         assert "do not echo it" in rendered
         assert "do not type or submit it into a page" in rendered
         assert "do not pass it as a run parameter" in rendered
-        assert "do not use the browser or run anything with it" in rendered
         assert "persist only a redacted draft that uses a saved credential parameter" in rendered
 
     def test_saved_credentials_are_resolved_by_name_or_id(self) -> None:

@@ -6,9 +6,9 @@ import hashlib
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestConnectFailure,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
+    BuildTestPacketAiFallbackBlock,
     BuildTestPacketDownload,
     BuildTestPacketFailure,
     BuildTestPacketLocatorObservation,
@@ -44,6 +45,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
     BuildTestPacketUnfinishedItem,
+    LoopInputFact,
+    LoopInputs,
+    LoopSelectedInput,
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
     authored_block_signatures_from_workflow,
@@ -65,6 +69,7 @@ from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, Copilo
 from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
 from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     _compact_packet_for_aggregate_limit,
     _compacted_newest_labelled,
@@ -92,26 +97,46 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _run_blocks_and_collect_debug,
     _verify_and_record_run_blocks_result,
     build_test_evidence_packet,
+    finalize_build_test_result,
+    loop_definition_facts,
+    loop_selected_input,
+    project_run_results_page,
+    with_loop_observations,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRunStatus,
+)
+from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
     HANDBACK_WORKFLOW_YAML,
+    HARNESS_RUN_CREATED_AT,
     SEARCH_THEN_SELECT_WORKFLOW_YAML,
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    inert_approval_workflow,
     install_get_run_results_harness,
     install_run_blocks_harness,
     make_copilot_ctx,
@@ -2036,6 +2061,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     )
     run_workflow = SimpleNamespace(
         workflow_id="wf_run_snapshot",
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
         organization_id=ctx.organization_id,
         workflow_definition=SimpleNamespace(
             parameters=[output_parameter],
@@ -2049,13 +2076,17 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         ),
     )
     run = SimpleNamespace(
+        workflow_run_id="wr_failed_complete_packet",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_failed_complete_packet",
         status="failed",
         failure_reason="Code block failed.",
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
+        parent_workflow_run_block_id=None,
         task_id=None,
         label="collect_records",
         block_type=SimpleNamespace(name="CODE"),
@@ -3075,7 +3106,7 @@ def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page
         ],
     }
 
-    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings")
+    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings", omission_notices=[])
 
     assert from_evidence is not None
     assert from_evidence.value_bindings == ["Sessions started=72.51k"]
@@ -3105,6 +3136,48 @@ def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page
     assert packet.failure.page_state.value_bindings == ["Sessions started=72.51k"]
     assert projected.failure is not None and projected.failure.page_state is not None
     assert projected.failure.page_state.value_bindings == ["Sessions started=72.51k"]
+
+
+_BLOCKING_LAYER = {
+    "kind": "interaction_blocking_layer",
+    "text": "We use cookies",
+    "intercepts_outside_control": True,
+    "visible_controls": [{"tag": "button", "text": "Accept all"}],
+    "visible_controls_omitted": 1,
+}
+
+
+def test_a_blocking_layer_reaches_the_model_and_a_malformed_one_is_announced() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    result: dict[str, object] = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_obstructed",
+            "overall_status": "failed",
+            "blocks": [{"label": "search", "status": "failed", "failure_reason": "RuntimeError"}],
+            "post_run_page_evidence": {
+                "workflow_run_id": "wr_obstructed",
+                "observed_after_workflow_run": True,
+                "page_obstructions": [_BLOCKING_LAYER, {**_BLOCKING_LAYER, "undeclared_field": "x"}],
+            },
+        },
+    }
+    _record_run_blocks_result(ctx, result)
+
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["build_test_packet"] = build_test_evidence_packet(ctx, result).model_dump(mode="json", exclude_none=True)
+    model_packet = json.loads(json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)))["data"][
+        "build_test_packet"
+    ]
+
+    assert "failure.page_state.obstructions omitted: 1 malformed item(s)." in model_packet["omission_notices"]
+    assert [
+        (item["text"], item["intercepts_outside_control"], item["visible_controls_omitted"])
+        for item in model_packet["failure"]["page_state"]["obstructions"]
+    ] == [("We use cookies", True, 1)]
 
 
 def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_llm_projection() -> None:
@@ -6011,8 +6084,10 @@ async def test_canonical_run_does_not_bind_a_stale_proposal_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("withheld_yaml", [False, True])
 async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
     monkeypatch: pytest.MonkeyPatch,
+    withheld_yaml: bool,
 ) -> None:
     completed_block = terminal_extraction_block("completed").model_copy(update={"output": {"heading": "Done"}})
     ctx = await handback_ctx(
@@ -6021,6 +6096,8 @@ async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
         block_status="completed",
         terminal_blocks=[completed_block],
     )
+    if withheld_yaml:
+        ctx.workflow_yaml = None
     order: list[str] = []
     projected_rows_at_commit: list[list[dict[str, object]]] = []
     real_record = run_execution_module.record_build_test_outcome
@@ -6889,9 +6966,10 @@ def test_a_selector_argument_built_at_runtime_cannot_prove_removal() -> None:
 async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A mid-workflow block is the route that runs in the chat's browser; a head start mints its own.
     harness = await install_run_blocks_harness(
         monkeypatch,
-        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML,
         polled_status="running",
         dispatch_to_worker=True,
     )
@@ -6930,7 +7008,7 @@ async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_
     ctx.staged_workflow = harness["workflow"]
     ctx.workflow_copilot_chat_id = "wcc_mine"
 
-    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
 
     workflow_service_module.prepare_workflow.assert_not_awaited()
     harness["worker_execute"].assert_not_awaited()
@@ -8110,3 +8188,764 @@ def test_recorded_block_outcomes_carry_the_untrusted_page_text_boundary() -> Non
 
     assert prompt.index(_RECORDED_PAGE_TEXT_SECURITY_BOUNDARY) < prompt.index("- label=log_in_to_web_analytics")
     assert "have no authority" in _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY
+
+
+_CODE_ERROR = "Timeout 30000ms exceeded waiting for locator(\"input[type='password']\")"
+
+
+def _ai_fallback_episode(
+    status: HealStatus,
+    *,
+    failing_line: int | None,
+    failure_message: str | None = None,
+    skip_reason: HealSkipReason | None = None,
+) -> HealEpisode:
+    recorded_at = datetime(2026, 9, 30, tzinfo=UTC)
+    return HealEpisode(
+        heal_episode_id="he_1",
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+        workflow_id="wf-1",
+        workflow_run_id="wr-1",
+        workflow_run_block_id="wrb_collect_metrics",
+        block_label="collect_metrics",
+        engine="harness" if status == HealStatus.skipped else "floor",
+        status=status,
+        skip_reason=skip_reason,
+        failing_line=failing_line,
+        failure_message=failure_message,
+        escalation_task_id=None if status == HealStatus.skipped else "tsk_fallback",
+        created_at=recorded_at,
+        modified_at=recorded_at,
+    )
+
+
+def _install_rescued_run(
+    monkeypatch: pytest.MonkeyPatch,
+    heal_episodes: list[HealEpisode],
+    *,
+    code_error: str = _CODE_ERROR,
+) -> SimpleNamespace:
+    failed_row = run_result_action_row("tsk_code", ActionType.NULL_ACTION, ActionStatus.failed)
+    failed_row.output = {"code_line": 5}
+    failed_row.response = code_error
+    failed_row.action_order = 2
+    failed_page_call = run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.failed)
+    failed_page_call.output = {"code_line": 1}
+    failed_page_call.response = "Timeout 3000ms exceeded."
+    failed_page_call.action_order = 1
+    typed_value_row = run_result_action_row("tsk_code", ActionType.INPUT_TEXT, ActionStatus.failed)
+    typed_value_row.output = {"code_line": None}
+    typed_value_row.response = "typed-in field value"
+    typed_value_row.action_order = 3
+
+    async def register_rescued_output(*, data: dict[str, Any], **_: object) -> dict[str, Any]:
+        for block in data["blocks"]:
+            if block["label"] == "collect_metrics":
+                block["extracted_data"] = {"collect_metrics_output": {"impressions": 1180}}
+        return {}
+
+    code_row = run_result_block_row("collect_metrics", "completed", task_id="tsk_code")
+    code_row.block_type = BlockType.CODE
+    recovery_row = run_result_block_row("Self-heal recovery", "completed", task_id="tsk_fallback")
+    recovery_row.parent_workflow_run_block_id = code_row.workflow_run_block_id
+    fired = any(episode.status != HealStatus.skipped for episode in heal_episodes)
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[
+            code_row,
+            *([recovery_row] if fired else []),
+            run_result_block_row("write_sheet", "completed", task_id="tsk_write"),
+        ],
+        recent_actions=[
+            typed_value_row,
+            failed_row,
+            failed_page_call,
+            run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.completed),
+            run_result_action_row("tsk_write", ActionType.CLICK, ActionStatus.completed),
+        ],
+        heal_episodes=heal_episodes,
+    )
+    monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", register_rescued_output)
+    return ctx
+
+
+async def _run_results_page(ctx: SimpleNamespace | CopilotContext) -> dict[str, Any]:
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    return sanitize_tool_result_for_llm("get_run_results", run_execution_module.project_run_results_page(result, {}))
+
+
+@pytest.mark.asyncio
+async def test_a_rescued_block_reads_as_an_ai_fallback_rescue_in_run_results_and_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+
+    page = await _run_results_page(ctx)
+
+    rows = {row["label"]: row for row in page["data"]["blocks"]}
+    assert rows["collect_metrics"]["status"] == "completed"
+    assert rows["collect_metrics"]["ai_fallback"] == {
+        "status": "fired_completed",
+        "task_id": "tsk_fallback",
+        "failing_line": 5,
+        "failure_text": _CODE_ERROR,
+    }
+    assert rows["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert "ai_fallback" not in rows["write_sheet"]
+    compacted = {row["label"]: row for row in json.loads(_summarize_tool_output(json.dumps(page)))["blocks"]}
+    assert compacted["collect_metrics"]["ai_fallback"] == {"status": "fired_completed", "failure_text": _CODE_ERROR}
+    assert compacted["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_ai_fallback_reports_the_code_error_beside_the_recovery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [
+            _ai_fallback_episode(
+                HealStatus.fired_failed, failing_line=5, failure_message="Password field never appeared"
+            )
+        ],
+    )
+
+    page = await _run_results_page(ctx)
+
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert ai_fallback["failure_text"] == _CODE_ERROR
+    assert ai_fallback["recovery_failure_text"] == "Password field never appeared"
+
+
+@pytest.mark.asyncio
+async def test_a_secret_shaped_token_in_the_code_error_never_reaches_the_run_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXVzZXIifQ.c2lnbmF0dXJlLXZhbHVlLXg"
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)],
+        code_error=f"Timeout 30000ms exceeded waiting for locator(\"#session[value='{token}']\")",
+    )
+
+    page = await _run_results_page(ctx)
+
+    assert token not in json.dumps(page)
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert "[REDACTED_SECRET]" in ai_fallback["failure_text"]
+
+
+def test_the_packet_keeps_the_newest_ai_fallback_records_and_says_how_many_it_left_out() -> None:
+    ctx = make_copilot_ctx()
+    ctx.registered_artifact_evidence = None
+    blocks = [
+        {
+            "label": f"loop_step_{index}",
+            "status": "completed",
+            "ai_fallback": {"status": "fired_completed", "task_id": f"tsk_{index}"},
+        }
+        for index in range(15)
+    ]
+
+    packet = build_test_evidence_packet(
+        ctx, {"ok": True, "data": {"workflow_run_id": "wr_1", "overall_status": "completed", "blocks": blocks}}
+    )
+
+    assert [block.block_label for block in packet.ai_fallback_blocks or []] == [
+        f"loop_step_{index}" for index in range(3, 15)
+    ]
+    assert any(notice.startswith("ai_fallback_blocks shortened: 3 oldest") for notice in packet.omission_notices)
+
+
+@pytest.mark.asyncio
+async def test_the_prior_run_packet_and_its_recorded_outcome_name_the_rescued_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid-1")
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+
+    rescued = {
+        "block_label": "collect_metrics",
+        "status": "fired_completed",
+        "task_id": "tsk_fallback",
+        "failing_line": 5,
+        "failure_text": _CODE_ERROR,
+    }
+    assert outcome is not None
+    assert [block.model_dump(mode="json", exclude_none=True) for block in outcome.ai_fallback_blocks or []] == [rescued]
+    assert hydrated is not None
+    assert hydrated["ai_fallback_blocks"] == [rescued]
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_an_ai_fallback_reads_exactly_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[str] = []
+    for episodes in (
+        [],
+        [_ai_fallback_episode(HealStatus.skipped, failing_line=5, skip_reason=HealSkipReason.no_goal)],
+    ):
+        _install_rescued_run(monkeypatch, episodes)
+        ctx = make_copilot_ctx(workflow_permanent_id="wpid-1")
+        page = await _run_results_page(ctx)
+        hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
+        outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+        assert hydrated is not None
+        assert outcome is not None
+        reads.append(json.dumps([page, hydrated, outcome.model_dump(mode="json", exclude_none=True)], default=str))
+
+    assert reads[0] == reads[1]
+    for absent in ("ai_fallback", "parent_block_label"):
+        assert absent not in reads[0]
+
+
+_PARSE_THEN_LOOP_YAML = """
+title: parse then loop
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: file_url_parser
+      label: parse_rows
+      file_url: https://fixture.test/rows.csv
+      file_type: csv
+      next_block_label: visit_each_row
+    - block_type: for_loop
+      label: visit_each_row
+      loop_over_parameter_key: parse_rows_output
+      {reference}
+      loop_blocks:
+        - block_type: goto_url
+          label: open_row_url
+          url: "{{{{ current_value.url }}}}"
+"""
+
+_LoopFactRow = tuple[
+    str,
+    str | None,
+    str | None,
+    str | None,
+    LoopSelectedInput,
+    int | None,
+    list[int | Literal["not_recorded"]] | None,
+    int | None,
+]
+
+_NESTED_LOOP_YAML = """
+title: nested loop
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: groups
+      workflow_parameter_type: json
+      default_value: [{"urls": ["https://fixture.test/a"]}]
+  blocks:
+    - block_type: for_loop
+      label: each_group
+      loop_over_parameter_key: groups
+      loop_blocks:
+        - block_type: for_loop
+          label: each_url
+          loop_variable_reference: current_value.urls
+          loop_blocks:
+            - block_type: goto_url
+              label: open_url
+              url: "{{ current_value }}"
+"""
+
+_REFERENCE_NAMES_A_PARAMETER_YAML = """
+title: reference names a parameter
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: groups
+      workflow_parameter_type: json
+      default_value: [{}]
+    - parameter_type: workflow
+      key: other_groups
+      workflow_parameter_type: json
+      default_value: [{}]
+  blocks:
+    - block_type: for_loop
+      label: each_group
+      loop_over_parameter_key: other_groups
+      loop_variable_reference: "{{ groups }}"
+      loop_blocks:
+        - block_type: goto_url
+          label: open_url
+          url: https://fixture.test/a
+"""
+
+
+def _parse_then_loop_yaml(reference: str | None) -> str:
+    return _PARSE_THEN_LOOP_YAML.format(
+        reference=f"loop_variable_reference: {json.dumps(reference)}" if reference else ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_both_inputs_run_reports_the_dispatched_versions_selected_reference_to_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser_row = terminal_extraction_block("completed", label="parse_rows").model_copy(
+        update={"block_type": BlockType.FILE_URL_PARSER}
+    )
+    failed_loop_row = terminal_extraction_block(
+        "failed", label="visit_each_row", failure_reason="Failed to get loop values."
+    ).model_copy(update={"block_type": BlockType.FOR_LOOP})
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_parse_then_loop_yaml("current_value"),
+        polled_status="failed",
+        dispatch_to_worker=True,
+        terminal_blocks=[parser_row, failed_loop_row],
+    )
+    dispatched = harness["workflow"].model_copy(deep=True, update={"workflow_id": "w_dispatch_v8", "version": 8})
+    forge_app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version = AsyncMock(return_value=dispatched)
+
+    async def execute_and_rewrite_reference(**_kwargs: object) -> None:
+        loop = dispatched.workflow_definition.blocks[1]
+        assert isinstance(loop, ForLoopBlock)
+        loop.loop_variable_reference = "extracted_loop_values_runtime"
+
+    harness["worker_execute"].side_effect = execute_and_rewrite_reference
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["parse_rows", "visit_each_row"], "parameters": {}}, ctx
+    )
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result)
+    model_facing = sanitize_tool_result_for_llm("update_and_run_blocks", result)["data"]
+
+    parser_output_id = dispatched.workflow_definition.blocks[0].output_parameter.output_parameter_id
+    assert "loop_inputs" not in model_facing
+    assert model_facing["build_test_packet"]["run"]["loop_inputs"] == {
+        "workflow_run_id": "wr_paused",
+        "workflow_id": "w_dispatch_v8",
+        "workflow_permanent_id": "wfp-1",
+        "version": 8,
+        "loops": [
+            {
+                "block_label": "visit_each_row",
+                "loop_over_parameter_key": "parse_rows_output",
+                "producer_block_label": "parse_rows",
+                "producer_output_parameter_id": parser_output_id,
+                "loop_variable_reference": "current_value",
+                "selected_input": "loop_variable_reference",
+                "run_rows": 1,
+                "loop_values_counts": ["not_recorded"],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "rows", "expected"),
+    [
+        pytest.param(
+            _parse_then_loop_yaml(None),
+            [
+                terminal_extraction_block("completed", label="visit_each_row").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": ["a", "b"]}
+                )
+            ],
+            [("visit_each_row", None, "parse_rows_output", None, "loop_over_parameter_key", 1, [2], None)],
+            id="typed-only",
+        ),
+        pytest.param(
+            _parse_then_loop_yaml("{{ parse_rows_output.rows }}"),
+            [],
+            [
+                (
+                    "visit_each_row",
+                    None,
+                    "parse_rows_output",
+                    "{{ parse_rows_output.rows }}",
+                    "loop_variable_reference",
+                    None,
+                    None,
+                    None,
+                )
+            ],
+            id="explicit-expression-never-reached",
+        ),
+        pytest.param(
+            _REFERENCE_NAMES_A_PARAMETER_YAML,
+            [
+                terminal_extraction_block("completed", label="each_group").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": [{}]}
+                )
+            ],
+            [("each_group", None, None, "{{ groups }}", "loop_variable_reference", 1, [1], None)],
+            id="reference-names-a-parameter",
+        ),
+        pytest.param(
+            _NESTED_LOOP_YAML,
+            [
+                terminal_extraction_block("completed", label="each_group").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": [{}]}
+                )
+            ]
+            + [
+                terminal_extraction_block("completed", label="each_url").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": list(range(minute)) or None}
+                )
+                for minute in range(12)
+            ],
+            [
+                ("each_group", None, "groups", None, "loop_over_parameter_key", 1, [1], None),
+                (
+                    "each_url",
+                    "each_group",
+                    None,
+                    "current_value.urls",
+                    "loop_variable_reference",
+                    12,
+                    list(range(2, 12)),
+                    2,
+                ),
+            ],
+            id="nested-keeps-newest-ten-rows",
+        ),
+    ],
+)
+async def test_loop_input_facts_report_each_loops_own_declared_and_recorded_input(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_yaml: str,
+    rows: list[WorkflowRunBlock],
+    expected: list[_LoopFactRow],
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    definitions = loop_definition_facts(await inert_approval_workflow(workflow_yaml, workflow_id="w_source"))
+    assert definitions is not None
+    facts = with_loop_observations(definitions, "wr_paused", rows)
+
+    assert [
+        (
+            loop.block_label,
+            loop.enclosing_loop_label,
+            loop.loop_over_parameter_key,
+            loop.loop_variable_reference,
+            loop.selected_input,
+            loop.run_rows,
+            loop.loop_values_counts,
+            loop.loop_values_counts_omitted,
+        )
+        for loop in facts.loops
+    ] == expected
+
+
+@pytest.mark.asyncio
+async def test_a_loop_over_id_from_an_older_version_still_names_its_producer_by_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    parser, loop = workflow.workflow_definition.blocks
+    assert isinstance(loop, ForLoopBlock) and isinstance(loop.loop_over, OutputParameter)
+    loop.loop_over = loop.loop_over.model_copy(update={"output_parameter_id": "op_from_version_2"})
+
+    definitions = loop_definition_facts(workflow)
+
+    assert definitions is not None
+    [fact] = definitions.loops
+    assert (fact.producer_block_label, fact.producer_output_parameter_id) == (
+        "parse_rows",
+        parser.output_parameter.output_parameter_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference", "loop_over", "expected"),
+    [
+        ("current_value", True, "loop_variable_reference"),
+        ("", True, "loop_over_parameter_key"),
+        (None, False, "none"),
+    ],
+)
+async def test_selected_input_matches_the_branch_the_real_for_loop_getter_takes(
+    reference: str | None, loop_over: bool, expected: str
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
+    block = ForLoopBlock(
+        label="visit_each_row",
+        output_parameter=OutputParameter(
+            output_parameter_id="op_loop",
+            key="visit_each_row_output",
+            workflow_id="w",
+            created_at=now,
+            modified_at=now,
+        ),
+        loop_blocks=[],
+        loop_over=(
+            WorkflowParameter(
+                workflow_parameter_id="wp_rows",
+                workflow_parameter_type=WorkflowParameterType.JSON,
+                key="rows",
+                workflow_id="w",
+                created_at=now,
+                modified_at=now,
+            )
+            if loop_over
+            else None
+        ),
+        loop_variable_reference=reference,
+        complete_if_empty=True,
+    )
+    branch_values = {"loop_variable_reference": ["from_reference"], "loop_over_parameter_key": ["from_key"], "none": []}
+    context = MagicMock()
+    context.get_value.return_value = branch_values["loop_over_parameter_key"]
+
+    with patch.object(
+        ForLoopBlock,
+        "get_values_from_loop_variable_reference",
+        AsyncMock(return_value=branch_values["loop_variable_reference"]),
+    ):
+        observed = await block.get_loop_over_parameter_values(context, "wr", "wrb")
+
+    assert loop_selected_input(block) == expected
+    assert observed == branch_values[expected]
+
+
+@pytest.mark.asyncio
+async def test_read_run_reports_the_executed_versions_loop_inputs_not_the_current_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    executed = (
+        await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    ).model_copy(update={"modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)})
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block(
+                "failed", label="visit_each_row", failure_reason="Failed to get loop values."
+            ).model_copy(update={"block_type": BlockType.FOR_LOOP})
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+    ctx.staged_workflow = await inert_approval_workflow(_parse_then_loop_yaml(None), workflow_id="w_source")
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    page = sanitize_tool_result_for_llm("get_run_results", project_run_results_page(result, {}))["data"]
+
+    assert page["loop_inputs"]["workflow_run_id"] == "wr-1"
+    assert page["loop_inputs"]["workflow_id"] == "w_source"
+    [loop] = page["loop_inputs"]["loops"]
+    assert (loop["loop_variable_reference"], loop["selected_input"], loop["loop_values_counts"]) == (
+        "current_value",
+        "loop_variable_reference",
+        ["not_recorded"],
+    )
+    assert "Failed to get loop values" not in json.dumps(page["loop_inputs"])
+
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=None)
+    unresolved = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    assert unresolved["data"]["loop_inputs"] == {"executed_definition": "unavailable"}
+    packet = build_test_evidence_packet(_locator_packet_ctx(), unresolved)
+    assert packet.run.loop_inputs is not None
+    assert packet.run.loop_inputs.model_dump() == {"executed_definition": "unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "created_by", "expected_unavailable"),
+    [
+        (_parse_then_loop_yaml("current_value"), None, True),
+        (_parse_then_loop_yaml("current_value"), COPILOT_TEST_WORKFLOW_CREATOR, False),
+        (SEARCH_THEN_SELECT_WORKFLOW_YAML, None, True),
+    ],
+    ids=[
+        "saved-version-overwritten-after-run",
+        "test-version-soft-deleted-after-run",
+        "loop-removed-from-saved-version-after-run",
+    ],
+)
+async def test_read_run_withholds_loop_inputs_when_the_workflow_row_changed_after_the_run(
+    monkeypatch: pytest.MonkeyPatch, workflow_yaml: str, created_by: str | None, expected_unavailable: bool
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    executed = (await inert_approval_workflow(workflow_yaml, workflow_id="w_source")).model_copy(
+        update={"created_by": created_by, "modified_at": HARNESS_RUN_CREATED_AT + timedelta(minutes=5)}
+    )
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block(
+                "failed", label="visit_each_row", failure_reason="Failed to get loop values."
+            ).model_copy(update={"block_type": BlockType.FOR_LOOP})
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    assert (result["data"]["loop_inputs"] == {"executed_definition": "unavailable"}) is expected_unavailable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["aware_modified_at", "loop_definition_facts", "with_loop_observations"])
+async def test_read_run_degrades_loop_inputs_to_unavailable_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    modified_at = (
+        HARNESS_RUN_CREATED_AT.replace(tzinfo=UTC) + timedelta(minutes=5)
+        if fault == "aware_modified_at"
+        else HARNESS_RUN_CREATED_AT - timedelta(minutes=1)
+    )
+    executed = (
+        await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    ).model_copy(update={"modified_at": modified_at})
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block("failed", label="visit_each_row").model_copy(
+                update={"block_type": BlockType.FOR_LOOP}
+            )
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+    if fault != "aware_modified_at":
+        monkeypatch.setattr(run_execution_module, fault, MagicMock(side_effect=ValueError("projection failed")))
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    assert result["data"]["loop_inputs"] == {"executed_definition": "unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["loop_definition_facts", "with_loop_observations"])
+async def test_build_test_loop_inputs_degrade_to_unavailable_when_the_projection_raises(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    monkeypatch.setattr(run_execution_module, fault, MagicMock(side_effect=ValueError("projection failed")))
+    execution = run_execution_module._RunExecution(
+        snapshot=run_execution_module.CopilotExecutionSnapshot(
+            provenance="staged",
+            workflow=workflow,
+            workflow_parameters=(),
+            output_parameters=(),
+            workflow_yaml="",
+        ),
+        workflow_yaml="",
+        metadata={},
+        associations={},
+        source_at_start=None,
+        unbound_keys=[],
+        explicit_blank=False,
+        loop_definitions=run_execution_module._loop_definitions_or_unavailable(workflow),
+    )
+    data: dict[str, Any] = {}
+
+    run_execution_module._attach_loop_inputs(data, execution, "wr-1", [])
+
+    assert data["loop_inputs"] == {"executed_definition": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_read_run_reports_no_loop_inputs_for_an_unresolved_workflow_that_ran_no_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch, blocks=[terminal_extraction_block("failed", label="open_result")]
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=None)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    assert "loop_inputs" not in result["data"]
+    assert build_test_evidence_packet(_locator_packet_ctx(), result).run.loop_inputs is None
+
+
+@pytest.mark.asyncio
+async def test_prior_run_packet_and_handoff_carry_the_notice_for_a_truncated_loop_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    executed = (
+        await inert_approval_workflow(_parse_then_loop_yaml("current_value." + "a" * 400), workflow_id="w_source")
+    ).model_copy(update={"modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)})
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block("failed", label="visit_each_row").model_copy(
+                update={"block_type": BlockType.FOR_LOOP}
+            )
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert isinstance(packet.run.loop_inputs, LoopInputs)
+    assert len(packet.run.loop_inputs.loops[0].loop_variable_reference or "") <= 200
+    assert any("loop_variable_reference" in notice for notice in packet.omission_notices)
+    handoff = project_direct_test_handoff_packet_for_llm(packet)
+    assert any("loop_variable_reference" in notice for notice in handoff.omission_notices)
+
+
+@pytest.mark.parametrize("ai_fallback_rows", [0, 12])
+def test_many_long_loop_facts_stay_inside_the_packet_budget(ai_fallback_rows: int) -> None:
+    long_label = "l" * 400
+    loop_inputs = LoopInputs(
+        workflow_run_id="wr_1",
+        workflow_id="w_dispatch",
+        workflow_permanent_id="wpid",
+        version=3,
+        loops=[
+            LoopInputFact(
+                block_label=f"{long_label}{index}",
+                enclosing_loop_label=long_label,
+                loop_over_parameter_key=f"{long_label}_output",
+                producer_block_label=long_label,
+                loop_variable_reference="r" * 5_000,
+                selected_input="loop_variable_reference",
+                run_rows=12 + index,
+                loop_values_counts=[1_000_000] * 10,
+                loop_values_counts_omitted=2,
+            )
+            for index in range(20)
+        ],
+    )
+    packet = _oversized_packet(build_test_evidence_packet(_locator_packet_ctx(), _failed_run_result(None)))
+    ai_fallback_blocks = [
+        BuildTestPacketAiFallbackBlock(
+            block_label=f"{long_label}{index}",
+            status="fired_failed",
+            task_id=f"tsk_{index}",
+            failing_line=index,
+            failure_text="f" * 2_000,
+            recovery_failure_text="g" * 2_000,
+        )
+        for index in range(ai_fallback_rows)
+    ]
+    packet = packet.model_copy(
+        update={
+            "run": packet.run.model_copy(update={"loop_inputs": loop_inputs}),
+            "ai_fallback_blocks": ai_fallback_blocks or None,
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(packet)
+
+    serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+    assert len(serialized) <= _BUILD_TEST_PACKET_MAX_CHARS
+    assert isinstance(projected.run.loop_inputs, LoopInputs)
+    # Loop facts give way before canonical_workflow_yaml is shortened.
+    assert [loop.run_rows for loop in projected.run.loop_inputs.loops] == [12 + index for index in range(6)]
+    assert projected.run.loop_inputs.loops_omitted == 14
+    assert all(len(loop.loop_variable_reference or "") <= 200 for loop in projected.run.loop_inputs.loops)
+    assert all(loop.selected_input == "loop_variable_reference" for loop in projected.run.loop_inputs.loops)
+    assert all(loop.loop_values_counts == [1_000_000] * 10 for loop in projected.run.loop_inputs.loops)

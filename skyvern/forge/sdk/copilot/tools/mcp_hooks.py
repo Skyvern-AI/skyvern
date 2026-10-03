@@ -10,18 +10,22 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
+import yaml
 from pydantic import JsonValue
 
+from skyvern.cli.core.js_dispatch import outer_cap_seconds
 from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.blocker_signal import stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
+    AuthoringCapability,
     BlockAuthoringPolicy,
-    download_scout_act_required_for_policy,
-    normalize_block_authoring_policy,
+    authoring_capability_from_policy,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, USER_FACING_REASON_SCHEMA, CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
@@ -29,6 +33,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
+    PreHook,
     SchemaOverlay,
     scrub_model_facing_tool_result,
 )
@@ -54,11 +59,19 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
-    clear_sensitive_origin_page_taint,
+    browser_valid_tab_count,
+    clear_sensitive_origin_page_taint_after_navigation,
+    live_working_page_url,
+    navigation_replaced_document,
+    pending_taint_source_url,
+    sensitive_origin_multi_tab_error,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
+    stage_pending_taint_source,
+    tab_switch_refusal,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import viewport_visible_effect
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
     register_matching_origin_run_redaction_values,
@@ -66,9 +79,14 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
-from skyvern.forge.sdk.workflow.models.block import CLEAR_BROWSER_DATA_HELPER_CONTRACT
+from skyvern.forge.sdk.workflow.models.block import (
+    CLEAR_BROWSER_DATA_HELPER_CONTRACT,
+    OPEN_PAGE_HELPER_CONTRACT,
+    open_page_cap_reached,
+)
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
+from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
 from ._shared import (
@@ -78,22 +96,32 @@ from ._shared import (
     attribute_navigation_failure,
 )
 from .banned_blocks import (
+    _AGENT_FAMILY_BLOCK_TYPES,
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
-    _COPILOT_BANNED_BLOCK_TYPES,
-    _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     _TASK_V3_ENGINE,
-    _TASK_V3_PURE_BANNED_BLOCK_TYPES,
-    _TASK_V3_PURE_TASK_BLOCK_TYPES,
+    AGENT_FAMILY_BLOCK_SUMMARIES,
+    AUTHORING_FAMILY_GUIDANCE,
+    CODE_BLOCK_SUMMARY,
+    _authoring_violation_reject_message,
+    _banned_block_types_for_capability,
+    _block_authoring_violations,
     _code_only_browser_schema_guidance,
     _code_only_browser_unavailable_summary,
+    _copilot_authoring_capability,
     _copilot_banned_block_alternatives,
     _copilot_banned_block_types,
-    _copilot_block_authoring_policy,
     _copilot_block_policy,
     _record_code_native_pending_capability,
     _render_block_policy_detail,
-    _task_v3_pure_block_violations,
-    _task_v3_pure_reject_message,
+    workflow_run_names,
+)
+from .credentials import (
+    _credential_run_approval_blocker_signal,
+    _credential_run_approval_error,
+    _extract_credential_ids_from_tool_value,
+    _extract_credential_ids_from_workflow_definition,
+    _google_connection_reference_ids,
+    _server_verified_google_account_choices,
 )
 from .page_observation import (
     _record_composition_page_observation,
@@ -101,6 +129,7 @@ from .page_observation import (
 )
 from .scouting import (
     _SCOUT_RESULT_CHAR_CAP,
+    _arm_scout_challenge_listener,
     _arm_scout_download_listener,
     _arm_scout_popup_listener,
     _attach_evaluate_page_facts,
@@ -111,8 +140,10 @@ from .scouting import (
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _clear_pending_scout_selector_facts,
+    _close_scout_challenge_baseline,
     _consume_scout_source_url,
     _mark_pending_browser_interaction_observation,
+    _maybe_attach_observed_challenge,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
     _page_evidence_location_fingerprint,
@@ -122,10 +153,14 @@ from .scouting import (
     _record_scout_trajectory_fact,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
+    _release_scout_challenge_listeners,
     _resolve_scout_role_name,
     _scout_act_observe_page_evidence,
     _scout_session_download_names,
     _shed_scout_page_summary_section,
+    _start_scout_challenge_settle,
+    _take_viewport_frame,
+    read_page_state,
     record_signed_out_page_observation,
 )
 
@@ -152,11 +187,57 @@ async def _sensitive_origin_page_pre_hook(
     return _sensitive_origin_page_refusal(ctx)
 
 
+async def _tab_new_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    refusal = _sensitive_origin_page_refusal(ctx)
+    if refusal is not None:
+        return refusal
+    open_tabs = await browser_valid_tab_count(ctx)
+    if open_tabs is not None and open_page_cap_reached(open_tabs):
+        return {
+            "ok": False,
+            "error": (
+                f"{open_tabs} tabs are open; the browser's limit is {settings.BROWSER_MAX_PAGES_NUMBER}. "
+                "Close a tab with skyvern_tab_close first."
+            ),
+        }
+    return None
+
+
 async def _sensitive_origin_page_action_pre_hook(
     _params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     return _sensitive_origin_page_action_refusal(ctx)
+
+
+async def _tab_switch_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    refusal = _sensitive_origin_page_refusal(ctx)
+    if refusal is not None:
+        return refusal
+    raw_index = params.get("index")
+    index: int | None = None
+    if isinstance(raw_index, int):
+        index = raw_index
+    elif isinstance(raw_index, str) and raw_index.isdigit():
+        index = int(raw_index)
+    raw_tab_id = params.get("tab_id")
+    error = await tab_switch_refusal(ctx, tab_id=raw_tab_id if isinstance(raw_tab_id, str) else None, index=index)
+    return {"ok": False, "error": error} if error else None
+
+
+async def _tab_close_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    if sensitive_origin_page_has_active_run(ctx):
+        return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
+    return None
 
 
 async def _sensitive_origin_page_post_hook(
@@ -352,14 +433,14 @@ async def _get_block_schema_pre_hook(
     normalized = normalize_copilot_block_type_alias(block_type)
     if normalized != block_type.strip().lower():
         params["block_type"] = normalized
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE and normalized == "task":
+    if _copilot_authoring_capability(ctx).agent_blocks and normalized == "task":
         return {
             "ok": True,
             "data": {
                 "block_type": "task",
                 "summary": "Run a general browser task with the Task V3 engine.",
                 "schema": _task_v3_pure_schema(TaskBlockYAML.model_json_schema()),
-                "task_v3_pure_guidance": _task_v3_pure_schema_guidance(),
+                "agent_block_guidance": _agent_block_schema_guidance(),
             },
         }
     policy_entry = _copilot_block_policy(normalized, ctx)
@@ -408,9 +489,6 @@ async def _validate_block_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     _normalize_block_json_alias(params)
-    authoring_policy = _copilot_block_authoring_policy(ctx)
-    if authoring_policy not in {BlockAuthoringPolicy.CODE_ONLY_BROWSER, BlockAuthoringPolicy.TASK_V3_PURE}:
-        return None
     block_json = params.get("block_json")
     if not isinstance(block_json, str):
         return None
@@ -420,31 +498,131 @@ async def _validate_block_pre_hook(
         return None
     if not isinstance(raw, dict):
         return None
-    if authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE:
-        violations = _task_v3_pure_block_violations(raw)
-        if violations:
-            return {
-                "ok": False,
-                "error": _task_v3_pure_reject_message(violations),
-                "data": {"violations": [violation.as_dict() for violation in violations]},
-            }
+    violations = _block_authoring_violations(
+        raw, _copilot_authoring_capability(ctx), run_names=workflow_run_names(ctx.workflow_yaml)
+    )
+    if not violations:
         return None
-    block_type = raw.get("block_type")
-    if not isinstance(block_type, str):
-        return None
-    normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
-    policy_entry = _copilot_block_policy(normalized, ctx)
-    if policy_entry is None:
-        return None
-    normalized, policy = policy_entry
-    _record_code_native_pending_capability(ctx, policy)
+    for violation in violations:
+        policy_entry = _copilot_block_policy(violation.block_type, ctx)
+        if policy_entry is not None:
+            _record_code_native_pending_capability(ctx, policy_entry[1])
     return {
         "ok": False,
-        "error": (
-            f"Block type {block_type!r} is not available in the workflow copilot. "
-            f"{_render_block_policy_detail(normalized, policy)} {_copilot_banned_block_alternatives(ctx)}"
-        ),
+        "error": _authoring_violation_reject_message(violations, ctx),
+        "data": {"violations": [violation.as_dict() for violation in violations]},
     }
+
+
+PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
+    "call": "await publish_file(filename, text=|data=|sheets=|report=|folder=, sources=None)",
+    "shadowed_by_parameter": "publish_file",
+    "parameters": {
+        "filename": {"accepted_type": "str", "description": "A plain file name with an extension, e.g. prices.xlsx."},
+        "text": {"accepted_type": "str", "renders": "UTF-8 text file"},
+        "data": {"accepted_type": "bytes", "renders": "the bytes as given"},
+        "sheets": {
+            "accepted_type": "dict[str, list[list[str | int | float | bool | None]]]",
+            "renders": "XLSX workbook, one sheet per key; each row is a list of cells",
+        },
+        "report": {
+            "accepted_type": "dict",
+            "shape": (
+                '{"title": str | None, "blocks": [{"heading": str} | {"paragraph": str} | '
+                '{"table": [[cell, ...], ...]} | {"image": bytes, "caption": str | None}]}'
+            ),
+            "renders": "PDF report; image bytes must be PNG or JPEG, such as await page.screenshot()",
+        },
+        "folder": {
+            "accepted_type": "dict[str, str | bytes]",
+            "renders": "one ZIP keyed by relative path (a/b/c.csv), plus a manifest.json describing each entry",
+        },
+        "sources": {
+            "accepted_type": "dict[str, str] | None",
+            "description": "folder= only: each relative path's provenance, e.g. the page URL it came from.",
+        },
+    },
+    "returns": {"type": "dict", "value": "{artifact_id, filename, size, content_type}"},
+    "effect": (
+        "The file becomes a download of this workflow run, and the chat offers it to the user after a test "
+        "run that published it. A block that fails afterwards removes the files it published."
+    ),
+    "usage": (
+        "Pass exactly one content argument per call. Call it inside a code block and prove it with a test run; "
+        "run_browser_code refuses it. A failed publish raises with the reason. Never write files or paths."
+    ),
+}
+
+
+_FOR_LOOP_PROPERTY_DESCRIPTIONS = {
+    "loop_over_parameter_key": (
+        "A workflow parameter key, or an earlier block's `<label>_output` when that output is itself the list. "
+        "To loop over an earlier block's output, set this key and leave `loop_variable_reference` unset. "
+        "Ignored whenever `loop_variable_reference` is non-empty."
+    ),
+    "loop_variable_reference": (
+        "A block label (also tried as `<label>.extracted_information`, `<label>.extracted_information.results` "
+        "and `<label>.results`), dotted path or template expression for the list. When non-empty it overrides "
+        "`loop_over_parameter_key`, even when both are set; a value that resolves to nothing is read as a "
+        "natural-language description of the list. `current_value` exists only inside a running for_loop's "
+        "`loop_blocks` (a while_loop leaves it unset), so name it here only in a loop nested inside an outer "
+        "for_loop."
+    ),
+}
+
+_FOR_LOOP_EXAMPLE: dict[str, JsonValue] = {
+    "parameters": [{"parameter_type": "workflow", "key": "rows_file", "workflow_parameter_type": "file_url"}],
+    "blocks": [
+        {
+            "block_type": "file_url_parser",
+            "label": "parse_rows",
+            "file_url": "{{ rows_file }}",
+            "file_type": "csv",
+            "next_block_label": "visit_each_row",
+        },
+        {
+            "block_type": "for_loop",
+            "label": "visit_each_row",
+            "loop_over_parameter_key": "parse_rows_output",
+            "loop_blocks": [{"block_type": "goto_url", "label": "open_row_url", "url": "{{ current_value.url }}"}],
+        },
+    ],
+}
+
+
+_FOR_LOOP_GUIDANCE = "\n".join(
+    [
+        "Purpose: Iterate over a list and run `loop_blocks` once per item. A for_loop reads exactly one input.",
+        "",
+        f"- loop_over_parameter_key: {_FOR_LOOP_PROPERTY_DESCRIPTIONS['loop_over_parameter_key']}",
+        f"- loop_variable_reference: {_FOR_LOOP_PROPERTY_DESCRIPTIONS['loop_variable_reference']}",
+        (
+            "- loop_blocks (required): the blocks run for each item, chained with next_block_label. Inside them "
+            "{{ current_value }} (also {{ current_item }}) is the current item and {{ current_index }} its position."
+        ),
+        "- complete_if_empty: true completes the loop successfully when the list is empty.",
+        "",
+        "Example - loop over a parser's rows (the parser's output is the list):",
+        yaml.safe_dump(_FOR_LOOP_EXAMPLE, sort_keys=False).rstrip(),
+    ]
+)
+
+
+def _apply_for_loop_schema_guidance(data: dict[str, Any]) -> None:
+    schema = data.get("schema")
+    if (
+        isinstance(schema, dict)
+        and isinstance(ref := schema.get("$ref"), str)
+        and isinstance(schema.get("$defs"), dict)
+    ):
+        # ForLoopBlockYAML nests blocks recursively, so its JSON schema is a $ref into $defs.
+        schema = schema["$defs"].get(ref.removeprefix("#/$defs/"))
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if isinstance(properties, dict):
+        for name, description in _FOR_LOOP_PROPERTY_DESCRIPTIONS.items():
+            if isinstance(properties.get(name), dict):
+                properties[name] = {**properties[name], "description": description}
+    data["example"] = copy.deepcopy(_FOR_LOOP_EXAMPLE)
 
 
 async def _get_block_schema_post_hook(
@@ -454,30 +632,33 @@ async def _get_block_schema_post_hook(
 ) -> dict[str, Any]:
     """Scrub banned block types from list-mode responses. Belt-and-suspenders
     against future drift in ``BLOCK_SUMMARIES`` (which currently omits them)."""
+    capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
     if isinstance(data, dict):
+        if data.get("block_type") == "for_loop":
+            _apply_for_loop_schema_guidance(data)
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
             for banned in _copilot_banned_block_types(ctx):
                 block_types.pop(banned, None)
-            if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
-                for task_block_type in sorted(_TASK_V3_PURE_TASK_BLOCK_TYPES):
-                    block_types.setdefault(
-                        task_block_type,
-                        f"Task V3 {task_block_type.replace('_', ' ')} block",
-                    )
+            if capability.agent_blocks:
+                for agent_block_type, summary in AGENT_FAMILY_BLOCK_SUMMARIES.items():
+                    block_types[agent_block_type] = summary
+            if capability.code_blocks and "code" in block_types:
+                block_types["code"] = CODE_BLOCK_SUMMARY
+            if capability.code_blocks and capability.agent_blocks:
+                data["choosing_a_block_family"] = AUTHORING_FAMILY_GUIDANCE
             data["count"] = len(block_types)
         block_type = data.get("block_type")
         if (
-            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE
+            capability.agent_blocks
             and isinstance(block_type, str)
-            and block_type in _TASK_V3_PURE_TASK_BLOCK_TYPES
+            and block_type in _AGENT_FAMILY_BLOCK_TYPES
             and isinstance(data.get("schema"), dict)
         ):
             data["schema"] = _task_v3_pure_schema(data["schema"])
-            data["task_v3_pure_guidance"] = _task_v3_pure_schema_guidance()
-        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
-            ctx.code_only_code_schema_seen = True
+            data["agent_block_guidance"] = _agent_block_schema_guidance()
+        if capability.code_blocks and block_type == "code":
             schema = data.get("schema")
             if isinstance(schema, dict):
                 properties = schema.get("properties")
@@ -486,18 +667,45 @@ async def _get_block_schema_post_hook(
                         "type": "string",
                         "description": (
                             "Every new or wholly rewritten code block must include this non-null string: "
-                            "the model-authored plain-language Goal shown in the editor."
+                            "the model-authored plain-language Goal shown in the editor, written for this code. "
+                            "Open with one sentence naming only what a person sees on the page once the block has "
+                            "succeeded, showing every value the block returns as it appears there, with no actions, "
+                            "conditions, 'after' or 'returns' clauses. Then give the route that reaches "
+                            "it: the site or page the block works on, the controls it uses by their visible label "
+                            "or role, the order it acts in, the inputs it reads by workflow parameter name (never "
+                            "a value), and what the block returns, naming only page content that first sentence "
+                            "already shows, never a data structure. A few sentences, enough for an agent to redo "
+                            "this block on a live browser without reading the code. Rewrite the Goal whenever you "
+                            "rewrite the code."
+                        ),
+                    }
+                    properties["data_schema"] = {
+                        "type": ["object", "null"],
+                        "description": (
+                            "JSON schema of what this block's return produces, authored for every new or wholly "
+                            "rewritten code block: an object schema whose property keys are exactly the keys of "
+                            "the returned dict, or, when the return is a top-level list, an array schema whose "
+                            "`items` is that object schema; null only when the block returns nothing. Mark a key "
+                            "`required` only when the block cannot have done its job without it. Rewrite the "
+                            "schema whenever you rewrite the return."
                         ),
                     }
                     required = schema.get("required")
                     required_fields = required if isinstance(required, list) else []
-                    if "prompt" not in required_fields:
-                        schema["required"] = [*required_fields, "prompt"]
-            data["code_only_note"] = _code_only_browser_unavailable_summary()
-            data["code_only_guidance"] = _code_only_browser_schema_guidance()
+                    schema["required"] = [
+                        *required_fields,
+                        *(field for field in ("prompt", "data_schema") if field not in required_fields),
+                    ]
+            if not capability.agent_blocks:
+                data["code_only_note"] = _code_only_browser_unavailable_summary()
+            data["code_only_guidance"] = _code_only_browser_schema_guidance(
+                agent_blocks=capability.agent_blocks,
+                image_ocr=app.AGENT_FUNCTION.supports_image_captcha_ocr(),
+            )
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
             data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT
+            data["open_page_helper_contract"] = OPEN_PAGE_HELPER_CONTRACT
             data["dialog_policy_helper_contract"] = DIALOG_POLICY_HELPER_CONTRACT
             page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
             if page_operation_contracts is not None:
@@ -508,6 +716,8 @@ async def _get_block_schema_post_hook(
             )
             if execution_limits is not None:
                 data["code_execution_limits"] = execution_limits
+                if app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is not True:
+                    data["publish_file_helper_contract"] = PUBLISH_FILE_HELPER_CONTRACT
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
@@ -520,23 +730,26 @@ def _task_v3_pure_schema(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
     if isinstance(properties, dict):
         properties["engine"] = {
             "type": "string",
-            "const": _TASK_V3_ENGINE,
-            "description": "Required by the active Task-V3-pure authoring policy.",
+            "description": _ENGINE_FIELD_DESCRIPTION,
         }
         required = policy_schema.get("required")
-        if isinstance(required, list) and "engine" not in required:
-            required.append("engine")
-        elif not isinstance(required, list):
-            policy_schema["required"] = ["engine"]
+        if isinstance(required, list) and "engine" in required:
+            required.remove("engine")
     return policy_schema
 
 
-def _task_v3_pure_schema_guidance() -> list[str]:
+_ENGINE_FIELD_DESCRIPTION = (
+    f"Omit on a new block: Copilot-authored agent blocks run on the {_TASK_V3_ENGINE} engine and it is filled in. "
+    "A saved block keeps the engine it has unless the user asks to change it."
+)
+
+
+def _agent_block_schema_guidance() -> list[str]:
     return [
-        "Set every task-shaped block engine exactly to `skyvern-3.0`.",
+        _ENGINE_FIELD_DESCRIPTION,
         "Use engine-less blocks for orchestration, integrations, direct navigation, waits, files, and human interaction.",
         "Use `loop_over_parameter_key` for for_loop input and explicit `jinja2_template` criteria for conditional or while_loop control flow.",
-        "Code, task_v2, free-form for_loop inputs, prompt control-flow criteria, and download-gated validation are unavailable.",
+        "task_v2, free-form for_loop inputs, prompt control-flow criteria, and download-gated validation are unavailable.",
     ]
 
 
@@ -545,13 +758,18 @@ async def _get_workflow_knowledge_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
-    if isinstance(data, dict) and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        data["active_policy_note"] = (
-            "This knowledge describes workflow concepts across all block types. Under the active code-only browser "
-            "policy, author browser work with code blocks only; get_block_schema is authoritative for what the active "
-            "policy permits."
-        )
+    sections = data.get("sections") if isinstance(data, dict) else None
+    if not isinstance(sections, dict):
+        return result
+    for_loop = sections.get("for_loop_block")
+    if isinstance(for_loop, dict):
+        for_loop["content"] = _FOR_LOOP_GUIDANCE
+    if capability.code_blocks and capability.agent_blocks:
+        choosing = sections.get("choosing_a_block")
+        if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
+            choosing["content"] = f"{AUTHORING_FAMILY_GUIDANCE}\n\n{choosing['content']}"
     return result
 
 
@@ -565,6 +783,7 @@ _MODEL_SCOUT_FACT_KEYS = (
     "source_url",
     "result_url",
     "observed_effects",
+    "challenge_vendor",
     "observed_wait_ms",
     "observation_step",
     "input_id",
@@ -654,25 +873,6 @@ def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
     return [scrub(fact) for fact in facts]
 
 
-def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | None:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if ctx.workflow_persisted or ctx.update_workflow_called:
-        return None
-    for value in (ctx.last_run_blocks_workflow_run_id, ctx.last_successful_run_blocks_workflow_run_id):
-        if isinstance(value, str) and value:
-            return None
-    return {
-        "ok": False,
-        "error": (
-            "CODE-ONLY EXPLORATION PHASE: get_run_results is unavailable before a real workflow run exists. "
-            "Use MCP browser tools such as navigate_browser, evaluate, click, type_text, get_browser_screenshot, "
-            "console_messages, scroll, select_option, or press_key to understand the page, then call "
-            "update_and_run_blocks with real focused code blocks."
-        ),
-    }
-
-
 async def _evaluate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -695,14 +895,14 @@ async def _evaluate_pre_hook(
 
 async def _screenshot_pre_hook(_params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
     if ctx.codeblock_redaction_parameters:
-        return {"ok": False, "error": "Screenshots are unavailable during runtime self-heal."}
+        return {"ok": False, "error": "Screenshots are unavailable during the code block AI fallback."}
     return _sensitive_origin_page_refusal(ctx)
 
 
 async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
     intent = params.get("intent")
     if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
-        return {"ok": False, "error": "AI-assisted scrolling is unavailable during runtime self-heal."}
+        return {"ok": False, "error": "AI-assisted scrolling is unavailable during the code block AI fallback."}
     return _sensitive_origin_page_action_refusal(ctx)
 
 
@@ -720,6 +920,11 @@ def _code_only_has_target_page_evidence(data: object) -> bool:
     return False
 
 
+# Bounds the frames only visible_effect needs, well under the screenshot tool's own action deadline so
+# a slow capture is cancelled here rather than recorded as a browser-health strike.
+_VISIBLE_EFFECT_FRAME_TIMEOUT_SECONDS = 2.0
+
+
 async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -731,19 +936,31 @@ async def _click_pre_hook(
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
+    ctx.pending_scout_challenge_frames = []
+    ctx.pending_scout_challenge_prior_frames = []
+    ctx.pending_scout_challenge_armed_at = None
+    ctx.pending_scout_click_records = []
+    ctx.pending_scout_click_pre_frame = None
+    _release_scout_challenge_listeners(ctx)
     sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
     await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
-    if not selector:
-        return None
-    ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
-        await _arm_scout_download_listener(ctx)
-        await _arm_scout_popup_listener(ctx)
+    ctx.pending_scout_click_pre_frame = await _take_viewport_frame(
+        ctx, timeout_seconds=_VISIBLE_EFFECT_FRAME_TIMEOUT_SECONDS
+    )
+    # Armed before the selector check: an intent or coordinate click carries no selector going in but
+    # reports the element it resolved, and the challenge it raises is recorded against that.
+    await _arm_scout_challenge_listener(ctx)
+    if selector:
+        ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
+        if _copilot_authoring_capability(ctx).code_blocks:
+            ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
+            await _arm_scout_download_listener(ctx)
+            await _arm_scout_popup_listener(ctx)
+    await _close_scout_challenge_baseline(ctx)
     return None
 
 
@@ -863,6 +1080,26 @@ async def _navigate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _start_scout_challenge_settle(ctx)
+    try:
+        navigated = await _navigate_post_hook_body(result, raw, ctx)
+        # The adapter refuses an unavailable binding before dispatch, and a post-hook runs only after one.
+        page_state = await read_page_state(
+            ctx, tool_name="navigate_browser", result=navigated, binding=None, settle=True
+        )
+        return {"page_state": page_state, **navigated}
+    finally:
+        ctx.pending_scout_challenge_frames = []
+        ctx.pending_scout_challenge_prior_frames = []
+        ctx.pending_scout_challenge_armed_at = None
+        _release_scout_challenge_listeners(ctx)
+
+
+async def _navigate_post_hook_body(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     sensitive_origin_page_was_tainted = sensitive_origin_page_is_tainted(ctx)
     captured_source_url = _consume_scout_source_url(ctx)
@@ -870,8 +1107,21 @@ async def _navigate_post_hook(
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
+        # Raw against raw: `result["url"]` is already secret-scrubbed, so against the raw before-URL a
+        # fragment hop on a page whose URL holds a registered value would differ only by the redaction.
         if sensitive_origin_page_was_tainted:
-            clear_sensitive_origin_page_taint(ctx)
+            # The staged source outlives a hold: the sensitive document stays what the next navigation
+            # is judged against, or re-navigating to this page after closing the tabs never lifts.
+            taint_source_url = pending_taint_source_url(ctx)
+            live_url = await live_working_page_url(ctx)
+            if not await clear_sensitive_origin_page_taint_after_navigation(
+                ctx, source_url=taint_source_url, result_url=live_url
+            ):
+                # Still withheld, so not even the URL goes back; the code tool and the navigating
+                # inspection refuse the same way. Which hold it is decides what the model can do next.
+                if navigation_replaced_document(taint_source_url, live_url):
+                    return {"ok": False, "error": await sensitive_origin_multi_tab_error(ctx)}
+                return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         _record_scouted_interaction(
             ctx,
             tool_name="navigate_browser",
@@ -907,8 +1157,10 @@ async def _navigate_pre_hook(
         return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     if sensitive_origin_page_is_tainted(ctx):
         ctx.pending_scout_source_url = None
+        await stage_pending_taint_source(ctx)
         return None
     await _capture_scout_source_url(ctx)
+    await _arm_scout_challenge_listener(ctx)
     return None
 
 
@@ -967,11 +1219,29 @@ async def _click_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _start_scout_challenge_settle(ctx)
+    try:
+        return await _click_post_hook_body(result, raw, ctx)
+    finally:
+        ctx.pending_scout_challenge_frames = []
+        ctx.pending_scout_challenge_armed_at = None
+        _release_scout_challenge_listeners(ctx)
+
+
+async def _click_post_hook_body(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    pre_frame = ctx.pending_scout_click_pre_frame
+    ctx.pending_scout_click_pre_frame = None
     ctx.last_scout_act_observe_outcome = None
     ctx.last_scout_act_observe_packet = None
     page_evidence: dict[str, Any] | None = None
     captured_url: str | None = None
     observation_step: int | None = None
+    failed_with_selector = False
+    success_summary_evidence: dict[str, Any] | None = None
     _clear_pending_browser_interaction_observation(ctx)
     sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
@@ -1050,13 +1320,14 @@ async def _click_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         captured_url = url or None
-        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        if _copilot_authoring_capability(ctx).code_blocks:
             # A download this click produced is proof the affordance works, so it outranks the
             # href-shape prediction — and is the only source that sees a command-URL download.
             await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
+        await _maybe_attach_observed_challenge(ctx, result, url=url)
         if page_evidence is not None:
-            _attach_scout_page_summary(ctx, result, page_evidence)
+            success_summary_evidence = page_evidence
         elif ctx.last_scout_act_observe_outcome == "unchanged":
             result["data"]["page_observation"] = {
                 "status": "unchanged",
@@ -1103,15 +1374,41 @@ async def _click_post_hook(
             page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
             if page_evidence is not None:
                 _attach_scout_page_summary(ctx, result, page_evidence)
+        # A handler can mount a challenge and then stall the navigation the click was waiting on.
+        await _maybe_attach_observed_challenge(ctx, result, url=url)
+        failed_with_selector = True
+    else:
+        await _maybe_attach_observed_challenge(ctx, result, url=source_url or "")
+    stage_frame = ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(
+        page_evidence
+    )
+    post_frame = None
+    if pre_frame is not None:
+        post_frame = await _take_viewport_frame(
+            ctx,
+            timeout_seconds=(
+                _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+                if stage_frame and ctx.supports_vision
+                else _VISIBLE_EFFECT_FRAME_TIMEOUT_SECONDS
+            ),
+        )
+    if not isinstance(result.get("data"), dict):
+        result["data"] = {}
+    result["data"]["visible_effect"] = viewport_visible_effect(pre_frame, post_frame)
+    # Both size bounds shed against the whole result, so they run after the last key is written.
+    if success_summary_evidence is not None:
+        _attach_scout_page_summary(ctx, result, success_summary_evidence)
+    if failed_with_selector:
         _bound_failed_click_result(ctx, result)
-    # The round-trip is skipped only when the evidence positively names the obstruction a frame
-    # would have shown; evidence that merely parsed is not a substitute for looking at the page.
-    if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
+    # No frame is staged when the post frame just failed, since a retry would wait out the same stall, or
+    # when the evidence positively names the obstruction a frame would show (merely parsed evidence is not).
+    if stage_frame and not (pre_frame is not None and post_frame is None):
         await _capture_post_interaction_screenshot(
             ctx,
             source_tool="click",
             captured_url=captured_url or source_url,
             observation_step=observation_step,
+            frame=post_frame,
         )
     return result
 
@@ -1605,9 +1902,7 @@ async def _evaluate_post_hook(
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested
         LOG.info("copilot_requested_output_unread_after_read", unread_count=len(unread_requested))
-    if _copilot_block_authoring_policy(
-        ctx
-    ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
+    if _copilot_authoring_capability(ctx).code_blocks and _code_only_has_target_page_evidence(data):
         ctx.code_only_target_page_evidence_seen = True
     await _attach_evaluate_page_facts(ctx, result, url=url)
     if data.get("claimed_output_without_a_single_value"):
@@ -1834,6 +2129,8 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "get_workflow_knowledge": "skyvern_workflow_knowledge",
         "get_block_schema": "skyvern_block_schema",
         "validate_block": "skyvern_block_validate",
+        "list_org_workflows": "skyvern_workflow_list",
+        "get_org_workflow": "skyvern_workflow_get",
         "navigate_browser": "skyvern_navigate",
         "get_browser_screenshot": "skyvern_screenshot",
         "evaluate": "skyvern_evaluate",
@@ -1844,13 +2141,217 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
         "wait_for_either_state": "skyvern_wait_for_either_state",
-        # These frame controls already use their user-facing MCP names.
+        # These frame and tab controls already use their user-facing MCP names.
         "skyvern_frame_list": "skyvern_frame_list",
         "skyvern_frame_switch": "skyvern_frame_switch",
         "skyvern_frame_main": "skyvern_frame_main",
+        "skyvern_tab_list": "skyvern_tab_list",
+        "skyvern_tab_new": "skyvern_tab_new",
+        "skyvern_tab_switch": "skyvern_tab_switch",
+        "skyvern_tab_close": "skyvern_tab_close",
+        "list_workflow_schedules": "skyvern_schedule_list_for_workflow",
+        "get_workflow_schedule": "skyvern_schedule_get",
+        "create_workflow_schedule": "skyvern_schedule_create",
+        "update_workflow_schedule": "skyvern_schedule_update",
+        "enable_workflow_schedule": "skyvern_schedule_enable",
+        "disable_workflow_schedule": "skyvern_schedule_disable",
+        "cancel_workflow_schedule": "skyvern_schedule_cancel",
+        "delete_workflow_schedule": "skyvern_schedule_delete",
+        "list_browser_profiles": "skyvern_browser_profile_list",
+        "get_browser_profile": "skyvern_browser_profile_get",
+        "create_browser_profile": "skyvern_browser_profile_create",
+        "list_workflow_runs": "skyvern_workflow_run_list",
     }
 
 
+_PENDING_PROPOSAL_SCHEDULE_ERROR = (
+    "No schedule was created: this chat has a workflow proposal that is not saved yet, and a schedule "
+    "runs the saved workflow. Ask the user to accept the proposal, which saves it, or to reject it to "
+    "schedule the saved version as it is; then create the schedule."
+)
+# The shared tools' hints name tools that are not on Copilot's surface.
+_SCHEDULE_HINT_REWRITES = (
+    ("Use skyvern_schedule_list to", "Use list_workflow_schedules to"),
+    (
+        "Use skyvern_workflow_list to find valid workflow IDs.",
+        "The workflow open in this chat was not found in this organization.",
+    ),
+    (
+        "Verify the workflow ID with skyvern_workflow_list",
+        "The workflow open in this chat was not found in this organization.",
+    ),
+    (", or set exact=true to do a full replace", ""),
+)
+
+
+async def _schedule_parameters_credential_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    # A schedule dispatches unattended runs of the saved definition, so it needs the same approval as a run now.
+    parameters = params.get("parameters")
+    schedule_id = params.get("workflow_schedule_id")
+    has_masked_values = isinstance(parameters, dict) and SECRET_HEADER_MASK in parameters.values()
+    if parameters is None or has_masked_values:
+        schedule = (
+            await app.DATABASE.schedules.get_workflow_schedule_by_id(
+                workflow_schedule_id=schedule_id, organization_id=ctx.organization_id
+            )
+            if isinstance(schedule_id, str)
+            else None
+        )
+        stored = (schedule.parameters if schedule is not None else None) or {}
+        if parameters is None:
+            parameters = stored
+        else:
+            # Read results mask every value, so a masked value sent back means "keep the stored one".
+            parameters = {
+                key: stored[key] if value == SECRET_HEADER_MASK else value
+                for key, value in parameters.items()
+                if value != SECRET_HEADER_MASK or key in stored
+            }
+            params["parameters"] = parameters
+    credential_ids = _extract_credential_ids_from_tool_value(parameters or {})
+    google_reference_ids: list[str] = []
+    workflow = (
+        await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
+        )
+        if ctx.workflow_permanent_id
+        else None
+    )
+    if workflow is not None:
+        credential_ids = list(
+            dict.fromkeys(
+                credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
+            )
+        )
+        # ponytail: no same-turn Sheets listing admission like the run path; schedule turns rarely list sheets.
+        google_reference_ids = _google_connection_reference_ids(workflow.workflow_definition, None)
+    google_approval_blocker = _credential_run_approval_blocker_signal(
+        credential_ids,
+        ctx.request_policy,
+        google_reference_ids=google_reference_ids,
+        action="schedule the workflow",
+        blocked_tool="workflow_schedule",
+    )
+    if google_approval_blocker is not None:
+        ctx.connected_account_recovery_choices = (
+            await _server_verified_google_account_choices(ctx.organization_id) or []
+        )
+        tool_error = stash_blocker_signal(ctx, google_approval_blocker)
+        return {"ok": False, "error": tool_error}
+    credential_approval_error = _credential_run_approval_error(credential_ids, ctx.request_policy)
+    if credential_approval_error is not None:
+        return {"ok": False, "error": credential_approval_error}
+    return None
+
+
+async def _chat_has_pending_proposal(ctx: AgentContext) -> bool:
+    if ctx.has_staged_proposal:
+        return True
+    # The chat row, not the turn's restore outcome: a restore can decline a proposal that stays pending.
+    chat_id = ctx.workflow_copilot_chat_id if isinstance(ctx, CopilotContext) else None
+    if not chat_id:
+        return False
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=chat_id,
+    )
+    return chat is not None and isinstance(chat.proposed_workflow, dict)
+
+
+async def _create_workflow_schedule_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    if await _chat_has_pending_proposal(ctx):
+        return {"ok": False, "error": _PENDING_PROPOSAL_SCHEDULE_ERROR}
+    return await _schedule_parameters_credential_pre_hook(params, ctx)
+
+
+async def _workflow_schedule_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    error = result.get("error")
+    if isinstance(error, str):
+        for raw_hint, copilot_hint in _SCHEDULE_HINT_REWRITES:
+            error = error.replace(raw_hint, copilot_hint)
+        result["error"] = error
+    _mask_schedule_parameter_values(result.get("data"))
+    return result
+
+
+def _mask_schedule_parameter_values(value: object) -> None:
+    # Stored inputs can hold secrets this chat never saw, and the scrubber only knows values it has seen.
+    if isinstance(value, dict):
+        if "workflow_schedule_id" in value and isinstance(value.get("parameters"), dict):
+            value["parameters"] = dict.fromkeys(value["parameters"], SECRET_HEADER_MASK)
+        for item in value.values():
+            _mask_schedule_parameter_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            _mask_schedule_parameter_values(item)
+
+
+_RUN_LIST_FIELDS = ("run_id", "status", "created_at", "trigger_type", "parent_run_id")
+
+
+async def _workflow_run_list_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    result = await _workflow_schedule_post_hook(result, raw, ctx)
+    data = result.get("data")
+    if isinstance(data, dict) and isinstance(data.get("runs"), list):
+        # A past run's outputs and failure reason can hold secrets this chat never saw, and the scrubber
+        # only knows values it has seen, so a bulk listing leaves them out.
+        data["runs"] = [
+            {key: run[key] for key in _RUN_LIST_FIELDS if key in run} for run in data["runs"] if isinstance(run, dict)
+        ]
+    return result
+
+
+def _workflow_schedule_overlay(
+    description: str,
+    *,
+    hide_params: frozenset[str] = frozenset(),
+    pre_hook: PreHook | None = None,
+    mutates: bool = True,
+) -> SchemaOverlay:
+    return SchemaOverlay(
+        description=description,
+        hide_params=hide_params | {"workflow_permanent_id"},
+        binds_chat_workflow=True,
+        requires_run_authority=mutates,
+        pre_hook=pre_hook,
+        post_hook=_workflow_schedule_post_hook,
+        post_hook_fails_closed=True,
+    )
+
+
+_CREATE_BROWSER_PROFILE_DESCRIPTION = (
+    "Save a new browser profile from a finished browser's cookies and storage, so later runs of a workflow "
+    "that selects it start with that state. The name must come from the user; if the user gave none, ask. "
+    "Names are unique in the organization, so list profiles with that name as search_key before creating. "
+    "Pass exactly one source. browser_session_id: a session started with generate_browser_profile that has "
+    "since closed; the profile holds that session's exact final state. workflow_run_id: a saved run of a "
+    "workflow that persists its browser session; the profile copies that workflow's latest saved browser "
+    "state at call time, not a snapshot of that run, so a later run of the workflow changes what is copied. "
+    "Say which source you used. "
+    "A 400 or 404 error means the source cannot be used: relay the service's reason. Closing a session is "
+    "the user's action; the user can also start a new capture with Create a Browser Profile on the Profiles "
+    "page under Browsers. A 409 means a profile with that name already exists and nothing was overwritten; "
+    "renaming or deleting it is the user's action. "
+    "After any failed create, list profiles with that name and report the error together with any profile "
+    "found (bp_ ID, created_at); say the profile was saved only when the create returned ok. "
+    "Creating a profile does not select it. Set the workflow's browser_profile_id only when the user asked, "
+    "and never to a profile found after a failed create unless the user confirms it. "
+    "In your reply give the bp_ ID and the name."
+)
 _EVALUATE_BASE_DESCRIPTION = (
     "Execute JavaScript in the browser and return the result. Use it to inspect DOM state and read "
     "values. JavaScript run here can also change the page, but only click, type_text, select_option "
@@ -1879,52 +2380,69 @@ _EVALUATE_SCOUT_ACT_DESCRIPTION = (
 )
 
 
-# The evaluate tool bounds its own dispatch at the engine's action deadline and reports a factual
-# TIMEOUT; an equal ceiling here would cancel first and return the generic unknown-effect error
-# instead. Same headroom the navigate path uses.
-_EVALUATE_OVERLAY_TIMEOUT_SECONDS = DEFAULT_ACTION_TIMEOUT_MS // 1000 + 5
+_EVALUATE_OVERLAY_TIMEOUT_SECONDS = outer_cap_seconds(DEFAULT_ACTION_TIMEOUT_MS)
+
+
+def _normalized_authoring_capability(
+    capability: AuthoringCapability | BlockAuthoringPolicy | str | None,
+) -> AuthoringCapability:
+    if isinstance(capability, AuthoringCapability):
+        return capability
+    return authoring_capability_from_policy(capability)
 
 
 def _evaluate_overlay_description(
-    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+    capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
 ) -> str:
-    if download_scout_act_required_for_policy(block_authoring_policy):
+    if _normalized_authoring_capability(capability).code_blocks:
         return _EVALUATE_SCOUT_ACT_DESCRIPTION
     return _EVALUATE_BASE_DESCRIPTION
 
 
 def _block_schema_banned_types_note(
-    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+    capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
 ) -> str:
-    """Name the rejected types from the same constant the schema pre-hook rejects on. The set is
-    policy-dependent, which a static prompt line cannot track."""
-    banned = (
-        _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
-        if normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-        else (
-            _TASK_V3_PURE_BANNED_BLOCK_TYPES
-            if normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.TASK_V3_PURE
-            else _COPILOT_BANNED_BLOCK_TYPES
-        )
-    )
-    return f"Unavailable under the active policy and rejected on request: {', '.join(sorted(banned))}."
+    """Name the rejected types from the same table the schema pre-hook rejects on. The set depends on
+    the turn's authoring capability, which a static prompt line cannot track."""
+    banned = _banned_block_types_for_capability(_normalized_authoring_capability(capability))
+    return f"Unavailable for this turn and rejected on request: {', '.join(sorted(banned))}."
 
 
 def _build_skyvern_mcp_overlays(
-    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+    capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
 ) -> dict[str, SchemaOverlay]:
-    return {
+    overlays = {
         "get_workflow_knowledge": SchemaOverlay(
             description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
-            description_suffix=_block_schema_banned_types_note(block_authoring_policy),
+            description_suffix=_block_schema_banned_types_note(capability),
             post_hook=_get_workflow_knowledge_post_hook,
         ),
         "get_block_schema": SchemaOverlay(
-            description_suffix=_block_schema_banned_types_note(block_authoring_policy),
+            description_suffix=_block_schema_banned_types_note(capability),
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),
         "validate_block": SchemaOverlay(pre_hook=_validate_block_pre_hook),
+        "list_org_workflows": SchemaOverlay(
+            description=(
+                "Search this organization's saved workflows by title, folder, or parameter name. Reach for it "
+                "when the user refers to one of their existing workflows ('like my X workflow', 'the one I "
+                "built for Y'), or before building for a site the org may already automate, so the new build "
+                "reuses the org's proven parameters, TOTP wiring and loop style. Each match carries "
+                "workflow_permanent_id (wpid_...), workflow_id, title, version, status and description. Pass "
+                "the workflow_permanent_id -- not workflow_id -- to get_org_workflow for the full definition."
+            ),
+            hide_params=frozenset({"query"}),
+        ),
+        "get_org_workflow": SchemaOverlay(
+            description=(
+                "Read one saved workflow's full definition. workflow_id must be the wpid_... value that "
+                "list_org_workflows returns as workflow_permanent_id; pass version=<n> for an earlier saved "
+                "version. Use it to copy an existing workflow's structure into a new build, or to answer "
+                "questions about a previous saved version of the workflow open in this chat (version=<n-1>). "
+                "Read-only; it does not change the current draft."
+            ),
+        ),
         "navigate_browser": SchemaOverlay(
             description=(
                 "Navigate the debug browser to a URL. "
@@ -1950,7 +2468,7 @@ def _build_skyvern_mcp_overlays(
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
-            description=_evaluate_overlay_description(block_authoring_policy),
+            description=_evaluate_overlay_description(capability),
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={
                 "output_path": {
@@ -1976,16 +2494,13 @@ def _build_skyvern_mcp_overlays(
         "click": SchemaOverlay(
             description=(
                 "Click an element in the browser by CSS selector. The click is instant and "
-                "deterministic. Derive the selector from page evidence — the selectors reported "
-                "by page inspection are verified to match exactly one element. When a shared "
+                "deterministic. Derive the selector from page evidence. When a shared "
                 "class matches many elements (e.g. one button per result row), scope the "
-                "selector to the specific item (its container, a unique attribute, or "
-                ":nth-of-type). If a selector does not resolve, inspect the page again and "
-                "derive a better one. "
+                "selector to the specific item (its container or a unique attribute). If a "
+                "selector does not resolve, inspect the page again and derive a better one. "
                 "IMPORTANT: jQuery pseudo-selectors like :contains(), :eq(), :first, "
                 ":visible are NOT valid CSS. Use standard selectors: "
-                "'button.download', 'a[href*=\"pdf\"]', '#submit-btn', "
-                "'table tr:nth-of-type(2) td a'."
+                "'button.download', 'a[href*=\"pdf\"]', '#submit-btn'."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "button", "click_count", "intent"}),
             forced_args={"selector_mode": "direct"},
@@ -2100,4 +2615,131 @@ def _build_skyvern_mcp_overlays(
             pre_hook=_sensitive_origin_page_pre_hook,
             post_hook=_sensitive_origin_page_post_hook,
         ),
+        "skyvern_tab_list": SchemaOverlay(
+            description=(
+                "List the open browser tabs: each entry carries tab_id, index, url, title and is_active, "
+                "and the result names active_tab_id. Listing changes nothing."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_tab_new": SchemaOverlay(
+            description=(
+                "Open a new browser tab, navigating it to url when one is given, and make it the active tab; "
+                "the result carries the new tab's tab_id, url and title. Other tabs stay open. The browser "
+                f"holds at most {settings.BROWSER_MAX_PAGES_NUMBER} tabs; at that count the call fails and says so."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_tab_new_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_tab_switch": SchemaOverlay(
+            description=(
+                "Make the tab named by tab_id (from skyvern_tab_list) or index the active tab that the other "
+                "browser tools act on; the result reports the tab that is now active."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_tab_switch_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        # Only an active sensitive run refuses: the result carries no page fact, and closing tabs is
+        # how a withheld multi-tab browser gets back to the one tab a fresh navigation can clear.
+        "skyvern_tab_close": SchemaOverlay(
+            description=(
+                "Close one browser tab, the one named by tab_id (from skyvern_tab_list) or index, or the active "
+                "tab when neither is given; the result carries closed_tab_id and remaining_tabs, and "
+                "skyvern_tab_list reports which tab is active afterwards."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_tab_close_pre_hook,
+        ),
+        "list_workflow_runs": SchemaOverlay(
+            description=(
+                "List the saved runs of the workflow open in this chat, newest first. Copilot chat runs are "
+                "left out, and so are child runs unless include_child_runs=true. Filter by status, e.g. "
+                'status=["terminated"]. Each run carries run_id, status, created_at and trigger_type. Read '
+                "one run's blocks and failure with get_run_results(workflow_run_id=<run_id>)."
+            ),
+            # search_key and error_code match stored run values, so matching run IDs would confirm guessed secrets.
+            hide_params=frozenset({"workflow_id", "search_key", "error_code"}),
+            binds_chat_workflow=True,
+            binds_chat_workflow_param="workflow_id",
+            post_hook=_workflow_run_list_post_hook,
+            post_hook_fails_closed=True,
+        ),
+        "list_workflow_schedules": _workflow_schedule_overlay(
+            "List the schedules of the workflow open in this chat, with each wfs_ ID. Check it before creating "
+            "or changing a schedule, and again afterwards to confirm.",
+            mutates=False,
+        ),
+        "get_workflow_schedule": _workflow_schedule_overlay(
+            "Read one schedule of the workflow open in this chat by wfs_ ID, with its next run times.",
+            mutates=False,
+        ),
+        "create_workflow_schedule": _workflow_schedule_overlay(
+            "Schedule the saved workflow open in this chat. Cadence and IANA timezone must come from the user; "
+            "if either is missing, ask rather than assume UTC or local time. Leave name unset unless the user "
+            "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression, interval_seconds, "
+            "which runs a fixed elapsed interval counted from first_fire_at (cron cannot express an elapsed interval "
+            "such as 'every 36 hours'), or run_at to run once at the user's instant, given as ISO 8601 with the "
+            "user's UTC offset. In your reply, give the saved wfs_ ID, timezone, enabled state and next run from the "
+            "result, and for a one-time schedule its run_at and dispatch_status.",
+            pre_hook=_create_workflow_schedule_pre_hook,
+        ),
+        "update_workflow_schedule": _workflow_schedule_overlay(
+            "Change a schedule by wfs_ ID, passing only the fields that change; parameters, name and paused "
+            "state are kept. Send name or clear_name only when the user asks to rename it, even if the name "
+            "mentions the old time. Parameter values read back as ***; send *** for a key to keep its stored "
+            "value. A one-time schedule keeps run_at as its cadence and can change only until it fires. Ask which "
+            "one when several could match.",
+            hide_params=frozenset({"exact"}),
+            pre_hook=_schedule_parameters_credential_pre_hook,
+        ),
+        "enable_workflow_schedule": _workflow_schedule_overlay(
+            "Resume a paused schedule by wfs_ ID. Ask which one when several could match.",
+            pre_hook=_schedule_parameters_credential_pre_hook,
+        ),
+        "disable_workflow_schedule": _workflow_schedule_overlay(
+            "Pause a schedule by wfs_ ID without deleting it. Ask which one when several could match."
+        ),
+        "cancel_workflow_schedule": _workflow_schedule_overlay(
+            "Cancel a one-time schedule by wfs_ ID before it fires; it stays listed with dispatch_status canceled. "
+            "Pause or delete a recurring schedule instead. Ask which one when several could match."
+        ),
+        "delete_workflow_schedule": _workflow_schedule_overlay(
+            "Delete a schedule by wfs_ ID; irreversible. Pass force=true only when the user clearly asked to "
+            "remove that schedule, then list schedules to confirm it is gone."
+        ),
+        "list_browser_profiles": SchemaOverlay(
+            description=(
+                "List this organization's saved browser profiles, each with its bp_ ID, name and created_at. "
+                "search_key matches a substring of the name or description. Profile names are unique in the "
+                "organization. Listing changes nothing."
+            ),
+        ),
+        "get_browser_profile": SchemaOverlay(
+            description="Read one saved browser profile by bp_ ID: its name, description and timestamps.",
+        ),
+        "create_browser_profile": SchemaOverlay(
+            description=_CREATE_BROWSER_PROFILE_DESCRIPTION,
+            requires_run_authority=True,
+        ),
     }
+
+    for name in get_skyvern_mcp_alias_map():
+        overlays.setdefault(name, SchemaOverlay())
+    for overlay in overlays.values():
+        overlay.copilot_params = {
+            **overlay.copilot_params,
+            USER_FACING_REASON_PARAM: dict(USER_FACING_REASON_SCHEMA),
+        }
+    return overlays

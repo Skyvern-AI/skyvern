@@ -11,11 +11,13 @@ import structlog
 import yaml
 
 try:
-    from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+    from bs4 import BeautifulSoup, NavigableString  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection degrades gracefully.
     BeautifulSoup = None  # type: ignore[assignment, misc]
+    NavigableString = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurfaceIdentity
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
@@ -1339,10 +1341,15 @@ def composition_page_evidence_error(
                 block_observation_refs=block_observation_refs,
             )
             if string_step is not None:
+                observation_source = (
+                    "inspect_page_for_composition"
+                    if ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE
+                    else "inspect_page_for_composition or evaluate"
+                )
                 return (
                     f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block_observation_refs entry uses observation_step "
                     f"{string_step!r} as a string. Pass the integer observation_step returned by "
-                    "inspect_page_for_composition or evaluate for click-reached blocks. "
+                    f"{observation_source} for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             if _required_observation_ref_missing(block, block_observation_refs):
@@ -1370,13 +1377,20 @@ def composition_page_evidence_error(
                 return (
                     f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{missing_step}, but {missing_reason}. "
-                    "Inspect or evaluate the reached page again and pass the new observation_step in "
+                    "Inspect the reached page again and pass the new observation_step in "
                     "block_observation_refs before composing page-dependent blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
+            if ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE:
+                inspect_hint = (
+                    f"Open {target_url!r} from browser code if the browser is not already there, then call "
+                    "inspect_page_for_composition"
+                )
+            else:
+                inspect_hint = f"Call inspect_page_for_composition(target_url={target_url!r})"
             return (
                 f"{INTERNAL_VALIDATION_FAILURE_PREFIX}page-dependent build blocks need observed page evidence before they are "
-                f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
+                f"authored. {inspect_hint} before composing page-dependent "
                 "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
                 f"Offending blocks: {_format_page_block_findings([block])}"
             )
@@ -2012,55 +2026,61 @@ def _clickable_controls_html(
     controls: list[dict[str, Any]] = []
     seen_selectors = set(used_selectors)
     seen_text: set[str] = set()
+    seen_textless_selectors: set[str] = set()
 
     def factual_entry(node: Any, entry: dict[str, Any]) -> dict[str, Any]:
         return _attach_node_evidence(entry, _element_address_evidence(node))
+
+    def collect(node: Any) -> None:
+        tag_name = str(node.name or "").lower()
+        if tag_name in {"script", "style", "noscript"}:
+            return
+        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
+            return
+        text = _schema_text(_clickable_control_text(node), 120)
+        selector = _clickable_control_selector(node)
+        state = {
+            **({"disabled": True} if _control_disabled(node) else {}),
+            **_html_disclosure_facts(node, controlled_region_visibility),
+        }
+        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
+            controls.append(
+                factual_entry(node, {"text": text, "selector": _bounded_selector(selector), "tag": tag_name, **state})
+            )
+            seen_selectors.add(selector)
+            if text:
+                seen_text.add(text)
+            return
+        if not text:
+            if not selector or selector in seen_textless_selectors:
+                return
+            controls.append(factual_entry(node, {"text": "", "tag": tag_name, **state}))
+            seen_textless_selectors.add(selector)
+            return
+        if text in seen_text:
+            return
+        controls.append(factual_entry(node, {"text": text, "tag": tag_name, **state}))
+        seen_text.add(text)
 
     try:
         candidates = soup.select('button, [role="button"], [data-action]')
     except Exception:
         candidates = soup.find_all("button")
+    role_matched = {id(node) for node in candidates}
     for node in candidates:
         if len(controls) >= _MAX_CLICKABLE_CONTROLS:
             break
-        tag_name = str(node.name or "").lower()
-        if tag_name in {"script", "style", "noscript"}:
+        collect(node)
+    try:
+        focusable = soup.select('[tabindex]:not([tabindex^="-"])')
+    except Exception:
+        focusable = []
+    for node in focusable:
+        if len(controls) >= _MAX_CLICKABLE_CONTROLS:
+            break
+        if id(node) in role_matched or _schema_text(_clickable_control_text(node), 120):
             continue
-        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
-            continue
-        text = _schema_text(_clickable_control_text(node), 120)
-        selector = _clickable_control_selector(node)
-        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
-            controls.append(
-                factual_entry(
-                    node,
-                    {
-                        "text": text,
-                        "selector": _bounded_selector(selector),
-                        "tag": tag_name,
-                        **({"disabled": True} if _control_disabled(node) else {}),
-                        **_html_disclosure_facts(node, controlled_region_visibility),
-                    },
-                )
-            )
-            seen_selectors.add(selector)
-            if text:
-                seen_text.add(text)
-            continue
-        if not text or text in seen_text:
-            continue
-        controls.append(
-            factual_entry(
-                node,
-                {
-                    "text": text,
-                    "tag": tag_name,
-                    **({"disabled": True} if _control_disabled(node) else {}),
-                    **_html_disclosure_facts(node, controlled_region_visibility),
-                },
-            )
-        )
-        seen_text.add(text)
+        collect(node)
     return controls
 
 
@@ -2224,6 +2244,7 @@ def _append_metric_card_relations(
         leaves: list[tuple[int, str]] = []
         # Where each leaf sits when it is a grandchild: the child holding it, and its index within.
         leaf_anchors: dict[tuple[int, str], tuple[Any, int, int]] = {}
+        leaf_nodes: dict[tuple[int, str], Any] = {}
         nested_ok = True
         for index, child in enumerate(children):
             grandchildren = [grand for grand in child.find_all(recursive=False) if grand.name]
@@ -2231,6 +2252,7 @@ def _append_metric_card_relations(
                 text = _schema_text(_node_text(child), 240)
                 if text:
                     leaves.append((index, text))
+                    leaf_nodes.setdefault((index, text), child)
                 continue
             if any(not _reads_as_one_leaf(grand) for grand in grandchildren):
                 nested_ok = False
@@ -2240,6 +2262,7 @@ def _append_metric_card_relations(
                 if text:
                     leaves.append((index, text))
                     leaf_anchors.setdefault((index, text), (child, grand_index, len(grandchildren)))
+                    leaf_nodes.setdefault((index, text), grand)
         if not nested_ok or not leaves or len(leaves) > 8:
             continue
         magnitudes = [(index, text) for index, text in leaves if _BARE_MAGNITUDE_RE.fullmatch(text)]
@@ -2286,6 +2309,9 @@ def _append_metric_card_relations(
             {
                 "key_text": headings[0][:120],
                 "value_text": value_text,
+                "selector_candidates": _relation_selector_candidates(
+                    value_carrier, headings[0][:120], leaf_nodes.get(heading_leaves[0])
+                ),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2316,6 +2342,96 @@ def _within(node: Any, ancestor: Any) -> bool:
             return True
         current = getattr(current, "parent", None)
     return False
+
+
+_TEXT_ANCHOR_MAX_HOPS = 4
+_TEXT_ANCHOR_MAX_LABEL_CHARS = 60
+_HIDDEN_TEXT_KEY = "_skyvern_hidden_text"
+
+
+def _shape_selector(node: Any) -> str:
+    return str(node.name or "*").lower() + _class_selector(_classes_for(node))
+
+
+def _own_text_runs(node: Any) -> list[str]:
+    """Mirror of ``ownTextRuns``: the runs of an element's own text nodes that Playwright's :text-is() compares."""
+    runs: list[str] = []
+    run = ""
+    for child in node.children:
+        if type(child) is NavigableString:
+            run += str(child)
+            continue
+        if run:
+            runs.append(run)
+        run = ""
+    if run:
+        runs.append(run)
+    return [" ".join(text.replace("​", "").split()) for text in runs]
+
+
+def _label_anchor_candidate(carrier: Any, label_node: Any, label: str) -> ScoutedSelectorCandidate | None:
+    """Mirror of the page-side relation key anchor, verified with the semantics Playwright runs it with."""
+    if not _label_like(label) or len(label) > _TEXT_ANCHOR_MAX_LABEL_CHARS:
+        return None
+    root = carrier
+    while root.parent is not None:
+        root = root.parent
+    folded = label.lower()
+    # Playwright's text engines also match hidden elements, which this parse has already removed.
+    if folded in str(vars(root).get(_HIDDEN_TEXT_KEY, "")).lower():
+        return None
+    base = _shape_selector(carrier)
+    containing = [
+        node for node in _selector_matches(carrier, base) or [] if folded in " ".join(node.get_text().split()).lower()
+    ]
+    has_text = f'{base}:has-text("{_css_attr(label)}")'
+    if len(containing) == 1 and containing[0] is carrier and len(has_text) <= _MAX_SELECTOR_CHARS:
+        return {"selector": has_text, "source": "text_anchor", "match_count": 1}
+    if label_node is None or label_node is carrier or _value_like(label) or label not in _own_text_runs(label_node):
+        return None
+    anchor = carrier
+    for _hop in range(_TEXT_ANCHOR_MAX_HOPS + 1):
+        if _within(label_node, anchor):
+            break
+        parent = anchor.parent
+        if parent is None or str(parent.name or "") in {"", "body", "html", "[document]"}:
+            return None
+        anchor = parent
+    else:
+        return None
+    base = _shape_selector(anchor)
+    label_shape = _shape_selector(label_node)
+    inner = "" if anchor is carrier else _shape_selector(carrier)
+    selector = f'{base}:has({label_shape}:text-is("{_css_attr(label)}"))' + (f" {inner}" if inner else "")
+    if len(selector) > _MAX_SELECTOR_CHARS:
+        return None
+    base_ids = {id(node) for node in _selector_matches(carrier, base) or []}
+    anchor_ids = {
+        id(parent)
+        for node in _selector_matches(carrier, label_shape) or []
+        if label in _own_text_runs(node)
+        for parent in node.parents
+        if id(parent) in base_ids
+    }
+    if inner:
+        matched = [
+            node
+            for node in _selector_matches(carrier, inner) or []
+            if any(id(parent) in anchor_ids for parent in node.parents)
+        ]
+    else:
+        matched = [node for node in _selector_matches(carrier, base) or [] if id(node) in anchor_ids]
+    if len(matched) != 1 or matched[0] is not carrier:
+        return None
+    return {"selector": selector, "source": "text_anchor", "match_count": 1}
+
+
+def _relation_selector_candidates(carrier: Any, key_text: str, label_node: Any) -> list[ScoutedSelectorCandidate]:
+    candidates = _carried_selector_candidates(carrier)
+    keyed = _label_anchor_candidate(carrier, label_node, key_text.strip()) if key_text.strip() else None
+    if keyed is not None and all(candidate["selector"] != keyed["selector"] for candidate in candidates):
+        candidates.append(keyed)
+    return candidates
 
 
 def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str, Any], Any] | None:
@@ -2364,6 +2480,7 @@ def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str,
             return (
                 {
                     "key_text": label_text,
+                    "selector_candidates": _relation_selector_candidates(carrier, label_text, label_node),
                     "label_selector": label_selector,
                     "value_text": _schema_text(_node_text(value_leaf), 240),
                     "container_selector": selector,
@@ -2470,6 +2587,7 @@ def _key_value_relations(soup: Any, requested_targets: tuple[str, ...] = ()) -> 
             {
                 "key_text": key_text,
                 "value_text": value_text,
+                "selector_candidates": _relation_selector_candidates(node, key_text, children[0]),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2596,6 +2714,9 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]], c
                 {
                     "key_text": key_text if index == designated_index else "",
                     "value_text": value_text,
+                    "selector_candidates": _relation_selector_candidates(
+                        node, key_text if index == designated_index else "", heading
+                    ),
                     "container_selector": selector,
                     "container_match_count": match_count,
                     "container_position": position,
@@ -3213,11 +3334,14 @@ def parse_composition_html(
 
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
+    hidden_texts: list[str] = []
     for node in soup.find_all(True):
         if node.decomposed:
             continue
         if _is_css_hidden_node(node):
+            hidden_texts.append(node.get_text(" "))
             node.decompose()
+    vars(soup)[_HIDDEN_TEXT_KEY] = " ".join(" ".join(hidden_texts).split())
     # Challenge capture runs against the original document, while the remaining channels report
     # the cleaned visible DOM. Do not reuse selector matches that still contain decomposed nodes.
     vars(soup).pop("_skyvern_selector_match_cache", None)
@@ -3849,8 +3973,9 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
             entry["disabled"] = True
         if isinstance(item.get("visible"), bool):
             entry["visible"] = item["visible"]
-        if entry.get("selector") or entry.get("text"):
-            controls.append(_attach_structured_disclosure_facts(_attach_node_evidence(entry, item), item))
+        entry = _attach_node_evidence(entry, item)
+        if entry.get("selector") or entry.get("text") or entry.get("selector_candidates"):
+            controls.append(_attach_structured_disclosure_facts(entry, item))
     return controls
 
 

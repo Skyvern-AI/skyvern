@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.util import find_spec
-from typing import NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
+
+if TYPE_CHECKING:
+    from skyvern.errors.errors import UserDefinedError
 
 # Representative modules that indicate the local extra is installed enough for
 # embedded/browser import graphs. Keep this list intentionally small, but include
@@ -73,6 +76,10 @@ class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
 
 
+class ActionDeadlineExceeded(SkyvernPageAnalysisTimeout):
+    """A driver call synthesized as timed out by its caller, as opposed to one the page analyzer raised."""
+
+
 class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
         self.feature = feature
@@ -132,6 +139,23 @@ class SkyvernHTTPException(SkyvernException):
     def __init__(self, message: str | None = None, status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST):
         self.status_code = int(status_code)
         super().__init__(message)
+
+
+class WorkflowPinnedByRunGroup(SkyvernHTTPException):
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"Workflow version {workflow_id} is running as a workflow run group, so it cannot be edited in place "
+            "until that group finishes. Save the change as a new version instead.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
+class WorkflowChangedSinceReview(SkyvernHTTPException):
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"Workflow version {workflow_id} changed after it was reviewed, so the group was not submitted.",
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 _BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
@@ -588,6 +612,14 @@ class WorkflowNotFound(SkyvernHTTPException):
         super().__init__(
             f"Workflow not found. {workflow_repr}",
             status_code=HTTPStatus.NOT_FOUND,
+        )
+
+
+class WorkflowHasNoBlocks(SkyvernHTTPException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(
+            f"Workflow {workflow_permanent_id} has no blocks to run. Add at least one block before running it.",
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -1195,6 +1227,15 @@ class CredentialParameterNotFoundError(SkyvernException):
         )
 
 
+# ValueError subclasses so existing handlers and the user-facing failure text stay as they were.
+class CredentialItemNotFoundError(ValueError):
+    """The credential binding resolved, but its vault holds no such item or key."""
+
+
+class CredentialSourceNotConfiguredError(ValueError):
+    """The organization or workflow lacks configuration a credential read needs."""
+
+
 class CredentialVaultShapeMismatchError(SkyvernHTTPException):
     def __init__(self, credential_id: str, stored_credential_type: str) -> None:
         super().__init__(
@@ -1491,26 +1532,26 @@ class IllegitComplete(SkyvernException):
         super().__init__(f"Illegit complete{data_str}")
 
 
-class CachedActionPlanError(SkyvernException):
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-
-
 class InvalidUrl(SkyvernHTTPException):
-    def __init__(self, url: str) -> None:
-        super().__init__(f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls with max 2083 character length.")
+    def __init__(
+        self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
+    ) -> None:
+        super().__init__(f"Invalid {field_name}: {reason}. Use an HTTP or HTTPS URL with at most 2083 characters.")
 
 
 class BlockedHost(SkyvernHTTPException):
-    def __init__(self, host: str) -> None:
+    def __init__(self, host: str, *, field_name: str = "url") -> None:
         super().__init__(
-            f"The host in your url is blocked: {host}",
+            f"Invalid {field_name}: blocked host.",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
 class UnresolvableHost(BlockedHost):
-    pass
+    def __init__(self, host: str, *, field_name: str = "url") -> None:
+        SkyvernHTTPException.__init__(
+            self, f"Invalid {field_name}: unresolvable host.", status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 class InvalidWorkflowParameter(SkyvernHTTPException):
@@ -1661,6 +1702,26 @@ class LLMCallerNotFoundError(SkyvernException):
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
     def __init__(self, browser_session_id: str, runnable_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
+
+
+class BrowserSessionAlreadyEndedError(SkyvernException):
+    """A late writer tried to publish liveness or a non-final status onto an already-terminal row;
+    the DB layer raises this rather than resurrect a session a concurrent close/timeout already ended.
+    Distinct from cloud's query-side BrowserSessionAlreadyTerminalError; carried values are identifiers
+    and a timestamp only, never a secret-bearing address or token."""
+
+    def __init__(
+        self,
+        browser_session_id: str,
+        status: str | None,
+        completed_at: datetime | None = None,
+    ) -> None:
+        self.browser_session_id = browser_session_id
+        self.status = status
+        self.completed_at = completed_at
+        super().__init__(
+            f"Browser session {browser_session_id} has already ended; refusing to publish liveness or status"
+        )
 
 
 class BrowserSessionOwnershipConflict(SkyvernHTTPException):
@@ -1828,7 +1889,10 @@ class AzureConfigurationError(AzureBaseError):
 
 
 class ScriptTerminationException(SkyvernException):
-    def __init__(self, reason: str | None = None) -> None:
+    def __init__(
+        self, reason: str | None = None, *, user_defined_errors: list["UserDefinedError"] | None = None
+    ) -> None:
+        self.user_defined_errors = user_defined_errors
         super().__init__(reason)
 
 

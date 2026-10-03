@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias
 
+from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value
+
 UsageScalar: TypeAlias = str | int | float
 CacheMode: TypeAlias = Literal["implicit", "explicit"]
 
@@ -76,6 +78,7 @@ class CopilotModelUsageEvent:
     cache_mode: CacheMode | None = None
     cache_breakpoint_count: int | None = None
     cache_stable_prefix_chars: int | None = None
+    ref_tool_outputs_escaped: int | None = None
 
     def log_fields(self) -> dict[str, UsageScalar]:
         provider_name = None
@@ -111,17 +114,24 @@ class CopilotModelUsageEvent:
             ("copilot.cache.mode", self.cache_mode),
             ("copilot.cache.breakpoint_count", self.cache_breakpoint_count),
             ("copilot.cache.stable_prefix_chars", self.cache_stable_prefix_chars),
+            ("copilot.ref_tool_outputs_escaped", self.ref_tool_outputs_escaped),
         )
         fields.update((key, value) for key, value in optional_fields if value is not None)
         return fields
 
 
-def emit_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> None:
-    logger.info("Copilot model usage", **event.log_fields())
+def _emit_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> None:
+    fields = event.log_fields()
+    for key, value in fields.items():
+        if key in {"gen_ai.request.model", "gen_ai.response.model"} and isinstance(value, str):
+            fields[key] = _model_log_value(key, value)
+        elif key != "copilot.prompt_name":
+            fields[key] = _generated_log_value(key, value)
+    logger.info("Copilot model usage", **fields)
 
 
-def emit_direct_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> bool:
+def _emit_direct_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> bool:
     if not is_workflow_copilot_prompt_name(event.prompt_name):
         return False
-    emit_copilot_model_usage(event, logger=logger)
+    _emit_copilot_model_usage(event, logger=logger)
     return True

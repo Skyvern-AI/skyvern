@@ -17,18 +17,43 @@ import {
   type SVGProps,
   type TextareaHTMLAttributes,
 } from "react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
+import { UserContext } from "@/store/UserContext";
 import { Link } from "react-router-dom";
 
 import { PromptBox, type PromptBoxHandle } from "./PromptBox";
+import {
+  PREWARM_DISPATCH_WAIT_TIMEOUT_MS,
+  waitForBrowserSessionPrewarm,
+} from "./useBrowserSessionPrewarm";
 
-const { mockNavigate, mockPost, mockSetAutoplay } = vi.hoisted(() => ({
+const {
+  authState,
+  currentOrgState,
+  mockNavigate,
+  mockPost,
+  mockPostHogCapture,
+  mockSetAutoplay,
+  prewarmFlagState,
+} = vi.hoisted(() => ({
+  authState: { userId: "user-a" as string | null },
+  currentOrgState: { organizationId: "org-a" as string | undefined },
   mockNavigate: vi.fn(),
   mockPost: vi.fn(),
+  mockPostHogCapture: vi.fn(),
   mockSetAutoplay: vi.fn(),
+  prewarmFlagState: { enabled: false },
+}));
+
+vi.mock("@/hooks/useCurrentOrgId", () => ({
+  useCurrentOrgId: () => currentOrgState.organizationId,
+}));
+
+vi.mock("posthog-js", () => ({
+  default: { capture: mockPostHogCapture },
 }));
 
 const { studioState } = vi.hoisted(() => ({
@@ -47,6 +72,10 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => studioState.enabled,
+}));
+
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => prewarmFlagState.enabled,
 }));
 
 vi.mock("@/store/useAutoplayStore", () => ({
@@ -73,6 +102,18 @@ vi.mock("@/components/AutoResizingTextarea/AutoResizingTextarea", async () => {
       HTMLTextAreaElement,
       TextareaHTMLAttributes<HTMLTextAreaElement>
     >((props, ref) => <textarea ref={ref} {...props} />),
+  };
+});
+
+vi.mock("./CyclingPlaceholderTextarea", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    CyclingPlaceholderTextarea: React.forwardRef<
+      HTMLTextAreaElement,
+      TextareaHTMLAttributes<HTMLTextAreaElement> & { cycling?: boolean }
+    >(({ cycling, ...props }, ref) => (
+      <textarea ref={ref} data-cycling={cycling} {...props} />
+    )),
   };
 });
 
@@ -110,30 +151,44 @@ vi.mock("@/components/TestWebhookDialog", () => ({
   TestWebhookDialog: ({ trigger }: { trigger: ReactNode }) => <>{trigger}</>,
 }));
 
-vi.mock("@/components/ImprovePrompt", () => ({
-  ImprovePrompt: () => null,
-}));
-
 vi.mock("./ExampleCasePill", () => ({
   ExampleCasePill: ({
     label,
     onClick,
+    selected,
   }: {
     label: string;
     onClick: () => void;
+    selected?: boolean;
   }) => (
-    <button type="button" onClick={onClick}>
+    <button type="button" aria-pressed={selected} onClick={onClick}>
       {label}
     </button>
   ),
 }));
 
 vi.mock("@radix-ui/react-icons", () => ({
+  CalendarIcon: () => null,
+  CheckIcon: () => null,
+  ClockIcon: () => null,
+  CodeIcon: () => null,
+  Cross2Icon: () => null,
+  DownloadIcon: () => null,
+  EnvelopeClosedIcon: () => null,
+  GlobeIcon: () => null,
+  LockClosedIcon: () => null,
+  TableIcon: () => null,
+  TextAlignLeftIcon: () => null,
+  ChevronDownIcon: () => null,
+  ChevronUpIcon: () => null,
+  PlusIcon: () => null,
+  UploadIcon: () => null,
+  VideoIcon: () => null,
   FileTextIcon: () => null,
   GearIcon: () => null,
   Pencil1Icon: () => null,
   ReloadIcon: () => null,
-  PaperPlaneIcon: (props: SVGProps<SVGSVGElement>) => <svg {...props} />,
+  ArrowUpIcon: (props: SVGProps<SVGSVGElement>) => <svg {...props} />,
 }));
 
 vi.mock("@/components/icons/CartIcon", () => ({ CartIcon: () => null }));
@@ -145,17 +200,34 @@ vi.mock("@/components/icons/TrophyIcon", () => ({ TrophyIcon: () => null }));
 function renderPromptBox(
   enableCopilotHandoff = false,
   ref?: Ref<PromptBoxHandle>,
+  minimal = false,
+  handoffFlagLoading = false,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
 
+  const getUser = () =>
+    authState.userId ? { id: authState.userId, email: "", name: "" } : null;
+
+  // No ClerkProvider: the OSS app never mounts one.
   return render(
-    <QueryClientProvider client={queryClient}>
-      <PromptBox ref={ref} enableCopilotHandoff={enableCopilotHandoff} />
-    </QueryClientProvider>,
+    <UserContext.Provider value={getUser}>
+      <QueryClientProvider client={queryClient}>
+        <PromptBox
+          ref={ref}
+          enableCopilotHandoff={enableCopilotHandoff}
+          minimal={minimal}
+          handoffFlagLoading={handoffFlagLoading}
+        />
+      </QueryClientProvider>
+    </UserContext.Provider>,
   );
 }
+
+beforeEach(() => {
+  vi.stubGlobal("matchMedia", () => ({ matches: true }));
+});
 
 afterEach(() => {
   cleanup();
@@ -163,13 +235,24 @@ afterEach(() => {
   studioState.enabled = true;
   mockNavigate.mockReset();
   mockPost.mockReset();
+  mockPostHogCapture.mockReset();
   mockSetAutoplay.mockReset();
+  prewarmFlagState.enabled = false;
+  authState.userId = "user-a";
+  currentOrgState.organizationId = "org-a";
   vi.mocked(toast).mockReset();
+  vi.unstubAllGlobals();
 });
+
+function promptInput() {
+  return document.getElementById(
+    "discover-prompt-input",
+  ) as HTMLTextAreaElement;
+}
 
 async function submitPrompt(text: string) {
   renderPromptBox();
-  fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+  fireEvent.change(promptInput(), {
     target: { value: text },
   });
   fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -177,46 +260,487 @@ async function submitPrompt(text: string) {
 }
 
 describe("PromptBox", () => {
-  test("focuses and prefills an empty prompt without submitting or overwriting typed text", () => {
+  test.each([
+    ["legacy", false],
+    ["redesigned", true],
+  ])(
+    "stops cycling example placeholders once the prompt is focused (%s)",
+    (_label, minimal) => {
+      renderPromptBox(false, undefined, minimal);
+      const textarea = promptInput();
+      expect(textarea.dataset.cycling).toBe("true");
+      fireEvent.focus(textarea);
+      expect(textarea.dataset.cycling).toBe("false");
+    },
+  );
+
+  test.each([
+    ["legacy", false, false, "RESIDENTIAL"],
+    ["redesigned", false, true, "RESIDENTIAL"],
+    ["Copilot handoff", true, true, null],
+  ])(
+    "prewarms once on first input in the %s Home prompt",
+    async (_label, enableCopilotHandoff, minimal, expectedProxyLocation) => {
+      prewarmFlagState.enabled = true;
+      mockPost.mockResolvedValue({ data: {} });
+      renderPromptBox(enableCopilotHandoff, undefined, minimal);
+
+      const textarea = document.getElementById(
+        "discover-prompt-input",
+      ) as HTMLTextAreaElement;
+      expect(textarea).not.toBeNull();
+      fireEvent.focus(textarea);
+      expect(mockPost).not.toHaveBeenCalled();
+
+      fireEvent.change(textarea, { target: { value: "Start" } });
+      await waitFor(() =>
+        expect(mockPost).toHaveBeenCalledWith("/debug-session/prewarm", {
+          proxy_location: expectedProxyLocation,
+        }),
+      );
+
+      fireEvent.change(textarea, { target: { value: "Start an agent" } });
+      expect(
+        mockPost.mock.calls.filter(
+          ([path]) => path === "/debug-session/prewarm",
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  test("caps the editor wait without aborting a stalled prewarm request", async () => {
+    vi.useFakeTimers();
+    let finishPrewarm: (() => void) | undefined;
+    try {
+      prewarmFlagState.enabled = true;
+      mockPost.mockReturnValue(
+        new Promise((resolve) => {
+          finishPrewarm = () => resolve({ data: {} });
+        }),
+      );
+      renderPromptBox();
+
+      fireEvent.change(promptInput(), {
+        target: { value: "Start" },
+      });
+      await act(async () => undefined);
+
+      let waitFinished = false;
+      const wait = waitForBrowserSessionPrewarm().then(() => {
+        waitFinished = true;
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PREWARM_DISPATCH_WAIT_TIMEOUT_MS - 1);
+      });
+      expect(waitFinished).toBe(false);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      await wait;
+      expect(waitFinished).toBe(true);
+
+      finishPrewarm?.();
+      await act(async () => undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not let a stalled request from another identity suppress prewarming", async () => {
+    let finishFirstPrewarm: (() => void) | undefined;
+    prewarmFlagState.enabled = true;
+    mockPost
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishFirstPrewarm = () => resolve({ data: {} });
+        }),
+      )
+      .mockResolvedValueOnce({ data: {} });
+
+    renderPromptBox();
+    fireEvent.change(promptInput(), {
+      target: { value: "First identity" },
+    });
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    authState.userId = "user-b";
+    currentOrgState.organizationId = "org-b";
+    renderPromptBox();
+    fireEvent.change(promptInput(), {
+      target: { value: "Second identity" },
+    });
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(2));
+
+    finishFirstPrewarm?.();
+    await act(async () => undefined);
+  });
+
+  test("releases a stalled client dedupe lock for a later Home mount", async () => {
+    vi.useFakeTimers();
+    let finishFirstPrewarm: (() => void) | undefined;
+    try {
+      prewarmFlagState.enabled = true;
+      mockPost
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            finishFirstPrewarm = () => resolve({ data: {} });
+          }),
+        )
+        .mockResolvedValueOnce({ data: {} });
+
+      renderPromptBox();
+      fireEvent.change(promptInput(), {
+        target: { value: "First mount" },
+      });
+      await act(async () => undefined);
+      expect(mockPost).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PREWARM_DISPATCH_WAIT_TIMEOUT_MS);
+      });
+      renderPromptBox();
+      fireEvent.change(promptInput(), {
+        target: { value: "Later mount" },
+      });
+      await act(async () => undefined);
+      expect(mockPost).toHaveBeenCalledTimes(2);
+
+      finishFirstPrewarm?.();
+      await act(async () => undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("prewarms after an imperative prompt prefill without submitting or overwriting typed text", async () => {
+    prewarmFlagState.enabled = true;
+    mockPost.mockResolvedValue({ data: {} });
     const ref = createRef<PromptBoxHandle>();
     renderPromptBox(false, ref);
-    const textarea = screen.getByPlaceholderText("Enter your prompt...");
+    const textarea = promptInput();
     textarea.scrollIntoView = vi.fn();
 
-    act(() => ref.current?.focusAndPrefillExample("hackernews"));
-    expect((textarea as HTMLTextAreaElement).value).toBe(
-      "Navigate to the Hacker News homepage and get the top 3 posts.",
+    act(() =>
+      ref.current?.focusAndPrefillExample("AAPLStockPrice", "finditparts"),
+    );
+    expect((textarea as HTMLTextAreaElement).value).toContain(
+      'search for "AAPL"',
     );
     expect(document.activeElement).toBe(textarea);
     expect(textarea.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
     expect(textarea.getAttribute("id")).toBe("discover-prompt-input");
-    expect(mockPost).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(mockPost).toHaveBeenCalledWith("/debug-session/prewarm", {
+        proxy_location: "RESIDENTIAL",
+      }),
+    );
 
     fireEvent.change(textarea, { target: { value: "Keep my agent prompt" } });
-    act(() => ref.current?.focusAndPrefillExample("contact_us_forms"));
+    act(() =>
+      ref.current?.focusAndPrefillExample("add_employee", "finditparts"),
+    );
     expect((textarea as HTMLTextAreaElement).value).toBe(
       "Keep my agent prompt",
     );
     expect(document.activeElement).toBe(textarea);
+    expect(
+      mockPost.mock.calls.filter(([path]) => path === "/debug-session/prewarm"),
+    ).toHaveLength(1);
+  });
+
+  test("links a submitted prompt to the created workflow with one attempt id", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_attributed",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    await submitPrompt("Visit the docs");
+
+    await waitFor(() =>
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.agent_creation_succeeded",
+        expect.objectContaining({
+          workflow_permanent_id: "wpid_attributed",
+        }),
+      ),
+    );
+    const submitted = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_submitted",
+    )?.[1];
+    const succeeded = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_succeeded",
+    )?.[1];
+    expect(submitted).toMatchObject({
+      source: "typed",
+      handoff: false,
+      variant: "legacy",
+    });
+    expect(succeeded.attempt_id).toBe(submitted.attempt_id);
+    expect(JSON.stringify([submitted, succeeded])).not.toContain(
+      "Visit the docs",
+    );
+  });
+
+  test("assigns a new attempt id when a failed submission is retried", async () => {
+    mockPost
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 422, data: { detail: "Invalid prompt" } },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          workflow_permanent_id: "wpid_retry",
+          workflow_definition: { blocks: [] },
+        },
+      });
+
+    renderPromptBox();
+    fireEvent.change(promptInput(), {
+      target: { value: "Visit the docs" },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+    await waitFor(() =>
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.agent_creation_failed",
+        expect.objectContaining({ error_category: "invalid_request" }),
+      ),
+    );
+
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("submit-prompt") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+    await waitFor(() =>
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.agent_creation_succeeded",
+        expect.objectContaining({ workflow_permanent_id: "wpid_retry" }),
+      ),
+    );
+
+    const submitted = mockPostHogCapture.mock.calls.filter(
+      ([event]) => event === "home.agent_creation_submitted",
+    );
+    const failed = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_failed",
+    );
+    const succeeded = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_succeeded",
+    );
+    expect(submitted).toHaveLength(2);
+    expect(submitted[0]?.[1].attempt_id).toBe(failed?.[1].attempt_id);
+    expect(submitted[1]?.[1].attempt_id).toBe(succeeded?.[1].attempt_id);
+    expect(submitted[1]?.[1].attempt_id).not.toBe(submitted[0]?.[1].attempt_id);
+  });
+
+  test("loads a clicked example for review and attributes it on submit without capturing its prompt", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox();
+    const card = screen.getByRole("button", { name: "Add a product to cart" });
+    fireEvent.click(card);
     expect(mockPost).not.toHaveBeenCalled();
+    expect(card.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    const submitted = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_submitted",
+    )?.[1];
+    expect(submitted).toMatchObject({
+      source: "example",
+      example: "finditparts",
+      example_edited: false,
+      variant: "legacy",
+    });
+    expect(JSON.stringify(mockPostHogCapture.mock.calls)).not.toContain(
+      "W01-377-8537",
+    );
+  });
+
+  test("hides run settings on the legacy home when the Copilot handoff is on", () => {
+    renderPromptBox(true);
+    expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
+    cleanup();
+
+    renderPromptBox(false);
+    expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
+  });
+
+  test("holds back the legacy toolbar controls while the handoff flag loads, then falls back to flag-off", () => {
+    vi.useFakeTimers();
+    try {
+      renderPromptBox(false, undefined, false, true);
+      expect(screen.queryByLabelText("Add files and more")).toBeNull();
+      expect(screen.queryByLabelText("Dictate message")).toBeNull();
+      expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
+      expect(screen.getByLabelText("submit-prompt")).toBeTruthy();
+
+      act(() => {
+        vi.advanceTimersByTime(3000);
+      });
+      expect(screen.getByLabelText("Dictate message")).toBeTruthy();
+      expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("clears the selected legacy example once its prompt is edited", () => {
+    renderPromptBox();
+    const card = screen.getByRole("button", { name: "Apply for a job" });
+    fireEvent.click(card);
+    expect(card.getAttribute("aria-pressed")).toBe("true");
+
+    const textarea = promptInput() as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: `${textarea.value} now` } });
+    expect(card.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  test("preserves an unedited redesign example through creation outcomes", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() =>
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.agent_creation_succeeded",
+        expect.objectContaining({ workflow_permanent_id: "wpid_example" }),
+      ),
+    );
+
+    for (const event of [
+      "home.agent_creation_submitted",
+      "home.prompt_submitted",
+      "home.agent_creation_succeeded",
+    ]) {
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        event,
+        expect.objectContaining({
+          source: "example",
+          example: "forms.apply_for_job",
+          example_edited: false,
+        }),
+      );
+    }
+    expect(JSON.stringify(mockPostHogCapture.mock.calls)).not.toContain(
+      "Solutions Engineer",
+    );
+  });
+
+  test("keeps example origin when the seeded prompt is edited", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_edited_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Scrape a catalog" }));
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, {
+      target: {
+        value: `${(textarea as HTMLTextAreaElement).value} Include URLs.`,
+      },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPostHogCapture).toHaveBeenCalledWith(
+      "home.agent_creation_submitted",
+      expect.objectContaining({
+        source: "example",
+        example: "extract.scrape_catalog",
+        example_edited: true,
+      }),
+    );
+  });
+
+  test("clears example attribution after an explicit reset", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_typed_replacement",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Get a quote" }));
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "" } });
+    fireEvent.change(textarea, { target: { value: "Check a public page" } });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    const submitted = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_submitted",
+    )?.[1];
+    expect(submitted).toMatchObject({
+      source: "typed",
+      variant: "revamp",
+    });
+    expect(submitted).not.toHaveProperty("example");
+    expect(submitted).not.toHaveProperty("example_edited");
+  });
+
+  test("replaces attribution when a different example is selected", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_reselected_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    fireEvent.click(screen.getByRole("button", { name: "Get a quote" }));
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPostHogCapture).toHaveBeenCalledWith(
+      "home.agent_creation_submitted",
+      expect.objectContaining({
+        source: "example",
+        example: "forms.get_quote",
+        example_edited: false,
+      }),
+    );
   });
 
   test("reuses the shipped sample prompts for onboarding intent keys", () => {
     const ref = createRef<PromptBoxHandle>();
     renderPromptBox(false, ref);
-    const textarea = screen.getByPlaceholderText(
-      "Enter your prompt...",
-    ) as HTMLTextAreaElement;
+    const textarea = promptInput() as HTMLTextAreaElement;
     const cases = [
       ["finditparts", "finditparts.com"],
-      ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
-      ["hackernews", "Hacker News homepage"],
-      ["AAPLStockPrice", "google finance"],
+      ["add_employee", "opensource-demo.orangehrmlive.com"],
+      ["extractIntegrationsFromSkyvern", "skyvern.com"],
+      ["AAPLStockPrice", "Google Finance"],
+      ["download_invoices", "[vendor portal]"],
     ] as const;
 
     for (const [key, expected] of cases) {
       fireEvent.change(textarea, { target: { value: "" } });
-      act(() => ref.current?.focusAndPrefillExample(key));
+      act(() => ref.current?.focusAndPrefillExample(key, "finditparts"));
       expect(textarea.value).toContain(expected);
     }
     expect(mockPost).not.toHaveBeenCalled();
@@ -234,7 +758,7 @@ describe("PromptBox", () => {
 
     expect(screen.queryByText("Skyvern 2.0")).toBeNull();
 
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Visit the docs" },
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -248,6 +772,70 @@ describe("PromptBox", () => {
     expect(body.task_version).toBe("v1");
     expect(body.request.run_with).toBe("agent");
     expect(body.request.url).toBe("https://google.com");
+  });
+
+  test.each([
+    { minimal: false, coarsePointer: false, submits: true },
+    { minimal: false, coarsePointer: true, submits: false },
+    { minimal: true, coarsePointer: false, submits: true },
+    { minimal: true, coarsePointer: true, submits: false },
+  ])(
+    "Enter submits unless on a touch keyboard; Shift+Enter never does (minimal=$minimal, coarse=$coarsePointer)",
+    async ({ minimal, coarsePointer, submits }) => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query === "(any-pointer: fine)" ? !coarsePointer : true,
+      }));
+      mockPost.mockResolvedValue({
+        data: {
+          workflow_permanent_id: "wpid_1",
+          workflow_definition: { blocks: [] },
+        },
+      });
+      renderPromptBox(false, undefined, minimal);
+      const textarea = document.getElementById("discover-prompt-input")!;
+      fireEvent.change(textarea, { target: { value: "Visit the docs" } });
+
+      fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+      fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+
+      if (submits) {
+        await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+      } else {
+        expect(mockPost).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  test("sends settings changed in the gear popover and lists them under the prompt", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_1",
+        workflow_definition: { blocks: [] },
+      },
+    });
+    renderPromptBox();
+
+    fireEvent.click(screen.getByLabelText("Advanced settings"));
+    fireEvent.change(screen.getByPlaceholderText("Default: 25"), {
+      target: { value: "10" },
+    });
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+
+    expect(await screen.findByText("Max steps: 10")).toBeTruthy();
+    expect(screen.getByLabelText("Advanced settings, 1 changed")).toBeTruthy();
+
+    fireEvent.change(promptInput(), {
+      target: { value: "Visit the docs" },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    const [path, , config] = mockPost.mock.calls[0]!;
+    expect(path).toBe("/workflows/create-from-prompt");
+    expect(config).toEqual({ headers: { "x-max-steps-override": "10" } });
   });
 
   // SKY-13154: a 2xx whose body fails JSON.parse arrives as a raw string, so
@@ -306,6 +894,79 @@ describe("PromptBox", () => {
     expect(mockSetAutoplay).not.toHaveBeenCalled();
   });
 
+  test("holds submit until the job example's sample resume is attached, then hands it off", async () => {
+    let resolveFetch!: (response: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (resolveFetch = resolve))),
+    );
+    mockPost.mockImplementation((path: string) =>
+      Promise.resolve({
+        data:
+          path === "/upload_file"
+            ? { file_id: "file_resume" }
+            : {
+                workflow_permanent_id: "wpid_job",
+                workflow_definition: { blocks: [] },
+              },
+      }),
+    );
+
+    renderPromptBox(true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    const submit = screen.getByLabelText("submit-prompt") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith("/sample-resume.pdf"),
+    );
+    expect(submit.disabled).toBe(true);
+    resolveFetch(new Response(new Blob(["%PDF"]), { status: 200 }));
+    await waitFor(() => expect(submit.disabled).toBe(false));
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalled());
+    expect(mockNavigate.mock.calls[0]![1].state.copilotAttachedFiles).toEqual([
+      expect.objectContaining({
+        file_id: "file_resume",
+        filename: "sample-resume.pdf",
+      }),
+    ]);
+  });
+
+  test("drops only the example's sample resume when switching to an example without one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(new Response(new Blob(["%PDF"]), { status: 200 })),
+      ),
+    );
+    mockPost
+      .mockResolvedValueOnce({ data: { file_id: "file_user" } })
+      .mockResolvedValueOnce({ data: { file_id: "file_example" } });
+
+    renderPromptBox(true);
+    fireEvent.change(screen.getByLabelText("Upload document"), {
+      target: {
+        files: [
+          new File(["%PDF"], "sample-resume.pdf", { type: "application/pdf" }),
+        ],
+      },
+    });
+    await screen.findByText("sample-resume.pdf");
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    await waitFor(() =>
+      expect(screen.getAllByText("sample-resume.pdf")).toHaveLength(2),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add a product to cart" }),
+    );
+    await waitFor(() =>
+      expect(screen.getAllByText("sample-resume.pdf")).toHaveLength(1),
+    );
+  });
+
   test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {
     studioState.enabled = true;
     mockPost.mockResolvedValue({
@@ -317,7 +978,7 @@ describe("PromptBox", () => {
 
     renderPromptBox(true);
 
-    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    fireEvent.change(promptInput(), {
       target: { value: "Build this in studio" },
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
@@ -356,7 +1017,7 @@ describe("PromptBox", () => {
       });
 
       renderPromptBox(handoff);
-      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      fireEvent.change(promptInput(), {
         target: { value: "Visit the docs" },
       });
       fireEvent.click(screen.getByLabelText("submit-prompt"));

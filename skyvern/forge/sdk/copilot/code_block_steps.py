@@ -3,13 +3,19 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
+import unicodedata
 from dataclasses import dataclass, replace
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
+from urllib.parse import urlsplit
 
 import structlog
 import yaml
 
-from skyvern.forge.sdk.copilot.code_block_synthesis import _RESERVED_PARAM_NAMES
+from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
+from skyvern.forge.sdk.copilot.code_block_synthesis import _RECORDING_REQUIRED_ACTION_TYPES, _RESERVED_PARAM_NAMES
+from skyvern.utils.templating import mask_jinja_control_blocks, strip_jinja_control_blocks
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
 LOG = structlog.get_logger()
 
@@ -72,6 +78,9 @@ _READ_METHODS: dict[str, str] = {
 # Methods whose natural-language `prompt` is the first positional argument (it is keyword-only on the
 # interaction methods, which the keyword scan below already covers).
 _PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
+# Injected into the code block's namespace as a bare builtin rather than a page method
+# (block.py build_safe_vars), so it is called as `await solve_captcha(page)` with no receiver.
+_BARE_NAME_METHODS: frozenset[str] = frozenset({"solve_captcha"})
 # Awaited calls that are sync/no-op helpers — never surfaced as their own step.
 _IGNORED_METHODS: frozenset[str] = frozenset(
     {"wait_for_load_state", "wait_for_selector", "wait_for_url", "wait_for_function"}
@@ -79,6 +88,12 @@ _IGNORED_METHODS: frozenset[str] = frozenset(
 
 _STRING_LITERAL = re.compile(r"""^\s*['"](.*)['"]\s*$""", re.DOTALL)
 _NAME_KWARG = re.compile(r"""name\s*=\s*['"]([^'"]+)['"]""")
+# The repair line code_block_synthesis emits for a recorded action it could not replay.
+_RECORDING_REPAIR_MESSAGE = re.compile(r"Recorded (\w+) needs repair: ")
+_JINJA_TAGS = ("{{", "{%", "{#")
+_UNQUOTABLE_MARKERS = (*_JINJA_TAGS, INERT_SLOT_NAME)
+# Cs: a lone surrogate cannot be UTF-8 encoded, so the request carrying it would fail.
+_UNQUOTABLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 
 @dataclass
@@ -91,49 +106,118 @@ class CodeActionSpan:
     first_arg: str | None  # source of the first call arg, if any
     prompt: str | None  # natural-language `prompt` argument value, if a string literal
     loop_var: str | None  # name of the enclosing for-loop target, if the call is inside one
+    store_name: str | None = None  # where a read's value is stored: assigned variable, appended list, or dict key
+    element_name: str | None = None  # visible name from get_by_role(name=...)/get_by_label/get_by_text
+    goto_name: str | None = None
+    goto_literal: str | None = None  # the string constant goto_name is bound to, when bound exactly once
+    goto_url_literal: str | None = None
+    input_literal: str | None = None  # the string literal a text input types, when it is safe to quote
+    input_target: str | None = None  # source of the selector or receiver input_literal is typed into
 
 
 def analyze_code_actions(code: str) -> list[CodeActionSpan]:
     """Find browser-action calls in `code` and map each to an action_type + exact line range."""
     if not code or not code.strip():
         return []
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
+    tree: ast.Module | None = None
+    # Stripping keeps Python that shares a line with a tag; commenting is the fallback for tag bodies that are not Python.
+    for mask in (strip_jinja_control_blocks, mask_jinja_control_blocks):
+        try:
+            tree = ast.parse(mask(code))
+            break
+        # CPython's parser reports source nested too deeply as MemoryError, not RecursionError.
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            continue
+    if tree is None:
         return []
 
     parents: dict[ast.AST, ast.AST] = {}
+    parent_fields: dict[ast.AST, str] = {}
     for parent in ast.walk(tree):
-        for child in ast.iter_child_nodes(parent):
-            parents[child] = parent
+        for field, value in ast.iter_fields(parent):
+            for child in value if isinstance(value, list) else [value]:
+                if isinstance(child, ast.AST):
+                    parents[child] = parent
+                    parent_fields[child] = field
+    bindings = _name_bindings(tree)
+    store_names: dict[ast.AST, str | None] = {}
+    loop_vars: dict[ast.AST, str | None] = {}
 
     spans: list[CodeActionSpan] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and (repair_tool := _recording_repair_tool(node)) is not None:
+            spans.append(
+                CodeActionSpan(
+                    action_type=_RECORDING_REQUIRED_ACTION_TYPES[repair_tool],
+                    line_start=node.lineno,
+                    line_end=node.end_lineno or node.lineno,
+                    method="raise",
+                    receiver="",
+                    first_arg=repair_tool,
+                    prompt=None,
+                    loop_var=None,
+                )
+            )
+            continue
         if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
             continue
         call = node.value
-        if not isinstance(call.func, ast.Attribute):
+        receiver_node: ast.expr | None
+        if isinstance(call.func, ast.Attribute):
+            method = call.func.attr
+            receiver_node = call.func.value
+        elif isinstance(call.func, ast.Name) and call.func.id in _BARE_NAME_METHODS:
+            method = call.func.id
+            receiver_node = None
+        else:
             continue
-        method = call.func.attr
         if method in _IGNORED_METHODS:
             continue
         action_type = _METHOD_ACTION_TYPES.get(method) or _READ_METHODS.get(method)
         if action_type is None:
             continue
+        goto_url = _goto_url_node(call, method)
+        goto_arg = goto_url if isinstance(goto_url, ast.Name) else None
+        first_arg = (call.args[0] if call.args else goto_url) if receiver_node is not None else None
+        goto_literal = None
+        if goto_arg is not None:
+            goto_literal = _address_without_secrets(
+                _same_body_string_binding(node, goto_arg, bindings, parents, parent_fields)
+            )
+        input_literal = input_target = None
+        if action_type == "input_text":
+            input_literal, input_target = _typed_value(node, call, receiver_node, bindings, parents, parent_fields)
         spans.append(
             CodeActionSpan(
                 action_type=action_type,
                 line_start=node.lineno,
                 line_end=getattr(node, "end_lineno", None) or node.lineno,
                 method=method,
-                receiver=_safe_unparse(call.func.value),
-                first_arg=_safe_unparse(call.args[0]) if call.args else None,
+                receiver=_safe_unparse(receiver_node) if receiver_node is not None else "",
+                first_arg=_safe_unparse(first_arg) if first_arg is not None else None,
                 prompt=_prompt_literal(call, method),
-                loop_var=_enclosing_loop_var(node, parents),
+                loop_var=_enclosing_loop_var(node, parents, loop_vars),
+                store_name=_store_name(node, parents, store_names) if action_type == "extract" else None,
+                element_name=(
+                    _element_name(receiver_node) if action_type == "extract" and receiver_node is not None else None
+                ),
+                goto_name=goto_arg.id if goto_arg else None,
+                goto_literal=goto_literal,
+                goto_url_literal=_constant_str(goto_url) if goto_url is not None else None,
+                input_literal=input_literal,
+                input_target=input_target,
             )
         )
     spans.sort(key=lambda s: (s.line_start, s.line_end))
     return spans
+
+
+def _recording_repair_tool(node: ast.Raise) -> str | None:
+    if not isinstance(node.exc, ast.Call) or not node.exc.args:
+        return None
+    match = _RECORDING_REPAIR_MESSAGE.match(_constant_str(node.exc.args[0]) or "")
+    tool = match.group(1) if match else None
+    return tool if tool in _RECORDING_REQUIRED_ACTION_TYPES else None
 
 
 def _prompt_literal(call: ast.Call, method: str) -> str | None:
@@ -150,6 +234,239 @@ def _prompt_literal(call: ast.Call, method: str) -> str | None:
     return None
 
 
+def code_typed_values(code: str) -> list[tuple[int, str, str]]:
+    """(line, target, value) for each text input whose value is a literal safe to quote as one line of prompt data."""
+    source = textwrap.dedent(code)
+    lines = source.splitlines()
+    return [
+        (span.line_start, span.input_target, span.input_literal)
+        for span in analyze_code_actions(source)
+        if span.input_literal is not None
+        and span.input_target
+        and not _breaks_a_quoted_line(span.input_target)
+        # Parsing strips Jinja tags even inside string literals, so the literal must be checked on the raw lines too.
+        and not any(tag in line for line in lines[span.line_start - 1 : span.line_end] for tag in _JINJA_TAGS)
+    ]
+
+
+def _typed_value(
+    awaited: ast.Await,
+    call: ast.Call,
+    receiver: ast.expr | None,
+    bindings: dict[str, list[ast.AST]],
+    parents: dict[ast.AST, ast.AST],
+    parent_fields: dict[ast.AST, str],
+) -> tuple[str | None, str | None]:
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+    value_node = keywords.get("value") or keywords.get("text")
+    selector_node = keywords.get("selector")
+    if value_node is None and len(call.args) >= 2:
+        selector_node, value_node = call.args[0], call.args[1]
+    elif value_node is None and len(call.args) == 1 and _is_locator(receiver, bindings, parents):
+        value_node = call.args[0]
+    elif value_node is not None and selector_node is None and call.args:
+        selector_node = call.args[0]
+    if value_node is None:
+        return None, None
+    if isinstance(value_node, ast.Name):
+        value = _same_body_string_binding(awaited, value_node, bindings, parents, parent_fields)
+    else:
+        value = _constant_str(value_node)
+    target: str | None
+    if selector_node is not None:
+        target = _constant_str(selector_node) or _safe_unparse(selector_node)
+    else:
+        target = _safe_unparse(receiver) if receiver is not None else None
+    return _quotable(value), target
+
+
+def _quotable(value: str | None) -> str | None:
+    """The literal unchanged when it cannot break out of one quoted line of data, else None."""
+    return None if value is None or _breaks_a_quoted_line(value) else value
+
+
+def _breaks_a_quoted_line(text: str) -> bool:
+    # json.dumps escapes characters below U+0020, so only the ones it leaves raw can break the rendered row.
+    return any(m in text for m in _UNQUOTABLE_MARKERS) or any(
+        ch >= " " and unicodedata.category(ch) in _UNQUOTABLE_CATEGORIES for ch in text
+    )
+
+
+def _is_locator(receiver: ast.expr | None, bindings: dict[str, list[ast.AST]], parents: dict[ast.AST, ast.AST]) -> bool:
+    """A call result, a name bound once to one, or `.first`/`.last` of either: a Locator, whose lone fill arg is its value."""
+    # ponytail: any Call-shaped receiver counts, so `page.frame(...).fill('#sel')` reads its selector as a value; resolve
+    # receiver types if that shape shows up.
+    receiver = _without_first_last(receiver)
+    if isinstance(receiver, ast.Call):
+        return True
+    if not isinstance(receiver, ast.Name) or len(bindings.get(receiver.id, [])) != 1:
+        return False
+    assign = parents.get(bindings[receiver.id][0])
+    return (
+        isinstance(assign, ast.Assign)
+        and len(assign.targets) == 1
+        and isinstance(_without_first_last(assign.value), ast.Call)
+    )
+
+
+def _without_first_last(node: ast.expr | None) -> ast.expr | None:
+    while isinstance(node, ast.Attribute) and node.attr in ("first", "last"):
+        node = node.value
+    return node
+
+
+def _goto_url_node(call: ast.Call, method: str) -> ast.expr | None:
+    if method != "goto":
+        return None
+    if call.args:
+        return call.args[0]
+    return next((keyword.value for keyword in call.keywords if keyword.arg == "url"), None)
+
+
+_PASS_UP = object()
+
+
+def _store_name(node: ast.AST, parents: dict[ast.AST, ast.AST], cache: dict[ast.AST, str | None]) -> str | None:
+    """Where the enclosing statement stores a read's value, or None for any use that could borrow an unrelated name.
+
+    Memoized per node, so reads sharing one long expression (a chain of `+`) walk it once in total."""
+    visited: list[ast.AST] = []
+    current = node
+    while current not in cache:
+        visited.append(current)
+        outcome = _stored_in(parents.get(current), current)
+        if outcome is _PASS_UP:
+            current = parents[current]
+            continue
+        cache[current] = outcome if isinstance(outcome, str) else None
+    result = cache[current]
+    for seen in visited:
+        cache[seen] = result
+    return result
+
+
+def _stored_in(parent: ast.AST | None, current: ast.AST) -> object:
+    """The name `parent` stores `current` in, None when there is none, or _PASS_UP to keep walking up."""
+    if parent is None:
+        return None
+    if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+        if parent.value is current and len(targets) == 1 and isinstance(targets[0], ast.Name):
+            return targets[0].id
+        return None
+    if isinstance(parent, ast.Dict):
+        key = next((key for key, value in zip(parent.keys, parent.values) if value is current), None)
+        return _constant_str(key) if key is not None else None
+    if isinstance(parent, ast.Call):
+        if parent.func is current:
+            return _PASS_UP
+        func = parent.func
+        if (
+            current in parent.args
+            and isinstance(func, ast.Attribute)
+            and func.attr == "append"
+            and isinstance(func.value, ast.Name)
+        ):
+            return func.value.id
+        return None
+    if isinstance(parent, (ast.Attribute, ast.Subscript)) and parent.value is current:
+        return _PASS_UP
+    if isinstance(parent, (ast.BinOp, ast.BoolOp, ast.UnaryOp)):
+        return _PASS_UP
+    return None
+
+
+def _element_name(receiver: ast.AST) -> str | None:
+    """The nearest visible element name cited by a get_by_role/get_by_label/get_by_text call in the receiver chain."""
+    node: ast.AST | None = receiver
+    while node is not None:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in ("get_by_role", "get_by_label", "get_by_text"):
+                for keyword in node.keywords:
+                    if keyword.arg == "name" or (keyword.arg == "text" and func.attr != "get_by_role"):
+                        return _constant_str(keyword.value)
+                if func.attr != "get_by_role" and node.args:
+                    return _constant_str(node.args[0])
+                return None
+            node = func
+        elif isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        else:
+            node = None
+    return None
+
+
+def _name_bindings(tree: ast.AST) -> dict[str, list[ast.AST]]:
+    bindings: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names = [node.id]
+        elif isinstance(node, ast.arg):
+            names = [node.arg]
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, ast.alias):
+            names = [node.asname or node.name.split(".")[0]]
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names = list(node.names)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            names = [node.name]
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names = [node.rest]
+        else:
+            continue
+        for name in names:
+            bindings.setdefault(name, []).append(node)
+    return bindings
+
+
+def _same_body_string_binding(
+    awaited: ast.AST,
+    name: ast.Name,
+    bindings: dict[str, list[ast.AST]],
+    parents: dict[ast.AST, ast.AST],
+    parent_fields: dict[ast.AST, str],
+) -> str | None:
+    """The string `name` holds, when its only binding is `name = "<str>"` earlier in the call's own statement body."""
+    if len(bindings.get(name.id, [])) != 1:
+        return None
+    assignment = parents.get(bindings[name.id][0])
+    if not isinstance(assignment, ast.Assign) or len(assignment.targets) != 1:
+        return None
+    statement = awaited
+    while not isinstance(statement, ast.stmt):
+        statement = parents[statement]
+    if (
+        parents.get(assignment) is not parents.get(statement)
+        or parent_fields.get(assignment) != parent_fields.get(statement)
+        or assignment.lineno >= statement.lineno
+    ):
+        return None
+    return _constant_str(assignment.value)
+
+
+def _address_without_secrets(value: str | None) -> str | None:
+    """The literal unchanged when it is a plain http(s) address, else None so the label names the variable instead.
+
+    Credentials, a query, a fragment, or a template placeholder never reach a label."""
+    if not value or "{{" in value:
+        return None
+    try:
+        parts = urlsplit(value)
+        plain = (
+            parts.scheme in ("http", "https")
+            and bool(parts.hostname)
+            and "@" not in parts.netloc
+            and not parts.query
+            and not parts.fragment
+            and (parts.port is None or parts.port > 0)
+        )
+    except ValueError:
+        return None
+    return value if plain else None
+
+
 def _constant_str(node: ast.AST) -> str | None:
     """The decoded value of a string-literal AST node, else None (e.g. a variable or f-string)."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -157,14 +474,23 @@ def _constant_str(node: ast.AST) -> str | None:
     return None
 
 
-def _enclosing_loop_var(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
-    """Name of the nearest enclosing for-loop's target, when it is a plain variable."""
+def _enclosing_loop_var(node: ast.AST, parents: dict[ast.AST, ast.AST], cache: dict[ast.AST, str | None]) -> str | None:
+    """Name of the nearest enclosing for-loop's target, when it is a plain variable (memoized per ancestor)."""
+    visited: list[ast.AST] = []
     current = parents.get(node)
+    result: str | None = None
     while current is not None:
+        if current in cache:
+            result = cache[current]
+            break
+        visited.append(current)
         if isinstance(current, (ast.For, ast.AsyncFor)) and isinstance(current.target, ast.Name):
-            return current.target.id
+            result = current.target.id
+            break
         current = parents.get(current)
-    return None
+    for seen in visited:
+        cache[seen] = result
+    return result
 
 
 def _safe_unparse(node: ast.AST) -> str:
@@ -214,6 +540,8 @@ def _describe(span: CodeActionSpan) -> str:
         normalized = _normalize_whitespace(span.prompt)
         if normalized:
             return normalized
+    if span.method == "raise":
+        return f"Repair recorded {span.first_arg}"
     value = _string_value(span.first_arg)
     if span.action_type == "goto_url":
         if value:
@@ -222,8 +550,19 @@ def _describe(span: CodeActionSpan) -> str:
         # a repeated generic "Open the page". Inside a loop it opens each iterated item.
         if span.loop_var:
             return f"Open each {_humanize_identifier(span.loop_var)}"
+        if span.goto_literal:
+            return f"Open {span.goto_literal}"
+        if span.goto_name:
+            return f"Open the {_humanize_identifier(span.goto_name)}"
         return "Open the linked page"
     if span.action_type == "extract":
+        store = _humanize_identifier(span.store_name) if span.store_name else None
+        if store and span.element_name:
+            return f'Extract {store} from "{span.element_name}"'
+        if store:
+            return f"Extract {store}"
+        if span.element_name:
+            return f'Extract "{span.element_name}"'
         return "Extract information from the page"
     if span.action_type == "click":
         return f"Click {_target_label(span.receiver, span.first_arg)}"
@@ -268,18 +607,23 @@ def _describe(span: CodeActionSpan) -> str:
 
 
 def _consolidate_read_spans(spans: list[CodeActionSpan]) -> list[CodeActionSpan]:
-    """Merge adjacent raw DOM reads into one extract span."""
+    """Merge adjacent raw DOM reads that carry the same label into one extract span."""
     consolidated: list[CodeActionSpan] = []
     for span in spans:
         prev = consolidated[-1] if consolidated else None
-        if span.method in _READ_METHODS and prev is not None and prev.method in _READ_METHODS:
+        if (
+            span.method in _READ_METHODS
+            and prev is not None
+            and prev.method in _READ_METHODS
+            and _describe(prev) == _describe(span)
+        ):
             consolidated[-1] = replace(prev, line_end=max(prev.line_end, span.line_end))
             continue
         consolidated.append(span)
     return consolidated
 
 
-def derive_code_block_steps(code: str, goal: str | None = None) -> list[dict[str, Any]]:
+def derive_code_block_steps(code: str) -> list[dict[str, Any]]:
     """Derive the ordered plain-language steps for a code block from its code (deterministic)."""
     return [
         {
@@ -292,10 +636,16 @@ def derive_code_block_steps(code: str, goal: str | None = None) -> list[dict[str
     ]
 
 
+def is_code_block_type(block_type: object) -> bool:
+    """True for every spelling the schema later canonicalizes to ``code``, so a pre-normalization
+    pass cannot be skipped by an alias."""
+    return isinstance(block_type, str) and normalize_copilot_block_type_alias(block_type) == "code"
+
+
 def _iter_code_block_dicts(node: Any) -> Iterator[dict[str, Any]]:
     """Yield every code-block dict anywhere in the workflow structure (handles nested loop_blocks)."""
     if isinstance(node, dict):
-        if node.get("block_type") == "code" and isinstance(node.get("code"), str):
+        if is_code_block_type(node.get("block_type")) and isinstance(node.get("code"), str):
             yield node
         for value in node.values():
             yield from _iter_code_block_dicts(value)
@@ -305,12 +655,9 @@ def _iter_code_block_dicts(node: Any) -> Iterator[dict[str, Any]]:
 
 
 def derive_code_block_steps_in_yaml(workflow_yaml: str) -> str:
-    """Return workflow_yaml with each code block's `steps` filled from its `code` when absent.
-
-    Deterministic and sync: a block that already carries steps is left untouched, so this
-    can run on the shared YAML->Workflow seam without clobbering steps produced upstream."""
+    """Return workflow_yaml with each code block's `steps` rebuilt from its `code`, discarding any it carried."""
     try:
-        data = yaml.safe_load(workflow_yaml)
+        data = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(data, (dict, list)):
@@ -318,60 +665,9 @@ def derive_code_block_steps_in_yaml(workflow_yaml: str) -> str:
 
     changed = False
     for block in _iter_code_block_dicts(data):
-        if block.get("steps"):
-            continue
-        block["steps"] = derive_code_block_steps(block["code"], block.get("prompt"))
-        changed = True
-
-    if not changed:
-        return workflow_yaml
-    return yaml.safe_dump(data, sort_keys=False)
-
-
-def fill_code_block_prompts_in_yaml(
-    workflow_yaml: str,
-    *,
-    prior_yaml: str | None = None,
-    fallback_goals: dict[str, str] | None = None,
-) -> str:
-    """Return workflow_yaml with each code block's `prompt` (goal) filled when absent.
-
-    The editor treats a code block as code-first (plain view + steps) only when it
-    carries a `prompt`; the model authors the goal as artifact `declared_goal`, not on
-    the block, and code regeneration replaces the whole block YAML and drops it. Prefer
-    the prior block's prompt by label (exact user text, preserved across regen), then a
-    fallback goal by label (e.g. the model's `declared_goal`)."""
-    try:
-        data = yaml.safe_load(workflow_yaml)
-    except yaml.YAMLError:
-        return workflow_yaml
-    if not isinstance(data, (dict, list)):
-        return workflow_yaml
-
-    prior_prompts: dict[str, str] = {}
-    if prior_yaml:
-        try:
-            prior_data = yaml.safe_load(prior_yaml)
-        except yaml.YAMLError:
-            prior_data = None
-        if isinstance(prior_data, (dict, list)):
-            for block in _iter_code_block_dicts(prior_data):
-                label = block.get("label")
-                prompt = block.get("prompt")
-                if isinstance(label, str) and isinstance(prompt, str) and prompt:
-                    prior_prompts[label] = prompt
-
-    fallback_goals = fallback_goals or {}
-    changed = False
-    for block in _iter_code_block_dicts(data):
-        if block.get("prompt"):
-            continue
-        label = block.get("label")
-        if not isinstance(label, str):
-            continue
-        goal = prior_prompts.get(label) or fallback_goals.get(label)
-        if goal:
-            block["prompt"] = goal
+        derived = derive_code_block_steps(block["code"])
+        if block.get("steps") != derived:
+            block["steps"] = derived
             changed = True
 
     if not changed:
@@ -386,14 +682,14 @@ def fill_code_block_error_code_mappings_in_yaml(workflow_yaml: str, *, prior_yam
     are deliberate values and therefore remain untouched.
     """
     try:
-        data = yaml.safe_load(workflow_yaml)
+        data = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(data, (dict, list)) or not prior_yaml:
         return workflow_yaml
 
     try:
-        prior_data = yaml.safe_load(prior_yaml)
+        prior_data = safe_load_no_dates(prior_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(prior_data, (dict, list)):
@@ -411,25 +707,6 @@ def fill_code_block_error_code_mappings_in_yaml(workflow_yaml: str, *, prior_yam
         if "error_code_mapping" not in block and isinstance(label, str) and label in prior_mappings:
             block["error_code_mapping"] = prior_mappings[label]
             changed = True
-
-    if not changed:
-        return workflow_yaml
-    return yaml.safe_dump(data, sort_keys=False)
-
-
-async def apply_derived_code_block_steps(workflow_yaml: str) -> str:
-    """Return workflow_yaml with each code block's `steps` recomputed from its `code`."""
-    try:
-        data = yaml.safe_load(workflow_yaml)
-    except yaml.YAMLError:
-        return workflow_yaml
-    if not isinstance(data, (dict, list)):
-        return workflow_yaml
-
-    changed = False
-    for block in _iter_code_block_dicts(data):
-        block["steps"] = derive_code_block_steps(block["code"], block.get("prompt"))
-        changed = True
 
     if not changed:
         return workflow_yaml
@@ -477,7 +754,7 @@ def bind_referenced_parameters_in_yaml(workflow_yaml: str) -> str:
     declares can be added, so this cannot invent a binding.
     """
     try:
-        data = yaml.safe_load(workflow_yaml)
+        data = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(data, (dict, list)):
@@ -505,3 +782,159 @@ def bind_referenced_parameters_in_yaml(workflow_yaml: str) -> str:
     if not changed:
         return workflow_yaml
     return yaml.safe_dump(data, sort_keys=False)
+
+
+def _user_owned_goal_labels(workflow_yaml: str, *, awaiting_rebuild: bool) -> list[str]:
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(data, (dict, list)):
+        return []
+    labels: list[str] = []
+    for block in _iter_code_block_dicts(data):
+        label = block.get("label")
+        if not isinstance(label, str) or not label or block.get("user_owned_goal") is not True:
+            continue
+        if awaiting_rebuild and block.get("goal_needs_regeneration") is not True:
+            continue
+        labels.append(label)
+    return labels
+
+
+_USER_OWNED_GOAL_FIELDS = ("user_owned_goal", "goal_needs_regeneration")
+_CODE_EDITED_BY_HAND_FIELD = "code_edited_by_hand"
+
+
+def code_block_labels_with_user_owned_goal(workflow_yaml: str) -> list[str]:
+    return _user_owned_goal_labels(workflow_yaml, awaiting_rebuild=False)
+
+
+def code_block_labels_awaiting_goal_rebuild(workflow_yaml: str) -> list[str]:
+    return _user_owned_goal_labels(workflow_yaml, awaiting_rebuild=True)
+
+
+@dataclass(frozen=True)
+class UserOwnedGoalCarry:
+    """The candidate workflow with user-owned Goals restored, and what the carry kept or dropped."""
+
+    workflow_yaml: str
+    kept: list[str]
+    dropped: list[str]
+
+    @property
+    def kept_message(self) -> str | None:
+        if not self.kept:
+            return None
+        return (
+            "The user wrote these blocks' Goals, so the stored Goal text was kept and the submitted "
+            "prompt was discarded for them."
+        )
+
+    @property
+    def dropped_message(self) -> str | None:
+        if not self.dropped:
+            return None
+        return (
+            "These blocks carried a Goal the user wrote and are absent from the accepted workflow, so "
+            "their Goal is gone: " + ", ".join(self.dropped) + "."
+        )
+
+
+def carry_user_owned_goals_in_yaml(
+    workflow_yaml: str,
+    *,
+    prior_yaml: str | None = None,
+    rebuilt_labels: Collection[str] = (),
+    goal_rewritten_labels: Collection[str] = (),
+) -> UserOwnedGoalCarry:
+    """Ownership and code_edited_by_hand are read from prior_yaml alone, so a submission can neither mint
+    nor drop them. goal_needs_regeneration clears for labels in rebuilt_labels. code_edited_by_hand clears only
+    when the stored Goal now describes the code: a declared and changed Goal on a block the person does not own,
+    or the rebuild of a pending person-owned Goal."""
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+        prior_data = safe_load_no_dates(prior_yaml) if prior_yaml else {}
+    except yaml.YAMLError:
+        return UserOwnedGoalCarry(workflow_yaml, [], [])
+    if not isinstance(prior_data, dict) or not isinstance(data, dict):
+        return UserOwnedGoalCarry(workflow_yaml, [], [])
+
+    owned_prior_blocks: dict[str, dict[str, Any]] = {}
+    hand_edited_prior_prompts: dict[str, Any] = {}
+    for prior_block in _iter_code_block_dicts(prior_data):
+        prior_label = prior_block.get("label")
+        if not isinstance(prior_label, str):
+            continue
+        if prior_block.get("user_owned_goal") is True:
+            owned_prior_blocks[prior_label] = prior_block
+        if prior_block.get(_CODE_EDITED_BY_HAND_FIELD) is True:
+            hand_edited_prior_prompts[prior_label] = prior_block.get("prompt")
+
+    rebuilt = set(rebuilt_labels)
+    goal_rewritten = set(goal_rewritten_labels)
+    changed = False
+    kept: list[str] = []
+    submitted_labels: set[str] = set()
+    for block in _iter_code_block_dicts(data):
+        label = block.get("label")
+        if isinstance(label, str):
+            submitted_labels.add(label)
+        owner = owned_prior_blocks.get(label) if isinstance(label, str) else None
+        if isinstance(label, str) and label in hand_edited_prior_prompts:
+            goal_matches_code = (
+                label in rebuilt and owner.get("goal_needs_regeneration") is True
+                if owner is not None
+                else label in goal_rewritten and block.get("prompt") != hand_edited_prior_prompts[label]
+            )
+        else:
+            goal_matches_code = True
+        if not goal_matches_code:
+            if block.get(_CODE_EDITED_BY_HAND_FIELD) is not True:
+                block[_CODE_EDITED_BY_HAND_FIELD] = True
+                changed = True
+        elif block.get(_CODE_EDITED_BY_HAND_FIELD):
+            del block[_CODE_EDITED_BY_HAND_FIELD]
+            changed = True
+        if owner is None or not isinstance(label, str):
+            for field in _USER_OWNED_GOAL_FIELDS:
+                if block.get(field):
+                    del block[field]
+                    changed = True
+            continue
+        owned_prompt = owner.get("prompt")
+        restored: dict[str, Any] = {
+            "user_owned_goal": True,
+            "goal_needs_regeneration": owner.get("goal_needs_regeneration") is True and label not in rebuilt,
+        }
+        if isinstance(owned_prompt, str):
+            restored["prompt"] = owned_prompt
+            if block.get("prompt") != owned_prompt:
+                kept.append(label)
+        for field, value in restored.items():
+            if block.get(field) != value:
+                block[field] = value
+                changed = True
+
+    dropped = sorted(
+        label
+        for label, owned_block in owned_prior_blocks.items()
+        if label not in submitted_labels and isinstance(owned_block.get("prompt"), str)
+    )
+    if dropped:
+        LOG.info("copilot submission omitted user-owned goal blocks", dropped_labels=dropped)
+
+    carried_yaml = dump_workflow_yaml(data) if changed else workflow_yaml
+    return UserOwnedGoalCarry(carried_yaml, sorted(kept), dropped)
+
+
+def user_owned_goal_carry_disclosure(carry: UserOwnedGoalCarry) -> dict[str, str | list[str]]:
+    """What the model must be told about Goals it submitted that the carry overrode or lost."""
+    disclosure: dict[str, str | list[str]] = {}
+    if carry.kept_message is not None:
+        disclosure["stored_goal_kept"] = carry.kept
+        disclosure["stored_goal_kept_message"] = carry.kept_message
+    if carry.dropped_message is not None:
+        disclosure["stored_goal_dropped"] = carry.dropped
+        disclosure["stored_goal_dropped_message"] = carry.dropped_message
+    return disclosure

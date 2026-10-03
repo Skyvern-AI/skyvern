@@ -9,6 +9,7 @@ import re
 import textwrap
 import typing as t
 from dataclasses import dataclass, field
+from math import isfinite
 from urllib.parse import urlparse
 
 import structlog
@@ -53,11 +54,6 @@ CLICK_NAVIGATION_WINDOW_MS = 3000
 DRAFT_TIMESTAMP_TOLERANCE_MS = 1.0
 
 ActionDraftPair = tuple[Action, RecordingDraftStep | None]
-
-# Interactions that silently vanish from a workflow if the synthesizer cannot
-# locate them; any unlocatable one rejects the recording result.
-# Dropped hovers are tolerated: they are usually incidental to a located click.
-_REQUIRED_LOCATOR_TOOLS = frozenset({"click", "type_text", "select_option", "upload_file", CREDENTIAL_FILL_TOOL_NAME})
 
 # The credential field each recorded kind fills. A secret credential exposes one
 # `secret_value`; `magic_link` resolves at runtime rather than as a field, and `credit_card`
@@ -247,6 +243,10 @@ def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = N
         base["observed_hidden"] = True
 
     if isinstance(action, ActionClick):
+        if (target.tag_name or "").upper() == "CANVAS":
+            offset_x, offset_y = target.mouse.offset_x, target.mouse.offset_y
+            has_offset = offset_x is not None and offset_y is not None and isfinite(offset_x) and isfinite(offset_y)
+            base["canvas_click_position"] = {"x": offset_x, "y": offset_y} if has_offset else None
         return {"tool_name": "click", **base}
     if isinstance(action, ActionHover):
         return {"tool_name": "hover", **base}
@@ -265,7 +265,7 @@ def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = N
             interaction["typed_value"] = action.input_value
         return interaction
     if isinstance(action, ActionPressKey):
-        # Not in _REQUIRED_LOCATOR_TOOLS: an unlocatable press falls back to
+        # Not a recording-required action: an unlocatable press falls back to
         # page.keyboard.press, which is still deterministic replay.
         return {"tool_name": "press_key", "key": action.key, **base}
     if isinstance(action, ActionWait):
@@ -494,17 +494,13 @@ def actions_to_code_first_blocks(
 
     for segment in segments:
         trajectory = segment_trajectory(segment, bind_credentials=bind_credentials)
-        for interaction in trajectory:
-            if interaction["tool_name"] in _REQUIRED_LOCATOR_TOOLS and not (
-                interaction.get("selector") or (interaction.get("role") and interaction.get("accessible_name"))
-            ):
-                LOG.info(
-                    "record_browser.code_first_unlocatable_interaction",
-                    tool_name=interaction["tool_name"],
-                )
-                return None
         if trajectory:
-            synthesized = synthesize_code_block(trajectory, allowed_credential_fields=_ALLOWED_CREDENTIAL_FILL_FIELDS)
+            synthesized = synthesize_code_block(
+                trajectory,
+                allowed_credential_fields=_ALLOWED_CREDENTIAL_FILL_FIELDS,
+                _max_steps=len(trajectory),
+                _allow_recording_fallbacks=True,
+            )
         elif segment.source_url:
             synthesized = synthesize_goto_code_block(segment.source_url)
         else:
@@ -592,7 +588,7 @@ def actions_to_code_first_blocks(
                 parameters=[{"key": key} for key in block_parameter_keys],
                 # A non-null prompt is what makes the editor render the code-first node; "" is
                 # runtime-neutral (every backend prompt check is truthiness based) and leaves the
-                # Goal for the user, because a fabricated one would arm runtime self-heal.
+                # Goal for the user, because a fabricated one would arm the AI fallback.
                 prompt="",
                 steps=derive_code_block_steps(code) or None,
             )

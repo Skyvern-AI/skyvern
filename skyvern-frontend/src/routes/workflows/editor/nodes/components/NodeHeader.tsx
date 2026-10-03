@@ -1,3 +1,14 @@
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowSave,
+} from "@/store/WorkflowHasChangesStore";
+import {
+  isEditorMutationLocked,
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
 import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
@@ -14,6 +25,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import {
@@ -63,15 +75,17 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useMissingStartUrlStore } from "@/store/MissingStartUrlStore";
+import { useReviewAnnotation } from "../../review/reviewAnnotation";
+import { ReviewBlockChanges, ReviewStatusChip } from "../../review/ReviewParts";
 import {
   RUN_APPEND_PANES,
-  STUDIO_PANES_PARAM,
   withPanesOpen,
 } from "@/routes/workflows/studio/panes";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
+
 import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
@@ -94,7 +108,11 @@ import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
 import type { AppNode } from "..";
-import { getWorkflowErrors } from "../../workflowEditorUtils";
+import {
+  blockRunErrors,
+  isMissingRequiredStartUrl,
+} from "../../workflowEditorUtils";
+import { getNodeBrowserUrlError } from "../../browserBlockUrl";
 import { NodeGripHandle } from "./NodeGripHandle";
 import {
   getDragGateReason,
@@ -252,6 +270,7 @@ function NodeHeader({
   type,
 }: Props) {
   const log = useLogging();
+  const postHog = usePostHog();
   const mode = useWorkflowEditorMode();
   const workflowPermanentId = useWorkflowPermanentId();
   const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
@@ -264,6 +283,9 @@ function NodeHeader({
   const isCollapsible = collapsibleWorkflowBlockTypes.has(type);
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
+  const reviewAnnotation = useReviewAnnotation();
+  const blockReview =
+    reviewAnnotation?.kind === "block" ? reviewAnnotation : null;
   const [label, setLabel] = useNodeLabelChangeHandler({
     id: nodeId,
     initialValue: blockLabel,
@@ -278,7 +300,7 @@ function NodeHeader({
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
-  const { resolveLivePanes } = useStudioPanes();
+  const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
@@ -354,7 +376,7 @@ function NodeHeader({
     ) {
       setAutoplay(null, null);
       setTimeout(() => {
-        runBlock.mutateAsync({ codeGen: true });
+        runBlock.mutate({ codeGen: true });
       }, 100);
     }
 
@@ -379,6 +401,7 @@ function NodeHeader({
   });
 
   const runBlock = useMutation({
+    mutationKey: ["runBlock"],
     mutationFn: async (opts?: {
       codeGen: boolean;
       parameterOverrides?: Record<string, unknown>;
@@ -392,9 +415,24 @@ function NodeHeader({
       // one. Filter relies on the implicit contract that every validator
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
-      const allErrors = getWorkflowErrors(reactFlow.getNodes());
-      const labelPrefix = `${blockLabel}:`;
-      const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      const blockErrors = blockRunErrors(reactFlow.getNodes(), blockLabel);
+      if (
+        isMissingRequiredStartUrl(
+          reactFlow.getNodes(),
+          reactFlow.getEdges(),
+          nodeId,
+        )
+      ) {
+        useMissingStartUrlStore.getState().flag(nodeId);
+        blockErrors.push(
+          `${blockLabel}: URL is required. No earlier block opens a page, so the run would start on a blank page.`,
+        );
+      }
+      const thisNode = reactFlow.getNode(nodeId) as AppNode | undefined;
+      const urlError = thisNode ? getNodeBrowserUrlError(thisNode) : null;
+      if (urlError) {
+        blockErrors.push(`${blockLabel}: ${urlError}`);
+      }
       if (blockErrors.length > 0) {
         toast({
           variant: "destructive",
@@ -426,7 +464,7 @@ function NodeHeader({
 
       if (!debugSession) {
         // TODO: kind of redundant; investigate if this is necessary; either
-        // Sentry's log should output to the console, or Sentry should just
+        // the logging sink should output to the console, or it should just
         // gather native console.error output.
         console.error("Run block: there is no debug session, yet");
         log.error("Run block: there is no debug session, yet");
@@ -512,7 +550,12 @@ function NodeHeader({
         "/run/workflows/blocks",
         body,
       );
-      return { response, mergedParameters };
+      return {
+        response,
+        mergedParameters,
+        organizationId: workflow.organization_id,
+        blockType: type,
+      };
     },
     onSuccess: (result) => {
       if (!result?.response) {
@@ -530,7 +573,13 @@ function NodeHeader({
         return;
       }
 
-      const { response, mergedParameters } = result;
+      const { response, mergedParameters, organizationId, blockType } = result;
+
+      postHog.capture("builder.block.run", {
+        org_id: organizationId,
+        workflow_permanent_id: workflowPermanentId,
+        block_type: blockType,
+      });
 
       if (workflowPermanentId) {
         useDebuggerLastRunValuesStore
@@ -561,7 +610,7 @@ function NodeHeader({
           wr: response.data.run_id,
           bl: label,
         });
-        search.set(STUDIO_PANES_PARAM, panes.join(","));
+        preserveNextEntry(`?${search.toString()}`, panes);
         // Under the short /runs/{wr} URL the run id is the pathname, so keep it
         // and only swap the search; from the editor it is a full studio path.
         if (location.pathname.startsWith("/runs/")) {
@@ -575,10 +624,20 @@ function NodeHeader({
         );
       }
     },
-    onError: (error: AxiosError | ValidationFailureError) => {
+    onError: (
+      error:
+        | AxiosError
+        | ValidationFailureError
+        | SaveRefusedError
+        | SaveStaleError,
+    ) => {
       // The block-validation gate threw a typed error and already showed
       // its own toast; don't stack the generic "Failed to start" on top.
-      if (error instanceof ValidationFailureError) {
+      if (
+        error instanceof ValidationFailureError ||
+        error instanceof SaveRefusedError ||
+        error instanceof SaveStaleError
+      ) {
         return;
       }
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -599,6 +658,7 @@ function NodeHeader({
   });
 
   const cancelBlock = useMutation({
+    mutationKey: ["cancelBlock"],
     mutationFn: async () => {
       if (!debugSession) {
         log.error("Cancel block: missing debug session", {
@@ -874,11 +934,14 @@ function NodeHeader({
     );
   }
 
-  const collapseToggleGated = isCollapseGated({
-    isRecording,
-    isReadOnlyScope,
-    isCanvasLocked,
-  });
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+  const collapseToggleGated =
+    mutationLocked ||
+    isCollapseGated({
+      isRecording,
+      isReadOnlyScope,
+      isCanvasLocked,
+    });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
   const playInert =
     workflowRunIsRunningOrQueued ||
@@ -902,7 +965,7 @@ function NodeHeader({
               disabled={collapseToggleGated}
               onClick={(e) => {
                 e.stopPropagation();
-                if (collapseToggleGated) return;
+                if (collapseToggleGated || isEditorMutationLocked()) return;
                 toggleBlockCollapsed(
                   workflowPermanentId ?? "__global__",
                   blockLabel,
@@ -982,8 +1045,15 @@ function NodeHeader({
             <EditableNodeTitle
               value={blockLabel}
               editable={editable}
-              onChange={setLabel}
-              titleClassName="text-base"
+              onChange={(value) => {
+                // The label handler queues edits while the graph is locked.
+                useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+                setLabel(value);
+              }}
+              titleClassName={cn("text-base", {
+                "text-muted-foreground line-through":
+                  blockReview?.status === "removed",
+              })}
               // A negative margin here would shrink this auto-width column's
               // measured size and clip short values via max-w-full, so the
               // padding is offset with relative/left (paint-only) instead.
@@ -1034,6 +1104,9 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {blockReview?.showStatus && blockReview.status !== "unchanged" ? (
+            <ReviewStatusChip status={blockReview.status} />
+          ) : null}
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
@@ -1143,6 +1216,8 @@ function NodeHeader({
           )}
         </div>
       </header>
+
+      {blockReview ? <ReviewBlockChanges review={blockReview} /> : null}
 
       <BlockParametersDialog
         open={showParamsDialog}

@@ -41,6 +41,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     contains_internal_machinery_leak,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.repair_origin_run import (
+    OriginBlockOutput,
+    OriginExecutionSettings,
+    OriginOutputSnapshot,
+    SelectedOutputSource,
+)
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
@@ -58,7 +64,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML
@@ -565,6 +571,9 @@ title: human approval example
 workflow_definition:
   parameters: []
   blocks:
+    - block_type: wait
+      label: request_access
+      wait_sec: 1
     - block_type: human_interaction
       label: approve_login
       timeout_seconds: 3600
@@ -615,6 +624,21 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     ctx = make_copilot_ctx(browser_session_id="pbs_chat")
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_outputs_run_id = "wr_origin"
+    origin = OriginOutputSnapshot(
+        definition=harness["workflow"].workflow_definition,
+        outputs={
+            "request_access": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"sent": True}
+            )
+        },
+        settings=OriginExecutionSettings.of(harness["workflow"]),
+    )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "request_access": SelectedOutputSource("request_access", "wr_origin", "origin", origin)
+    }
+    ctx.frontier_origin_reused_labels = ["request_access"]
     before = set(run_execution._DETACHED_CLEANUP_TASKS)
 
     started = time.monotonic()
@@ -626,6 +650,8 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     assert result["data"]["control_signal"]["kind"] == "watchdog_paused", result
     assert "paused" in result["data"]["user_facing_summary"].lower()
     assert "uncertain" not in result["error"].lower()
+    assert result["data"]["reused_origin_output_labels"] == ["request_access"]
+    assert result["data"]["origin_workflow_run_id"] == "wr_origin"
 
     harness["cancel_run_task"].assert_not_awaited()
     harness["cooperative_cancel"].assert_not_awaited()
@@ -788,6 +814,7 @@ async def test_non_success_watchdog_result_types_selected_failed_block_locators(
     observe = AsyncMock(return_value=[{"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}])
     monkeypatch.setattr(run_execution, "_observe_authored_locators", observe)
     monkeypatch.setattr(run_execution, "RUN_BLOCKS_STAGNATION_WINDOW_SECONDS", 0)
+    monkeypatch.setattr(run_execution, "_any_quiet_block_requested", lambda *_args, **_kwargs: False)
     ctx = make_copilot_ctx(browser_session_id="pbs_chat")
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
@@ -878,6 +905,105 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
     assert "failure_categories" not in result["data"]
     harness["worker_execute"].assert_awaited_once()
     harness["cooperative_cancel"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("_repeat", range(3))
+@pytest.mark.parametrize("layout", ["direct", "loop", "nested", "finally"])
+async def test_web_search_finishes_after_silent_period_without_watchdog_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    _repeat: int,
+    layout: str,
+) -> None:
+    workflow_yaml = """
+title: web search example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: web_search
+      label: search
+      query: site:example.com docs
+"""
+    selected_label = "search"
+    if layout in {"loop", "nested"}:
+        workflow_yaml = """
+title: web search loop
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: items
+      workflow_parameter_type: json
+      default_value: [1]
+  blocks:
+    - block_type: for_loop
+      label: loop
+      loop_over_parameter_key: items
+      loop_blocks:
+        - block_type: web_search
+          label: search
+          query: site:example.com docs
+"""
+        selected_label = "search" if layout == "nested" else "loop"
+    elif layout == "finally":
+        workflow_yaml = """
+title: web search cleanup
+workflow_definition:
+  parameters: []
+  finally_block_label: search
+  blocks:
+    - block_type: navigation
+      label: navigate
+      url: https://example.com
+      navigation_goal: Open the page.
+    - block_type: web_search
+      label: search
+      query: site:example.com docs
+"""
+        selected_label = "navigate"
+    output = {"query": "site:example.com docs", "results": [], "total_count": 0, "prompt_output": None}
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=workflow_yaml,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=[
+            WorkflowRunBlock(
+                label="search",
+                block_type=BlockType.WEB_SEARCH,
+                status="completed",
+                output=output,
+                workflow_run_block_id="wrb_terminal",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                created_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 2, 30, tzinfo=UTC),
+            )
+        ],
+    )
+    elapsed = 0.0
+    progress = iter(((0.0, "running"), (120.0, "running"), (150.0, "completed")))
+    marker = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime, datetime]:
+        nonlocal elapsed
+        elapsed, status = next(progress)
+        return _fake_run(status=status, modified_at=marker), marker, marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": [selected_label], "parameters": {}}, ctx)
+
+    assert elapsed == 150.0
+    assert result["ok"] is True, result
+    assert result["data"]["overall_status"] == "completed"
+    assert result["data"]["blocks"][0]["output"] == output
+    harness["worker_execute"].assert_awaited_once()
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["cancel_run_task"].assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import typing
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .code_block_step_yaml import CodeBlockStepYaml
+from .code_block_yaml_data_schema import CodeBlockYamlDataSchema
 
 
 class CodeBlockYaml(UniversalBaseModel):
@@ -26,6 +27,7 @@ class CodeBlockYaml(UniversalBaseModel):
     parameter_keys: typing.Optional[typing.List[str]] = None
     prompt: typing.Optional[str] = None
     steps: typing.Optional[typing.List[CodeBlockStepYaml]] = None
+    data_schema: typing.Optional[CodeBlockYamlDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

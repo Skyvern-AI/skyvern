@@ -2,35 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from agents import ModelSettings, function_tool
+from agents import ItemHelpers, ModelSettings, RunContextWrapper, function_tool
 from agents.extensions.models.litellm_model import LitellmModel
+from agents.items import TResponseInputItem
+from agents.mcp import MCPServer, MCPUtil
 from agents.models.interface import ModelTracing
+from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
+from litellm.llms.vertex_ai.gemini.transformation import _gemini_convert_messages_with_history
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import Delta
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import ModelResponseStream, StreamingChoices, Usage
+from mcp.types import Tool as MCPTool
 from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
+from openai.types.responses import ResponseFunctionToolCall
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, SCREENSHOT_SENTINEL, _prune_input_list
+from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
+    _model_call_telemetry_scope,
     current_model_attempt_telemetry,
     current_model_call_telemetry,
     model_attempt_telemetry_scope,
-    model_call_telemetry_scope,
 )
 from skyvern.forge.sdk.copilot.pending_operation import (
     _turn_operations,
@@ -38,6 +48,7 @@ from skyvern.forge.sdk.copilot.pending_operation import (
     pending_operation,
     pending_operation_fields,
 )
+from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
@@ -363,6 +374,52 @@ async def test_explicit_cache_envelope_leaves_other_routes_unchanged(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["anthropic/claude-sonnet-5-5", "bedrock/global.anthropic.claude-sonnet-5-5"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_cacheable_system_instructions_survive_provider_message_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    stream: bool,
+) -> None:
+    prompt = CacheableSystemInstructions("stable instructions", "\ndynamic context", cache_namespace="wcc_test")
+    copied_messages: list[list[dict[str, Any]]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse | AsyncStream[ChatCompletionChunk]:
+        copied_messages.append(copy.deepcopy(kwargs["messages"]))
+        if kwargs.get("stream"):
+            return cast(AsyncStream[ChatCompletionChunk], _ChunkStream(_stream_chunks()))
+        return _completion()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    model = CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1)
+    if stream:
+        events = [
+            event
+            async for event in model.stream_response(
+                system_instructions=prompt,
+                input=[{"role": "user", "content": "Return 42"}],
+                model_settings=ModelSettings(include_usage=True),
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+            )
+        ]
+        response = events[-1].response
+    else:
+        response = await _get_response(model, system_instructions=prompt)
+
+    assert copied_messages[0][0] == {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "stable instructions", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "\ndynamic context"},
+        ],
+    }
+    assert ItemHelpers.extract_last_text(response.output[-1]) == "42"
+
+
+@pytest.mark.asyncio
 async def test_stream_capture_preserves_events_order_and_backpressure(monkeypatch: pytest.MonkeyPatch) -> None:
     requests: list[bytes] = []
     streams: list[_ChunkStream] = []
@@ -533,9 +590,9 @@ def test_chat_stop_metadata_captures_direct_refusal() -> None:
 
 def test_attempt_telemetry_keeps_only_the_latest_model_call() -> None:
     with model_attempt_telemetry_scope() as attempt:
-        with model_call_telemetry_scope(1) as first:
+        with _model_call_telemetry_scope(1) as first:
             first.finish_reason = "length"
-        with model_call_telemetry_scope(2) as second:
+        with _model_call_telemetry_scope(2) as second:
             second.finish_reason = "content_filter"
             second.content_filter = True
 
@@ -549,7 +606,7 @@ async def test_concurrent_attempt_stop_metadata_is_isolated() -> None:
     release = asyncio.Event()
 
     async def observe(index: int, reason: str) -> tuple[int, str | None]:
-        with model_attempt_telemetry_scope() as attempt, model_call_telemetry_scope(index) as call:
+        with model_attempt_telemetry_scope() as attempt, _model_call_telemetry_scope(index) as call:
             call.finish_reason = reason
             await release.wait()
         return attempt.latest_stop_metadata.model_call_index, attempt.latest_stop_metadata.finish_reason
@@ -575,9 +632,9 @@ async def test_model_error_resets_context(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_nested_model_call_scopes_restore_outer_call() -> None:
-    with model_call_telemetry_scope(1) as outer:
+    with _model_call_telemetry_scope(1) as outer:
         assert current_model_call_telemetry() is outer
-        with model_call_telemetry_scope(2) as inner:
+        with _model_call_telemetry_scope(2) as inner:
             assert current_model_call_telemetry() is inner
         assert current_model_call_telemetry() is outer
 
@@ -649,7 +706,7 @@ def test_completed_model_call_emits_datadog_usage_with_explicit_zeroes(
     )
     monkeypatch.setattr(model_telemetry_module, "_model_call_cost", lambda telemetry, model: 0.125)
 
-    with model_call_telemetry_scope(3, model="gpt-5.6-sol") as telemetry:
+    with _model_call_telemetry_scope(3, model="gpt-5.6-sol") as telemetry:
         telemetry.cache_mode = "explicit"
         telemetry.cache_breakpoint_count = 1
         telemetry.cache_stable_prefix_chars = 118_024
@@ -691,7 +748,7 @@ def test_datadog_usage_preserves_missing_cache_write_as_absent(
     )
     monkeypatch.setattr(model_telemetry_module, "_model_call_cost", lambda telemetry, model: None)
 
-    with model_call_telemetry_scope(
+    with _model_call_telemetry_scope(
         4,
         model="azure/gpt-5.6-sol",
         base_url="https://example.openai.azure.com",
@@ -722,7 +779,7 @@ def test_datadog_usage_attributes_fallback_spend_to_response_model(
         lambda telemetry, model: priced_models.append(model) or 0.25,
     )
 
-    with model_call_telemetry_scope(
+    with _model_call_telemetry_scope(
         5,
         model="azure/gpt-5.6-sol",
         base_url="https://example.openai.azure.com",
@@ -737,6 +794,32 @@ def test_datadog_usage_attributes_fallback_spend_to_response_model(
     assert events[0]["gen_ai.provider.name"] == "anthropic"
 
 
+@pytest.mark.asyncio
+async def test_datadog_usage_names_the_provider_that_served_an_in_call_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(model_telemetry_module.LOG, "info", lambda _event, **fields: events.append(fields))
+    monkeypatch.setattr(model_telemetry_module, "_model_call_cost", lambda telemetry, model: None)
+    chunk = ModelResponseStream(model="gpt-5.6-terra")
+    chunk._hidden_params = {"custom_llm_provider": "openai"}
+
+    async def served_by_openai() -> AsyncIterator[ModelResponseStream]:
+        yield chunk
+
+    with _model_call_telemetry_scope(
+        6,
+        model="azure/gpt-5.6-terra",
+        base_url="https://example.openai.azure.com",
+    ) as telemetry:
+        await anext(model_telemetry_module._UsageCapturingStream(served_by_openai(), telemetry))  # type: ignore[arg-type]
+        telemetry.input_tokens = 100
+        telemetry.output_tokens = 5
+
+    assert events[0]["gen_ai.request.model"] == "azure/gpt-5.6-terra"
+    assert events[0]["gen_ai.provider.name"] == "openai"
+
+
 def test_model_call_without_provider_usage_does_not_emit_datadog_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -747,7 +830,7 @@ def test_model_call_without_provider_usage_does_not_emit_datadog_event(
         lambda *args, **kwargs: events.append((args, kwargs)),
     )
 
-    with model_call_telemetry_scope(5, model="gpt-5.6-sol"):
+    with _model_call_telemetry_scope(5, model="gpt-5.6-sol"):
         pass
 
     assert events == []
@@ -761,7 +844,7 @@ def test_datadog_logging_failure_does_not_escape_or_leak_context(
 
     monkeypatch.setattr(model_telemetry_module.LOG, "info", fail_to_log)
 
-    with model_call_telemetry_scope(6, model="gpt-5.6-sol") as telemetry:
+    with _model_call_telemetry_scope(6, model="gpt-5.6-sol") as telemetry:
         telemetry.input_tokens = 100
         telemetry.output_tokens = 5
 
@@ -875,7 +958,7 @@ def test_otel_provider_name_rejects_lookalike_azure_urls(base_url: str) -> None:
 def test_model_call_scope_names_the_open_operation_and_retires_it_on_exit() -> None:
     install_pending_operation_slot()
 
-    with model_call_telemetry_scope(0, model="gpt-5.6-sol"):
+    with _model_call_telemetry_scope(0, model="gpt-5.6-sol"):
         while_open = pending_operation_fields()
 
     after_exit = pending_operation_fields()
@@ -1301,3 +1384,389 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     assert result.browser_ablation_metadata is not None
     assert result.browser_ablation_metadata["eval_mode"] == "browser_ablation"
     assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]
+
+
+_GEMINI = "vertex_ai/gemini-2.5-flash"
+_SCHEMA_CALL = ResponseFunctionToolCall(
+    type="function_call",
+    call_id="call_schema",
+    name="get_block_schema",
+    arguments='{"block_type": "code"}',
+)
+_REF_RESULT = json.dumps({"ok": True, "data": {"schema": {"$ref": "#/$defs/Step", "$defs": {"Step": {}}}}})
+_ESCAPED_REF_KEY_RESULT = '{"ok": true, "data": {"schema": {"\\u0024ref": "#/$defs/Step", "$defs": {"Step": {}}}}}'
+
+
+def _tool_turn(output: object) -> list[TResponseInputItem]:
+    return [
+        {"role": "user", "content": "Add a block"},
+        cast(TResponseInputItem, _SCHEMA_CALL.model_dump()),
+        ItemHelpers.tool_call_output_item(_SCHEMA_CALL, output),
+    ]
+
+
+async def _block_schema_tool_output(block_type: str) -> tuple[object, str]:
+    call_result = _copilot_to_call_tool_result(await skyvern_block_schema(block_type), "get_block_schema")
+    server = SimpleNamespace(
+        name="skyvern", use_structured_content=False, call_tool=AsyncMock(return_value=call_result)
+    )
+    output = await MCPUtil.invoke_mcp_tool(
+        cast(MCPServer, server),
+        MCPTool(name="get_block_schema", inputSchema={"type": "object"}),
+        RunContextWrapper(None),
+        _SCHEMA_CALL.arguments,
+    )
+    return output, cast(Any, call_result.content[0]).text
+
+
+async def _sent_request(
+    monkeypatch: pytest.MonkeyPatch,
+    model: LitellmModel,
+    turn: list[TResponseInputItem],
+    extra_args: dict[str, Any] | None,
+    stream: bool = False,
+    system_instructions: str = "You are concise.",
+    model_settings: ModelSettings | None = None,
+) -> dict[str, Any]:
+    requests: list[dict[str, Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse | AsyncStream[ChatCompletionChunk]:
+        requests.append(kwargs)
+        return cast(AsyncStream[ChatCompletionChunk], _ChunkStream(_stream_chunks())) if stream else _completion()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    call = {
+        "system_instructions": system_instructions,
+        "input": turn,
+        "model_settings": model_settings or ModelSettings(extra_args=extra_args),
+        "tools": [],
+        "output_schema": None,
+        "handoffs": [],
+        "tracing": ModelTracing.DISABLED,
+    }
+    if stream:
+        async for _ in model.stream_response(**call):
+            pass
+    else:
+        await model.get_response(**call)
+    return requests[0]
+
+
+async def _sent_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    model: LitellmModel,
+    turn: list[TResponseInputItem],
+    extra_args: dict[str, Any] | None,
+    stream: bool = False,
+) -> list[dict[str, Any]]:
+    return (await _sent_request(monkeypatch, model, turn, extra_args, stream))["messages"]
+
+
+_SONNET_ROUTES = ["anthropic/claude-sonnet-5-5", "bedrock/global.anthropic.claude-sonnet-5-5"]
+_CACHED_PROMPT = CacheableSystemInstructions("stable instructions", "\ndynamic timestamp", cache_namespace="wcc_test")
+_FRAME: TResponseInputItem = {
+    "role": "user",
+    "content": [
+        {"type": "input_text", "text": SCREENSHOT_SENTINEL + "Frame"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "low"},
+    ],
+}
+_NUDGE: TResponseInputItem = {"role": "user", "content": NUDGE_SENTINEL + "Keep going."}
+
+
+def _provider_messages(model_name: str, request: dict[str, Any]) -> list[dict[str, Any]]:
+    _, messages, _ = AnthropicCacheControlHook().get_chat_completion_prompt(
+        model=model_name,
+        messages=request["messages"],
+        non_default_params={"cache_control_injection_points": request.get("cache_control_injection_points")},
+        prompt_id=None,
+        prompt_variables=None,
+        dynamic_callback_params={},
+    )
+    return messages
+
+
+def _marked_indices(messages: list[dict[str, Any]]) -> list[int]:
+    return [index for index, message in enumerate(messages) if '"cache_control"' in json.dumps(message)]
+
+
+def _cache_usage(logs: list[dict[str, Any]]) -> tuple[str, int, int | None]:
+    (usage,) = (entry for entry in logs if entry.get("log_code") == "copilot_model_usage")
+    return (
+        usage["copilot.cache.mode"],
+        usage["copilot.cache.breakpoint_count"],
+        usage.get("copilot.cache.stable_prefix_chars"),
+    )
+
+
+def _tool_round(call_id: str) -> list[TResponseInputItem]:
+    return [
+        {"type": "function_call", "call_id": call_id, "name": "evaluate", "arguments": json.dumps({"code": "x" * 400})},
+        {"type": "function_call_output", "call_id": call_id, "output": json.dumps({"ok": True, "text": "y" * 400})},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", _SONNET_ROUTES)
+@pytest.mark.parametrize(
+    ("turn", "marked", "breakpoints"),
+    [
+        (_tool_turn("tool result"), [0, 1], 2),
+        (_tool_turn("tool result") + [_FRAME], [0, 1], 2),
+        (_tool_turn("tool result") + [_FRAME, _NUDGE], [0, 1], 2),
+        ([_FRAME], [0], 1),
+    ],
+)
+async def test_anthropic_route_marks_stable_system_prefix_and_the_stable_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    turn: list[TResponseInputItem],
+    marked: list[int],
+    breakpoints: int,
+) -> None:
+    model_settings = ModelSettings(extra_args={"fallbacks": ["bedrock/global.anthropic.claude-sonnet-5-5"]})
+    with capture_logs() as logs:
+        request = await _sent_request(
+            monkeypatch,
+            CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1),
+            turn,
+            None,
+            system_instructions=_CACHED_PROMPT,
+            model_settings=model_settings,
+        )
+
+    stable_block, dynamic_block = request["messages"][0]["content"]
+    assert stable_block["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in dynamic_block
+    assert stable_block["text"] + dynamic_block["text"] == str(_CACHED_PROMPT)
+    assert _marked_indices(_provider_messages(model_name, request)) == marked
+    assert _cache_usage(logs) == ("explicit", breakpoints, len("stable instructions"))
+    assert model_settings.extra_args == {"fallbacks": ["bedrock/global.anthropic.claude-sonnet-5-5"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", _SONNET_ROUTES)
+@pytest.mark.parametrize(
+    "next_call_input",
+    [copilot_session_input_callback, lambda history, new_items: _prune_input_list([*history, *new_items])],
+    ids=["session", "no_session"],
+)
+@pytest.mark.parametrize(
+    ("mid_history", "anchor_call_id"),
+    [([_FRAME, _NUDGE], "call_1"), ([_NUDGE], "call_2")],
+    ids=["frame_then_nudge", "nudge"],
+)
+async def test_anthropic_rolling_marker_prefix_is_resent_unchanged_on_the_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    next_call_input: Callable[[list[TResponseInputItem], list[TResponseInputItem]], list[TResponseInputItem]],
+    mid_history: list[TResponseInputItem],
+    anchor_call_id: str,
+) -> None:
+    (call_0a, output_0a), (call_0b, output_0b) = _tool_round("call_0a"), _tool_round("call_0b")
+    history: list[TResponseInputItem] = [
+        {"role": "user", "content": "Build the workflow"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "id": "msg_0",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Checking the page.", "annotations": []}],
+        },
+        call_0a,
+        call_0b,
+        output_0a,
+        output_0b,
+        *_tool_round("call_1"),
+        *mid_history,
+        *_tool_round("call_2"),
+        *_tool_round("call_3"),
+        *_tool_round("call_4"),
+        *_tool_round("call_5"),
+    ]
+    requests = []
+    for turn in (
+        next_call_input(history, []),
+        next_call_input([*history, *_tool_round("call_6")], [_FRAME, _NUDGE]),
+    ):
+        requests.append(
+            await _sent_request(
+                monkeypatch,
+                CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1),
+                turn,
+                None,
+                system_instructions=_CACHED_PROMPT,
+            )
+        )
+
+    provider_messages = _provider_messages(model_name, requests[0])
+    rolling = _marked_indices(provider_messages)[-1]
+    assert requests[0]["messages"][: rolling + 1] == requests[1]["messages"][: rolling + 1]
+    assert provider_messages[rolling]["tool_call_id"] == anchor_call_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "extra_args"),
+    [
+        ("openai/gpt-5.5", None),
+        ("anthropic/claude-sonnet-5-5", {"fallbacks": ["openai/gpt-5.5"]}),
+        ("anthropic/claude-sonnet-5-5", {"cache_control_injection_points": [{"location": "message", "role": "user"}]}),
+    ],
+)
+async def test_anthropic_cache_breakpoints_opt_out_off_an_all_anthropic_chain_or_with_caller_points(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    extra_args: dict[str, Any] | None,
+) -> None:
+    with capture_logs() as logs:
+        request = await _sent_request(
+            monkeypatch,
+            CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1),
+            _tool_turn("tool result"),
+            extra_args,
+            system_instructions=_CACHED_PROMPT,
+        )
+
+    assert request["messages"][0] == {"role": "system", "content": str(_CACHED_PROMPT)}
+    assert request.get("cache_control_injection_points") == (extra_args or {}).get("cache_control_injection_points")
+    assert _cache_usage(logs)[:2] == ("implicit", 0)
+
+
+def _tool_message(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    return next(message for message in messages if message["role"] == "tool")
+
+
+def _tool_text(messages: list[dict[str, Any]]) -> str:
+    content = _tool_message(messages)["content"]
+    return content if isinstance(content, str) else "".join(part["text"] for part in content)
+
+
+def _gemini_function_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    contents = _gemini_convert_messages_with_history(
+        messages=cast(Any, [message for message in messages if message["role"] != "system"]),
+        model="gemini-2.5-flash",
+        custom_llm_provider="vertex_ai",
+    )
+    return [
+        part["function_response"] for content in contents for part in content["parts"] if "function_response" in part
+    ]
+
+
+def _json_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value).union(*(_json_keys(child) for child in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_json_keys(child) for child in value))
+    return set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "model_name", "extra_args", "stream"),
+    [
+        ("code", _GEMINI, None, False),
+        ("code", "openai/gpt-5.6", {"fallbacks": [_GEMINI]}, True),
+        ("for_loop", _GEMINI, None, True),
+        ("for_loop", "azure/gpt-5.6-sol", {"fallbacks": [{"model": _GEMINI, "api_key": None}]}, False),
+        ("escaped_ref_key", _GEMINI, None, False),
+    ],
+)
+async def test_gemini_on_the_model_chain_receives_ref_tool_results_as_literal_text(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+    model_name: str,
+    extra_args: dict[str, Any] | None,
+    stream: bool,
+) -> None:
+    if payload == "escaped_ref_key":
+        output, text = _ESCAPED_REF_KEY_RESULT, _ESCAPED_REF_KEY_RESULT
+    else:
+        output, text = await _block_schema_tool_output(payload)
+    turn = _tool_turn(output)
+    original_turn = copy.deepcopy(turn)
+
+    raw = await _sent_messages(monkeypatch, LitellmModel(model=model_name), turn, extra_args)
+    usage_events: list[dict[str, Any]] = []
+    monkeypatch.setattr(model_telemetry_module.LOG, "info", lambda event, **fields: usage_events.append(fields))
+    sent = await _sent_messages(
+        monkeypatch, CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1), turn, extra_args, stream
+    )
+
+    assert [event["copilot.ref_tool_outputs_escaped"] for event in usage_events] == [1]
+    assert _tool_text(raw) == text
+    assert "$ref" in _json_keys([response["response"] for response in _gemini_function_responses(raw)])
+    [function_response] = _gemini_function_responses(sent)
+    assert function_response["name"] == "get_block_schema"
+    assert function_response["response"] == {"content": text}
+    assert json.loads(_tool_text(sent)) == {"content": text}
+    assert _tool_message(sent)["tool_call_id"] == "call_schema"
+    assert turn == original_turn
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_too_deep_to_walk_is_still_sent_to_a_gemini_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    deep = "{" + '"a": {' * 600 + "}" * 600 + "}"
+
+    sent = await _sent_messages(
+        monkeypatch,
+        CopilotLitellmModel(model="openai/gpt-5.6", next_model_call_index=lambda: 1),
+        _tool_turn(deep),
+        {"fallbacks": [_GEMINI]},
+    )
+
+    assert json.loads(_tool_text(sent)) == {"content": deep}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "output"),
+    [
+        ("azure/gpt-5.6-sol", [{"type": "text", "text": _REF_RESULT}]),
+        ("openai/gpt-5.6", _REF_RESULT),
+        ("anthropic/claude-sonnet-4-5", [{"type": "text", "text": _REF_RESULT}]),
+        ("foo/bar", _REF_RESULT),
+        (_GEMINI, '{"ok": true, "data": {"count": 3}}'),
+        (_GEMINI, [{"type": "text", "text": '{"ok": false, "error": "Timed out waiting for the page"}'}]),
+        (_GEMINI, "An error occurred while running the tool."),
+        (_GEMINI, json.dumps([{"$ref": "#/$defs/Step"}])),
+    ],
+)
+async def test_tool_results_off_the_gemini_escape_reach_the_provider_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    output: object,
+) -> None:
+    turn = _tool_turn(output)
+    original_turn = copy.deepcopy(turn)
+
+    raw = await _sent_messages(monkeypatch, LitellmModel(model=model_name), turn, None)
+    sent = await _sent_messages(
+        monkeypatch, CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1), turn, None
+    )
+
+    assert sent == raw
+    assert turn == original_turn
+
+
+@pytest.mark.asyncio
+async def test_gemini_route_leaves_an_unresolved_media_reference_for_the_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_reference = {"screenshot": {"$ref": "page.png"}}
+    turn = _tool_turn(
+        [
+            {"type": "text", "text": json.dumps(media_reference)},
+            {"type": "image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+        ]
+    )
+
+    raw = await _sent_messages(monkeypatch, LitellmModel(model=_GEMINI), turn, None)
+    sent = await _sent_messages(
+        monkeypatch, CopilotLitellmModel(model=_GEMINI, next_model_call_index=lambda: 1), turn, None
+    )
+
+    assert sent == raw
+    [function_response] = _gemini_function_responses(sent)
+    assert function_response["response"] == media_reference
+    assert [set(part) for part in function_response["parts"]] == [{"inline_data"}]

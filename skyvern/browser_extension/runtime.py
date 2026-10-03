@@ -6,7 +6,8 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -17,6 +18,7 @@ import structlog
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 from skyvern.utils.contained_effects import contained_effect
@@ -44,6 +46,8 @@ class _Adapter(Protocol):
 
     def target_attachment_snapshot(self, target_id: str) -> bool: ...
 
+    def scoped_tab_id_for_target(self, target_id: str) -> int | None: ...
+
 
 class _Relay(Protocol):
     bound_port: int
@@ -58,7 +62,7 @@ class _Relay(Protocol):
 
     async def wait_connected(self, timeout: float) -> bool: ...
 
-    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
+    async def request(self, op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None) -> dict: ...
 
     async def ensure_root_lease(self) -> dict | None: ...
     async def list_scoped_tabs(self) -> list[dict]: ...
@@ -66,10 +70,7 @@ class _Relay(Protocol):
     async def release_tab(self, tab_id: int) -> None: ...
 
 
-_relay_factory: Callable[
-    [str, int, Callable[[str, dict], Awaitable[None]], Callable[[], Awaitable[None]] | None],
-    ExtensionRelayServer,
-] = ExtensionRelayServer
+_relay_factory: type[ExtensionRelayServer] = ExtensionRelayServer
 _adapter_factory: Callable[[VirtualTargetRegistry, _Relay], _Adapter] | None = None
 
 
@@ -147,7 +148,7 @@ class BrowserExtensionRuntime:
             async def on_disconnect() -> None:
                 await adapter_holder[0].on_extension_disconnect()
 
-            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect)
+            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect, order_debugger_events=True)
             adapter = _create_adapter(registry, relay)
             adapter_holder.append(adapter)
 
@@ -337,22 +338,22 @@ class BrowserExtensionRuntime:
     def describe_reported_build_hash(status: dict[str, Any]) -> str:
         return status.get("extensionReportedBuildHash") or "no hash reported (pre-dates this check)"
 
-    async def evaluate(self, expression: str) -> Any:
-        await self._relay.ensure_root_lease()
-        tabs = await self._relay.list_scoped_tabs()
-        candidates = [tab for tab in tabs if type(tab.get("tabId")) is int]
-        active = [tab for tab in candidates if tab.get("active") is True]
-        if len(active) == 1:
-            tab = active[0]
-        elif len(candidates) == 1:
-            tab = candidates[0]
-        else:
-            raise BrowserExtensionError("Select one Skyvern Controlled tab before evaluating JavaScript")
-        result = await self._relay.request(
-            "dom.evaluate",
-            {"tabId": tab["tabId"], "expression": expression},
+    async def fill_input(self, page: Any, selector: str, text: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Send fixed input data to the selected page; never evaluate caller source."""
+        deadline = int(time.time() * 1000 + min(timeout, 30.0) * 1000)
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            raise BrowserExtensionError("The selected page is no longer available")
+        target_id = await self._target_id_for_page(page)
+        tab_id = self._adapter.scoped_tab_id_for_target(target_id) if target_id is not None else None
+        if tab_id is None or self._page_is_closed(page):
+            raise BrowserExtensionError("The selected page is no longer in the controlled scope")
+        if time.time() * 1000 >= deadline:
+            raise TimeoutError("The fixed fill expired before it could be sent")
+        return await self._relay.request(
+            "dom.fill",
+            {"tabId": tab_id, "selector": selector, "text": text, "deadline": deadline},
+            timeout=min(timeout, 30.0),
         )
-        return result.get("result")
 
     @staticmethod
     def open_extension_url(url: str) -> bool:

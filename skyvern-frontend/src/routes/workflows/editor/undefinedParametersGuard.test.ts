@@ -5,15 +5,30 @@ import { ProxyLocation, RunEngine } from "@/api/types";
 import type {
   DataExportBlock,
   ExtractionBlock,
+  WorkflowApiResponse,
+  WebSearchBlock,
   WorkflowBlock,
   WorkflowSettings,
 } from "../types/workflowTypes";
 
-import { getElements, getWorkflowBlocks } from "./workflowEditorUtils";
+import {
+  type WebSearchNode,
+  webSearchNodeDefaultData,
+} from "./nodes/WebSearchNode/types";
+import {
+  convert,
+  getElements,
+  getWorkflowBlocks,
+  getWorkflowErrors,
+} from "./workflowEditorUtils";
 
 const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
   persistBrowserSession: false,
   reuseBrowserSession: false,
   pinSavedSessionIp: false,
@@ -28,7 +43,6 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
-  enableSelfHealing: false,
   maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
@@ -156,4 +170,142 @@ describe("extraction block export fields (SKY-15396)", () => {
       export_file_name: "names",
     });
   });
+});
+
+test("search Error Messages serialize and use standard mapping validation", () => {
+  const node: WebSearchNode = {
+    id: "search",
+    type: "web_search",
+    position: { x: 0, y: 0 },
+    data: { ...webSearchNodeDefaultData, label: "search", query: "documents" },
+  };
+
+  for (const mapping of [null, { NO_RESULTS: "No results were found." }]) {
+    node.data.errorCodeMapping = JSON.stringify(mapping);
+    expect(getWorkflowBlocks([node], [])).toEqual([
+      expect.objectContaining({
+        block_type: "web_search",
+        error_code_mapping: mapping,
+        no_results_error_code: null,
+        no_match_error_code: null,
+      }),
+    ]);
+    expect(getWorkflowErrors([node])).toEqual([]);
+  }
+
+  for (const mapping of ["{", "[]", '{" CODE ":"No match"}']) {
+    node.data.errorCodeMapping = mapping;
+    expect(getWorkflowErrors([node])).toEqual([
+      expect.stringContaining("search: Error messages"),
+    ]);
+  }
+});
+
+test("search without a prompt folds legacy codes and validates its Data Schema", () => {
+  const node: WebSearchNode = {
+    id: "search",
+    type: "web_search",
+    position: { x: 0, y: 0 },
+    data: {
+      ...webSearchNodeDefaultData,
+      label: "search",
+      query: "documents",
+      prompt: " \t ",
+      errorCodeMapping: '{"NO_MATCH":"No matching result."}',
+      jsonSchema: '{"type":"object"}',
+    },
+  };
+
+  for (const [legacyResults, legacyMatch, explicit, expected] of [
+    [" ", "\t", null, null],
+    [
+      " NO_RESULTS ",
+      " NO_MATCH ",
+      null,
+      {
+        NO_RESULTS: "The search returned no results.",
+        NO_MATCH: "No search result satisfies the Prompt.",
+      },
+    ],
+    [
+      " SAME ",
+      "SAME",
+      null,
+      {
+        SAME: "The search returned no results, or no search result satisfies the Prompt.",
+      },
+    ],
+    [
+      "SAME",
+      "SAME",
+      { SAME: "Explicit description" },
+      { SAME: "Explicit description" },
+    ],
+    ["BAD\u0000CODE", "A".repeat(129), null, null],
+    [
+      "__proto__",
+      null,
+      null,
+      { ["__proto__"]: "The search returned no results." },
+    ],
+  ] as const) {
+    const block: WebSearchBlock = {
+      output_parameter: {
+        parameter_type: "output",
+        key: "search_output",
+        description: null,
+        output_parameter_id: "output_search",
+        workflow_id: "workflow_search",
+        created_at: "2026-01-01T00:00:00Z",
+        modified_at: "2026-01-01T00:00:00Z",
+        deleted_at: null,
+      },
+      block_type: "web_search",
+      label: "search",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      query: "documents",
+      provider: "auto",
+      num_results: 10,
+      prompt: null,
+      json_schema: null,
+      parameters: [],
+      error_code_mapping: explicit,
+      no_results_error_code: legacyResults,
+      no_match_error_code: legacyMatch,
+    };
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const searchNode = nodes.find((entry) => entry.type === "web_search");
+    expect(searchNode?.data.errorCodeMapping).toBe(
+      JSON.stringify(expected, null, 2),
+    );
+    const saved = {
+      error_code_mapping: expected,
+      no_results_error_code: null,
+      no_match_error_code: null,
+    };
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(saved);
+    const workflow = {
+      workflow_definition: { blocks: [block], parameters: [] },
+    } as unknown as WorkflowApiResponse;
+    expect(convert(workflow).workflow_definition.blocks[0]).toMatchObject(
+      saved,
+    );
+  }
+
+  expect(getWorkflowBlocks([node], [])).toEqual([
+    expect.objectContaining({
+      block_type: "web_search",
+      error_code_mapping: { NO_MATCH: "No matching result." },
+      no_match_error_code: null,
+      no_results_error_code: null,
+      json_schema: { type: "object" },
+    }),
+  ]);
+  expect(getWorkflowErrors([node])).toEqual([]);
+  node.data.jsonSchema = "{";
+  expect(getWorkflowErrors([node])).toEqual([
+    expect.stringContaining("search: Data schema -"),
+  ]);
 });

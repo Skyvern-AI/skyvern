@@ -9,7 +9,6 @@ import {
   paneResizable,
   paneWidthsKey,
   STUDIO_PANE_DEFAULT_WIDTH,
-  STUDIO_TWO_PANE_SIDE_BASIS,
 } from "./paneLayout";
 import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
 
@@ -48,15 +47,32 @@ describe("paneResizable", () => {
 describe("paneFlex", () => {
   const noWidths = {};
 
-  test("browser takes all remaining space; others sit at the default width", () => {
+  test("built-agent panes use 25/45/30 of usable width", () => {
     const panes: StudioPaneId[] = ["copilot", "browser", "editor"];
     expect(paneFlex("browser", panes, noWidths)).toBe("1 1 0%");
-    expect(paneFlex("copilot", panes, noWidths)).toBe(
-      `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
+    expect(paneFlex("copilot", panes, noWidths)).toBe("0 1 calc(25% - 6px)");
+    expect(paneFlex("editor", panes, noWidths)).toBe("0 1 calc(30% - 7.2px)");
+  });
+
+  test("blank-agent panes use 30/70 even after reordering", () => {
+    for (const panes of [
+      ["copilot", "browser"],
+      ["browser", "copilot"],
+    ] as StudioPaneId[][]) {
+      expect(paneFlex("copilot", panes, noWidths)).toBe(
+        "0 1 calc(30% - 3.6px)",
+      );
+      expect(paneFlex("browser", panes, noWidths)).toBe("1 1 0%");
+    }
+  });
+
+  test("reordered built-agent panes keep ratios and pinned widths win", () => {
+    const panes: StudioPaneId[] = ["editor", "browser", "copilot"];
+    expect(paneFlex("editor", panes, {})).toBe("0 1 calc(30% - 7.2px)");
+    expect(paneFlex("copilot", panes, { editor: 480 })).toBe(
+      "0 1 calc(25% - 6px)",
     );
-    expect(paneFlex("editor", panes, noWidths)).toBe(
-      `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
-    );
+    expect(paneFlex("editor", panes, { editor: 480 })).toBe("0 1 480px");
   });
 
   test("editor becomes the greedy pane when the browser is closed", () => {
@@ -95,11 +111,11 @@ describe("paneFlex", () => {
 
   test("a two-pane default gives the side pane ~35% and the browser the rest", () => {
     expect(paneFlex("editor", ["editor", "browser"], noWidths)).toBe(
-      `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`,
+      "0 1 calc(35% - 4.2px)",
     );
     expect(paneFlex("browser", ["editor", "browser"], noWidths)).toBe("1 1 0%");
     expect(paneFlex("overview", ["browser", "overview"], noWidths)).toBe(
-      `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`,
+      "0 1 calc(35% - 4.2px)",
     );
     expect(paneFlex("browser", ["browser", "overview"], noWidths)).toBe(
       "1 1 0%",
@@ -109,7 +125,7 @@ describe("paneFlex", () => {
   test("the ~35% side split holds for any greedy two-pane row, not just the factory combos", () => {
     expect(paneFlex("editor", ["copilot", "editor"], noWidths)).toBe("1 1 0%");
     expect(paneFlex("copilot", ["copilot", "editor"], noWidths)).toBe(
-      `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`,
+      "0 1 calc(35% - 4.2px)",
     );
   });
 
@@ -129,13 +145,13 @@ describe("paneFlex", () => {
     );
   });
 
-  test("garbage persisted widths fall back to the default", () => {
+  test("invalid widths fall back to the default", () => {
     const panes: StudioPaneId[] = ["copilot", "browser", "editor"];
     expect(paneFlex("copilot", panes, { copilot: Number.NaN })).toBe(
-      `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
+      "0 1 calc(25% - 6px)",
     );
     expect(paneFlex("copilot", panes, { copilot: -50 })).toBe(
-      `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
+      "0 1 calc(25% - 6px)",
     );
   });
 });

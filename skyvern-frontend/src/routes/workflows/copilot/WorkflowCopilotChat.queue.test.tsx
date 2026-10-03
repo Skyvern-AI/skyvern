@@ -5,14 +5,22 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { AxiosError, type AxiosResponse } from "axios";
+import { useEffect, useState, type ComponentProps } from "react";
+import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 import { toast } from "@/components/ui/use-toast";
 
 import { getSseClient } from "@/api/sse";
-import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
 
@@ -70,6 +78,7 @@ const {
         content: string;
         created_at: string;
         narrative_payload?: Record<string, unknown> | null;
+        turn_outcome?: Record<string, unknown> | null;
       }[],
       proposed_workflow: null as Record<string, unknown> | null,
       auto_accept: false,
@@ -101,11 +110,27 @@ vi.mock("@/api/sse", () => ({
 }));
 
 const pageExitDelete = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mintSignedUrl = vi.hoisted(() =>
+  vi.fn((artifactId: string) =>
+    Promise.resolve({
+      data: {
+        artifact_id: artifactId,
+        signed_url: `https://files.example/artifacts/${artifactId}/content?expiry=1`,
+        expires_at: 1,
+      },
+    }),
+  ),
+);
 
 vi.mock("@/api/AxiosClient", () => ({
   deleteUploadedFileOnPageExit: pageExitDelete,
   getClient: vi.fn().mockResolvedValue({
-    get: vi.fn().mockImplementation(() => Promise.resolve(historyResponse)),
+    get: vi.fn().mockImplementation((path: string) => {
+      const minted = /^\/artifacts\/([^/]+)\/signed-url$/.exec(path);
+      return minted
+        ? mintSignedUrl(minted[1]!)
+        : Promise.resolve(historyResponse);
+    }),
     post: cancelPost,
     delete: deleteFile,
   }),
@@ -173,17 +198,23 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = {
+    getSaveData: () => saveData,
+    setSaveBlockedReason: () => {},
+  };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
-
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const terminalResponse = (
   message: string,
@@ -222,23 +253,32 @@ async function renderChat(
   return view;
 }
 
-async function renderChatWithFlags(booleanFlags: Record<string, boolean>) {
-  const view = render(
-    <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <WorkflowCopilotChat />
-    </FeatureFlagContext.Provider>,
+function HomeHandoffChat({
+  isLiveBrowserReady,
+  docked = false,
+}: {
+  isLiveBrowserReady: boolean;
+  docked?: boolean;
+}) {
+  const [initialMessage, setInitialMessage] = useState<string | undefined>(
+    "Create a workflow that opens example.com",
   );
-  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-  return view;
+
+  return (
+    <WorkflowCopilotChat
+      initialMessage={initialMessage}
+      onInitialMessageConsumed={() => setInitialMessage(undefined)}
+      requiresLiveBrowser
+      isLiveBrowserReady={isLiveBrowserReady}
+      liveBrowserSessionId={isLiveBrowserReady ? "pbs_live_1" : null}
+      docked={docked}
+      portalTarget={docked ? document.body : undefined}
+    />
+  );
 }
 
-// Code-block mode is off in the bare harness (no flag provider), so the turns
-// it drives all explicitly select non-code Build; this one opts into the code composer.
-function renderChatWithCodeMode() {
-  return renderChatWithFlags({
-    WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
-    CODE_BLOCK_ACCESS: true,
-  });
+function queuedStrip() {
+  return within(screen.getByTestId("copilot-queued-message"));
 }
 
 function textarea(): HTMLTextAreaElement {
@@ -317,6 +357,7 @@ beforeEach(() => {
   uploadGate.release.length = 0;
   deleteFile.mockClear();
   pageExitDelete.mockClear();
+  mintSignedUrl.mockClear();
   pageExitDelete.mockResolvedValue(true);
   vi.mocked(toast).mockClear();
   postStreaming.mockClear();
@@ -336,6 +377,7 @@ beforeEach(() => {
     proposed_workflow: null,
     auto_accept: false,
   };
+  saveData.workflow.workflow_id = "wf_1";
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -345,6 +387,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
@@ -387,6 +430,61 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       screen.getByRole("button", { name: "Remove report.pdf" }),
     ).toBeTruthy();
     expect(screen.queryByText("Drop files to attach")).toBeNull();
+  });
+
+  it("offers and uploads demonstration video attachments", async () => {
+    await renderChat();
+
+    const input = document.querySelector(
+      'input[type="file"][accept*=".csv"]',
+    ) as HTMLInputElement;
+    expect(input).toBeTruthy();
+    expect(input.accept.split(",")).toEqual(
+      expect.arrayContaining([".mp4", ".webm", ".mov"]),
+    );
+
+    await dropAttachments(
+      new File(["video"], "demo.MP4", { type: "video/mp4" }),
+      new File(["video"], "demo.webm", { type: "video/webm" }),
+      new File(["video"], "demo.mov", { type: "video/quicktime" }),
+    );
+
+    await waitFor(() => expect(uploadCount.n).toBe(3));
+    expect(
+      screen.getByRole("button", { name: "Remove demo.MP4" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove demo.webm" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove demo.mov" }),
+    ).toBeTruthy();
+    expect(vi.mocked(toast)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Unsupported file type" }),
+    );
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Use a non-sensitive video" }),
+    );
+  });
+
+  it("allows videos up to the upload service's 30MB limit", async () => {
+    await renderChat();
+    const accepted = new File(["video"], "five-minutes.mp4", {
+      type: "video/mp4",
+    });
+    Object.defineProperty(accepted, "size", { value: 20 * 1024 * 1024 });
+    const rejected = new File(["video"], "too-large.mp4", {
+      type: "video/mp4",
+    });
+    Object.defineProperty(rejected, "size", { value: 30 * 1024 * 1024 + 1 });
+
+    await dropAttachments(accepted, rejected);
+
+    await waitFor(() => expect(uploadCount.n).toBe(1));
+    expect(
+      screen.getByRole("button", { name: "Remove five-minutes.mp4" }),
+    ).toBeTruthy();
+    expect(screen.getByText("over 30MB")).toBeTruthy();
   });
 
   it("ignores unsupported dropped files before upload", async () => {
@@ -552,6 +650,209 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
   });
 
+  it("shows a Home handoff prompt before the Copilot is ready", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Ready to build your workflow.",
+        created_at: "2026-05-25T00:00:00Z",
+      },
+    ];
+    const view = render(<HomeHandoffChat isLiveBrowserReady={false} />);
+
+    expect(screen.getByText(prompt)).toBeTruthy();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+
+    view.rerender(<HomeHandoffChat isLiveBrowserReady />);
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.message).toBe(prompt);
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+
+    await completeOldestStream("Workflow built.");
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+    const promptBubble = screen.getByText(prompt);
+    const responseBubble = screen.getByText("Workflow built.");
+    expect(
+      promptBubble.compareDocumentPosition(responseBubble) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("drains a queued Home handoff prompt once when a sync render lands mid-drain", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    // Every send attempt flushes the editor draft before reserving its turn.
+    const flushDraft = vi.fn();
+    useWorkflowYamlEditorStore.setState({ flushDraft });
+    // The parent's sync render lands before the drain's own clear commits and hands
+    // the chat a new handleSend, re-running the drain effect with the stale prompt.
+    function RenderedMidDrain({ ready }: { ready: boolean }) {
+      const [initialMessage, setInitialMessage] = useState<string | undefined>(
+        prompt,
+      );
+      const [, bump] = useState(0);
+      useEffect(() => {
+        if (ready) flushSync(() => bump((n) => n + 1));
+      }, [ready]);
+      return (
+        <WorkflowCopilotChat
+          initialMessage={initialMessage}
+          onInitialMessageConsumed={() => setInitialMessage(undefined)}
+          onWorkflowPersisted={() => {}}
+          requiresLiveBrowser
+          isLiveBrowserReady={ready}
+          liveBrowserSessionId={ready ? "pbs_live_1" : null}
+        />
+      );
+    }
+    const view = render(<RenderedMidDrain ready={false} />);
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+
+    view.rerender(<RenderedMidDrain ready />);
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    expect(flushDraft).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("button", { name: "Edit queued message" }),
+    ).toBeNull();
+    useWorkflowYamlEditorStore.setState({ flushDraft: undefined });
+  });
+
+  it("does not carry the Home handoff prompt into another history chat", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    render(<HomeHandoffChat isLiveBrowserReady={false} docked />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+    historyResponse.data = {
+      ...historyResponse.data,
+      workflow_copilot_chat_id: "chat-2",
+      chat_history: [
+        {
+          sender: "ai",
+          content: "This belongs to a different chat.",
+          created_at: "2026-05-25T00:01:00Z",
+        },
+      ],
+    };
+
+    await act(async () => {
+      await useCopilotHeaderStore.getState().controls?.onSelectChat?.({
+        workflow_copilot_chat_id: "chat-2",
+      } as Parameters<
+        NonNullable<
+          NonNullable<
+            ReturnType<typeof useCopilotHeaderStore.getState>["controls"]
+          >["onSelectChat"]
+        >
+      >[0]);
+    });
+
+    expect(screen.queryByText(prompt)).toBeNull();
+    expect(screen.getByText("This belongs to a different chat.")).toBeTruthy();
+  });
+
+  it("keeps the Home handoff prompt during a same-chat reload", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    const workflowId = saveData.workflow.workflow_id;
+    saveData.workflow.workflow_id = "";
+    historyResponse.data = {
+      ...historyResponse.data,
+      workflow_copilot_chat_id: "chat-1",
+    };
+    Object.assign(historyResponse.data, {
+      question_interactions: [
+        {
+          interaction_id: "interaction-1",
+          turn_id: "turn-1",
+          tool_call_id: "call-1",
+          status: "pending",
+          response: null,
+          created_at: "2026-05-25T00:00:00Z",
+          resolved_at: null,
+          parts: [
+            {
+              part_id: "part-1",
+              prompt: "Which site?",
+              choices: [],
+            },
+          ],
+        },
+      ],
+      pending_question_cancel_token: "cancel-1",
+    });
+
+    render(<HomeHandoffChat isLiveBrowserReady={false} />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Cancel question" }),
+      ).toBeTruthy(),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel question" }));
+    });
+
+    expect(await screen.findByText(prompt)).toBeTruthy();
+    saveData.workflow.workflow_id = workflowId;
+  });
+
+  it("stops dictation when the question it was answering is cancelled", async () => {
+    const question = {
+      interaction_id: "interaction-1",
+      turn_id: "turn-1",
+      tool_call_id: "call-1",
+      response: null,
+      created_at: "2026-05-25T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part-1", prompt: "Which site?", choices: [] }],
+    };
+    Object.assign(historyResponse.data, {
+      workflow_copilot_chat_id: "chat-1",
+      question_interactions: [{ ...question, status: "pending" }],
+      pending_question_cancel_token: "cancel-1",
+    });
+    speechState.isListening = true;
+    await renderChat();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Cancel question" }),
+      ).toBeTruthy(),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Your response" }), {
+      target: { value: "example.com" },
+    });
+    Object.assign(historyResponse.data, {
+      question_interactions: [{ ...question, status: "cancelled" }],
+      pending_question_cancel_token: null,
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel question" }));
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("group", { name: "Question parts" }),
+      ).toBeNull(),
+    );
+    await waitFor(() => expect(speechState.stop).toHaveBeenCalled());
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+
   it("explains that the next send waits while the live browser is starting", async () => {
     render(
       <WorkflowCopilotChat requiresLiveBrowser isLiveBrowserReady={false} />,
@@ -606,11 +907,14 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     // The synchronous in-flight ref must prevent a second concurrent stream.
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("1 message queued")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+    // Undelivered, the message lives only on the strip: no bubble in the thread and no toast.
+    expect(screen.getAllByText("second message")).toHaveLength(1);
+    expect(queuedStrip().getByText("second message")).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Edit queued message" }),
+      queuedStrip().getByRole("button", { name: "Edit queued message" }),
     ).toBeTruthy();
+    expect(toast).not.toHaveBeenCalled();
   });
 
   it("drains the queued message into one new stream after the turn ends", async () => {
@@ -716,9 +1020,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await completeOldestStream("first done");
 
     await waitFor(() =>
-      expect(
-        screen.getByText("Prompt queued. Waiting for live browser..."),
-      ).toBeTruthy(),
+      expect(queuedStrip().getByText("parse the queued sheet")).toBeTruthy(),
     );
     expect(postStreaming).toHaveBeenCalledTimes(1);
     expect(
@@ -803,7 +1105,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.queryByText("over 10MB")).toBeNull();
   });
 
-  it("drops a failed chip when it replaces a queued message", async () => {
+  it("drops a failed chip when it adds to a queued message", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -814,7 +1116,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("read the scan instead");
 
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("read the scan instead")).toBeTruthy();
+    expect(queuedStrip().getByText(/read the scan instead/)).toBeTruthy();
     expect(screen.queryByText("over 10MB")).toBeNull();
   });
 
@@ -975,6 +1277,35 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("adds text once when Enter is pressed again while dictation finishes stopping", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("use the staging site");
+
+    speechState.isListening = true;
+    let finishStopping: () => void = () => {};
+    speechState.stop.mockImplementationOnce(
+      () =>
+        new Promise<Blob | null>((resolve) => {
+          finishStopping = () => resolve(null);
+        }),
+    );
+    await submit("and log in first");
+    speechState.isListening = false;
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+    });
+    await act(async () => {
+      finishStopping();
+    });
+
+    expect(
+      queuedStrip().getByText("use the staging site and log in first"),
+    ).toBeTruthy();
   });
 
   it("deletes a sent file whose request never went out because the composer unmounted", async () => {
@@ -1185,7 +1516,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       );
     });
 
-    // The queued bubble must not show, and the drain must not send, an upload that was deleted.
+    // The queued strip must not show, and the drain must not send, an upload that was deleted.
     await waitFor(() => expect(screen.queryByTitle("queued.csv")).toBeNull());
     await completeOldestStream("first done");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
@@ -1563,6 +1894,14 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     );
     await submit("second message");
 
+    await waitFor(() =>
+      expect(
+        cancelPost.mock.calls.filter(
+          ([path]) => path === "/workflow/copilot/chat-audio",
+        ),
+      ).toHaveLength(2),
+    );
+
     view.unmount();
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1571,8 +1910,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     // Both sends had taken their file out of the tray, so both uploads need reclaiming.
     expect(deleteFile).toHaveBeenCalledWith("/files/file_1");
     expect(deleteFile).toHaveBeenCalledWith("/files/file_2");
-    releaseFirstAudio();
-    releaseSecondAudio();
+    await act(async () => {
+      releaseFirstAudio();
+      releaseSecondAudio();
+    });
   });
 
   it("does not start a second delete for a file already being reclaimed", async () => {
@@ -1696,7 +2037,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(deleteFile).not.toHaveBeenCalled();
   });
 
-  it("returns a replaced queued message's file to the tray", async () => {
+  it("sends both files when a second message is added to a queued one", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1705,20 +2046,24 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("parse the first sheet");
     expect(postStreaming).toHaveBeenCalledTimes(1);
 
-    // Replacing the queued message with a different file must not strand the first one.
+    // Adding to the queued message must not drop the file it already carries.
     await attachSpreadsheet("second.csv");
-    await submit("parse the second sheet instead");
+    await submit("and the second sheet");
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(
-      screen.getByRole("button", { name: "Remove first.csv" }),
-    ).toBeTruthy();
+    expect(queuedStrip().getByText("2 files")).toBeTruthy();
 
     await completeOldestStream("first done");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_2"]);
+    expect(streamCalls[1]?.body.message).toBe(
+      "parse the first sheet\nand the second sheet",
+    );
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual([
+      "file_1",
+      "file_2",
+    ]);
   });
 
-  it("shows a queued message's attachment on its bubble", async () => {
+  it("shows a queued message's attachment on the queued strip", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1727,11 +2072,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("parse the queued sheet");
     expect(postStreaming).toHaveBeenCalledTimes(1);
 
-    // The tray is cleared on queue, so the bubble is the only place the file is visible.
+    // The tray is cleared on queue, so the strip is the only place the file is visible.
     expect(
       screen.queryByRole("button", { name: "Remove queued.csv" }),
     ).toBeNull();
-    expect(screen.getByTitle("queued.csv")).toBeTruthy();
+    expect(queuedStrip().getByTitle("queued.csv")).toBeTruthy();
   });
 
   it("returns the file to the composer, still deletable, when the server errors before a turn starts", async () => {
@@ -1955,6 +2300,99 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     ).toBeTruthy();
   });
 
+  it("holds a queued message's edit until a pending question is answered", async () => {
+    const question = {
+      interaction_id: "interaction-1",
+      turn_id: "turn-1",
+      tool_call_id: "call-1",
+      response: null,
+      created_at: "2026-05-25T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part-1", prompt: "Which site?", choices: [] }],
+    };
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("second message");
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        interactions: [{ ...question, status: "pending" }],
+        cancel_token: "cancel-1",
+      });
+    });
+    const answer = await screen.findByRole("textbox", {
+      name: "Your response",
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "Edit queued message" }),
+    ).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(answer, { key: "Escape" });
+    });
+    expect((answer as HTMLTextAreaElement).value).toBe("");
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_resolved",
+        interaction: { ...question, status: "cancelled" },
+      });
+    });
+    // Still queued, not silently moved into the prompt held for the question.
+    expect(textarea().value).toBe("");
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+    });
+    expect(textarea().value).toBe("second message");
+  });
+
+  it("keeps the prompt when dictation finishes stopping after the question is gone", async () => {
+    const question = {
+      interaction_id: "interaction-1",
+      turn_id: "turn-1",
+      tool_call_id: "call-1",
+      response: null,
+      created_at: "2026-05-25T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part-1", prompt: "Which site?", choices: [] }],
+    };
+    let finishStopping: () => void = () => {};
+    speechState.stop.mockImplementationOnce(
+      () =>
+        new Promise<Blob | null>((resolve) => {
+          finishStopping = () => resolve(null);
+        }),
+    );
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    speechState.isListening = true;
+    fireEvent.change(textarea(), { target: { value: "Also add a retry" } });
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        interactions: [{ ...question, status: "pending" }],
+        cancel_token: "cancel-1",
+      });
+    });
+    await waitFor(() => expect(speechState.stop).toHaveBeenCalled());
+    speechState.isListening = false;
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_resolved",
+        interaction: { ...question, status: "cancelled" },
+      });
+    });
+    expect(textarea().value).toBe("Also add a retry");
+    await act(async () => {
+      finishStopping();
+    });
+    expect(textarea().value).toBe("Also add a retry");
+  });
+
   it("an IME Escape in the composer does not discard the queued message", async () => {
     // Dismissing a conversion candidate is not abandoning the follow-up. The composer
     // handler consumes Escape before the window guard can see it, so it has to make the
@@ -1997,6 +2435,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     outside.remove();
@@ -2022,6 +2464,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
         cancel_token: expect.any(String),
         source: "escape_key",
       }),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
     outside.remove();
   });
@@ -2042,6 +2488,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
 
     await deliverFirstFrame();
@@ -2056,6 +2506,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect.objectContaining({
         cancel_token: expect.any(String),
         source: "stop_button",
+      }),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
       }),
     );
   });
@@ -2075,6 +2529,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).not.toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
 
       // Past the double-tap window, with no frame delivered at any point.
@@ -2087,6 +2545,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.objectContaining({ source: "stop_button" }),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
     } finally {
       vi.useRealTimers();
@@ -2120,6 +2582,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).not.toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
 
       await deliverFirstFrame();
@@ -2129,6 +2595,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
     } finally {
       vi.useRealTimers();
@@ -2207,6 +2677,27 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     );
   });
 
+  it("a build still running when the chat unmounts does not hold up the next one", async () => {
+    const view = await renderChat();
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    view.unmount();
+    useCopilotActionStore.getState().requestBuild({
+      blockLabel: "read_account",
+      prompt: "Return the balance",
+      applyingGoalChange: true,
+    });
+
+    expect(useCopilotActionStore.getState().pendingBuild?.blockLabel).toBe(
+      "read_account",
+    );
+  });
+
   it("does not arm a block-build target when its generate no-ops behind a queued prompt", async () => {
     await renderChat();
     await submit("first message");
@@ -2266,6 +2757,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
 
     // The original turn completes; the dropped build must not drain into a stream.
@@ -2292,6 +2787,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     // Resetting the narrative stops the progress/elapsed indicator from
     // ticking forever beside the error message.
     expect(screen.queryAllByRole("status")).toHaveLength(0);
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Your draft is retained",
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
     expect(
       screen.getByText(/Copilot is checking whether this turn finished/),
     ).toBeTruthy();
@@ -2497,7 +2997,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
 
-  it("keeps a rejected history-loaded auto-applicable draft labeled as proposed changes", async () => {
+  it("labels a rejected history-loaded auto-applicable draft as discarded, never applied", async () => {
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
       chat_history: [
@@ -2560,7 +3060,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     });
 
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
-    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.getByText("Discarded changes")).toBeTruthy();
     expect(screen.queryByText("Applied changes")).toBeNull();
     portalTarget.remove();
   });
@@ -2635,6 +3135,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).toHaveBeenCalledWith(
       "/workflow/copilot/apply-proposed-workflow",
       expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
     expect(screen.getByText("Applied changes")).toBeTruthy();
     expect(screen.queryByText("Proposed changes")).toBeNull();
@@ -2767,8 +3268,7 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     await renderChat();
     await attachSpreadsheet("rows.csv");
 
-    // Two Enter presses before React commits: the second still sees the same text and tray, so it
-    // queues an exact copy of the request the first one just sent.
+    // Two Enter presses before React commits: the second still sees the same text and tray.
     await act(async () => {
       fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
       const ta = textarea();
@@ -2781,46 +3281,12 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
 
     await completeOldestStream("first done");
     await act(async () => {});
 
     expect(postStreaming).toHaveBeenCalledTimes(1);
-  });
-
-  it("keeps a started turn's file when its queued duplicate is edited and the file removed", async () => {
-    await renderChat();
-    await attachSpreadsheet("rows.csv");
-    await act(async () => {
-      fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
-      const ta = textarea();
-      ta.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
-      );
-      ta.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
-      );
-    });
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await deliverFirstFrame();
-
-    // Editing the duplicate hands its ids back to the tray while the first turn still uses them.
-    await act(async () => {
-      fireEvent.keyDown(textarea(), { key: "Escape" });
-    });
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Remove rows.csv" }),
-      ).toBeTruthy(),
-    );
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Remove rows.csv" }));
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    expect(deleteFile).not.toHaveBeenCalled();
   });
 
   it("drains an identical queued prompt when the turn ends in a response-framed error", async () => {
@@ -2997,44 +3463,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     ).toBeNull();
   });
 
-  it("drains an identical queued prompt when the composer left the code mode the turn opened in", async () => {
-    await renderChatWithCodeMode();
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Build"));
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(
-      (streamCalls[0]!.body as unknown as { code_block: boolean | null })
-        .code_block,
-    ).toBe(false);
-
-    await submit("build me a workflow");
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    // A block-level Generate behind a queued prompt disarms its own target but
-    // still flips the composer into code, so the queued send is a new shape.
-    await act(async () => {
-      useCopilotActionStore
-        .getState()
-        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
-    });
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    await completeOldestStream("first done");
-
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("build me a workflow");
-    expect(
-      (streamCalls[1]!.body as unknown as { code_block: boolean | null })
-        .code_block,
-    ).toBe(true);
-  });
-
   it("drains a queued block build that repeats the message of the turn in flight", async () => {
     await renderChat();
     await act(async () => {
@@ -3116,22 +3544,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
     expect(streamCalls[2]!.body.message).toBe(blockBuildMessage);
   });
-
-  it("drops a queued prompt that a replacement send rewrote into a repeat", async () => {
-    await renderChat();
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    await submit("something else entirely");
-    await submit("build me a workflow");
-
-    await completeOldestStream("first done");
-    await act(async () => {});
-
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("something else entirely")).toBeNull();
-    expect(screen.getAllByText("build me a workflow")).toHaveLength(1);
-  });
 });
 
 describe("WorkflowCopilotChat — a stop never replays a queued message", () => {
@@ -3196,40 +3608,274 @@ describe("WorkflowCopilotChat — the composer stays usable while a prompt is pa
 
     expect(textarea().disabled).toBe(false);
     expect(
-      screen.getByPlaceholderText("Type to replace the queued message…"),
+      screen.getByPlaceholderText("Add to the queued message…"),
     ).toBeTruthy();
   });
 
-  it("does not clobber half-typed composer text when a stop returns the queued one", async () => {
+  it("keeps half-typed composer text after the queued text when a stop returns it", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await deliverFirstFrame();
     await submit("queued answer");
-    // Half-typed replacement, never submitted.
+    // Half-typed addition, never submitted.
     fireEvent.change(textarea(), {
-      target: { value: "half typed replacement" },
+      target: { value: "half typed addition" },
     });
 
     await act(async () => useCopilotActionStore.getState().requestCancel());
 
-    expect(textarea().value).toBe("half typed replacement");
+    expect(textarea().value).toBe("queued answer\nhalf typed addition");
   });
 
-  it("replaces the parked prompt rather than swallowing the second send", async () => {
+  it("Remove discards the queued message and hands its file back to the tray", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await submit("wrong code 000000");
-    await submit("correct code 123456");
+    await attachSpreadsheet("queued.csv");
+    await submit("parse this sheet");
 
-    expect(screen.queryByText("wrong code 000000")).toBeNull();
-    expect(screen.getAllByText("correct code 123456")).toHaveLength(1);
+    fireEvent.click(
+      queuedStrip().getByRole("button", { name: "Remove queued message" }),
+    );
+
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+    expect(textarea().value).toBe("");
+    expect(
+      screen.getByRole("button", { name: "Remove queued.csv" }),
+    ).toBeTruthy();
+    await completeOldestStream("done");
+    await act(async () => {});
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds to the parked prompt rather than replacing or swallowing the second send", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("use the staging site");
+    await submit("and log in first");
+
     // Still exactly one parked prompt, and still no second stream.
     expect(postStreaming).toHaveBeenCalledTimes(1);
 
     await completeOldestStream("done");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("correct code 123456");
+    expect(streamCalls[1]!.body.message).toBe(
+      "use the staging site\nand log in first",
+    );
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+  });
+});
+
+describe("WorkflowCopilotChat — delivered output files", () => {
+  const outputFiles = [
+    { artifact_id: "a_xlsx", filename: "quarterly.xlsx" },
+    { artifact_id: "a_pdf", filename: "report.pdf" },
+  ];
+
+  const builtPayload = (extra: Record<string, unknown> = {}) => ({
+    turnId: "turn-1",
+    turnIndex: 0,
+    mode: "build",
+    designStarted: true,
+    designEnded: true,
+    draft: null,
+    blocks: [],
+    terminal: "response",
+    terminalMessage: "Built it. Your spreadsheet and report are ready.",
+    narrativeSummary: "Built it. Your spreadsheet and report are ready.",
+    priorBlockCount: null,
+    designActivity: [],
+    startedAt: null,
+    endedAt: null,
+    ...extra,
+  });
+
+  function fileButtons() {
+    return outputFiles.map((file) => {
+      const button = screen.getByRole("button", { name: file.filename });
+      return [button.textContent, button.hasAttribute("href")];
+    });
+  }
+
+  function interceptTab() {
+    const tab = { opener: {}, location: { href: "" }, close: vi.fn() };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(tab as unknown as Window);
+    return { tab, open };
+  }
+
+  function mintFailure(status: number) {
+    return new AxiosError(
+      `Request failed with status code ${status}`,
+      undefined,
+      undefined,
+      undefined,
+      { status } as AxiosResponse,
+    );
+  }
+
+  async function renderPersistedTurn() {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "export the research as a spreadsheet and a report",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "Built it. Your spreadsheet and report are ready.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: builtPayload(),
+          turn_outcome: { response_kind: "build", output_files: outputFiles },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    await renderChat();
+    await waitFor(fileButtons);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("shows the same files, with no URL, in the live reply and after reload", async () => {
+    await renderChat();
+    await submit("export the research as a spreadsheet and a report");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse("Built it. Your spreadsheet and report are ready."),
+        narrative_payload: builtPayload({ outputFiles }),
+      });
+      call.resolve();
+    });
+    const live = await waitFor(fileButtons);
+    cleanup();
+
+    await renderPersistedTurn();
+
+    expect(live).toEqual([
+      ["quarterly.xlsx", false],
+      ["report.pdf", false],
+    ]);
+    expect(fileButtons()).toEqual(live);
+    expect(mintSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it("mints a fresh URL on every click, including modified and middle clicks", async () => {
+    await renderPersistedTurn();
+    const { tab, open } = interceptTab();
+    const button = screen.getByRole("button", { name: "quarterly.xlsx" });
+
+    for (const click of [
+      () => fireEvent.click(button),
+      () => fireEvent.click(button),
+      () => fireEvent.click(button, { metaKey: true }),
+      () =>
+        fireEvent(
+          button,
+          new MouseEvent("auxclick", {
+            bubbles: true,
+            cancelable: true,
+            button: 1,
+          }),
+        ),
+    ]) {
+      await act(async () => {
+        click();
+      });
+    }
+
+    await waitFor(() => expect(mintSignedUrl).toHaveBeenCalledTimes(4));
+    expect(mintSignedUrl.mock.calls.every(([id]) => id === "a_xlsx")).toBe(
+      true,
+    );
+    expect(open).toHaveBeenCalledTimes(4);
+    expect(tab.location.href).toBe(
+      "https://files.example/artifacts/a_xlsx/content?expiry=1",
+    );
+  });
+
+  it("says a file is no longer available when its URL cannot be minted", async () => {
+    await renderPersistedTurn();
+    const { tab } = interceptTab();
+    mintSignedUrl.mockImplementationOnce(() =>
+      Promise.reject(mintFailure(404)),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "report.pdf" }));
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          (_, element) =>
+            element?.getAttribute("title") === "Download report.pdf" &&
+            element.textContent === "report.pdf (no longer available)",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByRole("button", { name: "report.pdf" })).toBeNull();
+    expect(tab.close).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "quarterly.xlsx" })).toBeTruthy();
+  });
+
+  it("keeps a file clickable after a mint fails for a reason other than a missing artifact", async () => {
+    await renderPersistedTurn();
+    const { tab } = interceptTab();
+    mintSignedUrl.mockImplementationOnce(() =>
+      Promise.reject(mintFailure(500)),
+    );
+    const button = screen.getByRole("button", { name: "report.pdf" });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    await waitFor(() => expect(tab.close).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/no longer available/)).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "report.pdf" }));
+    });
+    await waitFor(() =>
+      expect(tab.location.href).toBe(
+        "https://files.example/artifacts/a_pdf/content?expiry=1",
+      ),
+    );
+    expect(mintSignedUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers no file for a reply that only names one", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Saved your data to quarterly.xlsx.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: builtPayload({
+            terminalMessage: "Saved your data to quarterly.xlsx.",
+            narrativeSummary: "Saved your data to quarterly.xlsx.",
+          }),
+          turn_outcome: { response_kind: "build", output_files: null },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    expect(screen.queryByRole("button", { name: "quarterly.xlsx" })).toBeNull();
   });
 });

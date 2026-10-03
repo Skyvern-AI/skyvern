@@ -59,6 +59,7 @@ function DataExportEditorBody({
         />
       </div>
       <WorkflowDataSchemaInputGroup
+        deferKey={JSON.stringify([blockId, "dataSchema"])}
         exampleValue={dataSchemaExample}
         onChange={(dataSchema) => update({ dataSchema })}
         suggestionContext={{ current_schema: data.dataSchema }}

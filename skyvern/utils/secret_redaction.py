@@ -7,6 +7,8 @@ import urllib.parse
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
+from skyvern.forge.sdk.core import skyvern_context
+
 REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 MIN_SECRET_LENGTH = 4
 MIN_NUMERIC_SECRET_LENGTH = 6
@@ -116,24 +118,30 @@ def expand_secret_encodings(value: str) -> set[str]:
 
 
 @functools.lru_cache(maxsize=64)
-def _compiled_secret_pattern(variants: frozenset[str], boundary_all_lengths: bool = False) -> re.Pattern[str]:
+def _compiled_secret_pattern(
+    variants: frozenset[str], boundary_all_lengths: bool = False, match_inside_words: bool = False
+) -> re.Pattern[str]:
     sorted_variants = sorted(variants, key=len, reverse=True)
     pattern_parts = [
         rf"(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])"
-        if boundary_all_lengths or len(variant) < 8
+        if not match_inside_words and (boundary_all_lengths or len(variant) < 8)
         else re.escape(variant)
         for variant in sorted_variants
     ]
     return re.compile("|".join(pattern_parts))
 
 
-def redact_secrets_from_text(text: str, secret_values: Collection[str], *, boundary_all_lengths: bool = False) -> str:
+def redact_secrets_from_text(
+    text: str, secret_values: Collection[str], *, boundary_all_lengths: bool = False, match_inside_words: bool = False
+) -> str:
     """Replace every registered secret variant found in ``text`` with a placeholder.
 
     By default, secrets of 8+ characters match as a plain substring (matches inside a longer
     alphanumeric run too), which suits free-form prose logs. ``boundary_all_lengths=True`` anchors
     every secret length to token boundaries instead, for structured data where a short secret can
     legitimately be a substring of an unrelated longer value (e.g. "Sunshine1" inside "MySunshine1Co").
+    ``match_inside_words=True`` scans every variant even inside words and placeholder-like tokens,
+    for rejecting values that must never carry a registered secret.
     """
     if not text or not secret_values:
         return text
@@ -143,7 +151,9 @@ def redact_secrets_from_text(text: str, secret_values: Collection[str], *, bound
     }
     if not variants:
         return text
-    pattern = _compiled_secret_pattern(frozenset(variants), boundary_all_lengths)
+    pattern = _compiled_secret_pattern(frozenset(variants), boundary_all_lengths, match_inside_words)
+    if match_inside_words:
+        return pattern.sub(REDACTED_SECRET_PLACEHOLDER, text)
     segments = re.split(f"({_PLACEHOLDER_TOKEN_RE.pattern})", text)
     for index, segment in enumerate(segments):
         if _PLACEHOLDER_TOKEN_RE.fullmatch(segment):
@@ -152,18 +162,69 @@ def redact_secrets_from_text(text: str, secret_values: Collection[str], *, bound
     return "".join(segments)
 
 
-def redact_secrets_from_bytes(data: bytes, secret_values: Collection[str]) -> bytes:
+def redact_multi_field_totp_artifact_bytes(data: bytes) -> bytes:
+    task_ids = skyvern_context.multi_field_totp_masking_task_ids()
+    if not task_ids:
+        return data
+    text = data.decode("utf-8", errors="replace")
+    forms = set().union(*(skyvern_context._multi_field_totp_mask_context(task_id)[2] for task_id in task_ids))
+    masked = text
+    if skyvern_context.multi_field_totp_artifact_scan_allowed(len(data)):
+        try:
+            decoded = json.loads(text) if text.lstrip().startswith(("{", "[", '"')) else None
+        except (ValueError, RecursionError):
+            decoded = None
+        if decoded is not None:
+
+            def mask_value(value: Any) -> Any:
+                if isinstance(value, str):
+                    return redact_secrets_from_text(
+                        skyvern_context.mask_multi_field_totp_artifact_text(
+                            value, replacement=REDACTED_SECRET_PLACEHOLDER
+                        ),
+                        forms,
+                    )
+                if isinstance(value, dict):
+                    return {key: mask_value(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [mask_value(item) for item in value]
+                return value
+
+            masked_value = mask_value(decoded)
+            if masked_value != decoded:
+                masked = json.dumps(masked_value)
+        else:
+            masked = skyvern_context.mask_multi_field_totp_artifact_text(text, replacement=REDACTED_SECRET_PLACEHOLDER)
+    literal_forms = {form for form in forms if any(variant in masked for variant in expand_secret_encodings(form))}
+    masked = redact_secrets_from_text(masked, literal_forms)
+    return data if masked == text else masked.encode()
+
+
+def redact_secrets_from_bytes(data: bytes, secret_values: Collection[str], *, multi_field_totp: bool = True) -> bytes:
+    if multi_field_totp:
+        data = redact_multi_field_totp_artifact_bytes(data)
     text = data.decode("utf-8", errors="replace")
     return redact_secrets_from_text(text, secret_values).encode()
 
 
-def redact_har_bytes(har_data: bytes, secret_values: Collection[str]) -> bytes:
+def redact_har_bytes(har_data: bytes, secret_values: Collection[str], *, multi_field_totp: bool = True) -> bytes:
     try:
         har = json.loads(har_data)
     except Exception:
-        return redact_secrets_from_bytes(har_data, secret_values)
+        return redact_secrets_from_bytes(har_data, secret_values, multi_field_totp=multi_field_totp)
 
     original_serialized_har = json.dumps(har)
+    base64_containers: set[int] = set()
+
+    def redact_body(container: Any) -> None:
+        if (
+            isinstance(container, dict)
+            and container.get("encoding") == "base64"
+            and isinstance(container.get("text"), str)
+        ):
+            _redact_base64_text(container, secret_values, multi_field_totp=multi_field_totp)
+            base64_containers.add(id(container))
+
     log = har.get("log", {}) if isinstance(har, dict) else {}
     entries = log.get("entries", []) if isinstance(log, dict) else []
     if isinstance(entries, list):
@@ -181,15 +242,47 @@ def redact_har_bytes(har_data: bytes, secret_values: Collection[str]) -> bytes:
                 if isinstance(post_data, dict):
                     _redact_form_fields(post_data.get("params", []))
                     _redact_urlencoded_post_data_text(post_data)
-                _redact_base64_text(post_data, secret_values)
+                redact_body(post_data)
             if isinstance(response, dict):
                 _redact_headers(response.get("headers", []))
                 _redact_cookies(response.get("cookies", []))
                 content = response.get("content", {})
                 if isinstance(content, dict):
-                    _redact_base64_text(content, secret_values)
+                    redact_body(content)
 
-    redacted_serialized_har = redact_secrets_from_text(json.dumps(har), secret_values)
+    if base64_containers:
+        task_ids = skyvern_context.multi_field_totp_masking_task_ids() if multi_field_totp else set()
+        forms = set().union(*(skyvern_context._multi_field_totp_mask_context(task_id)[2] for task_id in task_ids))
+        scan_allowed = bool(task_ids) and skyvern_context.multi_field_totp_artifact_scan_allowed(len(har_data))
+        combined_secrets = set(secret_values) | forms
+
+        def mask_text(text: str) -> str:
+            if scan_allowed:
+                text = skyvern_context.mask_multi_field_totp_artifact_text(
+                    text, replacement=REDACTED_SECRET_PLACEHOLDER
+                )
+            return redact_secrets_from_text(text, combined_secrets)
+
+        def mask_value(value: Any) -> Any:
+            if isinstance(value, str):
+                return mask_text(value)
+            if isinstance(value, dict):
+                return {
+                    key if id(value) in base64_containers and key in {"text", "encoding"} else mask_text(key): item
+                    if id(value) in base64_containers and key in {"text", "encoding"}
+                    else mask_value(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [mask_value(item) for item in value]
+            return value
+
+        redacted_serialized_har = json.dumps(mask_value(har))
+    else:
+        serialized = json.dumps(har).encode()
+        if multi_field_totp:
+            serialized = redact_multi_field_totp_artifact_bytes(serialized)
+        redacted_serialized_har = redact_secrets_from_text(serialized.decode(), secret_values)
     if redacted_serialized_har == original_serialized_har:
         return har_data
     return redacted_serialized_har.encode()
@@ -293,7 +386,7 @@ def _redact_cookies(cookies: Any) -> None:
             cookie["value"] = REDACTED_SECRET_PLACEHOLDER
 
 
-def _redact_base64_text(container: Any, secret_values: Collection[str]) -> None:
+def _redact_base64_text(container: Any, secret_values: Collection[str], *, multi_field_totp: bool = True) -> None:
     if not isinstance(container, dict):
         return
     if container.get("encoding") != "base64":
@@ -304,10 +397,17 @@ def _redact_base64_text(container: Any, secret_values: Collection[str]) -> None:
     try:
         decoded_bytes = base64.b64decode(encoded_text, validate=False)
     except Exception:
+        redacted_text = redact_secrets_from_bytes(
+            encoded_text.encode(), secret_values, multi_field_totp=multi_field_totp
+        ).decode()
+        if redacted_text != encoded_text:
+            container["text"] = base64.b64encode(redacted_text.encode()).decode()
         return
     try:
         decoded_text = decoded_bytes.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         return
-    redacted_text = redact_secrets_from_text(decoded_text, secret_values)
+    redacted_text = redact_secrets_from_bytes(
+        decoded_text.encode(), secret_values, multi_field_totp=multi_field_totp
+    ).decode()
     container["text"] = base64.b64encode(redacted_text.encode()).decode()

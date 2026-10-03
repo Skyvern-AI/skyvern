@@ -1,21 +1,30 @@
 import asyncio
 import difflib
+import hashlib
 import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
+from urllib.parse import urljoin, urlsplit
 
 import structlog
 from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
+    from skyvern.forge.agent_functions import TOTPVerificationResponse
     from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 
 from skyvern.config import settings
-from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
+from skyvern.exceptions import (
+    BlockedHost,
+    FailedToGetTOTPVerificationCode,
+    NoTOTPVerificationCodeFound,
+    SkyvernHTTPException,
+    UnresolvableHost,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
@@ -25,8 +34,19 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
-from skyvern.forge.sdk.services.credentials import generate_totp_code, is_unresolved_totp_placeholder
+from skyvern.forge.sdk.services.credentials import (
+    generate_totp_code,
+    is_totp_sentinel,
+    is_unresolved_totp_placeholder,
+    parse_totp_config,
+    wait_for_fresh_totp_window,
+)
 from skyvern.services.otp_email import EmailOTPVerificationContext
+from skyvern.utils.url_validators import (
+    BLOCKED_HOST_ALLOWLIST_HINT,
+    SAFE_REDIRECT_STATUS_CODES,
+    validate_fetch_url_with_resolved_ips,
+)
 
 LOG = structlog.get_logger()
 
@@ -44,6 +64,13 @@ class RawOTPVerificationContext:
     # Types that were present but rejected for not matching expected_otp_type; lets a caller
     # that times out say which kind of OTP did arrive instead of only that none matched.
     observed_otp_types: set[OTPType] = field(default_factory=set)
+    # Every stored row the queries returned, before any run, task or expiry filter. Rows Skyvern
+    # persisted from its own inbox search are in here too, so this is not a forwarded/pushed count.
+    # A row in here was returned, not necessarily parsed: the reparse budget stops the scan early.
+    seen_row_ids: set[str] = field(default_factory=set)
+    # False until the stored-code queries return once, so a wait that times out first can say the
+    # store went unchecked instead of claiming it was empty.
+    store_queried: bool = False
 
 
 @dataclass
@@ -110,6 +137,7 @@ _TOTP_WEBHOOK_REQUEST_FAILED_REASON = "totp_webhook_request_failed"
 _SAFE_TOTP_ERROR_REASON_PREFIXES = (_TOTP_WEBHOOK_NON_JSON_RESPONSE_REASON, _TOTP_WEBHOOK_REQUEST_FAILED_REASON)
 _TOTP_WEBHOOK_REQUEST_MAX_ATTEMPTS = 3
 _TOTP_WEBHOOK_REQUEST_RETRY_TIMEOUT_SECONDS = 5
+_TOTP_WEBHOOK_MAX_REDIRECTS = 3
 
 MFANavigationPayload = dict | list | str | None
 _TOTPWebhookPostResponse = tuple[int, dict[str, str], Any, bool]
@@ -117,6 +145,10 @@ _TOTPWebhookPostResponse = tuple[int, dict[str, str], Any, bool]
 
 class _TOTPWebhookRequestError(Exception):
     pass
+
+
+class TOTPWebhookRedirectRefused(Exception):
+    """Carries a fixed, URL-free message, so it is safe to surface in a failure reason."""
 
 
 class InsufficientCreditsForOTPParse(Exception):
@@ -285,12 +317,16 @@ def _is_mfa_like_parameter_key(key: object) -> bool:
 
 
 def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> OTPValue | None:
+    return next(iter_totp_from_navigation_inputs(navigation_payload), None)
+
+
+def iter_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload) -> Iterator[OTPValue]:
     """Extract inline OTP or magic-link content from runtime navigation inputs.
 
     Runtime inline OTP extraction is intentionally payload-only.
     """
     if not isinstance(navigation_payload, (dict, list)):
-        return None
+        return
 
     traversal_stack: list[dict | list | str] = [navigation_payload]
     visited_container_ids: set[int] = set()
@@ -302,7 +338,8 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
             otp_type = (
                 OTPType.MAGIC_LINK if current_item.strip().lower().startswith(("https://", "http://")) else OTPType.TOTP
             )
-            return OTPValue(value=current_item, type=otp_type)
+            yield OTPValue(value=current_item, type=otp_type)
+            continue
 
         current_id = id(current_item)
         if current_id in visited_container_ids:
@@ -329,7 +366,7 @@ def extract_totp_from_navigation_inputs(navigation_payload: MFANavigationPayload
             if candidate_value and not is_unresolved_totp_placeholder(candidate_value):
                 traversal_stack.append(candidate_value)
 
-    return None
+    return
 
 
 def _get_header_value(headers: dict[str, str], header_name: str) -> str | None:
@@ -416,6 +453,74 @@ def _coerce_totp_response_body(body: str) -> tuple[Any, bool]:
     return body, False
 
 
+async def _request_totp_following_redirects(
+    *,
+    url: str,
+    payload: str,
+    headers: dict[str, str],
+    timeout: int,
+    organization_id: str,
+) -> "TOTPVerificationResponse":
+    # Redirects are followed here rather than by the HTTP client so every hop is validated and pinned
+    # like the first. Method rewriting matches the earlier aiohttp client: 303, and 301/302 after a
+    # POST, continue as a GET without the body.
+    method = "POST"
+    current_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, url)
+    for hop in range(_TOTP_WEBHOOK_MAX_REDIRECTS + 1):
+        response = await app.AGENT_FUNCTION.post_totp_verification_request(
+            url=current_url,
+            payload=payload if method == "POST" else "",
+            headers=headers if method == "POST" else _headers_without_body(headers),
+            timeout_seconds=timeout,
+            organization_id=organization_id,
+            resolved_ips=resolved_ips,
+            method=method,
+        )
+        location = _get_header_value(response.headers, "Location")
+        if response.status_code not in SAFE_REDIRECT_STATUS_CODES or not location:
+            return response
+        if hop == _TOTP_WEBHOOK_MAX_REDIRECTS:
+            raise TOTPWebhookRedirectRefused(f"more than {_TOTP_WEBHOOK_MAX_REDIRECTS} redirects")
+        next_url = urljoin(current_url, location)
+        if urlsplit(current_url).scheme == "https" and urlsplit(next_url).scheme != "https":
+            raise TOTPWebhookRedirectRefused("redirect from https to http refused")
+        if _origin(next_url) != _origin(current_url):
+            # 307/308 would re-send the signed payload to the new host unchanged.
+            if response.status_code in (307, 308):
+                raise TOTPWebhookRedirectRefused("cross-origin 307/308 redirect refused")
+            headers = _headers_without_credentials(headers)
+        current_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, next_url)
+        if response.status_code == 303 or (response.status_code in (301, 302) and method == "POST"):
+            method = "GET"
+    raise AssertionError("unreachable")
+
+
+def _request_failure_detail(error: Exception) -> str:
+    # Other exception messages can carry the endpoint URL or response details, so only known-safe text is surfaced.
+    if isinstance(error, TOTPWebhookRedirectRefused):
+        return f" detail={error}"
+    if isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost):
+        return f" detail={BLOCKED_HOST_ALLOWLIST_HINT}"
+    return ""
+
+
+def _origin(url: str) -> tuple[str, str]:
+    parts = urlsplit(url)
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"content-type", "accept", "user-agent"})
+
+
+def _headers_without_credentials(headers: dict[str, str]) -> dict[str, str]:
+    # Signatures, auth and any custom headers are meant for the configured endpoint, not a host it redirects to.
+    return {key: value for key, value in headers.items() if key.lower() in _CROSS_ORIGIN_REDIRECT_HEADERS}
+
+
+def _headers_without_body(headers: dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in headers.items() if key.lower() not in ("content-type", "content-length")}
+
+
 async def _post_totp_verification_url(
     *,
     url: str,
@@ -430,11 +535,11 @@ async def _post_totp_verification_url(
     # (static IP), matching webhook and file-upload delivery.
     for attempt in range(max_attempts):
         try:
-            response = await app.AGENT_FUNCTION.post_totp_verification_request(
+            response = await _request_totp_following_redirects(
                 url=url,
                 payload=signed_payload,
                 headers=headers,
-                timeout_seconds=timeout,
+                timeout=timeout,
                 organization_id=organization_id,
             )
             # Content-Type gate: only trust an explicit non-JSON header to mean
@@ -447,6 +552,11 @@ async def _post_totp_verification_url(
             parsed, is_json = _coerce_totp_response_body(response.body)
             return response.status_code, response.headers, parsed, is_json
         except Exception as e:
+            # A refused target stays refused; a resolver failure may be transient, so it retries.
+            if isinstance(e, TOTPWebhookRedirectRefused) or (
+                isinstance(e, SkyvernHTTPException) and not isinstance(e, UnresolvableHost)
+            ):
+                raise
             # Avoid exc_info here because network exceptions can include the
             # webhook URL or response details; keep retry logs diagnostic but sanitized.
             LOG.debug(
@@ -460,11 +570,7 @@ async def _post_totp_verification_url(
     raise _TOTPWebhookRequestError("Failed post request to TOTP verification URL")
 
 
-def try_generate_totp_for_credential(
-    workflow_run_context: "WorkflowRunContext",
-    credential_key: str,
-    workflow_run_id: str,
-) -> OTPValue | None:
+def _credential_totp_secret(workflow_run_context: "WorkflowRunContext", credential_key: str) -> str | None:
     if not workflow_run_context.is_registered_credential_parameter_key(credential_key):
         return None
     value = workflow_run_context.values.get(credential_key)
@@ -474,7 +580,15 @@ def try_generate_totp_for_credential(
     if not totp_secret_id or not isinstance(totp_secret_id, str):
         return None
     totp_secret_key = workflow_run_context.totp_secret_value_key(totp_secret_id)
-    totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+    return workflow_run_context.get_original_secret_value_or_none(totp_secret_key) or None
+
+
+def try_generate_totp_for_credential(
+    workflow_run_context: "WorkflowRunContext",
+    credential_key: str,
+    workflow_run_id: str,
+) -> OTPValue | None:
+    totp_secret = _credential_totp_secret(workflow_run_context, credential_key)
     if not totp_secret:
         return None
     try:
@@ -502,6 +616,33 @@ def try_generate_totp_for_credential(
             exc_info=True,
         )
     return OTPValue(value=code, type=OTPType.TOTP, from_credential_seed=True)
+
+
+def is_usable_credential_totp_placeholder(
+    workflow_run_context: "WorkflowRunContext",
+    placeholder: object,
+    *,
+    active_credential_parameter_key: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None,
+) -> bool:
+    """Whether ``placeholder`` is the TOTP field of a credential this task may use, holding a vault sentinel
+    backed by a parseable TOTP secret -- i.e. a code can be generated for it here."""
+    if not isinstance(placeholder, str) or placeholder not in workflow_run_context.secrets:
+        return False
+    key = workflow_run_context.find_credential_parameter_key_for_secret(placeholder)
+    if not key or workflow_run_context.values.get(key, {}).get("totp") != placeholder:
+        return False
+    if allowed_credential_parameter_keys is not None and key not in allowed_credential_parameter_keys:
+        return False
+    if active_credential_parameter_key is not None and active_credential_parameter_key != key:
+        return False
+    if not is_totp_sentinel(workflow_run_context.get_original_secret_value_or_none(placeholder)):
+        return False
+    secret_key = workflow_run_context.totp_secret_value_key(placeholder)
+    if secret_key not in workflow_run_context.secrets:
+        return False
+    secret = workflow_run_context.get_original_secret_value_or_none(secret_key)
+    return bool(secret and parse_totp_config(secret))
 
 
 def has_credential_totp_candidate(
@@ -562,6 +703,34 @@ def try_generate_totp_from_credential(
     ``allowed_credential_parameter_keys`` restricts both paths to the originating block's
     linked credentials (SKY-15181); None means unrestricted (bare tasks, cached scripts).
     """
+    selected = _select_totp_credential(workflow_run_id, allowed_credential_parameter_keys)
+    if selected is None:
+        return None
+    workflow_run_context, credential_key, workflow_run_id = selected
+    return try_generate_totp_for_credential(workflow_run_context, credential_key, workflow_run_id)
+
+
+async def _generate_totp_from_credential_in_fresh_window(
+    workflow_run_id: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None,
+    min_remaining_seconds: int,
+) -> OTPValue | None:
+    """`try_generate_totp_from_credential`, but a code that would have fewer than ``min_remaining_seconds``
+    left in its step is generated in the next step instead."""
+    selected = _select_totp_credential(workflow_run_id, allowed_credential_parameter_keys)
+    if selected is None:
+        return None
+    workflow_run_context, credential_key, workflow_run_id = selected
+    totp_secret = _credential_totp_secret(workflow_run_context, credential_key)
+    if totp_secret:
+        await wait_for_fresh_totp_window(totp_secret, min_remaining_seconds=min_remaining_seconds)
+    return try_generate_totp_for_credential(workflow_run_context, credential_key, workflow_run_id)
+
+
+def _select_totp_credential(
+    workflow_run_id: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None,
+) -> tuple["WorkflowRunContext", str, str] | None:
     if not workflow_run_id:
         return None
 
@@ -590,7 +759,7 @@ def try_generate_totp_from_credential(
         active_credential_key = None
 
     if active_credential_key:
-        return try_generate_totp_for_credential(workflow_run_context, active_credential_key, workflow_run_id)
+        return workflow_run_context, active_credential_key, workflow_run_id
 
     candidate_keys = [
         key
@@ -617,7 +786,7 @@ def try_generate_totp_from_credential(
                 candidate_credential_keys=candidate_keys,
             )
         return None
-    return try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
+    return workflow_run_context, candidate_keys[0], workflow_run_id
 
 
 # Facetable rollout sentinel for SKY-15181: fires only when block scoping flips a run from
@@ -681,12 +850,38 @@ def has_otp_source(
     return has_polling_source
 
 
+def _exclude_rejected_otp(
+    otp_value: OTPValue | None,
+    rejected_code_hash: str | None,
+    multi_field_expected_digits: int | None = None,
+    *,
+    task_id: str | None = None,
+) -> OTPValue | None:
+    if otp_value is not None:
+        skyvern_context.register_multi_field_totp_candidate(otp_value.value, task_id=task_id)
+    if otp_value is not None and multi_field_expected_digits is not None:
+        normalized = skyvern_context.normalize_multi_field_totp_code(
+            otp_value.value, multi_field_expected_digits, task_id=task_id
+        )
+        if normalized is None:
+            return None
+        otp_value = otp_value.model_copy(update={"value": normalized})
+    if otp_value and rejected_code_hash and hashlib.sha256(otp_value.value.encode()).hexdigest() == rejected_code_hash:
+        return None
+    return otp_value
+
+
 async def resolve_otp_value(
     task: "Task",
     expected_otp_type: OTPType | None = None,
     max_wait_seconds: float | None = None,
     poll_started_at: datetime | None = None,
     allowed_credential_parameter_keys: Sequence[str] | None = None,
+    created_after: datetime | None = None,
+    rejected_code_hash: str | None = None,
+    multi_field_expected_digits: int | None = None,
+    *,
+    min_remaining_seconds: int = 0,
 ) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
@@ -697,15 +892,24 @@ async def resolve_otp_value(
     resolutions do not touch the database. Polling raises
     NoTOTPVerificationCodeFound or FailedToGetTOTPVerificationCode on timeout;
     those propagate so callers can build the right terminate action. Returns
-    None when no source is configured.
+    None when no source is configured. ``min_remaining_seconds`` > 0 makes a
+    credential-generated code wait for a TOTP step with at least that long left;
+    polled and payload codes never wait.
     """
     otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+    otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task.task_id)
     if otp_value and (expected_otp_type is None or otp_value.get_otp_type() == expected_otp_type):
         return otp_value
 
-    otp_value = try_generate_totp_from_credential(task.workflow_run_id, allowed_credential_parameter_keys)
+    if min_remaining_seconds > 0 and expected_otp_type in (None, OTPType.TOTP):
+        otp_value = await _generate_totp_from_credential_in_fresh_window(
+            task.workflow_run_id, allowed_credential_parameter_keys, min_remaining_seconds
+        )
+    else:
+        otp_value = try_generate_totp_from_credential(task.workflow_run_id, allowed_credential_parameter_keys)
     # A credential TOTP can only ever be a TOTP, so it's a match only when the caller isn't
     # expecting some other OTP type (e.g. a magic link) -- mirrors has_otp_source's gate.
+    otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task.task_id)
     if otp_value and expected_otp_type in (None, OTPType.TOTP):
         return otp_value
 
@@ -730,10 +934,12 @@ async def resolve_otp_value(
             workflow_permanent_id=workflow_permanent_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
-            created_after=run_started_at,
+            created_after=created_after or run_started_at,
+            rejected_code_hash=rejected_code_hash,
             expected_otp_type=expected_otp_type,
             max_wait_seconds=max_wait_seconds,
             poll_started_at=poll_started_at,
+            multi_field_expected_digits=multi_field_expected_digits,
         )
 
     _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)
@@ -755,6 +961,8 @@ async def poll_otp_value(
     webhook_context: WebhookOTPVerificationContext | None = None,
     max_wait_seconds: float | None = None,
     poll_started_at: datetime | None = None,
+    rejected_code_hash: str | None = None,
+    multi_field_expected_digits: int | None = None,
 ) -> OTPValue | None:
     """Poll until an OTP of ``expected_otp_type`` arrives or the wall-clock budget expires.
 
@@ -847,6 +1055,9 @@ async def poll_otp_value(
                     workflow_permanent_id=workflow_permanent_id,
                     context=webhook_otp_context,
                 )
+            otp_value = _exclude_rejected_otp(
+                otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id
+            )
             if otp_value is None and totp_identifier:
                 otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
@@ -857,6 +1068,9 @@ async def poll_otp_value(
                     expected_otp_type=expected_otp_type,
                     context=email_otp_context,
                 )
+            otp_value = _exclude_rejected_otp(
+                otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id
+            )
             if otp_value is None and totp_identifier:
                 # Preserve the historical DB behavior: callers that omit
                 # created_after may still read codes inserted before this poll began.
@@ -869,6 +1083,8 @@ async def poll_otp_value(
                     created_after=db_created_after,
                     expected_otp_type=expected_otp_type,
                     raw_context=raw_otp_context,
+                    rejected_code_hash=rejected_code_hash,
+                    multi_field_expected_digits=multi_field_expected_digits,
                 )
         except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
@@ -883,6 +1099,7 @@ async def poll_otp_value(
             continue
         consecutive_failures = 0
         last_error_reason = None
+        otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id)
         if otp_value:
             LOG.info(
                 "Got otp value",
@@ -931,7 +1148,7 @@ async def _get_otp_value_from_url(
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_id=workflow_permanent_id,
-            reason=f"{_TOTP_WEBHOOK_REQUEST_FAILED_REASON} exception_type={type(e).__name__}",
+            reason=f"{_TOTP_WEBHOOK_REQUEST_FAILED_REASON} exception_type={type(e).__name__}{_request_failure_detail(e)}",
         )
     content_type = _get_header_value(response_headers, "Content-Type")
     if context is not None:
@@ -1042,6 +1259,8 @@ async def _get_otp_value_from_db(
     created_after: datetime | None = None,
     expected_otp_type: OTPType | None = None,
     raw_context: RawOTPVerificationContext | None = None,
+    rejected_code_hash: str | None = None,
+    multi_field_expected_digits: int | None = None,
 ) -> OTPValue | None:
     # Email/SMS deliveries can arrive through /v1/credentials/totp without run
     # scope, so include both exact run matches and unscoped rows in SQL.
@@ -1063,6 +1282,9 @@ async def _get_otp_value_from_db(
             created_after=created_after,
             excluded_ids={row_id for row_id, otp_type in context.misses if otp_type == expected_otp_type},
         )
+    context.seen_row_ids.update(row.totp_code_id for row in totp_codes)
+    context.seen_row_ids.update(row.totp_code_id for row in raw_rows)
+    context.store_queried = True
 
     # The parsed repository groups run-scoped rows ahead of unscoped forwarded
     # messages, and raw rows come from a separate query. Re-establish global
@@ -1085,7 +1307,14 @@ async def _get_otp_value_from_db(
             continue
         if not is_raw:
             parsed_row = row
-            stored_otp_value = OTPValue(value=parsed_row.code, type=parsed_row.otp_type)
+            stored_otp_value = _exclude_rejected_otp(
+                OTPValue(value=parsed_row.code, type=parsed_row.otp_type),
+                rejected_code_hash,
+                multi_field_expected_digits,
+                task_id=task_id,
+            )
+            if stored_otp_value is None:
+                continue
             if expected_otp_type is None or stored_otp_value.get_otp_type() == expected_otp_type:
                 return stored_otp_value
             context.observed_otp_types.add(stored_otp_value.get_otp_type())
@@ -1120,6 +1349,10 @@ async def _get_otp_value_from_db(
             context.misses.add(cache_key)
             if otp_value is not None:
                 context.observed_otp_types.add(otp_value.get_otp_type())
+            continue
+        otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id)
+        if otp_value is None:
+            context.misses.add(cache_key)
             continue
         if is_raw:
             await app.DATABASE.otp.promote_raw_otp_code(

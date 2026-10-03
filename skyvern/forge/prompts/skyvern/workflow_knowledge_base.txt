@@ -588,7 +588,6 @@ label: <unique_label>
 navigation_goal: <download_instruction>        # Required: How to trigger the download
 url: <starting_url>                            # Optional: URL to navigate to first
 title: str                                     # Optional: Title for the block
-engine: skyvern-1.0                            # Optional: Run engine
 error_code_mapping: {}                         # Optional: Map errors to custom codes
 max_retries: 0                                 # Optional: Number of retry attempts
 max_steps_per_run: null                        # Optional: Limit steps per execution
@@ -669,6 +668,7 @@ label: <unique_label>
 file_url: <https_url_or_file_url>             # Required: URL to the file
 file_type: <auto_detect|csv|excel|pdf|image|docx|zip>  # Optional: defaults to auto_detect (infer from URL/content)
 json_schema: <json_schema>                     # Optional: Structure of parsed output
+worksheet: <worksheet_name>                    # Optional: Excel only; exact sheet name. Omit to read the first sheet.
 
 Use Cases:
 - Parse a PDF invoice into structured fields
@@ -739,7 +739,7 @@ Purpose: Pause the workflow and wait for a person. This is the "Human Interactio
 
 Use Cases:
 - A person approves before the workflow continues (high-value action, compliance review, a check of extracted data)
-- A person does a step by hand in the browser that has no automated path: solving a CAPTCHA, biometric or voice verification, or a sign-in that credentialed login cannot complete
+- A person does a step by hand in the browser that has no automated path: a CAPTCHA the solver and the image-text form of `solve_captcha` cannot clear, biometric or voice verification, or a sign-in that credentialed login cannot complete
 - Escalation for a case the agent is not allowed to decide on its own
 
 Structure:
@@ -770,13 +770,16 @@ blocks:
 
 ** CAPTCHA SOLVER (captcha_solver) **
 
-Purpose: The managed captcha solver is a product capability, enabled by default for cloud organizations; it can be turned off per browser session under "Captcha Solver", and an organization-level kill switch exists on the platform side. It clears Cloudflare Turnstile and hCaptcha challenges through the solver extension and mints reCAPTCHA v2/v3 tokens. It cannot clear a widget the page never renders, an IP-reputation block ("unusual traffic", "access denied"), a DataDome or Akamai deny page, or an account security prompt ("verify it's you", authenticator codes).
+Purpose: The managed captcha solver is a product capability, enabled by default for cloud organizations; it can be turned off per browser session under "Captcha Solver", and an organization-level kill switch exists on the platform side. It clears Cloudflare Turnstile and hCaptcha challenges through the solver extension and mints reCAPTCHA v2/v3 tokens, and it hands a DataDome or PerimeterX challenge page to that vendor's handler, reporting it solved only when a fresh look shows the page cleared. It cannot clear a widget the page never renders, an IP-reputation block ("unusual traffic", "access denied"), an Akamai deny page, or an account security prompt ("verify it's you", authenticator codes).
 
 How a run reaches it:
 - Task-shaped blocks (navigation, login, action) invoke the solver automatically when a challenge is detected.
-- A code block invokes it only when its code calls the builtin `await solve_captcha(page)`; nothing runs the solver for a code block otherwise. A failed solve raises inside the code block and the run's action trace records a `solve_captcha` action with status `failed`.
+- A code block invokes it only when its code calls the builtin `await solve_captcha(page)`; nothing runs the solver for a code block otherwise. A challenge that stays unsolved, or that the solver has no route for, raises inside the code block and the run's action trace records a `solve_captcha` action with status `failed`.
+- A distorted-text image CAPTCHA (characters drawn in an image, typed into a field) is read by the image form, `await solve_captcha(page, image=<selector>, input=<selector>)`. In Workflow Copilot, while scouting, `solve_page_challenge` with `image` and `input`, or the same call inside `run_browser_code`, runs the same OCR, so the selectors are proven on the live page before they are saved. `image` selects the observed <img>, <svg> or <canvas> holding the text and `input` the observed answer field; both come from the inspected page. It reads the text and types it, and does not submit. It requires image OCR enabled for the organization; otherwise it raises. It raises with nothing typed when the image yields no text, and the runtime enforces a per-block call limit, raising on every call past it. So the block runs a short bounded loop: solve; if the call raised, click the observed refresh control and retry; otherwise submit, and if the form is still shown, click the refresh control and retry. With no refresh control, raise instead of retrying; raise after the last try. An answer typed while scouting fits only that one image and never belongs in the saved code.
 
-Reading the run: the build-test packet's `challenge` record says whether the solver is available for this organization (`solver_available`), whether this run invoked it (`solver_attempted`, absent when unknown), and what happened (`solver_result`: failed, attempted, not_attempted, or unresolved). "not_attempted" on a code block means the code never called the builtin, not that the product declined. "attempted" means the solve step ran and returned without an error, which is not the same as the challenge clearing: when no solver handles the page the call still reports success. "unresolved" means the run's action history was unavailable, so whether the solver ran is unknown and should not be stated either way. `solver_available` is resolved per page, and is absent when it was only resolved for a different URL.
+Reading the run: the build-test packet's `challenge` record says whether the solver is available for this organization (`solver_available`), whether this run invoked it (`solver_attempted`, absent when unknown), and what happened (`solver_result`: failed, attempted, not_attempted, or unresolved). "not_attempted" on a code block means the code never called the builtin, not that the product declined. "attempted" means the solve step ran and returned without an error, which is not the same as the challenge clearing: when no solver handles the page the call still reports success. "unresolved" means the run's action history was unavailable or cut short, so whether the solver ran is unknown and should not be stated either way. `solver_available` is resolved per page, and is absent when it was only resolved for a different URL.
+
+A run that did not pass and met no wall can still carry a `challenge` record with the solver keys and no levers: it reports the last `solve_captcha` call in a code block, not that a challenge blocked the run. "attempted" there means that call returned without an error, for either form: the image form typed an answer and the widget fallback also returns success, so neither says the site accepted anything. Whether the form moved on is read from the final page and the block status.
 
 ** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **
 
@@ -891,6 +894,22 @@ workflow_definition:
         data: "{{ get_data.output }}"
       parameter_keys: []
 
+** GOOGLE SHEETS WRITE BLOCK (google_sheets_write) **
+
+Purpose: Write rows to a Google Sheet, appended below existing data or written over the cells at `range`. `values` is template text the block parses as JSON after rendering, so it must render to one of these shapes.
+- A two-dimensional array with one inner array per row: `[["30 %", 12], ["51.91%", 7]]`. One cell is `[["30 %"]]`.
+- That array wrapped under `values` or `rows`: `{"values": [["30 %"]]}`.
+- A list of objects plus `column_mapping` (object key -> column letter). A single object is written as one row and also needs `column_mapping`.
+- Rich cells: `{"cells": [[<Sheets CellData>, ...]], "merges": [{"start_row_index": 0, "end_row_index": 1, "start_column_index": 0, "end_column_index": 2}]}`.
+Every cell is a JSON value, so a string cell must be quoted. `| tojson` quotes and escapes a referenced value: `[[{{ extract_metric.output.metric | tojson }}]]` renders `[["30 %"]]`, while `[[{{ extract_metric.output.metric }}]]` renders `[[30 %]]`, which is not JSON. A bare scalar such as 30 %, 6.97K or 10200 fails with "Invalid values payload".
+A reference must match the producer's output shape. A browser-task block (extraction, navigation, action, login) holds its payload under `.output`: `{{ extract_metric.output.metric }}`. A code or text_prompt block holds its returned fields on the label itself: `{{ compute_metric.metric }}` (a text_prompt without json_schema returns `llm_response`). An http_request block holds the parsed response body under `.body`: `{{ fetch_metric.body.metric }}`.
+A reference to a value no upstream block produced fails the block with "references a value no upstream block produced", and nothing is written.
+
+Use Cases:
+- Write an extracted metric into one cell
+- Append one row per extracted record
+- Update a fixed range with computed values
+
 ** PARAMETER TEMPLATING **
 
 All string fields in blocks support Jinja2 templating to reference parameters and block outputs.
@@ -916,10 +935,14 @@ IMPORTANT — block output shapes are NOT uniform across block types. Using the 
 * File download blocks (file_download):
   - `{{ fetch_report.downloaded_file_urls }}` — the URLs of the downloaded files; `{{ fetch_report.downloaded_files }}` holds the full file records. Use these, NOT `{{ fetch_report.output.downloaded_file_urls }}`: a download has no extracted payload, so `.output` holds nothing to read from and renders blank on its own.
 
-* Non-task blocks (text_prompt, http_request, file_url_parser):
+* Non-task blocks (text_prompt, code, file_url_parser):
   - `{{ label.<field> }}` — fields from the returned JSON are on the block directly; there is NO `.output` wrapper.
   - Example: `{{ summarize_notes.summary }}` (NOT `{{ summarize_notes.output.summary }}`).
   - Writing `{{ summarize_notes.output.summary }}` raises "dict object has no attribute 'output'" because `summarize_notes` IS the dict.
+
+* HTTP request blocks (http_request):
+  - `{{ fetch_metric.body }}` — the response body, parsed as JSON when the response is JSON; `{{ fetch_metric.status_code }}` and `{{ fetch_metric.headers }}` sit beside it.
+  - Example: `{{ fetch_metric.body.metric }}`. The label itself has no `metric` key, only the recorded response fields.
 
 NULL-GUARD RULE — when a downstream field may legitimately be null/empty (e.g., a text_prompt returned `{"store_url": null}` because no such link exists on the page), wrap the reference in a `conditional` block BEFORE using it as a URL. Unguarded `goto_url` with `url: "{{ x.field }}"` where `x.field` is None renders as `https://None` and is not recoverable by retrying the same workflow — it is a nullity bug, not a navigation bug.
 

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from skyvern import analytics
 from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
 from skyvern.forge import app
+from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAME
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
@@ -27,7 +28,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import API_BROWSER_SESSION_CREATED_BY, is_final_status
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
@@ -183,6 +184,7 @@ async def get_browser_sessions_all(
 async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> BrowserSessionResponse:
     timeout_minutes = browser_session_request.timeout
     timeout_warning: str | None = None
@@ -223,6 +225,10 @@ async def create_browser_session(
             detail="proxy_session_id is only supported with RESIDENTIAL_ISP proxy_location",
         )
 
+    await app.AGENT_FUNCTION.validate_enterprise_feature_access(
+        organization_id=current_org.organization_id,
+        feature_names={STANDALONE_BROWSER_SESSION_FEATURE_NAME},
+    )
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         url=browser_session_request.url,
@@ -234,6 +240,7 @@ async def create_browser_session(
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
         needs_live_view=browser_session_request.needs_live_view,
+        created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
     )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
@@ -280,7 +287,8 @@ async def close_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
+    if browser_session.completed_at is None:
+        await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
     return ORJSONResponse(
         content={"message": "Browser session closed"},
         status_code=200,
@@ -490,6 +498,7 @@ async def get_browser_session(
         app.STORAGE,
         fail_download_lookup=True,
         include_stream_transport=True,
+        concurrent_listings=True,
     )
 
 

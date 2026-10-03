@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import litellm  # type: ignore[import-not-found]
 import pytest  # type: ignore[import-not-found]
+import structlog
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -196,6 +197,9 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
         if _event == "LLM API handler duration metrics":
             outcome.metrics_events.append(fields)
 
+    # Patching `info` on the shared lazy proxy leaves a stale bound method behind on undo, which detaches the
+    # module's logger from later `capture_logs()` calls; a throwaway proxy keeps the shared one untouched.
+    mp.setattr(api_handler_factory, "LOG", structlog.get_logger())
     mp.setattr(api_handler_factory.LOG, "info", capture_info)
 
     artifact_manager = MagicMock()
@@ -629,6 +633,34 @@ async def test_copilot_model_usage_survives_response_parse_failure(
     assert len(direct.usage_events) == len(router.usage_events) == 1
     assert direct.usage_events[0]["gen_ai.response.model"] == "openai/gpt-4.1"
     assert router.usage_events[0]["gen_ai.response.model"] == "openai/gpt-4.1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_id, expected",
+    [
+        ("gen-provider-issued-1", {"response_id": "gen-provider-issued-1"}),
+        # What litellm stamps when the provider sent no id.
+        (litellm.ModelResponse().id, {}),
+        (None, {}),
+    ],
+    ids=["provider-id", "litellm-synthesized", "no-id"],
+)
+async def test_metrics_log_carries_only_a_provider_issued_response_id(
+    span_exporter: InMemorySpanExporter, response_id: str | None, expected: dict[str, str]
+) -> None:
+    def response() -> ParityResponse:
+        r = ParityResponse("gpt-4")
+        r.id = response_id  # type: ignore[attr-defined]
+        return r
+
+    direct = await _run_direct(span_exporter, responses=[response()], parameters={})
+    router = await _run_router(span_exporter, responses=[response()], parameters={})
+
+    for outcome in (direct, router):
+        assert outcome.error is None
+        (metrics,) = outcome.metrics_events
+        assert {k: v for k, v in metrics.items() if k == "response_id"} == expected
 
 
 @pytest.mark.asyncio

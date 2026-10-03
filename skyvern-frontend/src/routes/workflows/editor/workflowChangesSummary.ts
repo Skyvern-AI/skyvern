@@ -13,6 +13,8 @@ import {
   isWorkflowYamlDirty,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
+import { yamlCommitInputs } from "./workflowVersionFromSaveData";
+import { applySettingsPatch } from "./workflowYamlDocument";
 
 // A frozen copy of the editable draft, taken at a clean baseline (see
 // WorkflowSnapshotStore). Diffed against the live draft to describe unsaved
@@ -24,30 +26,77 @@ export type WorkflowSnapshot = {
   parameters: Array<ParameterYAML | WorkflowParameter>;
   settings: WorkflowSettings;
   title: string;
+  description: string | null;
 };
 
 // Recursively sort object keys and drop empty values (null / "" / [] / {}) so
 // two serializations of the same content compare equal despite cosmetic
 // key-order or empty-value differences.
-function canonicalize(value: unknown): unknown {
+function canonicalize(value: unknown, dropEmpty = true): unknown {
   if (Array.isArray(value)) {
-    const items = value.map(canonicalize).filter((item) => item !== undefined);
-    return items.length > 0 ? items : undefined;
+    const items = value
+      .map((item) => canonicalize(item, dropEmpty))
+      .filter((item) => item !== undefined);
+    return items.length > 0 || !dropEmpty ? items : undefined;
   }
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      const canon = canonicalize((value as Record<string, unknown>)[key]);
+      const canon = canonicalize(
+        (value as Record<string, unknown>)[key],
+        dropEmpty,
+      );
       if (canon !== undefined) {
         out[key] = canon;
       }
     }
-    return Object.keys(out).length > 0 ? out : undefined;
+    return Object.keys(out).length > 0 || !dropEmpty ? out : undefined;
   }
-  if (value === null || value === "") {
+  if (dropEmpty && (value === null || value === "")) {
     return undefined;
   }
   return value;
+}
+
+function normalizedSettings(settings: WorkflowSettings) {
+  const headers = (value: string | null) => {
+    if (!value) return {};
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        return {};
+      return Object.fromEntries(
+        Object.entries(parsed)
+          .filter(([key]) => key !== "")
+          .map(([key, value]) => [key, String(value)]),
+      );
+    } catch {
+      return value;
+    }
+  };
+  // Save semantics: metadata/settings use only wire-equivalent defaults; the
+  // legacy block/parameter comparison retains its cosmetic empty-value rule.
+  return {
+    ...settings,
+    scriptCacheKey: settings.scriptCacheKey || "default",
+    webhookCallbackUrl: settings.webhookCallbackUrl || null,
+    extraHttpHeaders: headers(settings.extraHttpHeaders),
+    cdpConnectHeaders: headers(settings.cdpConnectHeaders),
+  };
+}
+
+function settingsKey(settings: WorkflowSettings): string {
+  return JSON.stringify(canonicalize(normalizedSettings(settings), false));
+}
+
+function snapshotKey(snapshot: WorkflowSnapshot): string {
+  return JSON.stringify({
+    blocks: canonicalize(snapshot.blocks),
+    parameters: canonicalize(snapshot.parameters),
+    settings: settingsKey(snapshot.settings),
+    title: snapshot.title,
+    description: snapshot.description || null,
+  });
 }
 
 function canonicalKey(value: unknown): string {
@@ -191,8 +240,7 @@ function summarizeParameterChanges(
 
 // Every user-editable workflow setting maps to a specific, value-free line so a
 // settings change is named rather than falling to the generic bucket. Grouped
-// pairs (browser profile, sequential runs) read as one line. TOTP and other
-// workflow-object fields are not diffed here — they live outside the snapshot.
+// pairs (browser profile, sequential runs) read as one line.
 const SETTINGS_LABELS: Array<{
   fields: Array<keyof WorkflowSettings>;
   label: string;
@@ -222,7 +270,6 @@ const SETTINGS_LABELS: Array<{
   { fields: ["codeVersion"], label: "Changed code version" },
   { fields: ["scriptCacheKey"], label: "Changed script cache key" },
   { fields: ["aiFallback"], label: "Toggled AI fallback" },
-  { fields: ["enableSelfHealing"], label: "Toggled self-healing" },
   { fields: ["maskSecrets"], label: "Toggled secret masking" },
   {
     fields: ["runSequentially", "sequentialKey"],
@@ -232,6 +279,15 @@ const SETTINGS_LABELS: Array<{
   { fields: ["workflowSystemPrompt"], label: "Changed workflow system prompt" },
   { fields: ["errorCodeMapping"], label: "Changed error handling" },
   { fields: ["retryPolicy"], label: "Automatic retry" },
+  {
+    fields: ["totpVerificationUrl", "totpIdentifier"],
+    label: "Changed TOTP settings",
+  },
+  { fields: ["adaptiveCaching"], label: "Toggled adaptive caching" },
+  {
+    fields: ["generateScriptOnTerminal"],
+    label: "Toggled terminal script generation",
+  },
 ];
 
 function summarizeSettingsChanges(
@@ -242,9 +298,15 @@ function summarizeSettingsChanges(
     return [];
   }
   const changes: Array<string> = [];
+  const normalizedBaseline = normalizedSettings(baseline);
+  const normalizedDraft = normalizedSettings(draft);
+  if (settingsKey(baseline) !== settingsKey(draft))
+    changes.push("Workflow settings");
   for (const { fields, label } of SETTINGS_LABELS) {
     const changed = fields.some(
-      (field) => canonicalKey(baseline[field]) !== canonicalKey(draft[field]),
+      (field) =>
+        JSON.stringify(canonicalize(normalizedBaseline[field], false)) !==
+        JSON.stringify(canonicalize(normalizedDraft[field], false)),
     );
     if (changed) {
       changes.push(label);
@@ -260,10 +322,15 @@ function summarizeSettingsChanges(
 function effectiveDraft(saveData: WorkflowSaveData): WorkflowSnapshot {
   let blocks = saveData.blocks;
   let parameters: WorkflowSnapshot["parameters"] = saveData.parameters;
+  let settings = saveData.settings;
+  let title = saveData.title;
+  let description = saveData.description;
   const yamlState = useWorkflowYamlEditorStore.getState();
   if (yamlState.active && isWorkflowYamlDirty(yamlState)) {
     try {
-      const parsed = parse(yamlState.draft) as {
+      const inputs = yamlCommitInputs(parse(yamlState.draft), yamlState.draft);
+      const mergedSettings = applySettingsPatch(settings, inputs.settingsPatch);
+      const parsed = inputs.definition as {
         blocks?: Array<BlockYAML>;
         parameters?: Array<ParameterYAML>;
       } | null;
@@ -272,6 +339,16 @@ function effectiveDraft(saveData: WorkflowSaveData): WorkflowSnapshot {
         if (Array.isArray(parsed.parameters)) {
           parameters = parsed.parameters;
         }
+      }
+      settings = mergedSettings;
+      title = inputs.metadataPatch.title ?? title;
+      if (
+        Object.prototype.hasOwnProperty.call(
+          inputs.metadataPatch,
+          "description",
+        )
+      ) {
+        description = inputs.metadataPatch.description ?? null;
       }
     } catch {
       // fall through to the canvas draft
@@ -283,8 +360,9 @@ function effectiveDraft(saveData: WorkflowSaveData): WorkflowSnapshot {
   return {
     blocks,
     parameters,
-    settings: saveData.settings,
-    title: saveData.title,
+    settings,
+    title,
+    description,
   };
 }
 
@@ -302,7 +380,7 @@ export function isDraftDirty(
   if (!snapshot) {
     return false;
   }
-  return canonicalKey(effectiveDraft(saveData)) !== canonicalKey(snapshot);
+  return snapshotKey(effectiveDraft(saveData)) !== snapshotKey(snapshot);
 }
 
 /**
@@ -328,6 +406,9 @@ export function summarizeWorkflowChanges(
   const changes: Array<string> = [];
   if (draft.title !== snapshot.title) {
     changes.push(`Renamed workflow to "${draft.title}"`);
+  }
+  if ((draft.description || null) !== (snapshot.description || null)) {
+    changes.push("Description");
   }
   changes.push(...summarizeBlockChanges(snapshot.blocks, draft.blocks));
   changes.push(

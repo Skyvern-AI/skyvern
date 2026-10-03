@@ -1297,37 +1297,6 @@ class TasksRepository(BaseRepository):
                 task_run.captcha_cost = captcha_cost
             await session.commit()
 
-    @db_operation("cache_task_run")
-    async def cache_task_run(self, run_id: str, organization_id: str | None = None) -> Run:
-        async with self.Session() as session:
-            task_run = (
-                await session.scalars(
-                    select(TaskRunModel).filter_by(organization_id=organization_id).filter_by(run_id=run_id)
-                )
-            ).first()
-            if task_run:
-                task_run.cached = True
-                await session.commit()
-                await session.refresh(task_run)
-                return Run.model_validate(task_run)
-            raise NotFoundError(f"Run {run_id} not found")
-
-    @db_operation("get_cached_task_run")
-    async def get_cached_task_run(
-        self, task_run_type: RunType, url_hash: str | None = None, organization_id: str | None = None
-    ) -> Run | None:
-        async with self.Session() as session:
-            query = select(TaskRunModel)
-            if task_run_type:
-                query = query.filter_by(task_run_type=task_run_type)
-            if url_hash:
-                query = query.filter_by(url_hash=url_hash)
-            if organization_id:
-                query = query.filter_by(organization_id=organization_id)
-            query = query.filter_by(cached=True).order_by(TaskRunModel.created_at.desc())
-            task_run = (await session.scalars(query)).first()
-            return Run.model_validate(task_run) if task_run else None
-
     @db_operation("get_run")
     async def get_run(
         self,

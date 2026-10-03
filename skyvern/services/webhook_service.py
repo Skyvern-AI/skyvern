@@ -22,6 +22,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -36,6 +37,7 @@ from skyvern.forge.sdk.workflow.retry_policy import (
     RETRY_DECISION_REVOKED,
     compute_attempt_view,
 )
+from skyvern.schemas.run_enums import WebhookDeliveryStatus
 from skyvern.schemas.runs import (
     ProxyLocation,
     RunStatus,
@@ -47,6 +49,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
+from skyvern.services.webhook_delivery import log_workflow_webhook_delivery_finalized
 from skyvern.utils.url_validators import validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
@@ -283,6 +286,38 @@ async def replay_run_webhook(
         run_id=run_id,
         resolved_ips=resolved_ips,
     )
+
+    if (
+        workflow_run is not None
+        and workflow_run.status.is_final()
+        and payload.run_type == RunType.workflow_run
+        and not target_url
+        and status_code is not None
+        and 200 <= status_code < 300
+        and error is None
+    ):
+        log_workflow_webhook_delivery_finalized(
+            workflow_run_id=run_id,
+            delivery_outcome=WebhookDeliveryStatus.delivered,
+            status_code=status_code,
+            attempts=1,
+            finished_at=workflow_run.finished_at,
+            replay=True,
+        )
+        try:
+            await app.DATABASE.workflow_runs.update_workflow_webhook_delivery(
+                workflow_run_id=run_id,
+                expected_status=workflow_run.status,
+                expected_finished_at=workflow_run.finished_at,
+                webhook_delivery_status=WebhookDeliveryStatus.delivered,
+                webhook_delivery_finalized_at=naive_utc_now(),
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record successful workflow webhook replay",
+                workflow_run_id=run_id,
+                exc_info=True,
+            )
 
     return RunWebhookReplayResponse(
         run_id=payload.run_id,
@@ -535,9 +570,13 @@ async def _deliver_webhook(
     except httpx.TimeoutException:
         error = "Request timed out after 60 seconds."
         LOG.warning("Webhook replay timed out", url=url)
-    except httpx.NetworkError as exc:
+    except (httpx.NetworkError, httpx.ProxyError) as exc:
         error = f"Could not reach URL: {exc}"
         LOG.warning("Webhook replay network error", url=url, error=str(exc))
+    except BlockedHost:
+        # The host passed validation, then resolved to a blocked address at delivery (DNS rebinding or proxy refusal).
+        error = "The target host was refused by SSRF protection."
+        LOG.warning("Webhook replay target refused", url=url)
     except Exception as exc:  # pragma: no cover - defensive guard
         error = f"Unexpected error: {exc}"
         LOG.error("Webhook replay unexpected error", url=url, error=str(exc), exc_info=True)

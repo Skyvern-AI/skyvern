@@ -13,6 +13,11 @@ import {
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import {
+  runWorkflowAuthoringAction,
+  refuseMutationDuringYamlCommit,
+  refuseMutationDuringAuthoring,
+} from "@/store/WorkflowYamlEditorStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import {
@@ -88,25 +93,32 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const processRecordingMutation = useProcessRecordingMutation({
     browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (result) => {
-      setRecordedBlocks(result, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
-        connectingEdgeType: "default",
-      });
+    onSuccess: (result, owner) => {
+      setRecordedBlocks(
+        result,
+        {
+          previous: previous ?? null,
+          next: id,
+          parent: parentId,
+          connectingEdgeType: "default",
+        },
+        owner,
+      );
     },
   });
 
   const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result) => {
-      // Reuse existing block insertion pattern
-      setRecordedBlocks(result, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
-        connectingEdgeType: "default",
-      });
+    onSuccess: (result, owner) => {
+      setRecordedBlocks(
+        result,
+        {
+          previous: previous ?? null,
+          next: id,
+          parent: parentId,
+          connectingEdgeType: "default",
+        },
+        owner,
+      );
     },
   });
 
@@ -174,11 +186,13 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
-      recordingStore.setIsRecording(true, {
-        workflowPermanentId: workflowPermanentId ?? null,
-        browserSessionId: settingsStore.browserSessionId,
+      void runWorkflowAuthoringAction(() => {
+        recordingStore.setIsRecording(true, {
+          workflowPermanentId: workflowPermanentId ?? null,
+          browserSessionId: settingsStore.browserSessionId,
+        });
+        updateWorkflowPanelState(false);
       });
-      updateWorkflowPanelState(false);
     }
   };
 
@@ -198,10 +212,14 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       recordingStore.setIsRecording(false);
     }
 
-    processRecordingMutation.mutate();
+    void runWorkflowAuthoringAction(() =>
+      processRecordingMutation.mutateAsync(),
+    );
   };
 
   const onUploadSOP = () => {
+    if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
+      return;
     fileInputRef.current?.click();
   };
 
@@ -219,7 +237,9 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       e.target.value = "";
       return;
     }
-    sopToBlocksMutation.mutate(file);
+    void runWorkflowAuthoringAction(() =>
+      sopToBlocksMutation.mutateAsync(file),
+    );
     e.target.value = "";
   };
 

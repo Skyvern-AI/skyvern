@@ -1,5 +1,7 @@
-from skyvern.services.browser_recording.evidence import build_recording_evidence
-from skyvern.services.browser_recording.types import Action, ActionKind
+from skyvern.services.browser_recording.evidence import RecordedPointerEvidence, build_recording_evidence
+from skyvern.services.browser_recording.state_machines.click import StateMachineClick
+from skyvern.services.browser_recording.types import Action, ActionKind, Mouse
+from tests.unit.services.test_browser_recording import make_console_event
 from tests.unit.services.test_browser_recording_code_first import (
     PBS_ID,
     WP_ID,
@@ -201,3 +203,52 @@ def test_selector_candidates_split_and_validate_class_tokens() -> None:
     assert target is not None
     assert target.selector_candidates == [".row", ".selected"]
     assert ".row selected" not in target.selector_candidates
+
+
+def test_canvas_clicks_are_distinguished_by_pointer() -> None:
+    first = make_click(1000, tag_name="canvas", selector="canvas")
+    first.target.mouse = Mouse(xp=0.25, yp=0.4)
+    second = make_click(2000, tag_name="canvas", selector="canvas")
+    second.target.mouse = Mouse(xp=0.75, yp=0.6)
+    button = make_click(3000, selector="#submit", tag_name="button")
+
+    packet = build_recording_evidence(
+        [first, second, button],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    targets = [action.target for action in packet.actions if action.target is not None]
+    assert len(targets) == 3
+    assert targets[0].pointer == RecordedPointerEvidence(viewport_x_fraction=0.25, viewport_y_fraction=0.4)
+    assert targets[1].pointer == RecordedPointerEvidence(viewport_x_fraction=0.75, viewport_y_fraction=0.6)
+    assert targets[2].selector_candidates == ["#submit"]
+    assert targets[2].pointer == RecordedPointerEvidence(viewport_x_fraction=0.5, viewport_y_fraction=0.5)
+
+
+def test_left_edge_click_keeps_zero_pointer() -> None:
+    event = make_console_event(
+        {
+            "type": "click",
+            "target": {"id": "board", "skyId": "sky-1", "tagName": "CANVAS", "text": []},
+            "timestamp": 1000,
+            "mousePosition": {"xp": 0.0, "yp": 0.4},
+        },
+        timestamp=1000,
+    )
+    click = StateMachineClick().tick(event, [])
+    assert click is not None
+
+    packet = build_recording_evidence(
+        [click],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    target = packet.actions[0].target
+    assert target is not None
+    assert target.pointer == RecordedPointerEvidence(viewport_x_fraction=0.0, viewport_y_fraction=0.4)

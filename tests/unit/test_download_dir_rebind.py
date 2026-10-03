@@ -27,6 +27,7 @@ from skyvern.webeye.browser_factory import (
     _create_headless_chromium,
     rebind_download_dir,
     set_download_file_listener,
+    was_download_cancelled_by_skyvern,
 )
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 
@@ -515,11 +516,31 @@ async def test_listener_falls_back_to_kwargs_without_context(tmp_path: Path) -> 
     assert captured.get("task_id") == "task_kwarg"
 
 
+@pytest.mark.asyncio
+async def test_listener_timeout_cancels_and_marks_download() -> None:
+    path_released = asyncio.Event()
+
+    async def unresolved_path() -> Path:
+        await path_released.wait()
+        return Path("never-used")
+
+    download = MagicMock()
+    download.path = AsyncMock(side_effect=unresolved_path)
+    download.cancel = AsyncMock()
+
+    await _run_listener(download, download_timeout=0.001)
+
+    download.cancel.assert_awaited_once_with()
+    assert was_download_cancelled_by_skyvern(download) is True
+    path_released.set()
+    await asyncio.sleep(0)
+
+
 _SENTINEL_STEM = "zz-sentinel-suggested-stem"
 _SENTINEL_QUERY_NAME = "zz-sentinel-query-stem"
 
 
-async def _run_listener(download: MagicMock) -> list[dict[str, object]]:
+async def _run_listener(download: MagicMock, *, download_timeout: float | None = None) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
 
     def capture(_msg: str, **kwargs: object) -> None:
@@ -529,7 +550,12 @@ async def _run_listener(download: MagicMock) -> list[dict[str, object]]:
     browser_context = MagicMock()
     browser_context.on = lambda _event, handler: captured_handler.setdefault("handler", handler)
     browser_context.pages = []
-    set_download_file_listener(browser_context, workflow_run_id="wr_priv", task_id="task_priv")
+    set_download_file_listener(
+        browser_context,
+        download_timeout=download_timeout,
+        workflow_run_id="wr_priv",
+        task_id="task_priv",
+    )
 
     page = MagicMock()
     page_handlers: dict[str, object] = {}
@@ -1738,6 +1764,7 @@ async def test_print_page_block_threads_resolved_id_to_all_sinks(tmp_path) -> No
     page.pdf = AsyncMock(return_value=b"%PDF-1.4 fake")
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=page)
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     captured: dict[str, object] = {}
 

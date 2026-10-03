@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 
 type StreamBody = {
   message: string;
@@ -139,15 +140,23 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
     workflowRunQueryMock(options),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 const choices = [
   {
@@ -236,7 +245,10 @@ beforeEach(() => {
   workflowRunQueryMock.mockReturnValue({ data: undefined });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  canonicalRecoveriesByWorkflow.clear();
+});
 
 describe("WorkflowCopilotChat connected account choices", () => {
   it("renders a readable receipt from notice-only account metadata", async () => {
@@ -335,7 +347,9 @@ describe("WorkflowCopilotChat connected account choices", () => {
         }).disabled,
       ).toBe(true);
       if (accountQuestion) {
-        expect(screen.getByText("Choose a Google account")).toBeTruthy();
+        expect(
+          screen.getByRole("group", { name: "Connected Google accounts" }),
+        ).toBeTruthy();
         expect(
           screen.getByRole<HTMLButtonElement>("button", {
             name: /Connection …goac_1/,
@@ -359,7 +373,13 @@ describe("WorkflowCopilotChat connected account choices", () => {
         );
       });
       expect(postStreaming).toHaveBeenCalledTimes(1);
-      if (replaceText) await submit("Read a different sheet");
+      if (replaceText) {
+        // A picked account is not the user's words, so the composer says it will be replaced.
+        expect(
+          screen.getByPlaceholderText("Type to replace the queued message…"),
+        ).toBeTruthy();
+        await submit("Read a different sheet");
+      }
       view.rerender(
         chatElement({
           requiresLiveBrowser: true,
@@ -382,6 +402,28 @@ describe("WorkflowCopilotChat connected account choices", () => {
         );
     },
   );
+
+  it("docks an actionable choice above the composer and picks an active row by number", async () => {
+    await renderChat();
+    await finishChoiceAsk();
+    const tray = screen.getByRole("group", {
+      name: "Connected Google accounts",
+    });
+    expect(
+      Boolean(
+        screen.getByText(/choose below/).compareDocumentPosition(tray) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+    expect(useCopilotHeaderStore.getState().attention).toBe("account");
+
+    // The first number is the first active row; the reconnect-only row above it has no key.
+    await act(async () => {
+      fireEvent.keyDown(tray, { key: "1" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.selected_connected_account_id).toBe("goac_1");
+  });
 
   it("renders canonical rows and sends one exact active id despite a same-tick double click", async () => {
     await renderChat();
@@ -499,7 +541,18 @@ describe("WorkflowCopilotChat connected account choices", () => {
     fireEvent.click(row);
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     const firstKey = streamCalls[0]?.body.idempotency_key;
-    await act(async () => streamCalls[0]!.resolve());
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "Please choose an account again.",
+        updated_workflow: null,
+        response_time: "2026-08-15T00:00:04Z",
+        proposal_disposition: "no_proposal",
+        narrative_payload: narrativePayload(false),
+      });
+      streamCalls[0]!.resolve();
+    });
 
     cleanup();
     streamCalls.length = 0;

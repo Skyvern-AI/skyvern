@@ -107,6 +107,7 @@ import {
 } from "./RunOutputsSection";
 import { failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
@@ -297,7 +298,12 @@ export function RunView({
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const resetRunView = useRunViewStore((s) => s.reset);
-  const { panes: studioPanes, openPane, setOpenPanes } = useStudioPanes();
+  const {
+    panes: studioPanes,
+    openPane,
+    setOpenPanes,
+    preserveNextEntry,
+  } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("overview");
   const navigate = useNavigate();
   const location = useLocation();
@@ -516,8 +522,16 @@ export function RunView({
     } else {
       next.delete("iteration");
     }
-    navigate({ search: toReadableSearch(next) }, { replace: true });
-  }, [activeIteration, pinnedFrameId, workflowRunId, navigate]);
+    const search = toReadableSearch(next);
+    preserveNextEntry(search);
+    navigate({ search }, { replace: true });
+  }, [
+    activeIteration,
+    pinnedFrameId,
+    workflowRunId,
+    navigate,
+    preserveNextEntry,
+  ]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
   // the Overview pane being open: RunView stays mounted while its pane is closed.
@@ -547,11 +561,10 @@ export function RunView({
     if (new URLSearchParams(live).get("wr")) {
       return;
     }
-    navigate(
-      { search: searchWithRunReference(live, workflowRunId) },
-      { replace: true },
-    );
-  }, [runPaneOpen, workflowRunId, pathRunId, navigate]);
+    const search = searchWithRunReference(live, workflowRunId);
+    preserveNextEntry(search);
+    navigate({ search }, { replace: true });
+  }, [runPaneOpen, workflowRunId, pathRunId, navigate, preserveNextEntry]);
 
   const frames = useMemo(
     () => buildFilmstrip(currentTimeline),
@@ -1033,6 +1046,16 @@ export function RunView({
               />
             }
           />
+          {!statusUnavailable &&
+          !runIsPlaceholder &&
+          !canceled &&
+          runIsLogicallyFinal(workflowRun) ? (
+            <RunFeedback
+              targetType="workflow_run"
+              targetId={workflowRun.workflow_run_id}
+              variant={failed ? "report" : "thumbs"}
+            />
+          ) : null}
           {failed || runIsRetryWaiting(workflowRun) ? (
             <RunFailureLine
               workflowRun={workflowRun}

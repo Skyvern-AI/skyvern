@@ -55,15 +55,20 @@ class StateMachineClick(StateMachine):
             self.reset()
             return None
 
-        xp = (self.mouse.xp or -1) if self.mouse else None
-        yp = (self.mouse.yp or -1) if self.mouse else None
+        xp = self.mouse.xp if self.mouse and self.mouse.xp is not None else None
+        yp = self.mouse.yp if self.mouse and self.mouse.yp is not None else None
 
         LOG.debug("~ emitting click action", exfiltrated_event=event)
 
         action_target = ActionTarget(
             class_name=self.target.className,
             id=self.target.id,
-            mouse=Mouse(xp=xp, yp=yp),
+            mouse=Mouse(
+                xp=xp,
+                yp=yp,
+                offset_x=self.mouse.offsetX if self.mouse else None,
+                offset_y=self.mouse.offsetY if self.mouse else None,
+            ),
             sky_id=self.target.skyId,
             tag_name=self.target.tagName,
             texts=self.target.text,

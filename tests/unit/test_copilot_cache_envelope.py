@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -245,7 +247,7 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     assert str(prompt) == prompt.stable_prefix + prompt.dynamic_suffix
 
 
-def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None:
+def test_no_authoring_policy_section_reaches_either_prompt_half() -> None:
     config = agent_module.CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
 
     base_prompt = agent_module._build_system_prompt(tool_usage_guide="tools", config=config)
@@ -268,4 +270,18 @@ def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None
     assert _CODE_ONLY_HEADER not in str(base_prompt)
     assert isinstance(prompt, CacheableSystemInstructions)
     assert _CODE_ONLY_HEADER not in prompt.stable_prefix
-    assert _CODE_ONLY_HEADER in prompt.dynamic_suffix
+    assert _CODE_ONLY_HEADER not in prompt.dynamic_suffix
+
+
+@pytest.mark.parametrize("duplicate", [copy.copy, copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value))])
+def test_cacheable_system_instructions_survive_the_copy_litellm_makes(duplicate: Any) -> None:
+    original = CacheableSystemInstructions("stable ", "dynamic", cache_namespace="ns")
+
+    duplicated = duplicate(original)
+
+    assert duplicated == original
+    assert (duplicated.stable_prefix, duplicated.dynamic_suffix, duplicated.cache_namespace) == (
+        "stable ",
+        "dynamic",
+        "ns",
+    )

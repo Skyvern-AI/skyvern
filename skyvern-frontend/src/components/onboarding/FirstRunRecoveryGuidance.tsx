@@ -63,6 +63,9 @@ function FirstRunRecoveryGuidance({
         ? workflowEditorPath(workflowPermanentId, studioEnabled)
         : "/agents";
     }
+    if (id === "create_browser_session") {
+      return "/browser-sessions";
+    }
     return "/credentials";
   }
 

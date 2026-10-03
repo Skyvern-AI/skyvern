@@ -7,6 +7,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
@@ -135,9 +139,14 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 vi.mock("./WorkflowCopilotHistory", () => ({
   WorkflowCopilotHistory: ({
@@ -152,9 +161,6 @@ vi.mock("./WorkflowCopilotHistory", () => ({
     </button>
   ),
 }));
-
-import { COPILOT_ACK_LINES } from "./NarrativeView";
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
@@ -181,18 +187,14 @@ async function submit(value: string) {
   await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 }
 
+const ACK = "Copilot is working on your request…";
+
 function expectNoAckLines() {
-  for (const line of COPILOT_ACK_LINES) {
-    expect(screen.queryByText(line)).toBeNull();
-  }
+  expect(screen.queryByText(ACK)).toBeNull();
 }
 
-// The placeholder opens on a random line, so assert *some* ack line shows.
 function expectSomeAckLine() {
-  const present = COPILOT_ACK_LINES.some(
-    (line) => screen.queryByText(line) !== null,
-  );
-  expect(present).toBe(true);
+  expect(screen.getByText(ACK)).toBeTruthy();
 }
 
 async function completeStream(index: number, message: string) {
@@ -229,6 +231,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — instant acknowledgement", () => {

@@ -33,7 +33,11 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.utils.secret_redaction import redact_har_bytes, redact_secrets_from_bytes
+from skyvern.utils.secret_redaction import (
+    redact_har_bytes,
+    redact_multi_field_totp_artifact_bytes,
+    redact_secrets_from_bytes,
+)
 
 if TYPE_CHECKING:
     from skyvern.schemas.action_log import ActionLogEvent
@@ -99,10 +103,29 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
 )
 
 
+_MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES = _REDACTABLE_TEXT_ARTIFACT_TYPES | frozenset(
+    {
+        ArtifactType.HAR,
+        ArtifactType.BROWSER_SESSION_ACTION_LOG,
+        ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP,
+        ArtifactType.EVAL_SCORE,
+        ArtifactType.EVAL_TRAJECTORY,
+        ArtifactType.EVAL_RUBRICS,
+        ArtifactType.SCRIPT_FILE,
+    }
+)
+
+
 def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
+    if artifact_type == ArtifactType.HAR:
+        if skyvern_context.multi_field_totp_masking_task_ids():
+            data = redact_har_bytes(data, set())
+    elif artifact_type in _MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES:
+        data = redact_multi_field_totp_artifact_bytes(data)
     if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES and artifact_type != ArtifactType.HAR:
         return data
-
     try:
         context = skyvern_context.current()
         resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
@@ -112,17 +135,17 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
             if artifact_type not in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
                 return data
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            if not secret_values:
+            if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
                 return data
         else:
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
     if artifact_type == ArtifactType.HAR:
-        return redact_har_bytes(data, secret_values)
-    if not secret_values:
+        return redact_har_bytes(data, secret_values, multi_field_totp=False)
+    if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
         return data
-    return redact_secrets_from_bytes(data, secret_values)
+    return redact_secrets_from_bytes(data, secret_values, multi_field_totp=False)
 
 
 def _safe_file_size_from_path(path: str | None) -> int | None:

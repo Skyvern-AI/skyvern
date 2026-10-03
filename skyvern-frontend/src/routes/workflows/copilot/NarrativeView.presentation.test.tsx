@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { NarrativeView } from "./NarrativeView";
@@ -88,8 +88,10 @@ describe("NarrativeView structured turn presentation", () => {
     );
 
     expect(screen.queryByText("Outcome not confirmed")).toBeNull();
-    const activityRow = screen.getByRole("button", { name: /Open Site.*ran/ });
-    fireEvent.click(activityRow);
+    // The warning is the card's line, not a preview behind a click.
+    expect(
+      screen.getByRole("button", { name: /Not confirmed Open Site/ }),
+    ).toBeTruthy();
     expect(screen.getByText(reason)).toBeTruthy();
   });
 
@@ -109,13 +111,12 @@ describe("NarrativeView structured turn presentation", () => {
     );
 
     expect(screen.queryByText("Outcome not confirmed")).toBeNull();
-    const activityRow = screen.getByRole("button", {
-      name: /Open Site.*stopped/,
-    });
+    expect(
+      screen.getByRole("button", { name: /Stopped Open Site/ }),
+    ).toBeTruthy();
     expect(
       screen.getByText(/The expected destination was not observed/),
     ).toBeTruthy();
-    expect(activityRow.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("shows a failed row's run-level reason while the row is collapsed", () => {
@@ -133,13 +134,12 @@ describe("NarrativeView structured turn presentation", () => {
       />,
     );
 
-    const activityRow = screen.getByRole("button", {
-      name: /Open Site.*halted/,
-    });
+    expect(
+      screen.getByRole("button", { name: /Failed Open Site/ }),
+    ).toBeTruthy();
     expect(
       screen.getByText(/The expected destination was not observed/),
     ).toBeTruthy();
-    expect(activityRow.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("does not make a reasonless stopped owner expandable", () => {
@@ -156,10 +156,8 @@ describe("NarrativeView structured turn presentation", () => {
       />,
     );
 
-    const activityRow = screen.getByRole("button", {
-      name: /Open Site.*stopped/,
-    });
-    expect(activityRow.getAttribute("aria-expanded")).toBeNull();
+    const card = screen.getByRole("button", { name: /Stopped Open Site/ });
+    expect(card.getAttribute("aria-expanded")).toBeNull();
   });
 });
 
@@ -312,6 +310,6 @@ describe("NarrativeView drafting row (codegen_progress)", () => {
     });
     rerender(<NarrativeView turn={reloaded!} />);
     expect(draftingRow()).toBeNull();
-    expect(screen.getByText("Wrote the workflow code")).toBeTruthy();
+    expect(screen.getByText("Tested the workflow")).toBeTruthy();
   });
 });

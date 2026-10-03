@@ -1,5 +1,7 @@
 import asyncio
+import secrets
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path as FilePath
 from typing import Any, NoReturn
 
@@ -15,7 +17,8 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import make_temp_directory
+from skyvern.forge.sdk.api.files import discard_temp_working_dir, make_temp_directory
+from skyvern.forge.sdk.credential_site_policy import same_release_scope
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
     CREATE_BROWSER_PROFILE_CODE_SAMPLE_TS,
@@ -43,6 +46,7 @@ from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
+from skyvern.webeye.profile_cookie_merge import cookies_for_login_urls, sanitize_cookies, write_signin_cookies
 
 LOG = structlog.get_logger()
 
@@ -653,10 +657,13 @@ async def _create_empty_profile(
     description: str | None,
     proxy_location: ProxyLocationInput = None,
     proxy_session_id: str | None = None,
+    seed_cookies: list[dict] | None = None,
 ) -> BrowserProfile:
     # Seed before inserting so local setup failures never reserve a profile name.
     profile_dir = _create_empty_browser_profile_directory()
     try:
+        if seed_cookies:
+            write_signin_cookies(profile_dir, seed_cookies)
         try:
             profile = await app.DATABASE.browser_sessions.create_browser_profile(
                 organization_id=organization_id,
@@ -674,7 +681,8 @@ async def _create_empty_profile(
                 profile_id=profile.browser_profile_id,
                 directory=profile_dir,
             )
-        except Exception:
+        # BaseException: a caller's timeout cancels mid-store, and the row must not outlive its files.
+        except BaseException:
             rolled_back = await _hard_delete_created_profile_after_store_failure(
                 organization_id=organization_id,
                 browser_profile_id=profile.browser_profile_id,
@@ -696,6 +704,70 @@ async def _create_empty_profile(
         browser_profile_id=profile.browser_profile_id,
     )
     return profile
+
+
+async def create_profile_from_running_session(
+    *,
+    organization_id: str,
+    browser_session_id: str,
+    login_urls: list[str],
+    name: str,
+    description: str | None,
+) -> tuple[BrowserProfile | None, int]:
+    """Save a live session's cookies for the sign-in hosts as a new profile; ``(None, 0)`` means none matched.
+
+    Raises when the live browser cannot be read, so callers can tell a failed read from an empty one.
+    """
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        browser_session_id, organization_id
+    )
+    if browser_session is None:
+        raise BrowserSessionNotFound(browser_session_id)
+    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(
+        browser_session_id, organization_id
+    )
+    if browser_state is None or browser_state.browser_context is None:
+        raise RuntimeError(f"The live browser for {browser_session_id} is not reachable")
+    try:
+        page = await browser_state.get_working_page(prune_excess_pages=False)
+        candidates = [*login_urls, page.url] if page is not None else list(login_urls)
+        # Only the site the card names: an identity provider's or another tab's cookies never ride along.
+        hosts = [url for url in candidates if login_urls and same_release_scope(url, login_urls[0])]
+        cookies = sanitize_cookies(cookies_for_login_urls(await browser_state.browser_context.cookies(), hosts))
+    finally:
+        await app.PERSISTENT_SESSIONS_MANAGER.release_observer_browser_state(browser_session_id, browser_state)
+    if not cookies:
+        return None, 0
+
+    proxy_location, proxy_session_id = _normalize_proxy_pin_fields(
+        proxy_location=browser_session.proxy_location,
+        proxy_session_id=browser_session.proxy_session_id,
+    )
+    # Each renewed sign-in adds a profile under the same name, so a taken name goes straight to a dated one.
+    stamp = f"{datetime.now(UTC):%Y-%m-%d %H:%M:%S}"
+    candidates = [name, f"{name} ({stamp})", f"{name} ({stamp} {secrets.token_hex(2)})"]
+    for candidate in candidates:
+        try:
+            profile = await _create_empty_profile(
+                organization_id=organization_id,
+                name=candidate,
+                description=description,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                seed_cookies=cookies,
+            )
+            break
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_409_CONFLICT or candidate == candidates[-1]:
+                raise
+    LOG.info(
+        "Created browser profile from running session",
+        organization_id=organization_id,
+        browser_profile_id=profile.browser_profile_id,
+        browser_session_id=browser_session_id,
+        cookie_count=len(cookies),
+    )
+    return profile, len(cookies)
 
 
 async def _create_profile_from_session(
@@ -788,36 +860,39 @@ async def _create_profile_from_session(
         proxy_session_id = browser_session.proxy_session_id
 
     try:
-        profile = await app.DATABASE.browser_sessions.create_browser_profile(
-            organization_id=organization_id,
-            name=name,
-            description=description,
-            source_browser_type=source_browser_type,
-            proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
-        )
-    except IntegrityError as exc:
-        _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
+        try:
+            profile = await app.DATABASE.browser_sessions.create_browser_profile(
+                organization_id=organization_id,
+                name=name,
+                description=description,
+                source_browser_type=source_browser_type,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+            )
+        except IntegrityError as exc:
+            _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
 
-    try:
-        await app.STORAGE.store_browser_profile(
-            organization_id=organization_id,
-            profile_id=profile.browser_profile_id,
-            directory=session_dir,
-        )
-    except Exception:
-        rolled_back = await _hard_delete_created_profile_after_store_failure(
-            organization_id=organization_id,
-            browser_profile_id=profile.browser_profile_id,
-        )
-        LOG.error(
-            "Failed to store browser profile artifacts",
-            organization_id=organization_id,
-            browser_profile_id=profile.browser_profile_id,
-            rolled_back=rolled_back,
-            exc_info=True,
-        )
-        raise
+        try:
+            await app.STORAGE.store_browser_profile(
+                organization_id=organization_id,
+                profile_id=profile.browser_profile_id,
+                directory=session_dir,
+            )
+        except Exception:
+            rolled_back = await _hard_delete_created_profile_after_store_failure(
+                organization_id=organization_id,
+                browser_profile_id=profile.browser_profile_id,
+            )
+            LOG.error(
+                "Failed to store browser profile artifacts",
+                organization_id=organization_id,
+                browser_profile_id=profile.browser_profile_id,
+                rolled_back=rolled_back,
+                exc_info=True,
+            )
+            raise
+    finally:
+        discard_temp_working_dir(session_dir)
 
     # The promote copied the session's own export (profiles/{pbs_session}.zip) into the new bp_, so
     # reap that source now that it's redundant. Keyed on the session id, never a reused bp_ profile.
@@ -922,41 +997,44 @@ async def _create_profile_from_workflow_run(
         )
 
     try:
-        profile = await app.DATABASE.browser_sessions.create_browser_profile(
-            organization_id=organization_id,
-            name=name,
-            description=description,
-            proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
-        )
-    except IntegrityError as exc:
-        _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
+        try:
+            profile = await app.DATABASE.browser_sessions.create_browser_profile(
+                organization_id=organization_id,
+                name=name,
+                description=description,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+            )
+        except IntegrityError as exc:
+            _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)
 
-    try:
-        await app.STORAGE.store_browser_profile(
-            organization_id=organization_id,
-            profile_id=profile.browser_profile_id,
-            directory=session_dir,
-        )
-        LOG.info(
-            "Created browser profile from workflow run",
-            organization_id=organization_id,
-            browser_profile_id=profile.browser_profile_id,
-            workflow_run_id=workflow_run_id,
-        )
-    except Exception:
-        rolled_back = await _hard_delete_created_profile_after_store_failure(
-            organization_id=organization_id,
-            browser_profile_id=profile.browser_profile_id,
-        )
-        LOG.error(
-            "Failed to store browser profile artifacts",
-            organization_id=organization_id,
-            browser_profile_id=profile.browser_profile_id,
-            workflow_run_id=workflow_run_id,
-            rolled_back=rolled_back,
-            exc_info=True,
-        )
-        raise
+        try:
+            await app.STORAGE.store_browser_profile(
+                organization_id=organization_id,
+                profile_id=profile.browser_profile_id,
+                directory=session_dir,
+            )
+            LOG.info(
+                "Created browser profile from workflow run",
+                organization_id=organization_id,
+                browser_profile_id=profile.browser_profile_id,
+                workflow_run_id=workflow_run_id,
+            )
+        except Exception:
+            rolled_back = await _hard_delete_created_profile_after_store_failure(
+                organization_id=organization_id,
+                browser_profile_id=profile.browser_profile_id,
+            )
+            LOG.error(
+                "Failed to store browser profile artifacts",
+                organization_id=organization_id,
+                browser_profile_id=profile.browser_profile_id,
+                workflow_run_id=workflow_run_id,
+                rolled_back=rolled_back,
+                exc_info=True,
+            )
+            raise
+    finally:
+        discard_temp_working_dir(session_dir)
 
     return profile

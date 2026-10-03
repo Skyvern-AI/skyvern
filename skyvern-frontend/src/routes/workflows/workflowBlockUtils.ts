@@ -1,8 +1,12 @@
 import {
   ActionTypes,
   getReadableActionType,
+  Status,
   type ActionsApiResponse,
+  type ActionSummary,
+  type ActionSummaryBody,
 } from "@/api/types";
+import { isRecord } from "@/util/utils";
 
 import {
   isNestedLoopWorkflowBlock,
@@ -106,15 +110,10 @@ export function buildCodeStepsByLabel(
 }
 
 /**
- * Plain-English text for a code-block step: prefer the generated title, then
- * the description, and only humanize the raw action type when neither is
- * present.
+ * Plain-English text for a code-block step: the description, and only
+ * humanize the raw action type when it is absent.
  */
 export function getCodeStepPlainText(step: CodeBlockStep): string {
-  const title = step.title?.trim();
-  if (title) {
-    return title;
-  }
   const description = step.description?.trim();
   if (description) {
     return description;
@@ -182,6 +181,114 @@ export function taskV3CallText(
     return null;
   }
   return normalizeInlineText(text.slice(TASK_V3_CALL_PREFIX.length));
+}
+
+export type ActionSummarySource = Partial<
+  Pick<
+    ActionsApiResponse,
+    | "action_type"
+    | "created_by"
+    | "description"
+    | "intention"
+    | "output"
+    | "reasoning"
+    | "response"
+    | "status"
+    | "text"
+  >
+>;
+
+// Only Task V3, code-block recorder and cached-script rows write a result into `response` (a script
+// select records the option it chose there and nowhere else). The agent stores its
+// `user_detail_answer` there and computer use its click coordinates, neither of which is a result.
+function recordsOutcome(action: ActionSummarySource): boolean {
+  return (
+    action.created_by === "script" ||
+    taskV3CallText(action.description) !== null ||
+    (isRecord(action.output) && "code_line" in action.output)
+  );
+}
+
+export function getActionInputValue(
+  action: ActionSummarySource,
+): string | null {
+  if (action.action_type === ActionTypes.InputText) {
+    // A Task V3 type call records the typed value in `text`; a script-generated row records it in
+    // `response` and leaves `text` empty, so an empty `text` is not an answer.
+    if (action.text) {
+      return action.text;
+    }
+    // A recorded fill that raised also leaves `text` empty, but its `response` is the exception
+    // that stopped it (code_block_recorder), which is an outcome and not an input.
+    if (action.status === Status.Failed) {
+      return null;
+    }
+    return action.response ?? null;
+  }
+  return action.text ?? null;
+}
+
+/**
+ * What the action actually did, when the run recorded it: a navigation's landing and HTTP status, a
+ * recorded call's return value, the exception that ended a code block.
+ *
+ * `response` doubles as the stored input on input-text actions — a cached run writes the same answer
+ * to both — so it is not echoed as an outcome there. Every other action type legitimately records
+ * its result in `response` even when that equals `text`.
+ */
+export function getActionOutcome(action: ActionSummarySource): string | null {
+  if (
+    action.action_type === ActionTypes.InputText &&
+    typeof action.response === "string" &&
+    action.response === getActionInputValue(action)
+  ) {
+    return null;
+  }
+  return action.response ?? null;
+}
+
+/**
+ * The reader-facing text for one action: what it meant to do, and what came of it.
+ *
+ * The body is the most specific account of the intent the row carries — the model's own reasoning,
+ * else the deterministic intention the agent recorded, else the value it typed. A Task V3 turn
+ * often emits no prose at all, and only `intention` and `response` carry a navigation's URL:
+ * `GotoUrlAction.url` is subclass-only and never reaches the client.
+ *
+ * A recorded outcome is returned alongside that body rather than behind it, so a card never shows
+ * the plan in place of the effect — an action whose intention reads "Tried to navigate to X" and
+ * whose response reads "HTTP 404, dead end" must not render as the first alone.
+ *
+ * Returns null when the action carries neither, so a caller that already shows the action type does
+ * not print it twice.
+ */
+export function getActionSummary(
+  action: ActionSummarySource,
+): ActionSummary | null {
+  const candidates: Array<[string | null | undefined, boolean]> = [
+    [action.reasoning, true],
+    [action.intention, true],
+    [action.text, false],
+  ];
+  let body: ActionSummaryBody | null = null;
+  for (const [value, isProse] of candidates) {
+    const text = value?.trim();
+    if (text) {
+      body = { text, isProse };
+      break;
+    }
+  }
+  const recorded = recordsOutcome(action)
+    ? normalizeInlineText(getActionOutcome(action))
+    : null;
+  const outcome =
+    recorded !== null && recorded !== normalizeInlineText(body?.text)
+      ? recorded
+      : null;
+  if (body === null && outcome === null) {
+    return null;
+  }
+  return { body, outcome };
 }
 
 /**

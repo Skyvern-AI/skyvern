@@ -81,6 +81,7 @@ async function renderControllingInputHook(
   clipboardCallbacks: {
     onClipboardPaste?: (text: string) => void;
     onClipboardCopy?: () => void;
+    forwardCopyShortcut?: boolean;
   } = {},
 ) {
   const { result } = renderHook(() =>
@@ -895,6 +896,45 @@ describe("useCdpInput key handling", () => {
     expect(pasteEvent.preventDefault).toHaveBeenCalled();
   });
 
+  it("routes menu paste through the supplied clipboard callback", async () => {
+    const onClipboardPaste = vi.fn();
+    const result = await renderControllingInputHook({ onClipboardPaste });
+    const send = latestSocketSend();
+    send.mockClear();
+    const pasteEvent = {
+      target: document.createElement("div"),
+      clipboardData: { getData: vi.fn(() => "menu paste") },
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+    } as unknown as React.ClipboardEvent;
+
+    act(() => result.current.handlers.handlePaste(pasteEvent));
+
+    expect(onClipboardPaste).toHaveBeenCalledWith("menu paste");
+    expect(send).not.toHaveBeenCalled();
+    expect(pasteEvent.preventDefault).toHaveBeenCalled();
+  });
+
+  it("keeps paste into local editable fields local with or without a callback", async () => {
+    for (const onClipboardPaste of [undefined, vi.fn()]) {
+      const result = await renderControllingInputHook({ onClipboardPaste });
+      const send = latestSocketSend();
+      send.mockClear();
+      const pasteEvent = {
+        target: document.createElement("input"),
+        clipboardData: { getData: vi.fn(() => "local URL") },
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+      } as unknown as React.ClipboardEvent;
+
+      act(() => result.current.handlers.handlePaste(pasteEvent));
+
+      expect(send).not.toHaveBeenCalled();
+      expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
+      if (onClipboardPaste) expect(onClipboardPaste).not.toHaveBeenCalled();
+    }
+  });
+
   it("preserves the pressed button mask while moving the mouse", async () => {
     const result = await renderControllingInputHook();
 
@@ -1007,6 +1047,31 @@ describe("useCdpInput key handling", () => {
     });
 
     expect(onClipboardPaste).not.toHaveBeenCalled();
+  });
+
+  it("syncs Cmd+C and still delivers it to the page only when forwarding is on", async () => {
+    for (const forwardCopyShortcut of [true, false]) {
+      const onClipboardCopy = vi.fn();
+      const result = await renderControllingInputHook({
+        onClipboardCopy,
+        forwardCopyShortcut,
+      });
+      const send = latestSocketSend();
+      send.mockClear();
+
+      act(() => {
+        result.current.handlers.handleKeyDown(
+          fakeKeyboardEvent("c", "KeyC", { metaKey: true }),
+        );
+        result.current.handlers.handleKeyUp(fakeKeyboardEvent("c", "KeyC"));
+      });
+
+      expect(onClipboardCopy).toHaveBeenCalledTimes(1);
+      const sentCodes = send.mock.calls.map(
+        (call) => JSON.parse(String(call[0])).code,
+      );
+      expect(sentCodes).toEqual(forwardCopyShortcut ? ["KeyC", "KeyC"] : []);
+    }
   });
 
   it("forwards an ordinary key pair after intercepting a clipboard chord", async () => {

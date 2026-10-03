@@ -52,7 +52,9 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.sdk.workflow.retry_policy import RETRY_DECISION_GRACE_SECONDS, RetryDecision, mark_attempt_started
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.run_enums import WebhookDeliveryStatus
 from skyvern.services import workflow_schedule_service as schedule_service_module
+from skyvern.services.webhook_delivery import PreparedWorkflowWebhook
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -124,7 +126,20 @@ async def interim_retry_db(sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch) 
         )
         await session.commit()
     svc = app.WORKFLOW_SERVICE
-    monkeypatch.setattr(svc, "prepare_workflow_webhook", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        svc,
+        "prepare_workflow_webhook",
+        AsyncMock(
+            return_value=PreparedWorkflowWebhook(
+                workflow_id="wf_retry",
+                workflow_run_id="wr_retry",
+                organization_id="org_test",
+                webhook_callback_url="https://example.com/hook",
+                signed_payload="{}",
+                headers={},
+            )
+        ),
+    )
     monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", AsyncMock())
     monkeypatch.setattr(app.AGENT_FUNCTION, "on_workflow_run_final", AsyncMock())
     monkeypatch.setattr(svc, "_start_credential_fallback_retry_best_effort", AsyncMock())
@@ -686,11 +701,18 @@ async def test_in_process_retry_continues_after_interim_delivery_exhaustion(
     svc = app.WORKFLOW_SERVICE
     events: list[str] = []
     deliveries: list[int] = []
+    delivery_projections: list[tuple[WebhookDeliveryStatus | None, WebhookDeliveryStatus | None]] = []
 
-    async def deliver(_webhook: object) -> bool:
+    async def deliver(
+        _webhook: PreparedWorkflowWebhook,
+        *,
+        delivered_projection: WebhookDeliveryStatus | None = None,
+        exhausted_projection: WebhookDeliveryStatus | None = None,
+    ) -> bool:
         attempts = await database.workflow_run_attempts.get_attempts("wr_retry")
         number = attempts[-1].attempt_number
         deliveries.append(number)
+        delivery_projections.append((delivered_projection, exhausted_projection))
         return number == 2 and final_delivery_succeeds
 
     async def execute(**kwargs: object) -> WorkflowRun:
@@ -738,6 +760,17 @@ async def test_in_process_retry_continues_after_interim_delivery_exhaustion(
     assert bool(attempts[1].final_side_effects_progress.get("webhook_delivery_attempted")) == final_delivery_succeeds
     assert bool(attempts[1].final_side_effects_progress.get("webhook_delivery_exhausted_at")) != final_delivery_succeeds
     assert deliveries.count(2) == (1 if final_delivery_succeeds else service_module.TERMINAL_RELEASE_RETRY_MAX_ATTEMPTS)
+    expected_final_projections: list[tuple[WebhookDeliveryStatus, WebhookDeliveryStatus | None]] = [
+        (WebhookDeliveryStatus.delivered, None)
+    ] * deliveries.count(2)
+    if not final_delivery_succeeds:
+        expected_final_projections[-1] = (
+            WebhookDeliveryStatus.delivered,
+            WebhookDeliveryStatus.exhausted_unattributed,
+        )
+    interim_delivery_count = service_module.TERMINAL_RELEASE_RETRY_MAX_ATTEMPTS
+    assert delivery_projections[:interim_delivery_count] == [(None, None)] * interim_delivery_count
+    assert delivery_projections[interim_delivery_count:] == expected_final_projections
 
 
 @pytest.mark.asyncio
@@ -2774,11 +2807,111 @@ async def test_scheduled_run_cannot_clobber_the_callers_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduled_run_gets_independent_download_popup_registries() -> None:
+    """A fire-and-forget run copied via ``replace(parent)`` must own EMPTY, independent download-popup
+    lifecycle registries. Otherwise the shallow copy aliases the parent's dicts, so a reset/cleanup on
+    either context destructively detaches the other live run's listeners and clears its reservations."""
+
+    class _FakeBrowserContext:
+        def __init__(self) -> None:
+            self.callbacks: list[Any] = []
+
+        def on(self, event: str, cb: Any) -> None:
+            if event == "page":
+                self.callbacks.append(cb)
+
+        def remove_listener(self, event: str, cb: Any) -> None:
+            if event == "page" and cb in self.callbacks:
+                self.callbacks.remove(cb)
+
+    parent = SkyvernContext(organization_id="org_1", task_id="tsk_parent")
+    parent_browser_context = _FakeBrowserContext()
+    parent_page = object()
+    parent.arm_download_popup_context_listener("tsk_parent", parent_browser_context, lambda page: None)
+    parent.record_download_popup_claim(
+        "tsk_parent",
+        parent_page,
+        baseline_files=["/d/parent.pdf"],
+        session_observed=True,
+        session_baseline_files=["s3://b/parent-session.pdf"],
+    )
+    parent.record_download_popup_late_candidate("tsk_parent", object())
+    parent.stash_pending_download_reservation_release("tsk_parent", ((parent_page,), ()))
+    parent_sibling = object()
+    parent.mark_download_popup_claim_delta_siblings("tsk_parent", [parent_page, parent_sibling])
+    parent.anchor_download_popup_recovery_grace("tsk_parent", parent_page, 0.0)
+
+    child_holder: list[SkyvernContext] = []
+
+    async def work() -> None:
+        child = skyvern_context.current()
+        assert child is not None
+        child_holder.append(child)
+
+    # Assert inside the scope: scoped()'s exit runs _cleanup_outgoing_context on the parent.
+    with skyvern_context.scoped(parent):
+        BackgroundTaskExecutor()._schedule(None, work)
+        for _ in range(100):
+            if child_holder:
+                break
+            await asyncio.sleep(0)
+
+        assert child_holder, "the scheduled child run never executed"
+        child = child_holder[0]
+        assert child is not parent
+
+        # All PR-owned popup lifecycle registries (incl. the recovery-grace anchor) are independent
+        # objects, empty in the child. The parent recorded a claim and anchored recovery grace.
+        assert parent.download_popup_recovery_grace_started_at, "parent should hold a recovery-grace anchor"
+        assert parent.download_popup_claim_baseline, "parent should hold a claim baseline snapshot"
+        assert parent.download_popup_claim_session_observed, "parent should hold a session-observed flag"
+        assert parent.download_popup_claim_session_baseline, "parent should hold a session baseline"
+        assert parent.download_popup_claim_delta_siblings, "parent should hold sibling markers"
+        for attr in (
+            "download_popup_claims",
+            "download_popup_context_listeners",
+            "download_popup_late_candidates",
+            "pending_download_reservation_release",
+            "download_popup_recovery_grace_started_at",
+            "download_popup_claim_baseline",
+            "download_popup_claim_session_observed",
+            "download_popup_claim_session_baseline",
+            "download_popup_claim_delta_siblings",
+        ):
+            assert getattr(child, attr) is not getattr(parent, attr), f"{attr} must not alias the parent's dict"
+            assert getattr(child, attr) == {}, f"{attr} must be empty in the copied child"
+
+        # Mutating the child's own sibling markers must not bleed into the parent's (would fail if the
+        # child aliased the parent's dict for lack of an independent reset).
+        child.mark_download_popup_claim_delta_siblings("tsk_child_sib", [object()])
+        assert "tsk_parent" in parent.download_popup_claim_delta_siblings, "child mutation dropped parent's marker"
+        assert "tsk_child_sib" not in parent.download_popup_claim_delta_siblings, "child marker leaked to the parent"
+
+        # A destructive teardown on the child must leave the parent's live ownership state untouched.
+        child.detach_all_download_popup_context_listeners()
+        assert parent.has_download_popup_claim("tsk_parent", parent_page), "child teardown cleared the parent's claim"
+        assert parent_browser_context.callbacks, "child teardown detached the parent's live listener"
+        assert "tsk_parent" in parent.pending_download_reservation_release, "child teardown cleared parent's pending"
+        assert parent.download_popup_recovery_grace_started_at, "child teardown cleared the parent's recovery anchor"
+        assert parent.download_popup_claim_baseline, "child teardown cleared the parent's claim baseline"
+        assert parent.download_popup_claim_session_observed, "child teardown cleared the parent's session flag"
+        assert parent.download_popup_claim_session_baseline, "child teardown cleared the parent's session baseline"
+        assert parent.download_popup_claim_delta_siblings, "child teardown cleared the parent's sibling markers"
+
+        # ...and the symmetric direction: a parent teardown must not touch the child's own state.
+        child_page = object()
+        child.record_download_popup_claim("tsk_child", child_page)
+        parent.detach_all_download_popup_context_listeners()
+        assert child.has_download_popup_claim("tsk_child", child_page), "parent teardown cleared the child's claim"
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_stamps_org_llm_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     organization = SimpleNamespace(
         organization_id="org_test",
         default_llm_key="CUSTOM_LLM_oat_smart",
         default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        created_at=None,
     )
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
@@ -3032,6 +3165,10 @@ async def test_no_policy_initializer_failure_fails_the_run_durably(
         execute.assert_not_awaited()
     if need_call_webhook and scenario in {"state_file", "llm_runtime"}:
         deliver.assert_awaited_once()
+        assert deliver.await_args.kwargs == {
+            "delivered_projection": WebhookDeliveryStatus.delivered,
+            "exhausted_projection": WebhookDeliveryStatus.exhausted_unattributed,
+        }
     else:
         deliver.assert_not_awaited()
     if app.WORKFLOW_SERVICE._background_tasks:
@@ -3340,7 +3477,11 @@ async def test_scheduled_run_whose_initializer_fails_is_recovered_after_a_restar
 ) -> None:
     fire_time = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
     schedule = SimpleNamespace(
-        workflow_schedule_id="wfs_test", workflow_permanent_id="wpid_test", organization_id="org_test", parameters={}
+        workflow_schedule_id="wfs_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        parameters={},
+        is_one_time=False,
     )
     workflow_run_id = schedule_service_module.build_scheduled_workflow_run_id(schedule.workflow_schedule_id, fire_time)
     async with sqlite_db.Session() as session:
@@ -3648,6 +3789,7 @@ async def test_execute_task_v2_stamps_org_llm_defaults(monkeypatch: pytest.Monke
         organization_id="org_test",
         default_llm_key="CUSTOM_LLM_oat_smart",
         default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        created_at=None,
     )
     monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(return_value=organization))
     monkeypatch.setattr(
@@ -4215,8 +4357,19 @@ async def test_in_process_retry_reacquires_serialized_lane(
         waiting.set()
         await release.wait()
 
+    admission_timeout: asyncio.Timeout | None = None
+
+    def timeout(seconds: float | None) -> asyncio.Timeout:
+        nonlocal admission_timeout
+        if outcome == "timeout" and seconds == 0.05:
+            # Arm the real cancellation only after the occupied lane is observed;
+            # database latency must not decide whether this ordering test passes.
+            admission_timeout = asyncio.timeout(None)
+            return admission_timeout
+        return asyncio.timeout(seconds)
+
     monkeypatch.setattr(svc, "execute_workflow", execute)
-    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep, timeout=timeout))
     clearance_query = sqlite_db.workflow_runs.get_blocking_sequential_workflow_run
     query_failed = False
 
@@ -4284,6 +4437,9 @@ async def test_in_process_retry_reacquires_serialized_lane(
             release.set()
         elif outcome == "task_cancel":
             task.cancel()
+        elif outcome == "timeout":
+            assert admission_timeout is not None
+            admission_timeout.reschedule(asyncio.get_running_loop().time())
 
         if outcome == "task_cancel":
             with pytest.raises(asyncio.CancelledError):

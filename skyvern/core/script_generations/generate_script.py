@@ -1570,6 +1570,10 @@ def _build_block_fn(
         )
     else:
         for act in actions:
+            # Internal-recovery closes are runtime-synthesized and have no ACTION_MAP entry; skip
+            # only the marked ones so user-authored close_page semantics are left untouched.
+            if act.get("is_internal_recovery"):
+                continue
             if act["action_type"] in [
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
@@ -2441,6 +2445,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             cst.Arg(
                 keyword=cst.Name("model"),
                 value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("worksheet"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("worksheet"),
+                value=_value(block.get("worksheet")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),

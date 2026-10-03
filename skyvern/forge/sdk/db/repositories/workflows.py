@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any, cast
 import structlog
 from sqlalchemy import exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import aliased
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
+from skyvern.exceptions import WorkflowPinnedByRunGroup
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
@@ -32,6 +34,7 @@ from skyvern.forge.sdk.db.models import (
     OutputParameterModel,
     WorkflowModel,
     WorkflowParameterModel,
+    WorkflowRunGroupModel,
     WorkflowRunModel,
     WorkflowScheduleModel,
     WorkflowTemplateModel,
@@ -51,6 +54,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.workflow_run_groups import WorkflowRunGroupStatus
 from skyvern.schemas.workflows import WorkflowStatus
 
 if TYPE_CHECKING:
@@ -104,6 +108,21 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
                 _visit(block.loop_blocks)
 
     _visit(workflow_definition.blocks)
+
+
+async def _refuse_if_pinned_by_run_group(session: AsyncSession, workflow_id: str) -> None:
+    pinned = await session.scalar(
+        select(WorkflowRunGroupModel.workflow_run_group_id)
+        .where(WorkflowRunGroupModel.workflow_id == workflow_id)
+        .where(
+            WorkflowRunGroupModel.status.in_(
+                [WorkflowRunGroupStatus.active.value, WorkflowRunGroupStatus.cancel_requested.value]
+            )
+        )
+        .limit(1)
+    )
+    if pinned is not None:
+        raise WorkflowPinnedByRunGroup(workflow_id)
 
 
 class WorkflowsRepository(BaseRepository):
@@ -706,6 +725,7 @@ class WorkflowsRepository(BaseRepository):
                     WorkflowModel.organization_id,
                     WorkflowModel.workflow_permanent_id,
                     func.max(WorkflowModel.version).label("max_version"),
+                    func.min(WorkflowModel.version).label("min_version"),
                 )
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
@@ -718,13 +738,32 @@ class WorkflowsRepository(BaseRepository):
                 )
                 .subquery()
             )
+            # Saves re-stamp created_by on each new version, so the true creator is the earliest version's row.
+            origin = aliased(WorkflowModel)
+            # Deleted versions still count toward when the agent was born, as in get_workflow_permanent_id_created_at.
+            lineage = aliased(WorkflowModel)
+            first_created_at = (
+                select(func.min(lineage.created_at))
+                .where(
+                    lineage.organization_id == WorkflowModel.organization_id,
+                    lineage.workflow_permanent_id == WorkflowModel.workflow_permanent_id,
+                )
+                .correlate(WorkflowModel)
+                .scalar_subquery()
+            )
             main_query = (
-                select(WorkflowModel)
+                select(WorkflowModel, origin.created_by, first_created_at)
                 .join(
                     subquery,
                     (WorkflowModel.organization_id == subquery.c.organization_id)
                     & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
                     & (WorkflowModel.version == subquery.c.max_version),
+                )
+                .join(
+                    origin,
+                    (origin.organization_id == subquery.c.organization_id)
+                    & (origin.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                    & (origin.version == subquery.c.min_version),
                 )
                 .outerjoin(
                     FolderModel,
@@ -882,19 +921,22 @@ class WorkflowsRepository(BaseRepository):
             main_query = (
                 main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             )
-            workflows = (await session.scalars(main_query)).all()
+            rows = (await session.execute(main_query)).all()
             template_permanent_ids: set[str] = set()
-            if workflows and organization_id:
+            if rows and organization_id:
                 template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
 
-            return [
-                convert_to_workflow(
-                    workflow,
+            workflows: list[Workflow] = []
+            for workflow_model, original_created_by, original_created_at in rows:
+                workflow = convert_to_workflow(
+                    workflow_model,
                     self.debug_enabled,
-                    is_template=workflow.workflow_permanent_id in template_permanent_ids,
+                    is_template=workflow_model.workflow_permanent_id in template_permanent_ids,
                 )
-                for workflow in workflows
-            ]
+                workflow.original_created_by = original_created_by
+                workflow.original_created_at = original_created_at
+                workflows.append(workflow)
+            return workflows
 
     @db_operation("link_workflow_browser_profile_if_unset")
     async def link_workflow_browser_profile_if_unset(
@@ -917,7 +959,7 @@ class WorkflowsRepository(BaseRepository):
             await session.commit()
             return result.rowcount > 0
 
-    @db_operation("update_workflow")
+    @db_operation("update_workflow", expected_errors=(WorkflowPinnedByRunGroup,))
     async def update_workflow(
         self,
         workflow_id: str,
@@ -953,6 +995,7 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        refuse_if_pinned_by_run_group: bool = False,
     ) -> Workflow:
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -960,7 +1003,11 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+            if refuse_if_pinned_by_run_group:
+                get_workflow_query = get_workflow_query.with_for_update()
             if workflow := (await session.scalars(get_workflow_query)).first():
+                if refuse_if_pinned_by_run_group:
+                    await _refuse_if_pinned_by_run_group(session, workflow_id)
                 if title is not None:
                     workflow.title = title
                 if description is not None:
@@ -1250,7 +1297,7 @@ class WorkflowsRepository(BaseRepository):
                 is_template=is_template,
             )
 
-    @db_operation("update_workflow_and_reconcile_definition_params")
+    @db_operation("update_workflow_and_reconcile_definition_params", expected_errors=(WorkflowPinnedByRunGroup,))
     async def update_workflow_and_reconcile_definition_params(
         self,
         workflow_id: str,
@@ -1287,6 +1334,7 @@ class WorkflowsRepository(BaseRepository):
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
         preserve_completion_contract: bool = True,
+        refuse_if_pinned_by_run_group: bool = False,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -1308,6 +1356,10 @@ class WorkflowsRepository(BaseRepository):
         round-trip.  That trade-off is deliberate — the alternative (sync
         every credential subclass's columns on every write) pulls a
         significant amount of orthogonal logic into this path.
+
+        The one exception is which ``credential_id`` each ``CredentialParameter``
+        key is bound to: run search dates those bindings by their
+        ``credential_parameters`` rows, so they are kept current here.
         """
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -1315,9 +1367,13 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+            if refuse_if_pinned_by_run_group:
+                get_workflow_query = get_workflow_query.with_for_update()
             workflow = (await session.scalars(get_workflow_query)).first()
             if not workflow:
                 raise NotFoundError("Workflow not found")
+            if refuse_if_pinned_by_run_group:
+                await _refuse_if_pinned_by_run_group(session, workflow_id)
 
             if title is not None:
                 workflow.title = title
@@ -1424,7 +1480,7 @@ class WorkflowsRepository(BaseRepository):
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], str | None]:
         """Soft-delete a workflow and its active schedules in a single DB transaction."""
         async with self.Session() as session:
             select_query = (
@@ -1453,7 +1509,10 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id is not None:
                 update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
-            await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+            workflow_result = await session.execute(
+                update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
+            )
+            deleted_workflow_id = workflow_result.scalars().first()
             recording_delete_query = update(BrowserRecordingModel).where(
                 BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
                 BrowserRecordingModel.deleted_at.is_(None),
@@ -1464,7 +1523,7 @@ class WorkflowsRepository(BaseRepository):
                 )
             await session.execute(recording_delete_query.values(deleted_at=deleted_at))
             await session.commit()
-            return schedule_ids
+            return schedule_ids, deleted_workflow_id
 
     @db_operation("add_workflow_template")
     async def add_workflow_template(

@@ -159,6 +159,7 @@ class TestMcpBrowserContextBridge:
 
         browser_state = MagicMock()
         browser_state.browser_context = MagicMock()
+        browser_state.get_working_page = AsyncMock(return_value=None)
         manager = MagicMock()
         manager.get_browser_state = AsyncMock(return_value=browser_state)
 

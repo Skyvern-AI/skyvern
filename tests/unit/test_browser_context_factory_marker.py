@@ -10,6 +10,7 @@ auto-stamp.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -17,12 +18,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from playwright.async_api import BrowserContext, Locator, Page
 
+from skyvern.config import settings
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.webeye import browser_factory as factory_module
 from skyvern.webeye import display_recorder as dr
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
+from skyvern.webeye.profile_cookie_merge import write_signin_cookies
 
 
 @pytest.mark.asyncio
@@ -167,6 +171,27 @@ async def test_create_browser_context_gates_playwright_video_on_acquired_recorde
 
 
 @pytest.mark.asyncio
+async def test_factory_restores_sign_in_seed_with_banked_cookies_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    write_signin_cookies(str(tmp_path), [{"name": "sid", "value": "1", "domain": "portal.example.com", "path": "/"}])
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+
+    async def _creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        return context, BrowserArtifacts(browser_session_dir=str(tmp_path)), None
+
+    _factory_harness(monkeypatch)
+    BrowserContextFactory.register_type("test-signin-seed", _creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-signin-seed")
+
+    await BrowserContextFactory.create_browser_context(playwright=object())
+
+    assert [c["name"] for c in context.add_cookies.await_args.args[0]] == ["sid"]
+    factory_module.restore_banked_cookies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_factory_registers_authoritative_playwright_input_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     context = MagicMock()
 
@@ -291,13 +316,55 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
 
     # Storage miss: the creator falls back to a temp dir and the field stays None.
     monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=None))
-    monkeypatch.setattr(factory_module, "make_temp_directory", lambda **_: str(tmp_path / "fresh"))
+    monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(tmp_path / "fresh"))
     _, artifacts_no_profile, _ = await factory_module._create_headless_chromium(
         playwright,
         browser_profile_id="bp_test",
         organization_id="o_test",
     )
     assert artifacts_no_profile.applied_browser_profile_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+async def test_headless_chromium_runs_only_a_read_only_profile_on_a_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_only: bool
+) -> None:
+    from skyvern.forge import app
+
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "sessions"))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    stored = tmp_path / "sessions" / "o_test" / "profiles" / "bp_test"
+    (stored / "Default").mkdir(parents=True)
+    (stored / "Default" / "Cookies").write_text("session=saved")
+    storage = LocalStorage()
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", storage.retrieve_browser_profile)
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_copy", storage.retrieve_browser_profile_copy)
+    monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
+    monkeypatch.setattr(
+        BrowserContextFactory,
+        "build_browser_args",
+        MagicMock(return_value={"record_har_path": str(tmp_path / "h.har")}),
+    )
+    monkeypatch.setattr(factory_module, "initialize_download_dir", lambda: str(tmp_path / "downloads"))
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock())
+
+    _, artifacts, cleanup = await factory_module._create_headless_chromium(
+        playwright,
+        browser_profile_id="bp_test",
+        organization_id="o_test",
+        profile_read_only=read_only,
+    )
+
+    assert artifacts.applied_browser_profile_id == "bp_test"
+    browser_dir = Path(str(artifacts.browser_session_dir))
+    assert (browser_dir.resolve() == stored.resolve()) is not read_only
+    assert (browser_dir / "Default" / "Cookies").read_text() == "session=saved"
+    if cleanup is not None:
+        await cleanup()
+    assert browser_dir.exists() is not read_only
+    assert (stored / "Default" / "Cookies").read_text() == "session=saved"
 
 
 @pytest.mark.asyncio
@@ -335,7 +402,7 @@ async def test_headful_creator_releases_recorder_when_launch_is_cancelled(
     # P1: a Temporal cancel (BaseException) landing on the pending launch_persistent_context must release the
     # already-started whole-display recorder — otherwise the bridge+ffmpeg keep recording and the display flock
     # and _REGISTRY entry leak pod-wide. RED at head: except-Exception does not catch CancelledError.
-    monkeypatch.setattr(factory_module, "make_temp_directory", lambda **_: str(tmp_path / "ud"))
+    monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(tmp_path / "ud"))
     monkeypatch.setattr(factory_module, "initialize_download_dir", lambda: str(tmp_path / "dl"))
     monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
     monkeypatch.setattr(

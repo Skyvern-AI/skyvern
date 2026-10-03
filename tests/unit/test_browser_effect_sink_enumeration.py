@@ -1,4 +1,5 @@
 import ast
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -15,13 +16,13 @@ _CANDIDATE_METHODS = frozenset(
 )
 
 _DISCOVERED_BROWSER_API_CALLS = {
-    "skyvern/forge/agent.py": Counter({"close": 1, "evaluate": 3, "new_page": 1}),
+    "skyvern/forge/agent.py": Counter({"close": 1, "evaluate": 4, "new_page": 1}),
     "skyvern/forge/agent_functions.py": Counter({"close": 1, "scroll_into_view_if_needed": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
             "bring_to_front": 2,
             "check": 2,
-            "click": 24,
+            "click": 25,
             "clear": 6,
             # 6 = 5 prior + the bounded v4 FileDownloadBlock synchronous popup close (SKY-15371).
             "close": 6,
@@ -47,6 +48,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "wheel": 5,
         }
     ),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 5}),
     "skyvern/webeye/actions/handler_utils.py": Counter(
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
@@ -71,17 +73,45 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {"clear": 1, "click": 2, "move": 2, "scroll_into_view_if_needed": 1, "type": 3, "wheel": 1}
     ),
     "skyvern/forge/sdk/event/factory.py": Counter({"click": 1, "wheel": 1}),
+    "skyvern/forge/taskv3/input_dispatch.py": Counter(
+        {
+            "click": 4,
+            "evaluate": 1,
+            "fill": 3,
+            "focus": 2,
+            "hover": 1,
+            "press": 3,
+            "press_sequentially": 1,
+            "scroll_into_view_if_needed": 1,
+            "select_option": 2,
+            "set_files": 1,
+            "set_input_files": 1,
+            "type": 2,
+            "wheel": 1,
+        }
+    ),
     "skyvern/webeye/real_browser_state.py": Counter({"close": 6, "evaluate": 1, "goto": 1, "new_page": 3, "reload": 2}),
 }
 
 _EVALUATE_CALLERS = {
     # Read-only DOM fingerprint sample for the v3 settle-before-complete check, and the per-document
     # nonce the v3 loop reads to tell whether a failed batched call navigated the page.
-    # _page_fingerprint samples TWICE: the page's own document, and — with TASK_V3_FRAME_PERCEPTION on
-    # — each readable child frame. Both are the same read-only probe; the second exists because the
-    # settle check is a live gate and a main-frame-only sample reads a page whose child frame is still
-    # rendering as settled (SKY-14657).
-    "skyvern/forge/agent.py": Counter({"_page_fingerprint": 2, "_page_probe": 1}),
+    # _page_fingerprint samples TWICE: the page's own document, and each readable child frame. Both
+    # are the same read-only probe; the second exists because the settle check is a live gate and a
+    # main-frame-only sample reads a page whose child frame is still rendering as settled (SKY-14657).
+    # _document_identity reads the same nonce in the main document and each acted-in child frame, via
+    # the shared _realm_part helper (one evaluate call site, invoked once per realm) that also reads
+    # each realm's browser-owned _realm_document_id (SKY-17372).
+    "skyvern/forge/agent.py": Counter({"_page_fingerprint": 2, "_page_probe": 1, "_realm_part": 1}),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter(
+        {
+            "_multi_field_totp_frame_gone": 1,
+            "_multi_field_totp_widget_snapshot": 1,
+            "bind": 1,
+            "refresh": 1,
+            "find_multi_field_totp_submit_controls": 1,
+        }
+    ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"_uses_native_value_set_fill": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
@@ -113,6 +143,8 @@ _EVALUATE_CALLERS = {
         }
     ),
     "skyvern/webeye/real_browser_state.py": Counter({"stop_page_loading": 1}),
+    # The hidden-native-control click V3 fires in-page.
+    "skyvern/forge/taskv3/input_dispatch.py": Counter({"js_click": 1}),
     # OTP box/scope/document marker writes, visual masks and read-only hit-test geometry.
     "skyvern/webeye/utils/dom.py": Counter(
         {"apply_secret_visual_mask": 1, "mark_totp_box": 2, "blur": 1, "_pointer_interceptor_matches_label": 1}
@@ -153,6 +185,7 @@ def _owned_source_paths() -> tuple[str, ...]:
         Path("skyvern/webeye/utils/dom.py"),
         *Path("skyvern/webeye/actions").glob("*.py"),
         *Path("skyvern/forge/sdk/event").glob("*.py"),
+        Path("skyvern/forge/taskv3/input_dispatch.py"),
     }
     return tuple(sorted(path.as_posix() for path in paths))
 
@@ -227,24 +260,110 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 173
+    assert sum(sum(methods.values()) for methods in observed.values()) == 207
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 166
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 200
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 31
+    assert sum(sum(callers.values()) for callers in observed.values()) == 38
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _cdp_send_callers(path))}
 
     assert observed == _CDP_SENDS
+
+
+# Task V3 sends input only through input_dispatch.
+_INPUT_DISPATCH = Path("skyvern/forge/taskv3/input_dispatch.py")
+_TASKV3_BANNED_INPUT_METHODS = frozenset(
+    """check click dblclick dispatch_event drag_and_drop drag_to fill focus hover insert_text press press_sequentially select_option
+    select_text set_checked set_files set_input_files tap type uncheck""".split()
+)
+_TASKV3_BANNED_DEVICES = frozenset({"mouse", "keyboard"})
+_IN_PAGE_INPUT_JS = re.compile(r"\.click\(\)|dispatchEvent\(|new (Mouse|Keyboard|Pointer)Event|Input\.dispatch")
+# `clear` is also a list and dict method, so it is banned only on a receiver shaped like an element.
+_ELEMENT_SOURCES = frozenset({"locator", "query_selector", "element_handle", "nth", "first", "last"})
+
+
+def _enclosing_function(parents: dict[ast.AST, ast.AST], node: ast.AST) -> str:
+    current = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return current.name
+    return "<module>"
+
+
+def _is_element(node: ast.expr, element_names: set[str]) -> bool:
+    if isinstance(node, ast.Await):
+        node = node.value
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Name):
+        return node.id in element_names
+    return isinstance(node, ast.Attribute) and (node.attr in _ELEMENT_SOURCES or node.attr.startswith("get_by_"))
+
+
+def _direct_input_sites(path: Path, only_function: str | None = None) -> list[str]:
+    tree = ast.parse(path.read_text())
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    element_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and _is_element(node.value, set())
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    sites: list[str] = []
+    for node in ast.walk(tree):
+        found: str | None = None
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            receiver = node.func.value
+            dispatched = isinstance(receiver, ast.Name) and receiver.id == "input_dispatch"
+            if node.func.attr in _TASKV3_BANNED_INPUT_METHODS and not dispatched:
+                found = f"{node.func.attr} on {ast.unparse(node.func.value)}"
+            elif node.func.attr == "clear" and _is_element(receiver, element_names):
+                found = f"clear on {ast.unparse(receiver)}"
+        elif isinstance(node, ast.Attribute) and node.attr in _TASKV3_BANNED_DEVICES:
+            found = f".{node.attr} on {ast.unparse(node.value)}"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in _TASKV3_BANNED_INPUT_METHODS | _TASKV3_BANNED_DEVICES
+        ):
+            found = f"getattr {node.args[1].value!r}"
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and _IN_PAGE_INPUT_JS.search(node.value):
+            found = "in-page input script"
+        if found is None:
+            continue
+        function = _enclosing_function(parents, node)
+        if only_function is not None and function != only_function:
+            continue
+        sites.append(f"{path}:{getattr(node, 'lineno', '?')} {function} {found}")
+    return sites
+
+
+def test_taskv3_input_flows_only_through_input_dispatch() -> None:
+    sites = [
+        site
+        for path in sorted(Path("skyvern/forge/taskv3").rglob("*.py"))
+        if path != _INPUT_DISPATCH
+        for site in _direct_input_sites(path)
+    ]
+    # The captcha ladder lives outside taskv3 and V3 hands it the click to use.
+    sites += _direct_input_sites(Path("skyvern/webeye/utils/captcha_solver.py"), "_solve_challenge_ladder_impl")
+
+    assert sites == []

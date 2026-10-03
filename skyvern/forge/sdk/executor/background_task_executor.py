@@ -65,7 +65,25 @@ async def _run_with_own_context(
     """
     parent = skyvern_context.current()
     if parent is not None:
-        skyvern_context.set(replace(parent))
+        # The download-popup lifecycle registries are context-owned and destructively torn down at
+        # context cleanup (detach listeners, clear claims/reservations). A shallow replace() would
+        # alias them, so a reset/cleanup on either run would wipe the other live run's ownership state.
+        # A background run is a distinct run whose task ids never carry the parent's reservations, so
+        # give it independent EMPTY registries -- never copy entries; ownership must not cross runs.
+        skyvern_context.set(
+            replace(
+                parent,
+                download_popup_claims={},
+                download_popup_context_listeners={},
+                download_popup_late_candidates={},
+                pending_download_reservation_release={},
+                download_popup_recovery_grace_started_at={},
+                download_popup_claim_baseline={},
+                download_popup_claim_session_observed={},
+                download_popup_claim_session_baseline={},
+                download_popup_claim_delta_siblings={},
+            )
+        )
     await func(*args, **kwargs)
 
 

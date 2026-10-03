@@ -350,6 +350,9 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         "run_id": run_id,
         "status": str(_get_value(run, "status")) if _get_value(run, "status") is not None else None,
         "run_type": str(run_type) if run_type is not None else None,
+        "created_at": _jsonable(_get_value(run, "created_at")),
+        "trigger_type": _jsonable(_get_value(run, "trigger_type")),
+        "copilot_session_id": _get_value(run, "copilot_session_id"),
         "artifact_summary": _summarize_artifacts(run, output_stats),
         "output_summary": output_summary,
     }
@@ -721,10 +724,9 @@ def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_
 
 
 def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
-    """Fill `steps` from `code` on code-first blocks (non-null prompt) that carry none, using the
-    copilot's own deterministic derivation. Legacy blocks (null/absent prompt) and explicit steps
-    (even an empty outline) are left untouched, so this composes with the prompt-default injection's
-    migration guarantees; `steps: null` is the workflow-get shape for "no steps yet" and derives."""
+    """Rebuild `steps` from `code` on code-first blocks (non-null prompt), discarding any submitted steps.
+    Legacy blocks (null/absent prompt) are left untouched, so this composes with the prompt-default
+    injection's migration guarantees."""
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None:
         return definition
@@ -735,13 +737,13 @@ def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
 
     changed = False
     for block in _iter_blocks_flat(blocks):
-        if block.get("block_type") != "code" or block.get("prompt") is None or block.get("steps") is not None:
+        if block.get("block_type") != "code" or block.get("prompt") is None:
             continue
         code = block.get("code")
         if not isinstance(code, str):
             continue
-        derived = derive_code_block_steps(code, block.get("prompt"))
-        if derived:
+        derived = derive_code_block_steps(code)
+        if (derived or block.get("steps")) and block.get("steps") != derived:
             block["steps"] = derived
             changed = True
 
@@ -1628,7 +1630,15 @@ async def skyvern_workflow_run_list(
     page: Annotated[int, Field(description="Page number (1-based)", ge=1)] = 1,
     page_size: Annotated[int, Field(description="Results per page", ge=1, le=100)] = 10,
     status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
-    search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
+    search_key: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Search workflow run IDs, parameters, headers and webhook callback URLs; a complete "
+                "browser profile, browser session or credential ID matches the runs that used it"
+            )
+        ),
+    ] = None,
     error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
     include_child_runs: Annotated[
         bool,
@@ -1649,16 +1659,20 @@ async def skyvern_workflow_run_list(
 
     with Timer() as timer:
         try:
-            requested_page_size = page_size
-            runs = await list_workflow_runs_raw(
+            list_runs = functools.partial(
+                list_workflow_runs_raw,
                 workflow_id,
-                page=page,
-                page_size=requested_page_size + 1,
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
                 include_child_runs=include_child_runs,
             )
+            runs = await list_runs(page=page, page_size=page_size)
+            has_more = False
+            if len(runs) == page_size:
+                # The route offsets by (page - 1) * page_size, so this one-row page is the next page's first run.
+                next_run = await list_runs(page=page * page_size + 1, page_size=1)
+                has_more = bool(next_run)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -1678,9 +1692,6 @@ async def skyvern_workflow_run_list(
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check your API key and workflow run filters"),
             )
-
-    has_more = len(runs) > page_size
-    runs = runs[:page_size]
 
     return make_result(
         "skyvern_workflow_run_list",
@@ -1735,7 +1746,7 @@ async def skyvern_workflow_create(
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
     Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
     editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
-    code block editor experience, and their `steps` outline is derived from the code when omitted.
+    code block editor experience. A code block's `steps` outline is always rebuilt from its code, so do not send one.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,

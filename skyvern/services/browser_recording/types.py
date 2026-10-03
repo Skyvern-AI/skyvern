@@ -116,6 +116,8 @@ class Mouse(BaseModel):
     """
     0 to 1.0 inclusive, percentage down the viewport
     """
+    offset_x: float | None = None
+    offset_y: float | None = None
 
 
 OutputBlock = t.Union[
@@ -213,6 +215,8 @@ class MousePosition(BaseModel):
     ya: float | None = None
     xp: float | None = None
     yp: float | None = None
+    offsetX: float | None = None
+    offsetY: float | None = None
 
 
 class BoundingRect(BaseModel):

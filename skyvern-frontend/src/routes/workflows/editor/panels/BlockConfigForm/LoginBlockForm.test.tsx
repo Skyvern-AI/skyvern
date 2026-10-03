@@ -162,6 +162,8 @@ vi.mock("../../workflowEditorUtils", () => ({
   getAvailableOutputParameterKeys: () => [],
   isNodeInsideForLoop: () => false,
   getParentLoopSkipsOnFail: () => false,
+  isFirstBrowserTaskBlock: () => false,
+  isMissingRequiredStartUrl: () => false,
 }));
 
 // Drive the dispatcher's `useReactFlow().getNode(blockId)` lookup via a

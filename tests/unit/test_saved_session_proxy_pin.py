@@ -11,7 +11,7 @@ from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile_key_digest
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.proxy_pinning import derive_proxy_session_id, is_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
@@ -141,7 +141,7 @@ async def _create_forced_workflow_run(
     get_or_create_profile = get_or_create_profile or AsyncMock(return_value=(_profile(), False))
     update_profile = update_profile or AsyncMock(return_value=_profile())
     create_events: list[str] = []
-    created_workflow_run = SimpleNamespace(
+    created_workflow_run = WorkflowRun.model_construct(
         workflow_run_id="wr_forced",
         workflow_id="wf_test",
         organization_id="org_test",
@@ -281,6 +281,7 @@ async def _setup_profile_with_reconcile_failure(
                 organization_name="Test Org",
                 default_llm_key=None,
                 default_secondary_llm_key=None,
+                created_at=None,
             ),
         )
     except Exception as exc:
@@ -342,6 +343,7 @@ async def test_force_browser_session_passes_managed_profile_and_pins_proxy(
     )
     forced.create_session.assert_awaited_once_with(
         organization_id="org_test",
+        workflow_run_id="wr_forced",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         timeout_minutes=60,
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
@@ -404,6 +406,7 @@ async def test_force_browser_session_rotating_profile_key_selects_after_run_crea
     )
     forced.create_session.assert_awaited_once_with(
         organization_id="org_test",
+        workflow_run_id="wr_forced",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         timeout_minutes=60,
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
@@ -517,6 +520,7 @@ async def test_force_browser_session_created_profile_seeds_legacy_session(
     )
     forced.create_session.assert_awaited_once_with(
         organization_id="org_test",
+        workflow_run_id="wr_forced",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         timeout_minutes=60,
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
@@ -626,6 +630,7 @@ async def test_force_browser_session_persist_off_does_not_pass_browser_profile(
     forced.update_profile.assert_not_awaited()
     forced.create_session.assert_awaited_once_with(
         organization_id="org_test",
+        workflow_run_id="wr_forced",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         timeout_minutes=60,
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
@@ -693,6 +698,7 @@ async def test_force_browser_session_non_pinned_profile_resolution_failure_still
     forced.update_profile.assert_not_awaited()
     forced.create_session.assert_awaited_once_with(
         organization_id="org_test",
+        workflow_run_id="wr_forced",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         timeout_minutes=60,
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
@@ -722,6 +728,7 @@ async def test_force_browser_session_non_pinned_unresolvable_profile_key_creates
     forced.update_profile.assert_not_awaited()
     forced.create_session.assert_awaited_once_with(
         organization_id="org_test",
+        workflow_run_id="wr_forced",
         proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         timeout_minutes=60,
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
@@ -818,6 +825,7 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         fallback_attempt=None,
         ignore_inherited_workflow_system_prompt=False,
         copilot_session_id=None,
+        created_by=None,
     )
     update_workflow_run.assert_not_awaited()
 

@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import os
 import socket
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -133,6 +134,7 @@ async def aiohttp_request(
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     follow_redirects: bool = True,
     proxy: str | None = None,
+    authorize_redirect: Callable[[str], bool] | None = None,
 ) -> tuple[int, dict[str, str], Any]:
     """
     Generic HTTP request function that supports all HTTP methods.
@@ -148,6 +150,8 @@ async def aiohttp_request(
         timeout: Request timeout in seconds
         follow_redirects: Whether to follow redirects
         proxy: Proxy URL
+        authorize_redirect: Refuses a redirect (rather than following it) when it returns False for
+            the next URL; the caller decides which destinations the request's contents may reach
 
     Returns:
         Tuple of (status_code, response_headers, response_body)
@@ -215,6 +219,8 @@ async def aiohttp_request(
                     and response.headers.get("Location")
                 ):
                     next_url = await validate_and_pin_redirect_url(current_url, response.headers["Location"], resolver)
+                    if authorize_redirect is not None and not authorize_redirect(next_url):
+                        raise HttpException(400, current_url, "Redirect blocked by policy")
                     request_headers, request_cookies = strip_cross_origin_redirect_credentials(
                         request_headers, request_cookies, current_url, next_url
                     )
@@ -248,6 +254,7 @@ async def aiohttp_get_json(
 ) -> dict[str, Any]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         count = 0
+        last_error: Exception | None = None
         while count <= retry:
             try:
                 async with session.get(
@@ -263,11 +270,12 @@ async def aiohttp_get_json(
                         raise HttpException(response.status, url)
                     LOG.error(f"Failed to fetch data from {url}", status_code=response.status)
                     return {}
-            except Exception:
+            except Exception as e:
+                last_error = e
                 if retry_timeout > 0:
                     await asyncio.sleep(retry_timeout)
                 count += 1
-        raise Exception(f"Failed to fetch data from {url}")
+        raise Exception(f"Failed to fetch data from {url}") from last_error
 
 
 async def aiohttp_get_text(
@@ -319,6 +327,7 @@ async def aiohttp_post(
 ) -> dict[str, Any] | None:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         count = 0
+        last_error: Exception | None = None
         while count <= retry:
             try:
                 async with session.post(
@@ -343,11 +352,12 @@ async def aiohttp_post(
                         response=response_text,
                     )
                     return {}
-            except Exception:
+            except Exception as e:
+                last_error = e
                 if retry_timeout > 0:
                     await asyncio.sleep(retry_timeout)
                 count += 1
-        raise Exception(f"Failed post request url={url}")
+        raise Exception(f"Failed post request url={url}") from last_error
 
 
 async def aiohttp_delete(

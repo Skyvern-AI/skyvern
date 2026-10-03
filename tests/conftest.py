@@ -1,11 +1,29 @@
 """Fixtures shared by every suite."""
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+
+from skyvern.forge import app
+from skyvern.forge.sdk.core import organization_age_cache
+from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.services import organization_log_scope
+
+
+@pytest.fixture(autouse=True)
+def _isolate_organization_age_cache() -> Iterator[None]:
+    """Loading an organization caches its creation time process-wide; no test may leak it into another's logs."""
+    yield
+    organization_age_cache._created_at_by_organization.clear()
+    organization_log_scope._missing_organization_until.clear()
+    organization_log_scope._failed_read_until.clear()
+    organization_log_scope._warmups_in_flight.clear()
 
 
 class ForcedSinkFailure(RuntimeError):
@@ -64,6 +82,54 @@ def failing_sink(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
 @pytest.fixture
 def no_saved_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Give standalone YAML conversion tests an explicit empty saved-workflow lookup."""
-    from skyvern.forge import app
-
     monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+
+
+class _AiFallbackFlagProvider(NoOpExperimentationProvider):
+    enabled_for_org: str | None = None
+
+    async def _is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        # Org targeting in PostHog reads the person property, so a caller that omits it must resolve False.
+        if feature_name != CODE_BLOCK_AI_FALLBACK_FLAG or (properties or {}).get("organization_id") != distinct_id:
+            return False
+        return distinct_id == self.enabled_for_org
+
+
+@pytest.fixture
+def ai_fallback_flag(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None], None]:
+    """Turn the org-scoped code block AI fallback flag on for one organization id (None: off everywhere), in a
+    run that is neither a Copilot build test nor an editor block run."""
+    provider = _AiFallbackFlagProvider()
+    monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", provider)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(copilot_session_id=None, is_debug_session=False, parent_workflow_run_id=None)
+        ),
+    )
+
+    def set_enabled_for_org(organization_id: str | None) -> None:
+        provider.enabled_for_org = organization_id
+        provider.result_map.clear()
+
+    return set_enabled_for_org
+
+
+@pytest.fixture
+def ai_fallback_on_in_an_ordinary_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the code block AI fallback on, in a run that is neither a Copilot build test nor an editor block run."""
+    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "_is_authoring_run", AsyncMock(return_value=False))
+
+
+@pytest.fixture
+def copilot_workflow_toggle_off() -> SimpleNamespace:
+    return SimpleNamespace(
+        enable_self_healing=False,
+        created_by="copilot",
+        edited_by=None,
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        workflow_definition=None,
+    )

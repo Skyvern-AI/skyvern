@@ -10,6 +10,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type ActionsApiResponse,
+  type ActionSummary,
   ActionTypes,
   getReadableActionType,
   Status,
@@ -38,6 +39,7 @@ import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
 import {
   describeRecordedAction,
   findCodeStepForLine,
+  getActionSummary,
   isRecorderCallText,
   normalizeInlineText,
   taskV3CallText,
@@ -49,6 +51,7 @@ import {
 import { ThoughtCard } from "./ThoughtCard";
 import {
   aggregateIterationStatus,
+  getConditionalEvaluationError,
   type SkippedBranchMetadata,
   type UnexecutedDefinedBlock,
 } from "./workflowTimelineUtils";
@@ -194,29 +197,6 @@ function StatusDot({
   );
 }
 
-type ActionSummary = {
-  text: string;
-  // Only the model's own prose is markdown. A typed value or a recorder trace is literal text and
-  // must render verbatim — a password containing "*" is not emphasis.
-  isProse: boolean;
-};
-
-function getActionSummary(action: ActionsApiResponse): ActionSummary | null {
-  const candidates: Array<[string | null | undefined, boolean]> = [
-    [action.reasoning, true],
-    [action.text, false],
-    [action.response, false],
-    [action.intention, true],
-  ];
-  for (const [value, isProse] of candidates) {
-    const text = normalizeInlineText(value);
-    if (text !== null) {
-      return { text, isProse };
-    }
-  }
-  return null;
-}
-
 function getRecordedActionMeta(action: ActionsApiResponse): {
   codeLine: number | null;
   durationMs: number | null;
@@ -274,13 +254,23 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
+  // An error row prints both halves of its summary: the exception that ended the block is
+  // recorded as the outcome, not the body.
+  const errorSummary = isCodeError ? getActionSummary(action) : null;
   const parts = [
-    // This row hides its label from sighted users, so it falls back to the readable type
-    // where the chat, which always shows the label, prints nothing.
-    isCodeError
-      ? (getActionSummary(action)?.text ?? null)
-      : (describeRecordedAction(action, matchedStep) ??
-        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
+    // Every other row hides its label from sighted users, so it falls back to the readable
+    // type where the chat, which always shows the label, prints nothing.
+    ...(isCodeError
+      ? [
+          normalizeInlineText(errorSummary?.body?.text),
+          errorSummary?.outcome ?? null,
+        ]
+      : [
+          describeRecordedAction(action, matchedStep) ??
+            getReadableActionType(action.action_type, {
+              nullActionLabel: "Step",
+            }),
+        ]),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
@@ -290,7 +280,9 @@ function getCodeActionRowPresentation(
     // Literal even when the leading part came from prose: the row's text is that part joined with
     // machine suffixes (line N, duration), and half-markdown-half-not would render as neither.
     summary:
-      parts.length > 0 ? { text: parts.join(" · "), isProse: false } : null,
+      parts.length > 0
+        ? { body: { text: parts.join(" · "), isProse: false }, outcome: null }
+        : null,
     detail:
       !isCodeError && isRecorderCallText(action.description)
         ? normalizeInlineText(action.description)
@@ -360,6 +352,46 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
+}
+
+function getWebSearchResultSummary(block: WorkflowRunBlock): string | null {
+  const output = block.output;
+  if (
+    block.block_type !== "web_search" ||
+    block.status !== Status.Completed ||
+    !output ||
+    typeof output !== "object" ||
+    Array.isArray(output) ||
+    !("total_count" in output) ||
+    typeof output.total_count !== "number"
+  ) {
+    return null;
+  }
+
+  const count = output.total_count;
+  const summary = `${count} ${count === 1 ? "result" : "results"}`;
+  if ("prompt_output" in output && Array.isArray(output.prompt_output)) {
+    let itemCount = output.prompt_output.length;
+    const lastItem: unknown = output.prompt_output[itemCount - 1];
+    if (
+      lastItem &&
+      typeof lastItem === "object" &&
+      "truncated" in lastItem &&
+      lastItem.truncated === true &&
+      "reason" in lastItem &&
+      lastItem.reason === "exceeded_max_run_response_value_size"
+    ) {
+      if (
+        !("original_count" in lastItem) ||
+        typeof lastItem.original_count !== "number"
+      ) {
+        return summary;
+      }
+      itemCount = lastItem.original_count;
+    }
+    return `${summary} · Prompt returned ${itemCount} ${itemCount === 1 ? "item" : "items"}`;
+  }
+  return summary;
 }
 
 function getLoopIterationGroups(
@@ -637,18 +669,19 @@ function TimelineActionRows({
                 ) : (
                   <span className="sr-only">{label}</span>
                 )}
-                {summary !== null ? (
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
-                    ·{" "}
-                    {summary.isProse ? (
+                {summary?.body ? (
+                  <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
+                    {summary.body.isProse ? (
                       <InlineMarkdown
-                        text={summary.text}
+                        // One line: InlineMarkdown drops every paragraph break, so prose that
+                        // kept its own would render as glued-together words.
+                        text={normalizeInlineText(summary.body.text) ?? ""}
                         // Prose that renders to nothing must not blank the row; the sr-only
                         // label above already names it, so this copy is decorative.
                         fallback={<span aria-hidden="true">{label}</span>}
                       />
                     ) : (
-                      summary.text
+                      summary.body.text
                     )}
                   </span>
                 ) : (
@@ -659,11 +692,29 @@ function TimelineActionRows({
                   tone !== "error" && (
                     <span
                       aria-hidden="true"
-                      className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500"
+                      className={cn(
+                        "truncate text-muted-foreground dark:text-slate-500",
+                        summary?.outcome ? "shrink-0" : "min-w-0 flex-1",
+                      )}
                     >
-                      · {label}
+                      {label}
                     </span>
                   )
+                )}
+                {summary?.outcome && (
+                  // Never squeezed out by the plan: a row whose intention reads "Tried to
+                  // navigate to X" must still show the 404 it landed on, so the body truncates
+                  // first and this keeps its width.
+                  <span
+                    className={cn(
+                      "truncate text-muted-foreground dark:text-slate-500",
+                      summary.body ? "max-w-[60%] shrink-0" : "min-w-0 flex-1",
+                    )}
+                  >
+                    <span aria-hidden="true">→ </span>
+                    <span className="sr-only">Result: </span>
+                    {summary.outcome}
+                  </span>
                 )}
               </button>
             </div>
@@ -739,9 +790,7 @@ function TimelineCodeStepRows({
     <div className="space-y-1 py-1">
       {steps.map((step, index) => {
         const lines = formatCodeStepLines(step);
-        const summary =
-          normalizeInlineText(step.title) ??
-          normalizeInlineText(step.description);
+        const summary = normalizeInlineText(step.description);
 
         return (
           <div key={index} className="flex min-h-[24px] items-stretch text-xs">
@@ -810,9 +859,7 @@ function TimelineSkippedStepRows({
     <div className="space-y-1 pb-1">
       {steps.map((step, index) => {
         const lines = formatCodeStepLines(step);
-        const summary =
-          normalizeInlineText(step.title) ??
-          normalizeInlineText(step.description);
+        const summary = normalizeInlineText(step.description);
 
         return (
           <div
@@ -1071,6 +1118,8 @@ function WorkflowRunTimelineBlockItem({
     : [];
   const blockName = block.label ?? blockTypeTitle;
   const descriptor = getTimelineDescriptor(block);
+  const resultSummary = getWebSearchResultSummary(block);
+  const evaluationError = getConditionalEvaluationError(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
@@ -1312,6 +1361,19 @@ function WorkflowRunTimelineBlockItem({
             <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
               {TIMELINE_DESCRIPTOR_SEPARATOR} {descriptor}
             </span>
+            {resultSummary && (
+              <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
+                {TIMELINE_DESCRIPTOR_SEPARATOR} {resultSummary}
+              </span>
+            )}
+            {evaluationError && (
+              <span
+                className="shrink-0 rounded bg-warning/15 px-1 text-[10px] text-warning"
+                title={`${evaluationError.summary}\n${evaluationError.message}`}
+              >
+                evaluation error
+              </span>
+            )}
             {isFinallyBlock && (
               <span className="shrink-0 rounded bg-amber-500/80 px-1 text-[9px] font-medium text-black">
                 finally

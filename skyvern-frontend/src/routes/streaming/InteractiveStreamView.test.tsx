@@ -255,8 +255,27 @@ describe("InteractiveStreamView take-control overlay", () => {
 
     expect(screen.queryByTestId("take-control-overlay")).toBeNull();
     expect(
-      screen.getByRole("button", { name: /stop controlling/ }),
+      screen.getByRole("button", { name: /stop controlling/i }),
     ).toBeTruthy();
+  });
+
+  it("offers Paste in the control bar only when the stream can paste", () => {
+    const { rerender } = render(
+      <InteractiveStreamView {...baseProps()} userIsControlling />,
+    );
+    expect(screen.queryByRole("button", { name: /paste/i })).toBeNull();
+
+    const onPasteClipboard = vi.fn();
+    rerender(
+      <InteractiveStreamView
+        {...baseProps()}
+        userIsControlling
+        onPasteClipboard={onPasteClipboard}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /paste/i }));
+
+    expect(onPasteClipboard).toHaveBeenCalledTimes(1);
   });
 });
 

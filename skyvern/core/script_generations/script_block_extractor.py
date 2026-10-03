@@ -31,6 +31,7 @@ KNOWN_NON_CACHEABLE_BLOCK_TYPES: frozenset[str] = frozenset(
         "file_url_parser",
         "pdf_parser",
         "http_request",
+        "terminate",
     }
 )
 

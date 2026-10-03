@@ -1312,7 +1312,12 @@ async def test_print_page_excludes_live_http_download_after_snapshot_registratio
         "get_or_create_browser_state",
         AsyncMock(
             return_value=SimpleNamespace(
-                get_working_page=AsyncMock(return_value=SimpleNamespace(pdf=AsyncMock(return_value=b"printed PDF")))
+                get_working_page=AsyncMock(
+                    return_value=SimpleNamespace(
+                        url="https://example.com/listing", pdf=AsyncMock(return_value=b"printed PDF")
+                    )
+                ),
+                list_valid_pages=AsyncMock(return_value=[]),
             )
         ),
     )

@@ -4,7 +4,7 @@ import {
   runIsLogicallyFinal,
   runIsExecuting,
 } from "@/routes/workflows/workflowRun/runRetryState";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { Status, WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
@@ -27,6 +27,7 @@ import {
   resolveScreenshotBlockId,
 } from "../workflowRun/workflowTimelineUtils";
 import { type HeroSelection } from "./runview/HeroScreenshot";
+import { useHeroScreenshot } from "./runview/useHeroScreenshot";
 import {
   buildFilmstrip,
   resolveLandingSelectionId,
@@ -45,22 +46,21 @@ export type RunVisuals = {
   recordingUrls: string[];
   recordingArchived: boolean;
   hasScreenshots: boolean;
+  // Not yet known: the timeline or the selected block/thought's artifacts are loading.
+  screenshotsPending: boolean;
   // ?active= pins a specific step (anything but the live-edge "stream" pin).
   scrubbing: boolean;
   heroSelection: HeroSelection | null;
 };
 
-function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
-  if (!selection) {
-    return false;
-  }
-  if (selection.kind === "action") {
-    return Boolean(
+function hasActionScreenshot(selection: HeroSelection | null): boolean {
+  return (
+    selection?.kind === "action" &&
+    Boolean(
       selection.artifactId ||
       (selection.stepId && selection.actionOrder != null),
-    );
-  }
-  return true;
+    )
+  );
 }
 
 /**
@@ -72,12 +72,29 @@ function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
 export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   const queryOptions = { workflowRunId };
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(queryOptions);
-  const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
-    useWorkflowRunTimelineQuery(queryOptions);
+  const {
+    data: retainedTimeline,
+    isPlaceholderData: timelineIsPlaceholder,
+    isFetching: timelineFetching,
+  } = useWorkflowRunTimelineQuery(queryOptions);
   // The timeline payload carries no run id of its own, so keepPreviousData serves
-  // the previous run's timeline on both a switch and a clear.
+  // the previous run's timeline on both a switch and a clear. It also bridges this
+  // run's own refetch on a status change (status is in the query key); those rows
+  // stay, or replay pills blink off mid-run.
+  const [loadedTimelineRunId, setLoadedTimelineRunId] = useState<string>();
+  if (
+    workflowRunId &&
+    !timelineIsPlaceholder &&
+    retainedTimeline !== undefined &&
+    loadedTimelineRunId !== workflowRunId
+  ) {
+    setLoadedTimelineRunId(workflowRunId);
+  }
   const timeline =
-    !workflowRunId || timelineIsPlaceholder ? undefined : retainedTimeline;
+    !workflowRunId ||
+    (timelineIsPlaceholder && loadedTimelineRunId !== workflowRunId)
+      ? undefined
+      : retainedTimeline;
   const currentTimeline = useMemo(
     () =>
       timeline
@@ -175,8 +192,20 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
       ),
     [frames],
   );
+  // A selected block or thought offers Screenshots only once its artifacts resolve
+  // to one (the same lookup the hero renders); otherwise the pill opens nothing.
+  const { screenshot: selectionScreenshot, isLoading: selectionLoading } =
+    useHeroScreenshot(
+      heroSelection?.kind === "action" ? null : heroSelection,
+      executing,
+    );
   const hasScreenshots =
-    hasScreenshotFrame || hasScreenshotCandidate(heroSelection);
+    heroSelection?.kind === "block" || heroSelection?.kind === "thought"
+      ? Boolean(selectionScreenshot && !selectionScreenshot.archived)
+      : hasScreenshotFrame || hasActionScreenshot(heroSelection);
+  const screenshotsPending =
+    !hasScreenshots &&
+    (selectionLoading || (timelineFetching && timeline === undefined));
 
   return {
     workflowRun,
@@ -190,6 +219,7 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
     recordingUrls,
     recordingArchived: workflowRun?.recording_archived ?? false,
     hasScreenshots,
+    screenshotsPending,
     scrubbing,
     heroSelection,
   };

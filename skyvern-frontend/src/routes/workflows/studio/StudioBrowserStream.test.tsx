@@ -1,14 +1,17 @@
 // @vitest-environment jsdom
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioBrowserStream } from "./StudioBrowserStream";
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { type StudioPaneId } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 
@@ -29,8 +32,36 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
     workflowRunQueryMock(options),
 }));
 
+// One captured action, so a pinned step (?active=act_1) has a frame to show.
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
-  useWorkflowRunTimelineQuery: () => ({ data: undefined }),
+  useWorkflowRunTimelineQuery: () => ({
+    data: [
+      {
+        type: "block",
+        block: {
+          workflow_run_block_id: "wrb_1",
+          block_type: "task",
+          status: "running",
+          created_at: "2026-01-01T00:00:00Z",
+          modified_at: "2026-01-01T00:00:00Z",
+          actions: [
+            {
+              action_id: "act_1",
+              action_type: "click",
+              status: "completed",
+              step_id: "step_1",
+              action_order: 0,
+              screenshot_artifact_id: "art_1",
+            },
+          ],
+        },
+        children: [],
+        thought: null,
+        created_at: "2026-01-01T00:00:00Z",
+        modified_at: "2026-01-01T00:00:00Z",
+      },
+    ],
+  }),
 }));
 
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
@@ -49,16 +80,19 @@ vi.mock("@/hooks/useRuntimeConfig", () => ({
 vi.mock("@/components/BrowserStream", () => ({
   BrowserStream: ({
     onActivity,
-    onReadyChange,
+    onStreamStateChange,
     showControlButtons,
   }: {
     onActivity?: () => void;
-    onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+    onStreamStateChange?: StreamStateChangeHandler;
     showControlButtons?: boolean;
   }) => (
     <div data-show-control-buttons={showControlButtons ? "yes" : "no"}>
-      <button type="button" onClick={() => onReadyChange?.(true, "pbs_test")}>
-        emit vnc ready
+      <button
+        type="button"
+        onClick={() => onStreamStateChange?.("live", "pbs_test")}
+      >
+        emit vnc live
       </button>
       <button type="button" onClick={onActivity}>
         emit vnc frame
@@ -70,14 +104,22 @@ vi.mock("@/components/BrowserStream", () => ({
 vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
   BrowserSessionStream: ({
     onActivity,
+    onStreamStateChange,
     onUrlChange,
     showControlButtons,
   }: {
     onActivity?: () => void;
+    onStreamStateChange?: StreamStateChangeHandler;
     onUrlChange?: (url: string) => void;
     showControlButtons?: boolean;
   }) => (
     <div data-show-control-buttons={showControlButtons ? "yes" : "no"}>
+      <button
+        type="button"
+        onClick={() => onStreamStateChange?.("live", "pbs_test")}
+      >
+        emit cdp live
+      </button>
       <button type="button" onClick={onActivity}>
         emit cdp activity
       </button>
@@ -94,7 +136,7 @@ vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
 const initialBrowserState = useStudioBrowserStore.getState();
 const initialRecordingState = useRecordingStore.getState();
 
-// Drives a real pane-state URL write, so the effect chain under test is the
+// Drives a real runtime pane change, so the effect chain under test is the
 // same one a spine click goes through.
 function OpenBrowserPaneButton() {
   const { openPane } = useStudioPanes();
@@ -105,25 +147,30 @@ function OpenBrowserPaneButton() {
   );
 }
 
-// The browser pane's visibility comes from ?panes= in the URL.
+// The incoming URL seeds visit-scoped pane visibility.
 function renderStudioBrowserStream(
   initialPath: string,
   visiblePanes?: readonly StudioPaneId[],
 ) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
-      <Routes>
-        <Route
-          path="/workflows/:workflowPermanentId/studio"
-          element={
-            <>
-              <StudioBrowserStream visiblePanes={visiblePanes} />
-              <OpenBrowserPaneButton />
-            </>
-          }
-        />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <Routes>
+          <Route
+            path="/workflows/:workflowPermanentId/studio"
+            element={
+              <StudioPaneDefaultsProvider hasBlocks={true}>
+                <StudioBrowserStream visiblePanes={visiblePanes} />
+                <OpenBrowserPaneButton />
+              </StudioPaneDefaultsProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -166,7 +213,7 @@ describe("StudioBrowserStream browser activity notifications", () => {
   it("marks VNC activity after the initial stream connection", () => {
     renderStudioBrowserStream(BROWSER_CLOSED_PATH);
 
-    fireEvent.click(screen.getByRole("button", { name: "emit vnc ready" }));
+    fireEvent.click(screen.getByRole("button", { name: "emit vnc live" }));
     useStudioBrowserStore.getState().clearActivity();
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc frame" }));
@@ -240,6 +287,23 @@ describe("StudioBrowserStream browser activity notifications", () => {
       "https://example.test",
     );
   });
+
+  it.each(["vnc", "cdp"] as const)(
+    "publishes which session the %s stream is painting",
+    (transport) => {
+      runtimeConfigMock.browserStreamingMode = transport;
+      renderStudioBrowserStream(BROWSER_OPEN_PATH);
+      expect(useStudioBrowserStore.getState().debugStream).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole("button", { name: `emit ${transport} live` }),
+      );
+      expect(useStudioBrowserStore.getState().debugStream).toEqual({
+        browserSessionId: "pbs_test",
+        state: "live",
+      });
+    },
+  );
 });
 
 describe("StudioBrowserStream block-run co-drive", () => {

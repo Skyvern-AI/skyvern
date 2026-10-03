@@ -25,9 +25,6 @@ export const WORKFLOW_TAGGING_FLAG = "WORKFLOW_TAGGING";
 // Not enrolled reads as disabled, so the default stays the flat folders/list.
 export const WORKFLOWS_DIRECTORY_TREE_FLAG = "WORKFLOWS_DIRECTORY_TREE";
 
-// Gates the optional, server-confirmed onboarding details step.
-export const ONBOARDING_QUESTIONNAIRE_FLAG = "onboarding_questionnaire_v1";
-
 // Gates the login-block fallback-credential editor. Off ⇒ the fallback config is hidden, because
 // automatic retries only run for orgs in the CREDENTIAL_FALLBACK_RETRY rollout (backend gate), so
 // showing the editor to other orgs would promise a retry that never fires. Server-evaluated via
@@ -41,3 +38,8 @@ export const ONBOARDING_TRACK_FLAG = "onboarding_track_v1";
 // Gates the second-agent track row and retires the standalone credit card.
 export const ONBOARDING_TRACK_SECOND_AGENT_FLAG =
   "onboarding_track_second_agent_v1";
+
+// A/B experiment: on for allow-listed organizations (organization_id person property), off otherwise.
+export const NEW_ONBOARDING_EXPERIENCE_FLAG = "new_onboarding_experience";
+
+export const BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM";

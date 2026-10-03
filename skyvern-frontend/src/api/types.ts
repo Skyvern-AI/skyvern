@@ -216,6 +216,7 @@ export type User = {
   id: string;
   email: string;
   name: string;
+  createdAt?: Date;
 };
 
 export type OrganizationApiResponse = {
@@ -684,8 +685,28 @@ export type ActionApiResponse = {
   screenshot_artifact_id?: string | null;
 };
 
+export type ActionSummaryBody = {
+  // Trimmed but not collapsed: paragraph breaks survive for a card that renders blocks. A caller
+  // rendering one line must collapse them itself (normalizeInlineText) — InlineMarkdown joins
+  // paragraphs with no separator at all.
+  text: string;
+  // Only the model's own prose is markdown. A typed value or a recorded outcome is literal text and
+  // must render verbatim — a password containing "*" is not emphasis.
+  isProse: boolean;
+};
+
+export type ActionSummary = {
+  // What the action set out to do.
+  body: ActionSummaryBody | null;
+  // What it actually did, when the run recorded it. Shown beside the body, never instead of it: a
+  // card that let the plan stand for the effect reads a dead end as a successful navigation.
+  outcome: string | null;
+};
+
 export type Action = {
-  reasoning: string;
+  // The text the card shows, already resolved through getActionSummary: a Task V3 action often
+  // carries no reasoning, and then its intention or its recorded outcome is all it has.
+  summary: ActionSummary | null;
   confidence?: number;
   type: ActionType;
   input: string;
@@ -875,6 +896,7 @@ export type TaskRunListItem = {
   workflow_deleted: boolean;
   script_run: boolean;
   trigger_type?: TriggerType | null;
+  created_by?: string | null;
   searchable_text: string | null;
 } & Pick<
   WorkflowRunRetryFields,
@@ -1103,6 +1125,7 @@ export type CredentialApiResponse = {
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
+  created_by?: string | null;
 };
 
 export function isPasswordCredential(
@@ -1229,6 +1252,23 @@ export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
 
 export type PylonEmailHash = {
   hash: string;
+};
+
+export type RunFeedbackTargetType = "workflow_run" | "task";
+export type FeedbackRating = "up" | "down";
+
+export type RunFeedbackApiResponse = {
+  run_feedback_id: string;
+  organization_id: string;
+  target_type: RunFeedbackTargetType;
+  target_id: string;
+  context_id: string | null;
+  rating: FeedbackRating;
+  reason: string | null;
+  needs_support: boolean;
+  submitted_by: string | null;
+  created_at: string;
+  modified_at: string;
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;

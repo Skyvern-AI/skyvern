@@ -144,6 +144,14 @@ class InvalidFileType(BaseWorkflowHTTPException):
         )
 
 
+class WorksheetNotFound(BaseWorkflowHTTPException):
+    def __init__(self, file_url: str, worksheet: str) -> None:
+        super().__init__(
+            f"Worksheet {worksheet!r} was not found in the workbook at file URL {file_url}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class FileParseTimeout(BaseWorkflowHTTPException):
     def __init__(self, file_url: str, step: str, timeout_seconds: float) -> None:
         super().__init__(
@@ -180,14 +188,6 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
         super().__init__(
             error_message,
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        )
-
-
-class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
-    def __init__(self, block_label: str, step_index: int, detail: str) -> None:
-        super().__init__(
-            f"Invalid step at index {step_index} in code block '{block_label}': {detail}",
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 

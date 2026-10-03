@@ -6,6 +6,8 @@ DB / LLM / agent mocks; these helpers keep that wiring in one place.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -34,6 +36,26 @@ def terminal_narrative_payload() -> dict[str, Any]:
         "startedAt": None,
         "endedAt": None,
     }
+
+
+def narrative_payload_with_run(run_id: str | None) -> dict[str, Any]:
+    return {
+        **terminal_narrative_payload(),
+        "turnFacts": {
+            "factsAvailable": True,
+            "evaluationState": None,
+            "runId": run_id,
+            "runCompleted": None,
+            "terminalCause": None,
+            "blocksRunThisTurn": None,
+            "ranCleanOnCurrentSource": False,
+        },
+    }
+
+
+@asynccontextmanager
+async def no_finalisation_fence(*_: object) -> AsyncIterator[None]:
+    yield
 
 
 def install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -133,6 +155,8 @@ def setup_new_copilot_mocks(
         ),
         replace_workflow_copilot_chat_message=AsyncMock(),
         claim_pending_copilot_turn=AsyncMock(return_value=True),
+        claim_pending_copilot_turn_for_finalisation=AsyncMock(return_value="claimed"),
+        hold_copilot_turn_finalisation=no_finalisation_fence,
         clear_pending_copilot_turn=AsyncMock(),
     )
     app.DATABASE.workflow_params = workflow_params

@@ -610,6 +610,17 @@ def normalize_download_filename(filename: str, content_type: str = "") -> str:
     return filename
 
 
+def monitor_saved_download_name(filename: str, content_type: str = "") -> str:
+    """The basename this monitor would save ``filename`` under, or "" when it is not a usable basename.
+
+    It percent-decodes, so names that differ only by escaping land on one file.
+    """
+    try:
+        return _validated_download_basename(filename, content_type)
+    except ValueError:
+        return ""
+
+
 def _validated_download_basename(filename: str, content_type: str = "") -> str:
     decoded_filename = filename.strip()
     while True:
@@ -1384,6 +1395,10 @@ class CDPDownloadInterceptor:
             self._browser_download_listener = download_listener
             self._accepting_browser_downloads = True
             LOG.info("Browser download monitor enabled")
+
+    @property
+    def browser_download_event_count(self) -> int:
+        return self._browser_download_generation
 
     async def bind_to_context(
         self,
@@ -3073,6 +3088,13 @@ async def false_click_download_attribution_is_quiescent(browser_context: Browser
     if not isinstance(interceptor, CDPDownloadInterceptor):
         return True
     return await interceptor.prove_pre_action_download_quiescence()
+
+
+def is_monitoring_browser_downloads_for_context(browser_context: BrowserContext | None) -> bool:
+    interceptor = (
+        getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
+    )
+    return isinstance(interceptor, CDPDownloadInterceptor) and interceptor.is_monitoring_browser_downloads()
 
 
 def has_download_interceptor_for_context(browser_context: BrowserContext | None) -> bool:

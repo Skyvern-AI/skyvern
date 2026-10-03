@@ -3498,6 +3498,10 @@ if (window.globalOneTimeIncrementElements === undefined) {
   window.globalOneTimeIncrementElements = [];
 }
 
+if (window.globalIncrementalJobCount === undefined) {
+  window.globalIncrementalJobCount = 0;
+}
+
 if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
@@ -3505,6 +3509,12 @@ if (window.globalDomDepthMap === undefined) {
 if (window.globalParsedElementCounter === undefined) {
   window.globalParsedElementCounter = new SafeCounter();
 }
+
+// Bumped whenever the incremental observer's callback/drain/count contract changes. A persistent
+// page can outlive a rolling deploy, so a running observer created by another bundle carries no
+// stamp or a different one; the current bundle compares this value exactly and stays compatible
+// with the older contract instead of retiring the observer mid-callback.
+const INCREMENTAL_OBSERVER_VERSION = 1;
 
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
@@ -3581,8 +3591,24 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
   await window.globalParsedElementCounter.add();
 }
 
-if (window.globalObserverForDOMIncrement === undefined) {
-  window.globalObserverForDOMIncrement = new MutationObserver(async function (
+async function processIncrementalNode(parentNode, childrenNode) {
+  // A listener restart can replace the global array while this job is parsing.
+  const pendingEntries = window.globalOneTimeIncrementElements;
+  const entry = { targetNode: parentNode, newNodes: childrenNode };
+  pendingEntries.push(entry);
+  window.globalIncrementalJobCount += 1;
+  try {
+    await addIncrementalNodeToMap(parentNode, childrenNode);
+  } finally {
+    const index = pendingEntries.indexOf(entry);
+    if (index !== -1) {
+      pendingEntries.splice(index, 1);
+    }
+  }
+}
+
+function createIncrementalObserver() {
+  const observer = new MutationObserver(async function (
     mutationsList,
     observer,
   ) {
@@ -3601,11 +3627,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
         isDropdownRelatedElement(node) &&
         getElementComputedStyle(node)?.display !== "none"
       ) {
-        window.globalOneTimeIncrementElements.push({
-          targetNode: node,
-          newNodes: [node],
-        });
-        await addIncrementalNodeToMap(node, [node]);
+        await processIncrementalNode(node, [node]);
         continue;
       }
 
@@ -3616,11 +3638,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
           switch (mutation.attributeName) {
             case "hidden": {
               if (!node.hidden) {
-                window.globalOneTimeIncrementElements.push({
-                  targetNode: node,
-                  newNodes: [node],
-                });
-                await addIncrementalNodeToMap(node, [node]);
+                await processIncrementalNode(node, [node]);
               }
               break;
             }
@@ -3628,11 +3646,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               // TODO: need to confirm that elemnent is hidden previously
               if (tagName === "body") continue;
               if (getElementComputedStyle(node)?.display !== "none") {
-                window.globalOneTimeIncrementElements.push({
-                  targetNode: node,
-                  newNodes: [node],
-                });
-                await addIncrementalNodeToMap(node, [node]);
+                await processIncrementalNode(node, [node]);
               }
               break;
             }
@@ -3654,11 +3668,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               )
                 continue;
               if (getElementComputedStyle(node)?.display !== "none") {
-                window.globalOneTimeIncrementElements.push({
-                  targetNode: node,
-                  newNodes: [node],
-                });
-                await addIncrementalNodeToMap(node, [node]);
+                await processIncrementalNode(node, [node]);
               }
               break;
             }
@@ -3666,9 +3676,6 @@ if (window.globalObserverForDOMIncrement === undefined) {
           break;
         }
         case "childList": {
-          let changedNode = {
-            targetNode: node, // TODO: for future usage, when we want to parse new elements into a tree
-          };
           let newNodes = [];
           if (mutation.addedNodes && mutation.addedNodes.length > 0) {
             for (const node of mutation.addedNodes) {
@@ -3688,24 +3695,63 @@ if (window.globalObserverForDOMIncrement === undefined) {
           }
 
           if (newNodes.length > 0) {
-            changedNode.newNodes = newNodes;
-            window.globalOneTimeIncrementElements.push(changedNode);
-            await addIncrementalNodeToMap(
-              changedNode.targetNode,
-              changedNode.newNodes,
-            );
+            await processIncrementalNode(node, newNodes);
           }
           break;
         }
       }
     }
   });
+  observer.skyvernObserverVersion = INCREMENTAL_OBSERVER_VERSION;
+  return observer;
+}
+
+function isCurrentIncrementalObserver(observer) {
+  return Boolean(
+    observer &&
+    observer.skyvernObserverVersion === INCREMENTAL_OBSERVER_VERSION,
+  );
+}
+
+function hasSplicingObserverContract(observer) {
+  // The current observer splices each finished job out of the pending array and bumps the scalar
+  // count. A transitional prior build that is unstamped (or carries a mismatched stamp) but already
+  // bumped the scalar proves it splices the same way, so both drain once the array empties. An
+  // observer whose scalar is still 0 is indistinguishable from a pre-splice build that only ever
+  // pushed a monotonic history, so it is treated as pre-splice until a job bumps the scalar.
+  return (
+    isCurrentIncrementalObserver(observer) ||
+    window.globalIncrementalJobCount > 0
+  );
+}
+
+if (window.globalObserverForDOMIncrement === undefined) {
+  window.globalObserverForDOMIncrement = createIncrementalObserver();
+}
+
+async function waitForIncrementalDrain() {
+  // Reevaluate the contract each poll: a transitional splicing observer that starts with a 0 scalar
+  // is drained by the pre-splice predicate until its first completed job bumps the scalar, then
+  // switches to pending-length draining so an in-flight parse is never abandoned. A pre-splice build
+  // only ever pushed to a monotonic history, so it drains when the parsed counter catches its length.
+  while (true) {
+    const elements = window.globalOneTimeIncrementElements;
+    if (!elements) return;
+    if (hasSplicingObserverContract(window.globalObserverForDOMIncrement)) {
+      if (elements.length === 0) return;
+    } else {
+      const counter = window.globalParsedElementCounter;
+      if (!counter || (await counter.get()) >= elements.length) return;
+    }
+    await asyncSleepFor(100);
+  }
 }
 
 async function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
+  window.globalIncrementalJobCount = 0;
   await getHoverStylesMap();
   window.globalParsedElementCounter = new SafeCounter();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
@@ -3731,30 +3777,27 @@ async function startGlobalIncrementalObserver(element = null) {
 
 async function stopGlobalIncrementalObserver() {
   window.globalListnerFlag = false;
+  // Any observer that is not the exact current version (unstamped pre-splice, unstamped splicing, or
+  // a mismatched stamp) is drained under its own contract and then replaced below.
+  const needsReplacement = !isCurrentIncrementalObserver(
+    window.globalObserverForDOMIncrement,
+  );
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
-  while (
-    window.globalParsedElementCounter &&
-    window.globalOneTimeIncrementElements &&
-    (await window.globalParsedElementCounter.get()) <
-      window.globalOneTimeIncrementElements.length
-  ) {
-    await asyncSleepFor(100);
-  }
+  await waitForIncrementalDrain();
   window.globalOneTimeIncrementElements = [];
+  window.globalIncrementalJobCount = 0;
   window.globalDomDepthMap = new Map();
+  // A never-navigating page adopts the memory-safe callback here: replace a drained older observer
+  // with a current one so the next action's parsing splices and counts under the current contract.
+  if (needsReplacement) {
+    window.globalObserverForDOMIncrement = createIncrementalObserver();
+  }
 }
 
 async function getIncrementElements(wait_until_finished = true) {
   if (wait_until_finished) {
-    while (
-      window.globalParsedElementCounter &&
-      window.globalOneTimeIncrementElements &&
-      (await window.globalParsedElementCounter.get()) <
-        window.globalOneTimeIncrementElements.length
-    ) {
-      await asyncSleepFor(100);
-    }
+    await waitForIncrementalDrain();
   }
 
   otpContainerCounts = new WeakMap();

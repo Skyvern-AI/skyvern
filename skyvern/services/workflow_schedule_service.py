@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -20,10 +21,10 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.custom_llm_registry import prepare_org_llm_runtime
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
+from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus, WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.forge.sdk.workflow.retry_policy import fail_run_without_attempt_row, queue_initial_attempt
-from skyvern.forge.sdk.workflow.schedules import compute_previous_fire_time
+from skyvern.forge.sdk.workflow.schedules import as_utc, compute_previous_fire_time
 from skyvern.services.workflow_service import prepare_workflow
 from skyvern.utils.files import initialize_skyvern_state_file
 
@@ -39,15 +40,62 @@ class DueWorkflowSchedule:
 
 
 def build_scheduled_workflow_run_id(workflow_schedule_id: str, fire_time: datetime) -> str:
-    normalized_fire_time = _as_utc(fire_time)
+    normalized_fire_time = as_utc(fire_time)
     digest = hashlib.sha256(f"{workflow_schedule_id}:{normalized_fire_time.isoformat()}".encode()).hexdigest()[:32]
     return f"wr_sched_{digest}"
 
 
-def _as_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
+def previous_fire_time_since_edit(schedule: WorkflowSchedule) -> datetime | None:
+    """Return the most recent fire time, or None when it precedes the last edit; missed ticks are never backfilled."""
+    previous_fire_time = compute_previous_fire_time(
+        schedule.cron_expression,
+        schedule.timezone,
+        interval_seconds=schedule.interval_seconds,
+        first_fire_at=schedule.first_fire_at,
+    )
+    if previous_fire_time is None or previous_fire_time < as_utc(schedule.modified_at):
+        return None
+    return previous_fire_time
+
+
+def due_fire_time(schedule: WorkflowSchedule) -> datetime | None:
+    """A one-time schedule is due from run_at on, however late; recurring ones follow previous_fire_time_since_edit."""
+    if schedule.run_at is not None:
+        return schedule.run_at if schedule.run_at <= datetime.now(UTC) else None
+    return previous_fire_time_since_edit(schedule)
+
+
+async def claim_schedule_for_dispatch(
+    schedule: WorkflowSchedule, workflow_run_id: str, fire_at: datetime
+) -> WorkflowSchedule | None:
+    """Return the row to dispatch from, or None when a one-time schedule was not claimed for this fire."""
+    if not schedule.is_one_time:
+        return schedule
+    return await app.DATABASE.schedules.claim_one_time_dispatch(
+        schedule.workflow_schedule_id, schedule.organization_id, workflow_run_id, fire_at
+    )
+
+
+async def _record_one_time_dispatch(claimed: WorkflowSchedule, workflow_run_id: str, *, succeeded: bool) -> None:
+    if not claimed.is_one_time:
+        return
+    dispatch_status = OneTimeDispatchStatus.fired if succeeded else OneTimeDispatchStatus.failed
+    if claimed.dispatch_status != dispatch_status:
+        await app.DATABASE.schedules.finish_one_time_dispatch(
+            claimed.workflow_schedule_id, claimed.organization_id, workflow_run_id, dispatch_status
+        )
+
+
+@asynccontextmanager
+async def one_time_dispatch_outcome(claimed: WorkflowSchedule, workflow_run_id: str) -> AsyncIterator[None]:
+    """An exception or cancellation marks the claimed dispatch failed; a normal exit, including finding the run already
+    created by an earlier attempt of the same run id, marks it fired."""
+    try:
+        yield
+    except (Exception, asyncio.CancelledError):
+        await _record_one_time_dispatch(claimed, workflow_run_id, succeeded=False)
+        raise
+    await _record_one_time_dispatch(claimed, workflow_run_id, succeeded=True)
 
 
 class LocalWorkflowScheduleScheduler:
@@ -148,19 +196,18 @@ class LocalWorkflowScheduleScheduler:
 
     async def _get_due_schedule(self, schedule: WorkflowSchedule) -> DueWorkflowSchedule | None:
         try:
-            previous_fire_time = _as_utc(compute_previous_fire_time(schedule.cron_expression, schedule.timezone))
+            previous_fire_time = due_fire_time(schedule)
         except Exception:
             LOG.warning(
                 "Failed to compute previous fire time for workflow schedule",
                 workflow_schedule_id=schedule.workflow_schedule_id,
                 cron_expression=schedule.cron_expression,
+                interval_seconds=schedule.interval_seconds,
                 timezone=schedule.timezone,
                 exc_info=True,
             )
             return None
-
-        modified_at = _as_utc(schedule.modified_at)
-        if previous_fire_time < modified_at:
+        if previous_fire_time is None:
             return None
 
         if await app.DATABASE.schedules.has_schedule_fired_since(
@@ -192,35 +239,45 @@ class LocalWorkflowScheduleScheduler:
             )
             return
 
-        try:
-            workflow_run = await prepare_workflow(
-                workflow_id=schedule.workflow_permanent_id,
-                organization=organization,
-                workflow_request=WorkflowRequestBody(data=schedule.parameters),
-                request_id=f"schedule:{schedule.workflow_schedule_id}:{due.previous_fire_time.isoformat()}",
-                trigger_type=WorkflowRunTriggerType.scheduled,
-                workflow_schedule_id=schedule.workflow_schedule_id,
-                workflow_run_id=workflow_run_id,
-            )
-        except IntegrityError:
+        claimed = await claim_schedule_for_dispatch(schedule, workflow_run_id, due.previous_fire_time)
+        if claimed is None:
             LOG.info(
-                "Scheduled workflow run already exists; skipping duplicate fire",
+                "One-time schedule was not claimed for this fire; skipping",
                 workflow_schedule_id=schedule.workflow_schedule_id,
                 workflow_run_id=workflow_run_id,
             )
             return
-        except SQLAlchemyError:
-            if await app.DATABASE.schedules.has_schedule_fired_since(
-                schedule.workflow_schedule_id,
-                due.previous_fire_time,
-            ):
+
+        async with one_time_dispatch_outcome(claimed, workflow_run_id):
+            try:
+                workflow_run = await prepare_workflow(
+                    workflow_id=schedule.workflow_permanent_id,
+                    organization=organization,
+                    workflow_request=WorkflowRequestBody(data=claimed.parameters),
+                    request_id=f"schedule:{schedule.workflow_schedule_id}:{due.previous_fire_time.isoformat()}",
+                    trigger_type=WorkflowRunTriggerType.scheduled,
+                    workflow_schedule_id=schedule.workflow_schedule_id,
+                    workflow_run_id=workflow_run_id,
+                )
+            except IntegrityError:
                 LOG.info(
-                    "Scheduled workflow run already persisted; skipping duplicate fire",
+                    "Scheduled workflow run already exists; skipping duplicate fire",
                     workflow_schedule_id=schedule.workflow_schedule_id,
                     workflow_run_id=workflow_run_id,
                 )
                 return
-            raise
+            except SQLAlchemyError:
+                if await app.DATABASE.schedules.has_schedule_fired_since(
+                    schedule.workflow_schedule_id,
+                    due.previous_fire_time,
+                ):
+                    LOG.info(
+                        "Scheduled workflow run already persisted; skipping duplicate fire",
+                        workflow_schedule_id=schedule.workflow_schedule_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    return
+                raise
 
         # A persisted run counts as a delivered fire. Queue its attempt for sweep recovery;
         # without an attempt row, an initialization failure must make the run terminal.

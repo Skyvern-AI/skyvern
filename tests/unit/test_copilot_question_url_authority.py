@@ -40,13 +40,20 @@ _LOGIN_URL = "https://portal.example.com/login"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_secret", [False, True])
 @pytest.mark.parametrize("form", ["text", "answer_text"])
 async def test_authenticated_question_url_reaches_the_real_card_and_rebuilds_from_history(
-    sqlite_engine, monkeypatch: pytest.MonkeyPatch, form: str
+    sqlite_engine, monkeypatch: pytest.MonkeyPatch, form: str, raw_secret: bool
 ) -> None:
     repo, client, ctx, frames = await setup_question_chat(sqlite_engine, monkeypatch)
     ctx.request_policy = RequestPolicy()
     _ground_user_provided_sites(ctx.request_policy, "Repair the login workflow", [])
+    if raw_secret:
+        ctx.request_policy.apply_raw_secret_redacted_draft()
+        before_answer = await _request_credential(_LOGIN_URL, "Login required", ctx)
+        assert before_answer["ok"] is False
+        assert ctx.credential_pause_used is False
+        assert ctx.request_policy.credential_ask_login_page_urls == []
 
     async with client:
         waiting = asyncio.create_task(
@@ -104,7 +111,8 @@ async def test_authenticated_question_url_reaches_the_real_card_and_rebuilds_fro
             cache = _FakeCache()
             cache.store[
                 credential_pause_module.credential_response_cache_key("org", ctx.workflow_copilot_chat_id, "turn")
-            ] = credential_pause_module.encode_credential_response("connected", "cred_1")
+            ] = credential_pause_module.encode_credential_response("connected", "cred_1", "tok-card")
+            monkeypatch.setattr(credential_pause_module, "_new_resume_token", lambda: "tok-card")
             monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
             monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
             monkeypatch.setattr(
@@ -124,7 +132,8 @@ async def test_authenticated_question_url_reaches_the_real_card_and_rebuilds_fro
             assert card_result["credential_id"] == "cred_1"
             card = ctx.stream.send.await_args_list[0].args[0]
             assert card.type is WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
-            assert card.login_page_urls == [_LOGIN_URL]
+            assert card.login_page_urls == (["https://portal.example.com"] if raw_secret else [_LOGIN_URL])
+            assert ctx.request_policy.allow_run_blocks is not raw_secret
         finally:
             if not waiting.done():
                 waiting.cancel()

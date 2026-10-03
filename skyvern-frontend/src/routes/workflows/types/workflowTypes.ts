@@ -217,11 +217,13 @@ export type WorkflowBlock =
   | ExtractionBlock
   | LoginBlock
   | WaitBlock
+  | TerminateBlock
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
   | URLBlock
   | HttpRequestBlock
+  | WebSearchBlock
   | PrintPageBlock
   | WorkflowTriggerBlock
   | EmailInboxBlock
@@ -250,11 +252,13 @@ export const WorkflowBlockTypes = {
   Extraction: "extraction",
   Login: "login",
   Wait: "wait",
+  Terminate: "terminate",
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
   URL: "goto_url",
   HttpRequest: "http_request",
+  WebSearch: "web_search",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
   EmailInbox: "email_inbox",
@@ -366,6 +370,7 @@ export type TaskBlock = WorkflowBlockBase & {
   disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type Taskv2Block = WorkflowBlockBase & {
@@ -394,12 +399,17 @@ export type WhileLoopBlock = WorkflowBlockBase & {
 };
 
 export type CodeBlockStep = {
-  title?: string | null;
   description?: string | null;
   action_type: string;
   line_start?: number | null;
   line_end?: number | null;
 };
+
+export type CodeBlockDataSchema =
+  | Record<string, unknown>
+  | Array<unknown>
+  | string
+  | null;
 
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
@@ -408,6 +418,10 @@ export type CodeBlock = WorkflowBlockBase & {
   error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
+  data_schema?: CodeBlockDataSchema;
+  user_owned_goal?: boolean | null;
+  goal_needs_regeneration?: boolean | null;
+  code_edited_by_hand?: boolean | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -478,6 +492,7 @@ export type FileURLParserBlock = WorkflowBlockBase & {
   file_url: string;
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema: Record<string, unknown> | null;
+  worksheet: string | null;
 };
 
 export type ValidationBlock = WorkflowBlockBase & {
@@ -488,6 +503,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type HumanInteractionBlock = WorkflowBlockBase & {
@@ -528,6 +544,7 @@ export type ActionBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type NavigationBlock = WorkflowBlockBase & {
@@ -547,6 +564,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   include_action_history_in_verification: boolean;
 };
 
@@ -561,6 +579,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   export_enabled?: boolean;
   export_data_schema?: Record<string, unknown> | null;
   export_file_name?: string | null;
@@ -583,11 +602,18 @@ export type LoginBlock = WorkflowBlockBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type WaitBlock = WorkflowBlockBase & {
   block_type: "wait";
   wait_sec?: number;
+};
+
+export type TerminateBlock = WorkflowBlockBase & {
+  block_type: "terminate";
+  reason: string;
+  error_code?: string | null;
 };
 
 export type FileDownloadBlock = WorkflowBlockBase & {
@@ -604,6 +630,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   download_timeout: number | null; // seconds
   download_target: "website" | "s3" | "azure" | "google_drive" | "sftp";
   path: string;
@@ -638,6 +665,19 @@ export type PDFParserBlock = WorkflowBlockBase & {
 export type URLBlock = WorkflowBlockBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type WebSearchBlock = WorkflowBlockBase & {
+  block_type: "web_search";
+  query: string;
+  provider: "auto" | "google" | "exa";
+  num_results: number;
+  prompt: string | null;
+  error_code_mapping: Record<string, string> | null;
+  no_results_error_code: string | null;
+  no_match_error_code: string | null;
+  json_schema: Record<string, unknown> | null;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type HttpRequestBlock = WorkflowBlockBase & {
@@ -765,7 +805,7 @@ export type WorkflowApiResponse = {
   title: string;
   workflow_permanent_id: string;
   version: number;
-  description: string;
+  description: string | null;
   workflow_definition: WorkflowDefinition;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
@@ -791,6 +831,7 @@ export type WorkflowApiResponse = {
   ai_fallback: boolean | null;
   enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
+  generate_script_on_terminal?: boolean;
   code_version: number | null;
   mask_secrets: boolean;
   run_sequentially: boolean | null;
@@ -799,10 +840,22 @@ export type WorkflowApiResponse = {
   import_error: string | null;
   created_by?: string | null;
   edited_by?: string | null;
+  original_created_by?: string | null;
+  original_created_at?: string | null;
   copilot_authored?: boolean | null;
+  effective_default_engine?: RunEngine | null;
 };
 
+// Each save inserts a new version row, so created_at is the latest save; the list endpoint adds the first version's.
+export function workflowCreatedAt(workflow: WorkflowApiResponse): string {
+  return workflow.original_created_at ?? workflow.created_at;
+}
+
 export type WorkflowSettings = {
+  totpVerificationUrl: string | null;
+  totpIdentifier: string | null;
+  adaptiveCaching: boolean;
+  generateScriptOnTerminal: boolean;
   retryPolicy: WorkflowRetryPolicy | null;
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
@@ -821,7 +874,6 @@ export type WorkflowSettings = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
-  enableSelfHealing: boolean | null;
   maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;

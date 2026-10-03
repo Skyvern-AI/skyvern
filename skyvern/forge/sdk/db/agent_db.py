@@ -36,9 +36,11 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import MicrosoftOAuthRepo
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+from skyvern.forge.sdk.db.repositories.run_feedback import RunFeedbackRepository
 from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
+from skyvern.forge.sdk.db.repositories.sms import SMSRepository
 from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.uploaded_files import UploadedFilesRepository
@@ -47,6 +49,7 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunA
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
 )
+from skyvern.forge.sdk.db.repositories.workflow_run_groups import WorkflowRunGroupsRepository
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.db.utils import (
@@ -403,14 +406,18 @@ class AgentDB(BaseAlchemyDB):
             db_engine=self.engine,
             sqlite_workflow_creation_lock=self._sqlite_workflow_creation_lock,
         )
-        self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflow_params = WorkflowParametersRepository(
+            self.Session, debug_enabled, self.is_retryable_error, db_engine=self.engine
+        )
         self.workflow_run_attempts = WorkflowRunAttemptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error
         )
+        self.workflow_run_groups = WorkflowRunGroupsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credentials = CredentialRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credential_folders = CredentialFoldersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.otp = OTPRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.sms = SMSRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.debug = DebugRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.scripts = ScriptsRepository(self.Session, debug_enabled, self.is_retryable_error)
@@ -419,6 +426,7 @@ class AgentDB(BaseAlchemyDB):
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_recordings = BrowserRecordingsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.uploaded_files = UploadedFilesRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.run_feedback = RunFeedbackRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(

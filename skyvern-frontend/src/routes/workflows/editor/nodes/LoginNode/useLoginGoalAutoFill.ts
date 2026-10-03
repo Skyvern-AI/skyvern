@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import type { CredentialApiResponse } from "@/api/types";
+import { deferredEdits } from "@/hooks/useDeferredLockedEdit";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
+import { useWorkflowScopeId } from "../../WorkflowScopeContext";
 import { computeLoginGoalPrefill } from "./loginGoalPrefill";
 
 /**
@@ -10,18 +16,27 @@ import { computeLoginGoalPrefill } from "./loginGoalPrefill";
  * loads with a credential already selected and the credentials list resolves after mount.
  */
 export function useLoginGoalAutoFill({
+  nodeId,
   editable,
   selectedCredentialId,
   credentials,
   currentGoal,
   onAutoFill,
 }: {
+  nodeId: string;
   editable: boolean;
   selectedCredentialId: string | undefined;
   credentials: Array<CredentialApiResponse>;
   currentGoal: string;
   onAutoFill: (goal: string) => void;
 }): void {
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+  const workflowId = useWorkflowScopeId();
+  const deferKey = JSON.stringify([workflowId, nodeId, "navigationGoal"]);
+  // An unlock effect can remove the buffer before its parent prop update commits.
+  const pendingGoalEdit = deferredEdits.get(deferKey);
+  const pendingGoalEditRef = useRef(pendingGoalEdit);
+
   // undefined = credential not yet resolved (or missing) — distinct from null, a
   // resolved credential confirmed to have no instructions.
   const selectedCredentialUserContext = useMemo(() => {
@@ -42,10 +57,17 @@ export function useLoginGoalAutoFill({
   useEffect(() => {
     onAutoFillRef.current = onAutoFill;
     currentGoalRef.current = currentGoal;
+    pendingGoalEditRef.current = pendingGoalEdit;
   });
 
   useEffect(() => {
-    if (!editable || selectedCredentialUserContext === undefined) {
+    if (
+      mutationLocked ||
+      !editable ||
+      selectedCredentialUserContext === undefined ||
+      pendingGoalEditRef.current !== undefined ||
+      deferredEdits.has(deferKey)
+    ) {
       return;
     }
     const prefill = computeLoginGoalPrefill(
@@ -55,5 +77,5 @@ export function useLoginGoalAutoFill({
     if (prefill !== null) {
       onAutoFillRef.current(prefill);
     }
-  }, [selectedCredentialUserContext, editable]);
+  }, [selectedCredentialUserContext, editable, mutationLocked, deferKey]);
 }

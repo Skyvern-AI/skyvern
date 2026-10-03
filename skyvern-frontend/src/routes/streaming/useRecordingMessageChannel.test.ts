@@ -368,7 +368,7 @@ describe("useRecordingMessageChannel", () => {
     );
     const socket = await openSocket();
 
-    act(() => useRecordingStore.setState({ manualCapturePaused: true }));
+    act(() => useRecordingStore.setState({ draftEditDepth: 1 }));
     expect(
       socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
     ).toContainEqual({ kind: "recording-capture-pause" });
@@ -387,7 +387,7 @@ describe("useRecordingMessageChannel", () => {
     );
 
     socket.send.mockClear();
-    act(() => useRecordingStore.setState({ manualCapturePaused: false }));
+    act(() => useRecordingStore.setState({ draftEditDepth: 0 }));
     expect(
       socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
     ).toContainEqual({ kind: "recording-capture-resume" });

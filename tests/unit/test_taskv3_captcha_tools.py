@@ -10,10 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge import app
-from skyvern.forge.taskv3 import captcha_tools
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError
-from tests.unit.conftest import ScopeRecordingAgentFunction
+from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -205,9 +206,20 @@ async def test_solve_captcha_threads_ids(monkeypatch: pytest.MonkeyPatch) -> Non
         _task(workflow_run_id="wr_9", browser_session_id="bs_9"), _provider(page), organization_id="o_9"
     )
     await tools[0].handler({})
-    ladder.assert_awaited_once_with(
-        page, organization_id="o_9", workflow_run_id="wr_9", browser_session_id="bs_9", probe_child_frames=True
-    )
+    ladder.assert_awaited_once()
+    kwargs = dict(ladder.await_args.kwargs)
+    # The ladder's widget clicks go through V3's input dispatch, bound to the page being solved.
+    click = kwargs.pop("click")
+    click_handle = kwargs.pop("click_handle")
+    assert (click.func, click.args) == (input_dispatch.click, (page,))
+    assert (click_handle.func, click_handle.args) == (input_dispatch.click_handle, (page,))
+    assert ladder.await_args.args == (page,)
+    assert kwargs == {
+        "organization_id": "o_9",
+        "workflow_run_id": "wr_9",
+        "browser_session_id": "bs_9",
+        "probe_child_frames": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -278,10 +290,19 @@ class _MarkerOnlyLocator:
     async def count(self) -> int:
         return self._count
 
+    def nth(self, _index: int) -> _MarkerOnlyLocator:
+        return self
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def bounding_box(self) -> dict[str, float]:
+        return {"x": 10.0, "y": 10.0, "width": 300.0, "height": 80.0}
+
 
 class _MarkerOnlyPage:
-    """Only the generic CAPTCHA marker selector matches: the real ladder detects a challenge, finds no
-    checkbox/anchor/recaptcha arm, and raises CaptchaChallengeUnsolvedError."""
+    """Only the generic CAPTCHA marker selector matches, and it is rendered: the real ladder detects a
+    challenge, finds no checkbox/anchor/recaptcha arm, and raises CaptchaChallengeUnsolvedError."""
 
     def __init__(self) -> None:
         self.url = "https://app.example/login"
@@ -324,3 +345,36 @@ async def test_page_unavailable_never_enters_lifecycle_scope(monkeypatch: pytest
     result = await tools[0].handler({})
     assert result.status == "error"
     assert agent_function.events == []
+
+
+@pytest.mark.asyncio
+async def test_without_image_selector_the_ocr_seam_is_never_touched(monkeypatch: pytest.MonkeyPatch) -> None:
+    ocr = OcrRecordingAgentFunction("unused")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", ocr)
+    ladder = AsyncMock(return_value=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
+
+    for args in ({}, {"image_selector": ""}, {"image_selector": "   "}):
+        result = await tools[0].handler(args)
+        assert (result.status, result.ok_class) == ("ok", "absent")
+    assert ladder.await_count == 3
+    assert ocr.images == []
+
+
+@pytest.mark.asyncio
+async def test_without_an_ocr_solver_the_argument_is_neither_offered_nor_honoured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # OSS has no solver: advertising the argument would send the model to a read that always fails and spends
+    # the failure cap the widget ladder shares.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    ladder = AsyncMock(return_value=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    tools, guidance = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
+
+    assert tools[0].to_openai_tool()["function"]["parameters"]["properties"] == {}
+    assert "image_selector" not in guidance + tools[0].description
+    result = await tools[0].handler({"image_selector": "#cap"})
+    assert "image_selector" not in result.content
+    assert ladder.await_count == 1

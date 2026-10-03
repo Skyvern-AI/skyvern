@@ -21,24 +21,43 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import functools
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Collection
 
+import litellm
 import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
+from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES, LLMCaller
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
-from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
-from skyvern.forge.taskv3.goal_composition import build_user_prompt
+from skyvern.forge.taskv3.goal_check import (
+    GOAL_CHECK_TIMEOUT_SECONDS,
+    INSTRUCTIONS_MAX_CHARS,
+    UNLISTED_REASK_PROMPT_NAME,
+    GoalJudge,
+    GoalVerdict,
+    NonCompletedStatus,
+    Redactor,
+    ToolTrail,
+    UnlistedReask,
+    goal_check_eligible,
+    reask_entered_values,
+    run_goal_check,
+    run_unlisted_reask,
+)
+from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
+    PERCEPTION_RETAIN_CHARS_HIGH,
     ActivityRecency,
     CompletionBlocker,
     CompletionProbe,
@@ -55,10 +74,15 @@ from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     PageProvider,
+    TotpPlaceholderResolver,
     apply_blank_page_guard,
     build_browser_tools,
 )
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 from skyvern.schemas.workflows import BlockType
+from skyvern.services.otp_service import iter_totp_from_navigation_inputs
+from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
+from skyvern.utils.token_counter import approx_count_tokens, count_tokens
 
 LOG = structlog.get_logger()
 
@@ -87,11 +111,13 @@ MIN_ACTION_STEPS = 24
 # at or below MIN_ACTION_STEPS keeps exactly DEFAULT_MAX_TOKENS; only larger budgets rise, so a long
 # block's raised step cap isn't silently nullified by the flat token ceiling.
 MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
-# The scaling clamps here: the token guard is a runaway backstop, not a budget, and a caller's step
-# cap is not bounded at the route layer, so an extreme value must not carry the ceiling away with
-# it. 4x covers every observed legitimate long-block need (~2x) with margin. Deliberately asymmetric:
-# turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
+# The scaling clamps here: tokens are the direct-spend guard, and a caller's step cap is not bounded at the
+# route layer, so an extreme value must not carry the ceiling away with it. Because the transcript grows each
+# turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
+# may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
+# Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
+GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
@@ -103,34 +129,36 @@ How to work:
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
 - Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. Act on what that error tells you rather than substituting a value of your own: this field commits only the suggestions the page itself offers, and those are often coarser than the value you hold.
-- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Only your last couple of reads stay in this conversation, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone.
+- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Your reads stay in this conversation until they add up to about two full-size reads; past that the oldest are replaced by a one-line note naming the read, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone. A read that returns exactly the bytes of a read still shown above is replaced by a short note saying so: look at that earlier read.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
 - Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its refs before doing anything else.
-- Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
+- Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved, or when you have established that it cannot be achieved; the finish tool's own description says which status each outcome takes.
 
 Rules:
-- Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
+- Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. If a required date-of-birth field needs a month and day and the task gives only the birth year, enter 01/01/<year>. Never invent a street address or phone number. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
 - A page message rejecting your submission and inviting you to try again is not an instruction to loop: retry at most once, and if the outcome is unchanged, finish honestly naming the rejection as the reason.
 - When a submit is refused, find the page's own message in `observe`: a `text:` line that reads as a rejection or validation message, or a field marked `*invalid`. Fix the named field if the task's data allows; otherwise finish and quote that message as the reason. A captcha widget that is merely present on the page is not evidence that it blocked the submission.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
+
 
 OPAQUE_URL_GUIDANCE = """
 
 Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
 DOWNLOAD_COMPLETION_GUIDANCE = """
 
-This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
+This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish and say why, choosing the status by the finish tool's own rule."""
 
 DOWNLOAD_REQUIRED_GUIDANCE = """
 
-This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
+This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish and say why, choosing the status by the finish tool's own rule."""
 
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
     """Return (max_turns, max_tool_calls, max_tokens) anti-runaway guards for an action-step budget.
 
-    Generous enough that a productive run is bounded by max_action_steps, not by these guards; with
-    no action-step budget, fall back to the engine's fixed defaults."""
+    Turns and tool calls are generous enough that a productive run is bounded by max_action_steps; the token
+    guard can bind first on a long form, where the loop's progress-gated token grant applies. With no
+    action-step budget, fall back to the engine's fixed defaults."""
     if not max_action_steps:
         return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOKENS
     return (
@@ -172,15 +200,53 @@ def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | 
     return {"task_data": navigation_payload}
 
 
+def _known_input_limit(names: list[str]) -> int | None:
+    for name in names:
+        try:
+            limit = litellm.get_model_info(model=name).get("max_input_tokens")
+        except Exception:  # litellm raises a bare Exception for a model absent from its map
+            continue
+        if isinstance(limit, int):
+            return limit
+    return None
+
+
+def model_input_token_limit(llm_config: object) -> int | None:
+    """The smallest input limit across every model the config can dispatch to, router fallbacks included; a model
+    litellm does not know counts as `PROMPT_HARD_CEILING_TOKENS`, so it never inherits a known model's larger limit."""
+    if isinstance(llm_config, LLMRouterConfig):
+        candidates = [
+            (
+                entry.model_info.get("max_input_tokens"),
+                [
+                    name
+                    for name in (
+                        entry.model_info.get("base_model"),
+                        entry.model_info.get("model_name"),
+                        entry.litellm_params.get("model"),
+                    )
+                    if name
+                ],
+            )
+            for entry in llm_config.model_list
+        ]
+    elif isinstance(llm_config, LLMConfig):
+        candidates = [(None, [llm_config.model_name])]
+    else:
+        return None
+    limits = [
+        declared if isinstance(declared, int) else _known_input_limit(names) or PROMPT_HARD_CEILING_TOKENS
+        for declared, names in candidates
+    ]
+    return min(limits) if limits else None
+
+
 async def run_task_v3_agent_loop(
     *,
     page_provider: PageProvider,
     llm_caller: Any,
     goal: str,
     parameters: dict[str, Any] | None = None,
-    # The customer's configured business outcomes. Offered to the model on the finish tool so a
-    # terminal verdict names its own code deliberately, instead of one being matched on afterwards.
-    error_code_mapping: dict[str, str] | None = None,
     starting_url: str | None = None,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
@@ -198,8 +264,11 @@ async def run_task_v3_agent_loop(
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     deadline_seconds: float | None = DEFAULT_DEADLINE_SECONDS,
     resolve_typed_text: Callable[[str], Any] | None = None,
+    credential_release_guard: CredentialReleaseGuard | None = None,
+    resolve_totp_placeholder: TotpPlaceholderResolver | None = None,
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    settle_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     completion_probe: CompletionProbe | None = None,
@@ -207,11 +276,38 @@ async def run_task_v3_agent_loop(
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
+    initial_navigation_url: str | None = None,
+    caller_known_urls: frozenset[str] = frozenset(),
+    label_secret_values: Callable[[], Collection[str]] | None = None,
+    login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
+    document_identity: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
+    has_navigation_goal: bool = False,
+    goal_judge: GoalJudge | None = None,
+    goal_check_enforce: bool = False,
+    extraction_requested: bool = False,
+    # Customer instructions that can redefine what "done" means, shown to the goal judge with the goal.
+    goal_instructions: str = "",
+    # Called once per goal check; the redactor it returns is applied to every judge input before
+    # truncation. The caller owns the run's secret set.
+    goal_check_redactor: Callable[[], Redactor] | None = None,
+    # A secret may already be on the page from before this loop (an earlier block, a self-healing
+    # script): the goal check then never captures a screenshot.
+    secret_on_page_at_start: bool = False,
+    # (complete_criterion, terminate_criterion) for a block whose failed or terminated finish may be re-asked
+    # once; None means the block is not eligible.
+    unlisted_reask_criteria: tuple[str, str | None] | None = None,
+    # The criteria may carry page-derived text, so the re-ask shows them as untrusted data.
+    unlisted_reask_criteria_untrusted: bool = False,
+    # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
+    unlisted_reask_instructions_untrusted: bool = False,
+    single_action_block: bool = False,
+    # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
+    code_typed_values: tuple[CodeTypedValue, ...] = (),
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -222,8 +318,9 @@ async def run_task_v3_agent_loop(
     for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
     only. `max_settle_deferrals=0` disables that completed-side re-verification while leaving the
     failure-evidence gate, which shares the sampler, intact. `page_probe` is a separate sampler (URL
-    plus fingerprint) the loop uses to detect whether a failed batched call moved the page; a
-    page-free run has no page to probe."""
+    plus document nonce) the loop uses to detect whether a failed batched call moved the page.
+    `document_identity` also covers the child frames the run acted in; the finish tool uses it to veto a re-ask
+    conversion whose document changed. A page-free run has no page to probe."""
     loop_started_at = time.monotonic()
     # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
@@ -239,6 +336,13 @@ async def run_task_v3_agent_loop(
         refs = mask_opaque_urls(parameters)
         model_goal = refs.mint_in_text(goal)
         extra_system_guidance = refs.mint_in_text(extra_system_guidance)
+        goal_instructions = refs.mint_in_text(goal_instructions)
+        if unlisted_reask_criteria is not None:
+            complete, terminate = unlisted_reask_criteria
+            unlisted_reask_criteria = (
+                refs.mint_in_text(complete),
+                refs.mint_in_text(terminate) if terminate is not None else None,
+            )
         # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
         if starting_url and is_signed_url(starting_url):
             model_starting_url = refs.derive(starting_url)
@@ -305,45 +409,20 @@ async def run_task_v3_agent_loop(
             downloads_dir=downloads_dir,
             organization_id=organization_id,
             resolve_typed_text=resolve_typed_text,
+            credential_release_guard=credential_release_guard,
+            resolve_totp_placeholder=resolve_totp_placeholder,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
             semantic_commit_stats=semantic_commit_stats,
         )
     )
 
-    # The code tool is built by the deployment, not here: executing model-authored Python needs a
-    # sandboxed runner, which `skyvern/` has no way to reach. A deployment without one returns None
-    # and the surface is left alone. Page-free runs have no page to broker and never ask.
+    # Withheld whenever offered: code driving the page bypasses the realm ledger the native action tools
+    # write, so in-frame fills and submits would be invisible to the data-loss guard and the completion gate.
     code_surface = configured_surface()
-    code_tool: ToolSpec | None = None
     if code_surface.offers_code_tool and not page_free:
-        execution_id = (_ctx.run_id or _ctx.workflow_run_id or _ctx.task_id or "") if _ctx else ""
-        if frame_perception_enabled():
-            # The realm-attributed ledger behind the data-loss guard and the completion gate is
-            # written only by the native action tools' wrapper. Code driving the page directly
-            # bypasses it, so in-frame fills and submits would be invisible to both -- worst under
-            # `replace`, where no native action runs and the ledger is never written at all. Until
-            # the brokered path records that work, the two features do not run together.
-            LOG.info("taskv3 code tool withheld", reason="frame_perception_enabled", surface=str(code_surface))
-        elif not execution_id:
-            # The deployment keys a sandbox session on this. Two runs sharing an empty identity would
-            # share a session, so no identity means no code tool rather than a shared one.
-            LOG.info("taskv3 code tool withheld", reason="no_run_identity", surface=str(code_surface))
-        else:
-            try:
-                code_tool = await app.AGENT_FUNCTION.build_task_v3_code_tool(
-                    page_provider=page_provider,
-                    organization_id=organization_id,
-                    execution_id=execution_id,
-                )
-            except Exception:
-                # Withhold, never fail the run: `add` is meant to be purely additive, so a sandbox
-                # hiccup must cost the code tool and nothing else. The action tools still work.
-                LOG.warning("taskv3 code tool build failed; continuing without it", exc_info=True)
-                code_tool = None
-            if code_tool is None:
-                LOG.info("taskv3 code tool withheld", reason="no_sandboxed_runner", surface=str(code_surface))
-    browser_tools = apply_surface(browser_tools, code_surface, code_tool)
+        LOG.info("taskv3 code tool withheld", reason="frame_perception", surface=str(code_surface))
+    browser_tools = apply_surface(browser_tools, code_surface, None)
 
     # The fingerprint sampler is caller-built (browser semantics — e.g. peeking without page
     # recovery — live with the dispatcher); the finish gate owns the settle wait, bounded by this
@@ -356,18 +435,118 @@ async def run_task_v3_agent_loop(
         completion_probe = None
         completion_blocker = None
         verification_blocker = None
+    refuse_input_entry = block_type == BlockType.EXTRACTION
+    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    goal_check_on = goal_judge is not None and goal_check_eligible(
+        page_free=page_free,
+        completion_blocker_present=completion_blocker is not None,
+        extraction_requested=extraction_requested,
+    )
+    # Same eligibility as the goal check: a block with its own completion verifier is left to it.
+    reask_on = unlisted_reask_criteria is not None and goal_check_eligible(
+        page_free=page_free,
+        completion_blocker_present=completion_blocker is not None,
+        extraction_requested=extraction_requested,
+    )
+    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on else None
+    goal_verdicts: list[GoalVerdict] = []
+    reasks: list[UnlistedReask] = []
+
+    async def _goal_check() -> GoalVerdict:
+        assert goal_judge is not None and tool_trail is not None
+        timeout = GOAL_CHECK_TIMEOUT_SECONDS
+        if deadline_at is not None:
+            timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
+        redact = goal_check_redactor() if goal_check_redactor is not None else None
+        if tool_trail.secret_entered:
+            verdict = GoalVerdict("achieved", "", "", "secret_entered", 0.0)
+        elif timeout <= 0:
+            verdict = GoalVerdict("achieved", "", "", "deadline", 0.0)
+        # Measured as the judge would see it: redaction can lengthen the text past the cap.
+        elif len(redact(goal_instructions) if redact is not None else goal_instructions) > INSTRUCTIONS_MAX_CHARS:
+            # A rule that decides "done" can sit past the cap, and a verdict against a prefix could fail it.
+            verdict = GoalVerdict("achieved", "", "", "instructions_too_long", 0.0)
+        else:
+            verdict = await run_goal_check(
+                goal=model_goal,
+                trail=tool_trail,
+                judge=goal_judge,
+                timeout_seconds=timeout,
+                instructions=goal_instructions,
+                redact=redact,
+            )
+        goal_verdicts.append(verdict)
+        return verdict
+
+    async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
+        # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
+        # No message history, so the loop's transcript is untouched.
+        return await reask_caller.call(
+            prompt=prompt,
+            prompt_name=UNLISTED_REASK_PROMPT_NAME,
+            step=step,
+            organization_id=organization_id,
+            use_message_history=False,
+            force_dict=True,
+        )
+
+    async def _unlisted_reask(status: NonCompletedStatus, reason: str) -> UnlistedReask:
+        assert unlisted_reask_criteria is not None and tool_trail is not None
+        timeout = GOAL_CHECK_TIMEOUT_SECONDS
+        if deadline_at is not None:
+            timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
+        redact = goal_check_redactor() if goal_check_redactor is not None else None
+        non_flex_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(llm_caller.llm_key)
+        reask_caller = llm_caller
+        if non_flex_key and LLMConfigRegistry.is_registered(non_flex_key):
+            reask_caller = LLMCaller(non_flex_key)
+        if timeout <= 0:
+            result = UnlistedReask(status, converts=False, skipped_reason="deadline", latency_s=0.0)
+        # A rule past the cap could be the one that says this stop is right.
+        elif len(redact(goal_instructions) if redact is not None else goal_instructions) > INSTRUCTIONS_MAX_CHARS:
+            result = UnlistedReask(status, converts=False, skipped_reason="instructions_too_long", latency_s=0.0)
+        else:
+            entered = reask_entered_values(
+                tool_trail.entered_values,
+                is_secret=(lambda value: redact(value) != value) if redact is not None else (lambda value: False),
+                excluded={otp.value for otp in iter_totp_from_navigation_inputs(parameters)} if parameters else (),
+            )
+            result = await run_unlisted_reask(
+                # The goal as the loop's model read it, minus code-typed rows; the re-ask fences it whole.
+                goal=model_goal,
+                complete_criterion=unlisted_reask_criteria[0],
+                terminate_criterion=unlisted_reask_criteria[1],
+                status=status,
+                reason=reason,
+                trail=tool_trail,
+                judge=functools.partial(_reask_judge, reask_caller),
+                timeout_seconds=timeout,
+                entered_values=entered,
+                instructions=goal_instructions,
+                redact=redact,
+                criteria_untrusted=unlisted_reask_criteria_untrusted,
+                instructions_untrusted=unlisted_reask_instructions_untrusted,
+            )
+        result.llm_key = llm_caller.llm_key
+        result.reask_llm_key = reask_caller.llm_key
+        reasks.append(result)
+        return result
+
     finish_tool = make_finish_tool(
-        page_fingerprint=None if page_free else page_fingerprint,
-        error_code_mapping=error_code_mapping,
+        page_fingerprint=None if page_free else (settle_fingerprint or page_fingerprint),
         max_settle_deferrals=max_settle_deferrals,
         pending_marker=None if page_free else pending_marker,
         submit_watch=None if page_free else submit_watch,
         should_cancel=should_cancel,
-        deadline_at=time.monotonic() + deadline_seconds if deadline_seconds is not None else None,
+        deadline_at=deadline_at,
         activity=activity,
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
+        goal_check=_goal_check if goal_check_on else None,
+        goal_check_enforce=goal_check_enforce,
+        unlisted_reask=_unlisted_reask if reask_on else None,
+        document_identity=None if page_free else document_identity,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
@@ -386,11 +565,33 @@ async def run_task_v3_agent_loop(
     )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
+    age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
+    age_default_text, age_default_reason = age_default or (None, None)
+    # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
+    # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
+    prompt_goal = model_goal
+    if code_typed_values:
+        # The goal is message 1 of every turn and an over-limit request is refused without retry, so typed rows get
+        # what the smallest dispatchable model's input limit leaves after the rest of the request, the tool schemas,
+        # and the page-read characters the loop retains (at approx_count_tokens' 4 characters per token).
+        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{age_default_text or ''}"
+        budget = (
+            (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
+            - count_tokens(system_prompt)
+            - count_tokens(rest)
+            - count_tokens(json.dumps([tool.to_openai_tool() for tool in tools]))
+            - approx_count_tokens("x" * PERCEPTION_RETAIN_CHARS_HIGH)
+        )
+        prompt_goal = "\n".join([model_goal, *typed_value_rows(code_typed_values, budget)])
+    user_prompt = build_user_prompt(prompt_goal, refs.masked, model_starting_url)
+    # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
+    if age_default_text:
+        user_prompt += f"\n\n{age_default_text}"
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=build_user_prompt(model_goal, refs.masked, model_starting_url),
+            user_prompt=user_prompt,
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
@@ -406,19 +607,26 @@ async def run_task_v3_agent_loop(
             deadline_seconds=deadline_seconds,
             retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
             max_call_retries=DEFAULT_MAX_CALL_RETRIES,
+            on_llm_call_exhausted=lambda error: llm_caller.emit_retry_chain_exhausted(error, prompt_name),
             activity=activity,
             submit_watch=None if page_free else submit_watch,
             completion_probe=completion_probe,
             verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
+            initial_navigation_url=initial_navigation_url,
+            caller_known_urls=caller_known_urls,
+            label_secret_values=label_secret_values,
+            login_identifier_tokens=login_identifier_tokens,
             page_probe=None if page_free else page_probe,
             page_fingerprint=None if page_free else page_fingerprint,
             reload_page=None if page_free else reload_page,
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
-            refuse_input_entry=block_type == BlockType.EXTRACTION,
+            refuse_input_entry=refuse_input_entry,
+            tool_trail=tool_trail,
+            single_action_block=single_action_block,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -442,12 +650,47 @@ async def run_task_v3_agent_loop(
             if not _cancelled:
                 # The guard bounds itself by `_deadline_remaining`; no second computation here.
                 await blank_page_guard.ensure_live()
+    if goal_check_on:
+        gate_verdicts = [v for v in goal_verdicts if not v.recheck]
+        last = gate_verdicts[-1] if gate_verdicts else None
+        held = sum(1 for v in gate_verdicts if v.action == "hold" and not v.no_headroom)
+        outcome.goal_check = {
+            "mode": "enforce" if goal_check_enforce else "shadow",
+            "checks": len(gate_verdicts),
+            "judged": sum(1 for v in gate_verdicts if v.skipped_reason is None),
+            "rechecks": len(goal_verdicts) - len(gate_verdicts),
+            "holds": held if goal_check_enforce else 0,
+            "would_holds": 0 if goal_check_enforce else held,
+            "would_fails": sum(1 for v in gate_verdicts if v.would_fail),
+            "no_headroom": sum(1 for v in gate_verdicts if v.no_headroom),
+            "last_verdict": last.verdict if last else None,
+            "last_action": last.action if last else None,
+            "last_skipped_reason": last.skipped_reason if last else None,
+        }
+    if reask_on:
+        # Present on every eligible block, so exposure is the share of loops carrying it, asked or not.
+        last_reask = reasks[-1] if reasks else None
+        outcome.unlisted_reask = {
+            "asked": last_reask is not None,
+            "original_status": last_reask.original_status if last_reask else None,
+            "verdict": last_reask.verdict if last_reask else None,
+            "terminate_criterion_holds": last_reask.terminate_criterion_holds if last_reask else None,
+            "converts": bool(last_reask and last_reask.converts),
+            "converted": bool(last_reask and last_reask.converted),
+            "veto": last_reask.veto if last_reask else None,
+            "skipped_reason": last_reask.skipped_reason if last_reask else None,
+            "latency_s": last_reask.latency_s if last_reask else None,
+        }
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
+        outcome.converted_from_reason = refs.resolve(outcome.converted_from_reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)
     LOG.info(
         "taskv3 engine loop finished",
         status=outcome.status,
+        # The per-run home of the guard class that used to be a prefix on the customer-facing reason:
+        # one row per run, so "how often did this policy end a run" is a facet, not a string match.
+        guard=outcome.guard,
         turns=outcome.turns,
         tool_calls=outcome.tool_calls,
         tool_seconds=outcome.tool_seconds,
@@ -457,6 +700,18 @@ async def run_task_v3_agent_loop(
         tool_choice_in_effect=outcome.tool_choice_in_effect,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
+        # State at the run's first failed/terminated finish that got past the failure-evidence gate, next to the
+        # terminal attempt count; all None when no such finish happened.
+        action_attempts=activity.action_attempts,
+        attempts_at_hold_gate=activity.attempts_at_hold_gate,
+        perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
+        status_at_hold_gate=activity.status_at_hold_gate,
+        has_navigation_goal=has_navigation_goal,
+        age_default_rendered=bool(age_default_text),
+        age_default_reason=age_default_reason,
+        # The run's model, so exposure rates on this line split per model like the re-ask line's.
+        llm_key=llm_caller.llm_key,
+        unlisted_reask=outcome.unlisted_reask,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a
         # per-run indexed event and makes the join to block_type free instead of a second lookup.

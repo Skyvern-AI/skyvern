@@ -96,11 +96,25 @@ class BlockDriftEntry:
 # runbook to resync, then remove the entry here.
 _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
     BlockDriftEntry(
+        block_type="web_search",
+        ticket="SKY-16450",
+        owner="@suchintan",
+        added_at=date(2026, 9, 16),
+        notes="Web search awaits the next Fern SDK regeneration.",
+    ),
+    BlockDriftEntry(
         block_type="data_export",
         ticket="SKY-14102",
         owner="@wintonzheng",
         added_at=date(2026, 8, 17),
         notes="Parquet data export awaits the next Fern SDK regeneration.",
+    ),
+    BlockDriftEntry(
+        block_type="terminate",
+        ticket="SKY-16910",
+        owner="@nickjtch-skyvern",
+        added_at=date(2026, 9, 23),
+        notes="Terminate block awaits the next Fern SDK regeneration.",
     ),
 )
 

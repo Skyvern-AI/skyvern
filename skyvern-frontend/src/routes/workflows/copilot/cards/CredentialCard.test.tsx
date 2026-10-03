@@ -7,6 +7,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -25,6 +26,7 @@ import {
   CredentialCard,
   type CredentialPauseHistorical,
   type CredentialRequiredReason,
+  type ManualSignInOffer,
 } from "./CredentialCard";
 
 const { getClientMock, credsData, credsFail, clientGet } = vi.hoisted(() => {
@@ -41,6 +43,13 @@ const { getClientMock, credsData, credsFail, clientGet } = vi.hoisted(() => {
   // can prove the picker's box reaches the server rather than filtering the fetched page.
   const get = vi.fn(
     (path: string, config?: { params?: { search?: string } }) => {
+      if (path.startsWith("/credentials/")) {
+        if (fail.current) return Promise.reject(new Error("network"));
+        const id = decodeURIComponent(path.slice("/credentials/".length));
+        return Promise.resolve({
+          data: data.current.find((c) => c.credential_id === id),
+        });
+      }
       if (path !== "/credentials") return Promise.resolve({ data: {} });
       if (fail.current) return Promise.reject(new Error("network"));
       const term = config?.params?.search?.toLowerCase();
@@ -324,6 +333,99 @@ describe("CredentialCard callbacks", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
     expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("CredentialCard sign in myself", () => {
+  const signIn = (overrides: Partial<ManualSignInOffer> = {}) => ({
+    busy: false,
+    onStart: vi.fn(),
+    onDone: vi.fn(),
+    ...overrides,
+  });
+
+  it("offers signing in yourself only when the chat passes an offer", () => {
+    const offer = signIn();
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        signIn={offer}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sign in myself" }));
+    expect(offer.onStart).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Sign in myself" })).toBeNull();
+  });
+
+  it("while signing in, Done finishes, Cancel skips, and a Done that found nothing says so", () => {
+    const offer = signIn({ notFoundHost: "portal.example.com" });
+    const onSkip = vi.fn();
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ signing_in: true })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={onSkip}
+        signIn={offer}
+      />,
+    );
+    expect(
+      screen.getAllByText(/No sign-in found for portal\.example\.com/),
+    ).not.toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(offer.onDone).toHaveBeenCalledTimes(1);
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+  });
+
+  it("says when a Done could not save the sign-in, not that none was found", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ signing_in: true })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        signIn={signIn({
+          saveFailed: true,
+          notFoundHost: "portal.example.com",
+        })}
+      />,
+    );
+    expect(screen.getAllByText(/Couldn't save your sign-in/)).not.toHaveLength(
+      0,
+    );
+    expect(screen.queryByText(/No sign-in found/)).toBeNull();
+  });
+
+  it("renders a signed-in receipt naming the saved profile", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        resolvedOutcome={{ outcome: "signed_in", name: "Sign-in for portal" }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Signed in, saved as 'Sign-in for portal'"),
+    ).toBeTruthy();
   });
 });
 
@@ -1359,7 +1461,7 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
     expect(screen.getByText("Credential added")).toBeTruthy();
   });
 
-  it("renders the muted skip row for a skipped outcome", () => {
+  it("renders a one-line skip receipt for a skipped outcome", () => {
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
@@ -1369,14 +1471,11 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText(
-        "Credential setup skipped — test run may stop at the login step",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByText("Sign-in skipped")).toBeTruthy();
+    expect(screen.getByText(/test may stop at login/)).toBeTruthy();
   });
 
-  it("renders the muted timeout row for a timeout outcome", () => {
+  it("renders a one-line timeout receipt for a timeout outcome", () => {
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
@@ -1386,11 +1485,8 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText(
-        "Credential request timed out — test run may stop at the login step",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByText("Sign-in request timed out")).toBeTruthy();
+    expect(screen.getByText(/test may stop at login/)).toBeTruthy();
   });
 });
 
@@ -1572,5 +1668,145 @@ describe("CredentialCard auto-bound receipt", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Change" }));
     fireEvent.click(await screen.findByRole("button", { name: "Other login" }));
     expect(onConnect).toHaveBeenCalledWith("cred_other", "Other login");
+  });
+});
+
+describe("CredentialCard missing-authenticator ask", () => {
+  const frame = CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_missing_totp;
+
+  function renderUpdateAsk(onUpdateCredential = vi.fn(), onSkip = vi.fn()) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={frame}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={onSkip}
+          onUpdateCredential={onUpdateCredential}
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("names the credential and hands its saved record to the editor, with no picker or input", async () => {
+    const onUpdateCredential = vi.fn();
+    const onSkip = vi.fn();
+    const record = {
+      credential_id: "cred_hn",
+      name: "HN login",
+      credential_type: "password",
+      credential: { username: "hn-user" },
+    };
+    credsData.current = [record];
+    const { container } = renderUpdateAsk(onUpdateCredential, onSkip);
+
+    const update = screen.getByRole("button", { name: "Add 2FA method" });
+    expect((update as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      await screen.findByText(
+        "Add 2FA to 'HN login' to sign in to https://news.ycombinator.com",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(update);
+    expect(onUpdateCredential).toHaveBeenCalledWith(record);
+    expect(container.querySelector("input, textarea")).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Connect credential" }),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+    expect(onSkip).toHaveBeenCalled();
+  });
+
+  it("does not claim 2FA was added when the editor saves", () => {
+    render(
+      <CredentialCard
+        frame={frame}
+        mode="inline-pause"
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Saved 'HN login', retrying the verification step"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/added|updated/)).toBeNull();
+  });
+
+  it("asks to update a credential the site rejected, and says so once saved or skipped", async () => {
+    const onUpdateCredential = vi.fn();
+    const record = { credential_id: "cred_hn", name: "HN login" };
+    credsData.current = [record];
+    const rejectedFrame =
+      CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_rejected_by_site;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={rejectedFrame}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+          onUpdateCredential={onUpdateCredential}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(
+        "Update 'HN login' to sign in to https://news.ycombinator.com",
+      ),
+    ).toBeTruthy();
+    const update = screen.getByRole("button", { name: "Update credential" });
+    await waitFor(() =>
+      expect((update as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(update);
+    expect(onUpdateCredential).toHaveBeenCalledWith(record);
+    expect(screen.queryByRole("combobox")).toBeNull();
+
+    rerender(
+      <CredentialCard
+        frame={rejectedFrame}
+        mode="inline-pause"
+        resolvedOutcome={{ outcome: "skipped" }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/keeps its saved sign-in/)).toBeTruthy();
+  });
+
+  it("offers Retry and Skip, never the generic picker, when the saved record cannot load", async () => {
+    credsFail.current = true;
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+    renderUpdateAsk();
+
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(screen.getByRole("status").textContent).toBe(
+      "Couldn't load this saved login.",
+    );
+    expect(screen.getByRole("button", { name: "Skip for now" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Connect credential" }),
+    ).toBeNull();
+
+    credsFail.current = false;
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Add 2FA method",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false),
+    );
   });
 });

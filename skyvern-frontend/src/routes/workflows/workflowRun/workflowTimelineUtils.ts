@@ -140,6 +140,34 @@ type BranchOutcome = {
   notTakenTargets: Array<SkippedBranchMetadata>;
 };
 
+type ConditionalEvaluationError = {
+  summary: string;
+  message: string;
+};
+
+// The block still reports completed when this is set: the backend routed
+// despite a branch it could not evaluate. Absent on cached-code and older runs.
+function getConditionalEvaluationError(
+  block: WorkflowRunBlock,
+): ConditionalEvaluationError | null {
+  if (block.block_type !== "conditional" || !hasEvaluations(block.output)) {
+    return null;
+  }
+  const { evaluation_error: message, evaluations = [] } = block.output;
+  if (!message) {
+    return null;
+  }
+  const tookDefaultBranch = evaluations.some(
+    (evaluation) => evaluation.is_matched && evaluation.is_default,
+  );
+  return {
+    summary: tookDefaultBranch
+      ? "A condition could not be evaluated, so the default branch was taken."
+      : "A condition could not be evaluated. The branch that ran was chosen without it.",
+    message,
+  };
+}
+
 function collectExecutedConditionals(
   timelineItems: Array<WorkflowRunTimelineItem>,
 ): Array<WorkflowRunBlock> {
@@ -855,10 +883,12 @@ export {
   findThoughtsForBlock,
   findTimelineBlock,
   flattenTimelineChronologically,
+  getConditionalEvaluationError,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
 };
 export type {
+  ConditionalEvaluationError,
   SkippedBranchMetadata,
   UnexecutedBlockReason,
   UnexecutedDefinedBlock,

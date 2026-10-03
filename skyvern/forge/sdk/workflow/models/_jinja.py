@@ -5,10 +5,10 @@ from __future__ import annotations
 import io
 import json
 import tokenize
-from typing import Any, Callable, cast
+from typing import Any, Callable, NoReturn, cast
 
 import structlog
-from jinja2 import ChainableUndefined, StrictUndefined
+from jinja2 import ChainableUndefined, StrictUndefined, Undefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
@@ -151,6 +151,20 @@ jinja_json_finalize_required_binding_env = SandboxedEnvironment(
     undefined=RequiredBindingUndefined, finalize=_json_finalize_required_binding
 )
 jinja_json_finalize_required_binding_env.filters["json"] = _json_type_filter
+
+
+def _fail_on_undefined_json(value: object) -> NoReturn:
+    if isinstance(value, Undefined):
+        value._fail_with_undefined_error()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+# `| tojson` serializes with json.dumps, which never calls __str__, so an undefined would surface as a
+# generic TypeError instead of the UndefinedError that names the missing binding.
+jinja_json_finalize_required_binding_env.policies["json.dumps_kwargs"] = {
+    **jinja_json_finalize_required_binding_env.policies["json.dumps_kwargs"],
+    "default": _fail_on_undefined_json,
+}
 
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
     jinja_json_finalize_strict_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)

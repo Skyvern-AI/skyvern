@@ -105,6 +105,7 @@ async def prepare_workflow(
     resolved_workflow_id: str | None = None,
     tag_write_context: TagWriteContext | None = None,
     block_scoped: bool = False,
+    created_by: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -123,6 +124,7 @@ async def prepare_workflow(
         organization=organization,
         version=version,
         max_steps_override=max_steps,
+        reject_empty_workflow=True,
         is_template_workflow=template,
         debug_session_id=debug_session_id,
         code_gen=code_gen,
@@ -137,6 +139,7 @@ async def prepare_workflow(
         resolved_workflow_id=resolved_workflow_id,
         tag_write_context=tag_write_context,
         block_scoped=block_scoped,
+        created_by=created_by,
     )
 
     if resolved_workflow_id is not None:
@@ -188,6 +191,7 @@ async def run_workflow(
     fallback_attempt: int | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     tag_write_context: TagWriteContext | None = None,
+    created_by: str | None = None,
 ) -> WorkflowRun:
     # Fail fast before the run is prepared/persisted: reject a run-level browser_type this runtime
     # cannot honor with a 4xx, rather than accepting it and failing at launch. No-op when unset or on
@@ -211,6 +215,7 @@ async def run_workflow(
         fallback_attempt=fallback_attempt,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         tag_write_context=tag_write_context,
+        created_by=created_by,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -241,6 +246,7 @@ async def get_workflow_run_response(
         organization_id=organization_id,
         include_step_count=True,
         cap_output_values=cap_output_values,
+        workflow_run=workflow_run,
     )
     app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
     # A fresh run reads/writes no saved memory; its run_request echoes start_fresh_browser and drops the

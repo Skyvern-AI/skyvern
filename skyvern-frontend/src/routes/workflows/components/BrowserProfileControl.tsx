@@ -73,6 +73,7 @@ function BrowserProfileControl({
     return (
       <div className="min-w-0 space-y-1.5">
         <WorkflowBlockInputTextarea
+          name="browserProfileKey"
           nodeId={nodeId ?? ""}
           value={codeValue}
           onChange={(value) => onCodeChange(value)}

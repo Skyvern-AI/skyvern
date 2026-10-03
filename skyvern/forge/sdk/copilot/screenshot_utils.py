@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -11,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from PIL import Image
@@ -232,31 +233,53 @@ def enqueue_screenshot(
     return True
 
 
-def stage_screenshot_from_artifact(
-    ctx: Any,
-    result: dict[str, Any],
-    *,
-    provenance: ScreenshotProvenance,
-    captured_at: float | None = None,
-) -> bool:
-    """Stage the frame a non-inline screenshot tool call wrote to disk, reporting whether this call
-    left an entry on the queue rather than whether the queue is merely non-empty.
-    """
+def consume_screenshot_artifact(result: dict[str, Any]) -> bytes | None:
     data = result.get("data")
     path = data.get("path") if isinstance(data, dict) else None
     if not isinstance(path, str) or not path:
-        return False
+        return None
+    artifact = Path(path)
     try:
-        raw = Path(path).read_bytes()
+        return artifact.read_bytes()
     except (OSError, ValueError):
-        LOG.info("Copilot screenshot artifact could not be read", path=path)
-        return False
-    return enqueue_screenshot(
-        ctx,
-        base64.b64encode(raw).decode("ascii"),
-        provenance=provenance,
-        captured_at=captured_at if captured_at is not None else time.monotonic(),
-    )
+        LOG.info("Copilot screenshot artifact could not be read")
+        return None
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            artifact.unlink(missing_ok=True)
+
+
+VisibleEffect = Literal["changed", "unchanged", "unknown"]
+
+
+@dataclass(frozen=True)
+class ViewportFrame:
+    png: bytes
+    dispatch_session_id: str | None
+    producer_url: str | None
+    producer_session_id: str | None
+    session_binding: ProvenanceBinding
+    started_at: float
+
+
+def viewport_visible_effect(pre: ViewportFrame | None, post: ViewportFrame | None) -> VisibleEffect:
+    if pre is None or post is None:
+        return "unknown"
+    if ProvenanceBinding.DISAGREE in (pre.session_binding, post.session_binding):
+        return "unknown"
+    if pre.producer_session_id and post.producer_session_id and pre.producer_session_id != post.producer_session_id:
+        return "unknown"
+    if pre.dispatch_session_id and post.dispatch_session_id and pre.dispatch_session_id != post.dispatch_session_id:
+        return "unknown"
+    try:
+        with Image.open(io.BytesIO(pre.png)) as pre_image, Image.open(io.BytesIO(post.png)) as post_image:
+            pre_rgb = pre_image.convert("RGB")
+            post_rgb = post_image.convert("RGB")
+    except (OSError, ValueError):
+        return "unknown"
+    if pre_rgb.size == post_rgb.size and pre_rgb.tobytes() == post_rgb.tobytes():
+        return "unchanged"
+    return "changed"
 
 
 def enqueue_screenshot_from_result(

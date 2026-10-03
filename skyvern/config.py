@@ -88,7 +88,6 @@ class Settings(BaseSettings):
 
     # Script reviewer settings
     SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
-    SELF_HEAL_DAILY_CAP: int = 5
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -279,6 +278,8 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
+    WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
@@ -294,10 +295,6 @@ class Settings(BaseSettings):
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
-    # Default for the bounded code-block self-heal; off by default.
-    ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
-    SELF_HEAL_MAX_ACTIONS: int = 15
-    SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
@@ -322,6 +319,9 @@ class Settings(BaseSettings):
     # also permits plaintext http:// endpoints, for self-hosted deployments pointing at an
     # object store on their own network (e.g. MinIO).
     ALLOW_S3_ENDPOINT_INTERNAL_HOSTS: bool = False
+    # Let SSRF-checked requests (webhooks, TOTP, downloads) use HTTP(S)_PROXY. A forward proxy resolves the host
+    # itself, so this gives up DNS-rebinding protection; enable only where egress must go through a proxy.
+    OUTBOUND_TRUST_ENV_PROXY: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
@@ -522,6 +522,8 @@ class Settings(BaseSettings):
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
+    # Pinned on every GPT-6 Luna key; high matches the gpt-5.6-luna key Task V3 serves (OPENAI_GPT5_6_LUNA_HIGH).
+    GPT6_LUNA_REASONING_EFFORT: str = "high"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
     # xAI
     XAI_API_KEY: str | None = None
@@ -541,37 +543,52 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
+    # Press a sub-pixel date segment through the layer painted over it, and route month/year and
+    # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
+    # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
+    TASK_V3_DATE_SEGMENT_AIM: bool = False
+    # Move the pointer onto an input or click target before acting, as v1 does, and take the click and typing
+    # pre-snapshots without writing an attribute to every visible element. Force-on term only: runs are randomized per run by the
+    # flag of the same name, read through run_arm_enabled(POINTER_PARITY_FLAG, ...).
+    TASK_V3_POINTER_PARITY: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
-    # Read, act in and verify inside child frames (SKY-14657). Covers perception, actuation and the
-    # element-probe realm as ONE unit on purpose: every partial state is worse than leaving it off.
-    # Perception alone mints refs a frame-blind resolver then reports stale, and perception plus
-    # actuation without the probe realm gives working actions whose readbacks answer about the main
-    # document instead of the element's own -- a verdict reported without being measured.
-    TASK_V3_FRAME_PERCEPTION: bool = False
+    # Ask a separate judge model, before accepting finish(status=completed), whether the page and the
+    # recent tool results contradict the goal (SKY-16928). On its own this is shadow mode: the verdict is
+    # logged and the outcome never changes. With TASK_V3_GOAL_CHECK_ENFORCE also on, a contradicted
+    # completion is held once and then failed, and an impossible one is terminated. Force-on terms only:
+    # runs are randomized per run by the flags of the same names, read through run_arm_enabled().
+    TASK_V3_GOAL_CHECK: bool = False
+    TASK_V3_GOAL_CHECK_ENFORCE: bool = False
+    # The judge's model. Unset means the judge never runs; there is no fallback to another model.
+    TASK_V3_GOAL_CHECK_LLM_KEY: str | None = None
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
     # executes only in the sandboxed runner and is withheld whenever that runner is unavailable --
     # there is no in-process execution path to fall back to.
     TASK_V3_CODE_TOOL_SURFACE: Literal["off", "add", "replace"] = "off"
+    # How long the Task V3 navigate tool waits for the committed document's domcontentloaded and then
+    # load events. Carved OUT OF BROWSER_LOADING_TIMEOUT_MS, never added to it -- the commit attempt
+    # gets the remainder, so one navigate call's worst case stays at that total.
+    TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS: int = 20000
     # Workflows whose permanent id was born at or after this instant run their task blocks on Task V3
     # when the organization resolves to the self-serve billing tier (an unknown tier is not enrolled),
-    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default). Setting it is not
-    # enough on its own: the rule fires only for runs whose TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT
-    # evaluation returns a conclusive true, so the cutoff stays inert until that flag enrols someone.
-    # Every off-state of that flag -- disabled, deleted, 0%, an excluding condition, an evaluation
-    # that raised, no flag provider at all -- leaves the run on the A/B, so there is no off-state that
-    # enrols. A naive value is read as UTC. Per-call platform workflows are excluded twice over -- by
-    # an auto_generated executing version, which covers the login, download_files, credential
-    # test-login and SDK endpoints, and by a per-call trigger kind, which covers the job recipe
-    # endpoints because those build a published definition. Enrolled runs are not randomized, so every
-    # per-arm read must exclude them by route_reason and read them against the unenrolled control cell
-    # instead.
+    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default), as does having no flag
+    # provider; DISABLE_TASK_V3 still wins over it. A naive value is read as UTC. Per-call platform
+    # workflows are excluded twice over -- by an auto_generated executing version, which covers the
+    # login, download_files, credential test-login and SDK endpoints, and by a per-call trigger kind,
+    # which covers the job recipe endpoints because those build a published definition. Enrolled runs
+    # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
+    # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
+    # task block's chosen engine and run a block with no engine on Task V3, outside WORKFLOW_TASK_V3_AB.
+    # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
+    # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
+    TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -582,6 +599,11 @@ class Settings(BaseSettings):
     # Yutori Navigator
     ENABLE_YUTORI: bool = False
     YUTORI_API_KEY: str | None = None
+    SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
+    EXA_API_KEY: str | None = Field(default=None, repr=False)
+    # Lets the search_web helper and Copilot tool spend the Search block's keys above. Off by default so
+    # keys set only for the Search block are not spent by code blocks and the Copilot.
+    ENABLE_SEARCH_WEB: bool = False
     YUTORI_API_BASE: str = "https://api.yutori.com/v1"
     YUTORI_MODEL: str = "n1.5-latest"
     YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
@@ -698,6 +720,30 @@ class Settings(BaseSettings):
     AZURE_GPT5_4_API_BASE: str | None = None
     AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
 
+    ENABLE_AZURE_GPT6_ASTRA: bool = False
+    AZURE_GPT6_ASTRA_DEPLOYMENT: str = "gpt-6-astra"
+    AZURE_GPT6_ASTRA_API_KEY: str | None = None
+    AZURE_GPT6_ASTRA_API_BASE: str | None = None
+    AZURE_GPT6_ASTRA_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_SOL: bool = False
+    AZURE_GPT6_SOL_DEPLOYMENT: str = "gpt-6-sol"
+    AZURE_GPT6_SOL_API_KEY: str | None = None
+    AZURE_GPT6_SOL_API_BASE: str | None = None
+    AZURE_GPT6_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_1_SOL: bool = False
+    AZURE_GPT6_1_SOL_DEPLOYMENT: str = "gpt-6.1-sol"
+    AZURE_GPT6_1_SOL_API_KEY: str | None = None
+    AZURE_GPT6_1_SOL_API_BASE: str | None = None
+    AZURE_GPT6_1_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_LUNA: bool = False
+    AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
+    AZURE_GPT6_LUNA_API_KEY: str | None = None
+    AZURE_GPT6_LUNA_API_BASE: str | None = None
+    AZURE_GPT6_LUNA_API_VERSION: str = "2025-04-01-preview"
+
     # AZURE gpt-5.6 sol
     ENABLE_AZURE_GPT5_6_SOL: bool = False
     AZURE_GPT5_6_SOL_DEPLOYMENT: str = "gpt-5.6-sol"
@@ -768,6 +814,7 @@ class Settings(BaseSettings):
     TOTP_LIFESPAN_MINUTES: int = 10
     TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
     TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS: int = 20
+    TWILIO_SMS_2FA_ENABLED: bool = False
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
@@ -948,6 +995,9 @@ class Settings(BaseSettings):
     """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
     RETRY_DISPATCH_GRACE_SECONDS: int = Field(default=600, ge=600)
     """OSS dispatch claim grace; the executor also enforces the retry lease takeover minimum."""
+    WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
+    """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
+    dispatch of already-submitted groups continue."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
@@ -1029,7 +1079,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", mode="before")
+    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", "TASK_V3_CHOSEN_ENGINE_CUTOFF", mode="before")
     @classmethod
     def _task_v3_default_engine_workflow_cutoff_off_sentinels(cls, value: Any) -> Any:
         # This setting is the rule's settings-side kill path, and blanking an already-set env var is
@@ -1105,6 +1155,34 @@ class Settings(BaseSettings):
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
             ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
+            (
+                "azure/gpt-6-astra",
+                self.ENABLE_AZURE_GPT6_ASTRA,
+                "AZURE_OPENAI_GPT6_ASTRA",
+                "OPENAI_GPT6_ASTRA",
+                "GPT 6 Astra",
+            ),
+            (
+                "azure/gpt-6-sol",
+                self.ENABLE_AZURE_GPT6_SOL,
+                "AZURE_OPENAI_GPT6_SOL",
+                "OPENAI_GPT6_SOL",
+                "GPT 6 Sol",
+            ),
+            (
+                "azure/gpt-6.1-sol",
+                self.ENABLE_AZURE_GPT6_1_SOL,
+                "AZURE_OPENAI_GPT6_1_SOL",
+                "OPENAI_GPT6_1_SOL",
+                "GPT 6.1 Sol",
+            ),
+            (
+                "azure/gpt-6-luna",
+                self.ENABLE_AZURE_GPT6_LUNA,
+                "AZURE_OPENAI_GPT6_LUNA",
+                "OPENAI_GPT6_LUNA",
+                "GPT 6 Luna",
+            ),
             (
                 "azure/gpt-5.6-sol",
                 self.ENABLE_AZURE_GPT5_6_SOL,
@@ -1223,6 +1301,14 @@ class Settings(BaseSettings):
                 "llm_key": "ANTHROPIC_CLAUDE5_OPUS",
                 "label": "Anthropic Claude Opus 5",
             }
+        mapping["claude-opus-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5.5_OPUS_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5.5_OPUS"
+            ),
+            "label": "Anthropic Claude Opus 5.5",
+        }
 
         try:
             from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415

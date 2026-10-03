@@ -4,6 +4,8 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { describe, expect, test, vi } from "vitest";
 
+import { StudioPaneDefaultsProvider } from "./studio/StudioPaneDefaults";
+import { useStudioPanes } from "./studio/useStudioPanes";
 import { WorkflowRunRoute } from "./StudioRouteGates";
 
 vi.mock("./editor/WorkflowEditor", () => ({
@@ -16,10 +18,14 @@ vi.mock("./LegacyBuildRedirect", () => ({
 
 function LocationProbe() {
   const location = useLocation();
+  const { panes } = useStudioPanes();
   return (
-    <div data-testid="location">
-      {location.pathname + location.search + location.hash}
-    </div>
+    <>
+      <output data-testid="panes">{panes.join(",")}</output>
+      <div data-testid="location">
+        {location.pathname + location.search + location.hash}
+      </div>
+    </>
   );
 }
 
@@ -36,13 +42,20 @@ describe("WorkflowRunRoute", () => {
             path="/agents/:workflowPermanentId/:workflowRunId/*"
             element={<WorkflowRunRoute />}
           />
-          <Route path="/runs/:runId" element={<LocationProbe />} />
+          <Route
+            path="/runs/:runId"
+            element={
+              <StudioPaneDefaultsProvider hasBlocks={true}>
+                <LocationProbe />
+              </StudioPaneDefaultsProvider>
+            }
+          />
         </Routes>
       </MemoryRouter>,
     );
 
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?active=act_1&iteration=2&view=timeline&panes=overview,browser#frame",
+      "/runs/wr_1?active=act_1&iteration=2&view=timeline#frame",
     );
   });
 
@@ -64,21 +77,29 @@ describe("WorkflowRunRoute", () => {
             path="/agents/:workflowPermanentId/:workflowRunId/*"
             element={<WorkflowRunRoute />}
           />
-          <Route path="/runs/:runId" element={<LocationProbe />} />
+          <Route
+            path="/runs/:runId"
+            element={
+              <StudioPaneDefaultsProvider hasBlocks={true}>
+                <LocationProbe />
+              </StudioPaneDefaultsProvider>
+            }
+          />
         </Routes>
       </MemoryRouter>,
     );
 
     expect(screen.getByTestId("location").textContent).toBe(
-      `/runs/wr_1?active=act_1&view=${studioView}&panes=${panes}#frame`,
+      `/runs/wr_1?active=act_1&view=${studioView}#frame`,
     );
+    expect(screen.getByTestId("panes").textContent).toBe(panes);
   });
 
   test.each([
     ["code", "browser", "overview,browser"],
     ["recording", "overview", "browser,overview"],
   ])(
-    "adds the pane needed for %s to an explicit layout",
+    "opens the pane needed for %s while preserving the explicit URL",
     (legacySubview, initialPanes, expectedPanes) => {
       render(
         <MemoryRouter
@@ -91,14 +112,22 @@ describe("WorkflowRunRoute", () => {
               path="/agents/:workflowPermanentId/:workflowRunId/*"
               element={<WorkflowRunRoute />}
             />
-            <Route path="/runs/:runId" element={<LocationProbe />} />
+            <Route
+              path="/runs/:runId"
+              element={
+                <StudioPaneDefaultsProvider hasBlocks={true}>
+                  <LocationProbe />
+                </StudioPaneDefaultsProvider>
+              }
+            />
           </Routes>
         </MemoryRouter>,
       );
 
       expect(screen.getByTestId("location").textContent).toContain(
-        `panes=${expectedPanes}`,
+        `panes=${initialPanes}`,
       );
+      expect(screen.getByTestId("panes").textContent).toBe(expectedPanes);
     },
   );
 
@@ -115,13 +144,20 @@ describe("WorkflowRunRoute", () => {
               path="/agents/:workflowPermanentId/:workflowRunId/*"
               element={<WorkflowRunRoute />}
             />
-            <Route path="/runs/:runId" element={<LocationProbe />} />
+            <Route
+              path="/runs/:runId"
+              element={
+                <StudioPaneDefaultsProvider hasBlocks={true}>
+                  <LocationProbe />
+                </StudioPaneDefaultsProvider>
+              }
+            />
           </Routes>
         </MemoryRouter>,
       );
 
       expect(screen.getByTestId("location").textContent).toBe(
-        `/runs/wr_1?view=${studioView}&panes=overview,browser`,
+        `/runs/wr_1?view=${studioView}`,
       );
     },
   );
@@ -136,13 +172,21 @@ describe("WorkflowRunRoute", () => {
             path="/agents/:workflowPermanentId/:workflowRunId/*"
             element={<WorkflowRunRoute />}
           />
-          <Route path="/runs/:runId" element={<LocationProbe />} />
+          <Route
+            path="/runs/:runId"
+            element={
+              <StudioPaneDefaultsProvider hasBlocks={true}>
+                <LocationProbe />
+              </StudioPaneDefaultsProvider>
+            }
+          />
         </Routes>
       </MemoryRouter>,
     );
 
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?embed=true&panes=overview&view=code",
+      "/runs/wr_1?embed=true&panes=browser&view=code",
     );
+    expect(screen.getByTestId("panes").textContent).toBe("overview");
   });
 });

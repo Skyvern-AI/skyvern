@@ -3,14 +3,17 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import logging
+import os
 import shutil
 import sys
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -23,20 +26,28 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from playwright.async_api import Download
 from playwright.async_api import Error as PlaywrightError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
+from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
+from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
@@ -199,6 +210,25 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_cli_runtime_entry() -> Iterator[None]:
+    """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
+
+    Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
+    against the default production URL in any later test that builds a cloud client. The env
+    load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
+    """
+    entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
+    yield
+    cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    for name, value in loaded.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+@pytest.fixture(autouse=True)
 def reset_mcp_stateless_http_mode():
     """Keep MCP transport mode from leaking between independently collected test files."""
     from skyvern.cli.core import session_manager
@@ -221,6 +251,13 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
 def render_agent_prompt(**overrides: str) -> str:
     """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:
+    now = datetime.now(UTC)
+    return OutputParameter(
+        output_parameter_id=f"{key}_id", key=key, workflow_id=workflow_id, created_at=now, modified_at=now
+    )
 
 
 def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
@@ -385,6 +422,51 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     return el
 
 
+def make_claimed_download_mock(
+    *,
+    path: Path | str | None,
+    suggested_filename: str,
+    path_error: BaseException | None = None,
+    failure: str | None = None,
+    failure_error: BaseException | None = None,
+    context: object | None = None,
+) -> Download:
+    """A Playwright ``Download`` double for the value a ``page.expect_download`` claim resolves to.
+    ``spec`` is the real class so the attach guard's ``isinstance`` check sees what it does live."""
+    download = MagicMock(spec=Download)
+    if path_error is not None:
+        download.path.side_effect = path_error
+    else:
+        download.path.return_value = None if path is None else str(path)
+    if failure_error is not None:
+        download.failure.side_effect = failure_error
+    else:
+        download.failure.return_value = failure
+    download.suggested_filename = suggested_filename
+    download.page = SimpleNamespace(context=context)
+    return download
+
+
+SESSION_DOWNLOAD_BYTES = b"session-delivered certificate"
+
+
+def registered_download_row(
+    filename: str = "certificate.pdf",
+    content: bytes = SESSION_DOWNLOAD_BYTES,
+    artifact_id: str | None = "a_session",
+    checksum: str | None = None,
+    file_size: int | None = None,
+) -> FileInfo:
+    """A DOWNLOAD row as the run's registration lists it for a file a remote browser session delivered."""
+    return FileInfo(
+        url=f"https://storage.test/{filename}",
+        filename=filename,
+        checksum=hashlib.sha256(content).hexdigest() if checksum is None else checksum,
+        file_size=len(content) if file_size is None else file_size,
+        artifact_id=artifact_id,
+    )
+
+
 @dataclass
 class DownloadDestinationHarness:
     """A real HTTP server plus a stubbed resolver, for exercising download destination checks.
@@ -544,41 +626,103 @@ def fake_api_request_context() -> Callable[[], object]:
     return _build
 
 
-class FakeSearchPage:
-    """Temporary tab a `search_web` call opens on the run's browser context."""
+def serpapi_page(*links: str, next_start: int | None = None) -> dict[str, Any]:
+    page: dict[str, Any] = {
+        "search_metadata": {"status": "Success"},
+        "organic_results": [{"title": f"Title {link}", "link": link, "snippet": f"About {link}"} for link in links],
+    }
+    if next_start is not None:
+        page["serpapi_pagination"] = {"next": f"https://serpapi.com/search.json?start={next_start}"}
+    return page
 
-    def __init__(self, html: str, page_title: str, goto_error: Exception | None, http_status: int = 200) -> None:
-        self._html = html
-        self._page_title = page_title
-        self._goto_error = goto_error
-        self.http_status = http_status
+
+SearchApiReply = tuple[int, object] | BaseException
+
+
+class FakeSearchApi:
+    """Stands in for `aiohttp_request` under the search client: answers each call with the next queued
+    (status, body) reply or raises it, repeating the last reply once the queue runs out."""
+
+    def __init__(self, *replies: SearchApiReply) -> None:
+        self._replies = list(replies)
+        self.urls: list[str] = []
+
+    async def __call__(self, *, url: str, **_kwargs: object) -> tuple[int, dict[str, str], object]:
+        self.urls.append(url)
+        reply = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        status, body = reply
+        return status, {}, body
+
+
+def arm_search_api(
+    monkeypatch: pytest.MonkeyPatch,
+    *replies: SearchApiReply,
+    serpapi_key: str | None = "serp-test-key",
+    exa_key: str | None = None,
+) -> FakeSearchApi:
+    """Configures the search keys, answers the vendor calls from `replies`, and admits every result
+    destination; a test that screens destinations patches `web_search.classify_url_async` after this."""
+
+    async def allow(_url: str) -> str | None:
+        return None
+
+    api = FakeSearchApi(*replies)
+    monkeypatch.setattr(web_search_client, "aiohttp_request", api)
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", serpapi_key)
+    monkeypatch.setattr(web_search_client.settings, "EXA_API_KEY", exa_key)
+    monkeypatch.setattr(SettingsManager.get_settings(), "ENABLE_SEARCH_WEB", True)
+    monkeypatch.setattr(web_search, "classify_url_async", allow)
+    return api
+
+
+class FakeSearchPage:
+    """A tab the block's browser context opens for an `open_page` call. A URL ending in ``/refused``
+    fails to load; the title is derived from the URL."""
+
+    def __init__(self, context: "FakeSearchBrowserContext | None" = None) -> None:
+        self.context = context
+        self.url = "about:blank"
         self.closed = False
         self.requested_url: str | None = None
 
-    async def goto(self, url: str, timeout: float | None = None) -> SimpleNamespace:
+    async def goto(self, url: str, timeout: float | None = None, **_kwargs: object) -> SimpleNamespace:
         self.requested_url = url
-        if self._goto_error is not None:
-            raise self._goto_error
-        return SimpleNamespace(status=self.http_status)
+        if url.endswith("/refused"):
+            raise PlaywrightError("net::ERR_FAILED")
+        self.url = url
+        return SimpleNamespace(status=200)
 
     async def title(self) -> str:
-        return self._page_title
+        return f"title of {self.url}"
 
     async def content(self) -> str:
-        return self._html
+        return ""
 
-    async def close(self) -> None:
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self, **_kwargs: object) -> None:
         self.closed = True
 
 
 class FakeSearchBrowserContext:
-    def __init__(
-        self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
-    ) -> None:
-        self.page = FakeSearchPage(html, page_title, goto_error, http_status)
+    def __init__(self) -> None:
+        self.opened: list[FakeSearchPage] = []
+
+    @property
+    def page(self) -> FakeSearchPage:
+        return self.opened[0]
+
+    @property
+    def pages(self) -> list[FakeSearchPage]:
+        return list(self.opened)
 
     async def new_page(self) -> FakeSearchPage:
-        return self.page
+        page = FakeSearchPage(context=self)
+        self.opened.append(page)
+        return page
 
 
 class FakeCdpSession:
@@ -653,17 +797,26 @@ class FakeClearingBrowserContext:
         # Storage key the browser reports for a tab whose URL names no origin, as it does for a
         # window opened on about:blank. A tab absent from this list has an opaque origin and none.
         self.inherited_storage_keys: list[tuple[object, str]] = []
+        # (frame, page) pairs whose frame session is attached to the page's target, as raw-CDP attaches
+        # a same-process frame, so protocol calls on it answer for the page's document.
+        self.frames_attached_to_page_target: list[tuple[object, object]] = []
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
         if self.clear_cookies_error is not None:
             raise self.clear_cookies_error
 
+    async def _probe_storage(self, document: object) -> str:
+        return "unreachable" if document in self.frames_without_storage else "reachable"
+
     async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        if not hasattr(page, "evaluate"):
+            page.evaluate = lambda expression, document=page: self._probe_storage(document)  # type: ignore[attr-defined]
         if page in self.frames_without_own_session:
             raise PlaywrightError("This frame does not have a separate CDP session")
+        answering = next((held for frame, held in self.frames_attached_to_page_target if frame is page), page)
         session = FakeCdpSession(
-            storage_reachable=page not in self.frames_without_storage,
+            storage_reachable=answering not in self.frames_without_storage,
             origins_refusing_clear=tuple(self.origins_refusing_clear),
             origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
             refuses_clear=page in self.frames_refusing_clear,
@@ -722,6 +875,26 @@ class ScopeRecordingAgentFunction(AgentFunction):
         if self._record_arms:
             self.events.append("token")
         return False
+
+
+class OcrRecordingAgentFunction(ScopeRecordingAgentFunction):
+    def __init__(self, text: str | None, *, enabled: bool = True) -> None:
+        super().__init__(record_arms=False)
+        self.text = text
+        self.enabled = enabled
+        self.images: list[bytes] = []
+
+    def supports_image_captcha_ocr(self) -> bool:
+        return True
+
+    async def image_captcha_ocr_enabled(self, organization_id: str | None = None, url: str | None = None) -> bool:
+        return self.enabled
+
+    async def read_image_captcha_text(
+        self, image_png: bytes, *, organization_id: str | None = None, url: str | None = None
+    ) -> str | None:
+        self.images.append(image_png)
+        return self.text
 
 
 _T = TypeVar("_T")

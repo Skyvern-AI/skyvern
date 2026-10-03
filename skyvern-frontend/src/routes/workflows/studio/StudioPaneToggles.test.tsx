@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -19,10 +20,12 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { useStudioRunSignals } from "./useStudioRunSignals";
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
+import { useStudioPanes } from "./useStudioPanes";
 import { StudioPaneToggles } from "./StudioPaneToggles";
 import { claimRunCompletionNotice } from "../workflowRun/runCompletionNotices";
 
@@ -92,8 +95,10 @@ const initialBrowserState = useStudioBrowserStore.getState();
 
 function LocationProbe() {
   const location = useLocation();
+  const { panes } = useStudioPanes();
   return (
     <>
+      <output data-testid="panes">{panes.join(",")}</output>
       <output data-testid="search">{location.search}</output>
       <output data-testid="route-state">
         {JSON.stringify(location.state ?? null)}
@@ -124,7 +129,9 @@ function renderAt(path = "/workflows/wpid_abc/studio", state?: unknown) {
         state === undefined ? path : { ...parsePath(path), state },
       ]}
     >
-      <ToggleHarness />
+      <StudioPaneDefaultsProvider hasBlocks={true}>
+        <ToggleHarness />
+      </StudioPaneDefaultsProvider>
     </MemoryRouter>,
   );
 }
@@ -133,7 +140,9 @@ function renderInBrowser(path: string, state: unknown) {
   window.history.replaceState({ usr: state, key: "seed", idx: 0 }, "", path);
   return render(
     <BrowserRouter>
-      <ToggleHarness />
+      <StudioPaneDefaultsProvider hasBlocks={true}>
+        <ToggleHarness />
+      </StudioPaneDefaultsProvider>
     </BrowserRouter>,
   );
 }
@@ -152,15 +161,18 @@ function runsTab(): HTMLButtonElement {
   );
 }
 
-function currentPanes(): string | null {
+function urlPanes(): string | null {
   const search = screen.getByTestId("search").textContent ?? "";
   return new URLSearchParams(search).get("panes");
+}
+
+function currentPanes(): string {
+  return screen.getByTestId("panes").textContent ?? "";
 }
 
 afterEach(cleanup);
 beforeEach(() => {
   localStorage.clear();
-  useStudioShellStore.getState().reset();
   window.history.replaceState(null, "", "/");
   useStudioBrowserStore.setState(initialBrowserState, true);
   runsQueryMock.mockReturnValue({ data: [] });
@@ -176,11 +188,11 @@ describe("StudioPaneToggles structure", () => {
     }
   });
 
-  test("reflects the default panes (editor + browser) as expanded", () => {
+  test("reflects the built-agent default panes as expanded", () => {
     renderAt();
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
   test("reflects an explicit ?panes= list", () => {
@@ -206,9 +218,9 @@ describe("StudioPaneToggles structure", () => {
     expect(runsTab().getAttribute("aria-pressed")).toBe("false");
   });
 
-  test("a block-run deep link opens Editor, Browser and the run pane", () => {
+  test("a block-run deep link opens Browser and the run pane", () => {
     renderAt("/workflows/wpid_abc/studio?wr=run_1&bl=block_1");
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("false");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
     expect(runsTab().getAttribute("aria-pressed")).toBe("true");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
@@ -217,23 +229,25 @@ describe("StudioPaneToggles structure", () => {
 
 describe("StudioPaneToggles pane toggling", () => {
   test("opening Copilot updates runtime state without creating a panes param", () => {
-    renderAt();
+    renderAt("/workflows/wpid_abc/studio?wr=wr_1");
     fireEvent.click(tab(/^Copilot/));
-    expect(currentPanes()).toBeNull();
+    expect(urlPanes()).toBeNull();
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
   test("closing Copilot keeps the committed panes URL unchanged", () => {
     renderAt("/workflows/wpid_abc/studio?panes=editor,copilot,browser");
     fireEvent.click(tab(/^Copilot/));
-    expect(currentPanes()).toBe("editor,copilot,browser");
+    expect(urlPanes()).toBe("editor,copilot,browser");
+    expect(currentPanes()).toBe("editor,browser");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
 
-  test("closing the last pane leaves an explicit empty list", () => {
+  test("closing the last pane leaves an empty runtime list and preserves the shared URL", () => {
     renderAt("/workflows/wpid_abc/studio?panes=editor");
     fireEvent.click(tab(/^Editor/));
     expect(currentPanes()).toBe("");
+    expect(urlPanes()).toBe("editor");
   });
 
   test("Copilot toggling preserves unrelated params without adding panes", () => {
@@ -329,6 +343,7 @@ describe("StudioPaneToggles run selector", () => {
     fireEvent.click(tab("View Run: wr_current"));
 
     expect(currentPanes()?.split(",")).toContain("overview");
+    expect(urlPanes()).toBe("copilot");
     expect(screen.queryByText("Past runs")).toBeNull();
   });
 
@@ -364,11 +379,9 @@ describe("StudioPaneToggles run selector", () => {
     fireEvent.click(tab("Past Runs"));
     fireEvent.click(await screen.findByText("wr_pick"));
 
-    // Selecting opens the run pane (overview). The row's switchRun also sets
-    // ?wr= (covered in PastRunsList.test); under MemoryRouter window.location
-    // doesn't sync between the two navigations, so ?wr= can't be co-asserted
-    // here, but the openPane merge is exercised.
-    expect(currentPanes()?.split(",")).toContain("overview");
+    expect(currentPanes()).toBe("browser,overview");
+    expect(urlPanes()).toBeNull();
+    expect(screen.getByTestId("search").textContent).toBe("?wr=wr_pick");
     await waitFor(() => expect(screen.queryByText("wr_pick")).toBeNull());
   });
 
@@ -394,7 +407,8 @@ describe("StudioPaneToggles run selector", () => {
         screen.getByTestId("search").textContent ?? "",
       );
       expect(params.get("wr")).toBe("wr_pick");
-      expect(params.get("panes")?.split(",")).toContain("overview");
+      expect(params.has("panes")).toBe(false);
+      expect(currentPanes()).toBe("browser,overview");
       expect(screen.getByTestId("route-state").textContent).toBe("null");
     });
     expect(window.history.state.usr).toBeNull();
@@ -417,6 +431,7 @@ describe("StudioPaneToggles run selector", () => {
     fireEvent.click(await screen.findByText("wr_same"));
 
     expect(currentPanes()?.split(",")).toContain("overview");
+    expect(urlPanes()).toBe("copilot");
   });
 });
 
@@ -506,6 +521,43 @@ describe("StudioPaneToggles browser activity", () => {
     fireEvent.click(tab(/Browser/));
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(false);
     expect(currentPanes()).toBe("copilot,browser");
+    expect(urlPanes()).toBe("copilot");
+  });
+});
+
+describe("StudioPaneToggles Copilot question", () => {
+  afterEach(() => useCopilotHeaderStore.getState().setAttention(null));
+
+  test.each(["copilot", "browser"])(
+    "flags the Copilot tab while a question waits (panes=%s)",
+    (panes) => {
+      useCopilotHeaderStore.getState().setAttention("question");
+      renderAt(`/workflows/wpid_abc/studio?panes=${panes}`);
+      expect(
+        screen.getByRole("button", {
+          name: "Copilot, waiting for your answer",
+        }),
+      ).toBeTruthy();
+    },
+  );
+
+  test("names a sign-in request instead of a question", () => {
+    useCopilotHeaderStore.getState().setAttention("credential");
+    renderAt("/workflows/wpid_abc/studio?panes=browser");
+    expect(
+      screen.getByRole("button", { name: "Copilot, needs to sign in" }),
+    ).toBeTruthy();
+  });
+
+  test("drops the flag once the question is answered", () => {
+    useCopilotHeaderStore.getState().setAttention("question");
+    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    act(() => useCopilotHeaderStore.getState().setAttention(null));
+    expect(
+      screen.queryByRole("button", {
+        name: "Copilot, waiting for your answer",
+      }),
+    ).toBeNull();
   });
 });
 
@@ -579,7 +631,7 @@ describe("StudioPaneToggles keyboard navigation", () => {
   test("arrow keys move focus without toggling panes", () => {
     renderAt();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowRight" });
-    expect(currentPanes()).toBeNull();
+    expect(urlPanes()).toBeNull();
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
   });
 });

@@ -132,7 +132,7 @@ def with_budget_expiry(outcome: TurnOutcome, state: BudgetExpiryState) -> TurnOu
 def with_copilot_code_mode_metadata(
     outcome: TurnOutcome,
     *,
-    effective_mode: CopilotComposerMode,
+    effective_mode: CopilotComposerMode | None,
     code_available: bool,
     turn_id: str | None,
 ) -> TurnOutcome:

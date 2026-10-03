@@ -807,7 +807,7 @@ def _global_get_by_text_wait_for_diagnostic(
         message=(
             "Code block waits on global `page.get_by_text(...).wait_for(...)`, which can collide with "
             "multiple matching text nodes under Playwright strict mode. Scope the text lookup "
-            "through a locator/container or narrow it with `first`, `nth`, or `filter` before waiting."
+            "through a locator/container or `filter` it before waiting."
         ),
     )
 

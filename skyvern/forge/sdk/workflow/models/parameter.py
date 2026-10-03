@@ -126,6 +126,7 @@ class BitwardenLoginCredentialParameter(Parameter):
     bitwarden_collection_id: str | None = None
     # bitwarden item id to request the login credential
     bitwarden_item_id: str | None = None
+    totp_identifier: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -204,6 +205,7 @@ class OnePasswordCredentialParameter(Parameter):
     # detection. Needed for items whose OTP is stored in a plain field (e.g. named "digits") rather
     # than a native 1Password one-time-password field.
     totp_field_name: str | None = None
+    totp_identifier: str | None = None
 
     created_at: datetime
     modified_at: datetime

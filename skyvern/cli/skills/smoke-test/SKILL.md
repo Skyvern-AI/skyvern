@@ -236,6 +236,26 @@ Never omit it and rely on the current page - this prevents test-to-test state bl
 
 After navigation, run the health gate to catch broken pages early:
 
+In extension mode, use this health gate. Do not call `skyvern_evaluate`. Before each `skyvern_navigate` to a route under test, call `skyvern_get_errors(clear=True)`, `skyvern_console_messages(clear=True)`, `skyvern_handle_dialog(clear=True)`, and `skyvern_network_requests(clear=True)`; discard what they return.
+
+```text
+skyvern_tab_list()
+skyvern_get_errors()
+skyvern_console_messages(level="error")
+skyvern_get_html(selector="body")
+skyvern_find(by="role", value="alert")
+skyvern_find(by="role", value="dialog")
+skyvern_handle_dialog()
+```
+
+PASS requires the active tab URL to match the expected route, with no unexpected login redirect.
+The body must contain the expected page content, not only scripts or an empty app container.
+Require no unexpected error text, visible alerts, visible dialogs, JavaScript errors, console errors, or JavaScript dialog events.
+`skyvern_handle_dialog` reads dialog history; JavaScript dialogs are auto-dismissed by default.
+If a call fails or evidence is incomplete, record FAIL and stop this test. Do not treat missing evidence as PASS.
+
+Outside extension mode, use this health gate:
+
 ```text
 skyvern_evaluate(expression="(() => {
   const errors = [];

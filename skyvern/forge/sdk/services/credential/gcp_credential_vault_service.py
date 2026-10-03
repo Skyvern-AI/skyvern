@@ -6,6 +6,7 @@ import structlog
 from pydantic import BaseModel, Field, TypeAdapter
 
 from skyvern.config import settings
+from skyvern.exceptions import CredentialItemNotFoundError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.gcp import AsyncGcpSecretManagerClient
 from skyvern.forge.sdk.schemas.credentials import (
@@ -67,7 +68,12 @@ class GcpCredentialVaultService(CredentialVaultService):
         self._client = client
         self._project_id = project_id
 
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+    ) -> Credential:
         item_id = await self._create_gcp_secret_item(
             organization_id=organization_id,
             credential=data.credential,
@@ -78,6 +84,7 @@ class GcpCredentialVaultService(CredentialVaultService):
             data=data,
             item_id=item_id,
             vault_type=CredentialVaultType.GCP,
+            created_by=created_by,
         )
 
         return credential
@@ -152,7 +159,7 @@ class GcpCredentialVaultService(CredentialVaultService):
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_id=db_credential.item_id, project_id=self._project_id)
         if secret_json_str is None:
-            raise ValueError(f"GCP Credential Vault secret not found for {db_credential.item_id}")
+            raise CredentialItemNotFoundError(f"GCP Credential Vault secret not found for {db_credential.item_id}")
 
         data = GcpCredentialVaultService._CREDENTIAL_DATA_ADAPTER.validate_json(secret_json_str)
         if isinstance(data, GcpCredentialVaultService._PasswordCredentialDataImage):

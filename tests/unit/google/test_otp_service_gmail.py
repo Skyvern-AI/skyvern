@@ -523,3 +523,216 @@ async def test_get_otp_value_from_email_throttles_gmail_searches_within_polling_
     get_credentials.assert_awaited_once()
     search_messages.assert_awaited_once()
     assert all(log.get("event") != "Unexpected email OTP lookup failure" for log in logs)
+
+
+@pytest.mark.asyncio
+async def test_failed_gmail_search_is_recorded_then_cleared_by_a_successful_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(id="goac_1", scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES))
+    monkeypatch.setattr(otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[credential]))
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    search_messages = AsyncMock(
+        side_effect=[google_gmail_service.GmailAPIError(status=503, code=None, message="unavailable"), []]
+    )
+    monkeypatch.setattr(otp_email.google_gmail_service, "search_recent_otp_messages", search_messages)
+    monkeypatch.setattr(
+        agent_functions,
+        "build_email_otp_sources",
+        lambda current_agent: [otp_email.GmailOTPSource(current_agent.get_google_workspace_credentials)],
+    )
+
+    context = EmailOTPVerificationContext()
+    source_context = context.for_source(otp_email.GmailOTPSource.name)
+
+    assert (
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+        is None
+    )
+    assert source_context.failed_credential_ids == {"goac_1"}
+
+    source_context.last_searched_at_by_credential.clear()
+    assert (
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+        is None
+    )
+    assert source_context.failed_credential_ids == set()
+    assert source_context.completed_credential_ids == {"goac_1"}
+
+
+@pytest.mark.asyncio
+async def test_refreshed_credential_list_drops_a_failure_for_a_disconnected_inbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(id="goac_current", scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES))
+    monkeypatch.setattr(otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[credential]))
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    monkeypatch.setattr(otp_email.google_gmail_service, "search_recent_otp_messages", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        agent_functions,
+        "build_email_otp_sources",
+        lambda current_agent: [otp_email.GmailOTPSource(current_agent.get_google_workspace_credentials)],
+    )
+
+    context = EmailOTPVerificationContext()
+    source_context = context.for_source(otp_email.GmailOTPSource.name)
+    source_context.failed_credential_ids.add("goac_disconnected")
+
+    assert (
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+        is None
+    )
+
+    assert source_context.credential_ids == ["goac_current"]
+    assert source_context.failed_credential_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_unparseable_gmail_candidate_is_counted_without_being_marked_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(id="goac_1", scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES))
+    monkeypatch.setattr(otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[credential]))
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    candidate = google_gmail_service.GmailMessageCandidate(
+        message_id="msg_unreadable",
+        content="Your verification code is 123456",
+        internal_date=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        otp_email.google_gmail_service, "search_recent_otp_messages", AsyncMock(return_value=[candidate])
+    )
+    monkeypatch.setattr(otp_service, "parse_otp_login", AsyncMock(side_effect=RuntimeError("parser down")))
+    monkeypatch.setattr(
+        agent_functions,
+        "build_email_otp_sources",
+        lambda current_agent: [otp_email.GmailOTPSource(current_agent.get_google_workspace_credentials)],
+    )
+
+    context = EmailOTPVerificationContext()
+    source_context = context.for_source(otp_email.GmailOTPSource.name)
+
+    assert (
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+        is None
+    )
+
+    assert source_context.unreadable_message_keys == {("goac_1", "msg_unreadable")}
+    assert not source_context.has_seen_message("goac_1", "msg_unreadable")
+
+
+@pytest.mark.asyncio
+async def test_unusable_gmail_token_counts_as_a_failed_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(id="goac_1", scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES))
+    monkeypatch.setattr(otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[credential]))
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=None))
+    search_messages = AsyncMock(return_value=[])
+    monkeypatch.setattr(otp_email.google_gmail_service, "search_recent_otp_messages", search_messages)
+    monkeypatch.setattr(
+        agent_functions,
+        "build_email_otp_sources",
+        lambda current_agent: [otp_email.GmailOTPSource(current_agent.get_google_workspace_credentials)],
+    )
+
+    context = EmailOTPVerificationContext()
+    source_context = context.for_source(otp_email.GmailOTPSource.name)
+
+    assert (
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+        is None
+    )
+
+    search_messages.assert_not_awaited()
+    assert source_context.failed_credential_ids == {"goac_1"}
+    assert source_context.completed_credential_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_parse_cancelled_by_the_budget_still_marks_the_message_it_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    agent = AgentFunction()
+    credential = SimpleNamespace(id="goac_1", scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES))
+    monkeypatch.setattr(otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[credential]))
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    candidate = google_gmail_service.GmailMessageCandidate(
+        message_id="msg_in_flight",
+        content="Your verification code is 123456",
+        internal_date=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        otp_email.google_gmail_service, "search_recent_otp_messages", AsyncMock(return_value=[candidate])
+    )
+    monkeypatch.setattr(otp_service, "parse_otp_login", AsyncMock(side_effect=asyncio.CancelledError()))
+    monkeypatch.setattr(
+        agent_functions,
+        "build_email_otp_sources",
+        lambda current_agent: [otp_email.GmailOTPSource(current_agent.get_google_workspace_credentials)],
+    )
+
+    context = EmailOTPVerificationContext()
+    source_context = context.for_source(otp_email.GmailOTPSource.name)
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+
+    assert source_context.unreadable_message_keys == {("goac_1", "msg_in_flight")}
+    assert not source_context.has_seen_message("goac_1", "msg_in_flight")
+
+
+@pytest.mark.asyncio
+async def test_a_credential_list_refresh_that_never_returns_leaves_the_list_marked_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    agent = AgentFunction()
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    monkeypatch.setattr(
+        agent_functions,
+        "build_email_otp_sources",
+        lambda current_agent: [otp_email.GmailOTPSource(current_agent.get_google_workspace_credentials)],
+    )
+
+    context = EmailOTPVerificationContext()
+    source_context = context.for_source(otp_email.GmailOTPSource.name)
+    source_context.credential_ids = []
+    source_context.credential_ids_loaded_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(side_effect=asyncio.CancelledError())
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+    assert source_context.credential_list_refresh_failed is True
+
+    credential = SimpleNamespace(id="goac_1", scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES))
+    monkeypatch.setattr(otp_email.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[credential]))
+    monkeypatch.setattr(otp_email.google_gmail_service, "search_recent_otp_messages", AsyncMock(return_value=[]))
+    assert (
+        await agent.get_otp_value_from_email(
+            organization_id="org_1", totp_identifier="user@example.com", context=context
+        )
+        is None
+    )
+    assert source_context.credential_list_refresh_failed is False

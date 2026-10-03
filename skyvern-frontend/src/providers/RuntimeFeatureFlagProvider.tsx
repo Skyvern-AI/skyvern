@@ -13,6 +13,9 @@ function RuntimeFeatureFlagProvider({ children }: PropsWithChildren) {
       if (flagName === "CODE_BLOCK_ACCESS") {
         return data?.code_block_access;
       }
+      if (flagName === "ENABLE_DISCOVER_COPILOT_HANDOFF") {
+        return false;
+      }
       return undefined;
     },
     [data],

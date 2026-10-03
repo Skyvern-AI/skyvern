@@ -18,11 +18,12 @@ import type {
   WorkflowApiResponse,
   Parameter,
 } from "@/routes/workflows/types/workflowTypes";
+import { getLocalTimezone } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import {
-  getLocalTimezone,
-  isValidCron,
-  meetsMinCronInterval,
-} from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
+  buildCadencePayload,
+  isCadenceAccepted,
+  type IntervalDraft,
+} from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConfigFields";
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
@@ -45,6 +46,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
   const [selectedWorkflow, setSelectedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
   const [cronExpression, setCronExpression] = useState("0 9 * * *");
+  const [interval, setIntervalDraft] = useState<IntervalDraft | null>(null);
   const [timezone, setTimezone] = useState(getLocalTimezone);
 
   const [scheduleName, setScheduleName] = useState("");
@@ -119,14 +121,14 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
     }
   }, [selectedWorkflowId, workflowParameters, resetParameters]);
 
-  const valid = isValidCron(cronExpression);
-  const cronAccepted = valid && meetsMinCronInterval(cronExpression);
+  const cadenceAccepted = isCadenceAccepted(cronExpression, interval, timezone);
 
   function resetForm() {
     setWorkflowSearch("");
     setWorkflowPickerOpen(false);
     setSelectedWorkflow(null);
     setCronExpression("0 9 * * *");
+    setIntervalDraft(null);
     setTimezone(getLocalTimezone());
     setScheduleName("");
     setScheduleDescription("");
@@ -136,7 +138,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
   function handleSubmit() {
     if (!selectedWorkflow || !workflowDetailLoaded) return;
     const parametersValid = validateParameters();
-    if (!cronAccepted || !parametersValid) return;
+    if (!cadenceAccepted || !parametersValid) return;
     const payload = buildScheduleParametersPayload(
       parameters,
       workflowParameters,
@@ -145,7 +147,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
       {
         workflowPermanentId: selectedWorkflow.workflow_permanent_id,
         request: {
-          cron_expression: cronExpression,
+          ...buildCadencePayload(cronExpression, interval, timezone),
           timezone,
           ...(scheduleName && { name: scheduleName }),
           ...(scheduleDescription && { description: scheduleDescription }),
@@ -261,6 +263,8 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
             timezone={timezone}
             onCronChange={setCronExpression}
             onTimezoneChange={setTimezone}
+            interval={interval}
+            onIntervalChange={setIntervalDraft}
             disabled={createMutation.isPending}
           />
         </div>
@@ -271,7 +275,9 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
           </Button>
           <Button
             disabled={
-              !cronAccepted || !workflowDetailLoaded || createMutation.isPending
+              !cadenceAccepted ||
+              !workflowDetailLoaded ||
+              createMutation.isPending
             }
             onClick={handleSubmit}
           >

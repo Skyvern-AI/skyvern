@@ -11,10 +11,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import psutil
 import structlog
@@ -64,10 +65,26 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.event_order import EventHold
 
 LOG = structlog.get_logger(__name__)
 
 MAX_CLIENT_EVENT_QUEUE_BYTES = 64 * 1024 * 1024
+
+_ORDERED_EVENTS = {"debugger.event", "debugger.detached", "scope.tabRemoved"}
+
+
+class _QueuedEvent(NamedTuple):
+    frame_size: int
+    generation: int
+    event: str
+    params: dict[str, Any]
+    dependencies: tuple[asyncio.Future[None], ...]
+    read_number: int
+
+
+class _ResumeTab(NamedTuple):
+    tab_id: int
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
@@ -111,8 +128,9 @@ class BrokerClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
-        self._event_queue: asyncio.Queue[tuple[int, int, str, dict[str, Any]]] | None = None
+        self._event_queue: asyncio.Queue[_QueuedEvent | _ResumeTab] | None = None
         self._event_queue_bytes = 0
+        self._read_number = 0
         self._event_generation = 0
         self._event_forwarder_generation: int | None = None
         self._event_forwarder_task: asyncio.Task[None] | None = None
@@ -126,6 +144,10 @@ class BrokerClient:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._live_consumers: set[str] = set()
+        self._resumption_futures: dict[str, asyncio.Future[None]] = {}
+        self._request_holds: dict[str, EventHold] = {}
+        self._event_holds: set[EventHold] = set()
         self._large_response_ids: set[str] = set()
         self._request_counter = 0
         self._client_id: str | None = None
@@ -205,12 +227,13 @@ class BrokerClient:
             self._extension_connected.set()
         return connected
 
-    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request(self, op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None) -> dict:
         await self.start()
         result = await self._control_request(
             "extension.request",
             {"op": op, "args": args, "timeout": min(timeout, 30.0)},
             timeout + 1,
+            hold=hold,
         )
         return result
 
@@ -366,6 +389,7 @@ class BrokerClient:
         self._reader = reader
         self._writer = writer
         self._connection_generation = connection_generation
+        self._clear_event_order()
         self._transport_generation += 1
         transport_generation = self._transport_generation
         self._disconnect_notified = False
@@ -376,6 +400,7 @@ class BrokerClient:
 
     async def _authenticate(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int:
         challenge, _size = await read_frame(reader, max_size=PREAUTH_FRAME_LIMIT, timeout=10.0)
+        self._read_number += 1
         if (
             set(challenge) != {"v", "type", "event", "params"}
             or challenge.get("type") != "event"
@@ -417,6 +442,7 @@ class BrokerClient:
                 args["operator"] = True
         await write_frame(writer, request_frame(request_id, op, args), max_size=PREAUTH_FRAME_LIMIT)
         response, _size = await read_frame(reader, max_size=PREAUTH_FRAME_LIMIT, timeout=10.0)
+        self._read_number += 1
         expected_response_keys = (
             {"v", "type", "id", "ok", "result"}
             if response.get("ok") is True
@@ -467,7 +493,9 @@ class BrokerClient:
         self._recovery_secret = recovery_secret
         return connection_generation
 
-    async def _control_request(self, op: str, args: dict[str, Any], timeout: float) -> dict[str, Any]:
+    async def _control_request(
+        self, op: str, args: dict[str, Any], timeout: float, *, hold: EventHold | None = None
+    ) -> dict[str, Any]:
         writer = self._writer
         if writer is None or writer.is_closing():
             raise BrowserExtensionNotConnectedError("Browser-extension broker is not connected")
@@ -475,43 +503,53 @@ class BrokerClient:
         request_id = f"c-{self._request_counter}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        if op == "extension.request":
-            self._large_response_ids.add(request_id)
-        frame = request_frame(request_id, op, args)
-        max_size = OPERATION_FRAME_LIMIT if op == "extension.request" else CONTROL_FRAME_LIMIT
-        frame_written = False
+        self._live_consumers.add(request_id)
+        if hold is not None:
+            self._request_holds[request_id] = hold
         try:
-            async with self._write_lock:
-                encoded = encode_frame(frame, max_size=max_size)
-                writer.write(encoded)
-                frame_written = True
-                await writer.drain()
-        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
-            self._pending.pop(request_id, None)
-            self._large_response_ids.discard(request_id)
-            if not future.done():
-                future.cancel()
-            await self._teardown_transport(self._transport_generation, writer)
-            raise BrowserExtensionNotConnectedError("Browser-extension broker is not connected") from exc
-        except BaseException as exc:
-            self._pending.pop(request_id, None)
-            if not frame_written or not isinstance(exc, asyncio.CancelledError):
+            if op == "extension.request":
+                self._large_response_ids.add(request_id)
+            frame = request_frame(request_id, op, args)
+            max_size = OPERATION_FRAME_LIMIT if op == "extension.request" else CONTROL_FRAME_LIMIT
+            frame_written = False
+            try:
+                async with self._write_lock:
+                    encoded = encode_frame(frame, max_size=max_size)
+                    writer.write(encoded)
+                    frame_written = True
+                    await writer.drain()
+            except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                self._pending.pop(request_id, None)
                 self._large_response_ids.discard(request_id)
-            if not future.done():
-                future.cancel()
-            raise
-        try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout)
-        except TimeoutError as exc:
-            self._pending.pop(request_id, None)
-            if not future.done():
-                future.cancel()
-            raise ExtensionRequestError("INTERNAL", "Broker request timed out") from exc
-        except asyncio.CancelledError:
-            self._pending.pop(request_id, None)
-            if not future.done():
-                future.cancel()
-            raise
+                if not future.done():
+                    future.cancel()
+                await self._teardown_transport(self._transport_generation, writer)
+                raise BrowserExtensionNotConnectedError("Browser-extension broker is not connected") from exc
+            except BaseException as exc:
+                self._pending.pop(request_id, None)
+                if not frame_written or not isinstance(exc, asyncio.CancelledError):
+                    self._large_response_ids.discard(request_id)
+                if not future.done():
+                    future.cancel()
+                raise
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout)
+            except TimeoutError as exc:
+                self._pending.pop(request_id, None)
+                if not future.done():
+                    future.cancel()
+                raise ExtensionRequestError("INTERNAL", "Broker request timed out") from exc
+            except asyncio.CancelledError:
+                self._pending.pop(request_id, None)
+                if not future.done():
+                    future.cancel()
+                raise
+        finally:
+            self._live_consumers.discard(request_id)
+            self._request_holds.pop(request_id, None)
+            resumed = self._resumption_futures.pop(request_id, None)
+            if resumed is not None and not resumed.done():
+                resumed.set_result(None)
 
     async def _read_loop(
         self,
@@ -529,6 +567,7 @@ class BrokerClient:
                     large_response_ids=self._large_response_ids,
                     large_event="extension.event",
                 )
+                self._read_number += 1
                 frame_type = frame.get("type")
                 if frame_type == "response":
                     self._handle_response(frame)
@@ -575,6 +614,28 @@ class BrokerClient:
         self._large_response_ids.discard(request_id)
         if future is None or future.done():
             return
+        if request_id in self._live_consumers:
+            hold = self._request_holds.get(request_id)
+            if hold is None or not self._hold_is_active(hold):
+                self._resumption_futures[request_id] = asyncio.get_running_loop().create_future()
+            if hold is not None:
+                if hold.trigger_read_number is None:
+                    hold.trigger_read_number = self._read_number
+                if not hold.future.done() and hold not in self._event_holds:
+                    self._event_holds.add(hold)
+                    queue = self._event_queue
+                    event_generation = self._event_forwarder_generation
+
+                    def resume_tab(_: asyncio.Future[None]) -> None:
+                        self._event_holds.discard(hold)
+                        if (
+                            queue is not None
+                            and queue is self._event_queue
+                            and event_generation == self._event_forwarder_generation
+                        ):
+                            queue.put_nowait(_ResumeTab(hold.tab_id))
+
+                    hold.future.add_done_callback(resume_tab)
         try:
             result = _parse_response(frame, request_id)
         except (BrowserExtensionBrokerError, ExtensionRequestError) as exc:
@@ -627,11 +688,13 @@ class BrokerClient:
             self._update_scoped_tabs(inner_event, inner_params)
             if self._event_forwarder_task is None or self._event_forwarder_task.done():
                 self._start_event_forwarder(transport_generation, self._writer)
+            dependencies = tuple(self._resumption_futures.values()) if inner_event in _ORDERED_EVENTS else ()
             self._enqueue_event(
                 inner_event,
                 inner_params,
                 transport_generation,
                 frame_size if frame_size is not None else _serialized_frame_size(frame),
+                dependencies,
             )
             if inner_event == "extension.hello":
                 # The broker publishes the synthetic hello before extension.connected.
@@ -657,7 +720,7 @@ class BrokerClient:
             return
         self._event_generation += 1
         event_generation = self._event_generation
-        queue: asyncio.Queue[tuple[int, int, str, dict[str, Any]]] = asyncio.Queue()
+        queue: asyncio.Queue[_QueuedEvent | _ResumeTab] = asyncio.Queue()
         self._event_queue = queue
         self._event_queue_bytes = 0
         self._event_forwarder_generation = event_generation
@@ -670,6 +733,7 @@ class BrokerClient:
         self._event_forwarder_task = None
         self._event_forwarder_generation = None
         self._event_generation += 1
+        self._clear_event_order()
         self._event_queue = None
         self._event_queue_bytes = 0
         if task is None or task is asyncio.current_task():
@@ -684,6 +748,7 @@ class BrokerClient:
         params: dict[str, Any],
         transport_generation: int,
         frame_size: int,
+        dependencies: tuple[asyncio.Future[None], ...] = (),
     ) -> None:
         if transport_generation != self._transport_generation:
             return
@@ -705,25 +770,82 @@ class BrokerClient:
             )
             raise BrowserExtensionNotConnectedError("Browser-extension event queue overflowed")
         self._event_queue_bytes += frame_size
-        queue.put_nowait((frame_size, event_generation, event, params))
+        queue.put_nowait(_QueuedEvent(frame_size, event_generation, event, params, dependencies, self._read_number))
+
+    def _hold_is_active(self, hold: EventHold) -> bool:
+        return (
+            hold.activated
+            and not hold.future.done()
+            and hold.trigger_read_number is not None
+            and hold in self._event_holds
+        )
+
+    def _tab_event_is_held(self, tab_id: int, read_number: int) -> bool:
+        return any(
+            hold.tab_id == tab_id
+            and self._hold_is_active(hold)
+            and hold.trigger_read_number is not None
+            and hold.trigger_read_number < read_number
+            for hold in self._event_holds
+        )
 
     async def _forward_events(
         self,
-        queue: asyncio.Queue[tuple[int, int, str, dict[str, Any]]],
+        queue: asyncio.Queue[_QueuedEvent | _ResumeTab],
         transport_generation: int,
         event_generation: int,
         writer: asyncio.StreamWriter | None,
     ) -> None:
+        parked: dict[int, deque[_QueuedEvent]] = {}
+
+        def is_current(queued_generation: int) -> bool:
+            return (
+                transport_generation == self._transport_generation
+                and queued_generation == self._event_forwarder_generation == event_generation
+                and queue is self._event_queue
+            )
+
         while True:
-            frame_size, queued_generation, event, params = await queue.get()
+            item = await queue.get()
+            frame_size = 0
+            event = None
             try:
-                if (
-                    transport_generation != self._transport_generation
-                    or queued_generation != self._event_forwarder_generation
-                    or queue is not self._event_queue
-                ):
+                if isinstance(item, _ResumeTab):
+                    tab_events = parked.get(item.tab_id)
+                    while tab_events:
+                        queued_event = tab_events[0]
+                        if not is_current(queued_event.generation):
+                            return
+                        if queued_event.event in _ORDERED_EVENTS and self._tab_event_is_held(
+                            item.tab_id, queued_event.read_number
+                        ):
+                            break
+                        tab_events.popleft()
+                        event = queued_event.event
+                        try:
+                            await self._on_event(event, queued_event.params)
+                        finally:
+                            if queue is self._event_queue:
+                                self._event_queue_bytes = max(0, self._event_queue_bytes - queued_event.frame_size)
+                    if not tab_events:
+                        parked.pop(item.tab_id, None)
                     continue
-                await self._on_event(event, params)
+                frame_size = item.frame_size
+                event = item.event
+                if not is_current(item.generation):
+                    continue
+                if item.dependencies:
+                    await asyncio.gather(*(asyncio.shield(dependency) for dependency in item.dependencies))
+                if not is_current(item.generation):
+                    continue
+                tab_id = item.params.get("tabId")
+                if type(tab_id) is int and (
+                    tab_id in parked or (event in _ORDERED_EVENTS and self._tab_event_is_held(tab_id, item.read_number))
+                ):
+                    parked.setdefault(tab_id, deque()).append(item)
+                    frame_size = 0
+                    continue
+                await self._on_event(event, item.params)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -839,7 +961,19 @@ class BrokerClient:
         elif event == "scope.tabRemoved" and type(params.get("tabId")) is int:
             self.scoped_tabs = [tab for tab in self.scoped_tabs if tab["tabId"] != params["tabId"]]
 
+    def _clear_event_order(self) -> None:
+        for resumed in self._resumption_futures.values():
+            if not resumed.done():
+                resumed.set_result(None)
+        self._resumption_futures.clear()
+        for hold in self._event_holds | set(self._request_holds.values()):
+            hold.release()
+        self._event_holds.clear()
+        self._request_holds.clear()
+        self._live_consumers.clear()
+
     def _disconnect_state(self) -> None:
+        self._clear_event_order()
         self._extension_connected.clear()
         self.scoped_tabs = []
         pending = tuple(self._pending.values())

@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
 
 class PersistentBrowserSessionStatus(StrEnum):
@@ -17,6 +17,9 @@ class PersistentBrowserSessionStatus(StrEnum):
     completed = "completed"
     timeout = "timeout"
     retry = "retry"
+
+
+API_BROWSER_SESSION_CREATED_BY = "api"
 
 
 FINAL_STATUSES = (
@@ -107,6 +110,7 @@ class PersistentBrowserSession(BaseModel):
     close_requested_at: datetime | None = None
     cdp_unreachable_at: datetime | None = None
     close_reason: str | None = None
+    created_by: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -119,6 +123,10 @@ class PersistentBrowserSession(BaseModel):
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
+    # Loads browser_profile_id but saves nothing at teardown, under either the bp_ or the session id.
+    profile_read_only: bool = False
+    # Keyed digest of the egress IP probed at launch; server-side only, never on BrowserSessionResponse.
+    exit_identity_digest: str | None = None
 
     @property
     def is_browser_ready(self) -> bool:
@@ -149,7 +157,41 @@ class PersistentBrowserSession(BaseModel):
         A reuse session (browser_profile_id set) must always re-export so the updated session-cookie
         sidecar survives; gating it off would silently log the profile out on the next reuse.
         """
-        return bool(self.generate_browser_profile or self.browser_profile_id)
+        return not self.profile_read_only and bool(self.generate_browser_profile or self.browser_profile_id)
+
+
+class FreshExitOutcome(StrEnum):
+    distinct_verified = "distinct_verified"
+    no_alternate = "no_alternate"
+    pin_conflict = "pin_conflict"
+
+
+class NoAlternateReason(StrEnum):
+    unsupported = "unsupported"
+    prior_not_found = "prior_not_found"
+    scope_mismatch = "scope_mismatch"
+    profile_unavailable = "profile_unavailable"
+    direct = "direct"
+    custom_proxy = "custom_proxy"
+    prior_exit_unknown = "prior_exit_unknown"
+    same_exit = "same_exit"
+    exit_unverified = "exit_unverified"
+    close_failed = "close_failed"
+
+
+class FreshExitReceipt(BaseModel):
+    """Exit ids are opaque keyed digests. ``verified`` means the two exits differed when each browser launched."""
+
+    outcome: FreshExitOutcome
+    reason: NoAlternateReason | None = None
+    prior_browser_session_id: str
+    new_browser_session_id: str | None = None
+    prior_exit_id: str | None = None
+    new_exit_id: str | None = None
+    verified: bool = False
+    proxy_location: ProxyLocation | GeoTarget | None = None
+    browser_profile_id: str | None = None
+    profile_read_only: bool = False
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

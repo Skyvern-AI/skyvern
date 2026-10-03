@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import random
+import socket
+import ssl
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -12,8 +16,11 @@ from urllib.parse import urlparse
 import httpx
 import structlog
 
-from skyvern.exceptions import InvalidUrl
+from skyvern.exceptions import BlockedHost, InvalidUrl, UnresolvableHost
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.run_enums import WebhookDeliveryStatus
+from skyvern.utils.url_validators import BLOCKED_HOST_ALLOWLIST_HINT, validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
 
@@ -25,6 +32,9 @@ NON_5XX_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
         429,
     }
 )
+
+_RETRY_LATER_STATUS_CODES: frozenset[int] = frozenset({408, 425, 429})
+_LOCAL_RESOURCE_ERRNOS: frozenset[int] = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
 
 WEBHOOK_DELIVERY_MAX_ATTEMPTS = 3
 WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS = 1.0
@@ -45,17 +55,158 @@ class PreparedWorkflowWebhook:
     webhook_callback_url: str
     signed_payload: str
     headers: dict[str, str]
+    execution_status: WorkflowRunStatus | None = None
+    execution_finished_at: datetime | None = None
+
+
+@dataclass
+class WebhookDeliveryAttempts:
+    count: int = 0
 
 
 def is_retryable_status(status_code: int) -> bool:
     return status_code in NON_5XX_RETRYABLE_STATUS_CODES or 500 <= status_code < 600
 
 
+def classify_exhausted_webhook_delivery(url: str | None) -> WebhookDeliveryStatus:
+    """Classify an exhausted final webhook from its URL alone, before any delivery evidence exists.
+
+    A structurally invalid target is a customer configuration failure; anything else stays
+    ``unattributed`` until ``refine_exhausted_webhook_delivery`` sees the final attempt.
+    """
+    if not url:
+        return WebhookDeliveryStatus.exhausted_customer_config
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return WebhookDeliveryStatus.exhausted_customer_config
+    return WebhookDeliveryStatus.exhausted_unattributed
+
+
+def refine_exhausted_webhook_delivery(
+    projection: WebhookDeliveryStatus | None,
+    *,
+    status_code: int | None = None,
+    error: BaseException | None = None,
+) -> WebhookDeliveryStatus | None:
+    """Attribute an unattributed exhaustion from the final attempt's response status or exception chain.
+
+    Evidence that does not say whose fault the failure is (5xx, 408/425/429, timeouts) stays unattributed.
+    """
+    if projection != WebhookDeliveryStatus.exhausted_unattributed:
+        return projection
+    if error is not None:
+        return _attribute_delivery_error(error)
+    if status_code is not None and 300 <= status_code < 500 and status_code not in _RETRY_LATER_STATUS_CODES:
+        return WebhookDeliveryStatus.exhausted_customer_config
+    return projection
+
+
+def _attribute_delivery_error(error: BaseException) -> WebhookDeliveryStatus:
+    # deliver_webhook returns the target's own status as a response, so an HTTPStatusError or
+    # ProxyError can only come from a hop in front of the target, such as the NAT egress proxy.
+    if isinstance(error, (httpx.ProxyError, httpx.HTTPStatusError)):
+        return WebhookDeliveryStatus.exhausted_platform
+    if isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost):
+        return WebhookDeliveryStatus.exhausted_customer_config
+    chain = list(_exception_chain(error))
+    if any(_is_local_resource_exhaustion(link) for link in chain):
+        return WebhookDeliveryStatus.exhausted_platform
+    if any(_is_customer_endpoint_failure(link) for link in chain):
+        return WebhookDeliveryStatus.exhausted_customer_config
+    return WebhookDeliveryStatus.exhausted_unattributed
+
+
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    # httpx raises from httpcore, which carries the socket/ssl error only as implicit __context__;
+    # anyio groups per-address connect failures in an ExceptionGroup.
+    seen: set[int] = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
+
+
+def _is_local_resource_exhaustion(error: BaseException) -> bool:
+    # gaierror and SSLError reuse the errno slot for their own code spaces.
+    return (
+        isinstance(error, OSError)
+        and not isinstance(error, (socket.gaierror, ssl.SSLError))
+        and error.errno in _LOCAL_RESOURCE_ERRNOS
+    )
+
+
+def _is_customer_endpoint_failure(error: BaseException) -> bool:
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_NONAME
+    return isinstance(error, (ConnectionRefusedError, ssl.SSLCertVerificationError))
+
+
 def describe_delivery_error(exc: Exception) -> str:
     # httpx timeout exceptions stringify to "", which made both persisted
-    # failure reasons and retry logs unactionable (SKY-13149).
+    # failure reasons and retry logs unactionable.
     text = str(exc).strip()
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def format_no_response_failure_reason(exc: Exception) -> str:
+    reason = f"Webhook delivery failed before receiving a response: {describe_delivery_error(exc)}"
+    if isinstance(exc, BlockedHost) and not isinstance(exc, UnresolvableHost):
+        return f"{reason} {BLOCKED_HOST_ALLOWLIST_HINT}"
+    return reason
+
+
+def format_http_failure_reason(status_code: int, body: str) -> str:
+    return f"Webhook failed with status code {status_code}, error message: {body}"
+
+
+def format_http_log_reason(status_code: int) -> str:
+    return f"Webhook failed with status code {status_code}"
+
+
+def http_status_class(status_code: int | None) -> str:
+    if status_code is None:
+        return "no_response"
+    if 200 <= status_code < 600:
+        return f"{status_code // 100}xx"
+    return "other"
+
+
+def log_workflow_webhook_delivery_finalized(
+    *,
+    workflow_run_id: str,
+    delivery_outcome: WebhookDeliveryStatus,
+    status_code: int | None,
+    attempts: int,
+    finished_at: datetime | None,
+    replay: bool = False,
+) -> None:
+    delivery_seconds = None
+    if finished_at is not None:
+        finished = finished_at if finished_at.tzinfo else finished_at.replace(tzinfo=timezone.utc)
+        delivery_seconds = (datetime.now(timezone.utc) - finished).total_seconds()
+    LOG.info(
+        "Workflow webhook delivery finalized",
+        workflow_run_id=workflow_run_id,
+        delivery_outcome=delivery_outcome.value,
+        http_status_class=http_status_class(status_code),
+        attempts=attempts,
+        delivery_seconds=delivery_seconds,
+        replay=replay,
+    )
+
+
+def status_code_from_exception(exc: Exception) -> int | None:
+    # A proxy-hop failure surfaces as httpx.HTTPStatusError with a populated response
+    # (e.g. the NAT egress proxy raising for a 5xx); expose that status on the log only.
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    return None
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -95,6 +246,7 @@ async def deliver_webhook_with_retries(
     run_id: str | None,
     max_attempts: int = WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     base_delay_seconds: float = WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
+    attempts: WebhookDeliveryAttempts | None = None,
 ) -> httpx.Response:
     parsed_url = urlparse(url)
     if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
@@ -107,14 +259,18 @@ async def deliver_webhook_with_retries(
     last_exc: Exception | None = None
 
     for attempt in range(max_attempts):
+        if attempts is not None:
+            attempts.count = attempt + 1
         try:
+            validated_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, url)
             response = await app.AGENT_FUNCTION.deliver_webhook(
-                url=url,
+                url=validated_url,
                 payload=payload,
                 headers=headers,
                 timeout_seconds=timeout_seconds,
                 organization_id=organization_id,
                 run_id=run_id,
+                resolved_ips=resolved_ips,
             )
             last_response = response
             last_exc = None
@@ -129,13 +285,25 @@ async def deliver_webhook_with_retries(
             last_exc = exc
             if not is_retryable_status(exc.response.status_code):
                 raise
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+            UnresolvableHost,
+        ) as exc:
             last_response = None
             last_exc = exc
 
         if attempt < max_attempts - 1:
             delay = _compute_backoff_delay(attempt, base_delay_seconds, last_response)
             status_code = last_response.status_code if last_response is not None else None
+            if last_response is not None:
+                error_reason = format_http_log_reason(last_response.status_code)
+            elif last_exc is not None:
+                error_reason = format_no_response_failure_reason(last_exc)
+            else:
+                error_reason = None
             log_fn = LOG.warning if status_code == 403 else LOG.info
             log_fn(
                 "Retrying webhook delivery after transient failure",
@@ -146,6 +314,7 @@ async def deliver_webhook_with_retries(
                 max_attempts=max_attempts,
                 status_code=status_code,
                 error=describe_delivery_error(last_exc) if last_exc is not None else None,
+                error_reason=error_reason,
                 sleep_seconds=delay,
                 retry_after_present=last_response is not None and "Retry-After" in last_response.headers,
             )

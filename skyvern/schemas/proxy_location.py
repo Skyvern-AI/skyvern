@@ -183,6 +183,7 @@ class GeoTarget(BaseModel):
         examples=["New York", "Los Angeles", "London", "Berlin"],
         max_length=100,
     )
+    isISP: bool = Field(default=False, description="Whether this geo target is marked as an ISP proxy location.")
 
     @field_validator("country")
     @classmethod

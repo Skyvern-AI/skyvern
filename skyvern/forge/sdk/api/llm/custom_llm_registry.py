@@ -214,6 +214,7 @@ async def prepare_org_llm_runtime(
         skyvern_context.set(context)
     context.org_default_llm_key = organization.default_llm_key if organization is not None else None
     context.org_default_secondary_llm_key = organization.default_secondary_llm_key if organization is not None else None
+    context.org_age = skyvern_context.compute_org_age(organization.created_at if organization is not None else None)
 
 
 async def ensure_custom_llm_registered_for_org(

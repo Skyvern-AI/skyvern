@@ -1,14 +1,36 @@
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
-import { type Node, Edge } from "@xyflow/react";
+import type { QueryClient } from "@tanstack/react-query";
+import {
+  applyNodeChanges,
+  applyEdgeChanges,
+  type NodeChange,
+  type EdgeChange,
+  type Node,
+  Edge,
+} from "@xyflow/react";
+import {
+  useCallback,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
+import {
+  reconcileYamlDraftAfterGraphChange,
+  refuseMutationDuringYamlCommit,
+  filterWorkflowChanges,
+  isWorkflowMutation,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 
 import {
-  WorkflowBlockType,
-  WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
   BranchCriteriaTypes,
@@ -46,6 +68,7 @@ import {
   WorkflowCreateYAMLRequest,
   ExtractionBlockYAML,
   LoginBlockYAML,
+  TerminateBlockYAML,
   WaitBlockYAML,
   FileDownloadBlockYAML,
   PDFParserBlockYAML,
@@ -53,6 +76,7 @@ import {
   URLBlockYAML,
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
+  WebSearchBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
   EmailInboxBlockYAML,
@@ -61,21 +85,18 @@ import {
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
-import {
-  EMAIL_BLOCK_SENDER,
-  REACT_FLOW_EDGE_Z_INDEX,
-  SMTP_HOST_AWS_KEY,
-  SMTP_HOST_PARAMETER_KEY,
-  SMTP_PASSWORD_AWS_KEY,
-  SMTP_PASSWORD_PARAMETER_KEY,
-  SMTP_PORT_AWS_KEY,
-  SMTP_PORT_PARAMETER_KEY,
-  SMTP_USERNAME_AWS_KEY,
-  SMTP_USERNAME_PARAMETER_KEY,
-} from "./constants";
+import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
-import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
+import {
+  codeBlockNodeDefaultData,
+  type CodeBlockNodeData,
+} from "./nodes/CodeBlockNode/types";
+import type {
+  CodeEditedBlock,
+  GoalSuggestion,
+  PendingGoalChange,
+} from "@/store/useCopilotActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -129,6 +150,10 @@ import {
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
 import { isLoginNode, loginNodeDefaultData } from "./nodes/LoginNode/types";
+import {
+  isTerminateNode,
+  terminateNodeDefaultData,
+} from "./nodes/TerminateNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import {
   fileDownloadNodeDefaultData,
@@ -149,6 +174,7 @@ import {
   validateUrl,
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
+import { webSearchNodeDefaultData } from "./nodes/WebSearchNode/types";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import { analyzeCodeBlockErrorCodes } from "./codeBlockErrorCodeDiagnostics";
@@ -655,10 +681,105 @@ function layout(
   };
 }
 
+// Keep this sentinel aligned with skyvern/forge/sdk/workflow/models/parameter.py.
+const UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY = "UNUSED_CUSTOM_SMTP_PLACEHOLDER";
+
+// Custom SMTP placeholders are undeclared; saving their keys would prevent
+// switching back to the platform sender after clearing the custom host.
+function declaredSmtpParameterKey(
+  parameter: AWSSecretParameter | undefined,
+): string | undefined {
+  if (
+    !parameter ||
+    parameter.aws_key === UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY
+  ) {
+    return undefined;
+  }
+  return parameter.key;
+}
+
+// A stored skyvern-1.0 is a pin where the workflow honours chosen engines or a person marked it; elsewhere
+// it is the routed Default. `undefined` means the workflow's semantics are unknown, so the engine is kept.
+function blockEngineForWorkflow(
+  engine: RunEngine | null | undefined,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+  enginePinned: boolean = false,
+): RunEngine | null {
+  if (
+    engine === RunEngine.SkyvernV1 &&
+    !enginePinned &&
+    effectiveDefaultEngine === null
+  ) {
+    return null;
+  }
+  return engine ?? null;
+}
+
+// Only the detail GET computes effective_default_engine; save responses and version listings omit it. It is a
+// property of the workflow rather than the version, so the cached detail answers for any version of it.
+function workflowEffectiveDefaultEngine(
+  workflow: Pick<
+    WorkflowApiResponse,
+    "workflow_permanent_id" | "effective_default_engine"
+  >,
+  queryClient: QueryClient,
+): RunEngine | null | undefined {
+  if ("effective_default_engine" in workflow) {
+    return workflow.effective_default_engine;
+  }
+  return queryClient.getQueryData<WorkflowApiResponse>([
+    "workflow",
+    workflow.workflow_permanent_id,
+  ])?.effective_default_engine;
+}
+
+type EngineBearingBlock = {
+  engine: RunEngine | null;
+  engine_pinned?: boolean;
+};
+
+function blockEngineNodeData(
+  block: EngineBearingBlock,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  return {
+    engine: blockEngineForWorkflow(
+      block.engine,
+      effectiveDefaultEngine,
+      block.engine_pinned,
+    ),
+    enginePinned: block.engine_pinned ?? false,
+  };
+}
+
+// The marker is written only beside skyvern-1.0, and only when set, so an unmarked block's YAML is unchanged.
+function engineYAML(engine: RunEngine | null, enginePinned?: boolean) {
+  return {
+    engine,
+    ...(enginePinned &&
+      engine === RunEngine.SkyvernV1 && { engine_pinned: true }),
+  };
+}
+
+function blockEngineYAML(
+  block: EngineBearingBlock,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  return engineYAML(
+    blockEngineForWorkflow(
+      block.engine,
+      effectiveDefaultEngine,
+      block.engine_pinned,
+    ),
+    block.engine_pinned,
+  );
+}
+
 function convertToNode(
   identifiers: { id: string; parentId?: string },
   block: WorkflowBlock,
   editable: boolean,
+  effectiveDefaultEngine?: RunEngine | null,
 ): AppNode {
   const common = {
     draggable: false,
@@ -726,7 +847,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -774,7 +895,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -795,7 +916,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -820,7 +941,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           legacyV2Available: isV2Engine,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
@@ -870,7 +991,7 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           exportEnabled: block.export_enabled ?? false,
           exportDataSchema:
             block.export_data_schema == null
@@ -901,7 +1022,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -913,6 +1034,18 @@ function convertToNode(
         data: {
           ...commonData,
           waitInSeconds: String(block.wait_sec ?? 1),
+        },
+      };
+    }
+    case "terminate": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "terminate",
+        data: {
+          ...commonData,
+          reason: block.reason,
+          errorCode: block.error_code ?? "",
         },
       };
     }
@@ -933,7 +1066,7 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
-          engine: block.engine ?? RunEngine.SkyvernV1,
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           downloadTimeout: block.download_timeout ?? null, // seconds
           downloadTarget: block.download_target ?? "website",
           path: block.path ?? "{{ workflow_run_id }}",
@@ -976,6 +1109,15 @@ function convertToNode(
           ),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
+          dataSchema:
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
+          userOwnedGoal: block.user_owned_goal ?? null,
+          goalNeedsRegeneration: block.goal_needs_regeneration ?? null,
+          codeEditedByHand: block.code_edited_by_hand ?? null,
         },
       };
     }
@@ -992,10 +1134,14 @@ function convertToNode(
           recipients: block.recipients.join(", "),
           subject: block.subject,
           sender: block.sender,
-          smtpHostSecretParameterKey: block.smtp_host?.key,
-          smtpPortSecretParameterKey: block.smtp_port?.key,
-          smtpUsernameSecretParameterKey: block.smtp_username?.key,
-          smtpPasswordSecretParameterKey: block.smtp_password?.key,
+          smtpHostSecretParameterKey: declaredSmtpParameterKey(block.smtp_host),
+          smtpPortSecretParameterKey: declaredSmtpParameterKey(block.smtp_port),
+          smtpUsernameSecretParameterKey: declaredSmtpParameterKey(
+            block.smtp_username,
+          ),
+          smtpPasswordSecretParameterKey: declaredSmtpParameterKey(
+            block.smtp_password,
+          ),
           customSmtpHost: block.custom_smtp_host ?? null,
           customSmtpPort:
             block.custom_smtp_port !== null &&
@@ -1096,6 +1242,7 @@ function convertToNode(
           fileUrl: block.file_url,
           fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          worksheet: block.worksheet ?? "",
           model: block.model,
         },
       };
@@ -1179,6 +1326,27 @@ function convertToNode(
         data: {
           ...commonData,
           url: block.url,
+        },
+      };
+    }
+    case "web_search": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "web_search",
+        data: {
+          ...commonData,
+          query: block.query,
+          provider: block.provider ?? "auto",
+          numResults: block.num_results ?? 10,
+          prompt: block.prompt ?? "",
+          errorCodeMapping: JSON.stringify(
+            foldWebSearchErrorCodeMapping(block),
+            null,
+            2,
+          ),
+          jsonSchema: JSON.stringify(block.json_schema ?? null, null, 2),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -2131,6 +2299,7 @@ function getElements(
   blocks: Array<WorkflowBlock>,
   settings: WorkflowSettings,
   editable: boolean,
+  effectiveDefaultEngine?: RunEngine | null,
 ): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
@@ -2177,12 +2346,16 @@ function getElements(
   nodes.push(
     startNode(startNodeId, {
       withWorkflowSettings: true,
+      totpVerificationUrl: settings.totpVerificationUrl,
+      totpIdentifier: settings.totpIdentifier,
+      adaptiveCaching: settings.adaptiveCaching,
+      generateScriptOnTerminal: settings.generateScriptOnTerminal,
       persistBrowserSession: settings.persistBrowserSession,
       reuseBrowserSession: settings.reuseBrowserSession,
       pinSavedSessionIp: settings.pinSavedSessionIp,
       browserProfileId: settings.browserProfileId,
       browserProfileKey: settings.browserProfileKey,
-      proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
+      proxyLocation: settings.proxyLocation,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
@@ -2195,7 +2368,6 @@ function getElements(
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
-      enableSelfHealing: settings.enableSelfHealing ?? false,
       maskSecrets: settings.maskSecrets,
       label: "__start_block__",
       showCode: false,
@@ -2219,6 +2391,7 @@ function getElements(
       },
       d.block,
       editable,
+      effectiveDefaultEngine,
     );
     nodes.push(node);
     if (isWorkflowBlockNode(node)) {
@@ -2614,6 +2787,17 @@ function createNode(
         },
       };
     }
+    case "terminate": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "terminate",
+        data: {
+          ...terminateNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "fileDownload": {
       return {
         ...identifiers,
@@ -2742,6 +2926,17 @@ function createNode(
         type: "fileUpload",
         data: {
           ...fileUploadNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "web_search": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "web_search",
+        data: {
+          ...webSearchNodeDefaultData,
           label,
         },
       };
@@ -3054,7 +3249,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "taskv2": {
@@ -3080,7 +3275,7 @@ function getWorkflowBlock(
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "human_interaction": {
@@ -3120,7 +3315,7 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "navigation": {
@@ -3160,7 +3355,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
       };
@@ -3179,7 +3374,7 @@ function getWorkflowBlock(
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         // export_data_schema (like export_file_name/export_records below) is
         // saved regardless of export_enabled -- the backend already no-ops on
         // all three while export is off, and gating persistence here would
@@ -3213,7 +3408,7 @@ function getWorkflowBlock(
         terminate_criterion: node.data.terminateCriterion,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "wait": {
@@ -3221,6 +3416,14 @@ function getWorkflowBlock(
         ...base,
         block_type: "wait",
         wait_sec: Number(node.data.waitInSeconds),
+      };
+    }
+    case "terminate": {
+      return {
+        ...base,
+        block_type: "terminate",
+        reason: node.data.reason,
+        error_code: node.data.errorCode.trim() || null,
       };
     }
     case "fileDownload": {
@@ -3243,7 +3446,7 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         download_timeout: node.data.downloadTimeout, // seconds
         ...(node.data.downloadTarget &&
           node.data.downloadTarget !== "website" && {
@@ -3328,6 +3531,10 @@ function getWorkflowBlock(
         ) as Record<string, string> | null,
         prompt: node.data.prompt,
         steps: node.data.steps,
+        data_schema: JSONSafeOrStringAllowArrays(node.data.dataSchema),
+        user_owned_goal: node.data.userOwnedGoal,
+        goal_needs_regeneration: node.data.goalNeedsRegeneration,
+        code_edited_by_hand: node.data.codeEditedByHand,
       };
     }
     case "dataExport": {
@@ -3393,6 +3600,7 @@ function getWorkflowBlock(
         file_url: node.data.fileUrl,
         file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+        worksheet: node.data.worksheet || null,
       };
     }
     case "textPrompt": {
@@ -3418,6 +3626,24 @@ function getWorkflowBlock(
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+    }
+    case "web_search": {
+      return {
+        ...base,
+        block_type: "web_search",
+        query: node.data.query,
+        provider: node.data.provider,
+        num_results: node.data.numResults,
+        prompt: node.data.prompt || null,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        no_results_error_code: null,
+        no_match_error_code: null,
+        json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "http_request": {
@@ -3774,6 +4000,10 @@ function getWorkflowBlocks(
 
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
+    totpVerificationUrl: null,
+    totpIdentifier: null,
+    adaptiveCaching: false,
+    generateScriptOnTerminal: false,
     persistBrowserSession: false,
     reuseBrowserSession: false,
     pinSavedSessionIp: false,
@@ -3790,7 +4020,6 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
-    enableSelfHealing: false,
     maskSecrets: false,
     runSequentially: false,
     sequentialKey: null,
@@ -3809,13 +4038,17 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const data = startNodeWithWorkflowSettings.data;
   if (isWorkflowStartNodeData(data)) {
     return {
+      totpVerificationUrl: data.totpVerificationUrl,
+      totpIdentifier: data.totpIdentifier,
+      adaptiveCaching: data.adaptiveCaching,
+      generateScriptOnTerminal: data.generateScriptOnTerminal,
       persistBrowserSession: data.persistBrowserSession,
       reuseBrowserSession: data.reuseBrowserSession,
       pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
       proxyLocation: data.proxyLocation,
-      webhookCallbackUrl: data.webhookCallbackUrl,
+      webhookCallbackUrl: data.webhookCallbackUrl || null,
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
@@ -3832,7 +4065,6 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
-      enableSelfHealing: data.enableSelfHealing,
       maskSecrets: data.maskSecrets,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
@@ -3855,22 +4087,18 @@ function generateNodeLabel(existingLabels: Array<string>) {
   throw new Error("Failed to generate a new node label");
 }
 
-/**
- * If a parameter is not displayed in the editor, we should echo its value back when saved.
- */
 function convertEchoParameters(
-  parameters: Array<AWSSecretParameter>,
+  parameters: Array<Parameter>,
 ): Array<ParameterYAML> {
-  return parameters.map((parameter) => {
-    if (parameter.parameter_type === "aws_secret") {
-      return {
-        key: parameter.key,
-        parameter_type: "aws_secret",
-        aws_key: parameter.aws_key,
-      };
-    }
-    throw new Error("Unknown parameter type");
-  });
+  // Output parameters are generated from block labels; the API rejects them in YAML requests.
+  return parameters
+    .filter((parameter) => parameter.parameter_type === "aws_secret")
+    .map((parameter) => ({
+      key: parameter.key,
+      description: parameter.description,
+      parameter_type: parameter.parameter_type,
+      aws_key: parameter.aws_key,
+    }));
 }
 
 function getOutputParameterKey(label: string) {
@@ -4184,72 +4412,6 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
   });
 }
 
-const sendEmailExpectedParameters = [
-  {
-    key: SMTP_HOST_PARAMETER_KEY,
-    aws_key: SMTP_HOST_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_PORT_PARAMETER_KEY,
-    aws_key: SMTP_PORT_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_USERNAME_PARAMETER_KEY,
-    aws_key: SMTP_USERNAME_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_PASSWORD_PARAMETER_KEY,
-    aws_key: SMTP_PASSWORD_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-] as const;
-
-function getBlocksOfType(
-  blocks: Array<BlockYAML>,
-  blockType: WorkflowBlockType,
-): Array<BlockYAML> {
-  const blocksOfType: Array<BlockYAML> = [];
-  for (const block of blocks) {
-    if (
-      block.block_type === WorkflowBlockTypes.ForLoop ||
-      block.block_type === WorkflowBlockTypes.WhileLoop
-    ) {
-      const subBlocks = block.loop_blocks;
-      const subBlocksOfType = getBlocksOfType(subBlocks, blockType);
-      blocksOfType.push(...subBlocksOfType);
-    } else {
-      if (block.block_type === blockType) {
-        blocksOfType.push(block);
-      }
-    }
-  }
-  return blocksOfType;
-}
-
-function getAdditionalParametersForEmailBlock(
-  blocks: Array<BlockYAML>,
-  parameters: Array<ParameterYAML>,
-): Array<ParameterYAML> {
-  const emailBlocks = getBlocksOfType(blocks, WorkflowBlockTypes.SendEmail);
-  if (emailBlocks.length === 0) {
-    return [];
-  }
-  const sendEmailParameters = sendEmailExpectedParameters.flatMap(
-    (parameter) => {
-      const existingParameter = parameters.find((p) => p.key === parameter.key);
-      if (existingParameter) {
-        return [];
-      }
-      return [parameter];
-    },
-  );
-
-  return sendEmailParameters;
-}
-
 function getUniqueLabelForExistingNode(
   label: string,
   existingLabels: Array<string>,
@@ -4382,11 +4544,25 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "navigation":
       return node.data.engine !== RunEngine.SkyvernV2;
     case "loop":
-    case "conditional":
       // A container itself navigates nothing; its children do.
       return nodes.some(
         (child) =>
           child.parentId === node.id && leavesBrowserState(child, nodes),
+      );
+    case "conditional":
+      // Only the matched branch runs, so a page is open afterwards only when
+      // every branch opens one and a default branch catches the no-match case.
+      return (
+        node.data.branches.some((branch) => branch.is_default) &&
+        node.data.branches.every((branch) =>
+          nodes.some(
+            (child) =>
+              child.parentId === node.id &&
+              isWorkflowBlockNode(child) &&
+              child.data.conditionalBranchId === branch.id &&
+              leavesBrowserState(child, nodes),
+          ),
+        )
       );
     default:
       return false;
@@ -4403,6 +4579,33 @@ function isFirstBrowserTaskBlock(
     if (!node) return false;
     return leavesBrowserState(node, nodes);
   });
+}
+
+// A run starts on about:blank, so the backend fails a first page-opening block that has no
+// URL (MissingStarterUrl).
+function isMissingRequiredStartUrl(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  const node = nodes.find((node) => node.id === id);
+  if (!node) return false;
+  switch (node.type) {
+    case "task":
+    case "navigation":
+    case "action":
+    case "extraction":
+    case "login":
+    case "url":
+    case "fileDownload":
+      return (
+        node.data.url.trim() === "" &&
+        leavesBrowserState(node, nodes) &&
+        isFirstBrowserTaskBlock(nodes, edges, id)
+      );
+    default:
+      return false;
+  }
 }
 
 function convertParametersToParameterYAML(
@@ -4554,8 +4757,41 @@ export function upgradeWorkflowDefinitionToVersionTwo(
   return { blocks: clonedBlocks, version: targetVersion };
 }
 
+export function foldWebSearchErrorCodeMapping(
+  block: Pick<
+    WebSearchBlockYAML,
+    "error_code_mapping" | "no_results_error_code" | "no_match_error_code"
+  >,
+): Record<string, string> | null {
+  const mapping = new Map(Object.entries(block.error_code_mapping ?? {}));
+  const noResultsCode = block.no_results_error_code?.trim();
+  const noMatchCode = block.no_match_error_code?.trim();
+  const legacyEntries = [
+    [noResultsCode, "The search returned no results."],
+    [noMatchCode, "No search result satisfies the Prompt."],
+  ] as const;
+  for (const [code, description] of legacyEntries) {
+    if (
+      !code ||
+      Array.from(code).length > 128 ||
+      /\p{C}/u.test(code) ||
+      mapping.has(code)
+    ) {
+      continue;
+    }
+    mapping.set(
+      code,
+      noResultsCode === noMatchCode
+        ? "The search returned no results, or no search result satisfies the Prompt."
+        : description,
+    );
+  }
+  return mapping.size ? Object.fromEntries(mapping) : null;
+}
+
 function convertBlocksToBlockYAML(
   blocks: Array<WorkflowBlock>,
+  effectiveDefaultEngine?: RunEngine | null,
 ): Array<BlockYAML> {
   return blocks.map((block) => {
     const base = {
@@ -4589,7 +4825,7 @@ function convertBlocksToBlockYAML(
           disable_cache: block.disable_cache ?? false,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4614,7 +4850,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4666,7 +4902,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4676,7 +4912,7 @@ function convertBlocksToBlockYAML(
           block_type: "navigation",
           url: block.url,
           title: block.title,
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           model: block.model,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
@@ -4707,7 +4943,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           export_enabled: block.export_enabled ?? false,
           export_data_schema: block.export_data_schema ?? null,
           export_file_name: block.export_file_name ?? null,
@@ -4733,7 +4969,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4742,6 +4978,15 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "wait",
           wait_sec: block.wait_sec,
+        };
+        return blockYaml;
+      }
+      case "terminate": {
+        const blockYaml: TerminateBlockYAML = {
+          ...base,
+          block_type: "terminate",
+          reason: block.reason,
+          error_code: block.error_code ?? null,
         };
         return blockYaml;
       }
@@ -4760,7 +5005,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
-          engine: block.engine,
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           download_timeout: null, // seconds
           ...(block.download_target &&
             block.download_target !== "website" && {
@@ -4806,7 +5051,10 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "for_loop",
           loop_over_parameter_key: block.loop_over?.key ?? "",
-          loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
+          loop_blocks: convertBlocksToBlockYAML(
+            block.loop_blocks,
+            effectiveDefaultEngine,
+          ),
           loop_variable_reference: block.loop_variable_reference,
           complete_if_empty: block.complete_if_empty,
           data_schema: block.data_schema,
@@ -4818,7 +5066,10 @@ function convertBlocksToBlockYAML(
         const blockYaml: WhileLoopBlockYAML = {
           ...base,
           block_type: "while_loop",
-          loop_blocks: convertBlocksToBlockYAML(wblock.loop_blocks),
+          loop_blocks: convertBlocksToBlockYAML(
+            wblock.loop_blocks,
+            effectiveDefaultEngine,
+          ),
           condition: {
             criteria_type: wblock.condition.criteria_type,
             expression: wblock.condition.expression,
@@ -4836,6 +5087,10 @@ function convertBlocksToBlockYAML(
           error_code_mapping: block.error_code_mapping ?? null,
           prompt: block.prompt,
           steps: block.steps,
+          data_schema: block.data_schema,
+          user_owned_goal: block.user_owned_goal,
+          goal_needs_regeneration: block.goal_needs_regeneration,
+          code_edited_by_hand: block.code_edited_by_hand,
         };
         return blockYaml;
       }
@@ -4911,6 +5166,7 @@ function convertBlocksToBlockYAML(
           file_url: block.file_url,
           file_type: block.file_type,
           json_schema: block.json_schema,
+          worksheet: block.worksheet,
         };
         return blockYaml;
       }
@@ -4927,10 +5183,18 @@ function convertBlocksToBlockYAML(
         const blockYaml: SendEmailBlockYAML = {
           ...base,
           block_type: "send_email",
-          smtp_host_secret_parameter_key: block.smtp_host?.key,
-          smtp_port_secret_parameter_key: block.smtp_port?.key,
-          smtp_username_secret_parameter_key: block.smtp_username?.key,
-          smtp_password_secret_parameter_key: block.smtp_password?.key,
+          smtp_host_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_host,
+          ),
+          smtp_port_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_port,
+          ),
+          smtp_username_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_username,
+          ),
+          smtp_password_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_password,
+          ),
           custom_smtp_host: block.custom_smtp_host,
           custom_smtp_port: block.custom_smtp_port,
           custom_smtp_username: block.custom_smtp_username,
@@ -4949,6 +5213,23 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "goto_url",
           url: block.url,
+        };
+        return blockYaml;
+      }
+      case "web_search": {
+        const blockYaml: WebSearchBlockYAML = {
+          ...base,
+          block_type: "web_search",
+          model: block.model,
+          query: block.query,
+          provider: block.provider,
+          num_results: block.num_results,
+          prompt: block.prompt,
+          error_code_mapping: foldWebSearchErrorCodeMapping(block),
+          no_results_error_code: null,
+          no_match_error_code: null,
+          json_schema: block.json_schema,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -5070,7 +5351,10 @@ function convertBlocksToBlockYAML(
   });
 }
 
-function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
+function convert(
+  workflow: WorkflowApiResponse,
+  options?: { asNewWorkflow?: boolean },
+): WorkflowCreateYAMLRequest {
   const workflowDefinitionVersion = workflow.workflow_definition.version ?? 1;
   const userParameters = workflow.workflow_definition.parameters.filter(
     (parameter) => parameter.parameter_type !== WorkflowParameterTypes.Output,
@@ -5087,13 +5371,22 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     browser_profile_key: workflow.browser_profile_key ?? null,
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
+    totp_identifier: workflow.totp_identifier ?? null,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,
     max_elapsed_time_minutes: workflow.max_elapsed_time_minutes,
     extra_http_headers: workflow.extra_http_headers,
+    cdp_connect_headers: workflow.cdp_connect_headers ?? null,
     workflow_definition: {
       version: workflowDefinitionVersion,
+      error_code_mapping:
+        workflow.workflow_definition.error_code_mapping ?? null,
       parameters: convertParametersToParameterYAML(userParameters),
-      blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
+      blocks: convertBlocksToBlockYAML(
+        workflow.workflow_definition.blocks,
+        options?.asNewWorkflow
+          ? (workflow.effective_default_engine ?? null)
+          : undefined,
+      ),
       retry_policy: normalizeRetryPolicy(
         workflow.workflow_definition.retry_policy,
       ),
@@ -5106,6 +5399,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     run_with: workflow.run_with ?? "agent",
     browser_type: workflow.browser_type ?? null,
     adaptive_caching: workflow.adaptive_caching ?? undefined,
+    generate_script_on_terminal: workflow.generate_script_on_terminal ?? false,
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
@@ -5116,8 +5410,176 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
   };
 }
 
+// The backend counts the flag only on a Goal a person owns, so the editor must too.
+function goalChangeIsPending(data: CodeBlockNodeData): boolean {
+  return data.userOwnedGoal === true && data.goalNeedsRegeneration === true;
+}
+
+function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
+  const changes: Array<PendingGoalChange> = [];
+  for (const node of nodes) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      goalChangeIsPending(node.data)
+    ) {
+      changes.push({
+        label: node.data.label,
+        goal: node.data.prompt ?? "",
+        previousGoal: node.data.goalBeforeEdit
+          ? (node.data.goalBeforeEdit.prompt ?? "")
+          : null,
+        ...(node.data.codeEditedByHand === true && { codeEditedByHand: true }),
+      });
+    }
+  }
+  return changes;
+}
+
+function goalChangeUndoPatch(
+  data: CodeBlockNodeData,
+): Partial<CodeBlockNodeData> | null {
+  if (!goalChangeIsPending(data) || !data.goalBeforeEdit) {
+    return null;
+  }
+  return { ...data.goalBeforeEdit, goalBeforeEdit: null };
+}
+
+// The person's new Goal describes the code they edited by hand, so neither needs to change.
+function keepCodeWithGoalPatch(
+  data: CodeBlockNodeData,
+): Partial<CodeBlockNodeData> | null {
+  if (!goalChangeIsPending(data) || data.codeEditedByHand !== true) {
+    return null;
+  }
+  return {
+    goalNeedsRegeneration: false,
+    codeEditedByHand: false,
+    goalBeforeEdit: null,
+  };
+}
+
+function codeEditedNoticeIsShown(data: CodeBlockNodeData): boolean {
+  return data.codeEditedByHand === true && !goalChangeIsPending(data);
+}
+
+// A suggestion is offered only for the exact code and Goal it was written from.
+function freshGoalSuggestion(
+  data: CodeBlockNodeData,
+  suggestion: GoalSuggestion | undefined,
+): string | null {
+  if (
+    !suggestion ||
+    !codeEditedNoticeIsShown(data) ||
+    suggestion.forCode !== data.code ||
+    suggestion.forGoal !== (data.prompt ?? "")
+  ) {
+    return null;
+  }
+  return suggestion.goal;
+}
+
+function codeEditedBlocksOf(
+  nodes: Array<AppNode>,
+  suggestions: Record<string, GoalSuggestion>,
+): Array<CodeEditedBlock> {
+  const blocks: Array<CodeEditedBlock> = [];
+  for (const node of nodes) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      node.data.editable &&
+      codeEditedNoticeIsShown(node.data)
+    ) {
+      blocks.push({
+        label: node.data.label,
+        goal: node.data.prompt ?? "",
+        suggestedGoal: freshGoalSuggestion(
+          node.data,
+          suggestions[node.data.label],
+        ),
+      });
+    }
+  }
+  return blocks;
+}
+
+function acceptGoalSuggestionPatch(
+  data: CodeBlockNodeData,
+  suggestion: GoalSuggestion | undefined,
+): Partial<CodeBlockNodeData> | null {
+  const goal = freshGoalSuggestion(data, suggestion);
+  if (goal === null) {
+    return null;
+  }
+  return {
+    prompt: goal,
+    userOwnedGoal: true,
+    goalNeedsRegeneration: false,
+    codeEditedByHand: false,
+    goalBeforeEdit: null,
+  };
+}
+
+// The undo record is editor-only, so a graph rebuilt from saved form drops it; keep it on a block
+// that still holds the same unapplied Goal.
+function withGoalUndoRecordsFrom(
+  previous: Array<AppNode>,
+  next: Array<AppNode>,
+): Array<AppNode> {
+  const records = new Map<string, CodeBlockNodeData>();
+  for (const node of previous) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      node.data.goalBeforeEdit
+    ) {
+      records.set(node.data.label, node.data);
+    }
+  }
+  if (records.size === 0) {
+    return next;
+  }
+  return next.map((node) => {
+    if (!isWorkflowBlockNode(node) || node.type !== "codeBlock") {
+      return node;
+    }
+    const before = records.get(node.data.label);
+    if (
+      !before ||
+      !goalChangeIsPending(node.data) ||
+      node.data.prompt !== before.prompt
+    ) {
+      return node;
+    }
+    return {
+      ...node,
+      data: { ...node.data, goalBeforeEdit: before.goalBeforeEdit },
+    };
+  });
+}
+
+function pendingGoalErrors(nodes: Array<AppNode>): Array<string> {
+  return pendingGoalChangesOf(nodes).map(
+    ({ label }) =>
+      `${label}: its new Goal isn't applied yet. Apply it or undo the change before saving.`,
+  );
+}
+
+// A block run saves the whole workflow first, so a pending Goal on any block stops it; every other
+// error stops only the block it names.
+function blockRunErrors(
+  nodes: Array<AppNode>,
+  blockLabel: string,
+): Array<string> {
+  const pendingGoals = new Set(pendingGoalErrors(nodes));
+  return getWorkflowErrors(nodes).filter(
+    (error) => error.startsWith(`${blockLabel}:`) || pendingGoals.has(error),
+  );
+}
+
 function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
-  const errors: Array<string> = [];
+  const errors: Array<string> = [...pendingGoalErrors(nodes)];
 
   const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
   if (
@@ -5366,6 +5828,32 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  nodes.filter(isTerminateNode).forEach((node) => {
+    if (node.data.reason.trim() === "") {
+      errors.push(`${node.data.label}: Reason is required.`);
+    }
+    const errorCode = node.data.errorCode.trim();
+    const hasJinjaOpener = /\{[{%#]/.test(errorCode);
+    if (!hasJinjaOpener && Array.from(errorCode).length > 128) {
+      errors.push(
+        `${node.data.label}: Error Code must be at most 128 characters.`,
+      );
+    }
+    if (/\p{C}/u.test(errorCode)) {
+      errors.push(
+        `${node.data.label}: Error Code must not contain Unicode category-C characters.`,
+      );
+    } else if (
+      errorCode &&
+      !hasJinjaOpener &&
+      !/^[A-Za-z0-9_.:-]+$/.test(errorCode)
+    ) {
+      errors.push(
+        `${node.data.label}: Error Code may contain only ASCII letters, digits, underscores, periods, colons, and hyphens.`,
+      );
+    }
+  });
+
   const waitNodes = nodes.filter(isWaitNode);
   waitNodes.forEach((node) => {
     const waitTimeString = node.data.waitInSeconds.trim();
@@ -5386,6 +5874,31 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(
         `${node.data.label}: Wait time must be between 1 and ${WORKFLOW_WAIT_BLOCK_MAX_SEC} seconds.`,
       );
+    }
+  });
+
+  nodes.forEach((node) => {
+    if (node.type !== "web_search") return;
+    if (!node.data.query.trim()) {
+      errors.push(`${node.data.label}: Search query is required.`);
+    }
+    if (
+      !Number.isInteger(node.data.numResults) ||
+      node.data.numResults < 1 ||
+      node.data.numResults > 100
+    ) {
+      errors.push(
+        `${node.data.label}: Maximum results must be an integer between 1 and 100.`,
+      );
+    }
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+    if (node.data.jsonSchema !== "null") {
+      const result = validateJson(node.data.jsonSchema);
+      if (!result.valid) {
+        errors.push(`${node.data.label}: Data schema - ${result.message}`);
+      }
     }
   });
 
@@ -5509,6 +6022,8 @@ function getParentLoopSkipsOnFail(
 }
 
 export {
+  blockEngineForWorkflow,
+  workflowEffectiveDefaultEngine,
   containsJinjaReference,
   convert,
   convertEchoParameters,
@@ -5518,9 +6033,9 @@ export {
   generateNodeLabel,
   getAffectedBlocks,
   getNestingLevel,
-  getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
+  isMissingRequiredStartUrl,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
@@ -5535,6 +6050,16 @@ export {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
+  goalChangeIsPending,
+  goalChangeUndoPatch,
+  keepCodeWithGoalPatch,
+  codeEditedNoticeIsShown,
+  freshGoalSuggestion,
+  codeEditedBlocksOf,
+  acceptGoalSuggestionPatch,
+  blockRunErrors,
+  withGoalUndoRecordsFrom,
+  pendingGoalChangesOf,
   getWorkflowErrors,
   isNodeInsideForLoop,
   getParentLoopSkipsOnFail,
@@ -5546,3 +6071,184 @@ export {
 };
 
 export type { AffectedBlock };
+
+function workflowGraphContent(items: AppNode[], connections: Edge[]) {
+  const blocks = getWorkflowBlocks(items, connections);
+  const settings = getWorkflowSettings(items);
+  try {
+    return JSON.stringify(
+      buildWorkflowSaveRequest({
+        blocks,
+        settings,
+        workflowDefinitionVersion: 2,
+        // Metadata and parameters have their own revision tracking outside the graph.
+        workflow: { is_saved_task: false, status: null },
+        title: "",
+        description: null,
+        parameters: [],
+      }),
+    );
+  } catch {
+    // Invalid settings must remain editable even when a save cannot serialize them.
+    return JSON.stringify({ blocks, settings });
+  }
+}
+
+// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// React Flow's `.selected` so a normal editor node click (which sets
+// `selected` to open the sidebar) doesn't trigger the flash. Must match the
+// selector in reactFlowOverrideStyles.css.
+const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
+const COPILOT_BLOCK_HIGHLIGHT_MS = 1500;
+
+function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
+  const tokens = (node.className ?? "")
+    .split(/\s+/)
+    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  const next = tokens.join(" ") || undefined;
+  if ((node.className ?? undefined) === next) return node;
+  return { ...node, className: next };
+}
+
+export function useWorkflowGraphState(
+  initialNodes: AppNode[],
+  initialEdges: Edge[],
+) {
+  const [nodes, setNodeState] = useState(initialNodes);
+  const [edges, setEdgeState] = useState(initialEdges);
+  // Keep consecutive updates in one event based on the latest graph, before React renders.
+  const currentNodes = useRef(nodes);
+  const currentEdges = useRef(edges);
+  const updateNodes: Dispatch<SetStateAction<AppNode[]>> = useCallback(
+    (value) => {
+      const next =
+        typeof value === "function" ? value(currentNodes.current) : value;
+      currentNodes.current = next;
+      setNodeState(next);
+    },
+    [],
+  );
+  const updateEdges: Dispatch<SetStateAction<Edge[]>> = useCallback((value) => {
+    const next =
+      typeof value === "function" ? value(currentEdges.current) : value;
+    currentEdges.current = next;
+    setEdgeState(next);
+  }, []);
+  const setNodes = useCallback(
+    (value: SetStateAction<AppNode[]>, fromUser = true) => {
+      if (refuseMutationDuringYamlCommit()) return;
+      const previous = currentNodes.current;
+      const next = typeof value === "function" ? value(previous) : value;
+      if (
+        workflowGraphContent(previous, currentEdges.current) !==
+        workflowGraphContent(next, currentEdges.current)
+      ) {
+        reconcileYamlDraftAfterGraphChange();
+        useWorkflowYamlEditorStore.getState().bumpRevision();
+      }
+      const workflowId =
+        useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
+      const trackedProposal = workflowId
+        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        : undefined;
+      if (
+        fromUser &&
+        trackedProposal &&
+        !trackedProposal.graphEdited &&
+        JSON.stringify(getWorkflowBlocks(previous, currentEdges.current)) !==
+          JSON.stringify(getWorkflowBlocks(next, currentEdges.current))
+      )
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+      updateNodes(next);
+    },
+    [updateNodes],
+  );
+  const setEdges = useCallback(
+    (value: SetStateAction<Edge[]>, fromUser = true) => {
+      if (refuseMutationDuringYamlCommit()) return;
+      const previous = currentEdges.current;
+      const next = typeof value === "function" ? value(previous) : value;
+      if (
+        workflowGraphContent(currentNodes.current, previous) !==
+        workflowGraphContent(currentNodes.current, next)
+      ) {
+        reconcileYamlDraftAfterGraphChange();
+        useWorkflowYamlEditorStore.getState().bumpRevision();
+      }
+      const workflowId =
+        useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
+      const trackedProposal = workflowId
+        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        : undefined;
+      if (
+        fromUser &&
+        trackedProposal &&
+        !trackedProposal.graphEdited &&
+        JSON.stringify(getWorkflowBlocks(currentNodes.current, previous)) !==
+          JSON.stringify(getWorkflowBlocks(currentNodes.current, next))
+      )
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+      updateEdges(next);
+    },
+    [updateEdges],
+  );
+  const onNodesChange = useCallback(
+    (changes: NodeChange<AppNode>[]) => {
+      const allowed = filterWorkflowChanges(changes);
+      if (allowed.length === 0) return;
+      if (allowed.some(isWorkflowMutation)) {
+        setNodes(
+          (previous) => applyNodeChanges(allowed, previous),
+          allowed.some(
+            (change) => change.type === "add" || change.type === "remove",
+          ),
+        );
+      } else {
+        updateNodes((previous) => applyNodeChanges(allowed, previous));
+      }
+    },
+    [setNodes, updateNodes],
+  );
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      const allowed = filterWorkflowChanges(changes);
+      if (allowed.length === 0) return;
+      const update = allowed.some(isWorkflowMutation) ? setEdges : updateEdges;
+      update((previous) => applyEdgeChanges(allowed, previous));
+    },
+    [setEdges, updateEdges],
+  );
+  // A highlight is presentation, not an edit, so it bypasses the edit lock a
+  // running Copilot turn holds.
+  const highlightBlock = useCallback(
+    (blockLabel: string) => {
+      const matches = (node: AppNode) =>
+        (node.data as { label?: string } | undefined)?.label === blockLabel;
+      updateNodes((prev) =>
+        prev.map((node) => setBlockHighlightClass(node, matches(node))),
+      );
+      // Auto-clear so the gold-ring flash animation re-triggers on the
+      // next select instead of the highlight sticking.
+      setTimeout(() => {
+        updateNodes((prev) =>
+          prev.map((node) =>
+            matches(node) ? setBlockHighlightClass(node, false) : node,
+          ),
+        );
+      }, COPILOT_BLOCK_HIGHLIGHT_MS);
+    },
+    [updateNodes],
+  );
+  return {
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    onNodesChange,
+    onEdgesChange,
+    updateNodes,
+    updateEdges,
+    highlightBlock,
+  };
+}

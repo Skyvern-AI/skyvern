@@ -88,7 +88,14 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import planner_levers
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
+from skyvern.services.webhook_delivery import (
+    deliver_webhook_with_retries,
+    describe_delivery_error,
+    format_http_failure_reason,
+    format_http_log_reason,
+    format_no_response_failure_reason,
+    status_code_from_exception,
+)
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
@@ -331,6 +338,7 @@ async def initialize_task_v2(
     browser_address: str | None = None,
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    created_by: str | None = None,
 ) -> TaskV2:
     await _validate_task_v2_model_for_org(organization, model)
     if user_url:
@@ -393,6 +401,7 @@ async def initialize_task_v2(
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
             trigger_type=trigger_type,
+            created_by=created_by,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
@@ -574,6 +583,9 @@ async def run_task_v2(
         organization_name=organization.organization_name,
         org_default_llm_key=organization.default_llm_key,
         org_default_secondary_llm_key=organization.default_secondary_llm_key,
+        org_age=parent_context.org_age
+        if parent_context and parent_context.org_age is not None
+        else skyvern_context.compute_org_age(organization.created_at),
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
@@ -1217,8 +1229,10 @@ async def run_task_v2_helper(
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
+            extra_http_headers=workflow.extra_http_headers or {},
+            cdp_connect_headers=workflow.cdp_connect_headers or {},
         )
-        LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
+        LOG.info("Creating workflow from request", workflow_permanent_id=workflow.workflow_permanent_id)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
             request=workflow_create_request,
@@ -1654,6 +1668,7 @@ async def _generate_loop_task(
         data_schema=_generate_data_extraction_schema_for_loop(loop_values_key),
         output_parameter=loop_value_extraction_output_parameter,
     )
+    extraction_block_for_loop.mark_internal_evaluation()
 
     extraction_block_result = await extraction_block_for_loop.execute_safe(
         workflow_run_id=workflow_run_id,
@@ -2050,7 +2065,7 @@ async def _generate_compute_task(
     label = f"compute_{generate_random_string()}"
     # A non-null prompt is what makes the editor render the code-first node; "" is runtime-neutral
     # (every backend prompt check is truthiness based) and leaves the Goal for the user, because a
-    # fabricated one would arm runtime self-heal on a data-only block.
+    # fabricated one would arm the AI fallback on a data-only block.
     code_block_yaml = CodeBlockYAML(label=label, code=safe_code, prompt="")
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -2540,7 +2555,9 @@ async def _get_navigate_complete_output(
     if not task_id:
         return None
     try:
-        actions = await app.DATABASE.tasks.get_task_actions(task_id=task_id, organization_id=organization_id)
+        # Hydrated: `output` is a base Action field with no ActionModel column, so the base read
+        # would resolve it to None and make this function's documented fallback dead.
+        actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id=task_id, organization_id=organization_id)
     except Exception:
         LOG.warning(
             "Failed to load navigate task actions; skipping terminal-output recovery",
@@ -2851,18 +2868,22 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 run_id=task_v2.observer_cruise_id,
             )
         except Exception as delivery_error:
+            failure_reason = format_no_response_failure_reason(delivery_error)
+            status_code = status_code_from_exception(delivery_error)
             LOG.warning(
                 "Task v2 webhook delivery failed after attempting delivery",
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
                 error=describe_delivery_error(delivery_error),
+                status_code=status_code,
+                error_reason=format_http_log_reason(status_code) if status_code is not None else failure_reason,
                 exc_info=True,
             )
             try:
                 await app.DATABASE.observer.update_task_v2(
                     task_v2_id=task_v2.observer_cruise_id,
                     organization_id=task_v2.organization_id,
-                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                    webhook_failure_reason=failure_reason,
                 )
             except Exception:
                 LOG.warning(
@@ -2884,16 +2905,19 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 webhook_failure_reason=success_marker,
             )
         else:
+            failure_reason = format_http_failure_reason(resp.status_code, resp.text)
             LOG.info(
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
+                status_code=resp.status_code,
+                error_reason=format_http_log_reason(resp.status_code),
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
-                webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
+                webhook_failure_reason=failure_reason,
             )
     except Exception as e:
         raise FailedToSendWebhook(task_v2_id=task_v2.observer_cruise_id) from e

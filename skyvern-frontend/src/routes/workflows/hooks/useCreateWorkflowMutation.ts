@@ -10,8 +10,30 @@ import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "../studioNavigation";
 import axios from "axios";
+import { HomeTelemetry, type AgentCreationAttempt } from "@/util/homeTelemetry";
 
-type CreateWorkflowInput = WorkflowCreateYAMLRequest & { _via?: string };
+type CreateWorkflowInput = WorkflowCreateYAMLRequest & {
+  _via?: string;
+  _agentCreationAttempt?: AgentCreationAttempt;
+};
+
+type UseCreateWorkflowMutationOptions = {
+  onCreated?: () => void;
+};
+
+function hasWorkflowShape(data: unknown): data is WorkflowApiResponse {
+  if (typeof data !== "object" || data === null) {
+    return false;
+  }
+  const candidate = data as Partial<WorkflowApiResponse>;
+  const definition = candidate.workflow_definition;
+  return (
+    typeof candidate.workflow_permanent_id === "string" &&
+    typeof definition === "object" &&
+    definition !== null &&
+    Array.isArray(definition.blocks)
+  );
+}
 
 function getCreateWorkflowErrorMessage(error: unknown) {
   if (axios.isAxiosError(error)) {
@@ -29,18 +51,21 @@ function getCreateWorkflowErrorMessage(error: unknown) {
   return "Please try again.";
 }
 
-function useCreateWorkflowMutation() {
+function useCreateWorkflowMutation({
+  onCreated,
+}: UseCreateWorkflowMutationOptions = {}) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
   return useMutation({
     mutationFn: async (input: CreateWorkflowInput) => {
-      const { _via: _, ...workflow } = input;
+      const { _via: _, _agentCreationAttempt: __, ...workflow } = input;
       void _;
+      void __;
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(workflow);
-      return client.post<string, { data: WorkflowApiResponse }>(
+      const response = await client.post<string, { data: WorkflowApiResponse }>(
         "/workflows",
         yaml,
         {
@@ -49,8 +74,19 @@ function useCreateWorkflowMutation() {
           },
         },
       );
+      if (!hasWorkflowShape(response.data)) {
+        throw new Error("The server returned an invalid workflow response.");
+      }
+      return response;
     },
     onSuccess: (response, variables) => {
+      if (variables._agentCreationAttempt) {
+        HomeTelemetry.agentCreationSucceeded(
+          variables._agentCreationAttempt,
+          response.data.workflow_permanent_id,
+        );
+      }
+      onCreated?.();
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
@@ -76,7 +112,13 @@ function useCreateWorkflowMutation() {
         ),
       );
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (variables._agentCreationAttempt) {
+        HomeTelemetry.agentCreationFailed(
+          variables._agentCreationAttempt,
+          error,
+        );
+      }
       toast({
         variant: "destructive",
         title: "Could not create agent",

@@ -1,4 +1,6 @@
+import asyncio
 import re
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
@@ -118,6 +120,11 @@ def is_unresolved_totp_value(value: object) -> bool:
     )
 
 
+def is_totp_sentinel(value: object) -> bool:
+    """Return whether a value is exactly a vault's marker for "generate this credential's TOTP here"."""
+    return isinstance(value, str) and value in _TOTP_MARKER_VALUES
+
+
 def _validate_base32_secret(totp_secret: str) -> str:
     normalized_secret = _compact_secret_value(totp_secret)
     try:
@@ -210,10 +217,7 @@ def parse_totp_secret(totp_secret: str) -> str:
         if parsed_from_secret_param:
             return parsed_from_secret_param
 
-    LOG.error(
-        "Invalid TOTP secret, discarding",
-        totp_secret_preview=_compact_secret_value(stripped_totp_secret)[:4] + "...",
-    )
+    LOG.error("Invalid TOTP secret, discarding", totp_secret_length=len(_compact_secret_value(stripped_totp_secret)))
     return ""
 
 
@@ -250,6 +254,31 @@ def normalize_totp_config(totp_secret: str) -> str:
         return unquoted_totp_secret if parse_totp_config(unquoted_totp_secret) else ""
 
     return parse_totp_secret(totp_secret)
+
+
+def totp_window_wait_seconds(totp_secret: str, min_remaining_seconds: int, *, now: float) -> float:
+    """Seconds to wait before generating so the code keeps at least ``min_remaining_seconds`` of its step
+    (capped at one second short of the step, as the multi-field path caps it); 0 when it already would."""
+    if min_remaining_seconds <= 0:
+        return 0.0
+    totp = parse_totp_config(totp_secret)
+    if totp is None:
+        return 0.0
+    interval = totp.interval
+    threshold = max(0, min(min_remaining_seconds, interval - 1))
+    remaining = interval - (now % interval)
+    return remaining if remaining < threshold else 0.0
+
+
+async def wait_for_fresh_totp_window(totp_secret: str, *, min_remaining_seconds: int = 0) -> None:
+    # Re-measured after each sleep: a loop that wakes late can land in the next window's tail. Bounded,
+    # because a wait always ends at a window boundary, which a timely wake leaves fresh.
+    for _ in range(3):
+        wait_seconds = totp_window_wait_seconds(totp_secret, min_remaining_seconds, now=time.time())
+        if wait_seconds <= 0:
+            return
+        LOG.info("Waiting for a fresh TOTP window", wait_seconds=round(wait_seconds, 1))
+        await asyncio.sleep(wait_seconds)
 
 
 def generate_totp_code(totp_secret: str, for_time: int | None = None) -> str:

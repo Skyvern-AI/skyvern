@@ -168,8 +168,8 @@ class FoldersRepository(BaseRepository):
         folder_id: str,
         organization_id: str,
         delete_workflows: bool = False,
-    ) -> bool:
-        """Soft delete a folder. Optionally delete all workflows in the folder."""
+    ) -> list[str] | None:
+        """Soft delete a folder and return the workflows deleted with it, or None when there is no such folder."""
         async with self.Session() as session:
             # Check if folder exists
             folder_stmt = (
@@ -180,8 +180,9 @@ class FoldersRepository(BaseRepository):
             folder_result = await session.execute(folder_stmt)
             folder = folder_result.scalar_one_or_none()
             if not folder:
-                return False
+                return None
 
+            workflow_permanent_ids: list[str] = []
             # If delete_workflows is True, delete all workflows in the folder
             if delete_workflows:
                 # Get workflow permanent IDs in the folder (inline logic)
@@ -243,7 +244,7 @@ class FoldersRepository(BaseRepository):
             # Soft delete the folder
             folder.deleted_at = datetime.now(timezone.utc)
             await session.commit()
-            return True
+            return workflow_permanent_ids
 
     @db_operation("get_folder_workflow_count")
     async def get_folder_workflow_count(

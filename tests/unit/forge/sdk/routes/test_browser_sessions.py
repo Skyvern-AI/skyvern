@@ -6,10 +6,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import ORJSONResponse
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
+from skyvern.forge import app as forge_app
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_mod
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import API_BROWSER_SESSION_CREATED_BY
 from skyvern.schemas.browser_session_timeouts import max_lifetime_exceeded_warning
+from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserSessionCreditAdmissionRefusal,
     BrowserSessionExtension,
@@ -32,6 +39,14 @@ async def _extend(app_mock: MagicMock, additional_minutes: int) -> Any:
     ):
         return await browser_sessions_mod.extend_browser_session(
             browser_sessions_mod.ExtendBrowserSessionRequest(additional_minutes=additional_minutes),
+            "pbs_1",
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+
+async def _close(app_mock: MagicMock) -> ORJSONResponse:
+    with patch.object(browser_sessions_mod, "app", app_mock):
+        return await browser_sessions_mod.close_browser_session(
             "pbs_1",
             current_org=SimpleNamespace(organization_id="org_1"),
         )
@@ -129,6 +144,50 @@ async def test_close_browser_session_returns_404_without_org_owned_session() -> 
 
 
 @pytest.mark.asyncio
+async def test_close_browser_session_skips_close_for_a_completed_session() -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+        return_value=SimpleNamespace(status="completed", completed_at=datetime(2026, 1, 1))
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    response = await _close(app_mock)
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"message": "Browser session closed"}
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_awaited_once_with("pbs_1", "org_1")
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "completed", "failed"])
+async def test_close_browser_session_closes_any_session_without_completed_at(status: str) -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+        return_value=SimpleNamespace(status=status, completed_at=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    response = await _close(app_mock)
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"message": "Browser session closed"}
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_1", "pbs_1")
+
+
+@pytest.mark.asyncio
+async def test_close_browser_session_propagates_close_failure_for_a_live_session() -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+        return_value=SimpleNamespace(status="running", completed_at=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock(side_effect=RuntimeError("close failed"))
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await _close(app_mock)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("needs_live_view", [True, False])
 async def test_create_browser_session_forwards_whether_the_session_will_be_watched(
     needs_live_view: bool,
@@ -136,6 +195,7 @@ async def test_create_browser_session_forwards_whether_the_session_will_be_watch
     """Dropped here, the session is still created and still connects — it only fails later, when
     someone opens the live view. Defaulting it False is what keeps unattended automation routable."""
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=MagicMock())
 
     with (
@@ -153,6 +213,7 @@ async def test_create_browser_session_forwards_whether_the_session_will_be_watch
 @pytest.mark.asyncio
 async def test_create_browser_session_preserves_typed_credit_refusal_http_contract() -> None:
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=BrowserSessionCreditAdmissionRefusal())
 
     with (
@@ -166,6 +227,38 @@ async def test_create_browser_session_preserves_typed_credit_refusal_http_contra
 
     assert exc_info.value.status_code == 402
     assert exc_info.value.detail == "Credits exhausted. Upgrade your plan in Billing."
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_observes_before_creating_the_session() -> None:
+    calls: list[str] = []
+    app_mock = MagicMock()
+
+    async def observe(**_: object) -> None:
+        calls.append("observe")
+
+    async def create_session(**_: object) -> MagicMock:
+        calls.append("create")
+        return MagicMock()
+
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock(side_effect=observe)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=create_session)
+
+    with (
+        patch.object(browser_sessions_mod, "app", app_mock),
+        patch.object(browser_sessions_mod.BrowserSessionResponse, "from_browser_session", AsyncMock()),
+    ):
+        await browser_sessions_mod.create_browser_session(
+            browser_sessions_mod.CreateBrowserSessionRequest(),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            user_id="user_1",
+        )
+
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access.assert_awaited_once_with(
+        organization_id="org_1",
+        feature_names={"standalone_browser_sessions"},
+    )
+    assert calls == ["observe", "create"]
 
 
 def test_a_session_request_is_unwatched_unless_it_says_otherwise() -> None:
@@ -197,4 +290,69 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
         app_mock.STORAGE,
         fail_download_lookup=True,
         include_stream_transport=True,
+        concurrent_listings=True,
     )
+
+
+@pytest.mark.parametrize("endpoint", ["history", "active"])
+@pytest.mark.asyncio
+async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(endpoint: str) -> None:
+    """These endpoints already gather across sessions, so overlapping a session's two listings would
+    only raise the request's peak pool checkouts from N to 2N."""
+    sessions = [MagicMock(), MagicMock()]
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_sessions_history = AsyncMock(return_value=sessions)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_active_sessions = AsyncMock(return_value=sessions)
+    from_browser_session = AsyncMock(return_value=MagicMock())
+
+    with (
+        patch.object(browser_sessions_mod, "app", app_mock),
+        patch.object(browser_sessions_mod.BrowserSessionResponse, "from_browser_session", from_browser_session),
+    ):
+        if endpoint == "history":
+            await browser_sessions_mod.get_browser_sessions_all(
+                current_org=SimpleNamespace(organization_id="org_1"), page=1, page_size=100
+            )
+        else:
+            await browser_sessions_mod.get_browser_sessions(current_org=SimpleNamespace(organization_id="org_1"))
+
+    assert from_browser_session.await_count == len(sessions)
+    for call in from_browser_session.await_args_list:
+        assert call.kwargs.get("concurrent_listings", False) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_id", "expected_stored_created_by", "expected_response_created_by"),
+    [
+        ("user_creator", "user_creator", "user_creator"),
+        (None, API_BROWSER_SESSION_CREATED_BY, None),
+    ],
+)
+async def test_create_and_history_hide_api_origin_but_preserve_real_user_id(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    user_id: str | None,
+    expected_stored_created_by: str,
+    expected_response_created_by: str | None,
+) -> None:
+    db = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    org = await db.organizations.create_organization(organization_name="Creator Org")
+    monkeypatch.setattr(forge_app.DATABASE, "browser_sessions", db.browser_sessions)
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", DefaultPersistentSessionsManager(database=db))
+    monkeypatch.setattr(forge_app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(forge_app, "STORAGE", None)
+
+    created = await browser_sessions_mod.create_browser_session(
+        browser_sessions_mod.CreateBrowserSessionRequest(),
+        current_org=org,
+        user_id=user_id,
+    )
+    [listed] = await browser_sessions_mod.get_browser_sessions_all(current_org=org, page=1, page_size=10)
+    [stored] = await db.browser_sessions.get_persistent_browser_sessions_history(
+        org.organization_id, page=1, page_size=10
+    )
+
+    assert created.model_dump()["created_by"] == expected_response_created_by
+    assert listed.model_dump()["created_by"] == expected_response_created_by
+    assert stored.created_by == expected_stored_created_by

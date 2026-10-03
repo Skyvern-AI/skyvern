@@ -1204,6 +1204,48 @@ def test_timeline_block_list_fields_never_receive_a_marker_dict() -> None:
         assert field not in workflow_service_module.UNBOUNDED_BLOCK_JSON_FIELDS
 
 
+# Action fields a reader could mistake for free text but which are bounded by construction, plus
+# the two structured fields capped separately as JSON.
+_EXEMPT_ACTION_FIELDS = {
+    "action_id",
+    "source_action_id",
+    "organization_id",
+    "workflow_run_id",
+    "task_id",
+    "step_id",
+    "created_by",
+    "element_id",
+    "skyvern_element_hash",
+    "screenshot_artifact_id",
+    "tool_call_id",
+    "xpath",  # a locator; a truncated one no longer locates anything
+    "downloaded_files",  # one short name per file the run actually downloaded
+    "totp_timing_info",  # fixed-shape record of ints and timestamps
+    "skyvern_element_data",  # capped as JSON by cap_action_payloads
+    "output",  # capped as JSON by cap_action_payloads
+}
+
+
+def test_action_text_field_coverage() -> None:
+    """A new free-text field on Action must be capped or explicitly exempted.
+
+    ``data_extraction_goal`` and ``description`` shipped uncapped for exactly this reason: they have
+    no ActionModel column, hydration restores them from ``action_json``, and the cap list had been
+    extended a field at a time. Excluded fields are skipped -- they never reach the wire.
+    """
+    capped = set(workflow_service_module.ACTION_TEXT_FIELDS)
+    unbounded_types = {
+        name for name, field in Action.model_fields.items() if not field.exclude and "str" in str(field.annotation)
+    }
+
+    uncovered = unbounded_types - capped - _EXEMPT_ACTION_FIELDS
+    assert not uncovered, (
+        f"Action fields can hold unbounded content but are neither capped nor exempt: "
+        f"{sorted(uncovered)}. Add them to ACTION_TEXT_FIELDS, or to _EXEMPT_ACTION_FIELDS "
+        f"with a reason."
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_workflow_run_timeline_caps_action_text(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime.now(timezone.utc)

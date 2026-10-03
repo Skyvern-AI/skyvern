@@ -14,10 +14,10 @@ import urllib.parse
 import uuid
 from collections import deque
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
@@ -104,6 +104,7 @@ from skyvern.forge.sdk.api.files import (
     get_run_temp_dir,
     list_downloading_files_in_directory,
     list_files_in_directory,
+    normalize_download_identity,
     resolve_run_download_id,
     wait_for_download_finished,
 )
@@ -160,7 +161,7 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements_tracked,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
-from skyvern.utils.url_validators import validate_fetch_url
+from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds, validate_fetch_url
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -168,6 +169,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     CheckboxAction,
     ClickAction,
+    ClosePageAction,
     CompleteVerifyResult,
     DownloadFileAction,
     InputOrSelectContext,
@@ -181,8 +183,15 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.multi_field_totp import (
     MultiFieldTotpBindingFailure,
+    MultiFieldTotpFillObserver,
+    MultiFieldTotpLogContext,
     _document_continuity,
+    _multi_field_totp_box_groups,
     _refresh_multi_field_totp_group_binding,
+    capture_multi_field_totp_submission_baseline,
+    install_multi_field_totp_fill_observer,
+    multi_field_totp_group_identity,
+    multi_field_totp_submission_evidence,
 )
 from skyvern.webeye.actions.responses import (
     STALE_TARGET_TOOL_RESULT,
@@ -195,7 +204,12 @@ from skyvern.webeye.actions.responses import (
 from skyvern.webeye.browser_artifacts import ActionDownloadObservation, DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
-from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
+from skyvern.webeye.browser_factory import (
+    initialize_download_dir,
+    read_download_failure,
+    resolve_artifact_path,
+    was_download_cancelled_by_skyvern,
+)
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
@@ -214,7 +228,11 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
-from skyvern.webeye.navigation import reported_nav_error_code, revalidate_redirect_chain
+from skyvern.webeye.navigation import (
+    clear_task_nav_error_code,
+    record_task_nav_error_code,
+    revalidate_redirect_chain,
+)
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -225,9 +243,12 @@ from skyvern.webeye.scraper.scraped_page import (
 from skyvern.webeye.scraper.scraper import (
     IncrementalScrapePage,
     hash_element,
+    page_is_dead_blank,
+    page_is_http_survivor,
     structural_identity,
     trim_element_tree,
 )
+from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.dom import (
     COMMON_INPUT_TAGS,
     DomUtil,
@@ -249,6 +270,9 @@ from skyvern.webeye.utils.page import (
     take_element_screenshot,
     teardown_blob_url_retention,
 )
+
+if TYPE_CHECKING:
+    from skyvern.forge.agent_functions import DownloadRecoveryHook
 
 LOG = structlog.get_logger()
 _DISPATCHER_OWNED_INPUT_EXCEPTIONS = (
@@ -376,6 +400,11 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
+# Fire the one-shot download-recovery retry this many seconds before the no-signal grace expires, so a
+# slow-but-real download has the whole grace to arrive on its own before we spend the single retry.
+# Clamped to the grace, so a short grace still fires the retry inside the existing wait.
+DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS = 15.0
+LARGE_DOWNLOAD_LOG_THRESHOLD_BYTES = 100 * 1024 * 1024
 # Synchronous FileDownloadBlock false-click start-signal detection window: how long to wait for a first local
 # download signal (a new .crdownload/final file) before giving up, so a legitimate non-download popup is not
 # held for the whole download budget. Widened by an operator-set popup grace (up to its 60s setting cap); the
@@ -447,6 +476,72 @@ class _ProviderPollPhase:
             materialized_file_delta=self._materialized_file_delta,
             elapsed_seconds=(time.monotonic() - self._started_at) if self._started_at is not None else 0.0,
         )
+
+
+class _DownloadProgressSampler:
+    def __init__(self, download_dir: Path, attempt_started_at: datetime | None, baseline_identities: set[str]) -> None:
+        self._download_dir = download_dir
+        self._attempt_started_at = attempt_started_at
+        self._baseline_identities = baseline_identities
+        self._partial_sizes: dict[str, int] = {}
+        self.first_observed_at: float | None = None
+        self.last_growth_at: float | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def last_observed_bytes(self) -> int | None:
+        return sum(self._partial_sizes.values()) if self._partial_sizes else None
+
+    def observe(self, files: list[str]) -> None:
+        observed_at = time.monotonic()
+        for file in files:
+            if (
+                not file.endswith(BROWSER_DOWNLOADING_SUFFIX)
+                or _normalize_download_identity(file) in self._baseline_identities
+                or urllib.parse.urlparse(file).scheme
+            ):
+                continue
+            try:
+                size = Path(file).stat().st_size
+            except OSError:
+                continue
+            previous_size = self._partial_sizes.get(file, 0)
+            self._partial_sizes[file] = size
+            if self.first_observed_at is None:
+                self.first_observed_at = observed_at
+            if size > previous_size:
+                self.last_growth_at = observed_at
+
+    def start_if_partial_seen(self, files: list[str]) -> None:
+        self.observe(files)
+        if self._partial_sizes and self._task is None:
+            self._task = asyncio.create_task(self._sample())
+
+    async def _sample(self) -> None:
+        while True:
+            files = list_files_in_directory(self._download_dir, attempt_started_at=self._attempt_started_at)
+            self.observe(files)
+            await asyncio.sleep(DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS)
+
+    async def aclose(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+
+def _abort_evidence(download: Download, sampler: _DownloadProgressSampler, now_monotonic: float) -> dict[str, object]:
+    return {
+        "last_observed_bytes": sampler.last_observed_bytes,
+        "seconds_since_last_growth": now_monotonic - sampler.last_growth_at
+        if sampler.last_growth_at is not None
+        else None,
+        "transfer_elapsed_s": now_monotonic - sampler.first_observed_at
+        if sampler.first_observed_at is not None
+        else None,
+        "url_origin": redacted_url_origin(download.url),
+        "signed_url_ttl_remaining_s": signed_url_ttl_remaining_seconds(download.url, datetime.now(UTC)),
+        "cancel_origin": "skyvern_timeout" if was_download_cancelled_by_skyvern(download) else "unknown",
+    }
 
 
 async def _provider_poll_and_measure(
@@ -1521,6 +1616,55 @@ async def _save_adopted_session_download(
 # the expensive dropdown/custom-select rescrape; never gates persistence or task finalization.
 _false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_download_eligible", default=False)
 
+# True once an action has committed a real browser dispatch (reached the type handler). Reset per
+# action at the ``handle_action`` wrapper entry and read back there to decide whether a failed action
+# owns its download reservations: a committed dispatch retains them for the durable-credit seam; a
+# no-dispatch exit (pre-handler error, stale abort, already-in-desired-state suppression) releases
+# them. Fails toward retention -- a missed suppression stays committed, degrading to base-equivalent
+# retention rather than releasing a genuinely-owned claim.
+_browser_dispatch_committed: ContextVar[bool] = ContextVar("browser_dispatch_committed", default=False)
+
+
+def _suppress_redundant_desired_click() -> list[ActionResult]:
+    """A control already in the desired state: no physical click is dispatched. Mark the action
+    no-dispatch so its epoch's download reservations are released rather than retained on exit."""
+    _browser_dispatch_committed.set(False)
+    return [ActionAbort(desired_state_reached=True)]
+
+
+def _settle_download_reservations_on_exit(
+    context: SkyvernContext,
+    task: Task,
+    action: Action,
+    prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]],
+    *,
+    failed: bool,
+) -> None:
+    """Decide a finished action's download reservations on the dispatch boundary, not on result status.
+
+    - No browser dispatch committed (pre-handler exit, stale abort, already-desired-state suppression):
+      the epoch cannot own a download, so release it now for every outcome.
+    - Dispatched and not failed: the reservations are causally owned; keep them for the credit seam.
+    - Dispatched then failed/raised: keep them until this step's durable-credit seam can consume them,
+      then release if uncredited (restoring generic blank-page recovery). An internal-recovery close
+      keeps its guarded claim in place -- it mints no epoch reservation, so nothing new is deferred.
+    """
+    if not _browser_dispatch_committed.get():
+        # retain_download_popup_reservations also stops the epoch's capture listener.
+        context.retain_download_popup_reservations(task.task_id, prior_reservations)
+        return
+    if not failed:
+        # A later successful dispatch owns reservations beyond the failed epoch's snapshot.
+        context.cancel_pending_download_reservation_release(task.task_id)
+        return
+    if isinstance(action, ClosePageAction) and action.is_internal_recovery:
+        return
+    # Dispatched then failed: keep the capture listener armed to the next action's entry -- the same
+    # boundary as a successful dispatch -- so a popup that joins the context after handle_action returns
+    # but before the next action is still observed. Only the reservation release is deferred, to the
+    # step's durable-credit seam, instead of dropping the claim now.
+    context.stash_pending_download_reservation_release(task.task_id, prior_reservations)
+
 
 def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
     off = getattr(page, "off", None)
@@ -1608,12 +1752,21 @@ def _record_action_owned_popup_delta(
     task_id: str,
     initiating_page: Page,
     baseline: _PageDeltaBaseline | None,
+    download_dir: Path | None = None,
+    attempt_started_at: datetime | None = None,
+    session_baseline_files: list[str] | None = None,
+    session_observed: bool = False,
 ) -> _PageDeltaOutcome:
     """At the action-finally boundary, claim every still-present Page newly added to the initiating
     BrowserContext since the baseline, excluding the initiating and baseline pages (store-deduped by exact
     identity; no delayed/global/credit-time sweep). Valid only inside the baseline's exact BrowserContext:
     if recovery reconnected into a different context, claim zero (``context_replaced``) rather than treating
-    that context's pre-existing tabs as new. Disabled (zero) when the baseline was unavailable."""
+    that context's pre-existing tabs as new. Disabled (zero) when the baseline was unavailable.
+
+    Each delta claim is anchored to the run dir's file snapshot at this boundary, unioned with the caller's
+    pre-fetched session snapshot (final + in-flight) when the run has a browser session, so dead-blank
+    recovery observes it against its own baseline, not a stale block baseline. No snapshot at all (no run
+    dir, no session) -> recovery falls back to the block baseline for those pages."""
     if owning_context is None or baseline is None:
         return _PageDeltaOutcome(claimed=0, context_replaced=False, pages=[])
     try:
@@ -1623,27 +1776,42 @@ def _record_action_owned_popup_delta(
         current_pages = list(current_context.pages)
     except Exception:
         return _PageDeltaOutcome(claimed=0, context_replaced=False, pages=[])
+    baseline_files: list[str] | None = None
+    if download_dir is not None:
+        baseline_files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+        if session_baseline_files:
+            baseline_files = baseline_files + list(session_baseline_files)
+    elif session_baseline_files:
+        baseline_files = list(session_baseline_files)
     delta_pages: list[Page] = []
     for candidate in current_pages:
         if candidate is initiating_page:
             continue
         if any(candidate is baseline_page for baseline_page in baseline.pages):
             continue
-        owning_context.record_download_popup_claim(task_id, candidate)
+        owning_context.record_download_popup_claim(
+            task_id,
+            candidate,
+            baseline_files=baseline_files,
+            session_observed=session_observed,
+            # Augment (union) the per-page session baseline: for a page already event-recorded with a stale
+            # pre-action snapshot, this later finally-boundary session snapshot is unioned in, not ignored.
+            session_baseline_files=session_baseline_files,
+        )
         delta_pages.append(candidate)
+    # A single delta popup owns any new file unambiguously (round-14 credit). Two or more claimed at this
+    # one instant are same-action siblings with no file->page mapping: mark them so a non-complete recovery
+    # does not early-credit-and-close one sibling on another sibling's later-settling file, cancelling its
+    # own still-pending download. The shared file snapshot above stays correct for "pre-existed this sweep";
+    # this only guards a file that lands AFTER the sweep, which no per-candidate snapshot could baseline.
+    if len(delta_pages) > 1:
+        owning_context.mark_download_popup_claim_delta_siblings(task_id, delta_pages)
     return _PageDeltaOutcome(claimed=len(delta_pages), context_replaced=False, pages=delta_pages)
 
 
-# The CDP download interceptor names its in-flight temp file ``<final>.<uuid4().hex>.crdownload`` (32
-# lowercase hex chars) before hard-linking to ``<final>``; Chrome-native downloads use ``<final>.crdownload``.
-# Stripped after the ``.crdownload`` suffix, this collapses both temp shapes to the same ``<final>`` identity.
-_INTERCEPTOR_TEMP_IDENTITY_RE = re.compile(r"\.[0-9a-f]{32}$")
-
-
-def _normalize_download_identity(file: str) -> str:
-    if not file.endswith(BROWSER_DOWNLOADING_SUFFIX):
-        return file
-    return _INTERCEPTOR_TEMP_IDENTITY_RE.sub("", file.removesuffix(BROWSER_DOWNLOADING_SUFFIX))
+# Shared identity normalization (defined in the files module) so the in-flight -> settled collapse is
+# identical on the v4 false-click path and the dead-blank recovery observer.
+_normalize_download_identity = normalize_download_identity
 
 
 def _local_download_signal_identities(download_dir: Path, *, attempt_started_at: datetime | None = None) -> set[str]:
@@ -1732,7 +1900,11 @@ async def _settle_and_close_false_click_download(
                 continue
             observed_delta_pages.append(candidate)
             if owning_context is not None:
-                owning_context.record_download_popup_claim(task.task_id, candidate)
+                owning_context.record_download_popup_claim(
+                    task.task_id,
+                    candidate,
+                    baseline_files=list_files_in_directory(download_dir, attempt_started_at=attempt_started_at),
+                )
         if _local_download_signal_identities(download_dir, attempt_started_at=attempt_started_at) - signal_before:
             file_signal_observed = True
         if observed_delta_pages and file_signal_observed:
@@ -2275,6 +2447,15 @@ async def _recover_download_page(
                 recovered_page = await browser_state.get_working_page()
                 if recovered_page is None:
                     raise RuntimeError("Browser reconnect did not create a working page")
+            # The replacement working page is deliberately created and persistent. On the direct new_page path
+            # it just joined the initiating context and the download context.on("page") owner may have recorded
+            # it as a blank late candidate; retire it from both registries as the next synchronous ownership op
+            # -- before the navigation await -- so a delayed download credit cannot close it. (The reconnect path
+            # produces a page on a fresh context with no owner armed, so it is never recorded and this is a safe
+            # no-op there.)
+            recovery_context = skyvern_context.current()
+            if recovery_context is not None:
+                recovery_context.retire_intentional_page(task.task_id, recovered_page)
             await browser_state.navigate_to_url(page=recovered_page, url=page_url_before_download)
             await browser_state.set_active_page(recovered_page)
     except Exception:
@@ -4188,6 +4369,8 @@ class ScopedXhrDownloadCapture:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._page = page
+        self.recovery_hook: "DownloadRecoveryHook | None" = None
+        self.recovery_requested = False
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
         self._monotonic = monotonic
@@ -4334,6 +4517,15 @@ class ScopedXhrDownloadCapture:
         self._accept_new_requests = False
         self._status_observation_deadline = self._monotonic() + _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS
 
+    def resume_in_flight_requests(self) -> None:
+        self._accept_new_requests = True
+        # Reopen the status-observation window for the one resumed retry so its own request (and the
+        # retry's exact 500/200-class response) is observable again. The window was sealed after the
+        # original action; without this the late retry's requests would start past the deadline and be
+        # dropped. The window is re-sealed by the caller's seal_in_flight_requests() after the retry
+        # click, still bounded by the original download-wait hard deadline.
+        self._status_observation_deadline = None
+
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
 
@@ -4379,6 +4571,8 @@ class ScopedXhrDownloadCapture:
             if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
                 return
             self._observed_download_failure_status = status
+            if self.recovery_hook is not None and self.recovery_hook.matches_failure(response):
+                self.recovery_requested = True
         except Exception:
             return
 
@@ -4580,6 +4774,63 @@ class ActionHandler:
         file_download_false_click_eligible: bool = False,
         allow_stale_refresh: bool = False,
     ) -> list[ActionResult]:
+        context = skyvern_context.current()
+        prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]] = ((), ())
+        if context is not None:
+            # Stop the previous action's capture listener before this action begins (the fixed causal
+            # capture boundary). A prior dispatched-then-failed epoch's reservations are NOT released
+            # here: they must survive later same-batch actions and durable credit, so the deferred
+            # release is applied only at the step's complete-on-download no-credit seam (or terminal
+            # cleanup). This action's own baseline snapshot therefore still includes those reservations,
+            # so a no-dispatch retain below preserves rather than disturbs the earlier failed epoch.
+            context.stop_download_popup_capture(task.task_id)
+            prior_reservations = context.snapshot_download_popup_reservations(task.task_id)
+        _browser_dispatch_committed.set(False)
+        try:
+            results = await ActionHandler._handle_action_with_downloads(
+                scraped_page,
+                task,
+                step,
+                page,
+                action,
+                file_download_false_click_eligible=file_download_false_click_eligible,
+                allow_stale_refresh=allow_stale_refresh,
+            )
+        except BaseException as exit_error:
+            if context is not None:
+                if isinstance(exit_error, Exception):
+                    _settle_download_reservations_on_exit(context, task, action, prior_reservations, failed=True)
+                else:
+                    # A cancellation (BaseException, not Exception) re-raises through the step loop's
+                    # `except CancelledError`, which -- unlike every failure handler -- re-raises without
+                    # running clean_up_task, so no next action and no teardown will invalidate capture at a
+                    # later boundary. Keeping the listener armed here (the ordinary failed-dispatch behavior)
+                    # would strand it on the live BrowserContext. Detach now and drop this epoch's reservation;
+                    # retain keeps prior epochs, and once the listener is off a queued callback cannot recreate
+                    # what it released.
+                    context.retain_download_popup_reservations(task.task_id, prior_reservations)
+            raise
+        if context is not None:
+            _settle_download_reservations_on_exit(
+                context,
+                task,
+                action,
+                prior_reservations,
+                failed=_terminal_action_status(results) == ActionStatus.failed,
+            )
+        return results
+
+    @staticmethod
+    async def _handle_action_with_downloads(
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        page: Page,
+        action: Action,
+        *,
+        file_download_false_click_eligible: bool = False,
+        allow_stale_refresh: bool = False,
+    ) -> list[ActionResult]:
         # task_id, step_id auto-attached by @traced from SkyvernContext
         _action_span = otel_trace.get_current_span()
         _action_span.set_attribute("action_type", str(action.action_type))
@@ -4594,7 +4845,7 @@ class ActionHandler:
         # code no longer describes the failure this task will report. Terminate and complete are the
         # exception: they are how a task ends, so the navigation before them is what it ends on.
         if action.action_type not in _TASK_ENDING_ACTION_TYPES:
-            _clear_task_nav_error_code(task)
+            clear_task_nav_error_code(task.task_id)
         # Hydrated/cached actions can arrive with a prior finished_at; clear it so the
         # exceptional-exit fallback below stamps this execution, not the previous one.
         action.finished_at = None
@@ -4602,18 +4853,26 @@ class ActionHandler:
         # Ownership transfer: this action's incoming page is now accepted navigation state, so retire any
         # stale task-scoped popup claim for that exact Page left by an earlier action that never got a durable
         # download credit. Identity-based, before any action-specific branch so it covers the false-click,
-        # explicit-download, and non-download paths alike; recovery rebinds and switch-tab adoption are the
-        # next action entry's transfer, not this one.
+        # explicit-download, and non-download paths alike. SWITCH_TAB retires its selected target in the
+        # switch handler, where that exact Page is first known.
+        # An internal-recovery close must NOT retire the dead page's claim here: the recovery guard
+        # below reads it to fail closed on a claimed download popup, so retiring it would blind that
+        # check and let recovery close a page that is still capturing a download.
         _reuse_owning_context = skyvern_context.current()
-        if _reuse_owning_context is not None and _reuse_owning_context.discard_download_popup_claim(task.task_id, page):
-            with contained_effect("retire reused download popup claim"):
-                LOG.info(
-                    "Retired download popup claim for reused page",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    discarded=1,
-                    reason="page_reused_as_initiating",
-                )
+        if _reuse_owning_context is not None and not (
+            isinstance(action, ClosePageAction) and action.is_internal_recovery
+        ):
+            discarded_claim = _reuse_owning_context.discard_download_popup_claim(task.task_id, page)
+            discarded_candidate = _reuse_owning_context.discard_download_popup_late_candidate(task.task_id, page)
+            if discarded_claim or discarded_candidate:
+                with contained_effect("retire reused download popup claim"):
+                    LOG.info(
+                        "Retired download popup claim for reused page",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        discarded=1,
+                        reason="page_reused_as_initiating",
+                    )
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
             isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
@@ -4719,10 +4978,43 @@ class ActionHandler:
                         # captured in the action coroutine (never current() here). The in-seam cleanup below
                         # stays the primary close; the claim is a superset backstop, deduped by Page identity.
                         if false_click_owning_context is not None:
-                            false_click_owning_context.record_download_popup_claim(task.task_id, download_page)
+                            false_click_owning_context.record_download_popup_claim(
+                                task.task_id,
+                                download_page,
+                                baseline_files=list_files_in_directory(
+                                    false_click_download_dir, attempt_started_at=false_click_attempt_started_at
+                                ),
+                            )
                             false_click_popup_event_count += 1
 
                     page.on("popup", on_popup)
+
+                    def on_context_child(child_page: Page) -> None:
+                        # Discovery can outlive the action's popup listener; closing still requires durable credit.
+                        if false_click_owning_context is None or false_click_baseline is None:
+                            return
+                        if child_page is page or child_page.context is not false_click_baseline.browser_context:
+                            return
+                        if any(child_page is baseline_page for baseline_page in false_click_baseline.pages):
+                            return
+                        false_click_owning_context.record_download_popup_late_candidate(
+                            task.task_id,
+                            child_page,
+                            baseline_files=list_files_in_directory(
+                                false_click_download_dir, attempt_started_at=false_click_attempt_started_at
+                            ),
+                        )
+
+                    if (
+                        false_click_owning_context is not None
+                        and false_click_gate_context is not None
+                        and false_click_baseline is not None
+                        and false_click_baseline.browser_context is false_click_gate_context
+                    ):
+                        # Remain observable after return, until the next action or credit/teardown.
+                        false_click_owning_context.arm_download_popup_context_listener(
+                            task.task_id, false_click_gate_context, on_context_child
+                        )
 
                     async def process_captured_download(results: list[ActionResult] | None) -> None:
                         await asyncio.sleep(0)
@@ -4864,6 +5156,8 @@ class ActionHandler:
                             task_id=task.task_id,
                             initiating_page=page,
                             baseline=false_click_baseline,
+                            download_dir=false_click_download_dir,
+                            attempt_started_at=false_click_attempt_started_at,
                         )
                         if false_click_delta.context_replaced:
                             with contained_effect("record download popup context replacement"):
@@ -4949,12 +5243,21 @@ class ActionHandler:
             # be recorded here for the task's credit seam to close it later. Records into the context
             # captured in the action coroutine, never current() at Playwright dispatch time.
             if context is not None:
-                context.record_download_popup_claim(task.task_id, popup_page)
+                context.record_download_popup_claim(
+                    task.task_id,
+                    popup_page,
+                    baseline_files=list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+                    + session_download_baseline,
+                    session_observed=bool(task.browser_session_id),
+                    # Augment the per-page session baseline so the action-finally resnapshot (which re-records
+                    # this same popup) can union a later, more conservative session view over this one.
+                    session_baseline_files=session_download_baseline,
+                )
 
         def _download_signal_identity(file: str) -> str:
             return _normalize_download_identity(file)
 
-        async def _list_download_signal_files() -> list[str]:
+        async def _list_download_signal_files(*, capture_session_into: list[str] | None = None) -> list[str]:
             files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
             if task.browser_session_id:
                 downloading_files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
@@ -4963,7 +5266,10 @@ class ActionHandler:
                 downloaded_files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
                     organization_id=task.organization_id, browser_session_id=task.browser_session_id
                 )
-                files = files + downloaded_files_in_browser_session + downloading_files_in_browser_session
+                session_files = downloaded_files_in_browser_session + downloading_files_in_browser_session
+                if capture_session_into is not None:
+                    capture_session_into.extend(session_files)
+                files = files + session_files
             return files
 
         async def _list_final_download_files() -> list[str]:
@@ -5045,10 +5351,17 @@ class ActionHandler:
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
+        # The per-claim session baseline is the SESSION portion of the single authoritative pre-click read
+        # below -- captured in one listing, never a second one. Pre-click, so it can never include this
+        # action's own download (round-14 invariant); if the read fails, the whole action fails on the
+        # authoritative baseline (as before this PR) rather than minting false durable credit.
+        session_download_baseline: list[str] = []
         signal_file_identities_before = {
-            _download_signal_identity(file) for file in await _list_download_signal_files()
+            _download_signal_identity(file)
+            for file in await _list_download_signal_files(capture_session_into=session_download_baseline)
         }
         list_files_before = list(signal_file_identities_before)
+        sampler = _DownloadProgressSampler(download_dir, attempt_started_at, signal_file_identities_before)
         LOG.info(
             "Number of files in download directory before action",
             num_downloaded_files_before=len(list_files_before),
@@ -5062,6 +5375,12 @@ class ActionHandler:
         staging_dir = Path(
             tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
         )
+        try:
+            recovery_hook = app.AGENT_FUNCTION.build_download_recovery(
+                action=action, scraped_page=scraped_page, page=page
+            )
+        except Exception:
+            recovery_hook = None
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
@@ -5069,6 +5388,7 @@ class ActionHandler:
             if task.download_timeout is not None
             else BROWSER_DOWNLOAD_TIMEOUT,
         )
+        xhr_capture.recovery_hook = recovery_hook
         download_triggered = False
         working_page_recovery_attempted = False
         working_page_replaced_after_close = False
@@ -5150,6 +5470,10 @@ class ActionHandler:
                 download_wait_hard_timeout_seconds = no_signal_grace_seconds + DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS
             download_wait_started_at = time.monotonic()
             download_wait_deadline = download_wait_started_at + download_wait_hard_timeout_seconds
+            # Late-fire the one-shot recovery retry near the end of the no-signal grace (clamped to the
+            # grace so a short timeout still fires inside the existing wait), giving a slow real download
+            # the whole grace to land on its own before the single retry is spent.
+            recovery_fire_after_seconds = max(0.0, no_signal_grace_seconds - DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS)
 
             def _remaining_download_wait_seconds() -> float:
                 return max(0.0, download_wait_deadline - time.monotonic())
@@ -5290,6 +5614,7 @@ class ActionHandler:
                                     break
 
                             list_files_after = await _list_download_signal_files()
+                            sampler.start_if_partial_seen(list_files_after)
                             local_signal_delta = {
                                 _download_signal_identity(file) for file in list_files_after
                             } - signal_file_identities_before
@@ -5364,6 +5689,106 @@ class ActionHandler:
                                 )
                                 download_event_fallback_failed = True
                                 break
+                            recovery_elapsed_seconds = time.monotonic() - download_wait_started_at
+                            if (
+                                recovery_hook is not None
+                                and xhr_capture.recovery_requested
+                                and recovery_elapsed_seconds >= recovery_fire_after_seconds
+                            ):
+                                # Consume the one-shot only now that a real attempt is about to begin: an
+                                # earlier poll where the fire time had not arrived leaves the still-eligible
+                                # hook untouched. Every branch below emits exactly one structured
+                                # "Download recovery click" receipt with a bounded sub-outcome.
+                                hook, recovery_hook = recovery_hook, None
+                                if download_event.done():
+                                    LOG.info(
+                                        "Download recovery click",
+                                        attempt=1,
+                                        result="not_attempted",
+                                        reason="event_done",
+                                        elapsed_seconds=recovery_elapsed_seconds,
+                                    )
+                                elif any(staging_dir.iterdir()):
+                                    LOG.info(
+                                        "Download recovery click",
+                                        attempt=1,
+                                        result="not_attempted",
+                                        reason="staging_nonempty",
+                                        elapsed_seconds=recovery_elapsed_seconds,
+                                    )
+                                elif _remaining_download_wait_seconds() <= 0:
+                                    LOG.info(
+                                        "Download recovery click",
+                                        attempt=1,
+                                        result="not_attempted",
+                                        reason="budget_exhausted",
+                                        elapsed_seconds=recovery_elapsed_seconds,
+                                    )
+                                else:
+                                    phase = "remap"
+                                    try:
+                                        remap = await hook.remap(page)
+                                        if remap.locator is None:
+                                            LOG.info(
+                                                "Download recovery click",
+                                                attempt=1,
+                                                result="remap_none",
+                                                reason=remap.reason,
+                                                elapsed_seconds=recovery_elapsed_seconds,
+                                            )
+                                        else:
+                                            phase = "recheck"
+                                            files = await _list_download_signal_files()
+                                            if (
+                                                download_event.done()
+                                                or any(staging_dir.iterdir())
+                                                or (
+                                                    {_download_signal_identity(file) for file in files}
+                                                    - signal_file_identities_before
+                                                )
+                                            ):
+                                                LOG.info(
+                                                    "Download recovery click",
+                                                    attempt=1,
+                                                    result="stale_signal",
+                                                    resolution=remap.resolution,
+                                                    elapsed_seconds=recovery_elapsed_seconds,
+                                                )
+                                            elif _remaining_download_wait_seconds() <= 0:
+                                                LOG.info(
+                                                    "Download recovery click",
+                                                    attempt=1,
+                                                    result="no_budget_at_click",
+                                                    resolution=remap.resolution,
+                                                    elapsed_seconds=recovery_elapsed_seconds,
+                                                )
+                                            else:
+                                                phase = "click"
+                                                remaining = _remaining_download_wait_seconds()
+                                                xhr_capture.resume_in_flight_requests()
+                                                try:
+                                                    await remap.locator.click(timeout=remaining * 1000)
+                                                    LOG.info(
+                                                        "Download recovery click",
+                                                        attempt=1,
+                                                        result="clicked",
+                                                        resolution=remap.resolution,
+                                                        elapsed_seconds=recovery_elapsed_seconds,
+                                                    )
+                                                    await asyncio.sleep(0)
+                                                finally:
+                                                    xhr_capture.seal_in_flight_requests()
+                                                continue
+                                    except Exception as recovery_exc:
+                                        LOG.info(
+                                            "Download recovery click",
+                                            attempt=1,
+                                            result="failed",
+                                            phase=phase,
+                                            error_type=type(recovery_exc).__name__,
+                                            elapsed_seconds=recovery_elapsed_seconds,
+                                        )
+
                             elapsed_since_action = time.monotonic() - download_wait_started_at
                             if elapsed_since_action >= download_wait_hard_timeout_seconds:
                                 raise asyncio.TimeoutError
@@ -5519,10 +5944,29 @@ class ActionHandler:
                     )
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
+                successful_download_bytes = 0
+                for filename in downloaded_file_names:
+                    try:
+                        successful_download_bytes += (download_dir / filename).stat().st_size
+                    except OSError:
+                        pass
+                if successful_download_bytes >= LARGE_DOWNLOAD_LOG_THRESHOLD_BYTES:
+                    transfer_started_at = (
+                        sampler.first_observed_at or download_event_captured_at or download_wait_started_at
+                    )
+                    LOG.info(
+                        "Large browser download completed",
+                        bytes_downloaded=successful_download_bytes,
+                        transfer_elapsed_s=time.monotonic() - transfer_started_at,
+                        url_origin=(
+                            redacted_url_origin(captured_download.url) if captured_download is not None else "unknown"
+                        ),
+                    )
             elif (
                 captured_download is not None
                 and (aborted_reason := await read_download_failure(captured_download)) is not None
             ):
+                evidence = _abort_evidence(captured_download, sampler, time.monotonic())
                 # The partial file appearing is what credited download_triggered, and the browser
                 # deletes it on abort, so the settle above reads an aborted transfer as a completed
                 # one. Without this the action reports success with no file and the agent retries
@@ -5532,6 +5976,7 @@ class ActionHandler:
                     workflow_run_id=task.workflow_run_id,
                     download_dir=download_dir,
                     failure=aborted_reason,
+                    **evidence,
                 )
                 results[-1] = ActionFailure(
                     Exception(f"{DOWNLOAD_ABORTED_FAILURE_MESSAGE} (browser reported: {aborted_reason})"),
@@ -5566,6 +6011,7 @@ class ActionHandler:
             # Close the provider polling phase exactly once if it ever started; a no-op otherwise.
             with contained_effect("provider download polling lifecycle exit"):
                 provider_poll_phase.finish()
+            await sampler.aclose()
             await _close_eager_capture_then_teardown_retention(
                 eager_blob_capture,
                 page,
@@ -5582,11 +6028,24 @@ class ActionHandler:
             except Exception:
                 with contained_effect("remove download popup claim recorder"):
                     LOG.warning("Failed to remove download popup claim recorder", exc_info=True)
+            # Baseline the swept popups against the PRE-ACTION session view (captured before the click),
+            # NOT a fresh finally re-snapshot. Causal attribution: only files present before the action
+            # began are provably not this action's own download. A finally re-fetch cannot tell an earlier
+            # action's just-settled file from THIS popup's own just-settled download (both appear after the
+            # pre-action fetch), so re-fetching risks baselining out -- and permanently denying credit to --
+            # the popup's own download that settles anywhere in the teardown/grace window. Earlier actions'
+            # files are already in the pre-action view (they exist at action start); the residual (an earlier
+            # in-flight download not yet listed at pre-action, a storage-listing latency) is accepted so the
+            # own download is never denied credit. The delta sweep still re-reads the LOCAL dir here.
             explicit_delta = _record_action_owned_popup_delta(
                 context,
                 task_id=task.task_id,
                 initiating_page=page,
                 baseline=explicit_baseline,
+                download_dir=download_dir,
+                attempt_started_at=attempt_started_at,
+                session_baseline_files=session_download_baseline,
+                session_observed=bool(task.browser_session_id),
             )
             if explicit_delta.context_replaced:
                 with contained_effect("record download popup context replacement"):
@@ -5748,11 +6207,18 @@ class ActionHandler:
                             actions_result.append(stop_result)
                             return actions_result
 
+                    # Setup can interact before returning or raising; exceptions must retain ownership.
+                    # Only a normal, explicitly effect-free setup exit clears this commitment.
+                    _browser_dispatch_committed.set(True)
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
                         results = await setup(action, page, scraped_page, task, step)
                         actions_result.extend(results)
                         if results and results[-1] != ActionSuccess:
+                            if isinstance(action, (ClickAction, SelectOptionAction)) and all(
+                                result.success and not result.setup_performed for result in results
+                            ):
+                                _browser_dispatch_committed.set(False)
                             return actions_result
 
                     # do the handler
@@ -5828,7 +6294,10 @@ class ActionHandler:
             )
             actions_result.append(ActionFailure(e))
         except Exception as e:
-            LOG.exception("Unhandled exception in action handler", action=action)
+            if is_driver_timeout_error(e):
+                LOG.warning("Browser timeout while handling action", action=action, exc_info=True)
+            else:
+                LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
         finally:
             tool_result_content = ""
@@ -6789,7 +7258,7 @@ async def _apply_label_desired_click_state(
             action=action,
             desired_state=desired_state,
         )
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
     LOG.info(
         "Label's bound control differs from the desired state, continuing with a single normal click",
         action=action,
@@ -6824,7 +7293,7 @@ async def _apply_checkbox_desired_click_state(
             return None
         if native_state == desired_state:
             LOG.info("Control already in the desired state, suppressing the redundant click", action=action)
-            return [ActionAbort(desired_state_reached=True)]
+            return _suppress_redundant_desired_click()
         LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
         set_outcome = await _set_native_checkbox_state(element, should_check=desired_state)
         if set_outcome is NativeSetOutcome.VERIFIED:
@@ -6843,10 +7312,10 @@ async def _apply_checkbox_desired_click_state(
     positively_unselected = state is _GridRowSelection.UNSELECTED
     if positively_selected and desired_state:
         LOG.info("Row already selected, suppressing the redundant click", action=action)
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
     if positively_unselected and not desired_state:
         LOG.info("Row already unselected, suppressing the redundant click", action=action)
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
 
     if not desired_state:
         # Deselect intent. Only a positively-SELECTED row is driven off its selection; an UNMARKED row is
@@ -6863,7 +7332,7 @@ async def _apply_checkbox_desired_click_state(
             native_checked = None
         if native_checked is False:
             LOG.info("Unmarked row with the box positively off already matches desired unselected", action=action)
-            return [ActionAbort(desired_state_reached=True)]
+            return _suppress_redundant_desired_click()
         LOG.info("Unmarked row can't be proven unselected, continuing the normal click", action=action)
         return None
 
@@ -6921,7 +7390,7 @@ async def _apply_desired_click_state(
             action=action,
             desired_state=desired_state,
         )
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
     if element.get_tag_name() == "input":
         # Only a native radio reaches here (checkbox is handled above; a non-toggle input has no
         # readable state and already fell open). The guard below rejects a checked radio requested
@@ -7433,12 +7902,35 @@ async def handle_click_to_download_file_action(
     return results
 
 
+def _multi_field_totp_retry_budget_failure(task: Task, step_id: str | None = None) -> ActionFailure | None:
+    if not skyvern_context.multi_field_totp_retry_budget_exhausted(
+        task.task_id, log_refusal=True, workflow_run_id=task.workflow_run_id, step_id=step_id
+    ):
+        return None
+    failure = ActionFailure(SkyvernException("The one-time code retry budget is exhausted."))
+    failure.skip_remaining_actions = True
+    return failure
+
+
 async def _resolve_multi_field_totp_code(task: Task, attempt: MultiFieldTotpAttempt) -> str | ActionFailure:
+    if failure := _multi_field_totp_retry_budget_failure(task):
+        return failure
     context = skyvern_context.ensure_context()
     cache_key = f"{task.task_id}_totp_cache"
     if attempt.code_source == "external":
-        code = context.totp_codes.get(cache_key)
-        if code is None or len(code) != attempt.expected_digits:
+        code = skyvern_context.normalize_multi_field_totp_code(
+            context.totp_codes.get(cache_key), attempt.expected_digits, task_id=task.task_id
+        )
+        if code is None:
+            context.totp_codes.pop(cache_key, None)
+        else:
+            context.totp_codes[cache_key] = code
+        rejection = context.multi_field_totp_rejections.get(task.task_id)
+        if (
+            code is None
+            or len(code) != attempt.expected_digits
+            or (rejection is not None and hashlib.sha256(code.encode()).hexdigest() == rejection.rejected_code_hash)
+        ):
             return ActionFailure(SkyvernException("The multi-field one-time code is unavailable."))
         _register_runtime_otp_value_best_effort(task.workflow_run_id, code)
         return code
@@ -7493,6 +7985,24 @@ async def _resolve_multi_field_totp_code(task: Task, attempt: MultiFieldTotpAtte
                 now=now, next_window_from=valid_until, interval=totp.interval
             )
         code = totp.at(int(valid_from))
+
+    rejection = context.multi_field_totp_rejections.get(task.task_id)
+    if rejection is not None:
+        assert valid_from is not None and valid_until is not None
+        if rejection.rejected_valid_from is not None and valid_from <= rejection.rejected_valid_from:
+            valid_from, valid_until = await _wait_for_next_multi_field_totp_window(
+                now=time.time(), next_window_from=rejection.rejected_valid_from + totp.interval, interval=totp.interval
+            )
+            code = totp.at(int(valid_from))
+        for collision in range(3):
+            if hashlib.sha256(code.encode()).hexdigest() != rejection.rejected_code_hash:
+                break
+            if collision == 2:
+                return ActionFailure(SkyvernException("A fresh one-time code is unavailable."))
+            valid_from, valid_until = await _wait_for_next_multi_field_totp_window(
+                now=time.time(), next_window_from=valid_until, interval=totp.interval
+            )
+            code = totp.at(int(valid_from))
 
     if len(code) != attempt.expected_digits:
         return ActionFailure(SkyvernException("The generated one-time code does not match the input group."))
@@ -7591,14 +8101,36 @@ async def _multi_field_totp_group_is_present(
     return True
 
 
-def _record_multi_field_totp_fill(state: MultiFieldTotpAttempt, code: str, *, verified: bool = True) -> None:
+def _record_multi_field_totp_fill(
+    state: MultiFieldTotpAttempt,
+    code: str,
+    *,
+    verified: bool = True,
+    filled_url: str | None = None,
+    filled_loader_id: str | None = None,
+) -> None:
+    if state.code_source == "external":
+        normalized = skyvern_context.normalize_multi_field_totp_code(code, state.expected_digits)
+        if normalized is None:
+            raise ValueError("Unsupported multi-field OTP code format")
+        code = normalized
+    if verified:
+        state.observed_max_filled = state.expected_digits
     state.filled_code_hash = hashlib.sha256(code.encode()).hexdigest()
     state.filled_at = time.time()
+    state.filled_url = filled_url
+    state.filled_loader_id = filled_loader_id
     state.fill_verified = verified
 
 
-def _multi_field_totp_unverified_success(state: MultiFieldTotpAttempt, code: str) -> ActionSuccess:
-    _record_multi_field_totp_fill(state, code, verified=False)
+def _multi_field_totp_unverified_success(
+    state: MultiFieldTotpAttempt,
+    code: str,
+    *,
+    filled_url: str | None = None,
+    filled_loader_id: str | None = None,
+) -> ActionSuccess:
+    _record_multi_field_totp_fill(state, code, verified=False, filled_url=filled_url, filled_loader_id=filled_loader_id)
     return ActionSuccess(data={"totp_group_filled": True, "verified": False})
 
 
@@ -7606,9 +8138,16 @@ async def _reresolve_multi_field_totp_group_elements(
     page: Page,
     scraped_page: ScrapedPage,
     state: MultiFieldTotpAttempt,
+    task: Task,
 ) -> tuple[ScrapedPage, list[SkyvernElement]] | MultiFieldTotpBindingFailure:
     await asyncio.sleep(0.1)
-    binding = await _refresh_multi_field_totp_group_binding(scraped_page, page, state)
+    context = skyvern_context.current()
+    log_context: MultiFieldTotpLogContext = {
+        "task_id": task.task_id,
+        "workflow_run_id": task.workflow_run_id,
+        "step_id": context.step_id if context else None,
+    }
+    binding = await _refresh_multi_field_totp_group_binding(scraped_page, page, state, **log_context)
     if isinstance(binding, MultiFieldTotpBindingFailure):
         return binding
     fresh, element_ids = binding
@@ -7616,6 +8155,8 @@ async def _reresolve_multi_field_totp_group_elements(
     if elements is None:
         LOG.info(
             "Multi-field OTP binding rejected",
+            **log_context,
+            reason="fresh_css_resolution_miss",
             reason_code="fresh_css_resolution_miss",
             classification=MultiFieldTotpBindingFailure.UNCONFIRMED.value,
             live_boxes=None,
@@ -7631,6 +8172,32 @@ async def _reresolve_multi_field_totp_group_elements(
     return fresh, elements
 
 
+async def _observe_multi_field_totp_submission(
+    page: Page,
+    scraped_page: ScrapedPage,
+    state: MultiFieldTotpAttempt,
+    *,
+    boxes: list[Locator] | None = None,
+    probes: int = 3,
+) -> bool:
+    try:
+        async with asyncio.timeout(0.6 if boxes is not None else None):
+            baseline = (
+                await capture_multi_field_totp_submission_baseline(page, boxes, sample_count=1) if boxes else None
+            )
+            for probe in range(probes):
+                if probe:
+                    await asyncio.sleep(0.2)
+                if await multi_field_totp_submission_evidence(
+                    page, scraped_page, state, baseline=baseline, post_dispatch=baseline is not None
+                ):
+                    return True
+    except TimeoutError:
+        if boxes is None:
+            raise
+    return False
+
+
 async def _fill_multi_field_totp_group(
     page: Page,
     scraped_page: ScrapedPage,
@@ -7638,9 +8205,21 @@ async def _fill_multi_field_totp_group(
     state: MultiFieldTotpAttempt,
     code: str,
 ) -> ActionResult:
+    if failure := _multi_field_totp_retry_budget_failure(task):
+        return failure
+    if state.code_source == "external":
+        normalized_code = skyvern_context.normalize_multi_field_totp_code(
+            code, state.expected_digits, task_id=task.task_id
+        )
+        if normalized_code is None:
+            return ActionFailure(SkyvernException("The multi-field one-time code is unavailable."))
+        code = normalized_code
     context = skyvern_context.current()
     if context is not None:
         context.register_secret_value(code)
+    filled_url = _multi_field_totp_page_url(page)
+    filled_loader_id = await get_main_document_loader_id(page)
+    state.filled_group_identity = multi_field_totp_group_identity(scraped_page, state.expected_digits)
     started_at = time.perf_counter()
     elements: list[SkyvernElement] = []
     strategy = "keyboard_stream"
@@ -7653,6 +8232,25 @@ async def _fill_multi_field_totp_group(
     fallback_reached_box_index: int | None = None
     fallback_filled_box_index: int | None = None
     external_code_logged = False
+    observer: MultiFieldTotpFillObserver | None = None
+
+    async def verified_success() -> ActionSuccess:
+        nonlocal verified
+        verified = True
+        _record_multi_field_totp_fill(state, code, filled_url=filled_url, filled_loader_id=filled_loader_id)
+        result = ActionSuccess(data={"totp_group_filled": True})
+        try:
+            if await _observe_multi_field_totp_submission(
+                page, scraped_page, state, boxes=[element.get_locator() for element in elements]
+            ):
+                result.data = {"totp_group_filled": True, "verified": True, "totp_submission_observed": True}
+        except Exception as exc:
+            LOG.debug(
+                "Multi-field TOTP post-fill observation unavailable",
+                task_id=task.task_id,
+                error_type=type(exc).__name__,
+            )
+        return result
 
     async def refresh_code_if_expiring() -> ActionFailure | None:
         nonlocal code, external_code_logged
@@ -7687,14 +8285,18 @@ async def _fill_multi_field_totp_group(
         nonlocal strategy
         strategy = strategy_name
         if stream_completed:
-            return _multi_field_totp_unverified_success(state, code)
+            return _multi_field_totp_unverified_success(
+                state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+            )
         return ActionFailure(
             SkyvernException(failure_message or "Multi-field one-time code input was interrupted before completion.")
         )
 
     def group_changed_failure() -> ActionFailure:
         if stream_completed and not state.fill_verified:
-            _record_multi_field_totp_fill(state, code, verified=False)
+            _record_multi_field_totp_fill(
+                state, code, verified=False, filled_url=filled_url, filled_loader_id=filled_loader_id
+            )
         skyvern_context.ensure_context().clear_multi_field_totp_state(task.task_id, restore_unverified_external=True)
         result = ActionFailure(MultiFieldTotpGroupChanged(), stop_execution_on_failure=True)
         result.skip_remaining_actions = True
@@ -7727,16 +8329,22 @@ async def _fill_multi_field_totp_group(
 
     async def recover_group() -> MultiFieldTotpBindingFailure | None:
         nonlocal elements, scraped_page
-        replacement = await _reresolve_multi_field_totp_group_elements(page, scraped_page, state)
+        replacement = await _reresolve_multi_field_totp_group_elements(page, scraped_page, state, task)
         if isinstance(replacement, MultiFieldTotpBindingFailure):
             return replacement
         scraped_page, elements = replacement
         await mask_elements()
+        if observer is not None:
+            await observer.bind([element.get_locator() for element in elements])
         return None
 
     def recovery_budget_exhausted() -> MultiFieldTotpBindingFailure:
         LOG.info(
             "Multi-field OTP binding rejected",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            step_id=context.step_id if context else None,
+            reason="recovery_budget_exhausted",
             reason_code="recovery_budget_exhausted",
             classification=MultiFieldTotpBindingFailure.UNCONFIRMED.value,
             live_boxes=None,
@@ -7770,7 +8378,9 @@ async def _fill_multi_field_totp_group(
         if fallback_filled_box_index == last_box_index or (
             fallback_reached_box_index == last_box_index and fallback_filled_box_index == last_box_index - 1
         ):
-            return _multi_field_totp_unverified_success(state, code)
+            return _multi_field_totp_unverified_success(
+                state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+            )
         return ActionFailure(SkyvernException("Multi-field one-time code input failed during navigation."))
 
     try:
@@ -7788,9 +8398,12 @@ async def _fill_multi_field_totp_group(
         if current_values == list(code):
             strategy = "prefilled"
             verified = True
-            _record_multi_field_totp_fill(state, code)
+            _record_multi_field_totp_fill(state, code, filled_url=filled_url, filled_loader_id=filled_loader_id)
             return ActionSuccess(data={"totp_group_prefilled": True})
 
+        observer = await install_multi_field_totp_fill_observer(
+            page, [element.get_locator() for element in elements], state
+        )
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
             strategy = "keyboard_stream_code_refresh_failed"
@@ -7814,6 +8427,8 @@ async def _fill_multi_field_totp_group(
             if recovery_failure is not None:
                 return keystream_recovery_failure(recovery_failure, "keyboard_stream_interrupted_teardown")
 
+        if observer is not None:
+            await observer.refresh([element.get_locator() for element in elements])
         try:
             current_values = await _read_multi_field_totp_values(elements)
         except Exception as read_error:
@@ -7830,9 +8445,15 @@ async def _fill_multi_field_totp_group(
                     current_values = None
 
         if current_values == list(code):
-            verified = True
-            _record_multi_field_totp_fill(state, code)
-            return ActionSuccess(data={"totp_group_filled": True})
+            return await verified_success()
+
+        if stream_completed and state.observed_max_filled == state.expected_digits:
+            evidence_checks = 3 if current_values and all(value == "" for value in current_values) else 1
+            if await _observe_multi_field_totp_submission(page, scraped_page, state, probes=evidence_checks):
+                result = delivered_unverified_or_failure("keyboard_stream_consumed")
+                if isinstance(result, ActionSuccess):
+                    result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
+                return result
 
         if page_url_before_stream is not None and _multi_field_totp_page_url(page) != page_url_before_stream:
             return delivered_unverified_or_failure("keyboard_stream_read_navigation")
@@ -7842,13 +8463,21 @@ async def _fill_multi_field_totp_group(
             if recovery_failure is not None:
                 return keystream_recovery_failure(recovery_failure, "keyboard_stream_read_teardown")
             try:
+                if observer is not None:
+                    await observer.refresh([element.get_locator() for element in elements])
                 current_values = await _read_multi_field_totp_values(elements)
             except Exception:
                 current_values = None
             if current_values == list(code):
-                verified = True
-                _record_multi_field_totp_fill(state, code)
-                return ActionSuccess(data={"totp_group_filled": True})
+                return await verified_success()
+            if state.observed_max_filled == state.expected_digits and await _observe_multi_field_totp_submission(
+                page, scraped_page, state, probes=1
+            ):
+                result = _multi_field_totp_unverified_success(
+                    state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+                )
+                result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
+                return result
 
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
@@ -7879,6 +8508,8 @@ async def _fill_multi_field_totp_group(
                         and _multi_field_totp_page_url(page) != page_url_before_stream
                     ):
                         return fallback_navigation_result()
+                if observer is not None:
+                    await observer.refresh([element.get_locator() for element in elements])
                 current_values = await _read_multi_field_totp_values(elements)
             except Exception as fallback_error:
                 if page_url_before_stream is not None and _multi_field_totp_page_url(page) != page_url_before_stream:
@@ -7893,9 +8524,15 @@ async def _fill_multi_field_totp_group(
                 return group_changed_failure()
 
             if current_values == list(code):
-                verified = True
-                _record_multi_field_totp_fill(state, code)
-                return ActionSuccess(data={"totp_group_filled": True})
+                return await verified_success()
+            if state.observed_max_filled == state.expected_digits and await _observe_multi_field_totp_submission(
+                page, scraped_page, state, probes=1
+            ):
+                result = _multi_field_totp_unverified_success(
+                    state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+                )
+                result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
+                return result
             if page_url_before_stream is not None and _multi_field_totp_page_url(page) != page_url_before_stream:
                 strategy = "per_box_fill_unverified_navigation"
                 return ActionFailure(SkyvernException("Multi-field one-time code input failed during navigation."))
@@ -7911,6 +8548,8 @@ async def _fill_multi_field_totp_group(
         return ActionFailure(SkyvernException("Multi-field one-time code input failed."))
     finally:
         with contained_effect("emit multi-field TOTP fill outcome"):
+            if observer is not None:
+                observer.stop()
             LOG.info(
                 "Multi-field one-time code fill completed",
                 strategy=strategy,
@@ -8220,9 +8859,50 @@ async def _handle_input_text_action(
     initial_action_target_id = action.element_id
     context = skyvern_context.current()
     attempt = context.multi_field_totp.get(task.task_id) if context else None
+    timing = action.totp_timing_info or {}
+    is_totp_candidate = skyvern_context.is_multi_field_totp_candidate(action.text, task.task_id)
+    retry_budget_exhausted = skyvern_context.multi_field_totp_retry_budget_exhausted(task.task_id)
+    if retry_budget_exhausted:
+        rejection = context.multi_field_totp_rejections.get(task.task_id) if context else None
+        width = attempt.expected_digits if attempt else rejection.expected_digits if rejection else None
+        groups = _multi_field_totp_box_groups(scraped_page, width) or []
+        # Old box IDs may belong to unrelated inputs after navigation.
+        if timing.get("is_totp_sequence") or any(action.element_id in group.box_element_ids for group in groups):
+            if failure := _multi_field_totp_retry_budget_failure(task, step.step_id):
+                action.totp_timing_info = {**timing, "is_totp_sequence": True, "blocked_candidate": True}
+                return [failure]
+    if (
+        not retry_budget_exhausted
+        and is_totp_candidate
+        and (not timing.get("is_totp_sequence") or timing.get("blocked_candidate"))
+    ):
+        rejection = context.multi_field_totp_rejections.get(task.task_id) if context else None
+        group_width = (
+            attempt.expected_digits
+            if attempt
+            else rejection.expected_digits
+            if rejection
+            else None
+            if skyvern_context.is_rejected_multi_field_totp_candidate(action.text, task.task_id)
+            else len(skyvern_context.strip_multi_field_totp_code_separators(action.text))
+        )
+        groups = _multi_field_totp_box_groups(scraped_page, group_width) or []
+        if (attempt is not None and action.element_id in attempt.box_element_ids) or any(
+            action.element_id in group.box_element_ids for group in groups
+        ):
+            action.totp_timing_info = {"is_totp_sequence": True, "blocked_candidate": True}
+            failure = ActionFailure(
+                SkyvernException("The multi-field one-time code must be entered through its group."),
+                stop_execution_on_failure=True,
+            )
+            failure.skip_remaining_actions = True
+            return [failure]
+        if timing.get("blocked_candidate"):
+            action.totp_timing_info = None
     resolved_hint: str | None = None
     if (
         attempt
+        and not retry_budget_exhausted
         and attempt.hint_code
         and action.text == attempt.hint_code
         and action.element_id not in attempt.box_element_ids
@@ -8284,7 +8964,7 @@ async def _handle_input_text_action(
         else:
             text = text_result
         current_text_target = text_result
-        is_secret_value = resolved_hint is not None or is_totp_value or text != action.text
+        is_secret_value = is_totp_candidate or resolved_hint is not None or is_totp_value or text != action.text
 
     if is_multi_field_totp:
         action.set_has_mini_agent()
@@ -10171,8 +10851,11 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
+        # A code Skyvern attached itself (OTP_TIMEOUT once TOTP polling ran out) records something the page cannot
+        # show, so the screenshot-based extraction must not drop it, even when the mapping does not declare it.
+        skyvern_errors = [error for error in action.errors if error.is_skyvern_defined]
         try:
-            action.errors = await extract_user_defined_errors(
+            extracted_errors = await extract_user_defined_errors(
                 task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
             )
         except Exception:
@@ -10183,6 +10866,11 @@ async def handle_terminate_action(
                 action_errors=action.errors,
                 exc_info=True,
             )
+        else:
+            skyvern_codes = {error.error_code for error in skyvern_errors}
+            action.errors = skyvern_errors + [
+                error for error in extracted_errors if error.error_code not in skyvern_codes
+            ]
     return [ActionSuccess()]
 
 
@@ -10652,35 +11340,6 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
-async def _record_task_nav_error_code(task: Task, error: BaseException, url: str | None = None) -> None:
-    """Keep the driver's code for a navigation action that failed.
-
-    These actions call the driver directly, so their failure becomes an ``ActionFailure`` and never
-    reaches the typed navigation error. Without this the code is gone by the time anything decides
-    who owned the failure, and an egress fault reads as a defect in the run.
-    """
-    context = skyvern_context.current()
-    if context is None:
-        return
-    # Dropped before the current attempt is read, not only on success: an attempt that reports no
-    # code of its own would otherwise be judged on the one before it.
-    context.task_nav_error_codes.pop(task.task_id, None)
-    code = await reported_nav_error_code(error, url)
-    if code:
-        context.task_nav_error_codes[task.task_id] = code
-
-
-def _clear_task_nav_error_code(task: Task) -> None:
-    """Drop a code kept from an earlier attempt once this task navigates successfully.
-
-    A retry that succeeds leaves the failure behind it, so a later failure of a different kind would
-    otherwise inherit the old code and be reported as a network fault.
-    """
-    context = skyvern_context.current()
-    if context is not None:
-        context.task_nav_error_codes.pop(task.task_id, None)
-
-
 @traced(name="skyvern.agent.action.goto_url")
 async def handle_goto_url_action(
     action: actions.GotoUrlAction,
@@ -10694,9 +11353,9 @@ async def handle_goto_url_action(
         response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
     except Exception as navigation_error:
-        await _record_task_nav_error_code(task, navigation_error, url=validated_url)
+        await record_task_nav_error_code(task.task_id, navigation_error, url=validated_url)
         raise
-    _clear_task_nav_error_code(task)
+    clear_task_nav_error_code(task.task_id)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -10714,9 +11373,9 @@ async def handle_go_back_action(
     try:
         await page.go_back(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as navigation_error:
-        await _record_task_nav_error_code(task, navigation_error)
+        await record_task_nav_error_code(task.task_id, navigation_error)
         raise
-    _clear_task_nav_error_code(task)
+    clear_task_nav_error_code(task.task_id)
     return [ActionSuccess()]
 
 
@@ -10730,9 +11389,9 @@ async def handle_go_forward_action(
     try:
         await page.go_forward(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as navigation_error:
-        await _record_task_nav_error_code(task, navigation_error)
+        await record_task_nav_error_code(task.task_id, navigation_error)
         raise
-    _clear_task_nav_error_code(task)
+    clear_task_nav_error_code(task.task_id)
     return [ActionSuccess()]
 
 
@@ -10748,9 +11407,9 @@ async def handle_reload_page_action(
     except Exception as navigation_error:
         # Unlike back and forward, whose target is a history entry rather than this URL, a reload
         # names the page it is on -- so the resolver can be asked about the right host.
-        await _record_task_nav_error_code(task, navigation_error, url=page.url)
+        await record_task_nav_error_code(task.task_id, navigation_error, url=page.url)
         raise
-    _clear_task_nav_error_code(task)
+    clear_task_nav_error_code(task.task_id)
     # Reloading re-renders the DOM and invalidates the scraped page's element ids; stop the
     # batch so the next step re-scrapes before any later actions run.
     result = ActionSuccess()
@@ -10767,6 +11426,24 @@ async def handle_close_page_action(
     step: Step,
 ) -> list[ActionResult]:
     target_page = page
+    if action.is_internal_recovery:
+        # Sub-second, LLM-free recheck against the page as it is now: only close it if it is still a
+        # dead blank, another usable page survives, and it holds no download-popup claim. Any drift
+        # declines with a non-terminal failure so the next cycle re-detects.
+        browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+        ctx = skyvern_context.current()
+        pages = await browser_state.list_valid_pages(max_pages=0) if browser_state is not None else []
+        if (
+            not page_is_dead_blank(page)
+            or not any(p is not page and page_is_http_survivor(p) for p in pages)
+            or (ctx is not None and ctx.has_download_popup_claim(task.task_id, page))
+        ):
+            return [
+                ActionFailure(
+                    Exception("recovery close declined: page state changed"),
+                    stop_execution_on_failure=False,
+                )
+            ]
     if action.tab_index is not None:
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is None:
@@ -10801,10 +11478,17 @@ async def handle_new_tab_action(
         return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
     validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
     new_page = await browser_state.new_page()
+    # A deliberately-created tab is not a stranded download popup. The context.on("page") owner records this
+    # exact new page (still blank) the instant new_page() joins it, so retire it from both download-popup
+    # registries as the very next synchronous op -- before the navigation await below, during which a delayed
+    # download credit could otherwise close the intentional tab. Idempotent if no owner recorded it.
+    new_tab_context = skyvern_context.current()
+    if new_tab_context is not None:
+        new_tab_context.retire_intentional_page(task.task_id, new_page)
     try:
         await browser_state.navigate_to_url(page=new_page, url=validated_url)
     except Exception as e:
-        await _record_task_nav_error_code(task, e, url=validated_url)
+        await record_task_nav_error_code(task.task_id, e, url=validated_url)
         # Don't leave a blank/failed tab as the newest page — the next scrape would fail it.
         try:
             await new_page.close()
@@ -10843,6 +11527,10 @@ async def handle_switch_tab_action(
             )
         ]
     target_page = pages[action.tab_index]
+    # Retire the selected tab before activation yields to delayed download credit.
+    context = skyvern_context.current()
+    if context is not None:
+        context.retire_intentional_page(task.task_id, target_page)
     await browser_state.set_active_page(target_page)
     try:
         await target_page.bring_to_front()

@@ -13,8 +13,9 @@ import textwrap
 from collections import Counter
 from collections.abc import Callable
 from string import Formatter
+from time import struct_time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 
@@ -220,6 +221,108 @@ def safe_builtins() -> dict[str, Any]:
 
 def module_shims() -> dict[str, SimpleNamespace]:
     """Fresh module-shaped namespaces both CodeBlock executors bind as globals."""
+
+    # Built per call so the writable heap types stay contained to a single execution.
+    class _SandboxTime(datetime.time):
+        """CPython's C date methods resolve ``__import__`` from the calling frame's globals, which a
+        CodeBlock's globals deliberately lack; these delegates put a trusted frame in between."""
+
+        __slots__ = ()
+
+        def strftime(self, format: str) -> str:
+            return super().strftime(format)
+
+        # Python 3.14 gives date and time their own C strptime, which imports from the calling frame.
+        if "strptime" in vars(datetime.time):
+
+            @classmethod
+            def strptime(cls, date_string: str, format: str, /) -> Self:
+                return super().strptime(date_string, format)  # type: ignore[misc]
+
+    class _SandboxDate(datetime.date):
+        __slots__ = ()
+
+        @classmethod
+        def today(cls) -> Self:
+            return super().today()
+
+        def strftime(self, format: str) -> str:
+            return super().strftime(format)
+
+        def timetuple(self) -> struct_time:
+            return super().timetuple()
+
+        if "strptime" in vars(datetime.date):
+
+            @classmethod
+            def strptime(cls, date_string: str, format: str, /) -> Self:
+                return super().strptime(date_string, format)  # type: ignore[misc]
+
+    # ``_SandboxDate`` precedes ``datetime.datetime`` in the MRO, so any delegate added to
+    # ``_SandboxDate`` must be mirrored here or it shadows ``datetime.datetime``'s version.
+    class _SandboxDateTime(_SandboxDate, datetime.datetime):
+        __slots__ = ()
+
+        @classmethod
+        def today(cls) -> Self:
+            return super().today()
+
+        @classmethod
+        def strptime(cls, date_string: str, format: str, /) -> Self:
+            return super().strptime(date_string, format)
+
+        # Their DeprecationWarning is raised from the calling frame, and the warning machinery
+        # imports from that frame, so these reach the same hidden import under any active filter.
+        @classmethod
+        def utcnow(cls) -> Self:
+            return super().utcnow()
+
+        @classmethod
+        def utcfromtimestamp(cls, timestamp: float, /) -> Self:
+            return super().utcfromtimestamp(timestamp)
+
+        def strftime(self, format: str) -> str:
+            return super().strftime(format)
+
+        def timetuple(self) -> struct_time:
+            return super().timetuple()
+
+        def utctimetuple(self) -> struct_time:
+            return super().utctimetuple()
+
+        def date(self) -> datetime.date:
+            return _SandboxDate(self.year, self.month, self.day)
+
+        def time(self) -> datetime.time:
+            return _SandboxTime(self.hour, self.minute, self.second, self.microsecond, fold=self.fold)
+
+        def timetz(self) -> datetime.time:
+            return _SandboxTime(self.hour, self.minute, self.second, self.microsecond, self.tzinfo, fold=self.fold)
+
+    # Instance reprs print ``tp_name``, which follows ``__name__``, and ``repr(type)`` prints
+    # ``__module__`` plus ``__qualname__``; both match the stdlib while ``__name__`` itself does not.
+    # A delegate's qualname reaches the block's failure_reason, where the defining frame would leak.
+    for sandbox_type, stdlib_name in ((_SandboxTime, "time"), (_SandboxDate, "date"), (_SandboxDateTime, "datetime")):
+        sandbox_type.__module__ = "datetime"
+        sandbox_type.__name__ = f"datetime.{stdlib_name}"
+        sandbox_type.__qualname__ = stdlib_name
+        for attribute, member in vars(sandbox_type).items():
+            if attribute.startswith("_"):
+                continue
+            function = member.__func__ if isinstance(member, classmethod) else member
+            if callable(function):
+                function.__module__ = "datetime"
+                function.__qualname__ = f"datetime.{stdlib_name}.{attribute}"
+
+    # The C types hand these bounds out as plain instances, and a plain instance re-breaks strftime
+    # one call later.
+    _SandboxTime.min = _SandboxTime.fromisoformat(datetime.time.min.isoformat())
+    _SandboxTime.max = _SandboxTime.fromisoformat(datetime.time.max.isoformat())
+    _SandboxDate.min = _SandboxDate.fromisoformat(datetime.date.min.isoformat())
+    _SandboxDate.max = _SandboxDate.fromisoformat(datetime.date.max.isoformat())
+    _SandboxDateTime.min = _SandboxDateTime.fromisoformat(datetime.datetime.min.isoformat())
+    _SandboxDateTime.max = _SandboxDateTime.fromisoformat(datetime.datetime.max.isoformat())
+
     return {
         "asyncio": SimpleNamespace(sleep=asyncio.sleep),
         "re": SimpleNamespace(
@@ -241,8 +344,8 @@ def module_shims() -> dict[str, SimpleNamespace]:
         "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
         "html": SimpleNamespace(escape=html.escape),
         "datetime": SimpleNamespace(
-            datetime=datetime.datetime,
-            date=datetime.date,
+            datetime=_SandboxDateTime,
+            date=_SandboxDate,
             timedelta=datetime.timedelta,
             timezone=datetime.timezone,
             UTC=datetime.UTC,

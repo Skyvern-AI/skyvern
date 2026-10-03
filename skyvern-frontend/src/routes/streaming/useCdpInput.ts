@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { getCredentialParam } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { useClientIdStore } from "@/store/useClientIdStore";
@@ -22,7 +23,11 @@ interface UseCdpInputOptions {
   viewportWidth: number;
   viewportHeight: number;
   onClipboardPaste?: (text: string) => void;
+  onClipboardPasteError?: () => void;
   onClipboardCopy?: () => void;
+  // Also deliver Cmd/Ctrl+C to the remote page, so apps with their own
+  // selection model (canvas grids, editors) still copy there.
+  forwardCopyShortcut?: boolean;
   onInput?: () => void;
 }
 
@@ -42,6 +47,7 @@ interface UseCdpInputReturn {
   navigate: (url: string) => void;
   historyNavigate: (action: HistoryAction) => void;
   navigateError: string | null;
+  pasteClipboard: () => void;
 }
 
 export type HistoryAction = "back" | "forward" | "reload";
@@ -107,19 +113,30 @@ function mouseButtonNameForButtons(buttons: number): string {
   return "none";
 }
 
+function isEditableTarget(target: EventTarget | null) {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  );
+}
+
 export function useCdpInput({
   inputWsUrl,
   interactive,
   viewportWidth,
   viewportHeight,
   onClipboardPaste,
+  onClipboardPasteError,
   onClipboardCopy,
+  forwardCopyShortcut = false,
   onInput,
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
   const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const clientId = useClientIdStore((s) => s.clientId);
 
   const inputSocketRef = useRef<WebSocket | null>(null);
@@ -130,6 +147,8 @@ export function useCdpInput({
   );
   const inputReconnectAttemptsRef = useRef(0);
   const inputStoppedRef = useRef(false);
+  const parseFailureLoggedRef = useRef(false);
+  const gaveUpLoggedRef = useRef(false);
   const inputEventCountRef = useRef(0);
   const wheelAccumulatorRef = useRef<{
     deltaX: number;
@@ -150,17 +169,49 @@ export function useCdpInput({
   };
   const interceptedClipboardKeysRef = useRef(new Set<string>());
   const onClipboardPasteRef = useRef(onClipboardPaste);
+  const onClipboardPasteErrorRef = useRef(onClipboardPasteError);
   const onClipboardCopyRef = useRef(onClipboardCopy);
   const onInputRef = useRef(onInput);
   onClipboardPasteRef.current = onClipboardPaste;
+  onClipboardPasteErrorRef.current = onClipboardPasteError;
   onClipboardCopyRef.current = onClipboardCopy;
+  const forwardCopyShortcutRef = useRef(forwardCopyShortcut);
+  forwardCopyShortcutRef.current = forwardCopyShortcut;
   onInputRef.current = onInput;
+
+  const pasteClipboard = useCallback(() => {
+    if (!interactive || !userIsControlling || !onClipboardPasteRef.current) {
+      return;
+    }
+    if (typeof navigator.clipboard?.readText !== "function") {
+      onClipboardPasteErrorRef.current?.();
+      return;
+    }
+    navigator.clipboard
+      .readText()
+      .then((text) => onClipboardPasteRef.current?.(text))
+      .catch((error) => {
+        console.error("Failed to read clipboard contents:", error);
+        onClipboardPasteErrorRef.current?.();
+      });
+  }, [interactive, userIsControlling]);
 
   useEffect(() => {
     if (!interactive || !inputWsUrl) return;
 
     inputStoppedRef.current = false;
     inputReconnectAttemptsRef.current = 0;
+    parseFailureLoggedRef.current = false;
+    gaveUpLoggedRef.current = false;
+    const streamTarget = inputWsUrl.match(
+      /\/cdp_input\/(browser_session|workflow_run)\/([^?]+)/,
+    );
+    const targetType = streamTarget?.[1];
+    const targetId = streamTarget?.[2]
+      ? decodeURIComponent(streamTarget[2])
+      : null;
+    const browserSessionId = targetType === "browser_session" ? targetId : null;
+    const workflowRunId = targetType === "workflow_run" ? targetId : null;
 
     function connectInputWs(credentialParam: string) {
       if (inputStoppedRef.current) return;
@@ -211,7 +262,14 @@ export function useCdpInput({
             void copyText(msg.text);
           }
         } catch {
-          // ignore non-JSON messages
+          if (!parseFailureLoggedRef.current) {
+            parseFailureLoggedRef.current = true;
+            logging.warn("Stream message parse failed", {
+              stream: "cdp_input",
+              browser_session_id: browserSessionId,
+              workflow_run_id: workflowRunId,
+            });
+          }
         }
       });
       ws.addEventListener("close", (event) => {
@@ -237,6 +295,16 @@ export function useCdpInput({
       if (inputStoppedRef.current) return;
       if (inputReconnectAttemptsRef.current >= 5) {
         console.log("[cdp-input] Max reconnect attempts reached, giving up");
+        if (!gaveUpLoggedRef.current) {
+          gaveUpLoggedRef.current = true;
+          logging.warn("Stream gave up", {
+            stream: "cdp_input",
+            browser_session_id: browserSessionId,
+            workflow_run_id: workflowRunId,
+            reason: "reconnect_exhausted",
+            reconnect_attempts: inputReconnectAttemptsRef.current,
+          });
+        }
         return;
       }
       inputReconnectAttemptsRef.current += 1;
@@ -267,7 +335,7 @@ export function useCdpInput({
       }
       cancelPendingMouseMove();
     };
-  }, [interactive, inputWsUrl, credentialGetter, clientId]);
+  }, [interactive, inputWsUrl, credentialGetter, clientId, logging]);
 
   useEffect(() => {
     userIsControllingRef.current = userIsControlling;
@@ -502,34 +570,28 @@ export function useCdpInput({
         interceptedClipboardKeysRef.current.add(e.code);
         e.stopPropagation();
         if (!onClipboardPasteRef.current) {
-          // Keep the native paste event alive so ClipboardEvent carries local
-          // clipboard text into the direct CDP fallback in handlePaste.
+          // Keep the native paste event alive for the direct CDP fallback.
           return;
         }
         e.preventDefault();
-        if (!navigator.clipboard) {
-          console.warn("Clipboard API not available.");
-          return;
-        }
-        navigator.clipboard
-          .readText()
-          .then((text) => onClipboardPasteRef.current?.(text))
-          .catch((error) => {
-            console.error("Failed to read clipboard contents:", error);
-          });
+        pasteClipboard();
         return;
       }
 
       if (isShortcut(e, "c")) {
         e.preventDefault();
         e.stopPropagation();
-        interceptedClipboardKeysRef.current.add(e.code);
         if (onClipboardCopyRef.current) {
           onClipboardCopyRef.current();
+          if (!forwardCopyShortcutRef.current) {
+            interceptedClipboardKeysRef.current.add(e.code);
+            return;
+          }
         } else {
+          interceptedClipboardKeysRef.current.add(e.code);
           sendInputEvent({ type: "copySelectedText" });
+          return;
         }
-        return;
       }
 
       e.preventDefault();
@@ -551,6 +613,23 @@ export function useCdpInput({
         payload.commands = commands;
       }
       sendInputEvent(payload);
+    },
+    [interactive, userIsControlling, sendInputEvent, pasteClipboard],
+  );
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      if (!interactive || !userIsControlling || isEditableTarget(e.target))
+        return;
+      const text = e.clipboardData.getData("text/plain");
+      if (!text) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (onClipboardPasteRef.current) {
+        onClipboardPasteRef.current(text);
+      } else {
+        sendInputEvent({ type: "insertText", text });
+      }
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -574,18 +653,6 @@ export function useCdpInput({
         payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
       }
       sendInputEvent(payload);
-    },
-    [interactive, userIsControlling, sendInputEvent],
-  );
-
-  const handlePaste = useCallback(
-    (e: React.ClipboardEvent) => {
-      if (!interactive || !userIsControlling) return;
-      const text = e.clipboardData.getData("text/plain");
-      if (!text) return;
-      e.preventDefault();
-      e.stopPropagation();
-      sendInputEvent({ type: "insertText", text });
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -624,5 +691,6 @@ export function useCdpInput({
     navigate,
     historyNavigate,
     navigateError,
+    pasteClipboard,
   };
 }

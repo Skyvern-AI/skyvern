@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -9,6 +10,14 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ReactFlowProvider } from "@xyflow/react";
+import { stringify as toYaml } from "yaml";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { StudioWorkflowPanels } from "../../studio/StudioWorkflowPanels";
+import { EditorPaneModeToggle } from "../../studio/EditorPaneHeader";
 import CloudContext from "@/store/CloudContext";
 
 const credentialsQuery = vi.hoisted(() => ({ isSuccess: false }));
@@ -39,6 +48,13 @@ class ResizeObserverStub {
 
 beforeEach(() => {
   credentialsQuery.isSuccess = false;
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  useWorkflowParametersStore.setState(
+    useWorkflowParametersStore.getInitialState(),
+  );
+  useWorkflowPanelStore.setState(useWorkflowPanelStore.getInitialState());
   vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   window.HTMLElement.prototype.scrollIntoView = () => {};
 });
@@ -46,6 +62,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
 });
 
 function panel(isCloud: boolean) {
@@ -118,4 +137,89 @@ describe("WorkflowParameterEditPanel Skyvern source availability", () => {
       ),
     );
   });
+});
+
+describe("Studio Inputs with an open YAML draft", () => {
+  it.each(["add", "delete", "default"])(
+    "keeps a panel %s when switching a stale draft to Visual",
+    async (operation) => {
+      const original = {
+        key: "query",
+        parameterType: "workflow" as const,
+        dataType: "string" as const,
+        defaultValue: "original",
+        description: "",
+      };
+      const originalParameters = operation === "add" ? [] : [original];
+      useWorkflowParametersStore.getState().setParameters(originalParameters);
+      const yaml = useWorkflowYamlEditorStore.getState();
+      const draft = toYaml({
+        title: "Original",
+        workflow_definition: { parameters: originalParameters, blocks: [] },
+      });
+      yaml.registerEnterYamlMode(() => yaml.open(draft));
+      const commit = vi.fn(async () => {
+        useWorkflowParametersStore
+          .getState()
+          .setParameters(originalParameters, { fromYamlCommit: true });
+        yaml.close();
+        return true;
+      });
+      yaml.registerCommit(commit);
+      yaml.open(draft);
+      yaml.setDraft(draft.replace("Original", "YAML title"));
+      useWorkflowPanelStore
+        .getState()
+        .setWorkflowPanelState({ active: true, content: "parameters" });
+      const view = render(
+        <ReactFlowProvider>
+          <TooltipProvider>
+            <StudioWorkflowPanels />
+            <EditorPaneModeToggle />
+          </TooltipProvider>
+        </ReactFlowProvider>,
+      );
+      if (operation === "delete") {
+        fireEvent.click(view.container.querySelector("section button")!);
+      } else {
+        if (operation === "add")
+          fireEvent.click(screen.getByRole("button", { name: "Add Input" }));
+        else
+          fireEvent.click(
+            view.container.querySelector("section svg.cursor-pointer")!,
+          );
+        if (operation === "add")
+          fireEvent.change(screen.getAllByRole("textbox")[0]!, {
+            target: { value: "added_input" },
+          });
+        else
+          fireEvent.change(screen.getByDisplayValue("original"), {
+            target: { value: "changed" },
+          });
+        fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      }
+      const changed = structuredClone(
+        useWorkflowParametersStore.getState().parameters,
+      );
+      if (operation === "delete") expect(changed).toEqual([]);
+      else
+        expect(changed).toEqual([
+          expect.objectContaining(
+            operation === "add"
+              ? { key: "added_input" }
+              : { key: "query", defaultValue: "changed" },
+          ),
+        ]);
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Visual" })),
+      );
+      expect(useWorkflowParametersStore.getState().parameters).toEqual(changed);
+      expect(commit).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+        active: true,
+        stale: true,
+        draft: draft.replace("Original", "YAML title"),
+      });
+    },
+  );
 });

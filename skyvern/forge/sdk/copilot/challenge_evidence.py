@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 
@@ -117,6 +118,82 @@ ANTI_BOT_ARTIFACT_MARKER_VALUES: frozenset[str] = frozenset(
     }
 )
 _MAX_ARTIFACT_FLAG_DEPTH = 5
+
+# Hosts that serve nothing but a challenge widget, matched as host suffixes against a frame's URL.
+# A match says what the page mounted, never that the widget is visible, interactive, or gating.
+CHALLENGE_VENDOR_FRAME_HOSTS: frozenset[str] = frozenset(
+    {
+        "arkoselabs.com",
+        "captcha-delivery.com",
+        "challenges.cloudflare.com",
+        "funcaptcha.com",
+        "hcaptcha.com",
+    }
+)
+# reCAPTCHA's hosts serve much more than challenges, so only the https anchor URLs
+# ``captcha_solver._is_trusted_recaptcha_anchor_url`` accepts match: a widget mount, which an invisible v3 badge also has.
+# Keys are the exact anchor hosts; values are the suffix recorded for them.
+_RECAPTCHA_FRAME_HOSTS = {"www.google.com": "google.com", "www.recaptcha.net": "recaptcha.net"}
+_RECAPTCHA_FRAME_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
+
+CHALLENGE_FRAMES_KEY = "challenge_frames"
+MAX_CHALLENGE_FRAME_HOSTS = 8
+_RECORDABLE_CHALLENGE_FRAME_HOSTS = CHALLENGE_VENDOR_FRAME_HOSTS | frozenset(_RECAPTCHA_FRAME_HOSTS.values())
+
+
+def _matched_suffix(hostname: str, suffixes: Sequence[str] | frozenset[str]) -> str | None:
+    return next((suffix for suffix in suffixes if hostname == suffix or hostname.endswith(f".{suffix}")), None)
+
+
+def challenge_vendor_frame_hosts(frame_urls: Sequence[str]) -> list[str]:
+    """The distinct allowlist suffixes that ``frame_urls`` match, sorted. Part of the input is a page-authored
+    ``iframe@src``, so only the fixed suffix is recorded, never the page's hostname."""
+    hosts: set[str] = set()
+    for frame_url in frame_urls:
+        try:
+            parsed = urlparse(frame_url)
+        except ValueError:
+            continue
+        if parsed.scheme != "https":
+            continue
+        hostname = (parsed.hostname or "").lower()
+        suffix = _matched_suffix(hostname, CHALLENGE_VENDOR_FRAME_HOSTS)
+        if suffix is None and parsed.path in _RECAPTCHA_FRAME_ANCHOR_PATHS:
+            suffix = _RECAPTCHA_FRAME_HOSTS.get(hostname)
+        if suffix is not None:
+            hosts.add(suffix)
+    return sorted(hosts)
+
+
+def stamp_challenge_frame_fact(
+    evidence: Mapping[str, Any],
+    frame_urls: Sequence[str] | None,
+    *,
+    complete: bool = True,
+) -> dict[str, Any]:
+    """Copy ``evidence`` with the matched challenge-vendor hosts in a non-carrier key that never touches
+    ``challenge_state``. ``frame_urls=None`` records a failed read and ``complete=False`` a partial one."""
+    hosts = challenge_vendor_frame_hosts(frame_urls or [])
+    return {
+        **evidence,
+        CHALLENGE_FRAMES_KEY: {
+            "read": "failed" if frame_urls is None else ("ok" if complete else "partial"),
+            "hosts": hosts[:MAX_CHALLENGE_FRAME_HOSTS],
+            "omitted": max(0, len(hosts) - MAX_CHALLENGE_FRAME_HOSTS),
+        },
+    }
+
+
+def stamped_challenge_frame_hosts(evidence: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(evidence, Mapping):
+        return []
+    frames = evidence.get(CHALLENGE_FRAMES_KEY)
+    if not isinstance(frames, Mapping):
+        return []
+    hosts = frames.get("hosts")
+    if not isinstance(hosts, list):
+        return []
+    return [host for host in hosts if isinstance(host, str) and host in _RECORDABLE_CHALLENGE_FRAME_HOSTS]
 
 
 def interactive_challenge_controls(

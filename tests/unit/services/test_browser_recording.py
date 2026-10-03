@@ -161,6 +161,23 @@ def test_click() -> None:
     assert actions[0].target.sky_id == "sky-123"
 
 
+def test_click_keeps_zero_coordinates_and_element_offset() -> None:
+    event = make_console_event(
+        params={
+            "type": "click",
+            "target": {"id": "board", "skyId": "sky-123", "tagName": "CANVAS", "text": []},
+            "timestamp": 1000.0,
+            "mousePosition": {"xp": 0.0, "yp": 0.0, "offsetX": 0.0, "offsetY": 7.5},
+        },
+        timestamp=1000.0,
+    )
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([event])
+
+    assert len(actions) == 1
+    assert actions[0].target.mouse == Mouse(xp=0.0, yp=0.0, offset_x=0.0, offset_y=7.5)
+
+
 def test_durable_recording_evidence_is_chronological_and_never_stores_typed_values() -> None:
     target = ActionTarget(
         id="password",

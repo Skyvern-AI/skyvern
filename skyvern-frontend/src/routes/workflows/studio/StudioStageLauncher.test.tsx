@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
+import { useStudioPanes } from "./useStudioPanes";
 import { StudioStageLauncher } from "./StudioStageLauncher";
 
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
@@ -36,23 +38,31 @@ const initialBrowserState = useStudioBrowserStore.getState();
 
 function LocationProbe() {
   const location = useLocation();
-  return <output data-testid="search">{location.search}</output>;
+  const { panes } = useStudioPanes();
+  return (
+    <>
+      <output data-testid="search">{location.search}</output>
+      <output data-testid="panes">{panes.join(",")}</output>
+    </>
+  );
 }
 
 function renderAt(path = "/workflows/wpid_1/studio?panes=") {
   return render(
     <TooltipProvider delayDuration={0}>
       <MemoryRouter initialEntries={[path]}>
-        <StudioStageLauncher />
-        <LocationProbe />
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <StudioStageLauncher />
+          <LocationProbe />
+        </StudioPaneDefaultsProvider>
       </MemoryRouter>
     </TooltipProvider>,
   );
 }
 
 function currentPanes(): string | null {
-  const search = screen.getByTestId("search").textContent ?? "";
-  return new URLSearchParams(search).get("panes");
+  expect(screen.getByTestId("search").textContent).toBe("?panes=");
+  return screen.getByTestId("panes").textContent;
 }
 
 afterEach(cleanup);

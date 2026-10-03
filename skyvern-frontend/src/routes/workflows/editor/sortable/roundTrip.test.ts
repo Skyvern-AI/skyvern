@@ -1,7 +1,14 @@
 import type { Edge } from "@xyflow/react";
 import { describe, expect, test } from "vitest";
+import { parse, stringify } from "yaml";
 
 import { ProxyLocation } from "@/api/types";
+import {
+  applySettingsPatch,
+  buildWorkflowSaveRequest,
+  buildWorkflowYamlDocument,
+} from "../workflowYamlDocument";
+import { yamlCommitInputs } from "../workflowVersionFromSaveData";
 
 import type { AppNode } from "../nodes";
 import {
@@ -11,18 +18,98 @@ import {
   getWorkflowSettings,
 } from "../workflowEditorUtils";
 import {
+  type AWSSecretParameter,
   type CodeBlock,
   type EmailInboxBlock,
   type OutputParameter,
+  type SendEmailBlock,
   type WorkflowBlock,
   type WorkflowApiResponse,
   type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
-import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
+import type {
+  CodeBlockYAML,
+  WorkflowCreateYAMLRequest,
+} from "../../types/workflowYamlTypes";
 
 import { rewireBlockDropInScope } from "./rewire";
 import { TOP_LEVEL_SCOPE } from "./scope";
+
+describe("send email SMTP round trip", () => {
+  test.each([
+    { kind: "placeholders", placeholder: true },
+    { kind: "declared secrets", placeholder: false },
+  ])("clearing a custom host handles $kind", ({ placeholder }) => {
+    const smtpParameter = (name: string): AWSSecretParameter => ({
+      parameter_type: "aws_secret",
+      key: placeholder ? name : `existing_${name}`,
+      description: null,
+      aws_key: placeholder ? "UNUSED_CUSTOM_SMTP_PLACEHOLDER" : name,
+      aws_secret_parameter_id: `secret_${name}`,
+      workflow_id: "wf-fixture",
+      created_at: "2026-04-20T00:00:00Z",
+      modified_at: "2026-04-20T00:00:00Z",
+      deleted_at: null,
+    });
+    const block: SendEmailBlock = {
+      block_type: "send_email",
+      label: "send_email",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("send_email"),
+      sender: "sender@example.com",
+      recipients: ["recipient@example.com"],
+      subject: "Workflow complete",
+      body: "<p>Workflow complete</p>",
+      body_format: "html",
+      file_attachments: [],
+      custom_smtp_host: "smtp.example.com",
+      custom_smtp_port: 587,
+      smtp_host: smtpParameter("smtp_host"),
+      smtp_port: smtpParameter("smtp_port"),
+      smtp_username: smtpParameter("smtp_username"),
+      smtp_password: smtpParameter("smtp_password"),
+    };
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const emailNode = nodes.find((node) => node.type === "sendEmail");
+    if (!emailNode || emailNode.type !== "sendEmail") {
+      throw new Error("Send Email node was not loaded");
+    }
+    emailNode.data.customSmtpHost = "";
+
+    const [savedFromEditor] = getWorkflowBlocks(nodes, edges);
+    const [savedFromDefinition] = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [{ ...block, custom_smtp_host: "" }],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+    for (const saved of [savedFromEditor, savedFromDefinition]) {
+      expect(saved).toMatchObject({
+        block_type: "send_email",
+        custom_smtp_host: "",
+        custom_smtp_port: 587,
+        body_format: "html",
+        smtp_host_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_host",
+        smtp_port_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_port",
+        smtp_username_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_username",
+        smtp_password_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_password",
+      });
+    }
+  });
+});
 
 /**
  * M1 round-trip regression: mirrors the full reorder → save → reload path
@@ -46,6 +133,10 @@ import { TOP_LEVEL_SCOPE } from "./scope";
 const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
   persistBrowserSession: false,
   reuseBrowserSession: false,
   pinSavedSessionIp: false,
@@ -60,7 +151,6 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
-  enableSelfHealing: false,
   maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
@@ -339,6 +429,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
 
   test("nested loop code manifest survives save and reload", () => {
     const nestedCode = makeCodeBlock("Nested Guard", null);
+    nestedCode.parameters = [makeWorkflowParameter("items")];
     nestedCode.error_code_mapping = {
       nested_lowercase: "when the nested condition occurs",
     };
@@ -364,6 +455,38 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       nestedCode.error_code_mapping,
     );
     expect(firstSaved.loop_blocks[0]).not.toHaveProperty("error_code");
+
+    const input = {
+      workflow: {
+        status: "published",
+        is_saved_task: false,
+      } as WorkflowApiResponse,
+      settings: DEFAULT_SETTINGS,
+      title: "Loop workflow",
+      description: null,
+      blocks: getWorkflowBlocks(first.nodes, first.edges),
+      parameters: [],
+      definitionVersion: 2,
+    };
+    const yaml = stringify(buildWorkflowYamlDocument(input));
+    const committed = yamlCommitInputs<
+      WorkflowCreateYAMLRequest["workflow_definition"]
+    >(parse(yaml), yaml);
+    const saved = parse(
+      stringify(
+        buildWorkflowSaveRequest({
+          ...input,
+          blocks: committed.definition.blocks,
+          parameters: committed.definition.parameters,
+          settings: applySettingsPatch(input.settings, committed.settingsPatch),
+          workflowDefinitionVersion: 2,
+        }),
+      ),
+    );
+    expect(saved.workflow_definition.blocks).toEqual(input.blocks);
+    expect(
+      saved.workflow_definition.blocks[0].loop_blocks[0].parameter_keys,
+    ).toEqual(["items"]);
   });
 
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {
@@ -687,5 +810,23 @@ describe("login block configuration round trip", () => {
         }
       ).include_action_history_in_verification,
     ).toBe(true);
+  });
+});
+
+test("workflow export includes error mapping, CDP headers, and TOTP identifier", () => {
+  const workflow = {
+    cdp_connect_headers: { "X-Test": "value" },
+    totp_identifier: "identifier",
+    workflow_definition: {
+      version: 2,
+      parameters: [],
+      blocks: [],
+      error_code_mapping: { RETRY: "Retry the request" },
+    },
+  } as unknown as WorkflowApiResponse;
+  expect(convert(workflow)).toMatchObject({
+    cdp_connect_headers: { "X-Test": "value" },
+    totp_identifier: "identifier",
+    workflow_definition: { error_code_mapping: { RETRY: "Retry the request" } },
   });
 });
