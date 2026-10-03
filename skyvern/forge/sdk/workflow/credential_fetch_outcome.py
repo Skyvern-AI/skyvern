@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     RuntimeSequentialCredentialUnsupported,
 )
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
+from skyvern.forge.sdk.services.bitwarden import BitwardenSessionUsage, track_bitwarden_session_usage
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialConfigurationError
 from skyvern.forge.sdk.workflow.models.parameter import (
     Parameter,
@@ -141,6 +142,7 @@ def _log_outcome(
     outcome: CredentialFetchOutcome,
     failure_type: str | None,
     started: float,
+    session: BitwardenSessionUsage,
 ) -> None:
     log = LOG.info if outcome == "succeeded" else LOG.warning
     log(
@@ -150,6 +152,9 @@ def _log_outcome(
         outcome=outcome,
         failure_type=failure_type,
         duration_seconds=round(time.monotonic() - started, 3),
+        session_reused=session.session_reused,
+        login_seconds=None if session.login_seconds is None else round(session.login_seconds, 3),
+        lock_wait_seconds=None if session.lock_wait_seconds is None else round(session.lock_wait_seconds, 3),
     )
 
 
@@ -167,10 +172,11 @@ async def record_credential_fetch(
     )
     fetch = CredentialFetch(provider=provider, parameter_type=parameter_type)
     started = time.monotonic()
-    try:
-        yield fetch
-    except Exception as error:
-        outcome, failure_type = classify_credential_fetch_failure(error, customer_owned=fetch.customer_owned)
-        _log_outcome(fetch, outcome, failure_type, started)
-        raise
-    _log_outcome(fetch, "succeeded", None, started)
+    with track_bitwarden_session_usage() as session:
+        try:
+            yield fetch
+        except Exception as error:
+            outcome, failure_type = classify_credential_fetch_failure(error, customer_owned=fetch.customer_owned)
+            _log_outcome(fetch, outcome, failure_type, started, session)
+            raise
+        _log_outcome(fetch, "succeeded", None, started, session)
