@@ -93,3 +93,47 @@ async def test_an_element_handle_is_clicked_with_only_the_arguments_given() -> N
     await input_dispatch.click_handle(_FakePage(), handle)
 
     handle.click.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("treatment", [False, True])
+async def test_pointer_parity_moves_the_pointer_onto_an_input_or_click_target_first(
+    monkeypatch: pytest.MonkeyPatch, treatment: bool
+) -> None:
+    # v1 moves the pointer onto every input before typing and onto every click target before pressing; a v3 run
+    # on the TASK_V3_POINTER_PARITY treatment must too. Control keeps only Playwright's own move into the click.
+    async_playwright = pytest.importorskip("playwright.async_api").async_playwright
+    monkeypatch.setattr(input_dispatch.settings, "TASK_V3_POINTER_PARITY", treatment)
+    async with async_playwright() as pw:
+        try:
+            browser = await pw.chromium.launch(headless=True)
+        except Exception:
+            pytest.skip("Requires Playwright browsers installed")
+        try:
+            page = await browser.new_page(viewport={"width": 800, "height": 600})
+            await page.set_content(
+                '<input id="user" style="position:absolute;top:100px;left:100px;width:200px;height:30px">'
+                '<input id="pass" type="password" style="position:absolute;top:900px;left:100px;width:200px;height:30px">'
+                '<button id="go" style="position:absolute;top:960px;left:100px;width:200px;height:40px">Go</button>'
+                "<script>window.ev = []; for (const t of ['mousemove', 'input', 'pointerdown'])"
+                " document.addEventListener(t, (e) => window.ev.push([t, e.target.id || '', e.isTrusted]), true);"
+                "</script>"
+            )
+            await input_dispatch.fill(page, "#user", "alice", timeout=2000)
+            await input_dispatch.fill(page, page.locator("#pass"), "secret", timeout=2000)
+            # Off-centre on purpose: the press lands somewhere other than where the approach move ends.
+            await input_dispatch.click(page, "#go", timeout=2000, position={"x": 3, "y": 3})
+            events = await page.evaluate("() => window.ev")
+        finally:
+            await browser.close()
+    press = events.index(["pointerdown", "go", True])
+    moves_onto_button = events[:press].count(["mousemove", "go", True])
+    if treatment:
+        # The move lands on each field, below the fold too, before its first input event.
+        for field in ("user", "pass"):
+            first_input = events.index(["input", field, True])
+            assert ["mousemove", field, True] in events[:first_input], events
+        assert moves_onto_button >= 2, events
+    else:
+        assert all(kind != "mousemove" for kind, target, _ in events[:press] if target != "go"), events
+        assert moves_onto_button == 1, events
