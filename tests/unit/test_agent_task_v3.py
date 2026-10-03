@@ -80,6 +80,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
+    POINTER_PARITY_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
@@ -324,6 +325,35 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
         DATE_SEGMENT_AIM_FLAG,
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_buckets_the_pointer_parity_arm_per_run_with_the_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The arm is targeted at named workflows, so the resolve must carry the workflow id, or no group matches.
+    monkeypatch.setattr(settings, "TASK_V3_POINTER_PARITY", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        workflow_run_id="wr_pointer_parity",
+        context_overrides={"workflow_permanent_id": "wpid_pointer_parity"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.context.run_arms[POINTER_PARITY_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        POINTER_PARITY_FLAG,
+        task.workflow_run_id,
+        properties={
+            "organization_id": task.organization_id,
+            "workflow_permanent_id": task.workflow_permanent_id or "wpid_pointer_parity",
+        },
     )
 
 

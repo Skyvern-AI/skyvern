@@ -152,6 +152,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -198,6 +199,7 @@ from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
+    POINTER_PARITY_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -2329,6 +2331,20 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DATE_SEGMENT_AIM,
             )
+            await resolve_run_arm(
+                context,
+                POINTER_PARITY_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_POINTER_PARITY,
+                properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
+            )
+            if run_arm_enabled(POINTER_PARITY_FLAG, settings.TASK_V3_POINTER_PARITY):
+                # The dose: the run's registered cursor strategy draws the moves, or a plain move does without one.
+                LOG.info(
+                    "Task V3 pointer parity cursor",
+                    cursor_strategy=type(EventStrategyFactory.get_cursor_strategy()).__name__,
+                )
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
         page_free_validation = bool(
