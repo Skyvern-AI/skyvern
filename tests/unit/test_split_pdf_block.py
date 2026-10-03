@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from pypdf import PdfReader, PdfWriter
 
+from skyvern.config import settings
+from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
@@ -27,6 +31,14 @@ def _write_blank_pdf(path: Path, page_count: int) -> None:
     writer = PdfWriter()
     for _ in range(page_count):
         writer.add_blank_page(width=300, height=400)
+    with path.open("wb") as f:
+        writer.write(f)
+
+
+def _write_pdf_with_page_widths(path: Path, widths: list[int]) -> None:
+    writer = PdfWriter()
+    for width in widths:
+        writer.add_blank_page(width=width, height=400)
     with path.open("wb") as f:
         writer.write(f)
 
@@ -106,7 +118,7 @@ def test_write_split_documents_writes_expected_pdf_ranges(tmp_path: Path) -> Non
         {"name": "second.pdf", "folder": "packet_b/nested", "start_page": 3, "end_page": 5},
     ]
 
-    written = SplitPdfBlock._write_split_documents(reader, documents, tmp_path / "downloads")
+    written = SplitPdfBlock._write_split_documents(reader, documents, tmp_path / "downloads", str(source_pdf))
 
     assert len(written) == 2
     for meta, pdf_bytes in written:
@@ -121,6 +133,62 @@ def test_write_split_documents_writes_expected_pdf_ranges(tmp_path: Path) -> Non
 
     assert Path(written[0][0]["file_path"]).relative_to(tmp_path / "downloads") == Path("packet_a/first.pdf")
     assert Path(written[1][0]["file_path"]).relative_to(tmp_path / "downloads") == Path("packet_b/nested/second.pdf")
+
+
+def test_write_split_documents_does_not_overwrite_source_pdf(tmp_path: Path) -> None:
+    source_pdf = tmp_path / "source.pdf"
+    _write_blank_pdf(source_pdf, page_count=2)
+    original_bytes = source_pdf.read_bytes()
+    reader = PdfReader(source_pdf)
+    documents = [{"name": "source.pdf", "folder": "", "start_page": 1, "end_page": 1}]
+
+    written = SplitPdfBlock._write_split_documents(reader, documents, tmp_path, str(source_pdf))
+
+    output_path = Path(written[0][0]["file_path"])
+    assert source_pdf.read_bytes() == original_bytes
+    assert output_path != source_pdf
+    assert output_path.name == "source_2.pdf"
+    assert len(PdfReader(output_path).pages) == 1
+
+
+def test_write_split_documents_does_not_overwrite_prior_output_while_avoiding_source(tmp_path: Path) -> None:
+    source_pdf = tmp_path / "downloads" / "invoice.pdf"
+    source_pdf.parent.mkdir(parents=True)
+    _write_pdf_with_page_widths(source_pdf, [300, 500])
+    original_bytes = source_pdf.read_bytes()
+    reader = PdfReader(source_pdf)
+    documents = [
+        {"name": "invoice.pdf", "folder": "", "start_page": 1, "end_page": 1},
+        {"name": "invoice_2.pdf", "folder": "", "start_page": 2, "end_page": 2},
+    ]
+
+    written = SplitPdfBlock._write_split_documents(reader, documents, source_pdf.parent, str(source_pdf))
+
+    output_paths = [Path(meta["file_path"]) for meta, _ in written]
+    assert output_paths[0].name == "invoice_2.pdf"
+    assert len(set(output_paths)) == 2
+    assert source_pdf.read_bytes() == original_bytes
+    assert [PdfReader(path).pages[0].mediabox.width for path in output_paths] == [300, 500]
+    assert all(path.read_bytes() == pdf_bytes for path, (_, pdf_bytes) in zip(output_paths, written))
+    assert [meta["page_range"] for meta, _ in written] == [[1, 1], [2, 2]]
+
+
+def test_write_split_documents_does_not_overwrite_duplicate_names_without_source_collision(tmp_path: Path) -> None:
+    source_pdf = tmp_path / "source.pdf"
+    _write_pdf_with_page_widths(source_pdf, [300, 500])
+    reader = PdfReader(source_pdf)
+    documents = [
+        {"name": "duplicate.pdf", "folder": "", "start_page": 1, "end_page": 1},
+        {"name": "duplicate.pdf", "folder": "", "start_page": 2, "end_page": 2},
+    ]
+
+    written = SplitPdfBlock._write_split_documents(reader, documents, tmp_path / "downloads", str(source_pdf))
+
+    output_paths = [Path(meta["file_path"]) for meta, _ in written]
+    assert len(set(output_paths)) == 2
+    assert [path.name for path in output_paths] == ["duplicate.pdf", "duplicate_2.pdf"]
+    assert [PdfReader(path).pages[0].mediabox.width for path in output_paths] == [300, 500]
+    assert all(path.read_bytes() == pdf_bytes for path, (_, pdf_bytes) in zip(output_paths, written))
 
 
 def test_split_pdf_yaml_to_block_conversion() -> None:
@@ -151,3 +219,29 @@ def test_split_pdf_yaml_rejects_raw_custom_llm_key() -> None:
 
     assert yaml_block.llm_key is None
     assert yaml_block.model is None
+
+
+@pytest.mark.asyncio
+async def test_split_pdf_resolves_run_local_file_uri_without_temporary_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_id = "run_split_pdf_file_uri"
+    downloads_dir = tmp_path / "downloads"
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(downloads_dir))
+    monkeypatch.setattr(settings, "ENV", "production")
+    monkeypatch.setattr(files.app, "STORAGE", SimpleNamespace(manages_local_file_uri=lambda *_: False))
+    source = downloads_dir / run_id / "source.pdf"
+    source.parent.mkdir(parents=True)
+    _write_blank_pdf(source, page_count=1)
+    block = SplitPdfBlock(
+        label="split_pdf",
+        output_parameter=_make_output_parameter(),
+        file_url=source.as_uri(),
+        prompt="Split by document.",
+    )
+
+    resolved, is_temp = await block._resolve_source_pdf(run_id, organization_id="org-1")
+
+    assert resolved == str(source.resolve())
+    assert is_temp is False
+    assert source.exists()
