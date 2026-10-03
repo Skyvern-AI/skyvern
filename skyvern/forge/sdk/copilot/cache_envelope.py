@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, cast
 
+import litellm
 from agents.handoffs import Handoff
 from agents.items import TResponseInputItem
 from agents.model_settings import ModelSettings
@@ -12,6 +13,7 @@ from agents.models.chatcmpl_converter import Converter, ShouldReplayReasoningCon
 from agents.tool import Tool
 from agents.util._json import _to_dump_compatible
 from litellm.completion_extras import responses_api_bridge
+from litellm.types.llms.openai import ChatCompletionTextObject
 
 _DIRECT_OPENAI_GPT56_MODELS = {
     "gpt-5.6",
@@ -22,12 +24,8 @@ _DIRECT_OPENAI_GPT56_MODELS = {
 
 
 class CacheableSystemInstructions(str):
-    """A behavior-identical system prompt with an explicit stable-prefix seam.
-
-    The Agents SDK still receives a string and therefore sees exactly the same
-    instructions as before. ``CopilotLitellmModel`` uses the attached parts only
-    when it builds a direct-OpenAI GPT-5.6 wire request.
-    """
+    """The joined system prompt string, carrying its stable prefix and dynamic suffix so ``CopilotLitellmModel`` can
+    cache the prefix: as a GPT Responses envelope, or as two Claude system blocks with the same text."""
 
     stable_prefix: str
     dynamic_suffix: str
@@ -109,6 +107,43 @@ def _cache_key(
     # Keep the routing key opaque: it binds the relevant inputs without
     # disclosing a chat/session identifier to request logs.
     return f"copilot:{digest[:48]}"
+
+
+def model_chain(model: str, model_settings: ModelSettings) -> list[str]:
+    fallbacks: list[str | dict[str, Any]] = (model_settings.extra_args or {}).get("fallbacks") or []
+    return [model, *(hop["model"] if isinstance(hop, dict) else hop for hop in fallbacks)]
+
+
+def _is_anthropic_model(model: str) -> bool:
+    try:
+        provider_model, provider, _, _ = litellm.get_llm_provider(model)
+    except litellm.exceptions.BadRequestError:
+        return False
+    return provider == "anthropic" or (provider == "bedrock" and "anthropic." in provider_model)
+
+
+def anthropic_cached_system_blocks(
+    *,
+    model: str,
+    model_settings: ModelSettings,
+    system_instructions: str | None,
+) -> list[ChatCompletionTextObject] | None:
+    if not isinstance(system_instructions, CacheableSystemInstructions) or not system_instructions.stable_prefix:
+        return None
+    if (model_settings.extra_args or {}).get("cache_control_injection_points"):
+        return None
+    if not all(_is_anthropic_model(candidate) for candidate in model_chain(model, model_settings)):
+        return None
+    blocks: list[ChatCompletionTextObject] = [
+        {
+            "type": "text",
+            "text": system_instructions.stable_prefix,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    if system_instructions.dynamic_suffix:
+        blocks.append({"type": "text", "text": system_instructions.dynamic_suffix})
+    return blocks
 
 
 def build_explicit_cache_envelope(
