@@ -466,6 +466,34 @@ INCEPTION_API_BASE=https://api.inception.ai/v1
 
 ---
 
+## Cheaper Inference
+
+[Cheaper Inference](https://cheaperinference.com/) is an OpenAI-compatible LLM gateway. Each model costs 15–60% less than the list price of its lab.
+
+```bash .env
+ENABLE_CHEAPER_INFERENCE=true
+CHEAPER_INFERENCE_API_KEY=your-cheaper-inference-api-key
+LLM_KEY=CHEAPER_INFERENCE_GPT5_4_MINI
+```
+
+Get an API key at [cheaperinference.com/signup](https://cheaperinference.com/signup). See the [Cheaper Inference docs](https://cheaperinference.com/docs) for details.
+
+### Available models
+
+| LLM_KEY | Model | Notes |
+|---------|-------|-------|
+| `CHEAPER_INFERENCE_GPT5_4_MINI` | gpt-5.4-mini | Recommended, vision support, 400K context |
+| `CHEAPER_INFERENCE_GPT5_4` | gpt-5.4 | Vision support, 1M context |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+CHEAPER_INFERENCE_API_BASE=https://api.cheaperinference.com/v1
+```
+
+---
+
 ## Ollama (Local Models)
 
 Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, but requires sufficient local compute.

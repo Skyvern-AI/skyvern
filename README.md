@@ -570,6 +570,7 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | Gemini | Gemini 3.1 Pro, Gemini 3 Flash, Gemini 2.5 Pro/Flash |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
+| Cheaper Inference | GPT-5.4 and GPT-5.4 mini through the [Cheaper Inference](https://cheaperinference.com) OpenAI-compatible gateway. Each model costs 15–60% less than the list price of its lab. |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
 
 For detailed LLM configuration including all available model keys, environment variables, and multi-model setups, see the [LLM Configuration docs](https://www.skyvern.com/docs/self-hosted/llm-configuration).
