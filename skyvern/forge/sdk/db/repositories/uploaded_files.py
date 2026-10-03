@@ -98,6 +98,10 @@ class UploadedFilesRepository(BaseRepository):
         """
         now = naive_utc_now()
         async with self.Session() as session:
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+            # SQLite has no LEAST(); its multi-argument min() is equivalent here because
+            # coalesce() guarantees neither argument is NULL.
+            least = func.min if dialect_name == "sqlite" else func.least
             result = await session.execute(
                 update(UploadedFileModel)
                 .where(UploadedFileModel.file_id.in_(file_ids))
@@ -108,7 +112,7 @@ class UploadedFilesRepository(BaseRepository):
                 )
                 .values(
                     run_id=run_id,
-                    expires_at=func.least(
+                    expires_at=least(
                         func.coalesce(UploadedFileModel.expires_at, to_naive_utc(expires_at)),
                         to_naive_utc(expires_at),
                     ),

@@ -285,6 +285,20 @@ def upgrade_sqlite_schema(connection: Connection) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL"
             )
         )
+    # create_all never alters an existing index, so one created before its model gained a sqlite_where
+    # is still a full index here. As a unique index it rejects rows Postgres accepts (e.g. rebinding a
+    # workflow after its previous browser session closed), so rebuild it in its partial form.
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            if index.dialect_options["sqlite"].get("where") is None:
+                continue
+            ddl = connection.execute(
+                text("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = :name"), {"name": index.name}
+            ).scalar()
+            if ddl is not None and " WHERE " not in ddl.upper():
+                # Can't fail on existing rows: a partial index constrains a subset of the full one's rows.
+                index.drop(connection)
+                index.create(connection)
 
 
 async def ensure_sqlite_schema(db: AgentDB) -> None:

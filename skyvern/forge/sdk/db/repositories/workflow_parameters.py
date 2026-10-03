@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 import structlog
-from sqlalchemy import cast, func, or_, select, text
+from sqlalchemy import JSON, cast, func, or_, select, text, type_coerce
 from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -1814,6 +1814,7 @@ class WorkflowParametersRepository(BaseRepository):
         request_cancel_token: str | None = None,
     ) -> WorkflowCopilotChat | None:
         async with self.Session() as session:
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
             query = (
                 select(WorkflowCopilotChatModel)
                 .filter(WorkflowCopilotChatModel.organization_id == organization_id)
@@ -1833,11 +1834,22 @@ class WorkflowParametersRepository(BaseRepository):
                     )
                     .exists()
                 )
-                pending_turn = func.jsonb_path_exists(
-                    cast(WorkflowCopilotChatModel.pending_turns, JSONB),
-                    cast("$.* ? (@.cancel_token == $token)", JSONPATH),
-                    func.jsonb_build_object("token", request_cancel_token),
-                )
+                if dialect_name == "sqlite":
+                    # SQLite has no JSONPATH: look through the pending turns (a turn id -> turn
+                    # object map) for one carrying the cancel token.
+                    turns = func.json_each(WorkflowCopilotChatModel.pending_turns).table_valued("value")
+                    pending_turn = (
+                        select(1)
+                        .select_from(turns)
+                        .where(func.json_extract(turns.c.value, "$.cancel_token") == request_cancel_token)
+                        .exists()
+                    )
+                else:
+                    pending_turn = func.jsonb_path_exists(
+                        cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                        cast("$.* ? (@.cancel_token == $token)", JSONPATH),
+                        func.jsonb_build_object("token", request_cancel_token),
+                    )
                 query = query.filter(or_(pending_turn, completed_turn))
             query = query.order_by(WorkflowCopilotChatModel.created_at.desc()).limit(1)
             chat = (await session.scalars(query)).first()
@@ -1857,30 +1869,78 @@ class WorkflowParametersRepository(BaseRepository):
         page = max(page, 1)
         page_size = max(min(page_size, 100), 1)
         async with self.Session() as session:
+            dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
             # Each chat's first message (earliest created_at) is its title source and proves the
             # chat is non-empty; DISTINCT ON keeps one opening row per chat.
-            first_message = (
-                select(
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.label("chat_id"),
-                    WorkflowCopilotChatMessageModel.content.label("title"),
+            if dialect_name == "sqlite":
+                # SQLite has no DISTINCT ON (SQLAlchemy silently drops it there, keeping every
+                # message), so rank each chat's messages oldest-first and keep the first.
+                ranked_messages = (
+                    select(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.label("chat_id"),
+                        WorkflowCopilotChatMessageModel.content.label("title"),
+                        func.row_number()
+                        .over(
+                            partition_by=WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
+                            order_by=(
+                                WorkflowCopilotChatMessageModel.created_at.asc(),
+                                WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                            ),
+                        )
+                        .label("rank"),
+                    )
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .subquery()
                 )
-                .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
-                .order_by(
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
-                    WorkflowCopilotChatMessageModel.created_at.asc(),
-                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                first_message = (
+                    select(ranked_messages.c.chat_id, ranked_messages.c.title)
+                    .where(ranked_messages.c.rank == 1)
+                    .subquery()
                 )
-                .subquery()
-            )
+                # SQLite has no JSONPATH: collect question_heartbeat_at from every pending turn
+                # that has a question still pending. Turns always carry the key (null when unset),
+                # so this matches the Postgres path, which yields JSON null for those too.
+                turns = func.json_each(WorkflowCopilotChatModel.pending_turns).table_valued("value").alias("turn")
+                questions = (
+                    func.json_each(turns.c.value, "$.question_interactions").table_valued("value").alias("question")
+                )
+                question_pending = (
+                    select(1)
+                    .select_from(questions)
+                    .where(func.json_extract(questions.c.value, "$.status") == "pending")
+                    .exists()
+                )
+                question_heartbeats = type_coerce(
+                    select(func.json_group_array(func.json_extract(turns.c.value, "$.question_heartbeat_at")))
+                    .select_from(turns)
+                    .where(question_pending)
+                    .scalar_subquery(),
+                    JSON,
+                )
+            else:
+                first_message = (
+                    select(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.label("chat_id"),
+                        WorkflowCopilotChatMessageModel.content.label("title"),
+                    )
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
+                    .order_by(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
+                        WorkflowCopilotChatMessageModel.created_at.asc(),
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                    )
+                    .subquery()
+                )
+                question_heartbeats = func.jsonb_path_query_array(
+                    cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                    cast('$.* ? (@.question_interactions[*].status == "pending").question_heartbeat_at', JSONPATH),
+                )
             query = (
                 select(
                     WorkflowCopilotChatModel,
                     first_message.c.title,
-                    func.jsonb_path_query_array(
-                        cast(WorkflowCopilotChatModel.pending_turns, JSONB),
-                        cast('$.* ? (@.question_interactions[*].status == "pending").question_heartbeat_at', JSONPATH),
-                    ).label("question_heartbeats"),
+                    question_heartbeats.label("question_heartbeats"),
                 )
                 .options(defer(WorkflowCopilotChatModel.pending_turns))
                 .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
