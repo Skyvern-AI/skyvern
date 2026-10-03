@@ -77,6 +77,9 @@ ToolErrorClass = Literal[
     "not_editable",
     # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
     "value_changed_by_page",
+    # `type`: another segment of the same date moved and could not be put back, or could not be read back.
+    "date_sibling_moved",
+    "date_sibling_unverified",
     # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
     # one-character-per-box code field whose boxes did not all keep their character.
     "text_not_held",

@@ -13,6 +13,7 @@ alongside `make_finish_tool()`.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import dataclasses
 import functools
@@ -88,6 +89,7 @@ from skyvern.forge.taskv3.run_arms import (
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
@@ -5950,6 +5952,32 @@ _COLLATERAL_IS_DATE_SEGMENT_JS = (
 }"""
 )
 
+_DATE_SEGMENT_FOCUS_JS = r"""(el) => {
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  const group = el.closest('[data-tv3-dateseg="group"]');
+  return a === el || (!!a && !!group && group.contains(a) && !a.hasAttribute('data-tv3-dateseg'));
+}"""
+
+# Per tagged date segment: [its first digit run as a number, or null when empty; the value a failed restore recorded
+# on it, or 'none'], or null when the segment is gone. `arg.set[label]` records a value, and 'drop' removes the record.
+_DATE_SEGMENT_STATE_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const K = Symbol.for('tv3-date-restore');
+  return arg.labels.map((l) => {
+    const e = _q.find('[data-tv3-dateseg="' + l + '"]');
+    if (!e) return null;
+    if (arg.set[l] === 'drop') delete e[K];
+    else if (l in arg.set) e[K] = arg.set[l];
+    const m = (String(e.value ?? '') + '|' + String(e.textContent ?? '')).match(/\d+/);
+    return [m ? Number(m[0]) : null, K in e ? e[K] : 'none'];
+  });
+}"""
+)
+
 # Every text-holding field our keystrokes could reach if the widget routes them somewhere other than
 # the element we focused, tagged so each one can be read back by the same handle afterwards. Scoped to
 # the target's own form -- or its own root when it has none, which keeps a field inside a component
@@ -6188,8 +6216,8 @@ _DATE_SEGMENT_GROUP_JS = (
     const da = String(el.getAttribute('aria-disabled') || '').trim().toLowerCase();
     return ro !== 'true' && da !== 'true';
   };
-  _q.all('[data-tv3-dateseg]').forEach((e) => e.removeAttribute('data-tv3-dateseg'));
   const target = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  _q.all('[data-tv3-dateseg]').forEach((e) => e.removeAttribute('data-tv3-dateseg'));
   if (!target || !isSpinbutton(target)) return { ok: false, reason: 'not_spinbutton', targetLabel: null };
   const targetLabel = norm(target) || null;
   if (LABELS.indexOf(targetLabel) === -1) return { ok: false, reason: 'target_not_date_segment', targetLabel };
@@ -15766,10 +15794,11 @@ def build_browser_tools(
             return None
         return {"month": f"{month:02d}", "day": f"{day:02d}", "year": year_s}
 
-    async def _date_segment_group(page: Any, selector: str) -> dict[str, Any]:
+    async def _date_segment_group(page: Any, selector: str, *, tag_partial: bool = False) -> dict[str, Any]:
         try:
             probe = await page.evaluate(
-                _DATE_SEGMENT_GROUP_JS, {**await _probe_arg(page, selector), "aim": _date_segment_aim_on()}
+                _DATE_SEGMENT_GROUP_JS,
+                {**await _probe_arg(page, selector), "aim": tag_partial or _date_segment_aim_on()},
             )
         except Exception:
             return {"ok": False, "reason": None, "targetLabel": None}
@@ -15781,6 +15810,171 @@ def build_browser_tools(
         except Exception:
             return ""
         return str(raw) if isinstance(raw, str) else ""
+
+    async def _date_segment_state(
+        page: Any, labels: Sequence[str], record: dict[str, Any] | None = None
+    ) -> dict[str, list[Any]] | None:
+        # Compared by integer, so a widget re-padding "3" as "03" is not a move; an empty segment is None, never 0.
+        try:
+            raw = await page.evaluate(_DATE_SEGMENT_STATE_JS, {"labels": list(labels), "set": record or {}})
+        except Exception:
+            return None
+        ok = isinstance(raw, list) and len(raw) == len(labels) and all(isinstance(r, list) for r in raw)
+        return dict(zip(labels, raw, strict=False)) if ok else None
+
+    async def _date_siblings_begin(page: Any, target: str, order: list[str]) -> dict[str, int | None] | None:
+        # Each other segment's reference is the value a failed restore recorded on it, so a retried write is judged
+        # against the date before the first corruption; else what it holds now. The target's record is dropped.
+        siblings = [label for label in order if label != target]
+        if not siblings:
+            return {}
+        state = await _date_segment_state(page, [target, *siblings], {target: "drop"})
+        if state is None:
+            return None
+        return {label: held if rec == "none" else rec for label, (held, rec) in state.items() if label != target}
+
+    async def _commit_with_tab(page: Any, selector: str) -> ToolResult | None:
+        # A trusted Tab, never blur(): a segment widget commits what it assembled only when focus really leaves.
+        try:
+            planted = await page.evaluate("() => { window.__tv3_doc = 1; return true; }") is True
+        except Exception:
+            planted = False
+        try:
+            await input_dispatch.press(_current_page(), None, "Tab")
+            await page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            pass
+        try:
+            if planted and await page.evaluate("() => window.__tv3_doc === 1"):
+                return None
+        except Exception:
+            pass
+        # Leaving the field submitted or navigated, or the check could not run: the selector may match something
+        # else now, so nothing is read back.
+        return ToolResult.error(
+            f"typed into {selector}, then the page navigated, or could not be checked, when focus "
+            "left the field -- the field may not hold the text. Re-observe before doing anything else.",
+            data={"navigated": True, "page_state_changed": True},
+        )
+
+    async def _settled_date_read(page: Any, selector: str, label: str, labels: list[str]) -> dict[str, Any] | None:
+        # Re-tagged through the written segment's own tag (the caller's selector only if that element is gone), since
+        # a widget may re-render on a commit; then two equal reads 0.15s apart within 0.6s. None: a segment is gone.
+        if not (await _date_segment_group(page, f'[data-tv3-dateseg="{label}"]', tag_partial=True)).get("ok"):
+            await _date_segment_group(page, selector, tag_partial=True)
+        last: dict[str, Any] | None = None
+        deadline = time.monotonic() + 0.6
+        while True:
+            state = await _date_segment_state(page, labels)
+            now = None if state is None else {other: held for other, (held, _) in state.items()}
+            if (now is not None and now == last) or time.monotonic() >= deadline:
+                return now
+            last = now
+            await asyncio.sleep(0.15)
+
+    async def _settle_date_group(
+        page: Any, selector: str, digits: str, group: dict[str, Any] | None
+    ) -> tuple[ToolResult | None, dict[str, Any] | None, int]:
+        # (error, settled values, segments the page set) after a write into the group's `label` segment. The keys land
+        # in earlier segments and a segment written alone is clean, so the group is re-read before each restore and the
+        # latest wrong segment is put back and committed with a Tab -- the day only once the month is right, since the
+        # page clamps the day against the month it holds. A segment that cannot be read stops the loop.
+        if group is None:
+            return None, None, 0
+        label, ref = group["label"], group["ref"]
+        stats = {"date_siblings_moved_after_tab": 0, "date_siblings_filled_after_tab": 0}
+        try:
+            unverified = ToolResult.error(
+                f"typed into {selector}, but the segments of the same date could not be read back afterwards, so the "
+                "date is NOT confirmed. Re-observe the date before relying on it.",
+                error_class="date_sibling_unverified",
+            )
+            if ref is None:
+                return unverified, None, 0
+            labels = [*ref, label]
+            want: dict[str, int | None] = {**ref, label: int(digits)}
+            # Recorded while the segments are still tagged, so an exit that cannot read them leaves the retry a
+            # reference; the confirmed path below drops the records again.
+            await _date_segment_state(page, list(ref), {o: want[o] for o in ref if want[o] is not None})
+            now = await _settled_date_read(page, selector, label, labels)
+            clamped = 0
+            emptied: set[str] = set()
+            restored: dict[str, tuple[Any, Any]] = {}
+            for _ in range(2 * len(ref)):
+                # A month outside 1-12 (a day/month flip into a lenient input) is never a date this can confirm.
+                if now is None or not 1 <= (now.get("month") or 1) <= 12:
+                    return unverified, None, 0
+                # Judged against the month and year the page holds, and only once both are the ones wanted.
+                month, year, day = now.get("month"), now.get("year") or 2000, ref.get("day") or 0
+                settled = month == want.get("month") and now.get("year") == want.get("year", now.get("year"))
+                if not clamped and settled and month and day > (last := calendar.monthrange(year, month)[1]):
+                    # Only the month's last day is a clamp; anything else leaves the date invalid or incomplete.
+                    if now.get("day") != last:
+                        return (
+                            ToolResult.error(
+                                f"typed into {selector}, but the day of the same date is not valid for that month. The "
+                                "date is NOT correct: re-type the day on its own.",
+                                error_class="date_sibling_moved",
+                            ),
+                            now,
+                            0,
+                        )
+                    want["day"], clamped = last, 1
+                # A segment emptied once and filled again by the widget holds its default, and keeps it.
+                wrong = [o for o in reversed(ref) if now[o] != want[o] and not (want[o] is None and o in emptied)]
+                if not wrong:
+                    break
+                other = "month" if wrong[0] == "day" and "month" in wrong else wrong[0]
+                restored[other] = (restored[other][0] if other in restored else now[other], want[other])
+                locator = page.locator(f'[data-tv3-dateseg="{other}"]').first
+                await _aim_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
+                # The caret goes to the end, since a clear deletes only what precedes it. Focus is checked before the
+                # clear, so a refusal never leaves the segment wiped.
+                with contextlib.suppress(Exception):
+                    await locator.evaluate(_CARET_TO_END_JS, timeout=2000)
+                if not await _segment_focused(locator):
+                    return unverified, None, 0
+                await _clear_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
+                cleared = ((await _date_segment_state(page, [other])) or {}).get(other, (1, None))[0] is None
+                if want[other] is not None:
+                    with contextlib.suppress(Exception):
+                        await input_dispatch.type_keys(_current_page(), None, str(want[other]).zfill(2), delay=40)
+                stats["date_siblings_moved_after_tab"] += 1
+                emptied |= {other} if want[other] is None and cleared else set()
+                if (navigated := await _commit_with_tab(page, selector)) is not None:
+                    return navigated, None, 0
+                before, now = now, await _settled_date_read(page, selector, label, labels)
+                # An emptied segment that this restore of another segment changed was moved again, not defaulted.
+                emptied -= {o for o in emptied if o != other and now and before and now[o] != before[o]}
+            if now is None:
+                return unverified, None, 0
+            # A value that reappears after a restore to empty is the widget's default, and becomes the reference.
+            noted = clamped + sum(ref[o] is None and now[o] is not None for o in ref)
+            stats["date_siblings_filled_after_tab"] = noted
+            wrong = [o for o in reversed(ref) if now[o] != want[o] and not (want[o] is None and o in emptied)]
+            await _date_segment_state(page, list(ref), {o: want[o] if o in wrong else "drop" for o in ref})
+            # A restore's keys can also land in the segment just written, which no caller re-reads after this.
+            wrong += [label] if now[label] != want[label] else []
+            if not wrong and restored:
+                # Named as put back only where the segment holds the wanted value; a widget default is shown as is.
+                put_back = ", ".join(
+                    f"put back the {o} {'empty' if a is None else a} -> {'empty' if want[o] is None else want[o]}"
+                    if now[o] == want[o]
+                    else f"saw the {o} changed to {now[o]}"
+                    for o, (a, _) in restored.items()
+                )
+                return ToolResult.ok(f"typed into {selector}; the write moved and the tool {put_back}"), now, noted
+            if not wrong:
+                return None, now, noted
+            error = ToolResult.error(
+                f"typed into {selector}, but the {' and '.join(wrong)} of the same date moved and could not be put "
+                f"back. The date is NOT correct: re-type the {', then the '.join(wrong)} one segment per call.",
+                error_class="date_sibling_moved",
+            )
+            return error, now, noted
+        finally:
+            with contained_effect("date siblings settled log"):
+                LOG.info("taskv3 date siblings settled", segment=label, **stats)
 
     def _date_segment_committed(rendered: str, expected_digits: str) -> bool:
         match = _DATE_SEGMENT_DIGITS_RE.search(rendered)
@@ -15968,6 +16162,14 @@ def build_browser_tools(
                 with contextlib.suppress(Exception):
                     await layer.dispose()
 
+    async def _segment_focused(locator: Any) -> bool:
+        # Keys go to whatever holds focus: refused when that is outside the tagged group or another of its segments,
+        # allowed on the segment or on an input the widget moved focus to inside the group.
+        try:
+            return bool(await locator.evaluate(_DATE_SEGMENT_FOCUS_JS, timeout=2000))
+        except Exception:
+            return False
+
     async def _type_one_date_segment(page: Any, selector: str, digits: str) -> tuple[bool, str]:
         locator = page.locator(selector).first
         try:
@@ -16054,6 +16256,8 @@ def build_browser_tools(
         page: Any, selector: str, components: dict[str, str], order: list[str], *, arm: bool, aimed: bool
     ) -> ToolResult:
         written: list[tuple[str, str, str]] = []
+        # Every segment is rewritten, so no earlier restore's record still describes the date.
+        await _date_segment_state(page, order, dict.fromkeys(order, "drop"))
         for label in _DATE_SEGMENT_ORDER:
             segment_selector = f'[data-tv3-dateseg="{label}"]'
             committed, aim = await _type_one_date_segment(page, segment_selector, components[label])
@@ -16104,47 +16308,37 @@ def build_browser_tools(
         # element the probe established is this segment, where re-resolving the caller's selector
         # would act on whatever it matches now.
         segment_selector = f'[data-tv3-dateseg="{label}"]'
-        siblings = [other for other in labels if other != label]
-
-        async def moved_segments(before_siblings: dict[str, str]) -> int:
-            # Read by value or text, so a segment rendered as text is counted when it moves too.
-            now = {other: await _read_date_segment(page, f'[data-tv3-dateseg="{other}"]') for other in siblings}
-            return sum(now[other] != before_siblings[other] for other in siblings)
-
-        # Exactly one segment is being written, so a sibling that moves while the keys are sent took
-        # them by misrouting and is owed them back -- the same repair the plain path performs, which
-        # this path would otherwise drop. The group fill cannot reuse it: writing its siblings is the
-        # job there, so their movement is indistinguishable from a misroute.
+        # Exactly one segment is being written, so every other segment of the group is held to its value from
+        # before the call; fields outside the group that moved are only reported.
         arm = _date_segment_aim_on()
-        before = await _read_date_segment(page, segment_selector)
-        before_siblings = (
-            {other: await _read_date_segment(page, f'[data-tv3-dateseg="{other}"]') for other in siblings}
-            if arm
-            else {}
-        )
+        ref = await _date_siblings_begin(page, label, labels)
         collateral = await _capture_collateral(page, segment_selector)
-        outside = await _collateral_outside_date_segments(page, collateral) if arm else []
+        outside = await _collateral_outside_date_segments(page, collateral)
         committed, aim = await _type_one_date_segment(page, segment_selector, digits)
-        moved = await _collateral_moved_while_typing(page, collateral) if collateral else []
-        moved_outside = await _collateral_moved_while_typing(page, outside) if outside else []
         LOG.info(
             "taskv3 date segment fill",
             segment=label,
             committed=committed,
             whole_date=False,
-            siblings_moved=await moved_segments(before_siblings) + len(moved_outside) if arm else len(moved),
             aim=aim,
             group_shape=_date_group_shape(labels),
             date_segment_aim_arm=arm,
         )
+        # The siblings are put back by keys even when this segment did not commit: a fill() take-back writes around
+        # the widget's own state, which can keep the stray key.
+        if (navigated := await _commit_with_tab(page, selector)) is not None:
+            return navigated
+        date_error, now, noted = await _settle_date_group(page, selector, digits, {"label": label, "ref": ref})
+        if date_error is not None and committed and date_error.status != "ok":
+            return date_error
+        # A restore the settle made leads the ok; a field outside the group that moved is still reported after it.
+        head = date_error.content if date_error is not None else f"typed into {selector}; filled its {label} segment"
         if not committed:
-            # Ownership is decided exactly as the plain path decides it: the keys are ours to take back
-            # only where the segment proves it took none of them -- still holding what it held, or empty
-            # because this call's own clear left it so. A segment holding anything else took some of the
-            # text, and a sibling that moved with it is the widget distributing that value.
-            held = await _read_date_segment(page, segment_selector)
-            if moved and (not held or held == before):
-                await _restore_collateral(page, moved)
+            # The target took none of the keys, so an in-group field outside the date that moved holds them (as base).
+            still = 0
+            if outside and (moved_outside := await _collateral_moved_while_typing(page, outside)):
+                await _restore_collateral(page, moved_outside)
+                still = len(await _collateral_moved_while_typing(page, moved_outside))
             reach = (
                 " It could only be focused, not clicked, so the widget may have sent the keys elsewhere."
                 if arm and aim == "focus"
@@ -16153,36 +16347,19 @@ def build_browser_tools(
             return ToolResult.error(
                 f"typed into {selector}, but its {label} segment did not commit the value afterward -- "
                 f"the field is NOT filled.{reach} Re-observe and retry."
+                + (f" {still} other field(s) in the group still hold keys it sent." if still else "")
             )
-        if await _drifted_date_segment(page, [(label, segment_selector, digits)]) is not None:
-            if not arm:
-                return ToolResult.error(
-                    f"typed into {selector}'s {label} segment, but it changed afterward, so the segment may now "
-                    "hold a different value than requested. The page changed it, and it was left as the page "
-                    "set it. Re-observe it to see what value the field holds.",
-                    error_class="value_changed_by_page",
-                )
-            now = _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, segment_selector))
-            return await _value_changed_by_page_error(
-                page, selector, digits, now.group(0) if now else "", echo=not text_is_secret
-            )
-        # Read the siblings a second time, because the blur above is itself an event a widget derives
-        # or clamps another component on -- and that fires after the read the restore decision used,
-        # which has to stay next to the keystrokes to be able to attribute them.
-        if arm:
-            settled_outside = await _collateral_moved_while_typing(page, outside) if outside else []
-            changed = await moved_segments(before_siblings) + len(settled_outside)
-        else:
-            changed = len(await _collateral_moved_while_typing(page, collateral) if collateral else moved)
+        if now is not None and now[label] != int(digits):
+            held = "" if now[label] is None else str(now[label])
+            return await _value_changed_by_page_error(page, selector, digits, held, echo=not text_is_secret)
+        changed = noted + len(await _collateral_moved_while_typing(page, outside) if outside else [])
         if changed:
-            # The keys landed in the segment, so by the ownership rule above these other fields are
-            # not ours to take back -- but they did move, and saying so is the tool reporting what
-            # happened rather than deciding whether it matters.
+            # Values the page set (a default, a clamp) and fields outside the group are kept, but reported.
             return ToolResult.ok(
-                f"typed into {selector}; filled its {label} segment. {changed} other field(s) in "
+                f"{head}. {changed} other field(s) in "
                 "the same group changed while it was typed -- re-observe the date before relying on it"
             )
-        return ToolResult.ok(f"typed into {selector}; filled its {label} segment")
+        return ToolResult.ok(head)
 
     def _resolves_to_one_time_code(raw_text: str) -> bool:
         # The provenance _resolve_text judges a one-time code by: a TOTP placeholder, or a value that resolves
@@ -16374,6 +16551,7 @@ def build_browser_tools(
         # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
         url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
+        date_group: dict[str, Any] | None = None
         # A segmented date input truncates a whole date typed into one segment at that segment's
         # maxlength, so a confirmed month/day/year group is filled segment by segment instead. A
         # caller may equally address ONE segment and write just its component, which no whole-date
@@ -16420,6 +16598,16 @@ def build_browser_tools(
                             labels,
                             text_is_secret=text != args.get("text", ""),
                         )
+                # The plain path types a month/year or year-only segment, so its group is tagged here only to read
+                # and restore the other segments around the write.
+                missing = group.get("reason") == "missing"
+                probe = await _date_segment_group(page, selector, tag_partial=True) if missing else group
+                target = str(probe.get("targetLabel"))
+                if probe.get("ok") and _DATE_SEGMENT_TEXT_RE.fullmatch(text.strip()):
+                    ref = await _date_siblings_begin(page, target, probe.get("order") or [])
+                    # None: the siblings could not be read before the write, so it can only end unverified.
+                    date_group = {"label": target, "ref": ref} if ref != {} else None
+                LOG.info("taskv3 date segment group declined", date_group_reject=group.get("reason"))
         field_type: str | None = None
         maxlength: int | None = None
         if text:
@@ -16482,7 +16670,9 @@ def build_browser_tools(
             if not await _anchor_typeable(page, selector) and await _anchor_has_list_semantics(page, selector):
                 return await _open_observe_pick(page, selector, text)
             opened_by_typing = await _list_opened_on_an_empty_field(page, selector)
-            result = await _type_typeahead_commit(page, selector, text, text_is_secret=text != args.get("text", ""))
+            result = await _type_typeahead_commit(
+                page, selector, text, text_is_secret=text != args.get("text", ""), date_group=date_group
+            )
             return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
         # The types that skip the typeahead probe still must not be typed into through an overlay.
         # They reach fill()/type(), which do no hit-testing, so nothing here would fail on its own --
@@ -16694,7 +16884,9 @@ def build_browser_tools(
             error_class="value_changed_by_page",
         )
 
-    async def _type_typeahead_commit(page: Any, selector: str, text: str, *, text_is_secret: bool) -> ToolResult:
+    async def _type_typeahead_commit(
+        page: Any, selector: str, text: str, *, text_is_secret: bool, date_group: dict[str, Any] | None = None
+    ) -> ToolResult:
         # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
         collateral: list[list[str]] = []
@@ -16724,27 +16916,9 @@ def build_browser_tools(
                 await asyncio.sleep(0.3)
                 reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
             if not reacted:
-                try:
-                    planted = await page.evaluate("() => { window.__tv3_doc = 1; return true; }") is True
-                except Exception:
-                    planted = False
-                try:
-                    await input_dispatch.press(_current_page(), None, "Tab")
-                    await page.wait_for_load_state("domcontentloaded", timeout=1000)
-                except Exception:
-                    pass
-                try:
-                    same_document = planted and bool(await page.evaluate("() => window.__tv3_doc === 1"))
-                except Exception:
-                    same_document = False
-                if not same_document:
-                    # Leaving the field submitted or navigated, or the check could not run: the selector may
-                    # match something else now, so nothing is read back.
-                    return ToolResult.error(
-                        f"typed into {selector}, then the page navigated, or could not be checked, when focus "
-                        "left the field -- the field may not hold the text. Re-observe before doing anything else.",
-                        data={"navigated": True, "page_state_changed": True},
-                    )
+                if (navigated := await _commit_with_tab(page, selector)) is not None:
+                    return navigated
+                date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
                 held = await _read_field_value(page, selector)
                 landed = _typed_text_landed(held, text)
                 siblings_moved = len(collateral)
@@ -16754,6 +16928,17 @@ def build_browser_tools(
                     page_changed=bool(held) and not landed,
                     siblings_moved=siblings_moved,
                 )
+                # The settle only overrides an ok; a write that did not land keeps its own error and restore below.
+                if date_error is not None and landed:
+                    outside = (
+                        await _collateral_outside_date_segments(page, collateral) if date_error.status == "ok" else []
+                    )
+                    tail = (
+                        f". {len(outside)} other field(s) in the same group changed while it was typed"
+                        if outside
+                        else ""
+                    )
+                    return ToolResult.ok(date_error.content + tail) if tail else date_error
                 if landed and siblings_moved:
                     # The keys reached the target, so the siblings are not ours to take back -- but a
                     # segment that took the first key of the next one's value must not pass as filled.
@@ -16883,6 +17068,13 @@ def build_browser_tools(
                 f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is NOT "
                 "filled; re-observe and retry, do not proceed"
             )
+        if date_group:
+            # A segment the click reached is not exempt: its keys can still land in an earlier segment.
+            if (navigated := await _commit_with_tab(page, selector)) is not None:
+                return navigated
+            date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+            if date_error is not None:
+                return date_error
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
         # inside one -- but not one the widget portals elsewhere in the page or renders in a
         # closed root, so inside a component this is still not evidence of absence. Saying
