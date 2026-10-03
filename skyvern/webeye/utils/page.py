@@ -2833,8 +2833,9 @@ class SkyvernFrame:
     async def scroll_to_top(self, draw_boxes: bool, frame: str, frame_index: int) -> float:
         """
         Scroll to the top of the page and take a screenshot.
-        :param drow_boxes: If True, draw bounding boxes around the elements.
-        :param page: Page instance to take the screenshot from.
+        :param draw_boxes: If True, draw bounding boxes around the elements.
+        :param frame: The frame to screenshot.
+        :param frame_index: Index of the frame being screenshotted.
         :return: Screenshot of the page.
         """
         js_script = with_dom_utils(
@@ -2861,8 +2862,9 @@ class SkyvernFrame:
     ) -> float:
         """
         Scroll to the next page and take a screenshot.
-        :param drow_boxes: If True, draw bounding boxes around the elements.
-        :param page: Page instance to take the screenshot from.
+        :param draw_boxes: If True, draw bounding boxes around the elements.
+        :param frame: The frame to screenshot.
+        :param frame_index: Index of the frame being screenshotted.
         :return: Screenshot of the page.
         """
         js_script = with_dom_utils(
@@ -2887,7 +2889,6 @@ class SkyvernFrame:
     async def remove_bounding_boxes(self) -> None:
         """
         Remove the bounding boxes from the page.
-        :param page: Page instance to remove the bounding boxes from.
         """
         js_script = with_dom_utils("() => removeBoundingBoxes()", ("removeBoundingBoxes",))
         await self.evaluate(
