@@ -12,7 +12,9 @@ repos:
       - id: check-merge-conflict
       - id: check-symlinks
       - id: debug-statements
+      # frozen migrated corpus; scanned by scripts/validate_blog_content.py SECRET_PATTERNS
       - id: detect-private-key
+        exclude: ^blogs/
   - repo: local
     hooks:
       - id: check-python-version
@@ -134,4 +136,5 @@ repos:
       - id: yamlfmt
         # Helm chart templates contain Go templating ({{ ... }}) and are not
         # valid standalone YAML, so yamlfmt cannot parse them.
-        exclude: ^k8s/charts/.*/templates/
+        # Blog bootstrap guard files preserve their reviewed formatting.
+        exclude: ^(?:k8s/charts/.*/templates/|\.github/(?:sync\.yml|workflows/ci\.yml)$)
