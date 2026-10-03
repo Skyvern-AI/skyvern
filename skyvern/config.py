@@ -547,6 +547,10 @@ class Settings(BaseSettings):
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
     TASK_V3_DATE_SEGMENT_AIM: bool = False
+    # Move the pointer onto an input or click target before acting, as v1 does, and take the click and typing
+    # pre-snapshots without writing an attribute to every visible element. Force-on term only: runs are randomized per run by the
+    # flag of the same name, read through run_arm_enabled(POINTER_PARITY_FLAG, ...).
+    TASK_V3_POINTER_PARITY: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is

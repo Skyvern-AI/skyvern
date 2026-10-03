@@ -1864,8 +1864,11 @@ _PIERCED_QUERY_JS = (
   // a static list as a reaction. The WeakSet is the best carrier that costs no mutation, at one
   // disclosed price -- a component that re-creates its own content by cloning reads as all-new.
   // Absent (a navigation cleared window) means "no snapshot", never "everything is new".
-  const preMark = (el, inShadow) => {
+  // A run that must write nothing (weak) keeps the light DOM in the WeakSet too, at the same disclosed
+  // price: a container the page re-creates by cloning reads as all-new.
+  const preMark = (el, inShadow, weak) => {
     if (inShadow) window.__tv3_pre.add(el);
+    else if (weak) window.__tv3_pre.add(el);
     else el.setAttribute('data-tv3-pre', '1');
   };
   // instanceof, not truthiness: a page that pre-defines __tv3_pre as an accessor keeps its own
@@ -1931,16 +1934,22 @@ _INSTRUCTION_CLAUSE_RE = re.compile(
 )
 
 _PRESNAPSHOT_JS = (
-    r"""() => {"""
+    r"""(weak) => {"""
     + _PIERCED_QUERY_JS
     + r"""
   preReset();
   pScopeEach((el, inShadow) => {
     const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) preMark(el, inShadow);
+    if (r.width > 0 && r.height > 0) preMark(el, inShadow, !!weak);
   });
 }"""
 )
+
+
+def _pre_weak() -> bool:
+    """Whether this run's pre-snapshots use only the WeakSet carrier, writing no attribute to the page."""
+    return input_dispatch.parity()
+
 
 # Behavioral, site-agnostic suggestion finder. After the caller types a value (with a pre-snapshot taken
 # first), this looks for the suggestion list the typeahead rendered IN REACTION: a small, visible,
@@ -2591,7 +2600,7 @@ _FOCUS_SNAPSHOT_JS = (
     if (preHas(el) && !inOpenOwn) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow);
+    if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow, !!arg.weak);
   });
   // Record what the list offered NOW: a widget that filters by re-rendering unmounts the rows the
   // typed value does not match, so a later read would find nothing to name on an honest no-match.
@@ -3595,7 +3604,8 @@ _WATCH_REWRITTEN_ROWS_JS = r"""() => {
       const row = t.closest(ROW);
       if (row) {
         unmark(row);
-        row.querySelectorAll('[data-tv3-pre]').forEach(unmark);
+        // Every descendant, not only stamped ones: a run that writes nothing carries its marks in the WeakSet.
+        row.querySelectorAll('*').forEach(unmark);
       } else if (rec.type === 'childList' && t.matches(LIST)) {
         t.querySelectorAll(ROW).forEach(unmark);
       }
@@ -6716,7 +6726,7 @@ _CLICK_PRECHECK_JS = (
     }
   }
   preReset();
-  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
+  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow, !!arg.weak); });
   return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState, optSel, optKids, optH, optVis };
 }"""
 )
@@ -13307,6 +13317,9 @@ def build_browser_tools(
             element = None
         return {"sel": selector, "el": element}
 
+    async def _snapshot_arg(page: Any, selector: str) -> dict[str, Any]:
+        return {**await _probe_arg(page, selector), "weak": _pre_weak()}
+
     def _with_target_label(handler: ToolHandler) -> ToolHandler:
         """Capture the target's page-visible name and kind BEFORE the handler runs and carry both on
         the result.
@@ -13768,7 +13781,7 @@ def build_browser_tools(
             await _require_single_target(page, selector)
         pre: dict[str, Any] | None = None
         try:
-            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
+            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _snapshot_arg(page, selector))
             if isinstance(pre_raw, dict):
                 pre = pre_raw
         except Exception:
@@ -15302,7 +15315,7 @@ def build_browser_tools(
         # of this attempt, and ownCommittedSurface reads nothing while it is open.
         pre_own = await _own_surface_text(page, selector)
         try:
-            await page.evaluate(_PRESNAPSHOT_JS)
+            await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
         except Exception:
             presnapshot_ok = False
             LOG.info("taskv3 typeahead pre-snapshot failed; skipping suggestion probe", selector=selector)
@@ -15317,7 +15330,7 @@ def build_browser_tools(
             # Focus may reveal help text or a validation note as well as a menu; only rows of a list
             # are a reaction the finder may pick from, so everything else focus revealed is marked too.
             try:
-                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _snapshot_arg(page, selector))
             except Exception:
                 pass
         # `query` is what the caller chose to search with; the row committed must still be `value` exactly.
@@ -15391,7 +15404,7 @@ def build_browser_tools(
         # The rows showing now are the widget's unfiltered list, not an answer to the query: only rows
         # the search renders (or rewrites) may count.
         try:
-            await page.evaluate(_PRESNAPSHOT_JS)
+            await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
             await page.evaluate(_WATCH_REWRITTEN_ROWS_JS)
         except Exception:
             return _settled(
@@ -16947,7 +16960,7 @@ def build_browser_tools(
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
             try:
-                await page.evaluate(_PRESNAPSHOT_JS)
+                await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
             except Exception:
                 return None, ToolResult.error(
                     f"could not snapshot the page to open {selector}'s option list — the field is NOT "
@@ -18007,7 +18020,7 @@ def build_browser_tools(
                     # reaction": the snapshot from before the first attempt would mark the rows the
                     # PREVIOUS query left on screen as pre-existing, and a widget that keeps its row
                     # nodes across a re-search would then have no reaction to show at all.
-                    await page.evaluate(_PRESNAPSHOT_JS)
+                    await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
                     await input_dispatch.type_keys(page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung))
                 except Exception:
                     return []
@@ -18065,7 +18078,7 @@ def build_browser_tools(
                 return
             await asyncio.sleep(0.4)
             try:
-                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _snapshot_arg(page, selector))
             except Exception:
                 LOG.debug("taskv3 empty-query offer snapshot failed", selector=selector)
 
