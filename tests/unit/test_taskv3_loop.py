@@ -87,6 +87,7 @@ from skyvern.forge.taskv3.loop import (
     _ProgressLedger,
     _raised_error_class,
     _RevisitMemory,
+    current_tool_call_seq,
     make_finish_tool,
     record_covered_layer,
     record_hit_class,
@@ -4399,6 +4400,27 @@ async def test_every_executed_tool_call_emits_one_timing_record() -> None:
     assert observe_record["duration_seconds"] >= 0.02
     assert records[2]["result_chars"] > 0  # the error text the model is handed back
     assert outcome.tool_seconds >= observe_record["duration_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_record_carries_the_seq_its_tool_saw() -> None:
+    # A tool's own log lines carry current_tool_call_seq(); the per-call record must carry the same value,
+    # or those lines cannot be joined to the call's tool name and selector kind.
+    seen: list[int | None] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        seen.append(current_tool_call_seq())
+        return ToolResult.ok("done")
+
+    tools = [ToolSpec(name="probe", description="p", parameters={}, handler=handler), make_finish_tool()]
+    script = [[("probe", {}), ("probe", {})], [("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    records = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "probe"]
+    assert [r["tool_call_seq"] for r in records] == seen
+    assert len(set(seen)) == 2 and None not in seen, seen
 
 
 _OBSERVE_SUMMARY_FIELDS = (

@@ -30684,6 +30684,14 @@ async def test_select_combobox_offers_vocabulary_on_no_match() -> None:
         assert "IL" in r.content, r.content
 
 
+def _already_selected_log(logs: list[dict[str, Any]], value: str) -> tuple[str, bool]:
+    # The one line the already-selected returns emit; the form value itself must never be in it.
+    entry = next((e for e in logs if e["event"] == "taskv3 select left an already-selected value"), None)
+    assert entry is not None, [e["event"] for e in logs]
+    assert value not in repr(entry) and "selector" not in entry, entry
+    return entry["signal"], entry["matched_exact"]
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_reports_already_selected_row_as_ok() -> None:
@@ -30693,9 +30701,11 @@ async def test_select_combobox_reports_already_selected_row_as_ok() -> None:
     async with _content_page(_VIRTUALIZED_BUTTON_LISTBOX_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         current = _CC_COUNTRIES[_CC_CURRENT_INDEX][0]
-        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": current})
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": current})
         assert r.status == "ok", r.content
         assert "already selected" in r.content, r.content
+        assert _already_selected_log(logs, current) == ("displayed text", True)
         expanded = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-expanded')")
         assert expanded == "false", expanded
         label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
@@ -31274,13 +31284,15 @@ async def test_select_combobox_leaves_a_held_chip_only_when_its_list_is_known_cl
         html = html.replace('<div id="dep">', '<div id="fld-list" role="listbox" hidden></div><div id="dep">', 1)
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": shape["target"]})
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#fld", "value": shape["target"]})
         state = await page.evaluate(
             "() => [document.body.getAttribute('data-committed'), window.__rowClicks,"
             " Number(document.getElementById('fld').getAttribute('data-inputs'))]"
         )
     assert r.status == "ok" and "already selected" in r.content, r.content
     assert state == [shape["target"], 0, 0], state
+    assert _already_selected_log(logs, shape["target"]) == ("chip", True)
 
 
 @_skip_no_browser
@@ -31643,9 +31655,11 @@ async def test_select_combobox_trusts_aria_selected_in_a_declared_multi_select_w
     assert '"2 selected"' in html
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Germany"})
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Germany"})
         assert r.status == "ok", r.content
         assert "already selected" in r.content, r.content
+        assert _already_selected_log(logs, "Germany") == ("aria-selected", True)
         assert await page.eval_on_selector("#de", "el => el.getAttribute('aria-selected')") == "true"
 
 
