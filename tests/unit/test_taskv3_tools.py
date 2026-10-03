@@ -2546,11 +2546,21 @@ class _DateSegmentFakePage(_TypeaheadFakePage):
         if "targetLabel" in js:
             self.group_probe_calls += 1
             return self._group_probe
+        if "__tv3_doc" in js:
+            return True
+        if "tv3-date-restore" in js:
+            # The group read: each segment's committed digits as a number, with no restore record.
+            return [[int(v) if (v := self._segment_digits(label)) else None, "none"] for label in arg["labels"]]
         if ".blur()" in js:
             self._blur_current_segment()
             self.focused_segment = None
             return None
         return await super().evaluate(js, arg)
+
+    def _segment_digits(self, label: str) -> str:
+        if self._committed_override is not None:
+            return self._committed_override.get(label) or ""
+        return self.typed_digits.get(label, "")
 
     def _blur_current_segment(self) -> None:
         if self._blur_clamp:
@@ -2587,7 +2597,9 @@ class _DateSegmentFakePage(_TypeaheadFakePage):
                     outer.typed_digits[label] = digits
                     outer.log.append(("type", label, digits))
 
-            async def evaluate(self, js: str, timeout: int | None = None) -> str:
+            async def evaluate(self, js: str, timeout: int | None = None) -> Any:
+                if "activeElement" in js:
+                    return outer.focused_segment == label
                 if outer._committed_override is not None:
                     return outer._committed_override.get(label) or ""
                 return outer.typed_digits.get(label, "")
@@ -13911,16 +13923,15 @@ _CONFIRMED_GROUP_DERIVES_A_SIBLING_HTML = """
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_a_single_segment_write_never_takes_back_a_sibling_the_page_derived() -> None:
-    # Ownership is not "the write failed", it is "the segment took none of the keys". Widen it to the
-    # former and this restore erases a year the widget itself computed -- a value the run never entered
-    # and cannot recompute, which is worse than the failed write it was trying to clean up after.
+async def test_a_single_segment_write_puts_back_a_sibling_the_page_derived() -> None:
+    # A write to one segment holds every other segment to the value it had before the call, so the year the widget
+    # derived from a month that did not commit goes back to the year the caller had; the month write still fails.
     async with _content_page(_CONFIRMED_GROUP_DERIVES_A_SIBLING_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
         assert r.status == "error", r.content
         assert await page.eval_on_selector("#month", "el => el.value") == "12"
-        assert await page.eval_on_selector("#year", "el => el.value") == "2030"
+        assert await page.eval_on_selector("#year", "el => el.value") == "1999"
 
 
 # The segment takes the keys AND the widget writes a sibling off the back of them. The write is a
@@ -13947,17 +13958,15 @@ _CONFIRMED_GROUP_MOVES_A_SIBLING_ON_SUCCESS_HTML = """
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_a_successful_single_segment_write_reports_a_sibling_that_moved() -> None:
-    # The evidence is already paid for; dropping it hands back a clean success on a group that no
-    # longer holds the date the caller thinks it does. Reporting is not adjudicating: the status
-    # stays ok, because turning a landed write into an error is the failure this path exists to stop.
+async def test_a_successful_single_segment_write_puts_back_a_sibling_that_moved() -> None:
+    # A sibling the write moved is restored to its value from before the call, and the ok says so, since the page
+    # may have meant the change.
     async with _content_page(_CONFIRMED_GROUP_MOVES_A_SIBLING_ON_SUCCESS_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
-        assert r.status == "ok", r.content
-        assert "other field(s)" in r.content
+        assert r.status == "ok" and "the year 2030 -> 1999" in r.content, r.content
         assert await page.eval_on_selector("#month", "el => el.value") == "09"
-        assert await page.eval_on_selector("#year", "el => el.value") == "2030"
+        assert await page.eval_on_selector("#year", "el => el.value") == "1999"
 
 
 # The same success, but the widget derives the sibling on BLUR -- which the segment path fires
@@ -13984,17 +13993,510 @@ _CONFIRMED_GROUP_MOVES_A_SIBLING_ON_BLUR_HTML = """
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_a_successful_single_segment_write_reports_a_sibling_derived_on_blur() -> None:
-    # The restore decision has to read the siblings next to the keystrokes, or it cannot attribute
-    # them -- so the REPORT cannot come from that same read, because this path blurs the segment
-    # afterwards and a widget is entitled to rewrite another component on exactly that event.
+async def test_a_successful_single_segment_write_puts_back_a_sibling_derived_on_commit() -> None:
+    # The widget rewrites the sibling only when focus leaves the segment, so the restore must read after the commit.
     async with _content_page(_CONFIRMED_GROUP_MOVES_A_SIBLING_ON_BLUR_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
         assert r.status == "ok", r.content
-        assert "other field(s)" in r.content
         assert await page.eval_on_selector("#month", "el => el.value") == "09"
-        assert await page.eval_on_selector("#year", "el => el.value") == "2030"
+        assert await page.eval_on_selector("#year", "el => el.value") == "1999"
+
+
+# A month/day/year group whose year's first key also lands in the month and the day.
+_CONFIRMED_GROUP_YEAR_FIRST_KEY_MOVES_MONTH_AND_DAY_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="03" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="07" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" style="width:60px">
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("keydown", (e) => {
+    if (year.value || !/^[0-9]$/.test(e.key)) return;
+    document.getElementById("month").value = e.key;
+    document.getElementById("day").value = e.key;
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_single_segment_year_write_restores_the_segments_its_first_key_moved() -> None:
+    async with _content_page(_CONFIRMED_GROUP_YEAR_FIRST_KEY_MOVES_MONTH_AND_DAY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        values = [await page.eval_on_selector(f"#{s}", "el => el.value") for s in ("month", "day", "year")]
+        assert values == ["03", "07", "2023"]
+
+
+# A month/day/year widget where the first key after focus enters a segment also lands in every earlier segment,
+# Backspace included. Writing the year of a February date leaves the month equal to the bled digit.
+_FIRST_KEY_REACHES_EARLIER_SEGMENTS_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="02" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="14" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" style="width:60px">
+</div>
+<script>
+  const ids = ["month", "day", "year"];
+  ids.forEach((id, i) => {
+    const el = document.getElementById(id);
+    let fresh = false;
+    el.addEventListener("focus", () => { fresh = true; });
+    el.addEventListener("keydown", (e) => {
+      if (!fresh) return;
+      fresh = false;
+      for (const earlier of ids.slice(0, i).map((x) => document.getElementById(x))) {
+        if (e.key === "Backspace") earlier.value = earlier.value.slice(0, -1);
+        else if (/^[0-9]$/.test(e.key)) earlier.value = e.key;
+      }
+    });
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_year_write_converges_when_putting_back_the_day_moves_the_month() -> None:
+    # The month reads unchanged after the year's bleed, and only the day's restore moves it, so each segment is read
+    # again just before deciding whether to restore it.
+    async with _content_page(_FIRST_KEY_REACHES_EARLIER_SEGMENTS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        values = [await page.eval_on_selector(f"#{s}", "el => el.value") for s in ("month", "day", "year")]
+        assert values == ["02", "14", "2023"]
+
+
+# A widget that clamps the day to the end of the month it holds and auto-advances a full segment to the next one.
+# With window.BLEED set, that many year keys go to the month instead (and re-clamp the day).
+def _clamping_group(month: str, day: str, year: str, extra: str = "") -> str:
+    return (
+        f"""
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="{month}" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="{day}" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="{year}" style="width:60px">
+</div>
+<input id="other" type="text" value="">
+{extra}
+"""
+        + """
+<script>
+  const $ = (id) => document.getElementById(id);
+  const dim = () => new Date(Number($("year").value) || 2024, Number($("month").value) || 1, 0).getDate();
+  const nextOf = { month: "day", day: "year", year: null };
+  let entered = "";
+  window.BLEED = window.BLEED || 0;
+  for (const id of ["month", "day", "year"]) {
+    const el = $(id);
+    el.addEventListener("focus", () => { entered = ""; });
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Backspace") { e.preventDefault(); el.value = el.value.slice(0, -1); entered = el.value; return; }
+      if (!/^[0-9]$/.test(e.key)) return;
+      e.preventDefault();
+      window.__keys = (window.__keys || []).concat(id);
+      if (id === "year" && window.BLEED > 0) {
+        window.BLEED--;
+        $("month").value = e.key;
+        if (Number($("day").value) > dim()) $("day").value = String(dim());
+        return;
+      }
+      const max = id === "month" ? 12 : id === "day" ? dim() : 9999;
+      let v = entered + e.key;
+      if (Number(v) > max) v = e.key;
+      entered = v;
+      el.value = v;
+      if (id !== "day" && Number($("day").value) > dim()) $("day").value = String(dim());
+      const full = id === "year" ? v.length >= 4 : (Number(v + "0") > max || v.length >= 2);
+      if (full && nextOf[id]) $(nextOf[id]).focus();
+    });
+  }
+</script>
+"""
+    )
+
+
+async def _date_values(page: Any) -> list[str]:
+    return [await page.eval_on_selector(f"#{s}", "el => el.value") for s in ("month", "day", "year", "other")]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_month_write_keeps_the_day_the_page_clamped_and_leaves_the_year_alone() -> None:
+    # 31 does not exist in February, so the page clamping the day is right; typing 31 back would auto-advance its
+    # second key into the year.
+    async with _content_page(_clamping_group("01", "31", "2024")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "02"})
+        assert r.status == "ok", r.content
+        assert await _date_values(page) == ["02", "29", "2024", ""]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_year_write_puts_the_month_back_before_the_day_it_clamped() -> None:
+    # The year's first key lands in the month and the page clamps the day to that month. Restoring the day first would
+    # be clamped again, and its second key would auto-advance into the year just written.
+    async with _content_page(_clamping_group("01", "31", "2024")) as page:
+        await page.evaluate("() => { window.BLEED = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        assert await _date_values(page) == ["01", "31", "2023", ""]
+        keys = await page.evaluate("() => window.__keys")
+        assert [k for k in keys if k != "year"] == ["month"] * 2 + ["day"] * 2
+        assert keys.index("month") > max(i for i, k in enumerate(keys) if k == "year")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("siblings", [("year",), ("day", "year")], ids=["month_year", "month_day_year"])
+async def test_an_impossible_month_is_never_confirmed(siblings: tuple[str, ...]) -> None:
+    # A day/month flip types "13" into a lenient month input; the date cannot be right, so it must not read as ok.
+    values = {"day": "15", "year": "2024"}
+    segments = "".join(
+        f'<input id="{label}" type="text" role="spinbutton" aria-label="{label.title()}" value="{values.get(label, "03")}"'
+        ' style="width:60px">'
+        for label in ("month", *siblings)
+    )
+    html = f'<div role="group" aria-label="Start" style="display:flex;width:300px;height:30px">{segments}</div>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "13"})
+    assert r.status == "error" and r.error_class == "date_sibling_unverified", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("siblings", [("month",), ("month", "day")], ids=["month_year", "month_day_year"])
+async def test_a_sibling_that_cannot_be_read_before_the_write_leaves_the_date_unverified(
+    siblings: tuple[str, ...],
+) -> None:
+    # The page strips the tag from the month as soon as it is set, so the siblings cannot be read before the write;
+    # the date must not then be confirmed by default.
+    segments = "".join(
+        f'<input id="{label}" type="text" role="spinbutton" aria-label="{label.title()}" value="{value}"'
+        ' style="width:60px">'
+        for label, value in [*((s, "03") for s in siblings), ("year", "2024")]
+    )
+    html = (
+        f'<div role="group" aria-label="Start" style="display:flex;width:300px;height:30px">{segments}</div>'
+        "<script>new MutationObserver(() => document.getElementById('month').removeAttribute('data-tv3-dateseg'))"
+        ".observe(document.getElementById('month'), {attributes: true, attributeFilter: ['data-tv3-dateseg']});"
+        "</script>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+    assert r.status == "error" and r.error_class == "date_sibling_unverified", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_restore_stops_when_a_segment_cannot_be_read_and_types_nowhere_else() -> None:
+    # The page marks the day read-only for a moment after the commit, so the group cannot be re-found; a restore that
+    # carried on would send its keys to whatever field the Tab focused.
+    readonly = (
+        "<script>let outs = 0; document.querySelector('[role=group]').addEventListener('focusout', () => {"
+        " outs++; if (outs === 2) { $('day').setAttribute('aria-readonly', 'true');"
+        " setTimeout(() => $('day').removeAttribute('aria-readonly'), 1500); } });</script>"
+    )
+    async with _content_page(_clamping_group("01", "31", "2024", readonly)) as page:
+        await page.evaluate("() => { window.BLEED = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "error" and r.error_class == "date_sibling_unverified", r.content
+        # The month is put back before the read fails; after that nothing is typed: not the day, not the field the
+        # Tab focused.
+        assert "day" not in await page.evaluate("() => window.__keys")
+        values = await _date_values(page)
+        assert values[0] == "01" and values[2:] == ["2023", ""], values
+
+
+# Each segment is a focusable span that hands focus to one hidden input inside the group, which takes the keys and
+# writes them into the span it came from.
+_FOCUS_REDIRECT_GROUP_HTML = """
+<div role="group" aria-label="Date" style="display:flex;gap:8px;font:16px monospace">
+  <span id="month" role="spinbutton" aria-label="Month" tabindex="0" style="width:40px;display:inline-block">01</span>
+  <span id="day" role="spinbutton" aria-label="Day" tabindex="0" style="width:40px;display:inline-block">15</span>
+  <span id="year" role="spinbutton" aria-label="Year" tabindex="0" style="width:60px;display:inline-block">2024</span>
+  <input id="sink" style="position:absolute;left:-9999px">
+</div>
+<script>
+  const sink = document.getElementById("sink");
+  let cur = null;
+  for (const id of ["month", "day", "year"]) {
+    const el = document.getElementById(id);
+    el.addEventListener("focus", () => { cur = el; sink.focus(); });
+  }
+  sink.addEventListener("keydown", (e) => {
+    if (!cur) return;
+    if (e.key === "Backspace") { e.preventDefault(); cur.textContent = cur.textContent.slice(0, -1); return; }
+    if (/^[0-9]$/.test(e.key)) { e.preventDefault(); cur.textContent += e.key; }
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_segment_whose_widget_moves_focus_to_its_own_input_is_still_written() -> None:
+    async with _content_page(_FOCUS_REDIRECT_GROUP_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        texts = [await page.eval_on_selector(f"#{s}", "el => el.textContent") for s in ("month", "day", "year")]
+        assert texts == ["01", "15", "2023"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_restore_that_moves_the_written_segment_is_never_ok() -> None:
+    # The month write makes the page derive the year; putting the year back sends its first key into the month.
+    html = _CONFIRMED_GROUP_MOVES_A_SIBLING_ON_SUCCESS_HTML.replace(
+        "</script>",
+        'const yr = document.getElementById("year"); let fresh = false;'
+        ' yr.addEventListener("focus", () => { fresh = true; });'
+        ' yr.addEventListener("keydown", (e) => { if (fresh && /^[0-9]$/.test(e.key)) month.value = e.key;'
+        " fresh = false; });</script>",
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
+        month = await page.eval_on_selector("#month", "el => el.value")
+        assert r.status == "error" or month == "09", (r.content, month)
+
+
+# A month/year group with ordinary clickable segments, whose year's first key also lands in the month.
+_CLICKABLE_MONTH_YEAR_BLEED_HTML = """
+<div role="group" aria-label="Expiry" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="03" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" style="width:60px">
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("keydown", (e) => {
+    if (year.value || !/^[0-9]$/.test(e.key)) return;
+    document.getElementById("month").value = e.key;
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_day_clamped_against_a_passing_year_is_put_back() -> None:
+    # The month write briefly derives a 2023 year, which clamps 29 February to 28; once the year is restored to 2024
+    # the 29th is a valid day again and must be put back, not kept as a clamp.
+    html = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="01" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="29" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="2024" style="width:60px">
+</div>
+<script>
+  const [m, d, y] = ["month", "day", "year"].map((id) => document.getElementById(id));
+  const clamp = () => {
+    const last = new Date(Number(y.value) || 2000, Number(m.value) || 1, 0).getDate();
+    if (Number(d.value) > last) d.value = String(last);
+  };
+  m.addEventListener("input", () => { if (m.value.length === 2) y.value = "2023"; clamp(); });
+  y.addEventListener("input", clamp);
+</script>
+"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "02"})
+        day = await page.eval_on_selector("#day", "el => el.value")
+    assert r.status == "error" or day == "29", (r.content, day)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_restore_that_lands_in_the_written_year_is_never_ok() -> None:
+    # Putting the month back sends a key into the year just written, so the year no longer holds what was typed.
+    html = _CLICKABLE_MONTH_YEAR_BLEED_HTML.replace(
+        "</script>",
+        'document.getElementById("month").addEventListener("keydown", (e) => {'
+        ' if (/^[0-9]$/.test(e.key)) document.getElementById("year").value = "2099"; });</script>',
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        year = await page.eval_on_selector("#year", "el => el.value")
+    assert r.status == "error" and r.error_class == "date_sibling_moved" and "year" in r.content, (r.content, year)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_blank_month_that_keeps_a_bled_digit_is_never_ok() -> None:
+    # The month starts blank, takes the year's first key, and refuses the clear that would empty it again.
+    html = _CLICKABLE_MONTH_YEAR_BLEED_HTML.replace(' value="03"', "").replace(
+        "</script>",
+        'document.getElementById("month").addEventListener("keydown", (e) => {'
+        ' if (e.key === "Backspace" || e.key === "Delete") e.preventDefault(); });</script>',
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        month = await page.eval_on_selector("#month", "el => el.value")
+    assert r.status == "error" or month == "", (r.content, month)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_retry_after_an_unverified_write_is_judged_against_the_month_before_it() -> None:
+    # The first write bleeds into the month and the group is unreadable while the month is briefly read-only, so it
+    # ends unverified; the retry, once the month is writable, must not take the bled month as its reference.
+    html = _CLICKABLE_MONTH_YEAR_BLEED_HTML.replace(
+        "</script>",
+        "let outs = 0; document.querySelector('[role=group]').addEventListener('focusout', () => {"
+        " if (++outs === 1) { const m = document.getElementById('month'); m.setAttribute('aria-readonly', 'true');"
+        " setTimeout(() => m.removeAttribute('aria-readonly'), 1500); } });</script>",
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        first = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        await page.wait_for_timeout(1600)
+        await page.evaluate("() => { document.getElementById('year').value = ''; }")
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        month = await page.eval_on_selector("#month", "el => el.value")
+    assert first.status == "error", first.content
+    assert r.status == "error" or month == "03", (r.content, month)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_put_back_ok_still_reports_another_field_the_keys_changed() -> None:
+    # Focus-reached segments: the year's first key lands in the month (put back) and also rewrites a note field.
+    html = """
+<div role="group" aria-label="Start" style="position:absolute;left:-500px;top:0;display:flex">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="03" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" style="width:60px">
+  <input id="note" type="text" aria-label="Note" value="keep" style="width:60px">
+</div>
+<script>
+  const year = document.getElementById("year");
+  year.addEventListener("keydown", (e) => {
+    if (year.value || !/^[0-9]$/.test(e.key)) return;
+    document.getElementById("month").value = e.key;
+    document.getElementById("note").value = "moved";
+  });
+</script>
+"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+    assert r.status != "ok" or "other field(s)" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_put_back_names_what_the_segment_holds_not_the_target() -> None:
+    # The widget refills a blank month with its default whenever it is left empty, so a put-back to empty ends at 01.
+    html = _CLICKABLE_MONTH_YEAR_BLEED_HTML.replace(' value="03"', "").replace(
+        "</script>",
+        'const mo = document.getElementById("month");'
+        ' mo.addEventListener("blur", () => { if (!mo.value) mo.value = "01"; });</script>',
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        month = await page.eval_on_selector("#month", "el => el.value")
+    assert r.status != "ok" or ("-> empty" not in r.content and "month changed to 1" in r.content), (r.content, month)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_blank_sibling_moved_again_by_a_later_restore_is_never_ok() -> None:
+    # Writing the day bleeds into the blank month; emptying the month corrupts the year, and putting the year back
+    # sends a key into the month again after it was already emptied.
+    html = """
+<div role="group" aria-label="Start" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="15" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="2024" style="width:60px">
+</div>
+<script>
+  const [m, d, y] = ["month", "day", "year"].map((id) => document.getElementById(id));
+  let bled = false;
+  d.addEventListener("keydown", (e) => { if (!bled && /^[0-9]$/.test(e.key)) { bled = true; m.value = e.key; } });
+  m.addEventListener("keydown", (e) => { if (e.key === "Backspace") y.value = "1999"; });
+  y.addEventListener("keydown", (e) => { if (/^[0-9]$/.test(e.key)) m.value = "7"; });
+</script>
+"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#day", "text": "20"})
+        month = await page.eval_on_selector("#month", "el => el.value")
+    assert r.status != "ok" or month == "", (r.content, month)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_day_write_that_did_not_commit_restores_the_note_its_keys_reached() -> None:
+    # The day refuses the keys and the widget hands them to a note field inside the same group.
+    html = """
+<div role="group" aria-label="Start" style="display:flex;width:400px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="01" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="15" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="2024" style="width:60px">
+  <input id="note" type="text" aria-label="Note" value="keep" style="width:60px">
+</div>
+<script>
+  const note = document.getElementById("note");
+  document.getElementById("day").addEventListener("keydown", (e) => {
+    if (!/^[0-9]$/.test(e.key)) return;
+    e.preventDefault();
+    note.value += e.key;
+  });
+</script>
+"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#day", "text": "20"})
+        note = await page.eval_on_selector("#note", "el => el.value")
+    assert r.status == "error", r.content
+    assert note == "keep" or "still hold keys" in r.content, (r.content, note)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day_after", ["31", "", "1"], ids=["left", "cleared", "reset_to_1"])
+async def test_a_day_the_widget_did_not_clamp_to_the_last_day_is_never_ok(day_after: str) -> None:
+    html = f"""
+<div role="group" aria-label="Start" style="display:flex;width:300px;height:30px">
+  <input id="month" type="text" role="spinbutton" aria-label="Month" value="01" style="width:40px">
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="31" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="2024" style="width:60px">
+</div>
+<script>
+  const m = document.getElementById("month");
+  m.addEventListener("input", () => {{ if (m.value.length === 2) document.getElementById("day").value = "{day_after}"; }});
+</script>
+"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "02"})
+        day = await page.eval_on_selector("#day", "el => el.value")
+    assert r.status != "ok" or day == "29", (r.content, day)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_retried_year_on_a_clickable_month_year_group_is_never_ok_on_a_wrong_month() -> None:
+    async with _content_page(_CLICKABLE_MONTH_YEAR_BLEED_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for _ in range(2):
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            month = await page.eval_on_selector("#month", "el => el.value")
+            assert r.status == "error" or month == "03", (r.content, month)
+        assert month == "03"
 
 
 # The group is declared on a custom element HOST and the segments live in its open shadow root, so
@@ -14439,8 +14941,121 @@ async def test_type_never_reports_a_clean_fill_when_a_sibling_segment_took_a_key
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
         assert r.status == "ok", r.content
-        assert "1 other field(s) in the same group changed" in r.content, r.content
-        assert await page.eval_on_selector("#month", "el => el.value") == "2"
+        assert await page.eval_on_selector("#month", "el => el.value") == "03"
+
+
+# The month/year widget whose month takes the year's first digit only when the year commits on blur, so a
+# sibling read taken before the commit Tab sees nothing move.
+_SEGMENTED_DATE_BLEED_ON_COMMIT_HTML = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+    "window.__committedYear = year.value;",
+    'window.__committedYear = year.value; document.getElementById("month").value = year.value[0];',
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_restores_a_month_the_commit_tab_moved() -> None:
+    async with _content_page(_SEGMENTED_DATE_BLEED_ON_COMMIT_HTML) as page:
+        await page.eval_on_selector("#month", "el => { el.value = '03'; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "03"
+        assert await page.evaluate("() => window.__committedYear") == "2023"
+
+
+# The same widget, but its month refuses typed digits, so the tool cannot put it back.
+_SEGMENTED_DATE_BLEED_ON_COMMIT_UNRESTORABLE_HTML = _SEGMENTED_DATE_BLEED_ON_COMMIT_HTML + (
+    '<script>document.getElementById("month").addEventListener("keydown", (e) => {'
+    " if (/^[0-9]$/.test(e.key)) e.preventDefault(); });</script>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_never_passes_a_retried_year_on_the_month_an_earlier_call_could_not_restore() -> None:
+    # The retry finds the month already holding the bled digit and writes the same digit again, so only the value the
+    # first call recorded can tell that the month is wrong.
+    async with _content_page(_SEGMENTED_DATE_BLEED_ON_COMMIT_UNRESTORABLE_HTML) as page:
+        await page.eval_on_selector("#month", "el => { el.value = '03'; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for _ in range(2):
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            assert r.status == "error" and r.error_class == "date_sibling_moved", r.content
+            assert "re-type the month" in r.content, r.content
+
+
+# A widget that fills an empty month with a default on the year's first key, and again whenever the month is left
+# empty: the restore to empty cannot hold, and must not loop.
+_SEGMENTED_DATE_DEFAULTS_HTML = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+    "year.value += e.key;",
+    'const m = document.getElementById("month"); if (!m.value) m.value = "01"; year.value += e.key;',
+) + (
+    '<script>const mo = document.getElementById("month");'
+    ' mo.addEventListener("blur", () => { if (!mo.value) mo.value = "01"; });</script>'
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_keeps_a_month_the_widget_defaults_without_looping() -> None:
+    async with _content_page(_SEGMENTED_DATE_DEFAULTS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for _ in range(2):
+            r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+            assert r.status == "ok", r.content
+            assert await page.eval_on_selector("#month", "el => el.value") == "01"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_errors_when_the_other_date_segment_cannot_be_read_back() -> None:
+    html = _SEGMENTED_DATE_COMMIT_ON_BLUR_HTML.replace(
+        "window.__committedYear = year.value;",
+        'window.__committedYear = year.value; document.getElementById("month").remove();',
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "error" and r.error_class == "date_sibling_unverified", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_year_that_leaves_its_month_alone_stays_ok() -> None:
+    async with _content_page(_SEGMENTED_DATE_COMMIT_ON_BLUR_HTML) as page:
+        await page.eval_on_selector("#month", "el => { el.value = '03'; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
+        assert r.status == "ok" and "other field" not in r.content, r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "03"
+
+
+# A postal code that fills its city when it commits: a field of the same group moving after the Tab is not a date.
+_POSTAL_CODE_FILLS_CITY_HTML = """
+<div role="group" aria-label="Address" style="display:flex;width:300px;height:30px">
+  <div style="position:relative;width:80px;height:30px">
+    <input id="zip" type="text" aria-label="ZIP"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">ZIP</div>
+  </div>
+  <input id="city" type="text" aria-label="City" style="width:120px">
+</div>
+<script>
+  const zip = document.getElementById("zip");
+  zip.addEventListener("blur", () => { if (zip.value.length === 5) document.getElementById("city").value = "Northfield"; });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_field_whose_commit_fills_a_non_date_neighbour_stays_ok() -> None:
+    async with _content_page(_POSTAL_CODE_FILLS_CITY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#zip", "text": "12345"})
+        assert r.status == "ok" and r.content.splitlines()[0] == "typed into #zip", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Northfield"
 
 
 _COMMIT_ON_BLUR = 'year.addEventListener("blur", () => { window.__committedYear = year.value; });'
