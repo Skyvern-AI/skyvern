@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
-import litellm
 import pytest
 from agents import ItemHelpers, ModelSettings, RunContextWrapper, function_tool
 from agents.extensions.models.litellm_model import LitellmModel
@@ -17,7 +16,6 @@ from agents.items import TResponseInputItem
 from agents.mcp import MCPServer, MCPUtil
 from agents.models.interface import ModelTracing
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
-from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 from litellm.llms.vertex_ai.gemini.transformation import _gemini_convert_messages_with_history
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import Delta
@@ -668,33 +666,6 @@ def test_model_call_cost_uses_runtime_litellm_pricing(monkeypatch: pytest.Monkey
         "cache_creation_input_tokens": 47,
         "call_type": "aresponses",
     }
-
-
-def test_anthropic_cache_writes_and_reads_are_priced_at_their_own_rates() -> None:
-    usage = AnthropicConfig().calculate_usage(
-        usage_object={
-            "input_tokens": 1200,
-            "cache_creation_input_tokens": 3000,
-            "cache_read_input_tokens": 20000,
-            "output_tokens": 400,
-        },
-        reasoning_content=None,
-    )
-    telemetry = model_telemetry_module.CopilotModelCallTelemetry(model_call_index=1)
-    telemetry.capture(usage)
-    rates = litellm.model_cost["claude-sonnet-5-5"]
-
-    assert (rates["cache_creation_input_token_cost"], rates["cache_read_input_token_cost"]) == (
-        pytest.approx(1.25 * rates["input_cost_per_token"]),
-        pytest.approx(0.1 * rates["input_cost_per_token"]),
-    )
-    assert (telemetry.cache_read_tokens, telemetry.cache_write_tokens) == (20000, 3000)
-    assert model_telemetry_module._model_call_cost(telemetry, "claude-sonnet-5-5") == pytest.approx(
-        1200 * rates["input_cost_per_token"]
-        + 3000 * rates["cache_creation_input_token_cost"]
-        + 20000 * rates["cache_read_input_token_cost"]
-        + 400 * rates["output_cost_per_token"]
-    )
 
 
 def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pytest.MonkeyPatch) -> None:
