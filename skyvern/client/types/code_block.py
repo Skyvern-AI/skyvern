@@ -33,7 +33,10 @@ class CodeBlock(UniversalBaseModel):
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
     prompt: typing.Optional[str] = None
     steps: typing.Optional[typing.List[CodeBlockStep]] = None
-    data_schema: typing.Optional[CodeBlockDataSchema] = None
+    data_schema: typing.Optional[CodeBlockDataSchema] = pydantic.Field(default=None)
+    """
+    JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing
+    """
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

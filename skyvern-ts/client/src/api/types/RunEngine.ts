@@ -3,6 +3,7 @@
 export const RunEngine = {
     Skyvern10: "skyvern-1.0",
     Skyvern20: "skyvern-2.0",
+    Skyvern30: "skyvern-3.0",
     OpenaiCua: "openai-cua",
     AnthropicCua: "anthropic-cua",
     UiTars: "ui-tars",

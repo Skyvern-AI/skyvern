@@ -10150,6 +10150,17 @@
               }
             ],
             "title": "Single Option Click"
+          },
+          "desired_state": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired State"
           }
         },
         "type": "object",
@@ -11117,6 +11128,18 @@
             "title": "Rotate Proxy Session Id",
             "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
             "default": false
+          },
+          "tested_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tested Url",
+            "description": "Login page URL used during the credential test"
           }
         },
         "type": "object",
@@ -20546,6 +20569,52 @@
             "type": "array",
             "title": "File Attachments",
             "default": []
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           }
         },
         "type": "object",
@@ -20658,6 +20727,52 @@
               }
             ],
             "title": "Smtp Password Secret Parameter Key"
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           },
           "sender": {
             "type": "string",
