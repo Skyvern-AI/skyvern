@@ -2,7 +2,7 @@ import { artifactApiBaseUrl } from "@/util/env";
 
 function resolveRecordingUrl(url: string): string {
   if (url.startsWith("file://")) {
-    return `${artifactApiBaseUrl}/artifact/recording?path=${url.slice(7)}`;
+    return `${artifactApiBaseUrl}/artifact/recording?path=${encodeURIComponent(url.slice(7))}`;
   }
   return url;
 }
