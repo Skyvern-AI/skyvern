@@ -1,0 +1,24 @@
+[project]
+name = "skyvern-humanpages"
+version = "0.1.0"
+description = "Human Pages integration for Skyvern — human fallback for blocked browser tasks"
+authors = [{ name = "Human Pages", email = "github@humanpages.ai" }]
+requires-python = ">=3.11,<3.14"
+readme = "README.md"
+
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["skyvern_humanpages"]
+
+[tool.hatch.build.targets.wheel]
+include = ["skyvern_humanpages"]
