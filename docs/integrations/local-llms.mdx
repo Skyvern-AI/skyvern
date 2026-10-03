@@ -104,6 +104,21 @@ curl -s http://localhost:4000/v1/models \
 
 ---
 
+## Custom endpoints in Settings
+
+You can also add an **OpenAI compatible** model in Settings → Custom LLMs by
+entering its model ID and API base URL. Leave **API Key** blank if your endpoint
+does not require one. Skyvern does not add a Bearer authorization header or use
+its server's OpenAI API key for that configuration. You can still supply explicit
+headers through `extra_headers` in advanced parameters.
+
+Local and private endpoints require a self-hosted installation that allows local
+custom LLM API bases. Services that require per-request payment signatures, such
+as paid BlockRun endpoints, need a compatible gateway or a separate integration;
+leaving the API key blank does not implement their payment protocol.
+
+---
+
 ## Step 4: Start Skyvern
 
 After configuring your `.env`, start the server:
