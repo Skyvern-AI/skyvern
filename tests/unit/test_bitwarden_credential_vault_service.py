@@ -425,3 +425,39 @@ async def test_update_credential_enqueues_orphan_when_cancelled_inline_cleanup_f
         item_id="item_new",
         vault_type=CredentialVaultType.BITWARDEN,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "message"),
+    [
+        pytest.param(RuntimeError, "database unavailable", id="exception"),
+        pytest.param(asyncio.CancelledError, "create cancelled", id="cancelled"),
+    ],
+)
+async def test_create_credential_reclaims_new_item_when_db_create_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+    message: str,
+) -> None:
+    service = BitwardenCredentialVaultService()
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_organization_bitwarden_collection",
+        AsyncMock(return_value=SimpleNamespace(collection_id="collection_test")),
+    )
+    create_item = AsyncMock(return_value="item_new")
+    monkeypatch.setattr(service_module.BitwardenService, "create_credential_item", create_item)
+    delete_item = AsyncMock()
+    monkeypatch.setattr(service_module.BitwardenService, "delete_credential_item", delete_item)
+    monkeypatch.setattr(service, "_create_db_credential", AsyncMock(side_effect=failure_type(message)))
+
+    with pytest.raises(failure_type):
+        await service.create_credential(
+            organization_id="org_test",
+            data=_password_request(),
+            created_by="user_test",
+        )
+
+    create_item.assert_awaited_once()
+    delete_item.assert_awaited_with("item_new")

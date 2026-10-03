@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import cast
@@ -16,6 +17,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialVaultType,
     CreditCardBillingAddress,
     CreditCardCredential,
+    NonEmptyPasswordCredential,
     PasswordCredential,
     SecretCredential,
     TotpType,
@@ -391,3 +393,34 @@ class TestRealSecretManagerClient:
         c = RealAsyncGcpSecretManagerClient(client=mock_client)
 
         await c.delete_secret("sid", "proj")  # must not raise
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "message"),
+    [
+        pytest.param(RuntimeError, "database unavailable", id="exception"),
+        pytest.param(asyncio.CancelledError, "create cancelled", id="cancelled"),
+    ],
+)
+async def test_create_credential_reclaims_new_secret_when_db_create_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+    message: str,
+) -> None:
+    svc, client = _service()
+    client.delete_secret = AsyncMock()
+    monkeypatch.setattr(svc, "_create_gcp_secret_item", AsyncMock(return_value="item_new"))
+    monkeypatch.setattr(svc, "_create_db_credential", AsyncMock(side_effect=failure_type(message)))
+
+    with pytest.raises(failure_type):
+        await svc.create_credential(
+            organization_id=TEST_ORG,
+            data=CreateCredentialRequest(
+                name="Login",
+                credential_type=CredentialType.PASSWORD,
+                credential=NonEmptyPasswordCredential(username="user_test", password="secret_test"),
+            ),
+        )
+
+    client.delete_secret.assert_awaited_with(secret_id="item_new", project_id=TEST_PROJECT)
