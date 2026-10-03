@@ -247,6 +247,7 @@ from skyvern.utils.secret_redaction import (
     redact_har_bytes,
     redact_secrets_from_text,
 )
+from skyvern.utils.stall_watch import log_if_stalled
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
@@ -330,6 +331,11 @@ EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
 _CLAIMED_DOWNLOAD_GRACE_POLL_SECONDS = 1.0
 _V3_BLANK_PAGE_SETTLE_POLLS = 8
 _V3_BLANK_PAGE_SETTLE_POLL_SECONDS = 0.25
+
+# Healthy steps finish well inside 20 minutes, so a step still running after that is logged with where it is
+# waiting, then again every 30 minutes.
+STEP_STALL_LOG_FIRST_AFTER_SECONDS = 20 * 60
+STEP_STALL_LOG_REPEAT_EVERY_SECONDS = 30 * 60
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -3902,19 +3908,27 @@ class ForgeAgent:
             if engine in [RunEngine.anthropic_cua, RunEngine.ui_tars, RunEngine.yutori_navigator] and llm_caller:
                 LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
 
-            step, detailed_output = await self.agent_step(
-                task,
-                step,
-                browser_state,
-                organization=organization,
-                task_block=task_block,
-                complete_verification=complete_verification,
-                engine=engine,
-                cua_response=cua_response,
-                llm_caller=llm_caller,
-                attempt_started_at=attempt_started_at,
-                list_files_before=list_files_before,
-            )
+            with log_if_stalled(
+                "Agent step still running",
+                first_after_seconds=STEP_STALL_LOG_FIRST_AFTER_SECONDS,
+                repeat_every_seconds=STEP_STALL_LOG_REPEAT_EVERY_SECONDS,
+                step_phase="agent_step",
+                step_id=step.step_id,
+                step_order=step.order,
+            ):
+                step, detailed_output = await self.agent_step(
+                    task,
+                    step,
+                    browser_state,
+                    organization=organization,
+                    task_block=task_block,
+                    complete_verification=complete_verification,
+                    engine=engine,
+                    cua_response=cua_response,
+                    llm_caller=llm_caller,
+                    attempt_started_at=attempt_started_at,
+                    list_files_before=list_files_before,
+                )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             # Shadow-only loop-stall observability; never raises, never terminates (see shadow.py).
@@ -4001,21 +4015,29 @@ class ForgeAgent:
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
                 # TODO (kerem): keep the task object uptodate at all times so that clean_up_task can just use it
-                (
-                    is_task_completed,
-                    maybe_last_step,
-                    maybe_next_step,
-                ) = await self.handle_completed_step(
-                    organization=organization,
-                    task=task,
-                    step=step,
-                    page=await browser_state.get_working_page(),
-                    task_block=task_block,
-                    browser_state=browser_state,
-                    scraped_page=detailed_output.scraped_page if detailed_output else None,
-                    engine=engine,
-                    complete_verification=complete_verification,
-                )
+                with log_if_stalled(
+                    "Agent step still running",
+                    first_after_seconds=STEP_STALL_LOG_FIRST_AFTER_SECONDS,
+                    repeat_every_seconds=STEP_STALL_LOG_REPEAT_EVERY_SECONDS,
+                    step_phase="handle_completed_step",
+                    step_id=step.step_id,
+                    step_order=step.order,
+                ):
+                    (
+                        is_task_completed,
+                        maybe_last_step,
+                        maybe_next_step,
+                    ) = await self.handle_completed_step(
+                        organization=organization,
+                        task=task,
+                        step=step,
+                        page=await browser_state.get_working_page(),
+                        task_block=task_block,
+                        browser_state=browser_state,
+                        scraped_page=detailed_output.scraped_page if detailed_output else None,
+                        engine=engine,
+                        complete_verification=complete_verification,
+                    )
                 # Flush here (after handle_completed_step) so that verification LLM artifacts
                 # from check_user_goal_complete/complete_verify are included in the same
                 # step archive as the rest of the step data.
