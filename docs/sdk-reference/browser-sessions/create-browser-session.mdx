@@ -35,6 +35,7 @@ console.log(session.browser_session_id); // pbs_abc123
 | `browser_type` | `PersistentBrowserType` | No | `None` | Browser type. Options: `"chrome"`, `"msedge"`. |
 | `browser_profile_id` | `str` | No | `None` | Load a browser profile (cookies, localStorage) into this session. ID starts with `bp_`. |
 | `generate_browser_profile` | `bool` | No | `False` | REST API only for now — not yet accepted by the SDK methods (see note below). Save the session's browser profile when it ends so it can be turned into a reusable [browser profile](/sdk-reference/browser-profiles/create-browser-profile). Sessions started with `browser_profile_id` always save theirs. |
+| `needs_live_view` | `bool` | No | `False` | Declare that a person will watch this session's browser live. Defaults to `False`, which suits unattended automation. Requests a capability (the session runs somewhere that can serve a live view stream) — it does not select where the session runs. The Skyvern app sets this because sessions opened in the UI are watched. |
 | `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
 
 <Note>
