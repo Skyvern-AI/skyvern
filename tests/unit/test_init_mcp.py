@@ -11,6 +11,7 @@ def test_setup_mcp_local_claude_code_uses_local_stdio(monkeypatch) -> None:
     answers = iter([True, False, False, False])
     calls: list[dict] = []
 
+    monkeypatch.setattr("skyvern.cli.setup_commands.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("skyvern.cli.mcp.Confirm.ask", lambda *args, **kwargs: next(answers))
     monkeypatch.setattr("skyvern.cli.mcp.setup_claude", lambda **kwargs: (_ for _ in ()).throw(AssertionError))
     monkeypatch.setattr("skyvern.cli.mcp.setup_cursor", lambda **kwargs: (_ for _ in ()).throw(AssertionError))
