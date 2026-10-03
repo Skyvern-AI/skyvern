@@ -178,7 +178,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
@@ -2847,7 +2847,7 @@ workflow_definition:
             captured["persisted_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]
             ctx.last_workflow_yaml = payload["workflow_yaml"]
-            ctx.last_workflow = SimpleNamespace(workflow_definition={"blocks": []})
+            ctx.last_workflow = SimpleNamespace(workflow_definition=WorkflowDefinition(parameters=[], blocks=[]))
             return {"ok": True, "data": {"block_count": 2}}
 
         async def fake_run_blocks(params, _ctx, **kwargs):
@@ -2857,7 +2857,11 @@ workflow_definition:
             return run_result
 
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
+        monkeypatch.setattr(
+            tools_module,
+            "_get_prior_workflow_definition",
+            AsyncMock(return_value=WorkflowDefinition(parameters=[], blocks=[])),
+        )
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
@@ -2904,7 +2908,9 @@ workflow_definition:
 """
         captured: dict[str, object] = {}
 
-        async def fake_update_workflow(payload, ctx, *, allow_missing_credentials=False, originating_call_id=None):
+        async def fake_update_workflow(
+            payload, ctx, *, allow_missing_credentials=False, originating_call_id=None, **_kwargs
+        ):
             captured["persisted_yaml"] = payload["workflow_yaml"]
             captured["allow_missing_credentials"] = allow_missing_credentials
             ctx.last_workflow_yaml = payload["workflow_yaml"]
@@ -2913,7 +2919,11 @@ workflow_definition:
 
         run_blocks = AsyncMock()
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
+        monkeypatch.setattr(
+            tools_module,
+            "_get_prior_workflow_definition",
+            AsyncMock(return_value=WorkflowDefinition(parameters=[], blocks=[])),
+        )
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", run_blocks)
         monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
@@ -3061,7 +3071,7 @@ workflow_definition:
             assert safe_load_no_dates(payload["workflow_yaml"]) == safe_load_no_dates(self._SAVED_WORKFLOW)
             ctx.workflow_yaml = self._SAVED_WORKFLOW
             ctx.last_workflow_yaml = self._SAVED_WORKFLOW
-            ctx.last_workflow = SimpleNamespace(workflow_definition={"blocks": []})
+            ctx.last_workflow = SimpleNamespace(workflow_definition=WorkflowDefinition(parameters=[], blocks=[]))
             return {"ok": True, "data": {"block_count": 1}, "_workflow": ctx.last_workflow}
 
         async def fake_run_blocks(_params, _ctx, **_kwargs):
@@ -3085,7 +3095,11 @@ workflow_definition:
 
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
-        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
+        monkeypatch.setattr(
+            tools_module,
+            "_get_prior_workflow_definition",
+            AsyncMock(return_value=WorkflowDefinition(parameters=[], blocks=[])),
+        )
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
@@ -5879,6 +5893,28 @@ class _CredentialWorkflow(BaseModel):
 
 class TestRunBlocksCredentialApproval:
     @staticmethod
+    def _typed_resume_workflow() -> Workflow:
+        from skyvern.forge.sdk.copilot.workflow_yaml import _copilot_definition_from_yaml
+
+        _, definition = _copilot_definition_from_yaml(
+            "title: Resume test\nworkflow_definition:\n  parameters: []\n  blocks:\n"
+            "    - block_type: navigation\n      label: login\n      url: https://example.test/\n      navigation_goal: Sign in\n",
+            "wf-1",
+        )
+        now = datetime.now(timezone.utc)
+        return Workflow(
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            organization_id="org-1",
+            title="Resume test",
+            version=1,
+            is_saved_task=False,
+            workflow_definition=definition,
+            created_at=now,
+            modified_at=now,
+        )
+
+    @staticmethod
     def _workflow(
         credential_id: str | None = None,
         *,
@@ -5940,7 +5976,7 @@ class TestRunBlocksCredentialApproval:
         from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 
-        workflow = self._workflow()
+        workflow = self._typed_resume_workflow()
         organization = Organization(
             organization_id="org-1",
             organization_name="org",
@@ -5957,7 +5993,9 @@ class TestRunBlocksCredentialApproval:
         async def never_mint(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("a fresh session was minted for a carried resume")
 
-        database.workflow_params = SimpleNamespace(get_workflow_output_parameters=AsyncMock(return_value=[]))
+        database.workflow_params = SimpleNamespace(
+            get_workflow_output_parameters=AsyncMock(return_value=[workflow.get_output_parameter("login")])
+        )
         from skyvern.services import workflow_service as workflow_service_module
 
         monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
@@ -5987,7 +6025,7 @@ class TestRunBlocksCredentialApproval:
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
         from skyvern.services import workflow_service as workflow_service_module
 
-        workflow = self._workflow()
+        workflow = self._typed_resume_workflow()
         organization = Organization(
             organization_id="org-1",
             organization_name="org",
@@ -5995,7 +6033,9 @@ class TestRunBlocksCredentialApproval:
             modified_at=datetime.now(timezone.utc),
         )
         database = self._db(workflow=workflow, organization_lookup=organization)
-        database.workflow_params = SimpleNamespace(get_workflow_output_parameters=AsyncMock(return_value=[]))
+        database.workflow_params = SimpleNamespace(
+            get_workflow_output_parameters=AsyncMock(return_value=[workflow.get_output_parameter("login")])
+        )
         dispatched: dict[str, object] = {}
 
         async def prepare_workflow(**kwargs: object) -> object:

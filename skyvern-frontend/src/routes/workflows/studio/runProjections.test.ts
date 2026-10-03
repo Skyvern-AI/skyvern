@@ -681,20 +681,20 @@ describe("formatRunTimesTooltip", () => {
     } as WorkflowRunStatusApiResponseWithWorkflow;
   }
 
-  test("lists created, queued, started, finished for a finalized run", () => {
+  test("lists queued, started, finished for a finalized run", () => {
     const title = formatRunTimesTooltip(run());
-    expect(title).toContain("Created");
+    expect(title).not.toContain("Created");
     expect(title).toContain("Queued");
     expect(title).toContain("Started");
     expect(title).toContain("Finished");
-    expect(title.split("\n")).toHaveLength(4);
+    expect(title.split("\n")).toHaveLength(3);
   });
 
   test("omits absent timestamps and holds Finished until the run finalizes", () => {
     const title = formatRunTimesTooltip(
       run({ status: Status.Running, queued_at: null, started_at: null }),
     );
-    expect(title).toContain("Created");
+    expect(title).not.toContain("Created");
     expect(title).not.toContain("Queued");
     expect(title).not.toContain("Started");
     // finished_at is present but the run is not finalized → still hidden.

@@ -8,6 +8,10 @@ import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import {
+  primaryButton,
+  secondaryButton,
+} from "@/routes/workflows/copilot/PendingGoalChangesCard";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
@@ -16,11 +20,17 @@ import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLi
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import {
+  codeEditedNoticeIsShown,
+  freshGoalSuggestion,
   goalChangeIsPending,
   goalChangeUndoPatch,
+  keepCodeWithGoalPatch,
 } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import {
+  goalActionIsLocked,
+  useCopilotActionStore,
+} from "@/store/useCopilotActionStore";
 import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
@@ -126,6 +136,24 @@ function CodeBlockEditorBody({
   const goalChangePending = goalChangeIsPending(data);
   const canEditGoalChange = editable && !scopeReadOnly && !mutationLocked;
   const undoPatch = goalChangeUndoPatch(data);
+  const keepCodePatch = keepCodeWithGoalPatch(data);
+  const codeEditedNotice = codeEditedNoticeIsShown(data);
+  const suggestedGoal = useCopilotActionStore((state) =>
+    freshGoalSuggestion(data, state.goalSuggestions[data.label]),
+  );
+  const suggestingGoal = useCopilotActionStore((state) =>
+    state.suggestingGoalLabels.includes(data.label),
+  );
+  const updateGoal = useCopilotActionStore((state) => state.updateGoal);
+  const keepGoal = useCopilotActionStore((state) => state.keepGoal);
+  const acceptGoal = useCopilotActionStore((state) => state.acceptGoal);
+  const canActOnCodeEdit = useCopilotActionStore(
+    (state) =>
+      !goalActionIsLocked(state, data.label, {
+        readOnly: !editable || scopeReadOnly,
+        mutationLocked,
+      }),
+  );
   const workflowStartNode = nodes
     .filter(isStartNode)
     .find((candidate) => "errorCodeMapping" in candidate.data);
@@ -262,6 +290,8 @@ function CodeBlockEditorBody({
         }
         update({
           code: value,
+          ...((data.prompt ?? "").trim().length > 0 &&
+            data.codeEditedByHand !== true && { codeEditedByHand: true }),
           ...(goalChangePending && {
             goalNeedsRegeneration: false,
             goalBeforeEdit: null,
@@ -469,7 +499,9 @@ function CodeBlockEditorBody({
       {isGenerating || isQueued ? null : (
         <>
           <p className="text-muted-foreground">
-            This block still does what its old Goal said.
+            {keepCodePatch
+              ? "The code was also edited by hand. Keep it if the new Goal describes it."
+              : "This block still does what its old Goal said."}
           </p>
           <div className="flex items-center gap-2">
             <button
@@ -486,6 +518,16 @@ function CodeBlockEditorBody({
             >
               Apply new Goal
             </button>
+            {keepCodePatch ? (
+              <button
+                type="button"
+                disabled={!canEditGoalChange}
+                onClick={() => update(keepCodePatch)}
+                className={cn("nodrag nopan", secondaryButton)}
+              >
+                Keep my code
+              </button>
+            ) : null}
             {undoPatch ? (
               <button
                 type="button"
@@ -502,6 +544,62 @@ function CodeBlockEditorBody({
     </div>
   ) : null;
 
+  const codeEditedBanner =
+    !goalChangePending && codeEditedNotice ? (
+      <div
+        role="status"
+        data-testid="goal-change-banner"
+        className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs"
+      >
+        <p className="font-medium text-foreground">
+          Code changed — Goal may be out of date
+        </p>
+        {suggestedGoal === null ? null : (
+          <>
+            <p className="text-muted-foreground">
+              <span aria-hidden="true">− </span>
+              <span className="sr-only">Old Goal: </span>
+              {data.prompt}
+            </p>
+            <p className="text-foreground">
+              <span aria-hidden="true">+ </span>
+              <span className="sr-only">Suggested Goal: </span>
+              {suggestedGoal}
+            </p>
+          </>
+        )}
+        <div className="flex items-center gap-2">
+          {suggestedGoal === null ? (
+            <button
+              type="button"
+              disabled={!canActOnCodeEdit || suggestingGoal}
+              onClick={() => updateGoal(data.label)}
+              className={cn("nodrag nopan", primaryButton)}
+            >
+              {suggestingGoal ? "Writing a Goal…" : "Update Goal"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={!canActOnCodeEdit}
+              onClick={() => acceptGoal(data.label)}
+              className={cn("nodrag nopan", primaryButton)}
+            >
+              Accept
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={!canActOnCodeEdit}
+            onClick={() => keepGoal(data.label)}
+            className={cn("nodrag nopan", secondaryButton)}
+          >
+            Keep Goal
+          </button>
+        </div>
+      </div>
+    ) : null;
+
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
       <div className="flex items-center justify-between gap-2">
@@ -511,6 +609,7 @@ function CodeBlockEditorBody({
       {goalChangeBanner}
       {view === "plain" ? (
         <>
+          {codeEditedBanner}
           {goalField}
           {dataSchemaField}
           <div
@@ -540,6 +639,7 @@ function CodeBlockEditorBody({
             </Label>
             {codeEditorElement}
           </div>
+          {codeEditedBanner}
           {errorCodeMappingField}
         </>
       )}

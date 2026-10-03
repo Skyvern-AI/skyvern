@@ -22,7 +22,6 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { RunEngineSelector } from "@/components/EngineSelector";
-import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -89,7 +88,6 @@ function LoginEditorBody({
   ];
   const { editable } = data;
   const update = useUpdate<LoginNodeData>({ id: blockId, editable });
-  const effectiveDefaultEngine = useEffectiveDefaultEngine();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
@@ -381,7 +379,6 @@ function LoginEditorBody({
                   </Label>
                 </div>
                 <RunEngineSelector
-                  effectiveDefaultEngine={effectiveDefaultEngine}
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"

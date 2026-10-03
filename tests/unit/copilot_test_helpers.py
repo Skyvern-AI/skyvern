@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from itertools import count
 from pathlib import Path
@@ -54,6 +54,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
@@ -66,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.self_heal import HealEpisode
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
@@ -161,7 +163,7 @@ def make_stub_html_artifact(
     created_at: datetime | None = None,
 ) -> SimpleNamespace:
     artifact = make_stub_artifact(artifact_id, f"{artifact_id}.html", file_size, artifact_type=artifact_type)
-    artifact.created_at = created_at or datetime(2026, 7, 9, tzinfo=timezone.utc)
+    artifact.created_at = created_at or datetime(2026, 7, 9, tzinfo=UTC)
     return artifact
 
 
@@ -207,11 +209,15 @@ _CHAT_SESSION_ID = "pbs_chat"
 _CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
 
 
-def _fake_workflow_run(status: str) -> SimpleNamespace:
-    return SimpleNamespace(
+def _fake_workflow_run(status: str) -> WorkflowRun:
+    return WorkflowRun(
+        workflow_run_id="wr_paused",
+        workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
         status=WorkflowRunStatus(status),
         created_at=datetime(2026, 4, 21, 11, 0, 0),
-        modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
+        modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC),
         trigger_type=None,
         browser_session_id=None,
         failure_reason=None,
@@ -259,11 +265,16 @@ def install_get_run_results_harness(
     other_runs: list[SimpleNamespace] | None = None,
     carried_successful_run_id: str | None = None,
     carried_run_id: str | None = None,
+    heal_episodes: list[HealEpisode] | None = None,
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
     pool = [harness_run("wr-1", status=run_status), *(other_runs or [])]
-    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=workflow_parameters or []))
+    workflow = SimpleNamespace(
+        created_by=None,
+        modified_at=HARNESS_RUN_CREATED_AT,
+        workflow_definition=SimpleNamespace(parameters=workflow_parameters or [], blocks=[]),
+    )
 
     async def get_workflow_run(workflow_run_id: str, organization_id: str | None = None) -> SimpleNamespace | None:
         return next(
@@ -308,6 +319,9 @@ def install_get_run_results_harness(
 
             class tasks:
                 get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
+
+            class self_heal:
+                get_heal_episodes_for_run = AsyncMock(return_value=list(heal_episodes or []))
 
         class AGENT_FUNCTION:
             should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=dispatch_to_worker)
@@ -400,7 +414,7 @@ async def install_run_blocks_harness(
         organization_id="org-1",
         workflow_yaml=workflow_yaml,
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     organization = Organization(
         organization_id="org-1",
         organization_name="Test Org",
@@ -419,6 +433,7 @@ async def install_run_blocks_harness(
     database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
     database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
+    database.workflow_runs.get_workflow_run_output_parameters = AsyncMock(return_value=[])
     database.workflow_runs.get_workflow_runs_for_workflow_permanent_id = AsyncMock(return_value=[])
     monkeypatch.setattr(forge_app, "DATABASE", database)
 
@@ -445,18 +460,31 @@ async def install_run_blocks_harness(
         MagicMock(return_value=False),
     )
 
-    workflow_run = SimpleNamespace(
+    workflow_run = WorkflowRun(
         workflow_run_id="wr_paused",
         workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        status=WorkflowRunStatus.running,
+        created_at=now,
+        modified_at=now,
         sequential_credential_id=None,
         proxy_location=run_proxy_location,
         runnable_id=None,
     )
     monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=workflow_run))
 
-    async def _get_session(session_id: str, _organization_id: str | None = None) -> SimpleNamespace:
+    async def _get_session(session_id: str, _organization_id: str | None = None) -> PersistentBrowserSession:
         proxy_location = run_session_proxy_location if session_id == _RUN_SESSION_ID else _CHAT_SESSION_PROXY_LOCATION
-        return SimpleNamespace(proxy_location=proxy_location, runnable_id=None)
+        return PersistentBrowserSession(
+            persistent_browser_session_id=session_id,
+            organization_id="org-1",
+            created_at=now,
+            modified_at=now,
+            proxy_location=proxy_location,
+            browser_profile_id=None,
+            browser_profile_loaded=True,
+        )
 
     monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", _get_session)
 
@@ -842,7 +870,7 @@ def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | No
 
 def origin_run_input(
     key: str,
-    value: bool | int | float | str | dict | list,
+    value: bool | float | str | dict | list,
     ptype: WorkflowParameterType = WorkflowParameterType.FILE_URL,
     *,
     default_value: str | None = None,

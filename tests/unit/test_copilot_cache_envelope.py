@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -269,3 +271,17 @@ def test_no_authoring_policy_section_reaches_either_prompt_half() -> None:
     assert isinstance(prompt, CacheableSystemInstructions)
     assert _CODE_ONLY_HEADER not in prompt.stable_prefix
     assert _CODE_ONLY_HEADER not in prompt.dynamic_suffix
+
+
+@pytest.mark.parametrize("duplicate", [copy.copy, copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value))])
+def test_cacheable_system_instructions_survive_the_copy_litellm_makes(duplicate: Any) -> None:
+    original = CacheableSystemInstructions("stable ", "dynamic", cache_namespace="ns")
+
+    duplicated = duplicate(original)
+
+    assert duplicated == original
+    assert (duplicated.stable_prefix, duplicated.dynamic_suffix, duplicated.cache_namespace) == (
+        "stable ",
+        "dynamic",
+        "ns",
+    )

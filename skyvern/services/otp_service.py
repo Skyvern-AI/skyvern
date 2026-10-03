@@ -7,16 +7,24 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
+from urllib.parse import urljoin, urlsplit
 
 import structlog
 from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
+    from skyvern.forge.agent_functions import TOTPVerificationResponse
     from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 
 from skyvern.config import settings
-from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
+from skyvern.exceptions import (
+    BlockedHost,
+    FailedToGetTOTPVerificationCode,
+    NoTOTPVerificationCodeFound,
+    SkyvernHTTPException,
+    UnresolvableHost,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
@@ -34,6 +42,11 @@ from skyvern.forge.sdk.services.credentials import (
     wait_for_fresh_totp_window,
 )
 from skyvern.services.otp_email import EmailOTPVerificationContext
+from skyvern.utils.url_validators import (
+    BLOCKED_HOST_ALLOWLIST_HINT,
+    SAFE_REDIRECT_STATUS_CODES,
+    validate_fetch_url_with_resolved_ips,
+)
 
 LOG = structlog.get_logger()
 
@@ -124,6 +137,7 @@ _TOTP_WEBHOOK_REQUEST_FAILED_REASON = "totp_webhook_request_failed"
 _SAFE_TOTP_ERROR_REASON_PREFIXES = (_TOTP_WEBHOOK_NON_JSON_RESPONSE_REASON, _TOTP_WEBHOOK_REQUEST_FAILED_REASON)
 _TOTP_WEBHOOK_REQUEST_MAX_ATTEMPTS = 3
 _TOTP_WEBHOOK_REQUEST_RETRY_TIMEOUT_SECONDS = 5
+_TOTP_WEBHOOK_MAX_REDIRECTS = 3
 
 MFANavigationPayload = dict | list | str | None
 _TOTPWebhookPostResponse = tuple[int, dict[str, str], Any, bool]
@@ -131,6 +145,10 @@ _TOTPWebhookPostResponse = tuple[int, dict[str, str], Any, bool]
 
 class _TOTPWebhookRequestError(Exception):
     pass
+
+
+class TOTPWebhookRedirectRefused(Exception):
+    """Carries a fixed, URL-free message, so it is safe to surface in a failure reason."""
 
 
 class InsufficientCreditsForOTPParse(Exception):
@@ -435,6 +453,74 @@ def _coerce_totp_response_body(body: str) -> tuple[Any, bool]:
     return body, False
 
 
+async def _request_totp_following_redirects(
+    *,
+    url: str,
+    payload: str,
+    headers: dict[str, str],
+    timeout: int,
+    organization_id: str,
+) -> "TOTPVerificationResponse":
+    # Redirects are followed here rather than by the HTTP client so every hop is validated and pinned
+    # like the first. Method rewriting matches the earlier aiohttp client: 303, and 301/302 after a
+    # POST, continue as a GET without the body.
+    method = "POST"
+    current_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, url)
+    for hop in range(_TOTP_WEBHOOK_MAX_REDIRECTS + 1):
+        response = await app.AGENT_FUNCTION.post_totp_verification_request(
+            url=current_url,
+            payload=payload if method == "POST" else "",
+            headers=headers if method == "POST" else _headers_without_body(headers),
+            timeout_seconds=timeout,
+            organization_id=organization_id,
+            resolved_ips=resolved_ips,
+            method=method,
+        )
+        location = _get_header_value(response.headers, "Location")
+        if response.status_code not in SAFE_REDIRECT_STATUS_CODES or not location:
+            return response
+        if hop == _TOTP_WEBHOOK_MAX_REDIRECTS:
+            raise TOTPWebhookRedirectRefused(f"more than {_TOTP_WEBHOOK_MAX_REDIRECTS} redirects")
+        next_url = urljoin(current_url, location)
+        if urlsplit(current_url).scheme == "https" and urlsplit(next_url).scheme != "https":
+            raise TOTPWebhookRedirectRefused("redirect from https to http refused")
+        if _origin(next_url) != _origin(current_url):
+            # 307/308 would re-send the signed payload to the new host unchanged.
+            if response.status_code in (307, 308):
+                raise TOTPWebhookRedirectRefused("cross-origin 307/308 redirect refused")
+            headers = _headers_without_credentials(headers)
+        current_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, next_url)
+        if response.status_code == 303 or (response.status_code in (301, 302) and method == "POST"):
+            method = "GET"
+    raise AssertionError("unreachable")
+
+
+def _request_failure_detail(error: Exception) -> str:
+    # Other exception messages can carry the endpoint URL or response details, so only known-safe text is surfaced.
+    if isinstance(error, TOTPWebhookRedirectRefused):
+        return f" detail={error}"
+    if isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost):
+        return f" detail={BLOCKED_HOST_ALLOWLIST_HINT}"
+    return ""
+
+
+def _origin(url: str) -> tuple[str, str]:
+    parts = urlsplit(url)
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"content-type", "accept", "user-agent"})
+
+
+def _headers_without_credentials(headers: dict[str, str]) -> dict[str, str]:
+    # Signatures, auth and any custom headers are meant for the configured endpoint, not a host it redirects to.
+    return {key: value for key, value in headers.items() if key.lower() in _CROSS_ORIGIN_REDIRECT_HEADERS}
+
+
+def _headers_without_body(headers: dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in headers.items() if key.lower() not in ("content-type", "content-length")}
+
+
 async def _post_totp_verification_url(
     *,
     url: str,
@@ -449,11 +535,11 @@ async def _post_totp_verification_url(
     # (static IP), matching webhook and file-upload delivery.
     for attempt in range(max_attempts):
         try:
-            response = await app.AGENT_FUNCTION.post_totp_verification_request(
+            response = await _request_totp_following_redirects(
                 url=url,
                 payload=signed_payload,
                 headers=headers,
-                timeout_seconds=timeout,
+                timeout=timeout,
                 organization_id=organization_id,
             )
             # Content-Type gate: only trust an explicit non-JSON header to mean
@@ -466,6 +552,11 @@ async def _post_totp_verification_url(
             parsed, is_json = _coerce_totp_response_body(response.body)
             return response.status_code, response.headers, parsed, is_json
         except Exception as e:
+            # A refused target stays refused; a resolver failure may be transient, so it retries.
+            if isinstance(e, TOTPWebhookRedirectRefused) or (
+                isinstance(e, SkyvernHTTPException) and not isinstance(e, UnresolvableHost)
+            ):
+                raise
             # Avoid exc_info here because network exceptions can include the
             # webhook URL or response details; keep retry logs diagnostic but sanitized.
             LOG.debug(
@@ -1057,7 +1148,7 @@ async def _get_otp_value_from_url(
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_id=workflow_permanent_id,
-            reason=f"{_TOTP_WEBHOOK_REQUEST_FAILED_REASON} exception_type={type(e).__name__}",
+            reason=f"{_TOTP_WEBHOOK_REQUEST_FAILED_REASON} exception_type={type(e).__name__}{_request_failure_detail(e)}",
         )
     content_type = _get_header_value(response_headers, "Content-Type")
     if context is not None:

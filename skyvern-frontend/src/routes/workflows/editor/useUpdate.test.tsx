@@ -4,6 +4,8 @@ import { renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { RunEngine } from "@/api/types";
+
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { useUpdate } from "./useUpdate";
 
@@ -49,6 +51,24 @@ describe("useUpdate", () => {
     result.current({ x: "1" });
 
     expect(updateNodeData).not.toHaveBeenCalled();
+  });
+
+  test("an engine pick marks only skyvern-1.0 as a person's pin", () => {
+    const { result } = renderHook(
+      () =>
+        useUpdate<{ engine: RunEngine | null }>({ id: "n1", editable: true }),
+      { wrapper: scopeWrapper(false) },
+    );
+
+    result.current({ engine: RunEngine.SkyvernV1 });
+    result.current({ engine: null });
+    result.current({ engine: RunEngine.SkyvernV3 });
+
+    expect(updateNodeData.mock.calls.map(([, data]) => data)).toEqual([
+      { engine: RunEngine.SkyvernV1, enginePinned: true },
+      { engine: null, enginePinned: false },
+      { engine: RunEngine.SkyvernV3, enginePinned: false },
+    ]);
   });
 
   test("does not persist when the node is not editable", () => {

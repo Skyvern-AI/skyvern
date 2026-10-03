@@ -80,6 +80,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_credential_selection_id,
+    generate_workflow_run_group_id,
     generate_workflow_run_id,
     generate_workflow_schedule_id,
     generate_workflow_script_id,
@@ -820,6 +821,61 @@ class WorkflowScheduleModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class WorkflowRunGroupModel(Base):
+    __tablename__ = "workflow_run_groups"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "submission_key", name="uq_workflow_run_groups_org_submission_key"),
+        Index(
+            "idx_workflow_run_groups_unfinished_modified_at",
+            "modified_at",
+            postgresql_where=text("status IN ('active', 'cancel_requested')"),
+        ),
+    )
+
+    workflow_run_group_id = Column(String, primary_key=True, default=generate_workflow_run_group_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    requested_version = Column(Integer, nullable=True)
+    workflow_id = Column(String, nullable=False)
+    submission_key = Column(String, nullable=False)
+    input_fingerprint = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    finished_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunGroupItemModel(Base):
+    __tablename__ = "workflow_run_group_items"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_group_id", "item_key", name="uq_workflow_run_group_items_group_item_key"),
+        UniqueConstraint("workflow_run_id", name="uq_workflow_run_group_items_workflow_run_id"),
+    )
+
+    workflow_run_group_id = Column(String, primary_key=True)
+    position = Column(Integer, primary_key=True)
+    item_key = Column(String, nullable=False)
+    parameters = Column(JSON, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="pending")
+    dispatch_token = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    dispatch_attempts = Column(Integer, nullable=False, default=0)
+    failure_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
 class WorkflowTemplateModel(Base):
     """
     Tracks which workflows are marked as templates.
@@ -981,6 +1037,12 @@ class WorkflowRunAttemptModel(Base):
     __table_args__ = (
         Index("ix_workflow_run_attempts_organization_created_at", "organization_id", "created_at"),
         Index(
+            "ix_workflow_run_attempts_profile_run_lookup",
+            "browser_profile_id",
+            "workflow_run_id",
+            postgresql_where=text("browser_profile_id IS NOT NULL"),
+        ),
+        Index(
             "ix_workflow_run_attempts_pending_retries",
             "next_attempt_at",
             "workflow_run_id",
@@ -1018,6 +1080,7 @@ class WorkflowRunAttemptModel(Base):
     interim_side_effects_progress = Column(JSON, nullable=True)
     final_side_effects_progress = Column(JSON, nullable=True)
     pinned_browser_session_id = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=naive_utc_now, nullable=False)
@@ -1165,6 +1228,7 @@ class BitwardenCreditCardDataParameterModel(Base):
 
 class CredentialParameterModel(Base):
     __tablename__ = "credential_parameters"
+    __table_args__ = (Index("ix_credential_parameters_credential_workflow_lookup", "credential_id", "workflow_id"),)
 
     credential_parameter_id = Column(String, primary_key=True, default=generate_credential_parameter_id)
     workflow_id = Column(String, index=True, nullable=False)
@@ -1186,6 +1250,7 @@ class WorkflowRunCredentialSelectionModel(Base):
     __tablename__ = "workflow_run_credential_selections"
     __table_args__ = (
         UniqueConstraint("workflow_run_id", "parameter_key", name="uq_wrcs_workflow_run_parameter_key"),
+        Index("ix_wrcs_credential_run_lookup", "credential_id", "workflow_run_id"),
         Index(
             "idx_wrcs_lru_lookup",
             "organization_id",

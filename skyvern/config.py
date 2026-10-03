@@ -278,6 +278,8 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
+    WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
@@ -317,6 +319,9 @@ class Settings(BaseSettings):
     # also permits plaintext http:// endpoints, for self-hosted deployments pointing at an
     # object store on their own network (e.g. MinIO).
     ALLOW_S3_ENDPOINT_INTERNAL_HOSTS: bool = False
+    # Let SSRF-checked requests (webhooks, TOTP, downloads) use HTTP(S)_PROXY. A forward proxy resolves the host
+    # itself, so this gives up DNS-rebinding protection; enable only where egress must go through a proxy.
+    OUTBOUND_TRUST_ENV_PROXY: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
@@ -538,27 +543,19 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
-    # When type's click is refused only by the viewport check (a sub-pixel input under its own display
-    # layer), press the mouse at the field's centre before focusing, then Tab and read the value back
-    # (SKY-16501). Force-on term only: runs are randomized per run by the flag of the same name, read
-    # through run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, ...). Off: the field is reached by focus() alone.
-    TASK_V3_TYPE_COORDINATE_CLICK: bool = False
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
     TASK_V3_DATE_SEGMENT_AIM: bool = False
-    # Send Task V3's clicks, typing and scrolls through EventStrategyFactory, as v1 does, so a run follows
-    # whatever USE_EVENT_STRATEGIES registered. Force-on term only: runs are randomized per run by
-    # the flag of the same name, read through run_arm_enabled(HUMANIZED_INPUT_FLAG, ...). Off: plain Playwright.
-    TASK_V3_HUMANIZED_INPUT: bool = False
+    # Move the pointer onto an input or click target before acting, as v1 does, and take the click and typing
+    # pre-snapshots without writing an attribute to every visible element. Force-on term only: runs are randomized per run by the
+    # flag of the same name, read through run_arm_enabled(POINTER_PARITY_FLAG, ...).
+    TASK_V3_POINTER_PARITY: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
-    # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
-    # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
-    TASK_V3_CUSTOMER_PRECEDENCE: bool = False
     # Ask a separate judge model, before accepting finish(status=completed), whether the page and the
     # recent tool results contradict the goal (SKY-16928). On its own this is shadow mode: the verdict is
     # logged and the outcome never changes. With TASK_V3_GOAL_CHECK_ENFORCE also on, a contradicted
@@ -568,10 +565,6 @@ class Settings(BaseSettings):
     TASK_V3_GOAL_CHECK_ENFORCE: bool = False
     # The judge's model. Unset means the judge never runs; there is no fallback to another model.
     TASK_V3_GOAL_CHECK_LLM_KEY: str | None = None
-    # Tell a block with no navigation goal that it reports what the page shows -- absent fields as null,
-    # finished completed -- as v1's single extract action does (SKY-16398). Force-on term only: runs are
-    # randomized per run by the flag of the same name, read through run_arm_enabled().
-    TASK_V3_EXTRACTION_REPORTS: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
@@ -1002,6 +995,9 @@ class Settings(BaseSettings):
     """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
     RETRY_DISPATCH_GRACE_SECONDS: int = Field(default=600, ge=600)
     """OSS dispatch claim grace; the executor also enforces the retry lease takeover minimum."""
+    WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
+    """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
+    dispatch of already-submitted groups continue."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

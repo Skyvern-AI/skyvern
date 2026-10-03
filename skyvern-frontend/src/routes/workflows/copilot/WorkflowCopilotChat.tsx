@@ -70,6 +70,7 @@ import {
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useManualSignInStore } from "@/store/useManualSignInStore";
 import {
   type CopilotAttention,
   useCopilotHeaderStore,
@@ -122,6 +123,7 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
+  WorkflowCopilotCredentialResponseResult,
   WorkflowCopilotCredentialPauseResolvedUpdate,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
@@ -226,7 +228,10 @@ import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { cn, formatElapsedSeconds } from "@/util/utils";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
-import { useSwitchStudioRun } from "@/routes/workflows/studio/runSwitchNavigation";
+import {
+  searchWithoutRun,
+  useSwitchStudioRun,
+} from "@/routes/workflows/studio/runSwitchNavigation";
 import { searchWithSystemBlockFocus } from "@/routes/workflows/editor/hooks/useSelectedBlockUrlSync";
 import { studioPanelId } from "@/routes/workflows/studio/constants";
 import {
@@ -374,6 +379,12 @@ const RECOVERY_POLL_STEADY_MS = 30_000;
 const RECOVERY_POLL_BUDGET_MS = 1_500_000;
 const CANONICAL_READ_TIMEOUT_MS = 5_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
+// Only an older backend writes an interrupted row a late reply may still replace.
+const isReplaceableInterruptedRow = (
+  outcome: WorkflowCopilotChatHistoryMessage["turn_outcome"],
+): boolean =>
+  outcome?.terminal_reason === INTERRUPTED_TERMINAL_REASON &&
+  outcome.interrupted_row_final !== true;
 const SEND_FAILED_MESSAGE = "Sorry, I encountered an error. Please try again.";
 // A severed stream is usually the client losing the network, so recovery reads
 // fail too. Few enough that an offline user gets the plain failure back in
@@ -1492,6 +1503,9 @@ type CanonicalRecovery = {
   retryApply?: () => Promise<boolean>;
   rollback?: TurnSnapshot;
   restoreRollback?: boolean;
+  // An interrupted turn commits canonical only if its process died between commit and reply, so a
+  // canonical change is not credited to Copilot; the editor loads it either way.
+  endedInterrupted?: boolean;
   waitingForUnlock: boolean;
   yaml: { draft: string; entrySnapshot: string } | null;
 };
@@ -1885,6 +1899,13 @@ export function WorkflowCopilotChat({
   // Live pause answers keyed by resume_token: one turn can raise a pick card and then an update card.
   const [pauseCardResolutions, setPauseCardResolutions] = useState<
     Record<string, CredentialResolution>
+  >({});
+  // Per resume token: a Done in flight, the site a Done found no sign-in for, or a Done that failed to save.
+  const [manualSignIns, setManualSignIns] = useState<
+    Record<
+      string,
+      { busy: boolean; notFoundHost?: string; saveFailed?: boolean }
+    >
   >({});
   // Terminal asks whose auto-continue send failed: the optimistic "connected"
   // receipt is rolled back and the ask is forced actionable again (it is no
@@ -2530,10 +2551,10 @@ export function WorkflowCopilotChat({
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
-      action: "connected" | "skip",
+      action: "connected" | "skip" | "signing_in" | "signed_in",
       credentialId?: string,
       name?: string,
-    ) => {
+    ): Promise<WorkflowCopilotCredentialResponseResult | undefined> => {
       if (credentialResponseInFlight.current) return;
       if (
         !streamingAbortController.current &&
@@ -2552,13 +2573,22 @@ export function WorkflowCopilotChat({
         // Copilot routes live on base_router (no /api/v1 prefix), like cancel.
         const client = await getClient(credentialGetter, "sans-api-v1");
         if (!isCopilotTurnCurrent(reservation)) return;
-        await client.post("/workflow/copilot/credential-response", {
-          turn_id: frame.turn_id,
-          workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
-          resume_token: frame.resume_token,
-          action,
-          credential_id: action === "connected" ? credentialId : undefined,
-        });
+        const response =
+          await client.post<WorkflowCopilotCredentialResponseResult>(
+            "/workflow/copilot/credential-response",
+            {
+              turn_id: frame.turn_id,
+              workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
+              resume_token: frame.resume_token,
+              action,
+              credential_id: action === "connected" ? credentialId : undefined,
+            },
+          );
+        // A backend that predates sign-in answers 204 with no body.
+        const result: WorkflowCopilotCredentialResponseResult = response.data
+          ?.result
+          ? response.data
+          : { result: "accepted" };
         if (
           !isCopilotTurnCurrent(reservation) ||
           recoveryGeneration.current !== generation ||
@@ -2574,10 +2604,19 @@ export function WorkflowCopilotChat({
             frame.turn_id,
           );
         }
+        if (
+          action === "signing_in" ||
+          result.result === "no_sign_in_found" ||
+          result.result === "save_failed"
+        ) {
+          return result;
+        }
         const resolution: CredentialResolution =
           action === "connected"
             ? { outcome: "connected", credentialId, name }
-            : { outcome: "skipped" };
+            : action === "signed_in"
+              ? { outcome: "signed_in" }
+              : { outcome: "skipped" };
         // The waiter's credential_pause_resolved frame can land first and carries the admitted verdict.
         setPauseCardResolutions((prev) =>
           prev[frame.resume_token]
@@ -2590,6 +2629,7 @@ export function WorkflowCopilotChat({
             withCappedResolution(prev, frame.turn_id, resolution),
           );
         }
+        return result;
       } catch (error) {
         if (!isCopilotTurnCurrent(reservation)) return;
         // Log only the message: the AxiosError serializes config.data, which
@@ -2613,6 +2653,48 @@ export function WorkflowCopilotChat({
       }
     },
     [credentialGetter, isCopilotTurnCurrent, logCopilotRequestFailure],
+  );
+  const startManualSignIn = useCallback(
+    async (frame: WorkflowCopilotCredentialRequiredUpdate) => {
+      const result = await respondToCredentialPause(frame, "signing_in");
+      if (!result) return;
+      // The card's countdown, its place in the open asks, and a reload all read the frame.
+      const startSignIn = (
+        candidate: WorkflowCopilotCredentialRequiredUpdate,
+      ) =>
+        candidate.resume_token === frame.resume_token
+          ? {
+              ...candidate,
+              signing_in: true,
+              expires_at: result.expires_at ?? candidate.expires_at,
+            }
+          : candidate;
+      setLivePauseFrame((prev) => (prev ? startSignIn(prev) : prev));
+      setRecoveredPauseFrames((prev) => prev.map(startSignIn));
+    },
+    [respondToCredentialPause],
+  );
+  const finishManualSignIn = useCallback(
+    async (frame: WorkflowCopilotCredentialRequiredUpdate) => {
+      const token = frame.resume_token;
+      setManualSignIns((prev) => ({
+        ...prev,
+        [token]: { ...prev[token], busy: true },
+      }));
+      const result = await respondToCredentialPause(frame, "signed_in");
+      setManualSignIns((prev) => ({
+        ...prev,
+        [token]: {
+          busy: false,
+          notFoundHost:
+            result?.result === "no_sign_in_found"
+              ? (result.host ?? undefined)
+              : undefined,
+          saveFailed: result?.result === "save_failed",
+        },
+      }));
+    },
+    [respondToCredentialPause],
   );
   // Terminal-mode cards have no resume_token — connect/skip is a local UI morph,
   // no network call.
@@ -3999,7 +4081,8 @@ export function WorkflowCopilotChat({
                 (recoveredNarrative?.draft || ownsChatProposal),
               );
               const recoveredStatus: RecordingRefinementStatus = interrupted
-                ? holdingReservation
+                ? holdingReservation ||
+                  !isReplaceableInterruptedRow(row.turn_outcome)
                   ? "failed"
                   : "working"
                 : isCancelledRefinementTurn(
@@ -4046,10 +4129,8 @@ export function WorkflowCopilotChat({
                 autoAcceptWritesBeforeRead,
               );
             }
-            // An interrupted row can be replaced by the still-running finalizer.
-            if (
-              row.turn_outcome?.terminal_reason !== INTERRUPTED_TERMINAL_REASON
-            ) {
+            // A replaceable interrupted row can be superseded by the still-running finalizer.
+            if (!isReplaceableInterruptedRow(row.turn_outcome)) {
               if (!schedulesRefreshed) {
                 schedulesRefreshed = true;
                 void queryClient.invalidateQueries({
@@ -4068,6 +4149,8 @@ export function WorkflowCopilotChat({
                   canonicalRecovery.awaitingTurnId === rowTurnId
                 ) {
                   canonicalRecovery.terminalConfirmed = true;
+                  canonicalRecovery.endedInterrupted =
+                    reason === INTERRUPTED_TERMINAL_REASON;
                   canonicalRecovery.restoreRollback ||=
                     isCancelledRefinementTurn(reason, narrative) ||
                     narrative?.terminal === "error" ||
@@ -4076,6 +4159,7 @@ export function WorkflowCopilotChat({
                         "cancelled",
                         "error",
                         "copilot_recoverable_failure",
+                        INTERRUPTED_TERMINAL_REASON,
                       ].includes(reason));
                   canonicalReadAttempted = true;
                   await reconcileCanonicalWorkflowRef.current?.(
@@ -4385,7 +4469,7 @@ export function WorkflowCopilotChat({
         data.chat_history.flatMap((message) =>
           message.sender === "ai" &&
           message.turn_outcome?.copilot_turn_id &&
-          message.turn_outcome.terminal_reason !== INTERRUPTED_TERMINAL_REASON
+          !isReplaceableInterruptedRow(message.turn_outcome)
             ? [message.turn_outcome.copilot_turn_id]
             : [],
         ),
@@ -5190,6 +5274,7 @@ export function WorkflowCopilotChat({
         if (pending) {
           if (
             !canonicalUnchanged &&
+            !pending.endedInterrupted &&
             pending.rollback?.snapshot &&
             (pending.rollback.titlePersisted ||
               pending.rollback.workflowPersisted)
@@ -6794,6 +6879,48 @@ export function WorkflowCopilotChat({
           Date.parse(frame.expires_at ?? "") > Date.now(),
       );
   const trayPauseFrame = openPauseFrames[0] ?? null;
+  const signingInSessionId =
+    openPauseFrames.find(
+      (frame) =>
+        frame.signing_in &&
+        // Done hands the browser back before its cookies are read.
+        !manualSignIns[frame.resume_token]?.busy &&
+        frame.sign_in_browser_session_id === (liveBrowserSessionId ?? null),
+    )?.sign_in_browser_session_id ?? null;
+  const setManualSignInSession = useManualSignInStore(
+    (state) => state.setBrowserSessionId,
+  );
+  useEffect(() => {
+    setManualSignInSession(signingInSessionId);
+  }, [signingInSessionId, setManualSignInSession]);
+  // The sign-in happens in the live browser, so a pane showing a past run goes back to it, once per sign-in.
+  const signInShownSessionId = useRef<string | null>(null);
+  useEffect(() => {
+    if (signingInSessionId === signInShownSessionId.current) return;
+    signInShownSessionId.current = signingInSessionId;
+    if (!signingInSessionId) return;
+    const search = liveSearch(location.search);
+    if (!new URLSearchParams(search).has("wr")) return;
+    navigate(
+      {
+        pathname: location.pathname,
+        search: searchWithoutRun(search),
+        hash: location.hash,
+      },
+      {
+        replace: true,
+        state: liveLocationState(location.search, location.state),
+      },
+    );
+  }, [
+    signingInSessionId,
+    navigate,
+    location.pathname,
+    location.search,
+    location.hash,
+    location.state,
+  ]);
+  useEffect(() => () => setManualSignInSession(null), [setManualSignInSession]);
   const nextPauseExpiry = openPauseFrames.length
     ? Math.min(
         ...openPauseFrames.map((frame) => Date.parse(frame.expires_at ?? "")),
@@ -9335,6 +9462,20 @@ export function WorkflowCopilotChat({
           : openCredentialModal(frame, frame.turn_id)
       }
       onSkip={() => void respondToCredentialPause(frame, "skip")}
+      signIn={
+        frame.sign_in_browser_session_id &&
+        frame.sign_in_browser_session_id === liveBrowserSessionId
+          ? {
+              busy: Boolean(manualSignIns[frame.resume_token]?.busy),
+              notFoundHost: manualSignIns[frame.resume_token]?.notFoundHost,
+              saveFailed: Boolean(
+                manualSignIns[frame.resume_token]?.saveFailed,
+              ),
+              onStart: () => void startManualSignIn(frame),
+              onDone: () => void finishManualSignIn(frame),
+            }
+          : undefined
+      }
       tray={tray}
     />
   );

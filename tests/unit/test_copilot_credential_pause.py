@@ -394,10 +394,14 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     )
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
     credential = _make_credential()
+    record_resume = AsyncMock()
     monkeypatch.setattr(
         credential_pause_module.app,
         "DATABASE",
-        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
+        SimpleNamespace(
+            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential])),
+            workflow_params=SimpleNamespace(record_pending_copilot_turn_credential_resume=record_resume),
+        ),
     )
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
 
@@ -407,6 +411,8 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     resume_msgs = await maybe_credential_pause(ctx, _fake_result(), stream, config)
 
     assert resume_msgs is not None
+    # Reconcile measures abandonment from this stamp, so a resumed turn is not recovered as dead.
+    record_resume.assert_awaited_with(organization_id="org-1", workflow_copilot_chat_id="chat-1", turn_id="turn-1")
     assert ctx.credential_pause_outcome == "connected"
     assert ctx.request_policy.resolved_credentials == [credential]
     assert ctx.request_policy.allow_run_blocks is True
@@ -1152,7 +1158,7 @@ async def test_route_503_when_cache_missing(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_route_204_writes_flag_for_skip_without_credential_id(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_route_writes_flag_for_skip_without_credential_id(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _FakeCache()
     _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
     monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
@@ -1160,7 +1166,7 @@ async def test_route_204_writes_flag_for_skip_without_credential_id(monkeypatch:
 
     result = await workflow_copilot_credential_response(_response_request(action="skip"), organization=organization)
 
-    assert result is None
+    assert result.result == "accepted"
     expected_key = credential_response_cache_key("org-1", "chat-1", "turn-1")
     assert cache.store[expected_key] == encode_credential_response("skip", None, "tok-1")
     response_set = next(call for call in cache.set_calls if call[0] == expected_key)
@@ -1203,7 +1209,7 @@ async def test_route_404_when_credential_unknown_or_foreign_org(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_route_204_writes_flag_for_connected_with_valid_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_route_writes_flag_for_connected_with_valid_credential(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _FakeCache()
     _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
     monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
@@ -1221,7 +1227,7 @@ async def test_route_204_writes_flag_for_connected_with_valid_credential(monkeyp
         organization=organization,
     )
 
-    assert result is None
+    assert result.result == "accepted"
     expected_key = credential_response_cache_key("org-1", "chat-1", "turn-1")
     assert cache.store[expected_key] == encode_credential_response("connected", "cred_1", "tok-1")
 
@@ -1302,7 +1308,7 @@ async def test_route_409_on_replay_after_first_accepted_response(monkeypatch: py
     organization = SimpleNamespace(organization_id="org-1")
 
     first = await workflow_copilot_credential_response(_response_request(action="skip"), organization=organization)
-    assert first is None
+    assert first.result == "accepted"
 
     with pytest.raises(HTTPException) as excinfo:
         await workflow_copilot_credential_response(_response_request(action="skip"), organization=organization)
@@ -2852,3 +2858,39 @@ async def test_the_finalize_seam_opens_no_card_on_a_redacted_secret_draft(monkey
 )
 def test_the_raw_secret_card_sees_only_the_origin(user_url: str, origin: str) -> None:
     assert credential_pause_module.raw_secret_card_origin(user_url) == origin
+
+
+@pytest.mark.asyncio
+async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_does_not_fire_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_context()
+    ctx.organization_id = "org-1"
+    ctx.turn_id = "turn-1"
+    ctx.workflow_copilot_chat_id = "chat-1"
+    ctx.client_supports_credential_pause = True
+    ctx.last_run_skipped_unbound_credentials = True
+    ctx.request_policy = RequestPolicy(
+        login_page_urls=["https://portal.example.com/login"], credential_draft_deferred_explicitly=True
+    )
+    signed_in = credential_pause_module.SignedInProfile(
+        browser_profile_id="bp_signed_in",
+        profile_name="Sign-in for portal.example.com",
+        site="portal.example.com",
+        cookie_count=2,
+    )
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
+        "signed_in", None, "tok-1", signed_in=signed_in
+    )
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+
+    resume_msgs = await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config)
+
+    assert resume_msgs is not None
+    assert credential_pause_module.signed_in_facts(signed_in) in json.dumps(resume_msgs)
+    assert ctx.credential_pause_outcome == "signed_in"
+    assert credential_prompt_reason(ctx.request_policy, None) is None
+    assert await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config) is None

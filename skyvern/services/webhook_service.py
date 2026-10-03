@@ -573,6 +573,10 @@ async def _deliver_webhook(
     except (httpx.NetworkError, httpx.ProxyError) as exc:
         error = f"Could not reach URL: {exc}"
         LOG.warning("Webhook replay network error", url=url, error=str(exc))
+    except BlockedHost:
+        # The host passed validation, then resolved to a blocked address at delivery (DNS rebinding or proxy refusal).
+        error = "The target host was refused by SSRF protection."
+        LOG.warning("Webhook replay target refused", url=url)
     except Exception as exc:  # pragma: no cover - defensive guard
         error = f"Unexpected error: {exc}"
         LOG.error("Webhook replay unexpected error", url=url, error=str(exc), exc_info=True)

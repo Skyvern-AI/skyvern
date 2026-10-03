@@ -8,6 +8,7 @@ from fastapi import Depends, HTTPException, Query, status
 from fastapi.exceptions import RequestValidationError
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.core.permissions.schedule_limit_checker import ScheduleLimitCheckerFactory
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.agent_db import ScheduleLimitExceededError
@@ -36,6 +37,17 @@ LOG = structlog.get_logger()
 SCHEDULE_SYNC_ERROR_DETAIL = "Failed to sync schedule with scheduling service"
 # Leaves time for the row write and the scheduler create to land before the requested first tick.
 MIN_FIRST_FIRE_LEAD = timedelta(seconds=60)
+_AUDITED_SCHEDULE_FIELDS = {
+    "cron_expression",
+    "description",
+    "enabled",
+    "first_fire_at",
+    "interval_seconds",
+    "name",
+    "parameters",
+    "run_at",
+    "timezone",
+}
 
 
 def _require_schedules_enabled() -> None:
@@ -233,6 +245,15 @@ async def _set_schedule_enabled(
                 )
             raise _schedule_sync_error() from e
 
+    if previous_enabled != enabled:
+        await record_request_audit_event(
+            organization.organization_id,
+            "workflow_schedule.update",
+            "workflow_schedule",
+            workflow_schedule_id,
+            changed_fields=("enabled",),
+            related_resource_ids=(workflow_permanent_id,),
+        )
     LOG.info(
         "Workflow schedule enabled state updated",
         organization_id=organization.organization_id,
@@ -433,6 +454,13 @@ async def create_workflow_schedule(
             )
         raise _schedule_sync_error() from e
 
+    await record_request_audit_event(
+        organization.organization_id,
+        "workflow_schedule.create",
+        "workflow_schedule",
+        schedule.workflow_schedule_id,
+        related_resource_ids=(workflow.workflow_permanent_id,),
+    )
     LOG.info(
         "Workflow schedule created",
         organization_id=organization.organization_id,
@@ -658,6 +686,18 @@ async def update_workflow_schedule(
             )
         raise _schedule_sync_error() from e
 
+    before = existing.model_dump(include=_AUDITED_SCHEDULE_FIELDS)
+    after = schedule.model_dump(include=_AUDITED_SCHEDULE_FIELDS)
+    changed_fields = tuple(sorted(name for name in after if before[name] != after[name]))
+    if changed_fields:
+        await record_request_audit_event(
+            organization.organization_id,
+            "workflow_schedule.update",
+            "workflow_schedule",
+            workflow_schedule_id,
+            changed_fields=changed_fields,
+            related_resource_ids=(workflow_permanent_id,),
+        )
     LOG.info(
         "Workflow schedule updated",
         organization_id=organization.organization_id,
@@ -720,6 +760,13 @@ async def cancel_workflow_schedule(
                 backend_schedule_id=existing.backend_schedule_id,
             )
 
+    await record_request_audit_event(
+        organization.organization_id,
+        "workflow_schedule.cancel",
+        "workflow_schedule",
+        workflow_schedule_id,
+        related_resource_ids=(workflow_permanent_id,),
+    )
     LOG.info(
         "One-time workflow schedule canceled",
         organization_id=organization.organization_id,
@@ -844,6 +891,13 @@ async def delete_workflow_schedule_route(
                 )
             raise _schedule_sync_error() from e
 
+    await record_request_audit_event(
+        organization.organization_id,
+        "workflow_schedule.delete",
+        "workflow_schedule",
+        workflow_schedule_id,
+        related_resource_ids=(workflow_permanent_id,),
+    )
     LOG.info(
         "Workflow schedule deleted",
         organization_id=organization.organization_id,

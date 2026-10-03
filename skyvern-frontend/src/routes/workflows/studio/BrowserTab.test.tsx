@@ -21,7 +21,6 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { compactLocalDateTime } from "@/util/timeFormat";
 
 import type {
   WorkflowRunBlock,
@@ -497,15 +496,26 @@ describe("BrowserTab view machine", () => {
     );
   });
 
-  it("labels the replay pills with the run they replay", () => {
+  it("identifies the inspected run without repeating its timestamp in the Browser header", () => {
     seedRun({ status: Status.Completed });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
-    // Same formatter as the Runs list, so the label is locale/TZ-stable here.
-    expect(screen.getByTestId("browser-pane-run-label").textContent).toBe(
-      `Run · ${compactLocalDateTime("2026-09-24T12:00:00")}`,
+    expect(screen.getByTestId("browser-pane-run-cue").textContent).toBe(
+      "Run wr_1",
     );
     expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
+  });
+
+  it("hides the inspected run cue when Debug browser is selected", () => {
+    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    const debugBrowser = screen.getByRole("button", { name: "Debug browser" });
+    fireEvent.click(debugBrowser);
+
+    expect(debugBrowser.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByTestId("browser-pane-run-cue")).toBeNull();
   });
 
   it("registers the shell stream slot while live", () => {
@@ -639,7 +649,9 @@ describe("BrowserTab view machine", () => {
 
     const status = screen.getByTestId("browser-pane-live-status");
     expect(status.textContent).toBe("Starting browser…");
-    expect(screen.getByTestId("browser-pane-run-label")).toBeTruthy();
+    expect(screen.getByTestId("browser-pane-run-cue").textContent).toBe(
+      "Run browser",
+    );
     expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "emit run live" }));
@@ -702,7 +714,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
       "Live",
     );
-    expect(screen.queryByTestId("browser-pane-run-label")).toBeNull();
+    expect(screen.queryByTestId("browser-pane-run-cue")).toBeNull();
     expect(screen.queryByRole("group", { name: "Browser view" })).toBeNull();
   });
 

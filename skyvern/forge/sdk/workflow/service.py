@@ -24,6 +24,7 @@ from typing import Any, Literal, TypeVar, cast, overload
 
 import structlog
 from jinja2 import meta as jinja2_meta
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -172,6 +173,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BaseTaskBlock,
     Block,
     BlockTypeVar,
+    BranchCondition,
     CodeBlock,
     ConditionalBlock,
     ExtractionBlock,
@@ -184,11 +186,13 @@ from skyvern.forge.sdk.workflow.models.block import (
     SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
+    V3AbIneligibleReason,
     WebSearchBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
+    pinned_v1_block_count,
     resolve_conditional_merge_edges,
     takes_default_engine,
     v3_ab_ineligibility_reason,
@@ -1431,18 +1435,25 @@ def workflow_definitions_differ(previous: WorkflowDefinition, current: WorkflowD
     return _get_workflow_definition_core_data(previous) != _get_workflow_definition_core_data(current)
 
 
-def _get_workflow_definition_core_data(
-    workflow_definition: WorkflowDefinition, *, unset_engine_is_v1: bool = True
-) -> dict[str, Any]:
-    """
-    This function dumps the workflow definition and removes the irrelevant data to the definition, like created_at and modified_at fields inside:
-    - list of blocks
-    - list of parameters
-    And return the dumped workflow definition as a python dictionary.
-    """
-    # Convert the workflow definition to a dictionary
-    workflow_dict = workflow_definition.model_dump(mode="json")
-    fields_to_remove = [
+_WORKFLOW_AUDIT_METADATA_FIELDS = {
+    "workflow_id",
+    "organization_id",
+    "workflow_permanent_id",
+    "version",
+    "is_template",
+    "created_by",
+    "edited_by",
+    "created_at",
+    "modified_at",
+    "deleted_at",
+    "copilot_authored",
+    "effective_default_engine",
+    "original_created_by",
+    "original_created_at",
+}
+
+_WORKFLOW_DEFINITION_METADATA_FIELDS = frozenset(
+    {
         "created_at",
         "modified_at",
         "deleted_at",
@@ -1456,15 +1467,67 @@ def _get_workflow_definition_core_data(
         "credential_parameter_id",
         "onepassword_credential_parameter_id",
         "azure_vault_credential_parameter_id",
-        # Graded at finalization, not executed: its presence must not invalidate cached scripts.
-        "completion_contract",
-        "disable_cache",
-        "next_block_label",
-        "version",
-        "model",
-    ]
-    # Plain-language annotations, not execution input, so editing them must not bust the cached script.
-    code_block_annotation_fields = ("steps", "user_owned_goal", "goal_needs_regeneration")
+    }
+)
+
+
+def workflow_changed_fields(previous: Workflow | None, current: Workflow) -> tuple[str, ...]:
+    if previous is None:
+        return ("workflow_definition",)
+
+    changed_fields = []
+    if _workflow_definition_audit_data(previous.workflow_definition) != _workflow_definition_audit_data(
+        current.workflow_definition
+    ):
+        changed_fields.append("workflow_definition")
+    changed_fields.extend(
+        field_name
+        for field_name in Workflow.model_fields
+        if field_name not in _WORKFLOW_AUDIT_METADATA_FIELDS
+        and field_name != "workflow_definition"
+        and getattr(previous, field_name) != getattr(current, field_name)
+    )
+    return tuple(changed_fields)
+
+
+def _workflow_definition_audit_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
+    """Drop generated metadata only from model fields, never from arbitrary user dictionaries."""
+    definition = workflow_definition.model_dump(mode="json")
+
+    def strip_model_metadata(model_value: Any, dump_value: Any) -> None:
+        if isinstance(model_value, BaseModel) and isinstance(dump_value, dict):
+            if isinstance(model_value, BranchCondition):
+                # The YAML converter regenerates this ID on every save.
+                dump_value.pop("id", None)
+            model_fields = type(model_value).model_fields
+            for field_name in _WORKFLOW_DEFINITION_METADATA_FIELDS & model_fields.keys():
+                dump_value.pop(field_name, None)
+            for field_name in model_fields:
+                if field_name in dump_value:
+                    strip_model_metadata(getattr(model_value, field_name), dump_value[field_name])
+        elif isinstance(model_value, dict) and isinstance(dump_value, dict):
+            for key, nested_value in model_value.items():
+                if key in dump_value:
+                    strip_model_metadata(nested_value, dump_value[key])
+        elif isinstance(model_value, (list, tuple)) and isinstance(dump_value, list):
+            for nested_value, nested_dump in zip(model_value, dump_value, strict=False):
+                strip_model_metadata(nested_value, nested_dump)
+
+    strip_model_metadata(workflow_definition, definition)
+    return definition
+
+
+def _get_workflow_definition_core_data(
+    workflow_definition: WorkflowDefinition, *, unset_engine_is_v1: bool = True
+) -> dict[str, Any]:
+    """Return the workflow definition without generated or script-inert fields."""
+    # Convert the workflow definition to a dictionary
+    workflow_dict = workflow_definition.model_dump(mode="json")
+    fields_to_remove = list(_WORKFLOW_DEFINITION_METADATA_FIELDS)
+    # Graded at finalization, not executed: its presence must not invalidate cached scripts.
+    fields_to_remove.extend(("completion_contract", "disable_cache", "next_block_label", "version", "model"))
+    # Plain-language annotations are cache-inert.
+    code_block_annotation_fields = ("steps", "user_owned_goal", "goal_needs_regeneration", "code_edited_by_hand")
 
     # Use BFS to recursively remove fields from all nested objects
 
@@ -7829,6 +7892,7 @@ class WorkflowService:
         # share an arm. Covers the DAG executor too, which this method delegates to.
         current_context = skyvern_context.current()
         if current_context:
+            ineligibility_reason = v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run)
             await resolve_workflow_block_engine_arm(
                 current_context,
                 workflow_run_id=workflow_run_id,
@@ -7836,8 +7900,14 @@ class WorkflowService:
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 workflow_status=workflow.status,
                 trigger_type=workflow_run.trigger_type,
-                ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
+                ineligibility_reason=ineligibility_reason,
                 takes_default_engine=takes_default_engine(all_blocks),
+                # Counted only when the pin is what left the A/B, so pinned_v1_engine never labels another reason.
+                pinned_v1_blocks=(
+                    pinned_v1_block_count(all_blocks)
+                    if ineligibility_reason == V3AbIneligibleReason.pinned_engine
+                    else 0
+                ),
             )
         else:
             LOG.warning(
@@ -11099,6 +11169,7 @@ class WorkflowService:
                 created_by=created_by,
                 edited_by=edited_by,
                 preserve_completion_contract=preserve_completion_contract,
+                refuse_if_pinned_by_run_group=True,
             )
         else:
             updated_workflow = await app.DATABASE.workflows.update_workflow(
@@ -11132,6 +11203,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 created_by=created_by,
                 edited_by=edited_by,
+                refuse_if_pinned_by_run_group=True,
             )
 
         if notify_workflow_saved:
@@ -11300,21 +11372,25 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> None:
+    ) -> str | None:
         # Delete workflow and schedules in one DB transaction so we do not leave
         # the workflow active if a process exits between separate commits.
-        deleted_schedule_ids = await app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id(
+        (
+            deleted_schedule_ids,
+            deleted_workflow_id,
+        ) = await app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
         if deleted_schedule_ids:
             LOG.info(
                 "Cascade-deleted schedules during workflow deletion",
-                workflow_permanent_id=workflow_permanent_id,
+                workflow_permanent_id=deleted_workflow_id,
                 organization_id=organization_id,
                 deleted_schedule_ids=deleted_schedule_ids,
                 count=len(deleted_schedule_ids),
             )
+        return deleted_workflow_id
 
     async def delete_workflow_by_id(
         self,
@@ -11991,6 +12067,10 @@ class WorkflowService:
             task = asyncio.create_task(hook_coroutine)
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+        try:
+            app.AGENT_FUNCTION.schedule_workflow_run_group_advance(workflow_run)
+        except Exception:
+            LOG.warning("Failed to schedule workflow run group advance", workflow_run_id=workflow_run_id, exc_info=True)
 
     async def _run_workflow_run_terminal_hooks(
         self,
@@ -12804,6 +12884,7 @@ class WorkflowService:
         failure_category: list[dict] | None = None,
         finalized_by: str | None = None,
         run_minutes_recorded_through: datetime | None = None,
+        only_from: Sequence[WorkflowRunStatus] | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
         run's own finalizer. Returns ``None`` when the row was already terminal."""
@@ -12813,6 +12894,7 @@ class WorkflowService:
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
+            only_from=only_from,
         )
         if workflow_run is None:
             return None
@@ -13327,7 +13409,7 @@ class WorkflowService:
         organization_id: str,
         attempt_number: int,
         dispatch_claim_started_at: datetime | None,
-        status: Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out],
+        status: Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out],  # type: ignore[valid-type]
         failure_reason: str | None,
         failure_category: list[dict[str, Any]] | None = None,
         cascade_children: bool = True,
@@ -13417,6 +13499,7 @@ class WorkflowService:
         failure_reason: str | None,
         failure_category: list[dict] | None = None,
         cascade_children: bool = False,
+        only_from: Sequence[WorkflowRunStatus] | None = None,
     ) -> WorkflowRun | None:
         """Conditional failure finalize that no-ops when the run has already reached a terminal
         state. Out-of-band finalizers (the interrupted-activity backstop) run concurrently with
@@ -13435,6 +13518,7 @@ class WorkflowService:
             status=WorkflowRunStatus.failed,
             failure_reason=failure_reason,
             failure_category=failure_category,
+            only_from=only_from,
         )
         if workflow_run is None:
             return None
@@ -16224,7 +16308,7 @@ class WorkflowService:
         created_by: str | None,
         edited_by: str | None,
         created_via: str | None = None,
-    ) -> Workflow:
+    ) -> tuple[Workflow, bool]:
         organization_id = organization.organization_id
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
@@ -16243,11 +16327,14 @@ class WorkflowService:
 
         async with app.DATABASE.workflows.acquire_workflow_creation_lock(workflow_permanent_id):
             try:
-                return await self.get_workflow_by_permanent_id(
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    version=1,
-                    filter_deleted=False,
+                return (
+                    await self.get_workflow_by_permanent_id(
+                        workflow_permanent_id=workflow_permanent_id,
+                        organization_id=organization_id,
+                        version=1,
+                        filter_deleted=False,
+                    ),
+                    False,
                 )
             except WorkflowNotFound:
                 pass
@@ -16282,7 +16369,7 @@ class WorkflowService:
             organization_id=organization_id,
             delete_script=delete_script,
         )
-        return created_workflow
+        return created_workflow, True
 
     async def _latest_version_and_settings_base(
         self, workflow_permanent_id: str, organization_id: str
@@ -16301,6 +16388,7 @@ class WorkflowService:
         )
         return latest.version, settings_base
 
+    @overload
     async def create_workflow_from_request(
         self,
         organization: Organization,
@@ -16313,7 +16401,42 @@ class WorkflowService:
         resolved_title: str | None = None,
         created_via: str | None = None,
         validate_code_block_templates: bool = True,
-    ) -> Workflow:
+        *,
+        return_write_result: Literal[True],
+    ) -> tuple[Workflow, tuple[str, ...]]: ...
+
+    @overload
+    async def create_workflow_from_request(
+        self,
+        organization: Organization,
+        request: WorkflowCreateYAMLRequest,
+        workflow_permanent_id: str | None = None,
+        delete_script: bool = True,
+        created_by: str | None = None,
+        edited_by: str | None = None,
+        new_workflow_permanent_id: str | None = None,
+        resolved_title: str | None = None,
+        created_via: str | None = None,
+        validate_code_block_templates: bool = True,
+        *,
+        return_write_result: Literal[False] = False,
+    ) -> Workflow: ...
+
+    async def create_workflow_from_request(
+        self,
+        organization: Organization,
+        request: WorkflowCreateYAMLRequest,
+        workflow_permanent_id: str | None = None,
+        delete_script: bool = True,
+        created_by: str | None = None,
+        edited_by: str | None = None,
+        new_workflow_permanent_id: str | None = None,
+        resolved_title: str | None = None,
+        created_via: str | None = None,
+        validate_code_block_templates: bool = True,
+        *,
+        return_write_result: bool = False,
+    ) -> Workflow | tuple[Workflow, tuple[str, ...]]:
         organization_id = organization.organization_id
         # Fail fast before any persistence path (idempotent, update, or initial create): a browser_type
         # this runtime cannot honor is rejected at ingress with a 4xx instead of a 200-on-save that
@@ -16334,7 +16457,7 @@ class WorkflowService:
             title=title,
         )
         if new_workflow_permanent_id:
-            return await self._create_idempotent_workflow_from_request(
+            workflow, created = await self._create_idempotent_workflow_from_request(
                 organization=organization,
                 request=request,
                 workflow_permanent_id=new_workflow_permanent_id,
@@ -16344,6 +16467,7 @@ class WorkflowService:
                 edited_by=edited_by,
                 created_via=created_via,
             )
+            return (workflow, ("workflow_definition",) if created else ()) if return_write_result else workflow
 
         recording_id_to_attach = request.recording_id
         workflow_save_fingerprint = _workflow_save_fingerprint(request) if request.recording_id is not None else None
@@ -16363,10 +16487,11 @@ class WorkflowService:
                 )
             if recording.workflow_id is not None:
                 if recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint:
-                    return await self.get_workflow(
+                    workflow = await self.get_workflow(
                         workflow_id=recording.workflow_id,
                         organization_id=organization_id,
                     )
+                    return (workflow, ()) if return_write_result else workflow
                 recording_id_to_attach = None
 
         await self._validate_and_normalize_credential_rotation_parameters(
@@ -16563,7 +16688,7 @@ class WorkflowService:
                         workflow_id=updated_workflow.workflow_id,
                         organization_id=organization_id,
                     )
-                    return original_workflow
+                    return (original_workflow, ()) if return_write_result else original_workflow
 
             await self.maybe_delete_cached_code(
                 updated_workflow,
@@ -16579,7 +16704,9 @@ class WorkflowService:
                     max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
                 )
 
-            return updated_workflow
+            if not return_write_result:
+                return updated_workflow
+            return updated_workflow, workflow_changed_fields(existing_latest_workflow, updated_workflow)
         except SkyvernHTTPException:
             # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
             # so they are not wrapped in a 500 by the caller.

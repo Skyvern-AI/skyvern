@@ -22,6 +22,7 @@ from sqlalchemy import (
     cast,
     delete,
     exists,
+    false,
     func,
     literal,
     literal_column,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     or_,
     select,
     true,
+    union_all,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -37,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import aliased, load_only
 from sqlalchemy.sql.compiler import SQLCompiler
-from sqlalchemy.sql.selectable import Join
+from sqlalchemy.sql.selectable import CompoundSelect, Join
 
 from skyvern.exceptions import WorkflowAttemptDispatchSuperseded, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.failure_classifier import derive_failure_attribution
@@ -48,6 +50,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX, PERSISTENT_BROWSER_SESSION_ID
 from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
 
 if TYPE_CHECKING:
@@ -56,6 +59,7 @@ if TYPE_CHECKING:
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
+    CredentialParameterModel,
     PersistentBrowserSessionModel,
     StepModel,
     TaskModel,
@@ -359,6 +363,23 @@ async def _has_serialized_publication_identity(
             )
         )
     return serialized_publication
+
+
+async def _first_queued_at(
+    session: AsyncSession, workflow_run: WorkflowRunModel, *, sequential_credential_id: str | None = None
+) -> datetime:
+    """A serialized run takes the next org-wide queue ticket; the caller must hold its publication-lane locks."""
+    if await _has_serialized_publication_identity(
+        session,
+        workflow_run,
+        browser_session_id=workflow_run.browser_session_id,
+        browser_address=workflow_run.browser_address,
+        sequential_credential_id=sequential_credential_id,
+    ):
+        return await _allocate_serialized_queue_ticket(
+            session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run.workflow_run_id
+        )
+    return naive_utc_now()
 
 
 class WorkflowRunsRepository(BaseRepository):
@@ -1001,25 +1022,9 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    serialized_publication = await _has_serialized_publication_identity(
-                        session,
-                        workflow_run,
-                        browser_session_id=workflow_run.browser_session_id,
-                        browser_address=workflow_run.browser_address,
-                        sequential_credential_id=sequential_credential_id,
+                    workflow_run.queued_at = await _first_queued_at(
+                        session, workflow_run, sequential_credential_id=sequential_credential_id
                     )
-                    if serialized_publication:
-                        # The caller holds every composed publication-lane lock until this transaction
-                        # commits. Advance beyond every active serialized ticket in the organization,
-                        # so all composed lanes share one comparable clock even when database transaction
-                        # time or an application host clock moved backwards.
-                        workflow_run.queued_at = await _allocate_serialized_queue_ticket(
-                            session,
-                            organization_id=workflow_run.organization_id,
-                            workflow_run_id=workflow_run_id,
-                        )
-                    else:
-                        workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
                     workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
@@ -1212,19 +1217,16 @@ class WorkflowRunsRepository(BaseRepository):
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        only_from: Sequence[WorkflowRunStatus] | None = None,
+        job_id: str | None = None,
+        depends_on_workflow_run_id: str | None = None,
     ) -> WorkflowRun | None:
-        """Transition a workflow run to ``status`` only if it is not already in a
-        terminal state. Returns the updated row, or ``None`` when the row was
-        already terminal (or missing). Implemented as a single conditional
-        ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
-        finalization write cannot be clobbered by a late cancel.
-
-        Mirrors the timestamp side effects of :meth:`update_workflow_run`:
-        ``finished_at`` is stamped on terminal transitions and ``started_at``
-        is stamped on the first ``running`` transition (preserving any
-        existing value via ``COALESCE``).
-        """
-        non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
+        cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
+        :meth:`update_workflow_run`."""
+        non_terminal = [
+            s.value for s in WorkflowRunStatus if not s.is_final() and (only_from is None or s in only_from)
+        ]
         now = naive_utc_now()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
@@ -1239,6 +1241,10 @@ class WorkflowRunsRepository(BaseRepository):
             values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
+        if job_id:
+            values["job_id"] = job_id
+        if depends_on_workflow_run_id:
+            values["depends_on_workflow_run_id"] = depends_on_workflow_run_id
         # The reopen/reset path clears attribution when it returns the row to `created`, so a
         # later terminal transition starts from SQL NULL and this COALESCE fills the freshly
         # derived document; on any row that already carries one it preserves the first writer.
@@ -1256,6 +1262,14 @@ class WorkflowRunsRepository(BaseRepository):
             )
 
         async with self.Session() as session:
+            if status == WorkflowRunStatus.queued:
+                workflow_run = (
+                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+                ).first()
+                if workflow_run is not None and workflow_run.queued_at is None:
+                    values["queued_at"] = func.coalesce(
+                        WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
+                    )
             result = await session.execute(
                 update(WorkflowRunModel)
                 .where(
@@ -1484,40 +1498,19 @@ class WorkflowRunsRepository(BaseRepository):
                 workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
 
             if search_key:
-                key_like = f"%{search_key}%"
-                # Match workflow_run_id directly
-                id_matches = WorkflowRunModel.workflow_run_id.ilike(key_like)
-                # Match parameter key or description (only for non-deleted parameter definitions)
-                param_key_desc_exists = exists(
-                    select(1)
-                    .select_from(WorkflowRunParameterModel)
-                    .join(
-                        WorkflowParameterModel,
-                        WorkflowParameterModel.workflow_parameter_id == WorkflowRunParameterModel.workflow_parameter_id,
-                    )
-                    .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-                    .where(WorkflowParameterModel.deleted_at.is_(None))
-                    .where(
-                        or_(
-                            WorkflowParameterModel.key.ilike(key_like),
-                            WorkflowParameterModel.description.ilike(key_like),
-                        )
-                    )
-                )
-                # Match run parameter value directly (searches all values regardless of parameter definition status)
-                param_value_exists = exists(
-                    select(1)
-                    .select_from(WorkflowRunParameterModel)
-                    .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
-                    .where(WorkflowRunParameterModel.value.ilike(key_like))
-                )
-                # Match extra HTTP headers (cast JSON to text for search, skip NULLs)
-                extra_headers_match = and_(
-                    WorkflowRunModel.extra_http_headers.isnot(None),
-                    func.cast(WorkflowRunModel.extra_http_headers, Text()).ilike(key_like),
-                )
                 workflow_run_query = workflow_run_query.where(
-                    or_(id_matches, param_key_desc_exists, param_value_exists, extra_headers_match)
+                    self._search_key_filter(
+                        search_key,
+                        WorkflowRunModel.workflow_run_id,
+                        [
+                            WorkflowRunModel.workflow_run_id.icontains(search_key, autoescape=True),
+                            *self._run_input_search_clauses(
+                                search_key,
+                                WorkflowRunModel.workflow_run_id,
+                                WorkflowRunModel.extra_http_headers,
+                            ),
+                        ],
+                    )
                 )
 
             if status:
@@ -1534,6 +1527,23 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(TaskModel.organization_id == organization_id)
                 .filter(TaskModel.workflow_run_id.is_(None))
             )
+            if search_key:
+                prefix = self._generated_id_prefix(search_key)
+                if prefix == PERSISTENT_BROWSER_SESSION_ID:
+                    task_query = task_query.filter(TaskModel.browser_session_id == search_key)
+                elif prefix in (BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX):
+                    task_query = task_query.filter(false())
+                else:
+                    # Standalone callback URLs are not part of workflow-run webhook search.
+                    task_query = task_query.filter(
+                        or_(
+                            TaskModel.task_id.icontains(search_key, autoescape=True),
+                            TaskModel.title.icontains(search_key, autoescape=True),
+                            TaskModel.url.icontains(search_key, autoescape=True),
+                            TaskModel.navigation_goal.icontains(search_key, autoescape=True),
+                            TaskModel.data_extraction_goal.icontains(search_key, autoescape=True),
+                        )
+                    )
             if status:
                 task_query = task_query.filter(TaskModel.status.in_(status))
             task_query = task_query.order_by(TaskModel.created_at.desc()).limit(limit)
@@ -1655,17 +1665,22 @@ class WorkflowRunsRepository(BaseRepository):
 
             if search_key:
                 query = query.filter(
-                    or_(
-                        TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
-                        TaskRunModel.run_id.icontains(search_key, autoescape=True),
-                        effective_wpid.icontains(search_key, autoescape=True),
-                        # task_runs.searchable_text is only title+url, so agent inputs are matched via
-                        # workflow_run_parameters / extra_http_headers correlated on this run's run_id.
-                        *self._run_input_search_clauses(
-                            search_key,
-                            TaskRunModel.run_id,
-                            WorkflowRunModel.extra_http_headers,
-                        ),
+                    self._search_key_filter(
+                        search_key,
+                        TaskRunModel.run_id,
+                        [
+                            TaskRunModel.searchable_text.icontains(search_key, autoescape=True),
+                            TaskRunModel.run_id.icontains(search_key, autoescape=True),
+                            effective_wpid.icontains(search_key, autoescape=True),
+                            # task_runs.searchable_text is only title+url, so agent inputs are matched via
+                            # workflow_run_parameters / extra_http_headers correlated on this run's run_id.
+                            *self._run_input_search_clauses(
+                                search_key,
+                                TaskRunModel.run_id,
+                                WorkflowRunModel.extra_http_headers,
+                            ),
+                        ],
+                        standalone_tasks=True,
                     )
                 )
 
@@ -1961,21 +1976,7 @@ class WorkflowRunsRepository(BaseRepository):
             if workflow_run is None:
                 return False
             if workflow_run.status == WorkflowRunStatus.created:
-                queued_at = workflow_run.queued_at
-                if queued_at is None:
-                    serialized_publication = await _has_serialized_publication_identity(
-                        session,
-                        workflow_run,
-                        browser_session_id=workflow_run.browser_session_id,
-                        browser_address=workflow_run.browser_address,
-                    )
-                    queued_at = (
-                        await _allocate_serialized_queue_ticket(
-                            session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run_id
-                        )
-                        if serialized_publication
-                        else now
-                    )
+                queued_at = workflow_run.queued_at or await _first_queued_at(session, workflow_run)
                 # A cancel committed since the caller's read must win: the status predicate re-evaluates
                 # against the latest committed row.
                 moved = await session.execute(
@@ -2233,11 +2234,12 @@ class WorkflowRunsRepository(BaseRepository):
                         WorkflowRunAttemptModel.attempt_number == from_attempt,
                     )
                     .values(
+                        browser_profile_id=workflow_run.browser_profile_id,
                         interim_side_effects_progress=merge_attempt_progress(
                             WorkflowRunAttemptModel.interim_side_effects_progress,
                             snapshot,
                             session.bind.dialect.name,
-                        )
+                        ),
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -2634,7 +2636,122 @@ class WorkflowRunsRepository(BaseRepository):
         return [param_key_desc_exists, param_value_exists, extra_headers_match]
 
     @staticmethod
-    def _apply_workflow_run_search_key_filter(query, search_key: str | None):  # type: ignore[no-untyped-def]
+    def _generated_id_prefix(search_key: str) -> str | None:
+        """Prefix of a complete generated id (``cred_123``); None for free text or a partial id."""
+        prefix, _, int_id = search_key.partition("_")
+        return prefix if int_id.isdigit() else None
+
+    def _run_identifier_search_clauses(
+        self,
+        search_key: str,
+        workflow_run_id_col: ColumnElement[Any],
+    ) -> list[ColumnElement[bool]]:
+        """Clauses matching the identifiers attached to a run rather than its inputs. WorkflowRunModel is in
+        the FROM of every search path (outer-joined on the task_runs query, primary elsewhere), so its
+        columns are referenced directly; NULLs on non-workflow runs never match.
+
+        Only a complete credential id matches a credential, and it matches by equality: a substring arm
+        would cost a pattern match per scanned row of a table that already times out on large orgs. A
+        credential can also reach a run as a plain input value, so these arms stay ORed with the input
+        search instead of replacing it the way ``_indexed_identifier_run_ids`` does.
+        """
+        clauses: list[ColumnElement[bool]] = [
+            WorkflowRunModel.webhook_callback_url.icontains(search_key, autoescape=True)
+        ]
+        if WorkflowRunsRepository._generated_id_prefix(search_key) == CREDENTIAL_PREFIX:
+            selection_run_id = WorkflowRunCredentialSelectionModel.workflow_run_id
+            # Retries retain prior picks as <run_id>:attempt:<n>; include those picks in the run's history.
+            if self._dialect_name == "sqlite":
+                attempt_delimiter = func.instr(selection_run_id, ":attempt:")
+                selected_run_id = case(
+                    (attempt_delimiter > 0, func.substr(selection_run_id, 1, attempt_delimiter - 1)),
+                    else_=selection_run_id,
+                )
+            else:
+                selected_run_id = func.split_part(selection_run_id, ":attempt:", 1)
+            selected_runs = select(selected_run_id).where(
+                WorkflowRunCredentialSelectionModel.credential_id == search_key
+            )
+            bound_workflows = select(CredentialParameterModel.workflow_id).where(
+                CredentialParameterModel.credential_id == search_key
+            )
+            # A pool pick or fallback override recorded for the same parameter replaced the definition's
+            # credential for this run, so that parameter's binding must not match it.
+            overriding_selection = exists(
+                select(1)
+                .select_from(WorkflowRunCredentialSelectionModel)
+                .where(WorkflowRunCredentialSelectionModel.workflow_run_id == workflow_run_id_col)
+                .where(WorkflowRunCredentialSelectionModel.parameter_key == CredentialParameterModel.key)
+                # Nested two levels deep, so the run's table is not auto-correlated and would cross join.
+                .correlate_except(WorkflowRunCredentialSelectionModel)
+            )
+            # An in-place definition edit closes the replaced binding's row, so a run matches only the
+            # binding in force when it was created.
+            bound_when_created = exists(
+                select(1)
+                .select_from(CredentialParameterModel)
+                .where(CredentialParameterModel.workflow_id == WorkflowRunModel.workflow_id)
+                .where(CredentialParameterModel.credential_id == search_key)
+                .where(CredentialParameterModel.created_at <= WorkflowRunModel.created_at)
+                .where(
+                    or_(
+                        CredentialParameterModel.deleted_at.is_(None),
+                        CredentialParameterModel.deleted_at > WorkflowRunModel.created_at,
+                    )
+                )
+                .where(~overriding_selection)
+            )
+            clauses += [
+                WorkflowRunModel.sequential_credential_id == search_key,
+                workflow_run_id_col.in_(selected_runs),
+                and_(WorkflowRunModel.workflow_id.in_(bound_workflows), bound_when_created),
+            ]
+        return clauses
+
+    @staticmethod
+    def _indexed_identifier_run_ids(search_key: str, *, standalone_tasks: bool) -> CompoundSelect | None:
+        """Run ids carrying a complete browser profile or session id, each from an indexed equality lookup;
+        None for any other search. The search filters on this set alone: ORed with the substring arms, a
+        rare id would be found only by walking every run in the organization."""
+        prefix = WorkflowRunsRepository._generated_id_prefix(search_key)
+        run = aliased(WorkflowRunModel)
+        if prefix == BROWSER_PROFILE_PREFIX:
+            return union_all(
+                select(run.workflow_run_id).where(run.browser_profile_id == search_key),
+                select(WorkflowRunAttemptModel.workflow_run_id).where(
+                    WorkflowRunAttemptModel.browser_profile_id == search_key
+                ),
+            )
+        if prefix != PERSISTENT_BROWSER_SESSION_ID:
+            return None
+        lookups = [
+            select(run.workflow_run_id).where(run.browser_session_id == search_key),
+            # A retry can replace the run's current session while earlier tasks retain their session.
+            select(TaskModel.workflow_run_id).where(TaskModel.browser_session_id == search_key),
+            select(TaskV2Model.workflow_run_id).where(TaskV2Model.browser_session_id == search_key),
+        ]
+        if standalone_tasks:
+            # task_v1/task_v2 rows of task_runs carry their own id as run_id and have no workflow run.
+            lookups += [
+                select(TaskModel.task_id).where(TaskModel.browser_session_id == search_key),
+                select(TaskV2Model.observer_cruise_id).where(TaskV2Model.browser_session_id == search_key),
+            ]
+        return union_all(*lookups)
+
+    def _search_key_filter(
+        self,
+        search_key: str,
+        run_id_col: ColumnElement[Any],
+        substring_clauses: list[ColumnElement[bool]],
+        *,
+        standalone_tasks: bool = False,
+    ) -> ColumnElement[bool]:
+        identifier_run_ids = self._indexed_identifier_run_ids(search_key, standalone_tasks=standalone_tasks)
+        if identifier_run_ids is not None:
+            return run_id_col.in_(identifier_run_ids)
+        return or_(*substring_clauses, *self._run_identifier_search_clauses(search_key, run_id_col))
+
+    def _apply_workflow_run_search_key_filter(self, query, search_key: str | None):  # type: ignore[no-untyped-def]
         if not search_key:
             return query
         # Call only on WorkflowRunModel queries that already join WorkflowModel. The TaskRunModel query in
@@ -2646,15 +2763,19 @@ class WorkflowRunsRepository(BaseRepository):
             autoescape=True,
         )
         return query.where(
-            or_(
-                id_matches,
-                workflow_title_matches,
-                workflow_permanent_id_matches,
-                *WorkflowRunsRepository._run_input_search_clauses(
-                    search_key,
-                    WorkflowRunModel.workflow_run_id,
-                    WorkflowRunModel.extra_http_headers,
-                ),
+            self._search_key_filter(
+                search_key,
+                WorkflowRunModel.workflow_run_id,
+                [
+                    id_matches,
+                    workflow_title_matches,
+                    workflow_permanent_id_matches,
+                    *self._run_input_search_clauses(
+                        search_key,
+                        WorkflowRunModel.workflow_run_id,
+                        WorkflowRunModel.extra_http_headers,
+                    ),
+                ],
             )
         )
 
@@ -2837,8 +2958,8 @@ class WorkflowRunsRepository(BaseRepository):
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
     ) -> list[WorkflowRun]:
         """
-        Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
-        or extra HTTP headers.
+        Get runs for a workflow, optionally searching its title, run ID, inputs, webhook URL,
+        and complete browser or credential identifiers.
         """
         async with self.Session() as session:
             db_page = page - 1  # offset logic is 0 based

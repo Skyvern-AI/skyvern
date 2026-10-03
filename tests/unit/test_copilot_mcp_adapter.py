@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -9,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote, urlparse
 
 import pytest
+import yaml
+from agents.mcp.util import MCPUtil
+from agents.tool_context import ToolContext
 from fastmcp import FastMCP
 from mcp.types import CallToolResult
 from playwright.async_api import Route
@@ -23,7 +27,8 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM_NAME,
@@ -37,6 +42,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _transform_args,
     resolve_browser_session_binding,
 )
+from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
@@ -57,7 +63,14 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _FOR_LOOP_EXAMPLE,
+    _FOR_LOOP_GUIDANCE,
+    _FOR_LOOP_PROPERTY_DESCRIPTIONS,
+    _build_skyvern_mcp_overlays,
+    get_skyvern_mcp_alias_map,
+)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -3112,6 +3125,31 @@ async def test_browserless_surface_can_read_but_not_change_schedules() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("browser_tools_available", "expected"),
+    [
+        (True, ["create_browser_profile", "get_browser_profile", "list_browser_profiles"]),
+        (False, ["get_browser_profile", "list_browser_profiles"]),
+    ],
+)
+async def test_profile_create_needs_run_authority_and_takes_exactly_the_shared_sources(
+    browser_tools_available: bool, expected: list[str]
+) -> None:
+    tools, _ = await _listed_tools(browser_tools_available=browser_tools_available)
+
+    assert sorted(name for name in tools if "profile" in name) == expected
+    if browser_tools_available:
+        schema = tools["create_browser_profile"].inputSchema
+        assert set(schema["properties"]) - {USER_FACING_REASON_PARAM} == {
+            "name",
+            "description",
+            "browser_session_id",
+            "workflow_run_id",
+        }
+        assert schema["required"] == ["name"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", _SCHEDULE_TOOLS)
 async def test_schedule_tools_always_target_the_chat_workflow(tool_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
@@ -3681,3 +3719,90 @@ class TestPageStateOnBrowserResults:
 
         assert result.isError is True
         assert "redaction_withheld" in result.content[0].text and "timed out" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    name = "get_block_schema"
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name]},
+        allowlist=frozenset({aliases[name]}),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        advertised = await server.list_tools()
+        assert [tool.name for tool in advertised] == [name]
+        schema = advertised[0].inputSchema
+        assert "user_facing_reason" in schema["properties"]
+        assert "user_facing_reason" not in schema.get("required", [])
+        tool = MCPUtil.to_function_tool(advertised[0], server, convert_schemas_to_strict=False)
+        assert serialize_tool_surface([tool]).payload["tools"][0]["params_json_schema"] == schema
+        tc = ToolContext(context=ctx, tool_name=name, tool_call_id="schema-call", tool_arguments="{}")
+        for reason in (None, "", "   ", 17, {"bad": True}, "I will inspect the code block options."):
+            result = await tool.on_invoke_tool(tc, json.dumps({"block_type": "code", "user_facing_reason": reason}))
+            assert "input validation error" not in str(result).lower()
+            assert "code" in str(result)
+        original = _transform_args(
+            {"block_type": "code", "user_facing_reason": "Explain"}, _build_skyvern_mcp_overlays()[name]
+        )
+        assert original == {"block_type": "code"}
+    finally:
+        await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    names = ("get_block_schema", "get_workflow_knowledge")
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name] for name in names},
+        allowlist=frozenset(aliases[name] for name in names),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        tools = {tool.name: tool for tool in await server.list_tools()}
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            tool = MCPUtil.to_function_tool(tools[name], server, convert_schemas_to_strict=False)
+            tc = ToolContext(context=ctx, tool_name=name, tool_call_id=f"{name}-call", tool_arguments="{}")
+            output = await tool.on_invoke_tool(tc, json.dumps(arguments))
+            return json.loads(output["text"])["data"]
+
+        schema_data = await call("get_block_schema", {"block_type": "for_loop"})
+        knowledge = (await call("get_workflow_knowledge", {"topics": ["for_loop_block"]}))["sections"]["for_loop_block"]
+    finally:
+        await server.cleanup()
+
+    schema = schema_data["schema"]
+    properties = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]["properties"]
+    assert {name: properties[name]["description"] for name in _FOR_LOOP_PROPERTY_DESCRIPTIONS} == (
+        _FOR_LOOP_PROPERTY_DESCRIPTIONS
+    )
+    assert schema_data["example"] == _FOR_LOOP_EXAMPLE
+    producer, loop = schema_data["example"]["blocks"]
+    assert loop["loop_over_parameter_key"] == f"{producer['label']}_output"
+    assert "loop_variable_reference" not in loop
+    assert knowledge["content"] == _FOR_LOOP_GUIDANCE
+    assert all(description in _FOR_LOOP_GUIDANCE for description in _FOR_LOOP_PROPERTY_DESCRIPTIONS.values())
+    assert yaml.safe_load(_FOR_LOOP_GUIDANCE.partition("the list):\n")[2]) == _FOR_LOOP_EXAMPLE
+    assert {"loop_over_parameter_key", "loop_variable_reference"} <= set(properties)
+
+    both_inputs = {
+        "block_type": "for_loop",
+        "label": "visit_each_row",
+        "loop_over_parameter_key": "parse_rows_output",
+        "loop_variable_reference": "current_value",
+        "loop_blocks": [{"block_type": "goto_url", "label": "open_row_url", "url": "{{ current_value.url }}"}],
+    }
+    submitted = copy.deepcopy(both_inputs)
+    assert _block_authoring_violations(submitted, AGENT_BLOCKS_ONLY) == []
+    assert submitted == both_inputs

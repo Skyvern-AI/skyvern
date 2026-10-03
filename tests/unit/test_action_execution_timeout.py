@@ -3,10 +3,12 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ActionType, ClickAction, WaitAction
 from skyvern.webeye.actions.handler import ActionHandler, _resolve_action_execution_timeout
+from skyvern.webeye.browser_driver_errors import DRIVER_TIMEOUT_ERROR_TYPES
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -71,6 +73,38 @@ async def test_handler_raised_timeout_error_keeps_original_exception_type() -> N
     assert len(results) == 1
     assert results[0].success is False
     assert results[0].exception_type == "TimeoutError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raised", "expected_level"),
+    [(timeout_type("Timeout 30000ms exceeded."), "warning") for timeout_type in DRIVER_TIMEOUT_ERROR_TYPES]
+    + [(RuntimeError("unexpected"), "error")],
+)
+async def test_only_driver_timeouts_are_demoted_from_error(raised: Exception, expected_level: str) -> None:
+    task, step, scraped_page, page = _rig()
+
+    async def raising_handler(*args: object, **kwargs: object) -> None:
+        raise raised
+
+    action = ClickAction(element_id="el")
+    with (
+        patch("skyvern.webeye.actions.handler.app", _app_mock()),
+        patch.dict(ActionHandler._handled_action_types, {ActionType.CLICK: raising_handler}),
+        patch.dict(ActionHandler._setup_action_types, {}, clear=True),
+        patch.dict(ActionHandler._teardown_action_types, {}, clear=True),
+        patch("skyvern.webeye.actions.handler.settings.BROWSER_ACTION_MAX_EXECUTION_SECONDS", 60, create=True),
+        capture_logs() as logs,
+    ):
+        results = await asyncio.wait_for(
+            ActionHandler._handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
+            timeout=2,
+        )
+    assert len(results) == 1
+    assert results[0].success is False
+    assert results[0].exception_type == type(raised).__name__
+    alerting_levels = [entry["log_level"] for entry in logs if entry["log_level"] in ("warning", "error", "critical")]
+    assert alerting_levels == [expected_level]
 
 
 def test_wait_action_extends_execution_budget() -> None:

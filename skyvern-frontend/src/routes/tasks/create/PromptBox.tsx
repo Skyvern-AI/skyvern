@@ -100,34 +100,59 @@ const exampleCases = [
     icon: <CartIcon className="size-6" />,
   },
   {
-    key: "contact_us_forms",
-    hint: "canadahvac.com",
-    label: "Fill a contact us form",
-    prompt: `Go to https://canadahvac.com/contact-hvac-canada. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. Here's the user information: {"name":"John Doe","email":"john.doe@gmail.com","phone":"123-456-7890","message":"Hello, I have a question about your services."}`,
+    key: "add_employee",
+    hint: "orangehrmlive.com",
+    label: "Log into an HR portal and add an employee",
+    prompt: `Make a workflow that logs into OrangeHRM at https://opensource-demo.orangehrmlive.com/web/index.php/auth/login using my saved OrangeHRM credential. Then go to PIM, click Add, and add a new employee with first name {{first_name}} and last name {{last_name}}. Keep the auto-filled Employee Id and leave "Create Login Details" off.`,
     icon: <EnvelopeClosedIcon className="size-6" />,
   },
   {
     key: "geico",
     hint: "geico.com",
     label: "Get an insurance quote",
-    prompt: `Go to https://www.geico.com first. Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If you're on a page showing an auto insurance quote (with premium amounts), your goal is COMPLETE. Extract all quote information in JSON format including the premium amount, the timeframe for the quote. Here's the user information: {"licensed_at_age":19,"education_level":"HIGH_SCHOOL","phone_number":"8042221111","full_name":"Chris P. Bacon","past_claim":[],"has_claims":false,"spouse_occupation":"Florist","auto_current_carrier":"None","home_commercial_uses":null,"spouse_full_name":"Amy Stake","auto_commercial_uses":null,"requires_sr22":false,"previous_address_move_date":null,"line_of_work":null,"spouse_age":"1987-12-12","auto_insurance_deadline":null,"email":"chris.p.bacon@abc.com","net_worth_numeric":1000000,"spouse_gender":"F","marital_status":"married","spouse_licensed_at_age":20,"license_number":"AAAAAAA090AA","spouse_license_number":"AAAAAAA080AA","how_much_can_you_lose":25000,"vehicles":[{"annual_mileage":10000,"commute_mileage":4000,"existing_coverages":null,"ideal_coverages":{"bodily_injury_per_incident_limit":50000,"bodily_injury_per_person_limit":25000,"collision_deductible":1000,"comprehensive_deductible":1000,"personal_injury_protection":null,"property_damage_per_incident_limit":null,"property_damage_per_person_limit":25000,"rental_reimbursement_per_incident_limit":null,"rental_reimbursement_per_person_limit":null,"roadside_assistance_limit":null,"underinsured_motorist_bodily_injury_per_incident_limit":50000,"underinsured_motorist_bodily_injury_per_person_limit":25000,"underinsured_motorist_property_limit":null},"ownership":"Owned","parked":"Garage","purpose":"commute","vehicle":{"style":"AWD 3.0 quattro TDI 4dr Sedan","model":"A8 L","price_estimate":29084,"year":2015,"make":"Audi"},"vehicle_id":null,"vin":null}],"additional_drivers":[],"home":[{"home_ownership":"owned"}],"spouse_line_of_work":"Agriculture, Forestry and Fishing","occupation":"Customer Service Representative","id":null,"gender":"M","credit_check_authorized":false,"age":"1987-11-11","license_state":"Washington","cash_on_hand":"$10000–14999","address":{"city":"HOUSTON","country":"US","state":"TX","street":"9625 GARFIELD AVE.","zip":"77082"},"spouse_education_level":"MASTERS","spouse_email":"amy.stake@abc.com","spouse_added_to_auto_policy":true}`,
+    prompt: `Go to https://www.geico.com first. Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. Here's the details: full name: Chris P. Bacon, date of birth: 1987-11-11, gender: male, marital status: married, address: 9625 Garfield Ave., Houston, TX 77082, phone number: 804-222-1111, email: chris.p.bacon@abc.com, education: high school, occupation: Customer Service Representative, license state: Washington, license number: AAAAAAA090AA, licensed at age: 19, current auto carrier: none, past claims: none, requires SR-22: no, additional drivers: none, credit check authorized: no, home ownership: owned, net worth: $1,000,000, cash on hand: $10,000–14,999, how much I can afford to lose: $25,000, vehicle: 2015 Audi A8 L AWD 3.0 quattro TDI 4dr Sedan, vehicle price estimate: $29,084, vehicle ownership: owned, parked: garage, vehicle use: commute, annual mileage: 10,000, commute mileage: 4,000, bodily injury limit: $25,000 per person / $50,000 per incident, property damage limit: $25,000, collision deductible: $1,000, comprehensive deductible: $1,000, underinsured motorist bodily injury limit: $25,000 per person / $50,000 per incident, spouse name: Amy Stake, spouse date of birth: 1987-12-12, spouse gender: female, spouse education: masters, spouse occupation: Florist, spouse line of work: Agriculture, Forestry and Fishing, spouse email: amy.stake@abc.com, spouse license number: AAAAAAA080AA, spouse licensed at age: 20, add spouse to auto policy: yes`,
     icon: <FileTextIcon className="size-6" />,
   },
   {
-    key: "extractIntegrationsFromGong",
-    hint: "gong.io",
-    label: "Extract integrations from Gong",
+    key: "extractIntegrationsFromSkyvern",
+    hint: "skyvern.com",
+    label: "Extract integrations from Skyvern",
     prompt:
-      "Go to https://www.gong.io first. Navigate to the 'Integrations' page on the Gong website. Extract the names and descriptions of all integrations listed on the Gong integrations page. Ensure not to click on any external links or advertisements.",
+      "Go to https://skyvern.com. Navigate to 'Resources' -> 'Integrations'. Extract the names and descriptions of all the supported integrations.",
     icon: <GearIcon className="size-6" />,
   },
   {
     key: "AAPLStockPrice",
     hint: "google.com/finance",
-    label: "Search for AAPL on Google Finance",
-    prompt:
-      'Go to google finance and find the "AAPL" stock price. COMPLETE when the search results for "AAPL" are displayed and the stock price is extracted.',
+    label: "Track Apple's stock price on Google Finance",
+    prompt: `Go to Google Finance and search for "AAPL" (Apple Inc., NASDAQ).
+Extract:
+- Current price
+- Change since previous close ($ and %)
+- Today's open, and the change since open ($ and %), calculated as current price minus open
+- Day high and low
+- Previous close
+- Market status (open, closed, pre-market or after-hours) and the timestamp shown
+- After-hours price, if shown
+Return the numbers as plain values with no $ or % symbols.`,
     icon: <GraphIcon className="size-6" />,
+  },
+] as const;
+
+// Reached only through `/discover?focus=prompt&example=<key>` links; not shown in the example grid.
+const promptStarters = [
+  {
+    key: "collect_website_data",
+    prompt: "Go to [page URL] and extract the product names and prices.",
+  },
+  {
+    key: "download_invoices",
+    prompt: "Log in to [vendor portal] and download last month's invoices.",
+  },
+  {
+    key: "fill_out_form",
+    prompt:
+      "Open [form URL] and fill it with [details]. Stop before submitting.",
   },
 ] as const;
 
@@ -293,6 +318,8 @@ function PromptBoxImpl(
   }, [handoffFlagLoading]);
   const hideFlagControls = handoffFlagLoading && !handoffFlagWaitExpired;
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // file_id of the sample resume an example uploaded, so a user's own upload is never mistaken for it.
+  const exampleFileIdRef = useRef<string>();
   const { setAutoplay } = useAutoplayStore();
   // react-query isPending only flips on the next render, so a same-frame
   // double-click can slip past it; the ref is the synchronous guard.
@@ -311,6 +338,7 @@ function PromptBoxImpl(
     focusAndPrefillExample: (key, fallback) => {
       const selectedExample =
         exampleCases.find((example) => example.key === key) ??
+        promptStarters.find((starter) => starter.key === key) ??
         exampleCases.find((example) => example.key === fallback) ??
         exampleCases[0];
       if (!prompt.trim()) {
@@ -367,7 +395,10 @@ function PromptBoxImpl(
         available: true,
       } satisfies CopilotAttachedFile;
     },
-    onSuccess: (attached) => {
+    onSuccess: (attached, source) => {
+      if (typeof source === "string") {
+        exampleFileIdRef.current = attached.file_id;
+      }
       HomeTelemetry.uploadDocumentFinished(true);
       setAttachedFiles((current) =>
         current.length >= MAX_HOME_ATTACHMENTS
@@ -385,8 +416,12 @@ function PromptBoxImpl(
   // Returns the prompt to load. Attachments only reach the copilot handoff path,
   // so the plain task path gets the file's public URL in the prompt instead.
   const withExampleAttachment = (prompt: string, path?: string) => {
-    const filename = path?.split("/").pop();
-    if (!path || !filename) return prompt;
+    if (!path) {
+      setAttachedFiles((current) =>
+        current.filter((file) => file.file_id !== exampleFileIdRef.current),
+      );
+      return prompt;
+    }
     if (!enableCopilotHandoff) {
       return `${prompt} The attached resume is at ${SAMPLE_RESUME_PUBLIC_URL}; download it from there.`;
     }
@@ -400,7 +435,9 @@ function PromptBoxImpl(
     }
     // Starting the upload here (not after a fetch) flips isPending before the next render,
     // which disables submit and the example buttons until the resume is attached.
-    if (!attachedFiles.some((file) => file.filename === filename)) {
+    if (
+      !attachedFiles.some((file) => file.file_id === exampleFileIdRef.current)
+    ) {
       uploadDocumentMutation.mutate(path);
     }
     return prompt;
@@ -901,12 +938,9 @@ function PromptBoxImpl(
           ) : null}
         </div>
         <section className="mt-9 w-full max-w-[60rem] md:mt-16">
-          <div className="mb-3 flex flex-col gap-1 md:mb-3.5 md:flex-row md:items-baseline md:justify-between">
-            <h2 className="text-sm font-semibold">Try an example</h2>
-            <p className="text-[13px] text-muted-foreground">
-              Pick one to load it into the prompt, edit it, then run.
-            </p>
-          </div>
+          <h2 className="mb-3 text-sm font-semibold md:mb-3.5">
+            Try an example
+          </h2>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 sm:gap-3 lg:grid-cols-3">
             {exampleCases.map((example) => (
               <ExampleCasePill

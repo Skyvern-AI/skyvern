@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from sqlalchemy import func, select
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, OutputParameterModel, WorkflowModel
@@ -198,12 +199,20 @@ async def test_create_workflow_accepts_idempotency_key_within_bounds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    audit_events: list[AuditEvent] = []
+
+    async def record_audit_event(_principal: object, event: AuditEvent) -> None:
+        audit_events.append(event)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "record_audit_event", record_audit_event)
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: None)
     async with idempotency_lab(monkeypatch, tmp_path / f"accept-{len(key or '')}.db") as lab:
         created = await lab.create(key)
         replayed = await lab.create(key)
 
         assert created.status_code == 200
         assert replayed.status_code == 200
+        assert [event.action for event in audit_events] == ["workflow.create"] * (2 if key is None else 1)
         if key is None:
             assert replayed.json()["workflow_permanent_id"] != created.json()["workflow_permanent_id"]
             assert await lab.count_workflows() == 2
@@ -220,6 +229,13 @@ async def test_create_workflow_honors_idempotency_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    audit_events: list[AuditEvent] = []
+
+    async def record_audit_event(_principal: object, event: AuditEvent) -> None:
+        audit_events.append(event)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "record_audit_event", record_audit_event)
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: None)
     database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency.db'}")
     async with database.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -289,6 +305,7 @@ async def test_create_workflow_honors_idempotency_key(
             assert len(original.json()["workflow_definition"]["blocks"]) == 1
             assert replay.json()["workflow_id"] == original.json()["workflow_id"]
             assert replay.json()["workflow_permanent_id"] == original.json()["workflow_permanent_id"]
+            assert [event.action for event in audit_events] == ["workflow.create"]
             async with database.Session() as session:
                 active_row_count = await session.scalar(
                     select(func.count())
@@ -307,6 +324,7 @@ async def test_create_workflow_honors_idempotency_key(
             assert distinct.status_code == 200
             assert distinct.json()["workflow_id"] != original.json()["workflow_id"]
             assert distinct.json()["workflow_permanent_id"] != original.json()["workflow_permanent_id"]
+            assert [event.action for event in audit_events] == ["workflow.create", "workflow.create"]
             async with database.Session() as session:
                 active_row_count = await session.scalar(
                     select(func.count())
@@ -328,6 +346,7 @@ async def test_create_workflow_honors_idempotency_key(
 
         assert deleted_replay.status_code == 200
         assert deleted_replay.json()["workflow_id"] == original.json()["workflow_id"]
+        assert [event.action for event in audit_events] == ["workflow.create", "workflow.create"]
     finally:
         await database.engine.dispose()
 

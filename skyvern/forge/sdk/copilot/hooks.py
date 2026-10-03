@@ -13,6 +13,7 @@ from agents.items import ModelResponse, TResponseInputItem
 from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
+from agents.tool_context import ToolContext
 
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
 from skyvern.forge.sdk.copilot.credential_pause import arm_credential_pause_gate
@@ -151,7 +152,7 @@ class CopilotRunHooks(RunHooksBase):
 
     async def on_tool_end(
         self,
-        context: RunContextWrapper,
+        context: ToolContext[CopilotContext],
         agent: Agent,
         tool: Tool,
         result: Any,
@@ -213,6 +214,17 @@ class CopilotRunHooks(RunHooksBase):
                 ]
                 activity_entry["integrations"] = integrations
 
+            if tool_name == "read_google_sheet" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                rows = data.get("connections", []) if isinstance(data, dict) else []
+                activity_entry["opened_connection_ids"] = [
+                    row["connection_id"]
+                    for row in (rows if isinstance(rows, list) else [])
+                    if isinstance(row, dict)
+                    and row.get("status") == "opened"
+                    and isinstance(row.get("connection_id"), str)
+                ]
+
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 blocks = data.get("blocks", []) if isinstance(data, dict) else []
@@ -256,6 +268,7 @@ class CopilotRunHooks(RunHooksBase):
                 else None,
                 **_copilot_log_fields(self._ctx),
             )
+            self._ctx.goal_satisfied_tool_call_id = context.tool_call_id
             self._ctx.goal_satisfied_tool_name = tool_name
             self._ctx.goal_satisfied_tool_output = dict(parsed)
 

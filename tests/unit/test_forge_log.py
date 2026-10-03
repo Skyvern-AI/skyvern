@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import subprocess
 import sys
 import textwrap
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -326,7 +329,8 @@ def test_org_age_is_an_integer_field_not_a_msg_suffix(org_age: int | None) -> No
     if org_age is None:
         assert "org_age" not in event_dict
     else:
-        assert type(event_dict["org_age"]) is int and event_dict["org_age"] == org_age
+        emitted_age = json.loads(json.dumps(event_dict))["org_age"]
+        assert type(emitted_age) is int and emitted_age == org_age
     assert event_dict["msg"] == "Run task activity started | workflow_run_id=wr_1"
 
 
@@ -362,3 +366,57 @@ def test_a_dropped_coroutine_warning_names_its_call_site() -> None:
     assert "was never awaited" in result.stderr
     assert "Coroutine created at" in result.stderr
     assert "in sig_handler" in result.stderr
+
+
+def test_json_log_callsite_names_the_caller_without_reading_its_source(tmp_path: Path) -> None:
+    """The callsite fields come from the frame alone. Reading the caller's source for context lines no field
+    uses made a process's first log line map every loaded module to its file, about 0.2 s of worker boot. Run out of
+    process for the same reason as the coroutine-warning test: setup_logger() rewires global state."""
+    probe_module = tmp_path / "callsite_probe.py"
+    probe_module.write_text(
+        textwrap.dedent(
+            """
+            import structlog
+
+            def emit() -> int:
+                structlog.get_logger("skyvern.test.callsite").info("callsite probe")
+                return emit.__code__.co_firstlineno + 1
+            """
+        )
+    )
+    program = textwrap.dedent(
+        """
+        import importlib.util
+        import json
+        import linecache
+        import sys
+
+        from skyvern.forge.sdk.forge_log import setup_logger
+
+        setup_logger()
+        spec = importlib.util.spec_from_file_location("callsite_probe", sys.argv[1])
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        line = module.emit()
+        print(json.dumps({"line": line, "source_read": sys.argv[1] in linecache.cache}))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(probe_module)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "JSON_LOGGING": "true", "LOG_LEVEL": "INFO"},
+    )
+
+    probe = json.loads(result.stdout.strip().splitlines()[-1])
+    record = next(
+        json.loads(line) for line in result.stderr.splitlines() if line.startswith("{") and "callsite probe" in line
+    )
+    assert (record["pathname"], record["filename"], record["module"]) == (
+        str(probe_module),
+        "callsite_probe.py",
+        "callsite_probe",
+    )
+    assert (record["func_name"], record["lineno"]) == ("emit", probe["line"])
+    assert probe["source_read"] is False

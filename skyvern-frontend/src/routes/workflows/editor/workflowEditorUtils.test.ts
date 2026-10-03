@@ -1,3 +1,4 @@
+import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, test } from "vitest";
 
 import { ProxyLocation, RunEngine } from "@/api/types";
@@ -17,11 +18,14 @@ import {
   getWorkflowErrors,
   pendingGoalChangesOf,
   withGoalUndoRecordsFrom,
+  workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
 
-function minimalTaskBlock(overrides: { engine?: RunEngine } = {}) {
+function minimalTaskBlock(
+  overrides: { engine?: RunEngine; engine_pinned?: boolean } = {},
+) {
   return {
     block_type: "task",
     label: "b1",
@@ -97,6 +101,7 @@ function codeBlock(goalNeedsRegeneration: boolean | null): AppNode {
       dataSchema: "null",
       userOwnedGoal: true,
       goalNeedsRegeneration,
+      codeEditedByHand: null,
       model: null,
     },
   } as AppNode;
@@ -128,6 +133,39 @@ describe("getWorkflowErrors", () => {
     } as AppNode;
 
     expect(getWorkflowErrors([apiAuthored])).toEqual([]);
+  });
+
+  test("a hand code edit holds no save and survives load, save and export", () => {
+    const stored = {
+      block_type: "code",
+      label: "read_total",
+      code: "return {'total': 1}",
+      parameters: [],
+      error_code_mapping: null,
+      prompt: "Read the total",
+      user_owned_goal: true,
+      code_edited_by_hand: true,
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([stored], SETTINGS, true);
+    const source = {
+      title: "Source",
+      description: null,
+      is_saved_task: false,
+      status: null,
+      run_with: "agent",
+      workflow_definition: { parameters: [], blocks: [stored] },
+    } as unknown as WorkflowApiResponse;
+
+    expect(getWorkflowErrors(nodes)).toEqual([]);
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      code_edited_by_hand: true,
+    });
+    expect(convert(source).workflow_definition.blocks[0]).toMatchObject({
+      code_edited_by_hand: true,
+    });
   });
 
   test("saves once the code has been rebuilt from the Goal", () => {
@@ -319,17 +357,21 @@ describe("terminate block error code round trip", () => {
 });
 
 function loadAndSave(
-  stored: RunEngine | undefined,
+  stored: { engine?: RunEngine; engine_pinned?: boolean },
   effectiveDefaultEngine: RunEngine | null | undefined,
 ) {
   const { nodes, edges } = getElements(
-    [minimalTaskBlock(stored ? { engine: stored } : {})],
+    [minimalTaskBlock(stored)],
     SETTINGS,
     true,
     effectiveDefaultEngine,
   );
   const [saved] = getWorkflowBlocks(nodes, edges);
-  return (saved as { engine?: RunEngine | null }).engine;
+  const { engine, engine_pinned } = saved as {
+    engine?: RunEngine | null;
+    engine_pinned?: boolean;
+  };
+  return { engine, engine_pinned };
 }
 
 describe("block engine load and save", () => {
@@ -339,28 +381,75 @@ describe("block engine load and save", () => {
     expect(getWorkflowBlocks([node], [])[0]).toMatchObject({ engine: null });
   });
 
+  const v1 = RunEngine.SkyvernV1;
   test.each([
-    ["unset", undefined, null, null],
-    ["skyvern-1.0 on a routed workflow", RunEngine.SkyvernV1, null, null],
+    ["unset", {}, null, { engine: null }],
+    [
+      "an unmarked skyvern-1.0 on a routed workflow",
+      { engine: v1 },
+      null,
+      { engine: null },
+    ],
+    [
+      "a marked skyvern-1.0 on a routed workflow",
+      { engine: v1, engine_pinned: true },
+      null,
+      { engine: v1, engine_pinned: true },
+    ],
     [
       "skyvern-1.0 on a chosen-engine workflow",
-      RunEngine.SkyvernV1,
+      { engine: v1 },
       RunEngine.SkyvernV3,
-      RunEngine.SkyvernV1,
+      { engine: v1 },
     ],
     [
       "skyvern-1.0 when the workflow's default is unknown",
-      RunEngine.SkyvernV1,
+      { engine: v1 },
       undefined,
-      RunEngine.SkyvernV1,
+      { engine: v1 },
     ],
-    ["skyvern-2.0", RunEngine.SkyvernV2, null, RunEngine.SkyvernV2],
-    ["skyvern-3.0", RunEngine.SkyvernV3, null, RunEngine.SkyvernV3],
-  ])("%s loads and saves as %s", (_, stored, effective, expected) => {
-    expect(loadAndSave(stored, effective)).toBe(expected);
+    [
+      "skyvern-2.0",
+      { engine: RunEngine.SkyvernV2 },
+      null,
+      { engine: RunEngine.SkyvernV2 },
+    ],
+    [
+      "skyvern-3.0",
+      { engine: RunEngine.SkyvernV3 },
+      null,
+      { engine: RunEngine.SkyvernV3 },
+    ],
+  ])(
+    "%s round-trips through load and save",
+    (_, stored, effective, expected) => {
+      expect(loadAndSave(stored, effective)).toEqual(expected);
+    },
+  );
+
+  test("a save response, which omits the workflow's default engine, shows an unmarked skyvern-1.0 as Default", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(["workflow", "wpid_old"], {
+      workflow_permanent_id: "wpid_old",
+      effective_default_engine: null,
+    });
+    const saveResponse = { workflow_permanent_id: "wpid_old" };
+
+    expect(
+      loadAndSave(
+        { engine: v1 },
+        workflowEffectiveDefaultEngine(saveResponse, queryClient),
+      ),
+    ).toEqual({ engine: null });
+    expect(
+      workflowEffectiveDefaultEngine(
+        { ...saveResponse, effective_default_engine: RunEngine.SkyvernV3 },
+        queryClient,
+      ),
+    ).toBe(RunEngine.SkyvernV3);
   });
 
-  test("a copy drops a legacy skyvern-1.0 unless the source honours chosen engines; an export keeps it", () => {
+  test("a copy drops a legacy skyvern-1.0 unless the source honours chosen engines or a person marked it; an export keeps it", () => {
     const source = {
       title: "Source",
       description: null,
@@ -375,6 +464,13 @@ describe("block engine load and save", () => {
             ...minimalTaskBlock({ engine: RunEngine.SkyvernV3 }),
             label: "b2",
           },
+          {
+            ...minimalTaskBlock({
+              engine: RunEngine.SkyvernV1,
+              engine_pinned: true,
+            }),
+            label: "b3",
+          },
         ],
       },
     } as unknown as WorkflowApiResponse;
@@ -383,10 +479,18 @@ describe("block engine load and save", () => {
         (block) => (block as { engine?: RunEngine | null }).engine,
       );
 
-    expect(engines(convert(source, { asNewWorkflow: true }))).toEqual([
+    const copy = convert(source, { asNewWorkflow: true });
+    expect(engines(copy)).toEqual([
       null,
       RunEngine.SkyvernV3,
+      RunEngine.SkyvernV1,
     ]);
+    expect(copy.workflow_definition.blocks[2]).toMatchObject({
+      engine_pinned: true,
+    });
+    expect(copy.workflow_definition.blocks[0]).not.toHaveProperty(
+      "engine_pinned",
+    );
     expect(
       engines(
         convert(
@@ -394,10 +498,11 @@ describe("block engine load and save", () => {
           { asNewWorkflow: true },
         ),
       ),
-    ).toEqual([RunEngine.SkyvernV1, RunEngine.SkyvernV3]);
+    ).toEqual([RunEngine.SkyvernV1, RunEngine.SkyvernV3, RunEngine.SkyvernV1]);
     expect(engines(convert(source))).toEqual([
       RunEngine.SkyvernV1,
       RunEngine.SkyvernV3,
+      RunEngine.SkyvernV1,
     ]);
   });
 });

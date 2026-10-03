@@ -12,6 +12,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import organization_age_cache
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.services import organization_log_scope
 
 
@@ -96,15 +97,30 @@ class _AiFallbackFlagProvider(NoOpExperimentationProvider):
 
 @pytest.fixture
 def ai_fallback_flag(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None], None]:
-    """Turn the org-scoped code block AI fallback flag on for one organization id (None: off everywhere)."""
+    """Turn the org-scoped code block AI fallback flag on for one organization id (None: off everywhere), in a
+    run that is neither a Copilot build test nor an editor block run."""
     provider = _AiFallbackFlagProvider()
     monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", provider)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(copilot_session_id=None, is_debug_session=False, parent_workflow_run_id=None)
+        ),
+    )
 
     def set_enabled_for_org(organization_id: str | None) -> None:
         provider.enabled_for_org = organization_id
         provider.result_map.clear()
 
     return set_enabled_for_org
+
+
+@pytest.fixture
+def ai_fallback_on_in_an_ordinary_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the code block AI fallback on, in a run that is neither a Copilot build test nor an editor block run."""
+    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "_is_authoring_run", AsyncMock(return_value=False))
 
 
 @pytest.fixture

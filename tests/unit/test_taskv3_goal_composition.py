@@ -18,12 +18,13 @@ from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN, PageDerivedRender
 from skyvern.forge.taskv3.goal_composition import (
     MAX_HANDOFF_LABEL_CHARS,
-    PAGE_DATA_NOTE,
     CodeProgressRecord,
+    CodeTypedValue,
     GoalDirectives,
     compose_goal,
     present_page_derived,
     render_block_context,
+    typed_value_rows,
 )
 from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff
 from tests.unit._taskv3_block_fakes import PLAIN_URL
@@ -264,7 +265,7 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
     # v1 runs a block with no navigation goal as ONE extract action that returns nulls for whatever the page does
     # not show and completes; workflows branch on those nulls. v3 was told neither what such a block is for nor
     # what finishing it means, so it failed the block whenever an earlier block had not reached the data
-    # (SKY-16398). Present on exactly v1's predicate, only in the treatment arm.
+    # (SKY-16398). Present on exactly v1's predicate.
     now = datetime.now(UTC)
     org = make_organization(now)
     extraction_only = make_task(now, org, navigation_goal=None, data_extraction_goal="the license status")
@@ -272,10 +273,9 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
         label="blk", output_parameter=output_param("blk"), data_extraction_goal="the license status"
     )
 
-    treated, _ = render_block_context(extraction_only, block, None, extraction_reports=True)
-    control, _ = render_block_context(extraction_only, block, None, extraction_reports=False)
+    framing, _ = render_block_context(extraction_only, block, None)
 
-    added = [p for p in treated.split("\n\n") if p not in control.split("\n\n")]
+    added = [p for p in framing.split("\n\n") if p.startswith("This block only reads the page")]
     assert len(added) == 1, added
     assert "null" in added[0]
     assert "status=completed" in added[0]
@@ -285,8 +285,6 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
     assert "read from the page" in added[0]
     assert "never invent" in added[0]
     assert "current date" in added[0]
-    # The control render is what shipped before the arm existed.
-    assert control == render_block_context(extraction_only, block, None)[0]
 
     out_of_predicate = [
         make_task(now, org, navigation_goal="Search for the record", data_extraction_goal="the license status"),
@@ -294,15 +292,11 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
         make_task(now, org, navigation_goal=None, data_extraction_goal="x", task_type=TaskType.validation),
     ]
     for task in out_of_predicate:
-        assert render_block_context(task, block, None, extraction_reports=True) == render_block_context(
-            task, block, None
-        )
+        assert "This block only reads the page" not in render_block_context(task, block, None)[0]
     # A task block carrying only an extraction goal keeps its fill tools, so it is not told it only reads.
-    assert render_block_context(extraction_only, _make_block("blk"), None, extraction_reports=True) == (
-        render_block_context(extraction_only, _make_block("blk"), None)
-    )
+    assert "This block only reads the page" not in render_block_context(extraction_only, _make_block("blk"), None)[0]
     # A bare task has no workflow to route its nulls, so it gets no block framing at all.
-    assert render_block_context(extraction_only, None, None, extraction_reports=True) == ("", "")
+    assert render_block_context(extraction_only, None, None) == ("", "")
 
 
 def test_a_page_value_cannot_close_its_own_span() -> None:
@@ -330,13 +324,20 @@ def test_a_page_value_read_only_in_control_flow_is_not_presented() -> None:
     assert present_page_derived("navigation_goal", "Apply now", render) is None
 
 
-def test_the_page_data_note_sits_between_the_criteria_and_the_framing_only_when_asked() -> None:
-    directives = GoalDirectives(complete_criterion="the form is sent", framing="FRAMING", page_data_note=True)
+def test_an_oversized_typed_value_is_withheld_without_hiding_the_rows_after_it() -> None:
+    values = (
+        CodeTypedValue(line=1, target="#notes", value=" ".join(f"word{n}" for n in range(5000))),
+        CodeTypedValue(line=2, target="#name", value="Ada"),
+        CodeTypedValue(line=3, target="#email", value="ada@example.test"),
+    )
 
-    goal = compose_goal("Apply", directives)
+    rows = typed_value_rows(values, token_budget=500)
 
-    assert goal.index("the form is sent") < goal.index(PAGE_DATA_NOTE) < goal.index("FRAMING")
-    assert PAGE_DATA_NOTE not in compose_goal("Apply", GoalDirectives(framing="FRAMING"))
+    assert rows == [
+        '- Line 2 types "Ada" into "#name"',
+        '- Line 3 types "ada@example.test" into "#email"',
+        "- 1 more typed values not listed",
+    ]
 
 
 def test_the_code_outline_is_one_labelled_section_after_everything_else_and_only_when_given() -> None:

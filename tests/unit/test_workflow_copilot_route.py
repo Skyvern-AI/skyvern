@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import re
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,9 +19,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -29,6 +32,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import credential_pause
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
@@ -63,6 +67,7 @@ from skyvern.forge.sdk.copilot.interruption import (
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump_workflow_yaml
+from skyvern.forge.sdk.db.agent_db import _build_engine
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import (
@@ -118,6 +123,7 @@ from tests.unit.copilot_route_test_support import (
     terminal_narrative_payload,
 )
 from tests.unit.services.test_browser_recording_code_first import draft_for, make_click, make_input, make_url_change
+from tests.unit.test_copilot_credential_pause import _FakeCache
 
 
 @pytest.fixture
@@ -582,12 +588,16 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     chat = SimpleNamespace(
         organization_id="org-1",
         workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
         proposed_workflow=None,
         auto_accept=True,
     )
     original_workflow = fake_workflow(workflow_id="wf-canonical")
     updated_workflow = MagicMock()
     updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    # This route test uses intentionally partial workflow doubles; changed-field
+    # behavior is covered with persisted Workflow models in the cloud audit tests.
+    monkeypatch.setattr(workflow_copilot_route, "workflow_changed_fields", lambda *_: ("title",))
     agent_result = AgentResult(
         user_response="done",
         updated_workflow=updated_workflow,
@@ -598,6 +608,8 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     )
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     stream = MagicMock(send=AsyncMock(return_value=True))
+    audit_writer = AsyncMock()
+    monkeypatch.setattr(workflow_copilot_route.app.AGENT_FUNCTION, "record_audit_event", audit_writer)
 
     await workflow_copilot_route._finalise_normal_turn(
         stream=stream,
@@ -611,6 +623,11 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
     assert response_frame.workflow_applied is True
+    audit_writer.assert_awaited_once()
+    _principal, event = audit_writer.await_args.args
+    assert event.action == "workflow.update"
+    assert event.resource_id == "wpid-1"
+    assert event.changed_fields == ("title",)
 
     persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
         "narrative_payload"
@@ -3494,6 +3511,9 @@ async def test_proposed_workflow_cleared_on_restore(
     organization: SimpleNamespace,
 ) -> None:
     captured = install_fake_create(monkeypatch)
+    # These proposal doubles deliberately omit persisted workflow fields; this
+    # test covers proposal clearing, not audit diff semantics.
+    monkeypatch.setattr(workflow_copilot_route, "workflow_changed_fields", lambda *_: ())
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -4596,7 +4616,7 @@ async def test_proposal_header_secrets_stay_server_side_across_endpoints(
         "PERSISTENT_SESSIONS_MANAGER",
         SimpleNamespace(get_session=AsyncMock(return_value=SimpleNamespace())),
     )
-    save = AsyncMock(return_value=original)
+    save = AsyncMock(return_value=(original, ("workflow_definition",)))
     monkeypatch.setattr(
         app,
         "WORKFLOW_SERVICE",
@@ -4932,7 +4952,7 @@ async def test_apply_releases_the_candidate_claim_when_post_create_clear_fails(
     monkeypatch.setattr(
         app,
         "WORKFLOW_SERVICE",
-        SimpleNamespace(create_workflow_from_request=AsyncMock(return_value=candidate)),
+        SimpleNamespace(create_workflow_from_request=AsyncMock(return_value=(candidate, ("workflow_definition",)))),
     )
 
     result = await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
@@ -5988,10 +6008,10 @@ async def test_a_turn_that_never_started_keeps_its_attachments_on_the_recovery_r
 
 
 @pytest.mark.asyncio
-async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping_its_reply(
+async def test_an_interrupted_row_stored_before_the_final_flag_is_served_final(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recovery can reach a slow-but-live turn first; when that turn finishes, its reply is the truth."""
+    """Nothing replaces stored rows anymore, so an unflagged one must not hold the chat's save lock forever."""
     chat = _make_persisted_chat([])
     store, _ = _install_reconcile_store(monkeypatch, chat)
     store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
@@ -6000,34 +6020,151 @@ async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping
         INTERRUPTED_TERMINAL_MESSAGE,
         TurnOutcome(
             response_kind=ResponseKind.RECOVER,
-            reason_code=INTERRUPTED_TERMINAL_REASON,
             terminal_reason=INTERRUPTED_TERMINAL_REASON,
             copilot_turn_id="turn-a",
-            user_message_id="wccm-0",
-            request_cancel_token="cancel-turn-a",
         ),
     )
 
-    await _persist_turn_messages(
-        chat=chat,
-        turn_id="turn-a",
+    response = await _load_history()
+
+    outcome = response.chat_history[-1].turn_outcome
+    assert outcome is not None
+    assert outcome.interrupted_row_final is True
+
+
+async def _start_abandoned_turn(repo: WorkflowParametersRepository, turn_id: str) -> str:
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    await repo.start_copilot_turn(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        pending_turn=CopilotPendingTurn(
+            turn_id=turn_id,
+            started_at=datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS + 60),
+        ),
         user_message="build me a scraper",
-        audio_artifact_id=None,
-        user_row_already_persisted=True,
-        sender=WorkflowCopilotChatSender.USER,
-        assistant_content="Here is your workflow.",
-        global_llm_context=None,
-        turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
-        narrative_payload=None,
+    )
+    return chat.workflow_copilot_chat_id
+
+
+@pytest.mark.asyncio
+async def test_a_turn_finishing_after_reconcile_claimed_it_cannot_write(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reconcile's interrupted row is final: the still-live turn loses its claim mid-recovery and after."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    mid_chat_id = await _start_abandoned_turn(repo, "turn-mid")
+    assert await repo.claim_pending_copilot_turn("org", mid_chat_id, "turn-mid", datetime.now(UTC))
+    mid_chat = await repo.get_workflow_copilot_chat_by_id("org", mid_chat_id)
+    assert not await workflow_copilot_route._claim_turn_finalisation(mid_chat, "turn-mid")
+
+    chat_id = await _start_abandoned_turn(repo, "turn-done")
+    chat = await repo.get_workflow_copilot_chat_by_id("org", chat_id)
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(chat, "org")
+
+    [row] = [m for m in await repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"]
+    assert row.turn_outcome is not None
+    assert row.turn_outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
+    assert row.turn_outcome.interrupted_row_final is True
+    assert not await workflow_copilot_route._claim_turn_finalisation(chat, "turn-done")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_a_turn_that_just_resumed_from_a_credential_pause(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two credential pauses outlast the abandon window from the turn's start while it is still working."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    chat_id = await _start_abandoned_turn(repo, "turn-a")
+    await repo.record_pending_copilot_turn_credential_resume("org", chat_id, "turn-a")
+    abandoned_before = datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
+    assert not await repo.claim_pending_copilot_turn("org", chat_id, "turn-a", abandoned_before)
+
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(
+        await repo.get_workflow_copilot_chat_by_id("org", chat_id), "org"
     )
 
-    assert len(store.assistant_messages) == 1
-    assert store.assistant_messages[0].content == "Here is your workflow."
-    outcome = store.assistant_messages[0].turn_outcome
-    assert outcome is not None
-    assert outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON
-    assert outcome.user_message_id == "wccm-0"
-    assert outcome.request_cancel_token == "cancel-turn-a"
+    assert [m for m in await repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"] == []
+    chat = await repo.get_workflow_copilot_chat_by_id("org", chat_id)
+    assert await workflow_copilot_route._claim_turn_finalisation(chat, "turn-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["connected", "skip", "signed_in"])
+async def test_reconcile_between_a_card_answer_and_the_waiter_leaves_the_turn(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """An answer consumes the pause before the waiter wakes; a history read in that gap must not take the turn."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    cache = _FakeCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    chat_id = await _start_abandoned_turn(repo, "turn-a")
+    token = credential_pause._new_resume_token()
+    sign_in = credential_pause.ManualSignIn(
+        browser_session_id="pbs_debug", login_urls=["https://portal.example.com/login"], profile_name="Sign-in"
+    )
+    cache.store[credential_pause.credential_pause_active_key("org", chat_id, "turn-a")] = (
+        credential_pause._encode_active_pause(token, datetime.now(UTC) + timedelta(minutes=5), manual_sign_in=sign_in)
+    )
+    ids = {"organization_id": "org", "workflow_copilot_chat_id": chat_id, "turn_id": "turn-a"}
+    if answer == "signed_in":
+        claim = await credential_pause.claim_manual_sign_in(cache, resume_token=token, **ids)
+        profile = credential_pause.SignedInProfile(
+            browser_profile_id="bp_signed_in", profile_name="Sign-in", site="portal.example.com", cookie_count=1
+        )
+        assert await credential_pause.finish_manual_sign_in(cache, claim=claim, signed_in=profile, **ids)
+    else:
+        await credential_pause.resolve_credential_pause(
+            cache, resume_token=token, action=answer, credential_id="cred_1", **ids
+        )
+    assert await credential_pause.credential_pause_is_active("org", chat_id, "turn-a") is False
+
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(
+        await repo.get_workflow_copilot_chat_by_id("org", chat_id), "org"
+    )
+
+    assert [m for m in await repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"] == []
+    chat = await repo.get_workflow_copilot_chat_by_id("org", chat_id)
+    assert await workflow_copilot_route._claim_turn_finalisation(chat, "turn-a")
+
+
+@pytest_asyncio.fixture(params=["sqlite", "postgres"])
+async def fence_repo(
+    request: pytest.FixtureRequest, sqlite_engine: AsyncEngine
+) -> AsyncIterator[WorkflowParametersRepository]:
+    if request.param == "sqlite":
+        yield WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session, db_engine=sqlite_engine)
+        return
+    if make_url(str(settings.DATABASE_STRING)).get_backend_name() != "postgresql":
+        pytest.skip("requires PostgreSQL")
+    engine = _build_engine(settings.DATABASE_STRING)
+    try:
+        yield WorkflowParametersRepository(BaseAlchemyDB(engine).Session, db_engine=engine)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_waits_for_a_finalising_handler_and_answers_once_its_lock_is_gone(
+    fence_repo: WorkflowParametersRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled handler keeps its lock and so its turn; a dead one's connection takes the lock with it."""
+    monkeypatch.setattr(app.DATABASE, "workflow_params", fence_repo)
+    chat_id = await _start_abandoned_turn(fence_repo, "turn-a")
+
+    async def reconcile() -> list[WorkflowCopilotChatMessage]:
+        chat = await fence_repo.get_workflow_copilot_chat_by_id("org", chat_id)
+        await workflow_copilot_route._reconcile_interrupted_copilot_turns(chat, "org")
+        return [m for m in await fence_repo.get_workflow_copilot_chat_messages(chat_id) if m.sender == "ai"]
+
+    async with fence_repo.hold_copilot_turn_finalisation(chat_id, "turn-a"):
+        assert await reconcile() == []
+
+    [row] = await reconcile()
+    assert row.turn_outcome is not None
+    assert row.turn_outcome.interrupted_row_final is True
 
 
 def test_reconcile_threshold_outlasts_the_turn_enforcement_ceiling() -> None:
@@ -6082,6 +6219,58 @@ async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
 
     assert app.DATABASE.workflow_params.start_copilot_turn.await_count == 1
     app.DATABASE.workflow_params.clear_pending_copilot_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["finished", "cancelled", "errored"])
+async def test_a_turn_reconcile_claimed_leaves_canonical_and_its_row_alone(
+    monkeypatch: pytest.MonkeyPatch, api_key_request: MagicMock, copilot_stream: MagicMock, ending: str
+) -> None:
+    """Rolling canonical back now could overwrite a save the user made once the interrupted row unlocked it."""
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="Here is your workflow.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        authoring_barred=False,
+        resolved_model=None,
+        turn_outcome=None,
+        cancelled=ending == "cancelled",
+        has_staged_proposal=False,
+    )
+    restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    workflow_params.claim_pending_copilot_turn_for_finalisation.return_value = "reconciling"
+    if ending == "errored":
+        monkeypatch.setattr(
+            workflow_copilot_route, "run_copilot_agent", AsyncMock(side_effect=RuntimeError("late failure"))
+        )
+    created_rows = workflow_params.create_workflow_copilot_chat_message.await_count
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    restore_mock.assert_not_awaited()
+    workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+    assert workflow_params.create_workflow_copilot_chat_message.await_count == created_rows
+    workflow_params.clear_pending_copilot_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -7000,7 +7189,7 @@ async def test_accept_writes_the_live_title_when_the_row_was_renamed_after_publi
     monkeypatch.setattr(
         app.DATABASE, "workflows", SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=live))
     )
-    create_workflow = AsyncMock(return_value=live)
+    create_workflow = AsyncMock(return_value=(live, ("workflow_definition",)))
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(create_workflow_from_request=create_workflow))
 
     await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(

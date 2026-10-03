@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.hooks import _copilot_log_fields
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
@@ -1687,6 +1688,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         arguments: dict[str, Any] | None,
         meta: dict[str, Any] | None = None,
     ) -> CallToolResult:
+        if arguments is not None:
+            arguments = {name: value for name, value in arguments.items() if name != USER_FACING_REASON_PARAM}
         propagated_error: BaseException
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())

@@ -13,6 +13,7 @@ alongside `make_finish_tool()`.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import dataclasses
 import functools
@@ -85,10 +86,10 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
@@ -347,14 +348,15 @@ def _escape_tags_in_text(text: str) -> str:
 
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
 # click menu probe, data-tv3-act by act-by-mark (written on the look-resolved element at act time and
-# kept for the life of the document, so the submit watch can still resolve it turns later). Each
+# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-close by
+# the covered probe for an unmarked onclick close. Each
 # exists only where we set it, so one that matches nothing now cannot reappear without a fresh
 # observe / menu-opening click / look.
 _TV3_MARKER_SELECTOR_RE = re.compile(
-    r'^\[data-tv3(?:(?:-menu|-act)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+    r'^\[data-tv3(?:(?:-menu|-act|-close)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
 )
 # Any v3 marker inside a selector, including one observe composed a host-anchored selector around.
-_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg)?="')
+_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-close)?="')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -1864,8 +1866,11 @@ _PIERCED_QUERY_JS = (
   // a static list as a reaction. The WeakSet is the best carrier that costs no mutation, at one
   // disclosed price -- a component that re-creates its own content by cloning reads as all-new.
   // Absent (a navigation cleared window) means "no snapshot", never "everything is new".
-  const preMark = (el, inShadow) => {
+  // A run that must write nothing (weak) keeps the light DOM in the WeakSet too, at the same disclosed
+  // price: a container the page re-creates by cloning reads as all-new.
+  const preMark = (el, inShadow, weak) => {
     if (inShadow) window.__tv3_pre.add(el);
+    else if (weak) window.__tv3_pre.add(el);
     else el.setAttribute('data-tv3-pre', '1');
   };
   // instanceof, not truthiness: a page that pre-defines __tv3_pre as an accessor keeps its own
@@ -1931,16 +1936,22 @@ _INSTRUCTION_CLAUSE_RE = re.compile(
 )
 
 _PRESNAPSHOT_JS = (
-    r"""() => {"""
+    r"""(weak) => {"""
     + _PIERCED_QUERY_JS
     + r"""
   preReset();
   pScopeEach((el, inShadow) => {
     const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) preMark(el, inShadow);
+    if (r.width > 0 && r.height > 0) preMark(el, inShadow, !!weak);
   });
 }"""
 )
+
+
+def _pre_weak() -> bool:
+    """Whether this run's pre-snapshots use only the WeakSet carrier, writing no attribute to the page."""
+    return input_dispatch.parity()
+
 
 # Behavioral, site-agnostic suggestion finder. After the caller types a value (with a pre-snapshot taken
 # first), this looks for the suggestion list the typeahead rendered IN REACTION: a small, visible,
@@ -2591,7 +2602,7 @@ _FOCUS_SNAPSHOT_JS = (
     if (preHas(el) && !inOpenOwn) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow);
+    if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow, !!arg.weak);
   });
   // Record what the list offered NOW: a widget that filters by re-rendering unmounts the rows the
   // typed value does not match, so a later read would find nothing to name on an honest no-match.
@@ -2683,6 +2694,43 @@ _FIELD_DECLARES_LIST_JS = (
 }"""
 )
 
+# A control's visible text, for a surface to print when the page binds the control a name (aria-label, a
+# <label>, aria-labelledby) and the label printed lacks that text as whole words, since an instruction
+# names what a person sees. Caption roles and caption-length text only: a link wrapping a card is not one.
+SHOWN_TEXT_MAX = 60
+# Per reading across every frame, framing included; what it leaves off is reported, never silent.
+SHOWN_TEXT_TOTAL_CAP = 600
+_SHOWN_TEXT_FRAMING = len(" shows=''")
+
+
+def _shows_omitted_note(count: int) -> str:
+    return (
+        f"(shows= left off {count} more control(s) whose visible text differs from the label printed: "
+        "this reading's budget for it ran out.)"
+    )
+
+
+_SHOWN_TEXT_JS = (
+    r"""((el, printed) => {
+  try {
+    if (el.isContentEditable || !Element.prototype.matches.call(el, 'button,a[href],summary,'
+      + '[role=button],[role=link],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=tab],'
+      + '[role=checkbox],[role=radio],[role=switch]')) return '';
+    const flat = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+    const bound = flat(Element.prototype.getAttribute.call(el, 'aria-label'))
+      || (el.labels && el.labels.length > 0) || flat(Element.prototype.getAttribute.call(el, 'aria-labelledby'));
+    const shown = flat(el.innerText);
+    const name = flat(printed);
+    if (!bound || !name || !shown || shown.length > """
+    + str(SHOWN_TEXT_MAX)
+    + r""") return '';
+    // Whole words only: "View" is not part of the name "Preview".
+    const words = (v) => ' ' + String(v).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim() + ' ';
+    return words(shown).trim() && words(name).indexOf(words(shown)) === -1 ? shown : '';
+  } catch (e) { return ''; }
+})"""
+)
+
 # Classifies the currently-open list's rows as EXPANDABLE CATEGORIES rather than leaves — for the
 # no-match error path only, when _FIND_SUGGESTION_JS found nothing (a drilldown menu's leaves are
 # often hidden a level down until their category is clicked, so text-matching never sees them). Unlike
@@ -2699,6 +2747,9 @@ _FIND_CATEGORIES_JS = (
   if (!field) return null;
   const fr = field.getBoundingClientRect();
   const ROW_ROLES = new Set(['option', 'menuitem', 'treeitem', 'row', 'group']);
+  const _shownText = """
+    + _SHOWN_TEXT_JS
+    + r""";
   const CHILD_ROLES = new Set(['option', 'menuitem', 'treeitem']);
   const cats = [];
   for (const el of pScopeAll()) {
@@ -2749,12 +2800,12 @@ _FIND_CATEGORIES_JS = (
     const label = el.getAttribute('aria-label') || (el.innerText || '').trim().split('\n')[0];
     const text = label.trim();
     if (!text) continue;
-    cats.push({ el, text });
+    cats.push({ el, text, shows: _shownText(el, text) });
   }
   if (!cats.length) return null;
   pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
   cats.forEach((c, i) => c.el.setAttribute('data-tv3-menu', String(i + 1)));
-  return { count: cats.length, categories: cats.map((c, i) => ({ n: i + 1, text: c.text })) };
+  return { count: cats.length, categories: cats.map((c, i) => (c.shows ? { n: i + 1, text: c.text, shows: c.shows } : { n: i + 1, text: c.text })) };
 }"""
 )
 
@@ -3140,10 +3191,11 @@ _OWN_FIELD_SCOPES_FN_JS = r"""
   // The stamped [data-tv3-sugglist] container is the LIVE option list of the pick in flight: its
   // rows are offers, never commits, and a re-render that strips row tags keeps the container stamp.
   // An explicit aria-selected="false" likewise marks an offered row.
-  const excludedFor = (el, cand) =>
+  const OFFER_TAGS = '[data-tv3-sugg],[data-tv3-menu],[data-tv3-sugglist]';
+  const excludedFor = (el, cand, tags = OFFER_TAGS) =>
     cand === el || cand.contains(el)
-    || !!cand.closest('[data-tv3-sugg],[data-tv3-menu],[data-tv3-sugglist]')
-    || !!cand.querySelector('[data-tv3-sugg],[data-tv3-menu],[data-tv3-sugglist]')
+    || !!cand.closest(tags)
+    || !!cand.querySelector(tags)
     || cand.getAttribute('aria-selected') === 'false'
     || !!cand.closest('[aria-selected="false"]');
   const SURFACE_ROW_SEL = '[role="option"],[role="listitem"],li,[class*="pill" i],[class*="chip" i],[class*="token" i]';
@@ -3499,8 +3551,10 @@ _OWN_FIELD_SELECTIONS_JS = (
       const cut = raw.lastIndexOf(',');
       return (cut > 0 && INSTRUCTION_RE.test(raw.slice(cut + 1))) || /pill|chip|token/i.test(c.className || '');
     };
+    // The row finder's own data-tv3-sugg tag is not consulted: a widget that commits between two probes
+    // gets its new pill tagged as a result row, and pillShaped is what tells a selection from an offer.
     const cands = [...scope.querySelectorAll(SURFACE_ROW_SEL)].filter(
-      (c) => !excludedFor(el, c) && visible(c) && pillShaped(c)
+      (c) => !excludedFor(el, c, '[data-tv3-menu],[data-tv3-sugglist]') && visible(c) && pillShaped(c)
     );
     // A pill list and the pill inside it both match; only the innermost names one selection.
     for (const cand of cands.filter((c) => !cands.some((o) => o !== c && c.contains(o)))) {
@@ -3552,7 +3606,8 @@ _WATCH_REWRITTEN_ROWS_JS = r"""() => {
       const row = t.closest(ROW);
       if (row) {
         unmark(row);
-        row.querySelectorAll('[data-tv3-pre]').forEach(unmark);
+        // Every descendant, not only stamped ones: a run that writes nothing carries its marks in the WeakSet.
+        row.querySelectorAll('*').forEach(unmark);
       } else if (rec.type === 'childList' && t.matches(LIST)) {
         t.querySelectorAll(ROW).forEach(unmark);
       }
@@ -3962,6 +4017,9 @@ _LOOK_ENUM_JS = (
     + _SHADOW_ROOTS_JS
     + r""";
   const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
+  const _shownText = """
+    + _SHOWN_TEXT_JS
+    + r""";
   // Interpolated from the Python pattern so the two spellings of "opaque" cannot drift apart.
   const _OPAQUE = /"""
     + _OPAQUE_ID_RUN_RE.pattern
@@ -3971,6 +4029,8 @@ _LOOK_ENUM_JS = (
   const out = [];
   let n = 0;
   let truncated = false;
+  let showsTotal = 0;
+  let showsOmitted = 0;
   for (const root of _roots(document)) {
     let els;
     try { els = root.querySelectorAll(q); } catch (e) { continue; }
@@ -3995,6 +4055,7 @@ _LOOK_ENUM_JS = (
       try { el.setAttribute('data-tv3-look', String(n)); } catch (e) { n -= 1; continue; }
       let label = '';
       let placeholder = '';
+      let shows = '';
       try {
         const t = (el.getAttribute('type') || '').toLowerCase();
         // .value is a useful label for a text/submit field but is 'on'/junk for a checkbox or radio —
@@ -4014,18 +4075,33 @@ _LOOK_ENUM_JS = (
         label = (el.getAttribute('aria-label') || named || placeholder || valuable
           || el.innerText || el.getAttribute('title') || (_OPAQUE.test(nm) ? '' : nm) || '')
           .trim().replace(/\s+/g, ' ').slice(0, 2000);
+        shows = _shownText(el, label);
       } catch (e) {}
       const rec = { n, x: r.left, y: r.top, w: r.width, h: r.height, tag: (el.tagName || '').toLowerCase(), label };
       if (placeholder && placeholder !== label) rec.placeholder = placeholder;
+      if (shows && !showsOmitted && showsTotal + shows.length + """
+    + str(_SHOWN_TEXT_FRAMING)
+    + r""" <= """
+    + str(SHOWN_TEXT_TOTAL_CAP)
+    + r""") { rec.shows = shows; showsTotal += shows.length + """
+    + str(_SHOWN_TEXT_FRAMING)
+    + r"""; } else if (shows) showsOmitted++;
       out.push(rec);
     }
     if (truncated) break;
   }
-  return { vw, vh, truncated, elements: out };
+  return { vw, vh, truncated, showsOmitted, elements: out };
 })()"""
 )
 
 _ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
+_CLOSE_ATTR_RE = re.compile(r' data-tv3-close="[^"]*"')
+# A withheld menu's rows carry a salted tag so no position can be guessed; printing it would hand the model one.
+_SALTED_MENU_ATTR_RE = re.compile(r'\s*data-tv3-menu="w[^"]*"')
+# Visible only: a closed menu's lingering rows are stale, not an open menu whose rows went unnumbered.
+_SALTED_MENU_SELECTOR = '[data-tv3-menu^="w"]:visible'
+# Every CSS spelling of a numbered menu tag: either quote, no quote, spaces inside, any case (HTML attribute names).
+_NUMBERED_MENU_SELECTOR_RE = re.compile(r'^\[\s*data-tv3-menu\s*=\s*(["\']?)\s*\d+\s*\1\s*\]$', re.IGNORECASE)
 _ACT_SELECTOR_PREFIX = '[data-tv3-act="'
 # Write the act-by-mark attribute on an element handle the caller already resolved (Playwright's
 # engine, which pierces open shadow). Returns whether the node is still connected; a detached handle
@@ -4745,6 +4821,7 @@ _TYPE_TARGET_PROBE_JS = (
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
+  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
 
   // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
   // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
@@ -5694,14 +5771,12 @@ _TYPE_TARGET_PROBE_JS = (
     // The role list mirrors observe()'s own _WIDGET_ROLES answer to "is this a control?" (minus the
     // form-field roles observe treats as fillable, not actionable), so a consent switch or a
     // role=menuitem Close action is not omitted just because it isn't a <button>.
-    const found = deepAll(
-      layer,
-      'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
+    const controlSel = 'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
       + 'input[type="reset"],[role="button"],'
       + '[role="checkbox"],[role="radio"],[role="combobox"],[role="option"],[role="menuitem"],'
       + '[role="menuitemcheckbox"],[role="menuitemradio"],[role="listbox"],[role="switch"],'
-      + '[role="spinbutton"],[role="tab"]'
-    );
+      + '[role="spinbutton"],[role="tab"]';
+    const found = deepAll(layer, controlSel);
     // A disabled control cannot be the thing to click -- recommending one wastes a click timeout on
     // a target Playwright will refuse, and can crowd the real dismisser out of the eight-slot cap.
     // :disabled (not the .disabled IDL property) is what the browser actually uses to decide this,
@@ -5712,6 +5787,9 @@ _TYPE_TARGET_PROBE_JS = (
       try { matched = !!(n.matches && n.matches(':disabled')); } catch (e) { matched = false; }
       return matched || (n.getAttribute && n.getAttribute('aria-disabled') === 'true');
     };
+    const _shownText = """
+    + _SHOWN_TEXT_JS
+    + r""";
     for (const c of found) {
       if (c === el || !visible(c) || isDisabled(c)) continue;
       const csel = idSelector(c) || markerSelector(c);
@@ -5719,7 +5797,8 @@ _TYPE_TARGET_PROBE_JS = (
       // shadow-aware resolution the layer's own name uses.
       const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title')) || '', 60);
       if (!label && !csel) continue;
-      allControls.push({ selector: csel, label });
+      const shows = boundedClean(_shownText(c, label), 60);
+      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
     }
     // A real dismisser (Accept, Confirm, Close) routinely comes AFTER a list of category rows or
     // toggles in document order -- a Privacy Preference Center's footer buttons follow its list of
@@ -5728,7 +5807,35 @@ _TYPE_TARGET_PROBE_JS = (
     // motivating bug with more words. Keep both ends: the first few for context, the last few
     // because that is where a footer actually lives.
     const truncated = allControls.length > 8;
-    const controls = truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls;
+    // An icon-only close is often a bare <div onclick>, which no tag or role above names. Only a leaf
+    // handler counts (a row, card or body handler wraps other controls), and at most two are added
+    // after the named ones, so a list of row handlers cannot displace the layer's own controls.
+    const leaves = [];
+    for (const c of deepAll(layer, '[onclick]').slice(0, 200)) {
+      if (c === layer || c === el || !visible(c) || isDisabled(c)) continue;
+      if (c.matches && c.matches(controlSel)) continue;
+      if (c.contains(el) || c.querySelector('[onclick],' + controlSel)) continue;
+      if (c.parentElement && c.parentElement.closest(controlSel)) continue;
+      const label = boundedClean(ownName(c) || c.textContent || (c.getAttribute && c.getAttribute('title')) || '', 60);
+      leaves.push({ c, label });
+    }
+    // An icon close has no text, so unlabeled leaves go first; a run of labelled rows cannot fill the slots ahead of it.
+    leaves.sort((a, b) => (a.label ? 1 : 0) - (b.label ? 1 : 0));
+    // Fresh per probe, so a selector an earlier probe printed matches nothing rather than another element.
+    const closeNonce = Math.random().toString(36).slice(2, 7);
+    const onclickControls = [];
+    for (const { c, label } of leaves) {
+      if (onclickControls.length >= 2) break;
+      let csel = idSelector(c) || markerSelector(c);
+      if (!csel) {
+        // A close that appeared after the last observe carries no marker, so the probe names it itself.
+        const key = closeNonce + '-' + onclickControls.length;
+        try { c.setAttribute('data-tv3-close', key); csel = '[data-tv3-close="' + key + '"]'; } catch (e) { continue; }
+      }
+      onclickControls.push({ selector: csel, label });
+    }
+    const controls = (truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls)
+      .concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
     out.occluder.layerKind = layerKind;
@@ -5845,6 +5952,32 @@ _COLLATERAL_IS_DATE_SEGMENT_JS = (
 }"""
 )
 
+_DATE_SEGMENT_FOCUS_JS = r"""(el) => {
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  const group = el.closest('[data-tv3-dateseg="group"]');
+  return a === el || (!!a && !!group && group.contains(a) && !a.hasAttribute('data-tv3-dateseg'));
+}"""
+
+# Per tagged date segment: [its first digit run as a number, or null when empty; the value a failed restore recorded
+# on it, or 'none'], or null when the segment is gone. `arg.set[label]` records a value, and 'drop' removes the record.
+_DATE_SEGMENT_STATE_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const K = Symbol.for('tv3-date-restore');
+  return arg.labels.map((l) => {
+    const e = _q.find('[data-tv3-dateseg="' + l + '"]');
+    if (!e) return null;
+    if (arg.set[l] === 'drop') delete e[K];
+    else if (l in arg.set) e[K] = arg.set[l];
+    const m = (String(e.value ?? '') + '|' + String(e.textContent ?? '')).match(/\d+/);
+    return [m ? Number(m[0]) : null, K in e ? e[K] : 'none'];
+  });
+}"""
+)
+
 # Every text-holding field our keystrokes could reach if the widget routes them somewhere other than
 # the element we focused, tagged so each one can be read back by the same handle afterwards. Scoped to
 # the target's own form -- or its own root when it has none, which keeps a field inside a component
@@ -5917,8 +6050,8 @@ _COLLATERAL_VALUES_JS = (
 )
 
 
-# How type put the caret in a field: a checked click, focus() alone, or an unchecked press at its centre.
-_Reach = Literal["click", "focus", "point"]
+# How type put the caret in a field: a checked click, or focus() alone.
+_Reach = Literal["click", "focus"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
@@ -6083,8 +6216,8 @@ _DATE_SEGMENT_GROUP_JS = (
     const da = String(el.getAttribute('aria-disabled') || '').trim().toLowerCase();
     return ro !== 'true' && da !== 'true';
   };
-  _q.all('[data-tv3-dateseg]').forEach((e) => e.removeAttribute('data-tv3-dateseg'));
   const target = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  _q.all('[data-tv3-dateseg]').forEach((e) => e.removeAttribute('data-tv3-dateseg'));
   if (!target || !isSpinbutton(target)) return { ok: false, reason: 'not_spinbutton', targetLabel: null };
   const targetLabel = norm(target) || null;
   if (LABELS.indexOf(targetLabel) === -1) return { ok: false, reason: 'target_not_date_segment', targetLabel };
@@ -6621,7 +6754,7 @@ _CLICK_PRECHECK_JS = (
     }
   }
   preReset();
-  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
+  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow, !!arg.weak); });
   return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState, optSel, optKids, optH, optVis };
 }"""
 )
@@ -6820,19 +6953,55 @@ _FIND_MENU_JS = (
     if (!txt || txt.length > ROW_TEXT_MAX) return null;
     return { r, txt };
   };
+  // Role-less lists are grouped only on the trigger's own ARIA word: its aria-controls target, or —
+  // when it declares a listbox/combobox — the rows' nearest shared ancestor. A plain button gives
+  // no such word, and guessing would merge unrelated option sets on the page.
+  const trigDeclares = !!trigger && (/(^|\s)combobox(\s|$)/i.test(trigger.getAttribute('role') || '')
+    || (trigger.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox');
+  let controlled = null;
+  try {
+    // A plain toggle's aria-controls names a revealed panel, not a list: only a declared picker's
+    // aria-controls is read as its option container.
+    const cid = trigDeclares ? trigger.getAttribute('aria-controls') : null;
+    const root = trigger.getRootNode();
+    controlled = cid ? ((root && root.getElementById) ? root.getElementById(cid) : document.getElementById(cid)) : null;
+    if (controlled && controlled.getBoundingClientRect().height > 500) controlled = null;
+  } catch (e) { controlled = null; }
+  const controlledList = !!controlled && /^(|listbox|menu|tree|grid)$/.test(controlled.getAttribute('role') || '');
   const rows = [];
+  // Clickable rows left out of the menu (too long to be undeclared, or over the row caps), so a list they sit
+  // in is not whole. Only an element's OWN pointer counts: a container's cursor is inherited by its paragraphs.
+  const unreadLong = [];
+  const ownClickable = (el) => {
+    if (el.tagName === 'BUTTON' || el.tagName === 'A') return true;
+    try {
+      const up = el.parentElement;
+      return getComputedStyle(el).cursor === 'pointer' && !(up && getComputedStyle(up).cursor === 'pointer');
+    } catch (e) { return false; }
+  };
   for (const el of pScopeAll()) {
     if (reuse !== 'any' && (preHas(el) || focusHas(el))) continue;
     const tag = el.tagName;
     const box = rowBox(el);
-    if (!box) continue;
+    if (!box) {
+      // innerText walks the subtree, so it runs after the cheaper checks that reject most containers.
+      if (arg.saltUnlisted && vis(el.getBoundingClientRect()) && ownClickable(el) && (el.innerText || '').trim()) unreadLong.push(el);
+      continue;
+    }
     const { r, txt } = box;
-    // A long row is an option only when the page declares one on it, in it or around it: an inherited
-    // pointer cursor otherwise makes every paragraph of a clickable popover read as a menu row.
+    // A long row is an option only where the page declares one on it, in it, around it, or by its list (a
+    // listbox/menu, or the list a combobox controls): a pointer cursor alone makes every paragraph a row.
     if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
       let declaresOption = false;
-      try { declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL); } catch (e) { declaresOption = false; }
-      if (!declaresOption) continue;
+      try {
+        declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
+          || !!composedClosest(el, '[role="listbox"],[role="menu"]')
+          || (controlledList && controlled !== el && pContains(controlled, el));
+      } catch (e) { declaresOption = false; }
+      if (!declaresOption) {
+        if (arg.saltUnlisted && ownClickable(el)) unreadLong.push(el);
+        continue;
+      }
     }
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
@@ -6853,20 +7022,6 @@ _FIND_MENU_JS = (
   // Group by parent AND grandparent so both flat menus (card > button*N) and nested ones
   // (ul > li > button) find their shared container.
   const groups = new Map();
-  // Role-less lists are grouped only on the trigger's own ARIA word: its aria-controls target, or —
-  // when it declares a listbox/combobox — the rows' nearest shared ancestor. A plain button gives
-  // no such word, and guessing would merge unrelated option sets on the page.
-  const trigDeclares = !!trigger && (/(^|\s)combobox(\s|$)/i.test(trigger.getAttribute('role') || '')
-    || (trigger.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox');
-  let controlled = null;
-  try {
-    // A plain toggle's aria-controls names a revealed panel, not a list: only a declared picker's
-    // aria-controls is read as its option container.
-    const cid = trigDeclares ? trigger.getAttribute('aria-controls') : null;
-    const root = trigger.getRootNode();
-    controlled = cid ? ((root && root.getElementById) ? root.getElementById(cid) : document.getElementById(cid)) : null;
-    if (controlled && controlled.getBoundingClientRect().height > 500) controlled = null;
-  } catch (e) { controlled = null; }
   // parentElement is null at a shadow boundary (a ShadowRoot is not an Element), so a menu whose
   // rows are written straight into the root -- root.innerHTML = '<div role="option">...' -- would
   // group under nothing and never be found. The host stands in for the boundary.
@@ -7058,15 +7213,21 @@ _FIND_MENU_JS = (
     listed.length = 0;
     for (const c of best.g) listed.push({ leaves: [c], reason: 'single_row_pieces' });
   }
+  const longUnread = unreadLong.some((el) => pContains(best.p, el) && !best.g.some((c) => pContains(el, c.el) || pContains(c.el, el)));
+  const withheld = listed.find((e) => e.reason) || (longUnread ? { reason: 'long_row_unread' } : null);
   pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
+  // A withheld note lists no rows, so a numbered tag could only be clicked by guessing a position. `saltUnlisted`
+  // callers salt those tags (still read by the click-commit checks; get_html strips them, _SALTED_MENU_ATTR_RE).
+  // One salt per document, so a rescan of an unchanged menu writes the same tags (the page fingerprint hashes them).
+  if (withheld && arg.saltUnlisted && !window.__tv3_menu_salt) window.__tv3_menu_salt = 'w' + Math.random().toString(36).slice(2, 8) + '-';
+  const salt = withheld && arg.saltUnlisted ? window.__tv3_menu_salt : '';
   let n = 0;
   const tagOf = new Map();
   for (const c of best.g) {
     n++;
-    c.el.setAttribute('data-tv3-menu', String(n));
+    c.el.setAttribute('data-tv3-menu', salt + String(n));
     tagOf.set(c, n);
   }
-  const withheld = listed.find((e) => e.reason);
   const options = [];
   for (const e of listed) {
     if (options.length >= 15) break;
@@ -7238,9 +7399,11 @@ _MENU_OPTION_TEXTS_JS = (
     } catch (e) { /* attributes unreadable: no veto values */ }
     // The nearest tagged ancestor, so a caller can tell a node nested inside another candidate from a sibling.
     const outer = el.parentElement ? composedClosest(el.parentElement, '[data-tv3-' + attr + ']') : null;
+    // A withheld menu's tags carry a random prefix (see _FIND_MENU_JS): the position is the trailing number.
+    const num = (e) => parseInt(String(e.getAttribute('data-tv3-' + attr)).split('-').pop(), 10);
     return {
-      n: parseInt(el.getAttribute('data-tv3-' + attr), 10),
-      inside: outer ? parseInt(outer.getAttribute('data-tv3-' + attr), 10) : null,
+      n: num(el),
+      inside: outer ? num(outer) : null,
       text: (el.innerText || el.textContent || '').trim(),
       nav: nav,
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
@@ -7750,6 +7913,9 @@ async (__tv3TextArgs) => {
   const _NONCHOICE_SEL = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea,select,[role=combobox],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
   const _CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch]';
   const _CAPTIONED_CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio]';
+  const _shownText = """
+    + _SHOWN_TEXT_JS
+    + r""";
   // Read through the prototypes: the walk below crosses the control's <form>, whose named controls
   // shadow its own properties (<input name="matches"> makes form.matches that input).
   const _getter = (proto, name) => {
@@ -9408,6 +9574,8 @@ async (__tv3TextArgs) => {
     if (pointerRoot) rec.pointerRoot = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
+    const shows = _shownText(el, label);
+    if (shows) rec.shows = shows;
     if (hidden) rec.hidden = true;
     if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
@@ -10065,7 +10233,21 @@ async (__tv3TextArgs) => {
     rec.ref = typeof r === 'number' ? r : null;
   }
   __OBSERVE_TEXT_DELTA__
-  const payload = JSON.stringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  // A page-defined toJSON (legacy libraries put one on Array.prototype) encodes every array as a string. It is
+  // lifted for this one synchronous call so page code never runs; the replacer runs after toJSON and hands
+  // back the holder's own value, so even one the page made non-configurable never reaches the payload.
+  const _ownStringify = (value) => {
+    const protos = [Array.prototype, Object.prototype];
+    const saved = protos.map((p) => Object.getOwnPropertyDescriptor(p, 'toJSON'));
+    // Kept in place when it could not be put back (non-configurable, or a non-extensible prototype).
+    const kept = protos.map((p, i) => !!saved[i] && !(saved[i].configurable && Object.isExtensible(p)));
+    protos.forEach((p, i) => { if (saved[i] && !kept[i]) delete p.toJSON; });
+    // A kept toJSON still runs before the replacer; if it throws, the reading is refused rather than the evaluate.
+    try { return JSON.stringify(value, kept.some(Boolean) ? function (k) { return this[k]; } : undefined); } catch (e) { return 'null'; } finally {
+      protos.forEach((p, i) => { if (saved[i] && !kept[i]) Object.defineProperty(p, 'toJSON', saved[i]); });
+    }
+  };
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -10101,11 +10283,14 @@ def _menu_mark_parts(options: list[dict[str, Any]], cap: int, text_cap: int = _M
     for o in (options or [])[:cap]:
         # option texts are page-controlled and land in the LLM transcript — same sanitation as filenames
         text = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", _model_text(o.get("text", ""), text_cap))
-        parts.append(f'[data-tv3-menu="{o.get("n")}"] {text!r}')
+        shows = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", _model_text(o.get("shows", ""), SHOWN_TEXT_MAX))
+        parts.append(f'[data-tv3-menu="{o.get("n")}"] {text!r}' + (f" shows={shows!r}" if shows else ""))
     return parts
 
 
-_MENU_WITHHOLD_REASONS = frozenset({"declared_row_over_caps", "bare_text_beside", "single_row_pieces"})
+_MENU_WITHHOLD_REASONS = frozenset(
+    {"declared_row_over_caps", "bare_text_beside", "single_row_pieces", "long_row_unread"}
+)
 
 
 def _menu_note_fields(found: dict[str, Any]) -> dict[str, Any]:
@@ -10633,10 +10818,10 @@ _READINESS_BY_READY_STATE = {"loading": "commit", "interactive": "domcontentload
 # larger than that total can never leave the navigation itself no time at all.
 _NAVIGATE_MIN_COMMIT_TIMEOUT_MS = 5000
 
-# Held back out of the readiness budget for the readyState read that decides the verdict. The
-# lifecycle waits may spend everything else; the read itself has to stay bounded, because a renderer
-# wedged on a synchronous script never answers an evaluate and one given no time would report a page
-# that did load as unreadable.
+# Held back out of the readiness budget for the readyState read. The lifecycle waits may spend
+# everything else; the read itself has to stay bounded, because a renderer wedged on a synchronous
+# script never answers an evaluate and one given no time would report a page that did load as
+# unreadable.
 _NAVIGATE_READINESS_PROBE_RESERVE_MS = 1000
 
 
@@ -10650,10 +10835,6 @@ def _navigate_budgets() -> tuple[int, int]:
 async def _document_readiness(page: Any, timeout_seconds: float) -> str | None:
     """The lifecycle level the current document has reached, or None when it could not be read.
 
-    Read from `document.readyState` rather than from whether the wait raised: the raw-CDP engine's
-    `wait_for_load_state` is advisory and returns normally on timeout, so the exception is not a
-    signal every engine gives.
-
     Bounded because a renderer wedged on a synchronous script never answers an evaluate, and the
     navigation's stated ceiling has to hold against that — a deadline enforced between awaits cannot
     interrupt this one.
@@ -10666,33 +10847,51 @@ async def _document_readiness(page: Any, timeout_seconds: float) -> str | None:
     return _READINESS_BY_READY_STATE.get(state) if isinstance(state, str) else None
 
 
-async def _wait_for_readiness(page: Any, budget_ms: int) -> tuple[str | None, float]:
+async def _wait_for_readiness(page: Any, budget_ms: int) -> tuple[str | None, bool, float]:
     """Wait up to `budget_ms` for the committed document to fire domcontentloaded, then load.
 
     Waits on the document already committed and never re-issues a navigation: a re-goto discards a
     partially fetched bundle and refetches it from zero, which on a starved link is self-defeating.
 
-    `load` is still what this waits for -- the budget is the bound, not the event -- and what the
-    document actually reached by the time the budget runs out is READ off `readyState` rather than
-    inferred from which wait gave up.
+    `load` is still what this waits for -- the budget is the bound, not the event. The level reported
+    is the one a WAIT witnessed whenever the `readyState` read cannot answer, which on an ad-heavy page
+    is the common case: the evaluate runs on the same busy main thread the page is on (SKY-16647). A
+    read that DOES answer wins outright, in both directions. It answers for the document that is there
+    now, while a wait's witness is only tied to the document that was there when the wait returned, and
+    readyState never moves backwards within one document -- so a reading below the witness means the
+    witnessed document is gone (a meta refresh, `location.replace`, an interstitial, an auth hop) and
+    the witness with it.
+
+    Returns (level, whether the readyState read failed, seconds spent).
     """
     started = time.monotonic()
     wait_budget_ms = max(0.0, budget_ms - _NAVIGATE_READINESS_PROBE_RESERVE_MS)
+    reached: str | None = None
     for state in ("domcontentloaded", "load"):
         remaining_ms = wait_budget_ms - (time.monotonic() - started) * 1000
         if remaining_ms <= 0:
             break
+        wait_started = time.monotonic()
         try:
             await page.wait_for_load_state(state, timeout=remaining_ms)
         except Exception as exc:
             if not is_driver_error(exc):
                 raise
-            # Any driver refusal leaves the verdict to the readyState read below, which answers for the
-            # document rather than for the wait; and load cannot fire before domcontentloaded has.
+            # A driver refusal is this level timing out, and load cannot fire before domcontentloaded.
             break
+        if (time.monotonic() - wait_started) * 1000 >= remaining_ms:
+            # An engine whose load-state wait is advisory returns normally on timeout, having spent
+            # the whole deadline first. Only a return INSIDE the deadline witnesses the event; a
+            # return AT it is indistinguishable from giving up.
+            break
+        reached = state
     probe_ms = max(budget_ms - (time.monotonic() - started) * 1000, _NAVIGATE_READINESS_PROBE_RESERVE_MS)
-    reached = await _document_readiness(page, probe_ms / 1000)
-    return reached, time.monotonic() - started
+    read = await _document_readiness(page, probe_ms / 1000)
+    if read is not None:
+        # Supersedes the witness rather than only raising it: readyState is monotonic within one
+        # document, so a reading below the witness can only mean the witnessed document was replaced.
+        reached = read
+    return reached, read is None, time.monotonic() - started
 
 
 def _scrub_urls_in_text(text: str) -> str:
@@ -11226,6 +11425,41 @@ _UNKNOWN_REALM = object()
 
 class _RealmChangedDuringRead(Exception):
     """A realm's document was replaced between the two identity samples bracketing its read."""
+
+
+class _RealmUnreadable(Exception):
+    """A realm's reading is not the shape observe builds, so nothing in it can be paired or merged."""
+
+
+def _realm_reading(raw: Any) -> dict[str, Any]:
+    # Reachable only when the page replaced JSON.stringify itself: every other shape the script can emit is fixed.
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        raise _RealmUnreadable("reading is not JSON") from None
+    if not isinstance(data, dict):
+        raise _RealmUnreadable(f"reading is a {type(data).__name__}")
+    iframes = data.get("iframes")
+    lists = {key: data.get(key) for key in ("elements", "text", "textFull")}
+    if isinstance(iframes, dict):
+        lists["iframes.entries"] = iframes.get("entries")
+    elif iframes is not None:
+        raise _RealmUnreadable(f"iframes is a {type(iframes).__name__}")
+    for key, value in lists.items():
+        if (value is not None or key in data) and not isinstance(value, list):
+            raise _RealmUnreadable(f"{key} is a {type(value).__name__}")
+    for key in ("elements", "iframes.entries"):
+        if not all(isinstance(e, dict) for e in lists.get(key) or []):
+            raise _RealmUnreadable(f"{key} holds a non-record entry")
+    if not all(isinstance(t, str) for t in lists["text"] or []) or not all(
+        t is None or isinstance(t, str) for t in lists["textFull"] or []
+    ):
+        raise _RealmUnreadable("text holds a non-string entry")
+    for key in _OBSERVE_SUMMED_KEYS:
+        count = data.get(key) or 0
+        if not isinstance(count, (int, float)) or not math.isfinite(count):
+            raise _RealmUnreadable(f"{key} is a {type(data.get(key)).__name__}")
+    return data
 
 
 class _Observation(NamedTuple):
@@ -11793,8 +12027,17 @@ def build_browser_tools(
         after = await _realm_document_id(target)
         if after != before:
             raise _RealmChangedDuringRead(f"realm changed during the read: {before!r} -> {after!r}")
-        data = json.loads(raw) if isinstance(raw, str) else raw
-        inline = data.pop("textDelta", None) if isinstance(data, dict) else None
+        try:
+            data = _realm_reading(raw)
+        except _RealmUnreadable:
+            for handle in handles:
+                if handle is not None:
+                    try:
+                        await handle.dispose()
+                    except Exception:
+                        pass
+            raise
+        inline = data.pop("textDelta", None)
         if text_args is not None:
             # Cleared on every main-frame attempt: a retry on a replacement document that yields no text
             # must not leave the previous document's text to be recorded as this one's.
@@ -11852,7 +12095,10 @@ def build_browser_tools(
             if isinstance(result, BaseException):
                 # One frame that will not answer costs its own contents and nothing else, and is
                 # counted so the digest can say a region went unread rather than imply it was empty.
-                LOG.debug("taskv3 observe could not read a child frame", exc_info=result)
+                if isinstance(result, _RealmUnreadable):
+                    LOG.info("taskv3 observe skipped a child frame", reason=str(result))
+                else:
+                    LOG.debug("taskv3 observe could not read a child frame", exc_info=result)
                 unreadable += 1
                 continue
             frame_data, frame_handles, frame_document = result
@@ -11897,7 +12143,13 @@ def build_browser_tools(
             return error
         # Bound the whole acquisition -- the digest AND the handles behind it -- so a wedged page
         # can't hang the turn indefinitely on a later round trip the first bound never covered.
-        observation = await asyncio.wait_for(_read_observation(page), timeout=30)
+        try:
+            observation = await asyncio.wait_for(_read_observation(page), timeout=30)
+        except _RealmUnreadable as exc:
+            LOG.warning("taskv3 observe could not read the page", reason=str(exc))
+            return ToolResult.error(
+                "observe could not read this page's controls; use look or get_html to read it instead"
+            )
         data, handles, owners = observation.data, observation.handles, observation.owners
         elements = data.get("elements", [])
         if len(handles) != len(elements):
@@ -12233,8 +12485,19 @@ def build_browser_tools(
             if el.get("group") and el.get("group_missing")
         }
 
+        shows_left = SHOWN_TEXT_TOTAL_CAP
+        shows_omitted = 0
         for _render_idx, e in enumerate(elements):
             extra = ""
+            if e.get("shows"):
+                # Charged at its printed width, escapes included; once one is left off, every later one
+                # is too, so the note's count is a tail and not a scatter.
+                shows_part = f" shows={_field(e['shows'], OBSERVE_DISPLAY_WIDTHS['label'])}"
+                if not shows_omitted and len(shows_part) <= shows_left:
+                    shows_left -= len(shows_part)
+                    extra += shows_part
+                else:
+                    shows_omitted += 1
             if e.get("value"):
                 extra += f" value={_field(e['value'], OBSERVE_DISPLAY_WIDTHS['value'])}"
             if e.get("placeholder"):
@@ -12330,6 +12593,8 @@ def build_browser_tools(
         bodies, _ = _disambiguate_digest_bodies(elements, bodies, _field)
         for e, body in zip(elements, bodies):
             lines.append(f"ref={e['ref']} {body}")
+        if shows_omitted:
+            lines.append(_shows_omitted_note(shows_omitted))
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
         frame_census = data.get("frameCensus") or {}
@@ -12855,6 +13120,7 @@ def build_browser_tools(
         # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
         # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
+        html = _CLOSE_ATTR_RE.sub("", html)
         html = _COLLATERAL_ATTR_RE.sub("", html)
         html = _DATE_SEGMENT_ATTR_RE.sub("", html)
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
@@ -12862,6 +13128,7 @@ def build_browser_tools(
         # token belongs to the element, not the number -- but it is ours, not the page's, and it
         # costs truncation budget the model needs for real markup.
         html = _ACT_ATTR_RE.sub("", html)
+        html = _SALTED_MENU_ATTR_RE.sub("", html)
         html = _mask_refs(html)
         scoped = bool(selector)
         windowed = _window(html, offset, lambda end, total: _markup_cut(end, total, scoped=scoped))
@@ -12909,12 +13176,16 @@ def build_browser_tools(
         for control in (occluder or {}).get("controls") or []:
             control_selector = control.get("selector") if isinstance(control, dict) else None
             label = str((control.get("label") if isinstance(control, dict) else "") or "").strip()
+            shows = str((control.get("shows") if isinstance(control, dict) else "") or "").strip()
+            named = json.dumps(label, ensure_ascii=False) + (
+                f" shows {json.dumps(shows, ensure_ascii=False)}" if shows else ""
+            )
             if control_selector and label:
-                parts.append(f'{control_selector} "{label}"')
+                parts.append(f"{control_selector} {named}")
             elif control_selector:
                 parts.append(control_selector)
             elif label:
-                parts.append(f'"{label}" (no selector — re-observe to address it)')
+                parts.append(f"{named} (no selector — re-observe to address it)")
         return parts
 
     def _covered_branch(occluder: dict[str, Any] | None) -> CoveredBranch:
@@ -12966,6 +13237,11 @@ def build_browser_tools(
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
         _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
+        # The probe walks only the hit element and its ancestors, so this claims nothing about other layers.
+        unqualified = (
+            "That is the element drawn where the pointer lands; neither it nor anything containing it qualified "
+            "as a dialog, an overlay or a banner."
+        )
         if branch == "clipped":
             # A dismissal is the one instruction that cannot be carried out here: the dialog, overlay
             # and banner it would name are what this branch is entered BECAUSE the probe ruled out.
@@ -13000,11 +13276,20 @@ def build_browser_tools(
                 layer_desc = f"a layer ({layer_selector})"
             else:
                 layer_desc = "a layer"
-            return ToolResult.error(
+            invisible = (
                 f"{selector} is covered by {layer_desc} that is INVISIBLE — it intercepts clicks but paints "
-                f"nothing on screen, so you will not see it in a screenshot{also}. It is most likely a "
-                "leftover backdrop from a dialog or cookie banner that was already dismissed. Do not keep "
-                "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way.",
+                f"nothing on screen, so you will not see it in a screenshot{also}."
+            )
+            if (occluder or {}).get("layerKind") == "hit_fallback":
+                return ToolResult.error(
+                    f"{invisible} {unqualified} Re-observe and reach {selector} another way or act on a "
+                    "different control.",
+                    error_class="covered",
+                )
+            return ToolResult.error(
+                f"{invisible} It is most likely a leftover backdrop from a dialog or cookie banner that was "
+                "already dismissed. Do not keep trying to dismiss a visible overlay; press Escape, re-observe, "
+                "or reach the field another way.",
                 error_class="covered",
             )
         if branch == "unnamed":
@@ -13016,10 +13301,7 @@ def build_browser_tools(
         layer_desc = f'"{name}"' if name else "a layer"
         if layer_selector:
             layer_desc = f"{layer_desc} ({layer_selector})"
-        if parts:
-            controls_desc = "; ".join(parts)
-        else:
-            controls_desc = "re-observe — no controls were found on it"
+        controls_desc = "; ".join(parts) if parts else "none named"
         if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
         if branch == "challenge":
@@ -13034,6 +13316,28 @@ def build_browser_tools(
                 "itself sits in, takes the pointer at the field's position. Do not try to dismiss it; it "
                 'holds the field. Click [data-tv3-catcher="1"] to activate the field, then retry '
                 f"{selector}.",
+                error_class="covered",
+            )
+        if (occluder or {}).get("layerKind") == "hit_fallback":
+            # The walk qualified no layer and named the element drawn at the target's position (a value cell, an
+            # option row), so any controls listed are what that element holds, not confirmed as a way to uncover the target.
+            found = (
+                f"Controls found on that element, not confirmed to uncover {selector}: {controls_desc}."
+                if parts
+                else "The probe named no controls on that element."
+            )
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {unqualified} "
+                f"{found} Re-observe and reach {selector} another way or act on a different control.",
+                error_class="covered",
+            )
+        if not parts:
+            # The probe names controls by tag, role and inline onclick; a close wired by a script listener is
+            # none of those, so an empty list is no evidence the layer has no way out.
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
+                "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
+                f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
                 error_class="covered",
             )
         return ToolResult.error(
@@ -13059,6 +13363,9 @@ def build_browser_tools(
         except Exception:
             element = None
         return {"sel": selector, "el": element}
+
+    async def _snapshot_arg(page: Any, selector: str) -> dict[str, Any]:
+        return {**await _probe_arg(page, selector), "weak": _pre_weak()}
 
     def _with_target_label(handler: ToolHandler) -> ToolHandler:
         """Capture the target's page-visible name and kind BEFORE the handler runs and carry both on
@@ -13237,6 +13544,10 @@ def build_browser_tools(
         menu_note_census.update(_menu_note_fields(found))
         return _menu_open_note(found, selector, clicked_row=clicked_row)
 
+    async def _click_menu_scan(page: Any, arg: dict[str, Any]) -> Any:
+        # Every menu the click tool reports goes through here, so a withheld one never keeps guessable numbers.
+        return await page.evaluate(_FIND_MENU_JS, {**arg, "saltUnlisted": True})
+
     async def _click_reaction(
         page: Any, selector: str, pre: dict[str, Any], url_before: str, *, doc_planted: bool
     ) -> tuple[str | None, str | None]:
@@ -13323,7 +13634,7 @@ def build_browser_tools(
                 # "committed" from "expanded" and the child rows can -- a cascading click that opened
                 # them committed nothing yet.
                 try:
-                    found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+                    found = await _click_menu_scan(page, await _probe_arg(page, selector))
                 except Exception:
                     return None
                 if isinstance(found, dict) and found.get("count"):
@@ -13340,7 +13651,7 @@ def build_browser_tools(
                 deadline = time.monotonic() + 2.4
                 while True:
                     try:
-                        found = await page.evaluate(_FIND_MENU_JS, {"sel": selector, "el": None, "cascade": True})
+                        found = await _click_menu_scan(page, {"sel": selector, "el": None, "cascade": True})
                     except Exception:
                         return None
                     if isinstance(found, dict) and found.get("count"):
@@ -13450,7 +13761,7 @@ def build_browser_tools(
                 after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return None, None
-            found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+            found = await _click_menu_scan(page, await _probe_arg(page, selector))
             if isinstance(found, dict) and found.get("count"):
                 return _menu_note(found, selector), None
             if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
@@ -13459,10 +13770,17 @@ def build_browser_tools(
                     'an option\'s [data-tv3-menu="N"] selector while the menu is open.'
                 ), None
             return None, None
-        found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+        found = await _click_menu_scan(page, await _probe_arg(page, selector))
         if isinstance(found, dict) and found.get("count"):
             return _menu_note(found, selector), None
         return None, None
+
+    async def _rows_unlisted(page: Any, selector: str) -> bool:
+        try:
+            return await _holders(page, selector) == 0 and await _holders(page, _SALTED_MENU_SELECTOR) > 0
+        except Exception:
+            # Unreadable: the click proceeds as it did before this check, through the marker path's own errors.
+            return False
 
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -13471,6 +13789,13 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("click needs a selector, or mark=N from the last look().")
+        if _NUMBERED_MENU_SELECTOR_RE.match(selector.strip()) and await _rows_unlisted(page, selector):
+            # Not a page change: the menu is still open, its rows were simply never numbered.
+            raise ToolRefusal(
+                f"{selector} names no row: the open menu's options could not be listed, so its rows have no "
+                "numbers. Re-observe and click the option you want by its ref.",
+                error_class="rows_unlisted",
+            )
         if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
             matches = await _marker_matches(page, selector)
             if matches == 0:
@@ -13501,10 +13826,9 @@ def build_browser_tools(
                 )
         else:
             await _require_single_target(page, selector)
-        await input_dispatch.approach(page, selector)
         pre: dict[str, Any] | None = None
         try:
-            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
+            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _snapshot_arg(page, selector))
             if isinstance(pre_raw, dict):
                 pre = pre_raw
         except Exception:
@@ -14026,38 +14350,6 @@ def build_browser_tools(
             return True
         return False
 
-    async def _click_at_box_centre(page: Any, selector: str) -> bool:
-        # No actionability or hit-target check: the press lands on whatever paints at the field's centre,
-        # which for a sub-pixel input is the display layer the probe has just ruled its own skin. Some
-        # segment widgets move their section cursor only on a trusted pointer event, so focus() alone
-        # leaves the keys rendering in the display while the input stays empty.
-        top = _current_page()
-        try:
-            # bounding_box() is relative to the main viewport even for an element inside a frame.
-            box = await page.locator(selector).first.bounding_box(timeout=2000)
-            width, height = await top.evaluate("() => [innerWidth, innerHeight]")
-            if not box:
-                return False
-            x = box["x"] + box["width"] / 2
-            y = box["y"] + box["height"] / 2
-            if not (0 <= x < width and 0 <= y < height):
-                return False
-            realm = page if _acted_realm else None
-            while realm is not None and realm.parent_frame is not None:
-                # A frame clips its content, so a point outside its element lands on the parent page.
-                frame_box = await (await realm.frame_element()).bounding_box()
-                if not frame_box or not (
-                    frame_box["x"] <= x < frame_box["x"] + frame_box["width"]
-                    and frame_box["y"] <= y < frame_box["y"] + frame_box["height"]
-                ):
-                    return False
-                realm = realm.parent_frame
-            await page.evaluate("() => { window.__tv3_doc = 1; }")
-            await input_dispatch.click_at(top, x, y)
-        except Exception:
-            return False
-        return True
-
     async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> _Reach:
         # focus() needs no hit target, so it stands in for a click refused only by the viewport check.
         # A widget that hands the caret to another segment would take the keys there, so a caret that
@@ -14068,32 +14360,14 @@ def build_browser_tools(
         # not tell a fill from a query; with no click to reach its rows, keep the error.
         if await _declares_a_list(page, selector):
             raise exc
-        reach: _Reach = "focus"
-        if run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, settings.TASK_V3_TYPE_COORDINATE_CLICK) and (
-            await _click_at_box_centre(page, selector)
-        ):
-            reach = "point"
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=1000)
-            except Exception:
-                pass
-            try:
-                same_document = bool(await page.evaluate("() => window.__tv3_doc === 1"))
-            except Exception:
-                same_document = False
-            if not same_document:
-                # The press followed a link: the selector may match something on the destination.
-                raise exc
         try:
-            # Still focused explicitly: the press need not move the caret, and the display it landed on
-            # may have no handler that forwards focus to the input.
             await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
             held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
             held = None
         if held is not True:
             raise exc
-        return reach
+        return "focus"
 
     async def _focus_for_typing(
         page: Any, selector: str, *, focus_fallback: bool = False
@@ -14283,7 +14557,6 @@ def build_browser_tools(
         # held value, and only with its own list known closed; every other field acts and verifies the click.
         if not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY:
             return False
-        await input_dispatch.approach(page, selector)
         try:
             if not await page.evaluate(_OWN_LIST_CLOSED_JS, await _probe_arg(page, selector)):
                 return False
@@ -15074,7 +15347,6 @@ def build_browser_tools(
         collateral: list[list[str]] | None = None,
         query: str | None = None,
         press_enter: bool = False,
-        secret: bool = False,
     ) -> tuple[_TypeaheadPick, str | None, str | None, _Reach]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM BEFORE the focus click, not just before typing: a widget that opens its full list on
@@ -15089,9 +15361,8 @@ def build_browser_tools(
         # Same reason: fill()/type() below open the widget's own list (aria-expanded=true) for the rest
         # of this attempt, and ownCommittedSurface reads nothing while it is open.
         pre_own = await _own_surface_text(page, selector)
-        await input_dispatch.approach(page, selector)
         try:
-            await page.evaluate(_PRESNAPSHOT_JS)
+            await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
         except Exception:
             presnapshot_ok = False
             LOG.info("taskv3 typeahead pre-snapshot failed; skipping suggestion probe", selector=selector)
@@ -15106,7 +15377,7 @@ def build_browser_tools(
             # Focus may reveal help text or a validation note as well as a menu; only rows of a list
             # are a reaction the finder may pick from, so everything else focus revealed is marked too.
             try:
-                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _snapshot_arg(page, selector))
             except Exception:
                 pass
         # `query` is what the caller chose to search with; the row committed must still be `value` exactly.
@@ -15120,9 +15391,7 @@ def build_browser_tools(
         # Clearing an empty multi-value input sends Delete, which removes the field's last chip.
         if not (pre_value == "" and await _holds_own_chips(page, selector)):
             await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
-        await input_dispatch.type_keys(
-            page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed), secret=secret, replace=True
-        )
+        await input_dispatch.type_keys(page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
         if collateral:
             collateral[:] = await _collateral_moved_while_typing(page, collateral)
         if not presnapshot_ok or reach != "click":
@@ -15182,7 +15451,7 @@ def build_browser_tools(
         # The rows showing now are the widget's unfiltered list, not an answer to the query: only rows
         # the search renders (or rewrites) may count.
         try:
-            await page.evaluate(_PRESNAPSHOT_JS)
+            await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
             await page.evaluate(_WATCH_REWRITTEN_ROWS_JS)
         except Exception:
             return _settled(
@@ -15544,10 +15813,11 @@ def build_browser_tools(
             return None
         return {"month": f"{month:02d}", "day": f"{day:02d}", "year": year_s}
 
-    async def _date_segment_group(page: Any, selector: str) -> dict[str, Any]:
+    async def _date_segment_group(page: Any, selector: str, *, tag_partial: bool = False) -> dict[str, Any]:
         try:
             probe = await page.evaluate(
-                _DATE_SEGMENT_GROUP_JS, {**await _probe_arg(page, selector), "aim": _date_segment_aim_on()}
+                _DATE_SEGMENT_GROUP_JS,
+                {**await _probe_arg(page, selector), "aim": tag_partial or _date_segment_aim_on()},
             )
         except Exception:
             return {"ok": False, "reason": None, "targetLabel": None}
@@ -15559,6 +15829,171 @@ def build_browser_tools(
         except Exception:
             return ""
         return str(raw) if isinstance(raw, str) else ""
+
+    async def _date_segment_state(
+        page: Any, labels: Sequence[str], record: dict[str, Any] | None = None
+    ) -> dict[str, list[Any]] | None:
+        # Compared by integer, so a widget re-padding "3" as "03" is not a move; an empty segment is None, never 0.
+        try:
+            raw = await page.evaluate(_DATE_SEGMENT_STATE_JS, {"labels": list(labels), "set": record or {}})
+        except Exception:
+            return None
+        ok = isinstance(raw, list) and len(raw) == len(labels) and all(isinstance(r, list) for r in raw)
+        return dict(zip(labels, raw, strict=False)) if ok else None
+
+    async def _date_siblings_begin(page: Any, target: str, order: list[str]) -> dict[str, int | None] | None:
+        # Each other segment's reference is the value a failed restore recorded on it, so a retried write is judged
+        # against the date before the first corruption; else what it holds now. The target's record is dropped.
+        siblings = [label for label in order if label != target]
+        if not siblings:
+            return {}
+        state = await _date_segment_state(page, [target, *siblings], {target: "drop"})
+        if state is None:
+            return None
+        return {label: held if rec == "none" else rec for label, (held, rec) in state.items() if label != target}
+
+    async def _commit_with_tab(page: Any, selector: str) -> ToolResult | None:
+        # A trusted Tab, never blur(): a segment widget commits what it assembled only when focus really leaves.
+        try:
+            planted = await page.evaluate("() => { window.__tv3_doc = 1; return true; }") is True
+        except Exception:
+            planted = False
+        try:
+            await input_dispatch.press(_current_page(), None, "Tab")
+            await page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            pass
+        try:
+            if planted and await page.evaluate("() => window.__tv3_doc === 1"):
+                return None
+        except Exception:
+            pass
+        # Leaving the field submitted or navigated, or the check could not run: the selector may match something
+        # else now, so nothing is read back.
+        return ToolResult.error(
+            f"typed into {selector}, then the page navigated, or could not be checked, when focus "
+            "left the field -- the field may not hold the text. Re-observe before doing anything else.",
+            data={"navigated": True, "page_state_changed": True},
+        )
+
+    async def _settled_date_read(page: Any, selector: str, label: str, labels: list[str]) -> dict[str, Any] | None:
+        # Re-tagged through the written segment's own tag (the caller's selector only if that element is gone), since
+        # a widget may re-render on a commit; then two equal reads 0.15s apart within 0.6s. None: a segment is gone.
+        if not (await _date_segment_group(page, f'[data-tv3-dateseg="{label}"]', tag_partial=True)).get("ok"):
+            await _date_segment_group(page, selector, tag_partial=True)
+        last: dict[str, Any] | None = None
+        deadline = time.monotonic() + 0.6
+        while True:
+            state = await _date_segment_state(page, labels)
+            now = None if state is None else {other: held for other, (held, _) in state.items()}
+            if (now is not None and now == last) or time.monotonic() >= deadline:
+                return now
+            last = now
+            await asyncio.sleep(0.15)
+
+    async def _settle_date_group(
+        page: Any, selector: str, digits: str, group: dict[str, Any] | None
+    ) -> tuple[ToolResult | None, dict[str, Any] | None, int]:
+        # (error, settled values, segments the page set) after a write into the group's `label` segment. The keys land
+        # in earlier segments and a segment written alone is clean, so the group is re-read before each restore and the
+        # latest wrong segment is put back and committed with a Tab -- the day only once the month is right, since the
+        # page clamps the day against the month it holds. A segment that cannot be read stops the loop.
+        if group is None:
+            return None, None, 0
+        label, ref = group["label"], group["ref"]
+        stats = {"date_siblings_moved_after_tab": 0, "date_siblings_filled_after_tab": 0}
+        try:
+            unverified = ToolResult.error(
+                f"typed into {selector}, but the segments of the same date could not be read back afterwards, so the "
+                "date is NOT confirmed. Re-observe the date before relying on it.",
+                error_class="date_sibling_unverified",
+            )
+            if ref is None:
+                return unverified, None, 0
+            labels = [*ref, label]
+            want: dict[str, int | None] = {**ref, label: int(digits)}
+            # Recorded while the segments are still tagged, so an exit that cannot read them leaves the retry a
+            # reference; the confirmed path below drops the records again.
+            await _date_segment_state(page, list(ref), {o: want[o] for o in ref if want[o] is not None})
+            now = await _settled_date_read(page, selector, label, labels)
+            clamped = 0
+            emptied: set[str] = set()
+            restored: dict[str, tuple[Any, Any]] = {}
+            for _ in range(2 * len(ref)):
+                # A month outside 1-12 (a day/month flip into a lenient input) is never a date this can confirm.
+                if now is None or not 1 <= (now.get("month") or 1) <= 12:
+                    return unverified, None, 0
+                # Judged against the month and year the page holds, and only once both are the ones wanted.
+                month, year, day = now.get("month"), now.get("year") or 2000, ref.get("day") or 0
+                settled = month == want.get("month") and now.get("year") == want.get("year", now.get("year"))
+                if not clamped and settled and month and day > (last := calendar.monthrange(year, month)[1]):
+                    # Only the month's last day is a clamp; anything else leaves the date invalid or incomplete.
+                    if now.get("day") != last:
+                        return (
+                            ToolResult.error(
+                                f"typed into {selector}, but the day of the same date is not valid for that month. The "
+                                "date is NOT correct: re-type the day on its own.",
+                                error_class="date_sibling_moved",
+                            ),
+                            now,
+                            0,
+                        )
+                    want["day"], clamped = last, 1
+                # A segment emptied once and filled again by the widget holds its default, and keeps it.
+                wrong = [o for o in reversed(ref) if now[o] != want[o] and not (want[o] is None and o in emptied)]
+                if not wrong:
+                    break
+                other = "month" if wrong[0] == "day" and "month" in wrong else wrong[0]
+                restored[other] = (restored[other][0] if other in restored else now[other], want[other])
+                locator = page.locator(f'[data-tv3-dateseg="{other}"]').first
+                await _aim_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
+                # The caret goes to the end, since a clear deletes only what precedes it. Focus is checked before the
+                # clear, so a refusal never leaves the segment wiped.
+                with contextlib.suppress(Exception):
+                    await locator.evaluate(_CARET_TO_END_JS, timeout=2000)
+                if not await _segment_focused(locator):
+                    return unverified, None, 0
+                await _clear_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
+                cleared = ((await _date_segment_state(page, [other])) or {}).get(other, (1, None))[0] is None
+                if want[other] is not None:
+                    with contextlib.suppress(Exception):
+                        await input_dispatch.type_keys(_current_page(), None, str(want[other]).zfill(2), delay=40)
+                stats["date_siblings_moved_after_tab"] += 1
+                emptied |= {other} if want[other] is None and cleared else set()
+                if (navigated := await _commit_with_tab(page, selector)) is not None:
+                    return navigated, None, 0
+                before, now = now, await _settled_date_read(page, selector, label, labels)
+                # An emptied segment that this restore of another segment changed was moved again, not defaulted.
+                emptied -= {o for o in emptied if o != other and now and before and now[o] != before[o]}
+            if now is None:
+                return unverified, None, 0
+            # A value that reappears after a restore to empty is the widget's default, and becomes the reference.
+            noted = clamped + sum(ref[o] is None and now[o] is not None for o in ref)
+            stats["date_siblings_filled_after_tab"] = noted
+            wrong = [o for o in reversed(ref) if now[o] != want[o] and not (want[o] is None and o in emptied)]
+            await _date_segment_state(page, list(ref), {o: want[o] if o in wrong else "drop" for o in ref})
+            # A restore's keys can also land in the segment just written, which no caller re-reads after this.
+            wrong += [label] if now[label] != want[label] else []
+            if not wrong and restored:
+                # Named as put back only where the segment holds the wanted value; a widget default is shown as is.
+                put_back = ", ".join(
+                    f"put back the {o} {'empty' if a is None else a} -> {'empty' if want[o] is None else want[o]}"
+                    if now[o] == want[o]
+                    else f"saw the {o} changed to {now[o]}"
+                    for o, (a, _) in restored.items()
+                )
+                return ToolResult.ok(f"typed into {selector}; the write moved and the tool {put_back}"), now, noted
+            if not wrong:
+                return None, now, noted
+            error = ToolResult.error(
+                f"typed into {selector}, but the {' and '.join(wrong)} of the same date moved and could not be put "
+                f"back. The date is NOT correct: re-type the {', then the '.join(wrong)} one segment per call.",
+                error_class="date_sibling_moved",
+            )
+            return error, now, noted
+        finally:
+            with contained_effect("date siblings settled log"):
+                LOG.info("taskv3 date siblings settled", segment=label, **stats)
 
     def _date_segment_committed(rendered: str, expected_digits: str) -> bool:
         match = _DATE_SEGMENT_DIGITS_RE.search(rendered)
@@ -15746,6 +16181,14 @@ def build_browser_tools(
                 with contextlib.suppress(Exception):
                     await layer.dispose()
 
+    async def _segment_focused(locator: Any) -> bool:
+        # Keys go to whatever holds focus: refused when that is outside the tagged group or another of its segments,
+        # allowed on the segment or on an input the widget moved focus to inside the group.
+        try:
+            return bool(await locator.evaluate(_DATE_SEGMENT_FOCUS_JS, timeout=2000))
+        except Exception:
+            return False
+
     async def _type_one_date_segment(page: Any, selector: str, digits: str) -> tuple[bool, str]:
         locator = page.locator(selector).first
         try:
@@ -15832,6 +16275,8 @@ def build_browser_tools(
         page: Any, selector: str, components: dict[str, str], order: list[str], *, arm: bool, aimed: bool
     ) -> ToolResult:
         written: list[tuple[str, str, str]] = []
+        # Every segment is rewritten, so no earlier restore's record still describes the date.
+        await _date_segment_state(page, order, dict.fromkeys(order, "drop"))
         for label in _DATE_SEGMENT_ORDER:
             segment_selector = f'[data-tv3-dateseg="{label}"]'
             committed, aim = await _type_one_date_segment(page, segment_selector, components[label])
@@ -15882,47 +16327,37 @@ def build_browser_tools(
         # element the probe established is this segment, where re-resolving the caller's selector
         # would act on whatever it matches now.
         segment_selector = f'[data-tv3-dateseg="{label}"]'
-        siblings = [other for other in labels if other != label]
-
-        async def moved_segments(before_siblings: dict[str, str]) -> int:
-            # Read by value or text, so a segment rendered as text is counted when it moves too.
-            now = {other: await _read_date_segment(page, f'[data-tv3-dateseg="{other}"]') for other in siblings}
-            return sum(now[other] != before_siblings[other] for other in siblings)
-
-        # Exactly one segment is being written, so a sibling that moves while the keys are sent took
-        # them by misrouting and is owed them back -- the same repair the plain path performs, which
-        # this path would otherwise drop. The group fill cannot reuse it: writing its siblings is the
-        # job there, so their movement is indistinguishable from a misroute.
+        # Exactly one segment is being written, so every other segment of the group is held to its value from
+        # before the call; fields outside the group that moved are only reported.
         arm = _date_segment_aim_on()
-        before = await _read_date_segment(page, segment_selector)
-        before_siblings = (
-            {other: await _read_date_segment(page, f'[data-tv3-dateseg="{other}"]') for other in siblings}
-            if arm
-            else {}
-        )
+        ref = await _date_siblings_begin(page, label, labels)
         collateral = await _capture_collateral(page, segment_selector)
-        outside = await _collateral_outside_date_segments(page, collateral) if arm else []
+        outside = await _collateral_outside_date_segments(page, collateral)
         committed, aim = await _type_one_date_segment(page, segment_selector, digits)
-        moved = await _collateral_moved_while_typing(page, collateral) if collateral else []
-        moved_outside = await _collateral_moved_while_typing(page, outside) if outside else []
         LOG.info(
             "taskv3 date segment fill",
             segment=label,
             committed=committed,
             whole_date=False,
-            siblings_moved=await moved_segments(before_siblings) + len(moved_outside) if arm else len(moved),
             aim=aim,
             group_shape=_date_group_shape(labels),
             date_segment_aim_arm=arm,
         )
+        # The siblings are put back by keys even when this segment did not commit: a fill() take-back writes around
+        # the widget's own state, which can keep the stray key.
+        if (navigated := await _commit_with_tab(page, selector)) is not None:
+            return navigated
+        date_error, now, noted = await _settle_date_group(page, selector, digits, {"label": label, "ref": ref})
+        if date_error is not None and committed and date_error.status != "ok":
+            return date_error
+        # A restore the settle made leads the ok; a field outside the group that moved is still reported after it.
+        head = date_error.content if date_error is not None else f"typed into {selector}; filled its {label} segment"
         if not committed:
-            # Ownership is decided exactly as the plain path decides it: the keys are ours to take back
-            # only where the segment proves it took none of them -- still holding what it held, or empty
-            # because this call's own clear left it so. A segment holding anything else took some of the
-            # text, and a sibling that moved with it is the widget distributing that value.
-            held = await _read_date_segment(page, segment_selector)
-            if moved and (not held or held == before):
-                await _restore_collateral(page, moved)
+            # The target took none of the keys, so an in-group field outside the date that moved holds them (as base).
+            still = 0
+            if outside and (moved_outside := await _collateral_moved_while_typing(page, outside)):
+                await _restore_collateral(page, moved_outside)
+                still = len(await _collateral_moved_while_typing(page, moved_outside))
             reach = (
                 " It could only be focused, not clicked, so the widget may have sent the keys elsewhere."
                 if arm and aim == "focus"
@@ -15931,36 +16366,19 @@ def build_browser_tools(
             return ToolResult.error(
                 f"typed into {selector}, but its {label} segment did not commit the value afterward -- "
                 f"the field is NOT filled.{reach} Re-observe and retry."
+                + (f" {still} other field(s) in the group still hold keys it sent." if still else "")
             )
-        if await _drifted_date_segment(page, [(label, segment_selector, digits)]) is not None:
-            if not arm:
-                return ToolResult.error(
-                    f"typed into {selector}'s {label} segment, but it changed afterward, so the segment may now "
-                    "hold a different value than requested. The page changed it, and it was left as the page "
-                    "set it. Re-observe it to see what value the field holds.",
-                    error_class="value_changed_by_page",
-                )
-            now = _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, segment_selector))
-            return await _value_changed_by_page_error(
-                page, selector, digits, now.group(0) if now else "", echo=not text_is_secret
-            )
-        # Read the siblings a second time, because the blur above is itself an event a widget derives
-        # or clamps another component on -- and that fires after the read the restore decision used,
-        # which has to stay next to the keystrokes to be able to attribute them.
-        if arm:
-            settled_outside = await _collateral_moved_while_typing(page, outside) if outside else []
-            changed = await moved_segments(before_siblings) + len(settled_outside)
-        else:
-            changed = len(await _collateral_moved_while_typing(page, collateral) if collateral else moved)
+        if now is not None and now[label] != int(digits):
+            held = "" if now[label] is None else str(now[label])
+            return await _value_changed_by_page_error(page, selector, digits, held, echo=not text_is_secret)
+        changed = noted + len(await _collateral_moved_while_typing(page, outside) if outside else [])
         if changed:
-            # The keys landed in the segment, so by the ownership rule above these other fields are
-            # not ours to take back -- but they did move, and saying so is the tool reporting what
-            # happened rather than deciding whether it matters.
+            # Values the page set (a default, a clamp) and fields outside the group are kept, but reported.
             return ToolResult.ok(
-                f"typed into {selector}; filled its {label} segment. {changed} other field(s) in "
+                f"{head}. {changed} other field(s) in "
                 "the same group changed while it was typed -- re-observe the date before relying on it"
             )
-        return ToolResult.ok(f"typed into {selector}; filled its {label} segment")
+        return ToolResult.ok(head)
 
     def _resolves_to_one_time_code(raw_text: str) -> bool:
         # The provenance _resolve_text judges a one-time code by: a TOTP placeholder, or a value that resolves
@@ -16053,7 +16471,7 @@ def build_browser_tools(
                 held = await box.input_value(timeout=1000)
                 if not held:
                     # v1's fallback: a box that drops a programmatic value may still take the key.
-                    await input_dispatch.type_keys(page, box, char, timeout=1000, secret=secret)
+                    await input_dispatch.type_keys(page, box, char, timeout=1000)
                     held = await box.input_value(timeout=1000)
             except Exception:
                 held = None
@@ -16152,6 +16570,7 @@ def build_browser_tools(
         # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
         url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
+        date_group: dict[str, Any] | None = None
         # A segmented date input truncates a whole date typed into one segment at that segment's
         # maxlength, so a confirmed month/day/year group is filled segment by segment instead. A
         # caller may equally address ONE segment and write just its component, which no whole-date
@@ -16198,6 +16617,16 @@ def build_browser_tools(
                             labels,
                             text_is_secret=text != args.get("text", ""),
                         )
+                # The plain path types a month/year or year-only segment, so its group is tagged here only to read
+                # and restore the other segments around the write.
+                missing = group.get("reason") == "missing"
+                probe = await _date_segment_group(page, selector, tag_partial=True) if missing else group
+                target = str(probe.get("targetLabel"))
+                if probe.get("ok") and _DATE_SEGMENT_TEXT_RE.fullmatch(text.strip()):
+                    ref = await _date_siblings_begin(page, target, probe.get("order") or [])
+                    # None: the siblings could not be read before the write, so it can only end unverified.
+                    date_group = {"label": target, "ref": ref} if ref != {} else None
+                LOG.info("taskv3 date segment group declined", date_group_reject=group.get("reason"))
         field_type: str | None = None
         maxlength: int | None = None
         if text:
@@ -16260,7 +16689,9 @@ def build_browser_tools(
             if not await _anchor_typeable(page, selector) and await _anchor_has_list_semantics(page, selector):
                 return await _open_observe_pick(page, selector, text)
             opened_by_typing = await _list_opened_on_an_empty_field(page, selector)
-            result = await _type_typeahead_commit(page, selector, text, text_is_secret=text != args.get("text", ""))
+            result = await _type_typeahead_commit(
+                page, selector, text, text_is_secret=text != args.get("text", ""), date_group=date_group
+            )
             return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
         # The types that skip the typeahead probe still must not be typed into through an overlay.
         # They reach fill()/type(), which do no hit-testing, so nothing here would fail on its own --
@@ -16307,9 +16738,7 @@ def build_browser_tools(
                     at_end = False
                 if at_end:
                     # page.type() would focus the field again, and a fresh focus puts the caret back at the start.
-                    sent = await _type_keys_before_deadline(
-                        text, press_end=at_end == "end_key", secret=text != args.get("text", "")
-                    )
+                    sent = await _type_keys_before_deadline(text, press_end=at_end == "end_key")
                     if sent < len(text):
                         progress = (
                             "partway" if text != args.get("text", "") else f"after {sent} of {len(text)} characters"
@@ -16321,9 +16750,7 @@ def build_browser_tools(
                             error_class="text_not_held",
                         )
                 else:
-                    await input_dispatch.type_keys(
-                        page, selector, text, timeout=_typing_timeout_ms(text), secret=text != args.get("text", "")
-                    )
+                    await input_dispatch.type_keys(page, selector, text, timeout=_typing_timeout_ms(text))
                 not_held = await _appended_text_not_held(
                     field, selector, text, before, text_is_secret=text != args.get("text", "")
                 )
@@ -16372,7 +16799,7 @@ def build_browser_tools(
             await handle.dispose()
         return element
 
-    async def _type_keys_before_deadline(text: str, *, press_end: bool, secret: bool) -> int:
+    async def _type_keys_before_deadline(text: str, *, press_end: bool) -> int:
         # One key at a time: a single keyboard.type(text) keeps typing in the browser after its caller stops
         # waiting, into whatever field the next action focuses. The keyboard is the page's; a frame has none.
         top = _current_page()
@@ -16387,7 +16814,7 @@ def build_browser_tools(
             if remaining <= 0:
                 return sent
             try:
-                await asyncio.wait_for(input_dispatch.type_keys(top, None, key, secret=secret), remaining)
+                await asyncio.wait_for(input_dispatch.type_keys(top, None, key), remaining)
             except asyncio.TimeoutError:
                 return sent
         return len(text)
@@ -16476,13 +16903,15 @@ def build_browser_tools(
             error_class="value_changed_by_page",
         )
 
-    async def _type_typeahead_commit(page: Any, selector: str, text: str, *, text_is_secret: bool) -> ToolResult:
+    async def _type_typeahead_commit(
+        page: Any, selector: str, text: str, *, text_is_secret: bool, date_group: dict[str, Any] | None = None
+    ) -> ToolResult:
         # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
         collateral: list[list[str]] = []
         try:
             pick, pre_value, pre_own, reach = await _type_and_commit(
-                page, selector, text, rounds=3, focus_fallback=True, collateral=collateral, secret=text_is_secret
+                page, selector, text, rounds=3, focus_fallback=True, collateral=collateral
             )
         except _FieldCovered as exc:
             return _covered_error(exc.selector, exc.occluder)
@@ -16500,34 +16929,48 @@ def build_browser_tools(
             # suggestion, which this path never clicks, so its raw text is no fill either. The poll's
             # wait also lets a widget that clears a rejected entry on a timer do so before the read.
             reacted = await _await_suggestion_rows(page, selector, text, rounds=8, any_region=True) is not None
-            if not reacted and reach == "point":
-                # Look for a slow list BEFORE leaving the field: Tab closes it. Tab is what commits a
-                # segment widget's assembled value, so the read-back comes after it.
+            if not reacted:
+                # Look for a slow list BEFORE leaving the field: Tab closes it. A segment widget commits
+                # its assembled value only on blur, so a read-back taken before the Tab reads it empty.
                 await asyncio.sleep(0.3)
                 reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
-                if not reacted:
-                    try:
-                        await input_dispatch.press(_current_page(), None, "Tab")
-                    except Exception:
-                        pass
-                    held = await _read_field_value(page, selector)
-                    landed = _typed_text_landed(held, text)
-                    LOG.info(
-                        "taskv3 type coordinate click fallback", landed=landed, page_changed=bool(held) and not landed
+            if not reacted:
+                if (navigated := await _commit_with_tab(page, selector)) is not None:
+                    return navigated
+                date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+                held = await _read_field_value(page, selector)
+                landed = _typed_text_landed(held, text)
+                siblings_moved = len(collateral)
+                LOG.info(
+                    "taskv3 type focus fallback",
+                    landed=landed,
+                    page_changed=bool(held) and not landed,
+                    siblings_moved=siblings_moved,
+                )
+                # The settle only overrides an ok; a write that did not land keeps its own error and restore below.
+                if date_error is not None and landed:
+                    outside = (
+                        await _collateral_outside_date_segments(page, collateral) if date_error.status == "ok" else []
                     )
-                    if landed:
-                        return ToolResult.ok(f"typed into {selector}")
-                    if held:
-                        # No restore: Tab already committed the page's value to the widget, and fill() fires no
-                        # blur, so taking the input back would leave the input and the widget disagreeing.
-                        return await _value_changed_by_page_error(page, selector, text, held, echo=not text_is_secret)
-            elif not reacted and _typed_text_landed(await _read_field_value(page, selector), text):
-                # The read-back costs a pause anyway, so spend it looking once more: a list slower than
-                # the poll would otherwise read as "no list" while its uncommitted query sits in the
-                # field. Slower than this is a bounded residual, not something a longer wait fixes.
-                await asyncio.sleep(0.3)
-                if await _find_suggestion_rows(page, selector, text, any_region=True) is None:
+                    tail = (
+                        f". {len(outside)} other field(s) in the same group changed while it was typed"
+                        if outside
+                        else ""
+                    )
+                    return ToolResult.ok(date_error.content + tail) if tail else date_error
+                if landed and siblings_moved:
+                    # The keys reached the target, so the siblings are not ours to take back -- but a
+                    # segment that took the first key of the next one's value must not pass as filled.
+                    return ToolResult.ok(
+                        f"typed into {selector}; {siblings_moved} other field(s) in the same group changed "
+                        "while it was typed -- re-observe them before relying on them"
+                    )
+                if landed:
                     return ToolResult.ok(f"typed into {selector}")
+                if held:
+                    # No restore: Tab already committed the page's value to the widget, and fill() fires no
+                    # blur, so taking the input back would leave the input and the widget disagreeing.
+                    return await _value_changed_by_page_error(page, selector, text, held, echo=not text_is_secret)
             # Collateral is ours only when the keystrokes demonstrably went nowhere near the target, and
             # there are two ways that shows: the target still holds what it held before, or it is empty
             # because this call cleared it and nothing landed after. A target holding anything ELSE took
@@ -16556,9 +16999,8 @@ def build_browser_tools(
                 )
             return ToolResult.error(
                 f"typed into {selector}, but it does not hold the typed text afterwards — the field is NOT "
-                "filled and may hold part of it. It sits outside the viewport and could only be "
-                + ("clicked at its position" if reach == "point" else "focused, not clicked")
-                + "; re-observe and fill it through the control the page shows instead",
+                "filled and may hold part of it. It sits outside the viewport and could only be focused, not "
+                "clicked; re-observe and fill it through the control the page shows instead",
                 data={"release_own_list": True},
             )
         if pick.suggestion is None and pick.candidates:
@@ -16645,6 +17087,13 @@ def build_browser_tools(
                 f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is NOT "
                 "filled; re-observe and retry, do not proceed"
             )
+        if date_group:
+            # A segment the click reached is not exempt: its keys can still land in an earlier segment.
+            if (navigated := await _commit_with_tab(page, selector)) is not None:
+                return navigated
+            date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+            if date_error is not None:
+                return date_error
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
         # inside one -- but not one the widget portals elsewhere in the page or renders in a
         # closed root, so inside a component this is still not evidence of absence. Saying
@@ -16721,9 +17170,8 @@ def build_browser_tools(
             pre_anchor_closed = None
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
-            await input_dispatch.approach(page, selector)
             try:
-                await page.evaluate(_PRESNAPSHOT_JS)
+                await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
             except Exception:
                 return None, ToolResult.error(
                     f"could not snapshot the page to open {selector}'s option list — the field is NOT "
@@ -17541,6 +17989,9 @@ def build_browser_tools(
                     await input_dispatch.press(_current_page(), None, "Escape")
             except Exception:
                 pass
+            same = " ".join(pre_value.split()).casefold() == " ".join(matched.split()).casefold()
+            signal = "aria-selected" if multi_select else "input value" if same else "displayed text"
+            _log_already_selected(signal, _exact_tier_key(matched) == _exact_tier_key(value))
             return ToolResult.ok(f"{matched!r} was already selected for {selector}; left it as is")
         chosen_values: list[str] = []
         try:
@@ -17609,7 +18060,17 @@ def build_browser_tools(
         return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
 
     def _already_held_result(selector: str, value: str) -> ToolResult:
+        _log_already_selected("chip", True)
         return ToolResult.ok(f"{value!r} was already selected for {selector}; left it as is")
+
+    def _log_already_selected(signal: str, matched_exact: bool) -> None:
+        # No form values and no selector, which can quote one. tool_call_seq joins this line to its tool call.
+        LOG.info(
+            "taskv3 select left an already-selected value",
+            tool_call_seq=current_tool_call_seq(),
+            signal=signal,
+            matched_exact=matched_exact,
+        )
 
     def _surface_holds(matched: str, surface: str, value: str) -> bool:
         def norm(t: str) -> str:
@@ -17783,10 +18244,8 @@ def build_browser_tools(
                     # reaction": the snapshot from before the first attempt would mark the rows the
                     # PREVIOUS query left on screen as pre-existing, and a widget that keeps its row
                     # nodes across a re-search would then have no reaction to show at all.
-                    await page.evaluate(_PRESNAPSHOT_JS)
-                    await input_dispatch.type_keys(
-                        page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung), replace=True
-                    )
+                    await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
+                    await input_dispatch.type_keys(page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung))
                 except Exception:
                     return []
                 rung_pick = await _commit_typeahead(
@@ -17843,7 +18302,7 @@ def build_browser_tools(
                 return
             await asyncio.sleep(0.4)
             try:
-                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _snapshot_arg(page, selector))
             except Exception:
                 LOG.debug("taskv3 empty-query offer snapshot failed", selector=selector)
 
@@ -18334,7 +18793,7 @@ def build_browser_tools(
                 failure or None,
                 error_class="navigation_failed",
             )
-        reached, readiness_seconds = await _wait_for_readiness(page, readiness_budget_ms)
+        reached, readiness_read_failed, readiness_seconds = await _wait_for_readiness(page, readiness_budget_ms)
         # Through _current_page() because `is_closed` is page-only: a Frame does not implement it, and
         # `page` here is whatever realm the call resolved in.
         if _current_page().is_closed():
@@ -18377,7 +18836,11 @@ def build_browser_tools(
             # readyState read that failed (a wedged renderer answers no evaluate). The result text
             # already distinguishes them for the model; this says which to a fleet read, without a
             # fourth class.
-            data["readiness_read_failed"] = reached is None
+            data["readiness_read_failed"] = readiness_read_failed
+        elif readiness_read_failed:
+            # A wait witnessed the level, so the failed read cost the model nothing here — but the
+            # read's failure rate is no longer confined to one class, and the index still wants it.
+            data["readiness_read_failed"] = True
         # Classified from where the navigation LANDED, not what was requested: a same-URL request
         # that redirects somewhere new is a real transition, while any request (alias, redirect,
         # or the URL itself) landing back on the pre-navigation page is a reload in effect.
@@ -18757,6 +19220,7 @@ def build_browser_tools(
 
         lines = [
             f"[{int(e['n'])}] {_digest_token(e.get('tag', ''), 20)} {_label(e.get('label', ''))!r}"
+            + (f" shows={_label(e['shows'])!r}" if e.get("shows") else "")
             + (f" placeholder={_label(e['placeholder'], 60)!r}" if e.get("placeholder") else "")
             for e in kept
         ]
@@ -18766,6 +19230,8 @@ def build_browser_tools(
         )
         if isinstance(data, dict) and data.get("truncated"):
             header += f" (only the first {_LOOK_MAX_MARKS} are marked; scroll for more.)"
+        if isinstance(data, dict) and data.get("showsOmitted"):
+            lines.append(_shows_omitted_note(int(data["showsOmitted"])))
         legend = header + "\n" + "\n".join(lines)
         return ToolResult.ok(legend, data=renumbered, screenshots=[annotated])
 
@@ -19162,8 +19628,16 @@ def build_browser_tools(
         between two documents on the model's behalf is the wrong-element commit in a new costume.
         """
         found: list[Any] = []
+        guessed_number = bool(_NUMBERED_MENU_SELECTOR_RE.match(selector.strip()))
+
+        async def _answers(realm: Any) -> bool:
+            if await _holders(realm, selector) > 0:
+                return True
+            # A realm whose menu was withheld salts its tags, but a guessed number still names one of its rows.
+            return guessed_number and await _holders(realm, _SALTED_MENU_SELECTOR) > 0
+
         try:
-            if await _holders(page, selector) > 0:
+            if await _answers(page):
                 found.append(page)
         except Exception:
             return page, None
@@ -19176,7 +19650,7 @@ def build_browser_tools(
         unreadable = 0
         for frame in frames:
             try:
-                if await _holders(frame, selector) > 0:
+                if await _answers(frame):
                     found.append(frame)
             except Exception:
                 # The page's own query already answered, so the selector is well formed and it is this

@@ -45,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
+from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
 

@@ -10,6 +10,7 @@ type Surface =
   | "dashboard"
   | "discover"
   | "editor"
+  | "studio"
   | "runs"
   | "settings"
   | "api_docs";

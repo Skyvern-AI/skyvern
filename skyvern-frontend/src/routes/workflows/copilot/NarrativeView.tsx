@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -19,6 +26,7 @@ import {
   revealedCountAt,
 } from "./actionReveal";
 import { humanizeBlockLabel } from "./blockLabel";
+import { fitSteps, STEP_SEPARATOR } from "./fitSteps";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import {
   ACTIVITY_KIND_WORD,
@@ -309,6 +317,22 @@ function AttemptsBadge({ attempts }: { attempts?: number }) {
 }
 
 function ActivityRow({ entry }: { entry: ActivityEntry }) {
+  return (
+    <div data-tool-call-id={toolCallIdOf(entry)}>
+      {entry.reason === undefined ? null : (
+        <p
+          data-testid="copilot-reason"
+          className="mb-1 whitespace-pre-wrap text-[12px] leading-[1.5]"
+        >
+          {entry.reason}
+        </p>
+      )}
+      <ActivityActionRow entry={entry} />
+    </div>
+  );
+}
+
+function ActivityActionRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
       <FSubRow
@@ -1516,6 +1540,49 @@ function FCardCodeChange({
   );
 }
 
+function FFittedSteps({ steps }: { steps: string[] }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const [[head, tail], setFit] = useState<[string, string]>(() => [
+    steps.join(STEP_SEPARATOR),
+    "",
+  ]);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) return;
+    const style = getComputedStyle(el);
+    context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    const fit = () =>
+      setFit(
+        fitSteps(steps, el.clientWidth, (t) => context.measureText(t).width),
+      );
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [steps]);
+  // whitespace-pre keeps the tail's leading separator, which a flex item
+  // would otherwise strip; the head's huge shrink factor makes it give up
+  // its width before the tail does.
+  return (
+    <span
+      ref={ref}
+      aria-hidden="true"
+      className="flex min-w-0 flex-1 overflow-hidden"
+    >
+      <span className="min-w-0 overflow-hidden text-ellipsis whitespace-pre [flex-shrink:9999]">
+        {head}
+      </span>
+      {tail ? (
+        <span className="min-w-0 overflow-hidden text-ellipsis whitespace-pre">
+          {tail}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 // One call in an expanded step. A result reads inline beside the call and
 // opens to its full text; an error opens as its own box.
 function FCallItem({
@@ -1546,6 +1613,7 @@ function FCallItem({
   // A cancelled turn can end with a call that never got its result.
   const pending = entry.kind === "tool_call" && !turnEnded;
   const diffs = entry.codeDiffs ?? [];
+  const steps = failed ? undefined : entry.browserSteps;
   const lineClass = `flex w-full min-w-0 items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT}`;
   const inner = (
     <>
@@ -1554,19 +1622,31 @@ function FCallItem({
         aria-hidden="true"
         className="size-3 shrink-0 text-muted-foreground"
       />
-      <span className="min-w-0 break-words">
-        {callLabel(entry)}
-        {count > 1 ? (
-          <span className="text-muted-foreground">{` ×${count}`}</span>
-        ) : null}
-        {failed ? (
-          <span className="text-muted-foreground"> · attempt failed</span>
-        ) : null}
-        <AttemptsBadge attempts={entry.attempts} />
-      </span>
+      {steps?.length ? (
+        // A finished browser code call is labelled by what it did.
+        <>
+          <span className="sr-only">{steps.join(STEP_SEPARATOR)}</span>
+          <FFittedSteps steps={steps} />
+          {count > 1 ? (
+            <span className="shrink-0 text-muted-foreground">{`×${count}`}</span>
+          ) : null}
+          <AttemptsBadge attempts={entry.attempts} />
+        </>
+      ) : (
+        <span className="min-w-0 break-words">
+          {callLabel(entry)}
+          {count > 1 ? (
+            <span className="text-muted-foreground">{` ×${count}`}</span>
+          ) : null}
+          {failed ? (
+            <span className="text-muted-foreground"> · attempt failed</span>
+          ) : null}
+          <AttemptsBadge attempts={entry.attempts} />
+        </span>
+      )}
       {/* Shown beside the label until opened, then in full below it; the
           button's name stays the call, not its result. */}
-      {inlineResult === null || open ? null : (
+      {inlineResult === null || open || steps?.length ? null : (
         <span
           aria-hidden="true"
           className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground"
@@ -1654,9 +1734,12 @@ function FActivityLogRow({
   // the string stays in flow, transparent, so the line never grows and later evidence stays put.
   const reasonNode =
     row.reason === null ? null : (
-      <p
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
         data-testid="copilot-reason"
-        className="mb-px mt-2 break-words text-[13px] leading-[1.55] text-foreground [overflow-wrap:anywhere] dark:text-slate-200"
+        className={`mb-px mt-2 break-words text-left text-[13px] leading-[1.55] text-foreground [overflow-wrap:anywhere] dark:text-slate-200 ${open || row.kind === null ? "" : "line-clamp-2"}`}
       >
         {row.reason.slice(0, reasonShown)}
         <span
@@ -1668,7 +1751,7 @@ function FActivityLogRow({
         <span className="text-transparent">
           {row.reason.slice(reasonShown)}
         </span>
-      </p>
+      </button>
     );
 
   // A block its run call ran reads as one card in that call's place, and the
@@ -1964,7 +2047,12 @@ function FActivityLogRow({
   const body = <>{segments}</>;
 
   return (
-    <div className="flex flex-col">
+    <div
+      className="flex flex-col"
+      data-tool-call-id={
+        row.entries.length === 1 ? toolCallIdOf(row.entries[0]!) : undefined
+      }
+    >
       {reasonNode}
       {hasDetail ? (
         <button

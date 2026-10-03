@@ -39,7 +39,6 @@ class EventStrategyFactory:
     __cursor_vis_cache: CursorEventStrategy | None = None
     __input: InputEventStrategy | None = None
     __scroll: ScrollEventStrategy | None = None
-    __profile: str | None = None
     __metrics: _EventMetrics = _EventMetrics()
 
     # -- setters ----------------------------------------------------------------
@@ -63,21 +62,7 @@ class EventStrategyFactory:
         EventStrategyFactory.__cursor_vis_cache = None
         EventStrategyFactory.__input = None
         EventStrategyFactory.__scroll = None
-        EventStrategyFactory.__profile = None
         EventStrategyFactory.__metrics = _EventMetrics()
-
-    @staticmethod
-    def record_profile(profile: str) -> None:
-        """Name the profile whoever registered the current strategies registered them under."""
-        EventStrategyFactory.__profile = profile
-
-    @staticmethod
-    def registered_profile() -> str:
-        """The recorded profile; "none" when nothing is registered, "unrecorded" when strategies were set unnamed."""
-        if EventStrategyFactory.__profile is not None:
-            return EventStrategyFactory.__profile
-        strategies = (EventStrategyFactory.__cursor, EventStrategyFactory.__input, EventStrategyFactory.__scroll)
-        return "none" if all(strategy is None for strategy in strategies) else "unrecorded"
 
     # -- getters (always return a non-None strategy) ----------------------------
 

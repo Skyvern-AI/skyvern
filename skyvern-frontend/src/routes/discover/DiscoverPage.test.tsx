@@ -132,6 +132,7 @@ vi.mock("@/util/homeTelemetry", async (importOriginal) => {
 });
 const baseState: OnboardingState = {
   tour_completed_at: null,
+  studio_tour_completed_at: null,
   modal_dismissed_at: null,
   first_save_at: null,
   first_run_at: null,
@@ -289,9 +290,9 @@ describe("DiscoverPage focus param", () => {
     );
     expect(mocks.focusAndPrefillExample).toHaveBeenCalledWith(
       null,
-      "contact_us_forms",
+      "add_employee",
     );
-    expect((prompt as HTMLTextAreaElement).value).toBe("contact_us_forms");
+    expect((prompt as HTMLTextAreaElement).value).toBe("add_employee");
     expect(document.activeElement).toBe(prompt);
     expect(screen.getByTestId("location").textContent).toBe("?foo=bar");
     expect(mocks.createWorkflow).not.toHaveBeenCalled();
@@ -322,7 +323,7 @@ describe("DiscoverPage focus param", () => {
     );
     expect(mocks.focusAndPrefillExample).toHaveBeenCalledWith(
       null,
-      "contact_us_forms",
+      "add_employee",
     );
     expect(screen.getByTestId("location").textContent).toBe("");
   });

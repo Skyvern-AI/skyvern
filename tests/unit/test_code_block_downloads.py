@@ -2128,6 +2128,7 @@ def test_none_valued_registration_fields_are_schema_not_claims() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2151,7 +2152,6 @@ async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
         "execute_user_function_with_timeout",
         AsyncMock(side_effect=_raise_after_download(_isolated_download_path, Exception("Download is starting"))),
     )
-    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", lambda self, e, page, engine_selection: True)
 
     healed = BlockResult(
@@ -2303,6 +2303,7 @@ async def test_cancel_during_registration_does_not_book_the_block_failed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2323,7 +2324,6 @@ async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise
         "execute_user_function_with_timeout",
         AsyncMock(side_effect=_raise_after_download(_isolated_download_path, Exception("Download is starting"))),
     )
-    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", lambda self, e, page, engine_selection: True)
 
     healed = BlockResult(

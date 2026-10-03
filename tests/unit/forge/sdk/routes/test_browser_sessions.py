@@ -14,6 +14,7 @@ from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_mod
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import API_BROWSER_SESSION_CREATED_BY
 from skyvern.schemas.browser_session_timeouts import max_lifetime_exceeded_warning
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import (
@@ -194,6 +195,7 @@ async def test_create_browser_session_forwards_whether_the_session_will_be_watch
     """Dropped here, the session is still created and still connects — it only fails later, when
     someone opens the live view. Defaulting it False is what keeps unattended automation routable."""
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=MagicMock())
 
     with (
@@ -211,6 +213,7 @@ async def test_create_browser_session_forwards_whether_the_session_will_be_watch
 @pytest.mark.asyncio
 async def test_create_browser_session_preserves_typed_credit_refusal_http_contract() -> None:
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=BrowserSessionCreditAdmissionRefusal())
 
     with (
@@ -224,6 +227,38 @@ async def test_create_browser_session_preserves_typed_credit_refusal_http_contra
 
     assert exc_info.value.status_code == 402
     assert exc_info.value.detail == "Credits exhausted. Upgrade your plan in Billing."
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_observes_before_creating_the_session() -> None:
+    calls: list[str] = []
+    app_mock = MagicMock()
+
+    async def observe(**_: object) -> None:
+        calls.append("observe")
+
+    async def create_session(**_: object) -> MagicMock:
+        calls.append("create")
+        return MagicMock()
+
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock(side_effect=observe)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=create_session)
+
+    with (
+        patch.object(browser_sessions_mod, "app", app_mock),
+        patch.object(browser_sessions_mod.BrowserSessionResponse, "from_browser_session", AsyncMock()),
+    ):
+        await browser_sessions_mod.create_browser_session(
+            browser_sessions_mod.CreateBrowserSessionRequest(),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            user_id="user_1",
+        )
+
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access.assert_awaited_once_with(
+        organization_id="org_1",
+        feature_names={"standalone_browser_sessions"},
+    )
+    assert calls == ["observe", "create"]
 
 
 def test_a_session_request_is_unwatched_unless_it_says_otherwise() -> None:
@@ -287,8 +322,19 @@ async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(e
 
 
 @pytest.mark.asyncio
-async def test_create_browser_session_records_the_caller_as_creator(
-    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+@pytest.mark.parametrize(
+    ("user_id", "expected_stored_created_by", "expected_response_created_by"),
+    [
+        ("user_creator", "user_creator", "user_creator"),
+        (None, API_BROWSER_SESSION_CREATED_BY, None),
+    ],
+)
+async def test_create_and_history_hide_api_origin_but_preserve_real_user_id(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    user_id: str | None,
+    expected_stored_created_by: str,
+    expected_response_created_by: str | None,
 ) -> None:
     db = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
     org = await db.organizations.create_organization(organization_name="Creator Org")
@@ -297,11 +343,16 @@ async def test_create_browser_session_records_the_caller_as_creator(
     monkeypatch.setattr(forge_app, "AGENT_FUNCTION", AgentFunction())
     monkeypatch.setattr(forge_app, "STORAGE", None)
 
-    await browser_sessions_mod.create_browser_session(
+    created = await browser_sessions_mod.create_browser_session(
         browser_sessions_mod.CreateBrowserSessionRequest(),
         current_org=org,
-        user_id="user_creator",
+        user_id=user_id,
     )
     [listed] = await browser_sessions_mod.get_browser_sessions_all(current_org=org, page=1, page_size=10)
+    [stored] = await db.browser_sessions.get_persistent_browser_sessions_history(
+        org.organization_id, page=1, page_size=10
+    )
 
-    assert listed.created_by == "user_creator"
+    assert created.model_dump()["created_by"] == expected_response_created_by
+    assert listed.model_dump()["created_by"] == expected_response_created_by
+    assert stored.created_by == expected_stored_created_by

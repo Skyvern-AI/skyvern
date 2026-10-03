@@ -195,7 +195,9 @@ DESTINATION_ADAPTERS: dict[str, DestinationAdapter] = {
 }
 
 
-_CODE_BLOCK_NON_IDENTITY_KEYS = frozenset({"steps", "user_owned_goal", "goal_needs_regeneration"})
+_CODE_BLOCK_NON_IDENTITY_KEYS = frozenset(
+    {"steps", "user_owned_goal", "goal_needs_regeneration", "code_edited_by_hand"}
+)
 
 
 def _without_code_steps(value: Any) -> Any:

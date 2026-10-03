@@ -223,6 +223,9 @@ export interface WorkflowCopilotChatHistoryMessage {
         // turn_start frame carries, so a client can correlate a row to its own send.
         copilot_turn_id?: string | null;
         terminal_reason?: string | null;
+        // Set on every interrupted row the server serves, since no late reply replaces
+        // a stored row. Absent only from a backend that still replaced rows.
+        interrupted_row_final?: boolean;
       })
     | null;
   narrative_payload?: Record<string, unknown> | null;
@@ -429,7 +432,17 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The tool call whose activity row was newest when the pause was raised, so
   // the card renders there. Absent against a backend that predates it.
   anchor_tool_call_id?: string | null;
+  // The live browser the user may sign in to themselves; absent when the card does not offer it.
+  sign_in_browser_session_id?: string | null;
+  signing_in?: boolean;
   timestamp: string;
+}
+
+export interface WorkflowCopilotCredentialResponseResult {
+  result: "accepted" | "signed_in" | "no_sign_in_found" | "save_failed";
+  expires_at?: string | null;
+  host?: string | null;
+  browser_profile_id?: string | null;
 }
 
 export interface WorkflowCopilotCredentialPauseResolvedUpdate {
@@ -437,13 +450,20 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   turn_id: string;
   workflow_copilot_chat_id: string;
   resume_token: string;
-  outcome: "connected" | "skipped" | "not_admitted";
+  outcome: "connected" | "skipped" | "not_admitted" | "signed_in";
   credential_id: string | null;
   name: string | null;
+  browser_profile_id?: string | null;
   timestamp: string;
 }
 
+export type ActivityBucket =
+  | { kind: "design" }
+  | { kind: "block"; workflow_run_block_id: string };
+
 export interface WorkflowCopilotToolCallUpdate {
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
   type: "tool_call";
   tool_name: string;
   display_label?: string | null;
@@ -464,6 +484,9 @@ export interface CodeWriteDiff {
 }
 
 export interface WorkflowCopilotToolResultUpdate {
+  activity_started_at?: string | null;
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
   type: "tool_result";
   tool_name: string;
   display_label?: string | null;
@@ -474,6 +497,8 @@ export interface WorkflowCopilotToolResultUpdate {
   code_diffs?: CodeWriteDiff[] | null;
   // The plan a successful set_work_plan stored. Absent on every other tool.
   work_plan?: string[] | null;
+  // A successful run_browser_code call's operations as display phrases.
+  browser_steps?: string[] | null;
   detail?: string | null;
   timestamp?: string | null;
 }

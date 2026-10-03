@@ -41,7 +41,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     contains_internal_machinery_leak,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.repair_origin_run import OriginBlockOutput, OriginExecutionSettings, OriginOutputSnapshot
+from skyvern.forge.sdk.copilot.repair_origin_run import (
+    OriginBlockOutput,
+    OriginExecutionSettings,
+    OriginOutputSnapshot,
+    SelectedOutputSource,
+)
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
@@ -620,7 +625,7 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
     ctx.repair_origin_outputs_run_id = "wr_origin"
-    ctx.repair_origin_outputs = OriginOutputSnapshot(
+    origin = OriginOutputSnapshot(
         definition=harness["workflow"].workflow_definition,
         outputs={
             "request_access": OriginBlockOutput(
@@ -629,6 +634,10 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
         },
         settings=OriginExecutionSettings.of(harness["workflow"]),
     )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "request_access": SelectedOutputSource("request_access", "wr_origin", "origin", origin)
+    }
     ctx.frontier_origin_reused_labels = ["request_access"]
     before = set(run_execution._DETACHED_CLEANUP_TASKS)
 

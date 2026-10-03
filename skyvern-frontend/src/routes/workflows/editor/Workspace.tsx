@@ -204,6 +204,7 @@ import {
   getWorkflowErrors,
   upgradeWorkflowDefinitionToVersionTwo,
   withGoalUndoRecordsFrom,
+  workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
 import { replayPersistedCollapseVisibility } from "./collapse/applyDescendantCollapseVisibility";
 import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
@@ -1099,6 +1100,7 @@ function Workspace({
           savedWorkflow.workflow_definition.blocks,
           settings,
           true,
+          workflowEffectiveDefaultEngine(savedWorkflow, queryClient),
         );
         updateNodes(
           replayPersistedCollapseVisibility(
@@ -1144,7 +1146,7 @@ function Workspace({
       )
         useWorkflowHasChangesStore.setState({ hydrateSavedSettings: null });
     };
-  }, [updateNodes, updateEdges]);
+  }, [updateNodes, updateEdges, queryClient]);
 
   usePendingWorkflowSaveRecovery(workflow);
 
@@ -2089,6 +2091,7 @@ function Workspace({
       workflowData.workflow_definition.blocks,
       settings,
       true,
+      workflowEffectiveDefaultEngine(workflowData, queryClient),
     );
 
     const collapsedSet = useNodeCollapseStore.getState().collapsed;
@@ -2394,6 +2397,7 @@ function Workspace({
         response.data.workflow_definition.blocks ?? [],
         settings,
         true,
+        workflowEffectiveDefaultEngine(saveData.workflow, queryClient),
       );
       const repairedBlocks = getWorkflowBlocks(repairedNodes, repairedEdges);
       settings.finallyBlockLabel = resolveFinallyBlockLabel(
@@ -2547,6 +2551,7 @@ function Workspace({
       selectedVersion.workflow_definition?.blocks || [],
       settings,
       true, // editable
+      workflowEffectiveDefaultEngine(selectedVersion, queryClient),
     );
 
     const collapsedSet = useNodeCollapseStore.getState().collapsed;

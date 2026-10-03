@@ -1,3 +1,4 @@
+import { queryClient } from "@/api/QueryClient";
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import {
   useCallback,
@@ -31,7 +32,10 @@ import {
 import { WorkflowVersion } from "../../hooks/useWorkflowVersionsQuery";
 import { WorkflowBlock } from "../../types/workflowTypes";
 import { FlowRenderer } from "../FlowRenderer";
-import { getElements } from "../workflowEditorUtils";
+import {
+  getElements,
+  workflowEffectiveDefaultEngine,
+} from "../workflowEditorUtils";
 import {
   PANE_FIT_DEBOUNCE_MS,
   revealNodeViewport,
@@ -85,6 +89,7 @@ function annotatedElements(
     JSON.parse(JSON.stringify(blocks)),
     apiWorkflowToSettings(version),
     false,
+    workflowEffectiveDefaultEngine(version, queryClient),
   );
   return {
     edges,

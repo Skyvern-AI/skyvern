@@ -108,6 +108,9 @@ export default {
         sidebar: "cubic-bezier(0.32, 0.72, 0, 1)",
       },
       keyframes: {
+        marquee: {
+          to: { transform: "translateX(-50%)" },
+        },
         "accordion-down": {
           from: { height: "0" },
           to: { height: "var(--radix-accordion-content-height)" },
@@ -160,6 +163,7 @@ export default {
         },
       },
       animation: {
+        marquee: "marquee 30s linear infinite",
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
         "collapsible-down":

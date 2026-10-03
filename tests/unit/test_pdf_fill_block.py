@@ -4,6 +4,7 @@ import io
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,6 +24,7 @@ from pypdf.generic import (
 )
 
 from skyvern.forge import app
+from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.utils.tesseract_languages import tesseract_language_arg, tesseract_ocr_packages
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import pdf_fill_block
@@ -444,6 +446,25 @@ async def test_resolve_source_pdf_accepts_run_local_absolute_path_in_non_local_e
 
     assert resolved == str(source_pdf.resolve())
     assert is_temp is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_pdf_accepts_run_local_file_uri_without_temporary_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_id = "run_pdf_fill_file_uri"
+    _install_context(monkeypatch, run_id)
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "source.pdf")
+    _write_fillable_pdf(source_pdf)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.settings.ENV", "production")
+    monkeypatch.setattr(files.app, "STORAGE", SimpleNamespace(manages_local_file_uri=lambda *_: False))
+    block = _make_block(file_url=source_pdf.as_uri())
+
+    resolved, is_temp = await block._resolve_source_pdf(run_id, organization_id="org-1")
+
+    assert resolved == str(source_pdf.resolve())
+    assert is_temp is False
+    assert source_pdf.exists()
 
 
 @pytest.mark.asyncio

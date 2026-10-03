@@ -43,8 +43,7 @@ export interface ActivityRow {
   // or a block still running, on a turn that has not ended. It goes false at
   // turn end even if a call never resolved.
   live: boolean;
-  // Narrator prose explaining why this step happened; the first narration that
-  // names the step keeps it.
+  // Actor metadata belongs to the call; legacy unowned text has its own row.
   reason: string | null;
   // First and last server clock reads across this row's entries. A browse
   // retry merges only when it started after the failed attempt ended.
@@ -195,117 +194,11 @@ function stableRowId(entry: ActivityEntry): string {
   return toolCallIdOf(entry) || entry.id;
 }
 
-function coalesceNarratedBrowseRetries(
-  rows: ActivityRow[],
-  intentByRow: ReadonlyMap<ActivityRow, string>,
-): void {
-  const coalesced: ActivityRow[] = [];
-  const coalescedIntents: (string | undefined)[] = [];
-  for (const row of rows) {
-    const previous = coalesced[coalesced.length - 1];
-    const intent = intentByRow.get(row);
-    const previousIntent = coalescedIntents[coalescedIntents.length - 1];
-    const previousTail = previous?.entries[previous.entries.length - 1];
-    const previousFailed =
-      previousTail?.kind === "tool_result" && previousTail.success === false;
-    const previousEndedMs = parseUtcIsoMs(previous?.endedAt);
-    const rowStartedMs = parseUtcIsoMs(row.startedAt);
-    // Parallel siblings can carry the same narrated intent. They are a retry
-    // only when the new attempt starts after the failed one ended; missing
-    // timestamps retain the legacy fallback for old hydrated payloads.
-    const followsFailure =
-      previousEndedMs === null ||
-      rowStartedMs === null ||
-      rowStartedMs >= previousEndedMs;
-    if (
-      previous?.kind !== "browse" ||
-      row.kind !== "browse" ||
-      row.reason !== null ||
-      !previousFailed ||
-      !followsFailure ||
-      intent === undefined ||
-      intent !== previousIntent
-    ) {
-      coalesced.push(row);
-      coalescedIntents.push(intent);
-      continue;
-    }
-
-    const latest = row.entries[row.entries.length - 1];
-    if (latest === undefined) {
-      coalesced.push(row);
-      coalescedIntents.push(intent);
-      continue;
-    }
-    const attempts =
-      (previous.entries[previous.entries.length - 1]?.attempts ?? 1) +
-      (latest.attempts ?? 1);
-    const earlierEntries = previous.entries.map((entry) => ({
-      ...entry,
-      attempts: undefined,
-    }));
-    const currentEntries = row.entries.slice();
-    currentEntries[currentEntries.length - 1] = {
-      ...latest,
-      attempts,
-      activityStartedAt:
-        previous.startedAt ?? latest.activityStartedAt ?? latest.timestamp,
-    };
-    coalesced[coalesced.length - 1] = {
-      ...row,
-      id: previous.id,
-      entries: [...earlierEntries, ...currentEntries],
-      startedAt: previous.startedAt ?? row.startedAt,
-      reason: previous.reason,
-      reasonAt: previous.reasonAt,
-    };
-  }
-  rows.splice(0, rows.length, ...coalesced);
-}
-
-// Condensing moves a call's result to where it arrived, past any narration
-// spoken mid-call; holding each narration behind calls that started strictly
-// before it keeps live and reload in the same order.
-function placeNarrations(entries: ActivityEntry[]): ActivityEntry[] {
-  const placed: ActivityEntry[] = [];
-  const held: ActivityEntry[] = [];
-  for (const entry of entries) {
-    if (entry.kind === "narration") {
-      held.push(entry);
-      continue;
-    }
-    const startedMs = parseUtcIsoMs(entry.activityStartedAt ?? entry.timestamp);
-    while (held.length > 0) {
-      const spokenMs = parseUtcIsoMs(held[0]!.timestamp);
-      if (startedMs !== null && spokenMs !== null && startedMs < spokenMs) {
-        break;
-      }
-      placed.push(held.shift()!);
-    }
-    placed.push(entry);
-  }
-  return [...placed, ...held];
-}
-
-// Whether some call in this row was still running when the narration was spoken.
-function wasInFlightAt(row: ActivityRow, narration: ActivityEntry): boolean {
-  const spokenMs = parseUtcIsoMs(narration.timestamp);
-  if (spokenMs === null) return false;
-  return row.entries.some((entry) => {
-    if (entry.kind !== "tool_call" && entry.kind !== "tool_result") {
-      return false;
-    }
-    const startedMs = parseUtcIsoMs(entry.activityStartedAt ?? entry.timestamp);
-    if (startedMs === null || startedMs > spokenMs) return false;
-    if (entry.kind === "tool_call") return true;
-    const endedMs = parseUtcIsoMs(entry.timestamp);
-    return endedMs === null || endedMs >= spokenMs;
-  });
-}
-
 function reasonOnlyRow(narration: ActivityEntry): ActivityRow {
   return {
-    id: `reason-${narration.id}`,
+    // The same recorded UTC timestamp may arrive with Z or +00:00.
+    // Normalize only the machine-generated identity, retaining subsecond precision.
+    id: `reason-${narration.id.replace("+00:00", "Z")}`,
     kind: null,
     entries: [],
     blocks: [],
@@ -357,76 +250,13 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
   // nothing is working once the turn is over, so nothing claims the open row.
   const ended = turn.terminal !== null;
   const rows: ActivityRow[] = [];
-  // The intent the narrator named for a row, used only to merge the
-  // unnarrated browse retries that pursue it.
-  const narratedIntent = new Map<ActivityRow, string>();
-  const narrate = (row: ActivityRow, narration: ActivityEntry) => {
-    row.reason = narration.text;
-    row.reasonAt = narration.receivedAtMs;
-    if (narration.activeLabel !== undefined) {
-      narratedIntent.set(row, narration.activeLabel);
-    }
-  };
-  // A reason, once shown, is never replaced. A narration names a step that has
-  // none and is about it; otherwise it opens the next line.
-  for (const entry of placeNarrations(
-    condenseActivityEntries(turn.designActivity),
-  )) {
+  for (const entry of condenseActivityEntries(turn.designActivity)) {
     const last = rows[rows.length - 1];
     if (entry.kind === "narration") {
-      // Iteration is the typed key. The tag can trail the work, though: a
-      // narration spoken while the newest call runs describes that call unless
-      // the step it is tagged with was itself still running.
-      let owner = rows.length - 1;
-      while (
-        owner >= 0 &&
-        !rows[owner]!.entries.some((e) => e.iteration === entry.iteration)
-      ) {
-        owner -= 1;
-      }
-      const aboutLast =
-        last !== undefined &&
-        (owner === rows.length - 1 ||
-          (wasInFlightAt(last, entry) &&
-            (owner === -1 || !wasInFlightAt(rows[owner]!, entry))));
-      const ownerRow = owner >= 0 ? rows[owner] : undefined;
-      // A card call is done once it returns, so a sentence after it is about
-      // the work that follows, even when tagged with the card call's iteration.
-      const tail = last?.entries[last.entries.length - 1];
-      const afterCard =
-        tail?.kind === "tool_result" && CARD_TOOLS.has(tail.toolName ?? "");
-      if (afterCard) {
-        const opened = reasonOnlyRow(entry);
-        rows.push(opened);
-        narrate(opened, entry);
-      } else if (last !== undefined && last.reason === null && aboutLast) {
-        narrate(last, entry);
-      } else if (
-        ownerRow !== undefined &&
-        ownerRow.reason === null &&
-        wasInFlightAt(ownerRow, entry)
-      ) {
-        narrate(ownerRow, entry);
-      } else if (
-        !ended &&
-        last !== undefined &&
-        hasPendingToolCall(last.entries)
-      ) {
-        // A new line under a running step reads as a new step starting, so a
-        // second sentence spoken over its loader waits for the step to settle.
-      } else {
-        const opened = reasonOnlyRow(entry);
-        rows.push(opened);
-        narrate(opened, entry);
-      }
+      rows.push(reasonOnlyRow(entry));
       continue;
     }
     const kind = kindOf(entry);
-    if (last !== undefined && isReasonOnlyRow(last)) {
-      last.kind = kind;
-      last.entries.push(...retryEntries(entry));
-      continue;
-    }
     const prev = last;
     const previousEntry = prev?.entries[prev.entries.length - 1];
     const previousEndedMs = parseUtcIsoMs(previousEntry?.timestamp);
@@ -443,6 +273,8 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     // while folding multiple failures reused the wrong action title. Same-tool
     // retries have already been condensed above and retain their attempt count.
     if (
+      entry.reason === undefined &&
+      prev?.reason === null &&
       kind === "browse" &&
       prev?.kind === "browse" &&
       entry.success !== false &&
@@ -457,6 +289,8 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     // freshly written diff while the test is active instead of flashing the
     // write row for a moment and collapsing it as soon as the run starts.
     if (
+      entry.reason === undefined &&
+      prev?.reason === null &&
       kind === "run" &&
       prev?.kind === "author" &&
       followsPreviousEntry &&
@@ -474,15 +308,12 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       codeDiffs: [],
       pending: false,
       live: false,
-      reason: null,
+      reason: entry.reason ?? null,
+      reasonAt: entry.receivedAtMs,
       startedAt: null,
       endedAt: null,
     });
   }
-
-  const intentBoundaryRows = new Set<ActivityRow>(
-    rows.filter((row) => row.id.startsWith("reason-")),
-  );
 
   const runRows = rows.filter((r) => r.kind === "run");
   const runStartedMs = runStartLookup(turn.designActivity);
@@ -540,28 +371,6 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     }
   });
 
-  // An unnarrated browse row pursues the intent narrated before it, so a retry
-  // that switched tools still merges into that attempt; the first attempt keeps
-  // its row id so the user's expansion choice survives.
-  let browseIntent: string | undefined;
-  const browseIntentByRow = new Map<ActivityRow, string>();
-  for (const row of rows) {
-    if (row.kind !== "browse" || intentBoundaryRows.has(row)) {
-      browseIntent = undefined;
-    }
-    if (row.kind !== "browse") continue;
-    browseIntent = narratedIntent.get(row) ?? browseIntent;
-    if (browseIntent !== undefined) browseIntentByRow.set(row, browseIntent);
-  }
-  coalesceNarratedBrowseRetries(rows, browseIntentByRow);
-  liveIndex = -1;
-  rows.forEach((row, i) => {
-    row.pending = hasPendingToolCall(row.entries);
-    row.live =
-      !ended &&
-      (row.pending || row.blocks.some((block) => block.state === "running"));
-    if (row.live) liveIndex = i;
-  });
   // The model is still writing the authoring call's arguments: no tool call is
   // in flight and no block is running, so nothing above claims the frontier.
   // The frames are live-only, which is why a terminated turn never shows this
@@ -635,6 +444,8 @@ export function condenseCalls(entries: ActivityEntry[]): CondensedCall[] {
     const previous = out[out.length - 1];
     if (
       previous !== undefined &&
+      entry.reason === undefined &&
+      previous.entry.reason === undefined &&
       entry.kind === "tool_result" &&
       previous.entry.kind === "tool_result" &&
       entry.success !== false &&

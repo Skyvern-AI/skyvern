@@ -90,10 +90,12 @@
           var regions = cookies.filter(function (cookie) {
             return cookie.startsWith(regionName);
           });
+          var region = regions[0]?.slice(regionName.length);
           return (
             regions.length > 0 &&
+            (region === "opt_out" || region === "opt_out_analytics") &&
             regions.every(function (cookie) {
-              return cookie.slice(regionName.length) === "opt_out";
+              return cookie.slice(regionName.length) === region;
             })
           );
         }
@@ -121,6 +123,26 @@
           (domain ? ";domain=" + domain : "") +
           ";SameSite=Lax";
       } catch {}
+    }
+
+    function syncDocsTelemetryConsent(consent) {
+      var previousConsent = appliedAnalyticsConsent;
+      appliedAnalyticsConsent = consent === true;
+      if (consent === true) {
+        try {
+          localStorage.setItem("skyvern_docs_telemetry", "granted");
+        } catch {}
+        return;
+      }
+      for (var key of ["skyvern_docs_telemetry", "mintlify_anonymous_id"]) {
+        try {
+          localStorage.removeItem(key);
+        } catch {}
+      }
+      try {
+        sessionStorage.removeItem("mintlify_session_id");
+      } catch {}
+      if (previousConsent) window.location.reload();
     }
 
     function purgeSessionStorage() {
@@ -787,6 +809,7 @@
     function beforeSend(event) {
       try {
         var currentConsent = hasAnalyticsConsent();
+        syncDocsTelemetryConsent(currentConsent);
         if (
           !currentConsent &&
           (currentConsent === null ||
@@ -844,11 +867,27 @@
     }
 
     var consent = hasAnalyticsConsent();
+    var appliedAnalyticsConsent = false;
     var livePostHog;
     var recapturingPageview = false;
     var optInPending = false;
     var restorePersistence = false;
+    syncDocsTelemetryConsent(consent);
     if (!consent) purgeStaleConsent();
+
+    try {
+      if (window.BroadcastChannel) {
+        var consentChannel = new window.BroadcastChannel("skyvern_consent");
+        consentChannel.onmessage = function () {
+          var currentConsent = hasAnalyticsConsent();
+          syncDocsTelemetryConsent(currentConsent);
+          if (currentConsent !== true) {
+            var posthog = getLivePostHog();
+            if (posthog) withdrawAnalyticsConsent(posthog);
+          }
+        };
+      }
+    } catch {}
 
     // The site's snippet, defined directly because Mintlify already loads this file as a script.
     (function (document, posthog) {
@@ -943,10 +982,16 @@
       },
       before_send: beforeSend,
     });
-    if (consent) {
-      try {
-        window.posthog.opt_in_capturing({ captureEventName: false });
-      } catch {}
-    }
+    window.posthog.push(function () {
+      var currentConsent = hasAnalyticsConsent();
+      syncDocsTelemetryConsent(currentConsent);
+      if (currentConsent === true) {
+        try {
+          this.opt_in_capturing({ captureEventName: false });
+        } catch {}
+      } else if (consent === true) {
+        withdrawAnalyticsConsent(this);
+      }
+    });
   } catch {}
 })();

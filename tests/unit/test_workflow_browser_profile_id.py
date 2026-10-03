@@ -357,9 +357,10 @@ async def test_recording_save_retry_returns_the_original_workflow_without_side_e
             organization=cast(Any, SimpleNamespace(organization_id="org_1")),
             request=request,
             workflow_permanent_id="wpid_test",
+            return_write_result=True,
         )
 
-    assert result is original_workflow
+    assert result == (original_workflow, ())
     create_workflow = service.create_workflow
     maybe_delete_cached_code = service.maybe_delete_cached_code
     refresh_schedules = service._refresh_workflow_schedule_runtime_limits
@@ -438,9 +439,10 @@ async def test_concurrent_recording_save_retry_removes_the_redundant_version() -
             organization=cast(Any, SimpleNamespace(organization_id="org_1")),
             request=request,
             workflow_permanent_id="wpid_test",
+            return_write_result=True,
         )
 
-    assert result is original_workflow
+    assert result == (original_workflow, ())
     delete_workflow = service.delete_workflow_by_id
     maybe_delete_cached_code = service.maybe_delete_cached_code
     refresh_schedules = service._refresh_workflow_schedule_runtime_limits

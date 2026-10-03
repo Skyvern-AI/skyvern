@@ -152,6 +152,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -185,7 +186,6 @@ from skyvern.forge.sdk.workflow.models.credential_release import CredentialRelea
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
-from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_PROMPT_NAME,
     PRE_JUDGE_SKIP_REASONS,
@@ -196,13 +196,10 @@ from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
-    CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
-    EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
-    HUMANIZED_INPUT_FLAG,
-    TYPE_COORDINATE_CLICK_FLAG,
+    POINTER_PARITY_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -569,7 +566,7 @@ _RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
 
 
 _PAGE_FINGERPRINT_PROBE_JS = (
-    "() => {" + OTP_INPUT_PRIVACY_JS + " if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
+    "(maskTicks) => {" + OTP_INPUT_PRIVACY_JS + " if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
     " const mix = (str, seed) => { let x = seed;"
     " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
     # The act-by-mark tag is OUR writing and it now outlives the action, so a page that never
@@ -578,8 +575,21 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # mark after mark, which is precisely the run the stall detector exists to catch.
     # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
     ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|tv3-pick|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
-    " const walk = (root) => { h = mix(scrub(otpSafeHtml(root, true)), h);"
+    # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
+    # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
+    # text whose digit-masked shape it has shown before: a countdown, a clock or a carousel, never a new word.
+    " let seen = window.__tv3_settle_text;"
+    " if (!(seen instanceof WeakMap)) seen = window.__tv3_settle_text = new WeakMap();"
+    " const own = (n) => { let t = ''; for (const c of n.childNodes) if (c.nodeType === 3) t += c.nodeValue; return t; };"
+    " const walk = (root) => { const html = scrub(otpSafeHtml(root, true)); let text = 0;"
     " const all = root.querySelectorAll('*'); elems += all.length;"
+    " for (const el of [root, ...all]) { const t = own(el); const r = seen.get(el); if (!r && !t.trim()) continue;"
+    " const shape = t.replace(/[0-9]+/g, '#');"
+    " if (!r) seen.set(el, { t: t, n: 0, s: new Set([shape]) }); else if (r.t === t) r.n = Math.max(0, r.n - 1);"
+    " else { r.n = t.length > r.t.length && t.startsWith(r.t.slice(0, -3)) ? 0 : Math.min(2, r.n + 1); r.t = t; }"
+    " if (r) r.k = r.n >= 2 || (!!r.k && r.n > 0); if (!(r && r.k && r.s.has(shape))) text = mix('|' + t, text);"
+    " if (r && r.s.size < 16) r.s.add(shape); }"
+    " h = mix(maskTicks ? ('>' + html + '<').replace(/>[^<]*</g, '><') + ':' + text : html, h);"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
     " v = mix((isOtpInputValueSecret(el) ? '*' : String(el.value || '')) + '|' + (el.checked === true ? '1' : '0'), v);"
     " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
@@ -2241,8 +2251,6 @@ class ForgeAgent:
             DEFAULT_DEADLINE_SECONDS,
             MAX_TOKENS_CEILING,
             MIN_ACTION_STEPS,
-            USER_INSTRUCTIONS_END,
-            USER_INSTRUCTIONS_LABEL,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
@@ -2318,13 +2326,6 @@ class ForgeAgent:
             # one executing.
             await resolve_run_arm(
                 context,
-                TYPE_COORDINATE_CLICK_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_TYPE_COORDINATE_CLICK,
-            )
-            await resolve_run_arm(
-                context,
                 DATE_SEGMENT_AIM_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
@@ -2332,32 +2333,18 @@ class ForgeAgent:
             )
             await resolve_run_arm(
                 context,
-                CUSTOMER_PRECEDENCE_FLAG,
+                POINTER_PARITY_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
-                forced=settings.TASK_V3_CUSTOMER_PRECEDENCE,
-                properties={
-                    "workflow_permanent_id": task.workflow_permanent_id
-                    or context.workflow_permanent_id
-                    or "not_workflow"
-                },
+                forced=settings.TASK_V3_POINTER_PARITY,
+                properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
             )
-            await resolve_run_arm(
-                context,
-                EXTRACTION_REPORTS_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_EXTRACTION_REPORTS,
-            )
-            await resolve_run_arm(
-                context,
-                HUMANIZED_INPUT_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_HUMANIZED_INPUT,
-            )
-            # Here as well as on the loop's finish line, so a run whose loop raises still records its profile.
-            LOG.info("Task V3 humanized input resolved", **input_dispatch.arm_fields())
+            if run_arm_enabled(POINTER_PARITY_FLAG, settings.TASK_V3_POINTER_PARITY):
+                # The dose: the run's registered cursor strategy draws the moves, or a plain move does without one.
+                LOG.info(
+                    "Task V3 pointer parity cursor",
+                    cursor_strategy=type(EventStrategyFactory.get_cursor_strategy()).__name__,
+                )
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
         page_free_validation = bool(
@@ -2410,7 +2397,6 @@ class ForgeAgent:
             handoff_enabled=handoff_enabled,
             previous_block=previous_block,
             selected_block_labels=context.run_block_labels if context else None,
-            extraction_reports=run_arm_enabled(EXTRACTION_REPORTS_FLAG, settings.TASK_V3_EXTRACTION_REPORTS),
         )
         # Surface the customer's completion/termination criteria (trusted task config, like the navigation
         # goal). Withhold a complete_criterion flagged untrusted (LLM-derived from page content) so it can't be
@@ -2425,29 +2411,20 @@ class ForgeAgent:
             "terminate_criterion": task.terminate_criterion,
         }
 
-        def _compose_goal(fields: dict[str, str | None], page_data_note: bool = False) -> str:
-            return compose_goal(
-                fields["navigation_goal"] or "",
-                GoalDirectives(
-                    data_extraction_goal=fields["data_extraction_goal"],
-                    extracted_information_schema=task.extracted_information_schema,
-                    complete_criterion=fields["complete_criterion"],
-                    terminate_criterion=fields["terminate_criterion"],
-                    # Validation only: that is the task type whose criteria a decision-maker weighs against
-                    # each other in both engines, and the only one this was measured on (SKY-16193).
-                    criteria_precedence=task.task_type == TaskType.validation,
-                    framing=framing,
-                    block_context_section=block_context_section,
-                    page_data_note=page_data_note,
-                    code_progress=recovery_code_progress,
-                ),
-            )
-
-        goal = _compose_goal(goal_fields)
-        # The precedence arm grants the goal and criteria the user's authority; a value a page produced must
-        # not share it. The goal judge reads this same goal, so it too sees page values as quoted data.
-        customer_precedence_on = not page_free_validation and run_arm_enabled(
-            CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE
+        goal = compose_goal(
+            goal_fields["navigation_goal"] or "",
+            GoalDirectives(
+                data_extraction_goal=goal_fields["data_extraction_goal"],
+                extracted_information_schema=task.extracted_information_schema,
+                complete_criterion=goal_fields["complete_criterion"],
+                terminate_criterion=goal_fields["terminate_criterion"],
+                # Validation only: that is the task type whose criteria a decision-maker weighs against
+                # each other in both engines, and the only one this was measured on (SKY-16193).
+                criteria_precedence=task.task_type == TaskType.validation,
+                framing=framing,
+                block_context_section=block_context_section,
+                code_progress=recovery_code_progress,
+            ),
         )
         block_renders = task_block.page_derived_renders if task_block is not None else {}
         page_derived_renders = {
@@ -2466,14 +2443,6 @@ class ForgeAgent:
             if workflow_run_context is not None and task.workflow_system_prompt
             else {}
         )
-        if customer_precedence_on and presented_fields:
-            goal = _compose_goal(
-                {
-                    name: shown.text if (shown := presented_fields.get(name)) else value
-                    for name, value in goal_fields.items()
-                },
-                page_data_note=any(shown.spans for shown in presented_fields.values()),
-            )
         if presented_fields or system_prompt_page_roots:
             withheld = {
                 name: shown.reason or shown.presentation
@@ -2498,12 +2467,10 @@ class ForgeAgent:
                 "taskv3 page-derived template",
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
-                customer_precedence_arm=customer_precedence_on,
                 page_derived_fields=sorted(name for name, roots in root_classes.items() if roots),
                 root_classes=root_classes,
                 presentation={name: shown.presentation for name, shown in presented_fields.items()},
                 span_count=sum(shown.spans for shown in presented_fields.values()),
-                customer_precedence_withheld="page_derived_unmarked" if withheld else None,
                 withheld_reasons=withheld,
             )
 
@@ -2923,11 +2890,11 @@ class ForgeAgent:
             " return window.__skyvern_doc_nonce; }"
         )
 
-        async def _page_fingerprint() -> str | None:
+        async def _page_fingerprint(mask_ticks: bool = False) -> str | None:
             peek = await _fingerprint_page()
             if peek is None:
                 return None
-            own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+            own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks)
             # The completion-side settle deferral rides this, and it is a LIVE gate rather than only the
             # shadow stall measurement: a main-frame-only fingerprint reads a page whose child frame is
             # still rendering as settled. When work can happen in a frame, whatever judges that work has
@@ -2942,12 +2909,15 @@ class ForgeAgent:
             parts = [own or ""]
             for frame in frames:
                 try:
-                    parts.append(str(await frame.evaluate(_PAGE_FINGERPRINT_PROBE_JS) or ""))
+                    parts.append(str(await frame.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks) or ""))
                 except Exception:
                     # A frame that will not answer contributes nothing rather than costing the page's
                     # own fingerprint -- the deferral still has the main document to judge.
                     LOG.debug("taskv3 page fingerprint could not read a child frame", exc_info=True)
             return "\n".join(parts)
+
+        async def _settle_fingerprint() -> str | None:
+            return await _page_fingerprint(mask_ticks=True)
 
         # Document identity, not content: a failed call's leftover text or open menu changes the DOM
         # without re-mapping other selectors, while a navigation or reload (which does) wipes the nonce.
@@ -3055,16 +3025,7 @@ class ForgeAgent:
                 captcha_tools, captcha_guidance = build_captcha_tools(
                     task, _page_provider, organization_id=organization.organization_id
                 )
-            # Page-free runs never get the precedence paragraph, so the label would have nothing to refer to.
             workflow_system_guidance = task.workflow_system_prompt
-            # A prompt that reads a page-derived value keeps control semantics: it is not presented as the user's.
-            if (
-                workflow_system_guidance
-                and not page_free_validation
-                and run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE)
-                and not system_prompt_page_roots
-            ):
-                workflow_system_guidance = USER_INSTRUCTIONS_LABEL + workflow_system_guidance + USER_INSTRUCTIONS_END
             block_type = str(task_block.block_type) if task_block is not None else None
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
             goal_judge: GoalJudge | None = None
@@ -3146,6 +3107,7 @@ class ForgeAgent:
                 resolve_totp_placeholder=verification_state.resolve_totp_placeholder,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                settle_fingerprint=_settle_fingerprint,
                 page_probe=_page_probe,
                 document_identity=_document_identity,
                 reload_page=_reload_page,
@@ -3229,6 +3191,7 @@ class ForgeAgent:
                 login_identifier_tokens=_login_identifier_tokens,
                 # A block that completes on a download is not done by its one action.
                 single_action_block=isinstance(task_block, ActionBlock) and not task_block.complete_on_download,
+                code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
         finally:
             if context and credential_parameter_key is not None:

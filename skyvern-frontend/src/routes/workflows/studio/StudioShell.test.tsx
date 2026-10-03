@@ -47,7 +47,6 @@ vi.mock("./runview/RunPaneHeader", () => ({
   RunPaneViewToggles: () => null,
 }));
 vi.mock("./StudioBrowserStream", () => ({ StudioBrowserStream: () => null }));
-vi.mock("./StudioCoachMark", () => ({ StudioCoachMark: () => null }));
 vi.mock("./StudioStageLauncher", () => ({ StudioStageLauncher: () => null }));
 vi.mock("./StudioTopBar", () => ({ StudioTopBar: () => null }));
 vi.mock("./StudioWorkflowPanels", () => ({ StudioWorkflowPanels: () => null }));

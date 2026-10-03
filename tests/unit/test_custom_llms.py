@@ -45,6 +45,9 @@ class FakeOrganizationsRepository:
         self.updated_encrypted_methods: list[EncryptMethod | None] = []
         self.update_organization = AsyncMock()
 
+    async def get_organization(self, organization_id: str) -> Organization | None:
+        return None
+
     async def get_valid_org_auth_tokens(
         self,
         organization_id: str,

@@ -70,11 +70,16 @@ ToolErrorClass = Literal[
     "ref_not_in_latest",
     "stale_mark",
     "mark_not_in_latest",
+    # A guessed menu number on an open menu whose rows were withheld, so never numbered.
+    "rows_unlisted",
     # The target resolved, but the page will not let the act happen.
     "disabled",
     "not_editable",
     # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
     "value_changed_by_page",
+    # `type`: another segment of the same date moved and could not be put back, or could not be read back.
+    "date_sibling_moved",
+    "date_sibling_unverified",
     # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
     # one-character-per-box code field whose boxes did not all keep their character.
     "text_not_held",
@@ -1250,11 +1255,11 @@ class _ProgressLedger:
         self.peak_actions_since_progress = max(self.peak_actions_since_progress, self.actions_since_progress)
 
 
-# Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
-# solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
-# complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
-# look while the page went on to show the submission confirmation. Trigger tools are the ones whose
-# page effects can land after their tool result; the window is in loop turns so intervening
+# Failure-evidence gate: finish(failed) and finish(terminated) shortly after a submit-class action or a
+# solve_captcha attempt are held for ONE evidence turn per fresh trigger, because submissions and
+# captcha protocols complete asynchronously — the sampled false-negative verdicts fired 2-7s after
+# the model's last look while the page went on to show the submission confirmation. Trigger tools
+# are the ones whose page effects can land after their tool result; the window is in loop turns so intervening
 # perception does NOT disarm it (the state can flip after the last observe while a protocol is in
 # flight). The true verdict-to-flip latency is unmeasured in the sampled replays: the quiescence
 # wait exits on the first stable fingerprint pair (so honest gated failures pay ~one sample), the
@@ -1477,6 +1482,8 @@ class ActivityRecency:
     tokens_remaining: int | None = None
     last_turn_tokens: int = 0
     last_trigger_turn: int | None = None
+    # Trigger actions can occur more than once in a model turn.
+    failure_evidence_trigger_generation: int = 0
     # True while one more read of some probe, returning what it last returned, would trip the stall
     # terminator: a deferral-forced observe must never be the snapshot that trips it. KNOWN LIMIT: a
     # run that reaches the edge and then stops reading that tool altogether leaves this true for the
@@ -1986,6 +1993,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "turn",
         "batch_size",
         "batch_index",
+        "tool_call_seq",
         "action_key_hash",
         "snapshot_digest",
         "probe_first_time",
@@ -2239,9 +2247,8 @@ def _navigate_record_fields(tool_name: str, args: dict[str, Any], result: ToolRe
     same_page = data.get("same_page")
     if isinstance(same_page, bool):
         fields["same_page"] = same_page
-    # Which fact the `committed_not_loaded` class is about on this row: a document that never became
-    # ready, or a readyState read that failed on a wedged renderer. Present only on that class, so a
-    # rate taken over it can exclude probe failures instead of silently mixing them in.
+    # Whether the readyState read failed; on `committed_not_loaded` it separates a document that never
+    # became ready from a renderer too busy to answer, so a rate query must filter by class.
     readiness_read_failed = data.get("readiness_read_failed")
     if isinstance(readiness_read_failed, bool):
         fields["readiness_read_failed"] = readiness_read_failed
@@ -2262,7 +2269,12 @@ def _menu_note_record_fields(tool_name: str, result: ToolResult | None) -> dict[
         if isinstance(rows, int) and not isinstance(rows, bool):
             fields["menu_rows"] = rows
         reason = data.get("withhold_reason")
-        if note == "withheld" and reason in ("declared_row_over_caps", "bare_text_beside", "single_row_pieces"):
+        if note == "withheld" and reason in (
+            "declared_row_over_caps",
+            "bare_text_beside",
+            "single_row_pieces",
+            "long_row_unread",
+        ):
             fields["withhold_reason"] = reason
     return fields
 
@@ -2354,9 +2366,9 @@ def make_finish_tool(
     is capped at `deadline_at` (time.monotonic clock) and abandoned once `should_cancel` reports
     True, so probing cannot outlive the loop's own bounds.
 
-    The symmetric failure side: when `activity` reports recent submit-class/captcha activity, a
-    finish(failed) is held for ONE evidence turn (`max_failure_deferrals`, per run like the
-    completed-side cap, not per verdict attempt) — a quiescence wait
+    The symmetric non-completed side: when `activity` reports recent submit-class/captcha activity,
+    finish(failed) and finish(terminated) are held for ONE evidence turn (`max_failure_deferrals` per
+    fresh trigger, not per run or verdict attempt) — a quiescence wait
     bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
 
@@ -2365,8 +2377,8 @@ def make_finish_tool(
     run is still awaiting a code it has unspent polling budget for -- a give-up at one 120s slice of
     a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
     the callee (the budget shrinks under every productive hold) and refused here without the deadline
-    headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
-    ungated on both sides.
+    headroom to fund the blocking poll slice it asks for. Terminated verdicts otherwise follow the
+    same evidence gate as failed verdicts.
 
     `pending_marker` reports the text the page still shows the control in `submit_watch` as in
     flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
@@ -2384,6 +2396,7 @@ def make_finish_tool(
     the settle window, and a conversion whose identity changed or could not be read is refused, settled or not."""
     deferrals = 0
     failure_deferrals = 0
+    failure_deferral_trigger_generation: int | None = None
     goal_check_held = False
     reask_asked = False
 
@@ -2558,12 +2571,15 @@ def make_finish_tool(
         )
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, goal_check_held, reask_asked
+        nonlocal deferrals, failure_deferrals, failure_deferral_trigger_generation, goal_check_held, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
                 f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
             )
+        if activity is not None and activity.failure_evidence_trigger_generation != failure_deferral_trigger_generation:
+            failure_deferrals = 0
+            failure_deferral_trigger_generation = activity.failure_evidence_trigger_generation
         if (
             status == "completed"
             and pending_marker is not None
@@ -2656,7 +2672,9 @@ def make_finish_tool(
                     "the page was still rendering, or could not be verified as settled, when you "
                     "called finish. Wait for it to settle, re-observe, confirm the goal's effect is "
                     "present in the loaded content (not a loading indicator or empty container), "
-                    "then finish again."
+                    f"then finish again. This check holds a finish at most {max_settle_deferrals} times, so a page "
+                    "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
+                    "report failure."
                 )
         if status == "completed" and goal_check is not None:
             try:
@@ -2759,7 +2777,7 @@ def make_finish_tool(
                         },
                     )
         if (
-            status == "failed"
+            status in ("failed", "terminated")
             and activity is not None
             and page_fingerprint is not None
             and failure_deferrals < max_failure_deferrals
@@ -2795,9 +2813,9 @@ def make_finish_tool(
                 pass  # unknown page state still defers: the model's re-observe is the evidence step
             if should_defer:
                 failure_deferrals += 1
-                LOG.info("taskv3 finish failure deferred for evidence", turn=activity.turn)
+                LOG.info("taskv3 finish failure deferred for evidence", status=status, turn=activity.turn)
                 return ToolResult.error(
-                    "failure verdict held for one evidence check: it follows recent page actions or "
+                    "non-completed verdict held for one evidence check: it follows recent page actions or "
                     "a captcha attempt whose effects can land after your last look — submissions and "
                     "captcha protocols often complete asynchronously, so the page may no longer show "
                     "the state this verdict was based on. Re-observe the page once (waiting briefly "
@@ -3198,6 +3216,8 @@ class LoopState:
     # A single-action block's completion is offered through the finish tool at most once: a guard that
     # holds a verdict only once would pass a second offer the model never saw it hold.
     block_completion_offered: bool = False
+    # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
+    block_action_transitioned: bool = False
 
 
 async def run_agent_tool_loop(
@@ -4282,23 +4302,34 @@ async def run_agent_tool_loop(
                         and not st.block_completion_offered
                     ):
                         st.block_completion_offered = True
-                        block_reason = (
-                            f"performed the block's action ({st.billable_actions[0]}); "
-                            "a further action was past the block's step limit"
+                        LOG.info(
+                            "taskv3 block completion evidence",
+                            url_changed=st.block_action_transitioned,
+                            billable_actions=st.billable_actions,
                         )
-                        # Through the real handler, so every guard on a completed verdict still applies.
-                        try:
-                            block_finish = await finish_spec.handler({"status": "completed", "reason": block_reason})
-                        except Exception:
-                            LOG.warning("taskv3 block completion finish raised", exc_info=True)
-                            block_finish = ToolResult.error("")
-                        if activity is not None:
-                            activity.held_verdict_batch_skip = False
-                        if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
-                            st.outcome = LoopOutcome("completed", block_reason)
-                            break
-                        if block_finish.status == "error":
-                            block_refusal = block_finish.content
+                        # A successful action that moved nothing (a no-op click, a username typed before the
+                        # login submits) is no sign the block is done; the finish gate's goal check, under enforce,
+                        # still vetoes a URL change that landed on the wrong page.
+                        if st.block_action_transitioned:
+                            block_reason = (
+                                f"performed the block's action ({st.billable_actions[0]}); "
+                                "a further action was past the block's step limit"
+                            )
+                            # Through the real handler, so every guard on a completed verdict still applies.
+                            try:
+                                block_finish = await finish_spec.handler(
+                                    {"status": "completed", "reason": block_reason}
+                                )
+                            except Exception:
+                                LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                                block_finish = ToolResult.error("")
+                            if activity is not None:
+                                activity.held_verdict_batch_skip = False
+                            if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
+                                st.outcome = LoopOutcome("completed", block_reason)
+                                break
+                            if block_finish.status == "error":
+                                block_refusal = block_finish.content
                     # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
                     # away once the final turn is granted: a billable dispatch on the granted turn still
                     # hits it, which is the honest exit the grant exists to produce.
@@ -4592,6 +4623,8 @@ async def run_agent_tool_loop(
                 turn=st.turns,
                 batch_size=len(tool_calls),
                 batch_index=idx,
+                # What current_tool_call_seq() returned inside this call, so a tool's own lines join here.
+                tool_call_seq=st.total_tool_calls,
                 **cost_fields,
                 **observe_summary,
                 **navigate_fields,
@@ -4825,8 +4858,16 @@ async def run_agent_tool_loop(
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
+                    # click reports it at the top level, navigate inside its action outcome. A navigation that
+                    # landed on an error page moved the URL without doing the block's action.
+                    if not _outcome_reports_failure(round_outcome) and (
+                        result_data.get("page_transitioned") is True
+                        or (round_outcome or {}).get("page_transitioned") is True
+                    ):
+                        st.block_action_transitioned = True
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
+                    activity.failure_evidence_trigger_generation += 1
                 if submit_watch is not None:
                     submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
                     if submit_selector is not None:

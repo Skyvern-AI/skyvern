@@ -71,6 +71,7 @@ BROWSER_ABLATION_PROMPT_TEMPLATE = "workflow-copilot-browser-ablation.j2"
 BROWSER_ABLATION_NATIVE_TOOLS = (
     "list_credentials",
     "list_integrations",
+    "read_google_sheet",
     "discover_workflow_entrypoint",
     "inspect_page_for_composition",
     "inspect_locator_matches",

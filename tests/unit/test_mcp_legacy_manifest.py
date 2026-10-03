@@ -136,9 +136,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
     "skyvern_workflow_retry": "da8782d457ba3bcc8b87fffb90ce9dbc287943f28260816d699233a7427b6978",
     "skyvern_workflow_run": "9a149c1cc66deb0afe879b00308aa6c750cfbf4a3fe4ed0af0d7eb307d8229cc",
-    # Re-frozen for SKY-14441: adds the optional `include_child_runs` param (default false, preserving the
-    # existing result set) and says in the description that child runs are excluded by default.
-    "skyvern_workflow_run_list": "5ed785968941b6b3ae3421d6d67ef15af365a2b59a9a1bd21c7bc54dff67e205",
+    # Re-frozen for SKY-15975: the `search_key` description now names webhook callback URLs and the
+    # exact-match browser profile, browser session and credential IDs. Description text only.
+    "skyvern_workflow_run_list": "4e86472ab42dfd49f42bb882a6b966dde69ae34f9fa0cb603b25d84529e46333",
     "skyvern_workflow_status": "730fd46aae7cb9e974b631abdca8fdbc5c5c8a77917c22c3bd76735388103487",
     "skyvern_workflow_update": "3931c7a6b3faee202ebb57291fc2a437b838411ff0082be93d3763dbf727d060",
     "skyvern_workflow_update_folder": "52efdfa02cf84cb9995bfbeb6d00562fdd1364e832e297e853d233ff6f68392d",

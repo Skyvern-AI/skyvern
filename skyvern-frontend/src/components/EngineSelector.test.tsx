@@ -102,44 +102,41 @@ describe("RunEngineSelector", () => {
     expect(onChange.mock.calls).toEqual([[RunEngine.SkyvernV3], [null]]);
   });
 
-  test.each([null, RunEngine.SkyvernV3])(
-    "labels Default with no hint when the effective default is %s",
-    (effectiveDefaultEngine) => {
-      const { container } = render(
-        <RunEngineSelector
-          value={null}
-          onChange={() => {}}
-          effectiveDefaultEngine={effectiveDefaultEngine}
-        />,
-      );
-
-      const defaultItem = screen
-        .getAllByRole("button")
-        .filter((button) => button.textContent?.includes("Default"));
-      expect(defaultItem.map((button) => button.textContent)).toEqual([
-        "Default",
-        "Default",
-      ]);
-      expect(container.textContent).not.toMatch(/routing|runs on/i);
-    },
-  );
-
-  test("offers Skyvern 1.0 as Legacy only where the workflow can pin it", () => {
-    const { unmount } = render(
+  test("labels Default with no routing hint", () => {
+    const { container } = render(
       <RunEngineSelector value={null} onChange={() => {}} />,
     );
-    expect(screen.queryByText("Skyvern 1.0")).toBeNull();
-    unmount();
 
-    render(
-      <RunEngineSelector
-        value={null}
-        onChange={() => {}}
-        effectiveDefaultEngine={RunEngine.SkyvernV3}
-      />,
-    );
-    expect(screen.getByText("Skyvern 1.0")).toBeTruthy();
+    const defaultItem = screen
+      .getAllByRole("button")
+      .filter((button) => button.textContent?.includes("Default"));
+    expect(defaultItem.map((button) => button.textContent)).toEqual([
+      "Default",
+      "Default",
+    ]);
+    expect(container.textContent).not.toMatch(/routing|runs on/i);
+  });
+
+  test("offers Skyvern 1.0 as Legacy in every workflow, and selecting it pins skyvern-1.0", () => {
+    const onChange = vi.fn();
+    render(<RunEngineSelector value={null} onChange={onChange} />);
+
     expect(screen.getByText("Legacy")).toBeTruthy();
+    fireEvent.click(screen.getByText("Skyvern 1.0"));
+    expect(onChange.mock.calls).toEqual([[RunEngine.SkyvernV1]]);
+  });
+
+  test("lists Skyvern 3.0 right after Default, above Skyvern 1.0", () => {
+    render(<RunEngineSelector value={null} onChange={() => {}} />);
+
+    const [, ...items] = screen.getAllByRole("button");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "Default",
+      "Skyvern 3.0Recommended",
+      "Skyvern 1.0Legacy",
+      "OpenAI CUAEnterprise",
+      "Anthropic CUAEnterprise",
+    ]);
   });
 
   test("marks Skyvern 3.0 as Recommended", () => {

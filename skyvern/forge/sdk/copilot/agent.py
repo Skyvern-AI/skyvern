@@ -2166,6 +2166,11 @@ def _make_agent_result(
                 pause_payload = {"outcome": pause_outcome}
                 if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
                     pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
+                signed_in_profile_id = (
+                    ctx.request_policy.credential_pause_signed_in_profile_id if ctx.request_policy else None
+                )
+                if pause_outcome == "signed_in" and signed_in_profile_id:
+                    pause_payload["browserProfileId"] = signed_in_profile_id
                 if ctx.credential_pause_anchor_tool_call_id:
                     pause_payload["anchorToolCallId"] = ctx.credential_pause_anchor_tool_call_id
                 payload_updates["credentialPause"] = pause_payload
@@ -2318,9 +2323,6 @@ def _build_narrative_payload(
             if not isinstance(label, str) or not label:
                 continue
             block_labels.append(label)
-    newest_attempt_by_label = {
-        attempt["label"]: attempt["workflowRunBlockId"] for attempt in ctx.narrative_block_attempts.values()
-    }
     for attempt in ctx.narrative_block_attempts.values():
         block_entry: NarrativeBlock = {
             "label": attempt["label"],
@@ -2328,11 +2330,7 @@ def _build_narrative_payload(
             "blockType": attempt["blockType"],
             "state": _block_ui_state(attempt["rawStatus"], drafted_fallback=False),
             "lastSeenIteration": attempt["lastSeenIteration"],
-            "activity": (
-                list(block_activity.get(attempt["label"], []))
-                if newest_attempt_by_label.get(attempt["label"]) == attempt["workflowRunBlockId"]
-                else []
-            ),
+            "activity": list(block_activity.get(attempt["workflowRunBlockId"], [])),
             "startedAt": attempt["startedAt"],
             "endedAt": attempt["endedAt"],
         }

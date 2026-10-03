@@ -16,10 +16,11 @@ from urllib.parse import urlparse
 import httpx
 import structlog
 
-from skyvern.exceptions import InvalidUrl
+from skyvern.exceptions import BlockedHost, InvalidUrl, UnresolvableHost
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.run_enums import WebhookDeliveryStatus
+from skyvern.utils.url_validators import BLOCKED_HOST_ALLOWLIST_HINT, validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
 
@@ -105,6 +106,8 @@ def _attribute_delivery_error(error: BaseException) -> WebhookDeliveryStatus:
     # ProxyError can only come from a hop in front of the target, such as the NAT egress proxy.
     if isinstance(error, (httpx.ProxyError, httpx.HTTPStatusError)):
         return WebhookDeliveryStatus.exhausted_platform
+    if isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost):
+        return WebhookDeliveryStatus.exhausted_customer_config
     chain = list(_exception_chain(error))
     if any(_is_local_resource_exhaustion(link) for link in chain):
         return WebhookDeliveryStatus.exhausted_platform
@@ -152,7 +155,10 @@ def describe_delivery_error(exc: Exception) -> str:
 
 
 def format_no_response_failure_reason(exc: Exception) -> str:
-    return f"Webhook delivery failed before receiving a response: {describe_delivery_error(exc)}"
+    reason = f"Webhook delivery failed before receiving a response: {describe_delivery_error(exc)}"
+    if isinstance(exc, BlockedHost) and not isinstance(exc, UnresolvableHost):
+        return f"{reason} {BLOCKED_HOST_ALLOWLIST_HINT}"
+    return reason
 
 
 def format_http_failure_reason(status_code: int, body: str) -> str:
@@ -256,13 +262,15 @@ async def deliver_webhook_with_retries(
         if attempts is not None:
             attempts.count = attempt + 1
         try:
+            validated_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, url)
             response = await app.AGENT_FUNCTION.deliver_webhook(
-                url=url,
+                url=validated_url,
                 payload=payload,
                 headers=headers,
                 timeout_seconds=timeout_seconds,
                 organization_id=organization_id,
                 run_id=run_id,
+                resolved_ips=resolved_ips,
             )
             last_response = response
             last_exc = None
@@ -277,7 +285,13 @@ async def deliver_webhook_with_retries(
             last_exc = exc
             if not is_retryable_status(exc.response.status_code):
                 raise
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError) as exc:
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+            UnresolvableHost,
+        ) as exc:
             last_response = None
             last_exc = exc
 

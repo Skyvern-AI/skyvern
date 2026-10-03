@@ -19,7 +19,7 @@ from pydantic import (
 
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
@@ -149,6 +149,9 @@ class CopilotPendingTurn(BaseModel):
     copilot_code_available: bool = False
     user_message_id: str | None = None
     recovering_at: datetime | None = None
+    # A credential pause stops the turn's budget clock, so reconcile measures abandonment from here
+    # too, as it does from a resolved question.
+    credential_resumed_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
     # never wrote canonical, so it owns no write to roll back.
     canonical_write_fingerprint: str | None = None
@@ -529,8 +532,21 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
     resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
-    action: Literal["connected", "skip"] = Field(..., description="The user's response to the credential card")
+    action: Literal["connected", "skip", "signing_in", "signed_in"] = Field(
+        ...,
+        description=(
+            "The user's response to the credential card: 'signing_in' when they start signing in themselves in "
+            "the live browser, 'signed_in' when they finish"
+        ),
+    )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+
+
+class WorkflowCopilotCredentialResponseResult(BaseModel):
+    result: Literal["accepted", "signed_in", "no_sign_in_found", "save_failed"]
+    expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
+    host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
@@ -721,6 +737,8 @@ class WorkflowCopilotStreamErrorUpdate(BaseModel):
 
 
 class WorkflowCopilotToolCallUpdate(BaseModel):
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
@@ -739,6 +757,9 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
+    activity_started_at: datetime | None = None
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )
@@ -758,6 +779,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
     work_plan: list[str] | None = Field(
         None,
         description="The plan a successful set_work_plan stored, as stored. None for every other tool",
+    )
+    browser_steps: list[str] | None = Field(
+        None,
+        description="A successful run_browser_code call's reported operations as display phrases, in order",
     )
     detail: str | None = Field(
         None,
@@ -959,10 +984,14 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     anchor_tool_call_id: str | None = Field(
         None, description="Tool call whose activity row was newest when the pause was raised"
     )
+    sign_in_browser_session_id: str | None = Field(
+        None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
+    )
+    signing_in: bool = Field(False, description="The user has started signing in themselves")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
-CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted"]
+CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted", "signed_in"]
 
 
 class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
@@ -976,7 +1005,10 @@ class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
         ..., description="The waiter's final verdict, after admission; never the raw POSTed action"
     )
     credential_id: str | None = Field(None, description="The connected credential; set only when connected")
-    name: str | None = Field(None, description="Display name of the connected credential; set only when connected")
+    name: str | None = Field(
+        None, description="Display name of the connected credential, or of the profile saved from a sign-in"
+    )
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1032,3 +1064,16 @@ class WorkflowYAMLConversionRequest(BaseModel):
 
 class WorkflowYAMLConversionResponse(BaseModel):
     workflow_definition: dict = Field(..., description="Converted workflow definition with blocks")
+
+
+class WorkflowCopilotGoalSuggestionRequest(BaseModel):
+    label: str = Field(..., max_length=256, description="Label of the code block whose Goal is suggested")
+    code: str = Field(..., max_length=200_000, description="The block's code as the person edited it")
+    current_goal: str = Field("", max_length=20_000, description="The block's Goal before the suggestion")
+    parameter_keys: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=500, description="Workflow parameters the block can read"
+    )
+
+
+class WorkflowCopilotGoalSuggestionResponse(BaseModel):
+    goal: str | None = Field(None, description="Suggested Goal written from the code; null when none was produced")

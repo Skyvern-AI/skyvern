@@ -49,6 +49,7 @@ from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
@@ -740,6 +741,9 @@ async def create_credential(
         )
         raise HTTPException(status_code=502, detail=detail)
 
+    await record_request_audit_event(
+        current_org.organization_id, "credential.create", "credential", credential.credential_id
+    )
     if credential.vault_type == CredentialVaultType.BITWARDEN:
         # Early resyncing the Bitwarden vault
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
@@ -947,6 +951,15 @@ async def rename_credential(
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
+    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id"}))
+    if changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "credential.update",
+            "credential",
+            updated.credential_id,
+            changed_fields=changed_fields,
+        )
     return _convert_to_response(updated)
 
 
@@ -2047,16 +2060,30 @@ async def update_credential(
     pin_provided = "pin_saved_session_ip" in data.model_fields_set
     bpid_provided = "browser_profile_id" in data.model_fields_set
     auto_profile_disabled_provided = "auto_profile_disabled" in data.model_fields_set
-    if bpid_provided or pin_provided or auto_profile_disabled_provided:
-        # Only pass browser_profile_id when the caller sent it — a pin-only update must not pass the
-        # field's omitted default (None) and unlink the profile via the repo's unlink sentinel.
-        profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
-        updated_credential = await _update_credential_or_profile_conflict(
-            credential_id=credential_id,
-            organization_id=current_org.organization_id,
-            **profile_update,
-            pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
-            auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
+    changed_fields = ["credential"]
+    # The secret is already overwritten, so the audit row is written even when the profile update is refused.
+    try:
+        if bpid_provided or pin_provided or auto_profile_disabled_provided:
+            # Only pass browser_profile_id when the caller sent it — a pin-only update must not pass the
+            # field's omitted default (None) and unlink the profile via the repo's unlink sentinel.
+            profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
+            updated_credential = await _update_credential_or_profile_conflict(
+                credential_id=credential_id,
+                organization_id=current_org.organization_id,
+                **profile_update,
+                pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+                auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
+            )
+            changed_fields += sorted(
+                data.model_fields_set & {"auto_profile_disabled", "browser_profile_id", "pin_saved_session_ip"}
+            )
+    finally:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "credential.update",
+            "credential",
+            credential_id,
+            changed_fields=tuple(changed_fields),
         )
 
     return _convert_to_response(updated_credential)
@@ -2219,6 +2246,7 @@ async def delete_credential(
             )
 
     _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
+    await record_request_audit_event(current_org.organization_id, "credential.delete", "credential", credential_id)
 
     return None
 
@@ -2485,6 +2513,9 @@ async def create_credential_folder(
         title=data.title,
         description=data.description,
     )
+    await record_request_audit_event(
+        current_org.organization_id, "credential_folder.create", "credential_folder", folder.folder_id
+    )
     return _to_credential_folder_response(folder, 0)
 
 
@@ -2586,6 +2617,16 @@ async def update_credential_folder(
     if not folder:
         raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
 
+    changed_fields = tuple(
+        name for name, value in (("title", data.title), ("description", data.description)) if value is not None
+    )
+    await record_request_audit_event(
+        current_org.organization_id,
+        "credential_folder.update",
+        "credential_folder",
+        folder.folder_id,
+        changed_fields=changed_fields,
+    )
     credential_count = await app.DATABASE.credential_folders.get_credential_folder_credential_count(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
@@ -2617,6 +2658,9 @@ async def delete_credential_folder(
     if not success:
         raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
 
+    await record_request_audit_event(
+        current_org.organization_id, "credential_folder.delete", "credential_folder", folder_id
+    )
     return {"status": "deleted", "folder_id": folder_id}
 
 
@@ -2652,6 +2696,14 @@ async def update_credential_folder_assignment(
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential {credential_id} not found")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "credential.update",
+        "credential",
+        credential.credential_id,
+        changed_fields=("folder_id",),
+        related_resource_ids=(credential.folder_id,) if credential.folder_id else (),
+    )
     return _convert_to_response(credential)
 
 
@@ -2945,6 +2997,12 @@ async def update_onepassword_token(
             organization_id=current_org.organization_id,
             token_id=auth_token.id,
         )
+        await record_request_audit_event(
+            current_org.organization_id,
+            "vault_provider.update",
+            "vault_provider",
+            OrganizationAuthTokenType.onepassword_service_account.value,
+        )
 
         return CreateOnePasswordTokenResponse(token=OrganizationAuthTokenMetadata.from_token(auth_token))
 
@@ -2985,10 +3043,14 @@ async def clear_org_auth_credential(
     if not token_type:
         raise HTTPException(status_code=404, detail="Unsupported organization auth credential provider")
     try:
-        await app.DATABASE.organizations.invalidate_org_auth_tokens(
+        invalidated_count = await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
             token_type=token_type,
         )
+        if invalidated_count:
+            await record_request_audit_event(
+                current_org.organization_id, "vault_provider.delete", "vault_provider", token_type.value
+            )
         return ClearOrganizationAuthTokenResponse(success=True)
     except Exception as e:
         LOG.error(
@@ -3096,6 +3158,12 @@ async def update_bitwarden_credential(
             organization_id=current_org.organization_id,
             token_id=auth_token.id,
         )
+        await record_request_audit_event(
+            current_org.organization_id,
+            "vault_provider.update",
+            "vault_provider",
+            OrganizationAuthTokenType.bitwarden_credential.value,
+        )
 
         return _to_safe_bitwarden_response(auth_token)
 
@@ -3200,6 +3268,12 @@ async def update_azure_client_secret_credential(
             "Created or updated Azure Client Secret Credential",
             organization_id=current_org.organization_id,
             token_id=auth_token.id,
+        )
+        await record_request_audit_event(
+            current_org.organization_id,
+            "vault_provider.update",
+            "vault_provider",
+            OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
 
         return AzureClientSecretCredentialResponse(token=auth_token)
@@ -3306,6 +3380,12 @@ async def update_custom_credential_service_config(
             "Created or updated custom credential service configuration",
             organization_id=current_org.organization_id,
             token_id=auth_token.id,
+        )
+        await record_request_audit_event(
+            current_org.organization_id,
+            "vault_provider.update",
+            "vault_provider",
+            OrganizationAuthTokenType.custom_credential_service.value,
         )
 
         return CustomCredentialServiceConfigResponse(token=auth_token)
