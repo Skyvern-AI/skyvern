@@ -671,6 +671,31 @@ If `verify_login` sees a login error, the agent terminates with `output.error = 
 
 ---
 
+## Terminate blocks with an error code
+
+A Terminate block ends the run as `terminated` with a `reason`. Set the optional `error_code` field to add your own code to the run's error codes. Use it as a conditional branch target when no page needs to be evaluated:
+
+```yaml YAML
+- block_type: terminate
+  label: no_account
+  reason: "No account matches {{ account_number }}"
+  error_code: ACCOUNT_NOT_FOUND
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `reason` | string | Required. Why the run ends here. Supports Jinja templating. |
+| `error_code` | string \| null | Optional. Code added to the run's error codes. Supports Jinja templating. |
+
+`error_code` rules:
+
+- A literal code must be at most 128 characters. It may contain only ASCII letters, digits, underscores (`_`), periods (`.`), colons (`:`), and hyphens (`-`). Skyvern rejects an agent definition with an invalid literal code.
+- A templated code, such as `{{ outcome_code }}`, is validated after rendering. Skyvern trims surrounding whitespace, and the same length and character rules apply.
+- If the rendered code is blank, the run terminates without an error code.
+- If the rendered code is invalid or contains a secret value, Skyvern drops it. The run still terminates. The block output includes `"error_code_dropped": true`, and the reason ends with "Error code was dropped because it was unusable after rendering."
+
+---
+
 ## Common error patterns
 
 | Error Code | Description | Typical Response |
