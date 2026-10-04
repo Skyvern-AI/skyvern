@@ -80,6 +80,10 @@ LOG = structlog.get_logger()
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
 async def db_unavailable_handler(
     request: Request, exc: OperationalError | DatabaseConnectionUnavailableError
 ) -> JSONResponse:
@@ -600,9 +604,7 @@ def create_api_app() -> FastAPI:
     async def handle_not_found_error(request: Request, exc: NotFoundError) -> Response:
         return Response(status_code=status.HTTP_404_NOT_FOUND)
 
-    @fastapi_app.exception_handler(SkyvernHTTPException)
-    async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     register_db_unavailable_handlers(fastapi_app)
 

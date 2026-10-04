@@ -640,9 +640,14 @@ class WorkflowRunNotFound(SkyvernHTTPException):
 
 
 class MissingValueForParameter(SkyvernHTTPException):
-    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str | None = None) -> None:
+        location = (
+            f"workflow run {workflow_run_id} of workflow {workflow_id}"
+            if workflow_run_id
+            else f"workflow {workflow_id}"
+        )
         super().__init__(
-            f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
+            f"Missing value for parameter {parameter_key} in {location}",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 

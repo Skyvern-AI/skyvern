@@ -724,6 +724,7 @@ async def run_workflow(
             trigger_type=trigger_type,
             tag_write_context=_tag_write_context_from_caller(caller),
             created_by=user_id,
+            refuse_unusable_parameters_before_create=True,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -4850,6 +4851,7 @@ async def run_workflow_legacy(
             trigger_type=legacy_trigger_type,
             tag_write_context=_tag_write_context_from_caller(caller),
             created_by=user_id,
+            refuse_unusable_parameters_before_create=True,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
