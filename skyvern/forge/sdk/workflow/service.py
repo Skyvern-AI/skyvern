@@ -169,6 +169,7 @@ from skyvern.forge.sdk.workflow.credential_selection import (
     select_credential_for_run,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
+    BlockEngineNotEnabledError,
     InvalidWorkflowDefinition,
     WorkflowVersionConflict,
 )
@@ -10699,6 +10700,14 @@ class WorkflowService:
                 block.validate_payload_templates()
 
     @staticmethod
+    def _validate_block_engines(workflow_definition: WorkflowDefinition) -> None:
+        if settings.ENABLE_VOLCENGINE:
+            return
+        for block in get_all_blocks(workflow_definition.blocks):
+            if isinstance(block, BaseTaskBlock) and block.engine == RunEngine.ui_tars:
+                raise BlockEngineNotEnabledError(block.label, RunEngine.ui_tars.value)
+
+    @staticmethod
     def _validate_code_block_templates(workflow_definition: WorkflowDefinition) -> None:
         for block in get_all_blocks(workflow_definition.blocks):
             if isinstance(block, CodeBlock):
@@ -10747,6 +10756,7 @@ class WorkflowService:
     ) -> Workflow:
         try:
             self._validate_code_block_templates(workflow_definition)
+            self._validate_block_engines(workflow_definition)
             if encrypt_secrets:
                 await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             return await app.DATABASE.workflows.create_workflow(
@@ -11298,6 +11308,7 @@ class WorkflowService:
         if workflow_definition is not None:
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
+            self._validate_block_engines(workflow_definition)
             if organization_id is not None:
                 organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
                 if organization is not None:
