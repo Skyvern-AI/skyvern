@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Self
@@ -48,6 +48,7 @@ from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import BaseModel
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
@@ -6063,6 +6064,53 @@ class TestRunBlocksCredentialApproval:
             await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
         assert dispatched["browser_session_id"] == "pbs_carried"
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_reports_a_resumed_browser_refused_at_submission_as_already_closed(
+        self, monkeypatch
+    ) -> None:
+        # Submission now refuses a session that has ended, so no run exists to carry the lease-seam
+        # reason code; the turn still needs the typed browser loss that offers the fresh-browser retry.
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+        from skyvern.services import workflow_service as workflow_service_module
+
+        workflow = self._typed_resume_workflow()
+        organization = Organization(
+            organization_id="org-1",
+            organization_name="org",
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+        database = self._db(workflow=workflow, organization_lookup=organization)
+        database.workflow_params = SimpleNamespace(
+            get_workflow_output_parameters=AsyncMock(return_value=[workflow.get_output_parameter("login")])
+        )
+        ended_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        refused = BrowserSessionExpired(
+            "pbs_carried",
+            started_at=ended_at - timedelta(minutes=60),
+            ended_at=ended_at,
+            timeout_minutes=60,
+            created_by="copilot",
+            refused_at_submission=True,
+        )
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
+        )
+        monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(side_effect=refused))
+
+        ctx = _ctx(browser_session_id=None)
+        ctx.frontier_resume_session_id = "pbs_carried"
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["build_test_connect_failure"]["state"] == "already_closed"
+        assert result["data"]["browser_session_id"] == "pbs_carried"
 
     @pytest.mark.asyncio
     async def test_run_blocks_rejects_unapproved_workflow_credential_before_dispatch(self, monkeypatch) -> None:

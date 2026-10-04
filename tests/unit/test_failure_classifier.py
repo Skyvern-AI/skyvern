@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1025,16 +1027,26 @@ def test_derive_is_never_raises_by_construction_for_pathological_primary() -> No
 def test_browser_lease_producer_reason_codes_round_trip_through_attribution() -> None:
     # Drift guard: the real producer's emitted reason codes must survive derivation. If a new
     # browser-lease code is added without updating the shared allowlist, this fails.
-    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionStartupTimeout
+    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionExpired, BrowserSessionStartupTimeout
     from skyvern.forge.sdk.workflow.service import _browser_lease_failure_category
 
-    for exc in (
-        BrowserSessionClosed(browser_session_id="pbs_x"),
-        BrowserSessionStartupTimeout(browser_session_id="pbs_x"),
+    started_at = datetime(2026, 9, 28, 13, 1, tzinfo=UTC)
+    ended_at = started_at + timedelta(minutes=240)
+    workflow_run = SimpleNamespace(created_at=ended_at + timedelta(hours=6))
+    expired = BrowserSessionExpired(
+        "pbs_x", started_at=started_at, ended_at=ended_at, timeout_minutes=240, created_by="api"
+    )
+    for exc, component in (
+        (BrowserSessionClosed(browser_session_id="pbs_x"), "browser"),
+        (BrowserSessionStartupTimeout(browser_session_id="pbs_x"), "browser"),
+        (expired, "non_infra"),
     ):
-        fc = _browser_lease_failure_category(exc)
+        fc = _browser_lease_failure_category(exc, workflow_run)
         assert fc is not None
         doc = derive_failure_attribution(fc)
         assert doc["reason_code"] == fc[0]["reason_code"]
         assert doc["evidence_source"] == "reason_code"
-        assert doc["primary_infra_component"] == "browser"
+        assert doc["primary_infra_component"] == component
+    assert derive_failure_attribution(_browser_lease_failure_category(expired, workflow_run))["failure_category"] == (
+        FailureCategory.BROWSER_SESSION_EXPIRED
+    )

@@ -37,6 +37,7 @@ from skyvern.forge.request_logging import (
     log_raw_request_middleware,
     set_request_organization,
 )
+from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
@@ -721,6 +722,16 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
     async def payment_required() -> dict:
         raise HTTPException(status_code=402, detail="Payment Required")
 
+    @app.post("/runs/shed")
+    async def shed_run_submission() -> dict:
+        gate = RunSubmissionGate(limit=1, wait_seconds=0.01)
+        async with gate.slot(), gate.slot():
+            return {"dispatched": True}
+
+    @app.post("/runs/unavailable")
+    async def unavailable() -> dict:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
     @app.post("/post-only")
     async def post_only() -> dict:
         return {"ok": True}
@@ -1062,6 +1073,15 @@ class TestMiddlewareLogVolume:
         log_mock.warning.assert_called_once()
         assert log_mock.warning.call_args.args[0] == "api.raw_request"
         assert log_mock.warning.call_args.kwargs["status_code"] == 403
+
+    @pytest.mark.parametrize(("path", "level"), [("/runs/shed", "warning"), ("/runs/unavailable", "error")])
+    def test_shed_run_submission_logs_at_warning_while_other_503s_stay_errors(
+        self, log_mock: MagicMock, path: str, level: str
+    ) -> None:
+        response = TestClient(_make_app()).post(path)
+
+        assert response.status_code == 503
+        assert [(call[0], call.kwargs["status_code"]) for call in log_mock.mock_calls] == [(level, 503)]
 
     def test_artifact_url_queries_are_redacted_from_logged_bodies(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
