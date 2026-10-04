@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     summarize_tool_result_detail,
     user_facing_success,
 )
+from tests.unit.helpers import unsolved_captcha_relabel_categories
 
 
 def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
@@ -2440,3 +2441,24 @@ async def test_saved_workflow_reader_uses_document_privacy_projection(monkeypatc
     metadata = listed["data"]["workflows"][0]
     assert set(private).isdisjoint(metadata)
     assert "workflow_definition" not in metadata
+
+
+def _run_tool_result(failure_category: list[dict]) -> dict[str, Any]:
+    task_output = {"task_id": "tsk_1", "status": "failed", "failure_category": failure_category}
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "failure_category": failure_category,
+            "blocks": [{"label": "submit", "status": "failed", "output": task_output, "extracted_data": task_output}],
+            "registered_output_parameter_values": [{"block_label": "submit", "value": task_output}],
+        },
+    }
+
+
+@pytest.mark.parametrize("tool_name", ["get_run_results", "run_blocks_and_collect_debug"])
+def test_the_model_reads_the_same_run_categories_after_an_output_only_relabel(tool_name: str) -> None:
+    before, after = unsolved_captcha_relabel_categories()
+    assert sanitize_tool_result_for_llm(tool_name, _run_tool_result(after)) == sanitize_tool_result_for_llm(
+        tool_name, _run_tool_result(before)
+    )

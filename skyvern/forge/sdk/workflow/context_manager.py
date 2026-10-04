@@ -35,6 +35,7 @@ from skyvern.exceptions import (
     sanitize_credential_for_error,
 )
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import without_output_only_anti_bot
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.core import skyvern_context
@@ -1814,6 +1815,8 @@ class WorkflowRunContext:
         if parameter.key in self.values:
             LOG.debug(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
 
+        # Later blocks template from this value; the persisted output keeps the full label.
+        value = without_output_only_anti_bot(value)
         self.values[parameter.key] = value
         self.register_block_reference_variable_from_output_parameter(parameter, value)
 

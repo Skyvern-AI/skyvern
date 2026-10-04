@@ -721,6 +721,31 @@ def test_derive_end_to_end_from_real_classifier_output() -> None:
     assert derive_failure_attribution(fc)["primary_infra_component"] == "proxy"
 
 
+@pytest.mark.parametrize(
+    "browser_loss",
+    [
+        pytest.param(skyvern_exceptions.MissingBrowserStatePage(), id="page-missing"),
+        pytest.param(
+            skyvern_exceptions.ScreenshotTargetClosed("Target page, context or browser has been closed"),
+            id="target-closed",
+        ),
+    ],
+)
+def test_an_unsolved_captcha_outranks_the_browser_loss_that_ended_the_run(browser_loss: Exception) -> None:
+    categories = classify_from_failure_reason(
+        skyvern_exceptions.get_user_facing_exception_message(browser_loss),
+        exception=browser_loss,
+        fallback_to_unknown=True,
+        unsolved_captcha_exception="CaptchaNotSolvedInTime",
+    )
+
+    assert categories is not None
+    assert categories[0]["category"] == "ANTI_BOT_DETECTION"
+    assert categories[0]["evidence_source"] == "exception_type"
+    assert "BROWSER_ERROR" in [category["category"] for category in categories]
+    assert derive_failure_attribution(categories)["primary_infra_component"] != "browser"
+
+
 def test_derive_parameter_binding_error_maps_to_worker() -> None:
     # PM adjudication: an internal configuration mismatch is owned by the worker in v1.
     fc = [{"category": "PARAMETER_BINDING_ERROR", "confidence_float": 0.95, "reasoning": "Keywords matched"}]
