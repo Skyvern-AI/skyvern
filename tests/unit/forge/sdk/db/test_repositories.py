@@ -1,14 +1,19 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
 import inspect
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     PersistentBrowserSessionModel,
@@ -21,6 +26,9 @@ from skyvern.forge.sdk.db.repositories.organizations import OrganizationsReposit
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
+from skyvern.schemas.runs import ProxyLocation
+from tests.unit._sql_recording import recorded_statements
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
 
@@ -130,9 +138,9 @@ async def test_otp_repository_stores_blank_run_scoping_ids_as_null():
         async def commit(self):
             return None
 
-        async def refresh(self, obj):
-            obj.totp_code_id = "otp_test"
-            obj.created_at = obj.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        async def flush(self):
+            self.added.totp_code_id = "otp_test"
+            self.added.created_at = self.added.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
     session = CapturingWriteSession()
     repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
@@ -172,9 +180,9 @@ async def test_otp_repository_creates_raw_row_without_fabricated_code():
         async def commit(self):
             return None
 
-        async def refresh(self, obj):
-            obj.totp_code_id = "otp_raw"
-            obj.created_at = obj.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        async def flush(self):
+            self.added.totp_code_id = "otp_raw"
+            self.added.created_at = self.added.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
     session = CapturingWriteSession()
     repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
@@ -769,3 +777,97 @@ async def test_resetting_a_task_for_rerun_re_arms_its_finish_claim(sqlite_engine
 
     for background_sync in list(repo._background_tasks):
         await background_sync
+
+
+_OTP_IDENTIFIER = "insert@example.test"
+# Aware on purpose: the row stores naive UTC, and the returned value must match what a read gets back.
+_OTP_EXPIRY = datetime.now(timezone.utc) + timedelta(hours=1)
+
+
+async def _read_otp_code(db: AgentDB, organization_id: str, created: TOTPCode) -> TOTPCode:
+    codes = await db.otp.get_otp_codes(organization_id=organization_id, totp_identifier=_OTP_IDENTIFIER)
+    return next(code for code in codes if code.totp_code_id == created.totp_code_id)
+
+
+async def _read_raw_otp_code(db: AgentDB, organization_id: str, created: RawTOTPCode) -> RawTOTPCode:
+    codes = await db.otp.get_raw_otp_codes(organization_id=organization_id, totp_identifier=_OTP_IDENTIFIER)
+    return next(code for code in codes if code.totp_code_id == created.totp_code_id)
+
+
+# Each entry: (create the row, read the same row back by its id).
+_INSERTS: dict[str, tuple[Callable[..., Awaitable[BaseModel]], Callable[..., Awaitable[BaseModel | None]]]] = {
+    "artifact": (
+        lambda db, org: db.artifacts.create_artifact(
+            artifact_id=generate_artifact_id(),
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            uri="s3://bucket/screenshot.png",
+            organization_id=org,
+            task_id="tsk_insert",
+            step_id="stp_insert",
+            file_size=3,
+        ),
+        lambda db, org, row: db.artifacts.get_artifact_by_id(row.artifact_id, org),
+    ),
+    "otp_code": (
+        lambda db, org: db.otp.create_otp_code(
+            organization_id=org,
+            totp_identifier=_OTP_IDENTIFIER,
+            content="Your code is 123456",
+            code="123456",
+            otp_type=OTPType.TOTP,
+            expired_at=_OTP_EXPIRY,
+        ),
+        _read_otp_code,
+    ),
+    "raw_otp_code": (
+        lambda db, org: db.otp.create_raw_otp_code(
+            organization_id=org,
+            totp_identifier=_OTP_IDENTIFIER,
+            content="Your code is 123456",
+            expired_at=_OTP_EXPIRY,
+        ),
+        _read_raw_otp_code,
+    ),
+    # Workflow blocks pass earlier block outputs, which hold datetimes, and scraped text can hold NULs.
+    "task": (
+        lambda db, org: db.tasks.create_task(
+            url="https://example.test/",
+            title="Insert",
+            navigation_goal="goal",
+            data_extraction_goal=None,
+            navigation_payload={
+                "block_output": {"downloaded_files": [{"modified_at": datetime(2026, 9, 30, 12, 0, 0)}]},
+                "field": "va\x00lue",
+            },
+            organization_id=org,
+            download_timeout=1.5,
+        ),
+        lambda db, org, row: db.tasks.get_task(row.task_id, organization_id=org),
+    ),
+    # The ISP pin is written by a second flush, whose UPDATE also stamps modified_at.
+    "browser_session": (
+        lambda db, org: db.browser_sessions.create_persistent_browser_session(
+            organization_id=org,
+            timeout_minutes=10,
+            proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        ),
+        lambda db, org, row: db.browser_sessions.get_persistent_browser_session(row.persistent_browser_session_id, org),
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("insert", list(_INSERTS))
+async def test_create_returns_the_stored_row_without_reading_it_back(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str], insert: str
+) -> None:
+    db, engine, organization_id = org_scoped_db
+    create, read_back = _INSERTS[insert]
+
+    with recorded_statements(engine) as statements:
+        created = await create(db, organization_id)
+
+    assert [statement for statement in statements if statement.startswith("SELECT")] == []
+    stored = await read_back(db, organization_id, created)
+    assert stored is not None
+    assert created.model_dump() == stored.model_dump()
