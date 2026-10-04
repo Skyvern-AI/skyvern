@@ -7,13 +7,20 @@ persists them in a single batch insert, and that validation failures
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.exceptions import (
     InvalidCredentialId,
@@ -23,10 +30,17 @@ from skyvern.exceptions import (
     UnrecognizedWorkflowParameters,
     WorkflowRunParameterPersistenceError,
 )
+from skyvern.forge import app
+from skyvern.forge.api_app import handle_skyvern_http_exception
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.models import CredentialModel, WorkflowRunModel
+from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.org_auth_service import CallerContext
 from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
@@ -37,6 +51,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+from skyvern.services import workflow_service as workflow_service_module
 
 
 def _make_workflow_parameter(
@@ -1546,3 +1562,225 @@ async def test_setup_rejects_composite_template_item_id_with_known_parameters() 
             request_data={"prefix": "abc", "suffix": "def"},
             workflow_parameters=[_make_workflow_parameter("prefix"), _make_workflow_parameter("suffix")],
         )
+
+
+@dataclass
+class RunSubmissionLab:
+    client: httpx.AsyncClient
+    database: AgentDB
+    workflow_permanent_id: str
+    execute_workflow: AsyncMock
+
+    async def submit(self, route: str, parameters: dict[str, object]) -> httpx.Response:
+        if route == "run":
+            return await self.client.post(
+                "/v1/run/workflows", json={"workflow_id": self.workflow_permanent_id, "parameters": parameters}
+            )
+        return await self.client.post(f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters})
+
+    async def run_rows(self) -> list[WorkflowRunModel]:
+        async with self.database.Session() as session:
+            return list((await session.scalars(select(WorkflowRunModel))).all())
+
+
+@asynccontextmanager
+async def run_submission_lab(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> AsyncIterator[RunSubmissionLab]:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    organization = await database.organizations.create_organization("Test", organization_id="o_test")
+    async with database.Session() as session:
+        for credential_id in ("cred_live", "cred_spare"):
+            session.add(
+                CredentialModel(
+                    credential_id=credential_id,
+                    organization_id="o_test",
+                    item_id=f"item_{credential_id}",
+                    name="Login",
+                    credential_type="password",
+                )
+            )
+        await session.commit()
+    workflow_service = WorkflowService()
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+    monkeypatch.setattr(
+        object.__getattribute__(app, "_inst"),
+        "RATE_LIMITER",
+        SimpleNamespace(rate_limit_submit_run=AsyncMock()),
+        raising=False,
+    )
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "remove_workflow_run_context", Mock())
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "should_defer_workflow_browser_creation", AsyncMock(return_value=False))
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    execute_workflow = AsyncMock()
+    monkeypatch.setattr(
+        workflow_service_module.AsyncExecutorFactory,
+        "get_executor",
+        lambda: SimpleNamespace(execute_workflow=execute_workflow),
+    )
+    workflow = await workflow_service.create_workflow_from_request(
+        organization=organization,
+        request=WorkflowCreateYAMLRequest.model_validate(
+            {
+                "title": "Sign in and read the balance",
+                "workflow_definition": {
+                    "parameters": [
+                        {"parameter_type": "workflow", "key": "login", "workflow_parameter_type": "credential_id"},
+                        {"parameter_type": "workflow", "key": "email", "workflow_parameter_type": "string"},
+                        {
+                            "parameter_type": "workflow",
+                            "key": "count",
+                            "workflow_parameter_type": "integer",
+                            "default_value": 1,
+                        },
+                        {
+                            "parameter_type": "workflow",
+                            "key": "vault_item",
+                            "workflow_parameter_type": "string",
+                            "default_value": "0b6f1c1e-6a8e-4f1e-9a51-3b2d6f0c9e10",
+                        },
+                        {
+                            "parameter_type": "bitwarden_login_credential",
+                            "key": "vault_login",
+                            "bitwarden_client_id_aws_secret_key": "client_id",
+                            "bitwarden_client_secret_aws_secret_key": "client_secret",
+                            "bitwarden_master_password_aws_secret_key": "master_password",
+                            "bitwarden_item_id": "vault_item",
+                        },
+                        {
+                            "parameter_type": "credential",
+                            "key": "account",
+                            "credential_id": "cred_live",
+                            "fallback_credential_ids": ["cred_spare"],
+                        },
+                    ],
+                    "blocks": [{"label": "visit_page", "block_type": "task", "url": "https://example.com"}],
+                },
+            }
+        ),
+    )
+
+    fastapi_app = FastAPI()
+    fastapi_app.dependency_overrides[org_auth_service.get_current_caller_context] = lambda: CallerContext(
+        organization=organization, caller_id="u_test", caller_type=CallerType.USER
+    )
+    fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
+
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
+
+    @fastapi_app.middleware("http")
+    async def request_context(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        skyvern_context.set(SkyvernContext(request_id="req_test"))
+        try:
+            return await call_next(request)
+        finally:
+            skyvern_context.reset()
+
+    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
+    fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
+        yield RunSubmissionLab(
+            client=client,
+            database=database,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            execute_workflow=execute_workflow,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["run", "legacy"])
+@pytest.mark.parametrize(
+    ("parameters", "detail"),
+    [
+        pytest.param(
+            {"login": "cred_deleted", "email": "a@example.com"},
+            "Invalid credential ID: cred_deleted. Failed to resolve to a valid credential.",
+            id="invalid-credential-id",
+        ),
+        pytest.param(
+            {"login": "cred_live"},
+            "Missing value for parameter email in workflow {wpid}",
+            id="missing-parameter",
+        ),
+        pytest.param(
+            {"email": "a@example.com", "count": "three"},
+            "Invalid workflow parameter. Expected parameter type: integer. Value: three.",
+            id="invalid-parameter-value",
+        ),
+        pytest.param(
+            {"logn": "cred_live", "email": "a@example.com"},
+            "The run request sent parameter(s) this workflow does not declare: logn.",
+            id="misdirected-credential-key",
+        ),
+        pytest.param(
+            {"login": "cred_live", "email": "a@example.com", "vault_item": "not-a-uuid"},
+            "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Value: not-a-uuid.",
+            id="invalid-bitwarden-item-id",
+        ),
+        pytest.param(
+            {"login": "cred_live", "email": "a@example.com", "account": "cred_unlisted"},
+            "Credential override for parameter account must be one of the configured rotation or fallback credentials.",
+            id="credential-override-outside-the-pool",
+        ),
+    ],
+)
+async def test_run_submission_refuses_unusable_parameters_without_writing_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    route: str,
+    parameters: dict[str, object],
+    detail: str,
+) -> None:
+    # These requests always got a 400, but setup wrote the run first and marked it failed; the 400 stays and the run
+    # must not exist. Setup skips its own credential-id and Bitwarden checks after the pre-check, so it is the only one.
+    async with run_submission_lab(monkeypatch, sqlite_engine) as lab:
+        refused = await lab.submit(route, parameters)
+
+        assert refused.status_code == 400
+        assert refused.json()["detail"].startswith(detail.format(wpid=lab.workflow_permanent_id))
+        assert await lab.run_rows() == []
+        lab.execute_workflow.assert_not_awaited()
+
+        accepted = await lab.submit(route, {"login": "cred_live", "email": "a@example.com"})
+
+        assert accepted.status_code == 200
+        (run,) = await lab.run_rows()
+        assert run.status == "created"
+        lab.execute_workflow.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["run", "legacy"])
+@pytest.mark.parametrize(
+    ("parameters", "deleted_credential_id"),
+    [
+        pytest.param({"login": "cred_spare", "email": "a@example.com"}, "cred_live", id="stored-credential-deleted"),
+        pytest.param(
+            {"login": "cred_live", "email": "a@example.com", "account": "cred_spare"},
+            "cred_spare",
+            id="override-credential-deleted",
+        ),
+    ],
+)
+async def test_run_submission_refuses_a_deleted_credential_the_workflow_fixes_without_writing_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    route: str,
+    parameters: dict[str, object],
+    deleted_credential_id: str,
+) -> None:
+    # The `account` parameter stores `cred_live` with `cred_spare` as its fallback. The request's own `login`
+    # credential stays valid in both cases, so only the check on the credentials the workflow fixes can refuse it.
+    async with run_submission_lab(monkeypatch, sqlite_engine) as lab:
+        async with lab.database.Session() as session:
+            await session.execute(delete(CredentialModel).where(CredentialModel.credential_id == deleted_credential_id))
+            await session.commit()
+
+        refused = await lab.submit(route, parameters)
+
+        assert refused.status_code == 400
+        assert refused.json()["detail"].startswith(f"Invalid credential ID: {deleted_credential_id}.")
+        assert await lab.run_rows() == []
+        lab.execute_workflow.assert_not_awaited()

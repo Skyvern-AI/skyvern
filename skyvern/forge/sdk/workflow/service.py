@@ -1426,6 +1426,16 @@ class ReusedSessionOwnerProof:
         )
 
 
+@dataclass(frozen=True)
+class RequestParameterValues:
+    values: list[tuple[WorkflowParameter, Any]]
+    missing: list[str]
+    unresolved_credentials: list[str]
+    # Only the credentials the request never mentioned. A key sent as null or blank is a caller who knows the key
+    # and means "run without a credential".
+    absent_credentials: list[str]
+
+
 class ReusedSessionBelowLifetimeFloor(Exception):
     def __init__(self, *, browser_session: PersistentBrowserSession, shortfall: dict[str, object]) -> None:
         super().__init__(browser_session.persistent_browser_session_id)
@@ -3401,10 +3411,12 @@ class WorkflowService:
         server_owned_browser_type: str | None = None,
         created_by: str | None = None,
         reject_empty_workflow: bool = False,
+        refuse_unusable_parameters_before_create: bool = False,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
-        parameters with no default value, mark the workflow run as failed.
+        parameters with no default value, mark the workflow run as failed, or with
+        refuse_unusable_parameters_before_create raise before the run is written.
         :param request_id: The request id for the workflow run.
         :param workflow_request: The request body for the workflow run, containing the parameters and the config.
         :param workflow_id: The workflow id to run.
@@ -3518,6 +3530,26 @@ class WorkflowService:
                 resolved_trigger_type = ambient_context.trigger_type
             if resolved_trigger_type is None:
                 resolved_trigger_type = WorkflowRunTriggerType.api
+
+            prevalidated_workflow_parameters: list[WorkflowParameter] | None = None
+            if refuse_unusable_parameters_before_create:
+                # The caller is waiting on this request for the 400 either way; checking first means a run that
+                # could never start is not also written and recorded as failed.
+                prevalidated_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+                try:
+                    await self._refuse_unusable_request_parameters(
+                        workflow=workflow,
+                        workflow_parameters=prevalidated_workflow_parameters,
+                        request_data=workflow_request.data,
+                        organization=organization,
+                    )
+                except SkyvernHTTPException as e:
+                    LOG.warning(
+                        "Refused a workflow run request before writing the run",
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        **exception_log_fields(e),
+                    )
+                    raise
 
             # Create the workflow run and set skyvern context
             workflow_run = await self.create_workflow_run(
@@ -3638,48 +3670,16 @@ class WorkflowService:
                     raise
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
-            all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+            all_workflow_parameters = (
+                prevalidated_workflow_parameters
+                if prevalidated_workflow_parameters is not None
+                else await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+            )
             try:
-                missing_parameters: list[str] = []
-                unresolved_credential_parameters: list[str] = []
-                # Only the credentials the request never mentioned. A key sent as null or blank is a
-                # caller who knows the key and means "run without a credential".
-                absent_credential_parameters: list[str] = []
-                workflow_parameter_values: list[tuple[WorkflowParameter, Any]] = []
-                for workflow_parameter in all_workflow_parameters:
-                    if workflow_request.data and workflow_parameter.key in workflow_request.data:
-                        request_body_value = workflow_request.data[workflow_parameter.key]
-                        # Fall back to default value if the request explicitly sends null
-                        # This supports API clients (e.g., n8n) that include the key with null value
-                        if request_body_value is None and workflow_parameter.default_value is not None:
-                            request_body_value = workflow_parameter.default_value
-                        if self._is_missing_required_value(workflow_parameter, request_body_value):
-                            # A missing-shaped value for an at-will credential means "run without a
-                            # credential": no run parameter row is written and the run context
-                            # backfills it as None.
-                            if self._is_optional_credential_parameter(workflow_parameter):
-                                unresolved_credential_parameters.append(workflow_parameter.key)
-                                continue
-                            missing_parameters.append(workflow_parameter.key)
-                            continue
-                        if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
-                            if not isinstance(request_body_value, str):
-                                raise InvalidCredentialId(
-                                    f"<non-string value of type {type(request_body_value).__name__}>"
-                                )
-                        workflow_parameter_values.append((workflow_parameter, request_body_value))
-                    elif workflow_parameter.default_value is not None:
-                        if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
-                            if not isinstance(workflow_parameter.default_value, str):
-                                raise InvalidCredentialId(
-                                    f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
-                                )
-                        workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
-                    elif not self._is_optional_credential_parameter(workflow_parameter):
-                        missing_parameters.append(workflow_parameter.key)
-                    else:
-                        unresolved_credential_parameters.append(workflow_parameter.key)
-                        absent_credential_parameters.append(workflow_parameter.key)
+                request_parameters = self._resolve_request_parameter_values(
+                    all_workflow_parameters, workflow_request.data
+                )
+                workflow_parameter_values = request_parameters.values
 
                 declared_parameter_keys = self._declared_request_parameter_keys(workflow, all_workflow_parameters)
                 unknown_parameter_keys = sorted(set(workflow_request.data or {}) - declared_parameter_keys)
@@ -3693,48 +3693,30 @@ class WorkflowService:
                         unknown_parameter_keys=self._bound_parameter_keys(unknown_parameter_keys),
                         declared_parameter_key_count=len(declared_parameter_keys),
                     )
-                # Only raise when an unknown key looks like it was meant for one of the credentials
-                # the request omitted -- a caller who legitimately runs without a credential must not
-                # 400 just because their request also carries an unrelated extra key (a stale field,
-                # a client-side sentinel, an internal marker).
-                misdirected_credential_keys = [
-                    unknown_key
-                    for unknown_key in unknown_parameter_keys
-                    if difflib.get_close_matches(unknown_key, absent_credential_parameters, n=1)
-                ]
-                if misdirected_credential_keys:
-                    raise UnrecognizedWorkflowParameters(
-                        unknown_keys=self._bound_parameter_keys(unknown_parameter_keys),
-                        expected_keys=self._bound_parameter_keys(sorted(declared_parameter_keys)),
-                        unresolved_credential_keys=sorted(absent_credential_parameters),
-                    )
-                if unresolved_credential_parameters:
+                self._raise_if_credential_sent_under_unknown_key(
+                    unknown_parameter_keys, declared_parameter_keys, request_parameters.absent_credentials
+                )
+                if request_parameters.unresolved_credentials:
                     LOG.info(
                         "Workflow run is starting without an at-will credential",
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_permanent_id=workflow.workflow_permanent_id,
-                        credential_parameter_keys=sorted(unresolved_credential_parameters),
+                        credential_parameter_keys=sorted(request_parameters.unresolved_credentials),
                     )
 
-                if missing_parameters:
-                    missing_list = ", ".join(sorted(missing_parameters))
+                if request_parameters.missing:
                     raise MissingValueForParameter(
-                        parameter_key=missing_list,
+                        parameter_key=", ".join(sorted(request_parameters.missing)),
                         workflow_id=workflow.workflow_permanent_id,
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
 
-                await self._validate_credential_ids(
-                    [
-                        value
-                        for (workflow_parameter, value) in workflow_parameter_values
-                        if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
-                    ],
-                    organization,
-                )
-
                 parameter_values = {param.key: value for param, value in workflow_parameter_values}
-                await self._validate_bitwarden_item_ids(workflow=workflow, parameter_values=parameter_values)
+                if prevalidated_workflow_parameters is None:
+                    await self._validate_credential_ids(
+                        self._credential_id_values(workflow_parameter_values), organization
+                    )
+                    await self._validate_bitwarden_item_ids(workflow=workflow, parameter_values=parameter_values)
                 run_credential_parameter_overrides = await self._apply_run_credential_parameter_overrides(
                     workflow=workflow,
                     workflow_run=workflow_run,
@@ -4808,6 +4790,141 @@ class WorkflowService:
             storage_key=storage_key,
         )
         return storage_key
+
+    def _resolve_request_parameter_values(
+        self,
+        workflow_parameters: list[WorkflowParameter],
+        request_data: dict[str, Any] | None,
+    ) -> RequestParameterValues:
+        values: list[tuple[WorkflowParameter, Any]] = []
+        missing: list[str] = []
+        unresolved_credentials: list[str] = []
+        absent_credentials: list[str] = []
+        for workflow_parameter in workflow_parameters:
+            if request_data and workflow_parameter.key in request_data:
+                request_body_value = request_data[workflow_parameter.key]
+                # Fall back to default value if the request explicitly sends null
+                # This supports API clients (e.g., n8n) that include the key with null value
+                if request_body_value is None and workflow_parameter.default_value is not None:
+                    request_body_value = workflow_parameter.default_value
+                if self._is_missing_required_value(workflow_parameter, request_body_value):
+                    # A missing-shaped value for an at-will credential means "run without a
+                    # credential": no run parameter row is written and the run context
+                    # backfills it as None.
+                    if self._is_optional_credential_parameter(workflow_parameter):
+                        unresolved_credentials.append(workflow_parameter.key)
+                        continue
+                    missing.append(workflow_parameter.key)
+                    continue
+                if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                    if not isinstance(request_body_value, str):
+                        raise InvalidCredentialId(f"<non-string value of type {type(request_body_value).__name__}>")
+                values.append((workflow_parameter, request_body_value))
+            elif workflow_parameter.default_value is not None:
+                if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                    if not isinstance(workflow_parameter.default_value, str):
+                        raise InvalidCredentialId(
+                            f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
+                        )
+                values.append((workflow_parameter, workflow_parameter.default_value))
+            elif not self._is_optional_credential_parameter(workflow_parameter):
+                missing.append(workflow_parameter.key)
+            else:
+                unresolved_credentials.append(workflow_parameter.key)
+                absent_credentials.append(workflow_parameter.key)
+        return RequestParameterValues(
+            values=values,
+            missing=missing,
+            unresolved_credentials=unresolved_credentials,
+            absent_credentials=absent_credentials,
+        )
+
+    def _raise_if_credential_sent_under_unknown_key(
+        self,
+        unknown_parameter_keys: list[str],
+        declared_parameter_keys: set[str],
+        absent_credential_parameters: list[str],
+    ) -> None:
+        # Only raise when an unknown key looks like it was meant for one of the credentials
+        # the request omitted -- a caller who legitimately runs without a credential must not
+        # 400 just because their request also carries an unrelated extra key (a stale field,
+        # a client-side sentinel, an internal marker).
+        misdirected_credential_keys = [
+            unknown_key
+            for unknown_key in unknown_parameter_keys
+            if difflib.get_close_matches(unknown_key, absent_credential_parameters, n=1)
+        ]
+        if misdirected_credential_keys:
+            raise UnrecognizedWorkflowParameters(
+                unknown_keys=self._bound_parameter_keys(unknown_parameter_keys),
+                expected_keys=self._bound_parameter_keys(sorted(declared_parameter_keys)),
+                unresolved_credential_keys=sorted(absent_credential_parameters),
+            )
+
+    @staticmethod
+    def _credential_id_values(workflow_parameter_values: list[tuple[WorkflowParameter, Any]]) -> list[str]:
+        return [
+            value
+            for (workflow_parameter, value) in workflow_parameter_values
+            if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+        ]
+
+    async def _refuse_unusable_request_parameters(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_parameters: list[WorkflowParameter],
+        request_data: dict[str, Any] | None,
+        organization: Organization,
+    ) -> None:
+        """Raise, before a run exists, each 4xx that setup_workflow_run would otherwise raise after writing it and
+        that the request and workflow alone decide."""
+        request_parameters = self._resolve_request_parameter_values(workflow_parameters, request_data)
+        declared_parameter_keys = self._declared_request_parameter_keys(workflow, workflow_parameters)
+        self._raise_if_credential_sent_under_unknown_key(
+            sorted(set(request_data or {}) - declared_parameter_keys),
+            declared_parameter_keys,
+            request_parameters.absent_credentials,
+        )
+        if request_parameters.missing:
+            raise MissingValueForParameter(
+                parameter_key=", ".join(sorted(request_parameters.missing)),
+                workflow_id=workflow.workflow_permanent_id,
+            )
+        await self._validate_credential_ids(self._credential_id_values(request_parameters.values), organization)
+        await self._validate_bitwarden_item_ids(
+            workflow=workflow,
+            parameter_values={param.key: value for param, value in request_parameters.values},
+        )
+        credential_overrides = self._get_run_credential_parameter_overrides(
+            workflow=workflow, request_data=request_data
+        )
+        await self._validate_credential_ids(
+            [
+                *credential_overrides.values(),
+                *self._definition_fixed_credential_ids(workflow, declared_parameter_keys, credential_overrides),
+            ],
+            organization,
+        )
+        for workflow_parameter, value in request_parameters.values:
+            self._serialize_workflow_run_parameter_value(workflow_parameter, value)
+
+    @staticmethod
+    def _definition_fixed_credential_ids(
+        workflow: Workflow,
+        declared_parameter_keys: set[str],
+        credential_overrides: dict[str, str],
+    ) -> list[str]:
+        """Credential ids the run binds that the workflow definition fixes: a credential parameter with no rotation
+        pool, no per-run override and a literal id rather than a reference to another parameter."""
+        return [
+            parameter.credential_id
+            for parameter in workflow.workflow_definition.parameters
+            if isinstance(parameter, CredentialParameter)
+            and not parameter.credential_ids
+            and parameter.key not in credential_overrides
+            and parameter.credential_id not in declared_parameter_keys
+        ]
 
     @staticmethod
     def _declared_request_parameter_keys(
