@@ -190,6 +190,9 @@ class FakePage:
     def set_default_timeout(self, timeout: float) -> None:
         self.default_timeout = timeout
 
+    def is_closed(self) -> bool:
+        return False
+
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
 

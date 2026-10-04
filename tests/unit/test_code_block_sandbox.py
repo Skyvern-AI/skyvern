@@ -3942,6 +3942,67 @@ class TestOpenPageHelperBinding:
         assert "Failed on opened page: https://example.test/detail/3" in result.failure_reason
 
     @pytest.mark.asyncio
+    async def test_a_failure_on_a_claimed_popup_names_that_popup_and_leaves_it_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = FakeSearchBrowserContext()
+        timeout = PlaywrightTimeoutError("locator timed out")
+
+        class PopupLocator:
+            def __init__(self, page: FakeSearchPage) -> None:
+                self.page = page
+
+            async def click(self, **_kwargs: Any) -> None:
+                raise timeout
+
+            async def evaluate(self, _script: str, **_kwargs: Any) -> str:
+                return '<div id="cover">'
+
+        class PopupPage(FakeSearchPage):
+            def locator(self, _selector: str, **_kwargs: Any) -> PopupLocator:
+                return PopupLocator(self)
+
+        popup = PopupPage(context=context)
+        popup.url = "https://example.test/sign-in"
+
+        @asynccontextmanager
+        async def expect_popup(**_kwargs: Any) -> AsyncIterator[SimpleNamespace]:
+            value: asyncio.Future[PopupPage] = asyncio.get_running_loop().create_future()
+            value.set_result(popup)
+            yield SimpleNamespace(value=value)
+
+        root = SimpleNamespace(
+            context=context, url="https://example.test/listing", is_closed=lambda: False, expect_popup=expect_popup
+        )
+        root.title = AsyncMock(return_value="Listing")
+        browser_state = SimpleNamespace(
+            browser_artifacts=BrowserArtifacts(),
+            get_working_page=AsyncMock(return_value=root),
+            list_valid_pages=AsyncMock(return_value=[root]),
+            set_active_page=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", AsyncMock()
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
+        monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext(values={}))
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
+        block = self._block()
+        block.code = (
+            "async with page.expect_popup() as popup_info:\n"
+            "    pass\n"
+            "popup = await popup_info.value\n"
+            "await popup.locator('#user').click()\n"
+        )
+
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        assert "Final URL: https://example.test/listing" in result.failure_reason
+        assert "Failed on opened page: https://example.test/sign-in" in result.failure_reason
+        assert popup.closed is False
+
+    @pytest.mark.asyncio
     async def test_open_page_fails_closed_without_a_run_browser(self) -> None:
         with pytest.raises(RuntimeError, match="only supported while the run browser is open"):
             await CodeBlock.build_safe_vars()["open_page"](None, "https://example.test/")

@@ -101,6 +101,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotClearProposedWorkflowRequest,
+    WorkflowCopilotCredentialRegistration,
     WorkflowCopilotDisableAutoAcceptRequest,
     WorkflowCopilotMessageFeedbackRequest,
     WorkflowCopilotStreamErrorUpdate,
@@ -4557,7 +4558,10 @@ async def test_request_webhook_is_validated_before_staging_once(
     await captured["handler"](copilot_stream)
 
     frames = [call.args[0].model_dump(mode="json") for call in copilot_stream.send.await_args_list]
-    if webhook_kind == "blocked":
+    # The Test action runs the proposal under its own settings, so the editor's webhook is never carried.
+    carried = product_action is None
+    expected_webhook = private_url if carried or webhook_kind == "stored" else None
+    if webhook_kind == "blocked" and carried:
         assert not contexts, "The agent must not receive a request with a newly carried blocked webhook"
         errors = [frame for frame in frames if frame["type"] == "error"]
         assert errors and "webhook_callback_url" in errors[0]["error"]
@@ -4566,7 +4570,7 @@ async def test_request_webhook_is_validated_before_staging_once(
     else:
         assert contexts and all(update["ok"] for update in updates), (updates, frames)
         ctx = contexts[0]
-        assert ctx.staged_workflow.webhook_callback_url == private_url
+        assert ctx.staged_workflow.webhook_callback_url == expected_webhook
         assert private_url not in ctx.workflow_yaml
         chat.proposed_workflow = workflow_copilot_route._build_proposed_workflow_data(
             ctx.staged_workflow,
@@ -4584,8 +4588,8 @@ async def test_request_webhook_is_validated_before_staging_once(
         await workflow_copilot_chat_post(api_key_request, request, organization)
         await captured["handler"](copilot_stream)
         assert len(contexts) == 2 and all(update["ok"] for update in updates), updates
-        assert contexts[-1].staged_workflow.webhook_callback_url == private_url
-    assert validated_urls == ([] if webhook_kind == "stored" else [private_url])
+        assert contexts[-1].staged_workflow.webhook_callback_url == expected_webhook
+    assert validated_urls == ([private_url] if carried and webhook_kind != "stored" else [])
 
 
 @pytest.mark.asyncio
@@ -6091,7 +6095,7 @@ async def test_reconcile_leaves_a_turn_that_just_resumed_from_a_credential_pause
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answer", ["connected", "skip", "signed_in"])
+@pytest.mark.parametrize("answer", ["connected", "skip", "signed_in", "generated"])
 async def test_reconcile_between_a_card_answer_and_the_waiter_leaves_the_turn(
     sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, answer: str
 ) -> None:
@@ -6105,11 +6109,23 @@ async def test_reconcile_between_a_card_answer_and_the_waiter_leaves_the_turn(
     sign_in = credential_pause.ManualSignIn(
         browser_session_id="pbs_debug", login_urls=["https://portal.example.com/login"], profile_name="Sign-in"
     )
+    registration = (
+        WorkflowCopilotCredentialRegistration(username="tester@example.com", credential_name="Portal")
+        if answer == "generated"
+        else None
+    )
     cache.store[credential_pause.credential_pause_active_key("org", chat_id, "turn-a")] = (
-        credential_pause._encode_active_pause(token, datetime.now(UTC) + timedelta(minutes=5), manual_sign_in=sign_in)
+        credential_pause._encode_active_pause(
+            token, datetime.now(UTC) + timedelta(minutes=5), manual_sign_in=sign_in, registration=registration
+        )
     )
     ids = {"organization_id": "org", "workflow_copilot_chat_id": chat_id, "turn_id": "turn-a"}
-    if answer == "signed_in":
+    if answer == "generated":
+        generation = await credential_pause.claim_credential_generation(cache, resume_token=token, **ids)
+        assert await credential_pause.finish_credential_generation(
+            cache, claim=generation, credential_id="cred_generated", **ids
+        )
+    elif answer == "signed_in":
         claim = await credential_pause.claim_manual_sign_in(cache, resume_token=token, **ids)
         profile = credential_pause.SignedInProfile(
             browser_profile_id="bp_signed_in", profile_name="Sign-in", site="portal.example.com", cookie_count=1
@@ -7020,7 +7036,8 @@ async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_age
         for key in ("extra_http_headers", "cdp_connect_headers", "totp_identifier", "totp_verification_url")
     }
     expected_settings["totp_identifier"] = "synthetic-unsaved-identifier"
-    assert private_settings == expected_settings
+    # The Test action runs the proposal under its own settings, so the editor's unsaved ones never reach the turn.
+    assert private_settings == ({} if product_action else expected_settings)
     expected_yaml.pop("totp_identifier")
     expected_yaml.pop("totp_verification_url")
     expected_yaml["extra_http_headers"] = {"Authorization": "***"}

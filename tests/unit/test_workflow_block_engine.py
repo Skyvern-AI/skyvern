@@ -542,9 +542,7 @@ async def _persisted_engine_from_execute_workflow_blocks(
 
     block = block or _make_block(TaskBlock, label="e2e_block")
     workflow = MagicMock()
-    workflow.workflow_definition.blocks = [block]
-    workflow.workflow_definition.version = 1
-    workflow.workflow_definition.finally_block_label = None
+    workflow.workflow_definition = WorkflowDefinition(parameters=[], blocks=[block])
     workflow.status = workflow_status
 
     workflow_run = MagicMock()

@@ -108,6 +108,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
+    RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
@@ -127,6 +128,7 @@ from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPo
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
+    RAW_SECRET_REFUSAL_SENTINEL,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     CompletionCriterion,
     RequestPolicy,
@@ -7475,6 +7477,58 @@ class TestCopilotConfig:
             monkeypatch, OutputGuardrailTripwireTriggered(MagicMock())
         )
         assert blocked.result is blocked_result
+
+    @staticmethod
+    def _withheld_reply(*reason_codes: OutputPolicyReason) -> OutputGuardrailTripwireTriggered:
+        guardrail_result = MagicMock()
+        guardrail_result.output.output_info = {"allowed": False, "reason_codes": [code.value for code in reason_codes]}
+        return OutputGuardrailTripwireTriggered(guardrail_result)
+
+    @pytest.mark.asyncio
+    async def test_reply_withheld_for_a_raw_secret_shape_gets_one_tool_less_reask(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "The page shows receipt FV-0F9080EE."}),
+            attempts=(_EnforcementAttempt(error=self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK)),),
+        )
+
+        [call] = run.drain_calls
+        assert call.current_input == RAW_SECRET_REPLY_WITHHELD_OBSERVATION
+        assert call.model_settings.tool_choice == "none"
+        assert call.max_turns == 1
+        assert run.result.user_response == "The page shows receipt FV-0F9080EE."
+
+    @pytest.mark.asyncio
+    async def test_reask_that_still_carries_a_raw_secret_keeps_the_refusal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK),
+            attempts=(_EnforcementAttempt(error=self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK)),),
+        )
+
+        assert len(run.drain_calls) == 1
+        assert RAW_SECRET_REFUSAL_SENTINEL in run.result.user_response
+
+    @pytest.mark.asyncio
+    async def test_reply_withheld_for_another_reason_is_not_reasked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "unused"}),
+            attempts=(
+                _EnforcementAttempt(
+                    error=self._withheld_reply(
+                        OutputPolicyReason.RAW_SECRET_LEAK, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH
+                    )
+                ),
+            ),
+        )
+
+        assert run.drain_calls == []
+        assert run.result.user_response != "unused"
 
     @pytest.mark.asyncio
     async def test_tool_bearing_empty_completion_final_reply_is_not_retried_for_untested_draft(
