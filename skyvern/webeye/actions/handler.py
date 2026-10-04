@@ -6251,9 +6251,10 @@ class ActionHandler:
             )
             actions_result.append(ActionFailure(e))
         except MultipleElementsFound as e:
-            LOG.exception(
+            LOG.warning(
                 "Cannot handle multiple elements with the same selector in one action.",
                 action=action,
+                exc_info=True,
             )
             actions_result.append(ActionFailure(e))
         except LLMProviderError as e:
