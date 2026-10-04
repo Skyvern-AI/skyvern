@@ -23,7 +23,11 @@ import structlog
 import yaml
 
 from skyvern.constants import SCRUBBED_VALUE
-from skyvern.exceptions import CopilotInlineSequentialCredentialUnsupported
+from skyvern.exceptions import (
+    BrowserSessionClosed,
+    BrowserSessionStartupTimeout,
+    CopilotInlineSequentialCredentialUnsupported,
+)
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import without_output_only_anti_bot, without_output_only_anti_bot_categories
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -4397,23 +4401,41 @@ async def _run_blocks_and_collect_debug(
         )
 
         current_context = skyvern_context.current()
-        workflow_run = await workflow_service.prepare_workflow(
-            workflow_id=ctx.workflow_permanent_id,
-            organization=organization,
-            workflow_request=workflow_request,
-            template=False,
-            # Both execution paths pin the exact version. A permanent-id lookup could
-            # select a newer proposal while this run still carries the previous definition.
-            resolved_workflow_id=snapshot.workflow.workflow_id,
-            max_steps=None,
-            request_id=current_context.request_id if current_context is not None else None,
-            # The trigger type (and the -ui queue routing it implies) is a cloud contract; ask the
-            # AgentFunction for it rather than hardcoding "manual == -ui pool" in OSS. OSS base
-            # returns None (no routing hint); cloud returns the value its executor routes to -ui.
-            trigger_type=(app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None),
-            copilot_session_id=ctx.workflow_copilot_chat_id,
-            created_by="copilot",
-        )
+        try:
+            workflow_run = await workflow_service.prepare_workflow(
+                workflow_id=ctx.workflow_permanent_id,
+                organization=organization,
+                workflow_request=workflow_request,
+                template=False,
+                # Both execution paths pin the exact version. A permanent-id lookup could
+                # select a newer proposal while this run still carries the previous definition.
+                resolved_workflow_id=snapshot.workflow.workflow_id,
+                max_steps=None,
+                request_id=current_context.request_id if current_context is not None else None,
+                # The trigger type (and the -ui queue routing it implies) is a cloud contract; ask the
+                # AgentFunction for it rather than hardcoding "manual == -ui pool" in OSS. OSS base
+                # returns None (no routing hint); cloud returns the value its executor routes to -ui.
+                trigger_type=(
+                    app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None
+                ),
+                copilot_session_id=ctx.workflow_copilot_chat_id,
+                created_by="copilot",
+            )
+        except (BrowserSessionClosed, BrowserSessionStartupTimeout) as refused:
+            # Submission refuses a session that has already ended, so no run exists to carry the
+            # lease-seam reason code; report the same typed browser loss that run would have.
+            if dispatch_draft_workflow_id is not None:
+                await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+                dispatch_draft_workflow_id = None
+            state: BuildTestConnectFailureState = (
+                "provisioning_unavailable" if isinstance(refused, BrowserSessionStartupTimeout) else "already_closed"
+            )
+            return _with_build_test_acquisition_context(
+                _build_test_connect_failure_result(
+                    BuildTestConnectFailure(state=state, browser_session_id=run_session_id)
+                ),
+                requested_block_labels=block_labels,
+            )
         if explicit_blank and workflow_run.browser_session_id != run_session_id:
             await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
                 workflow_run_id=workflow_run.workflow_run_id,
@@ -6832,14 +6854,16 @@ def _safe_reason_code(value: object) -> str:
 _RUN_SIDE_CONNECT_STATES: dict[str, BuildTestConnectFailureState] = {
     "browser_session_closed": "already_closed",
     "browser_session_startup_timeout": "provisioning_unavailable",
+    "browser_session_expired_before_run": "already_closed",
 }
+_RUN_SIDE_CONNECT_CATEGORIES = frozenset({"BROWSER_ERROR", "BROWSER_SESSION_EXPIRED"})
 
 
 def _run_side_connect_state(failure_category: object) -> BuildTestConnectFailureState | None:
     if not isinstance(failure_category, list):
         return None
     for entry in failure_category:
-        if isinstance(entry, dict) and entry.get("category") == "BROWSER_ERROR":
+        if isinstance(entry, dict) and entry.get("category") in _RUN_SIDE_CONNECT_CATEGORIES:
             state = _RUN_SIDE_CONNECT_STATES.get(str(entry.get("reason_code") or ""))
             if state is not None:
                 return state

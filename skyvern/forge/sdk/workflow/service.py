@@ -57,6 +57,7 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
+    BrowserSessionExpired,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
     BrowserSessionStartupTimeout,
@@ -83,6 +84,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_CLOSED_REASON_CODE,
+    BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
     BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
@@ -133,10 +135,12 @@ from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_pr
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    API_BROWSER_SESSION_CREATED_BY,
     FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
     SESSION_RETIREMENT_RUNNABLE_TYPE,
     PersistentBrowserSession,
     is_final_status,
+    unusable_browser_session_error,
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
@@ -286,7 +290,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
-from skyvern.schemas.browser_session_timeouts import REUSE_MIN_REMAINING_LIFETIME_SECONDS
+from skyvern.schemas.browser_session_timeouts import REUSE_MIN_REMAINING_LIFETIME_SECONDS, lived_full_lifetime
 from skyvern.schemas.proxy_pinning import (
     derive_proxy_session_id,
     redact_proxy_session_id,
@@ -1704,10 +1708,45 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     return f"{title}{suffix}"
 
 
-def _browser_lease_failure_category(exc: Exception) -> list[dict] | None:
+BROWSER_SESSION_EXPIRED_EXPLANATION = (
+    "The browser session this run was sent to had already reached its time limit, so the run never started. "
+    "Running it again with the same browser session will fail the same way. Create a new browser session and run "
+    "again, or leave the browser session empty to start a fresh browser."
+)
+
+
+def _session_expired_before_run(exc: Exception, workflow_run: WorkflowRun) -> BrowserSessionExpired | None:
+    """The session, when the caller sent this run to a session of their own that had already run out its lifetime.
+
+    Sessions Skyvern created (reuse and editor prewarm sessions carry a binding and no creator), sessions closed
+    early, and runs that queued while the session was still alive stay platform-attributed. So do sessions a
+    signed-in user made in the UI, whose creator is their user id: only creator null or api counts as the caller's."""
+    if not isinstance(exc, BrowserSessionExpired):
+        return None
+    if exc.bound or exc.created_by not in (None, API_BROWSER_SESSION_CREATED_BY):
+        return None
+    if exc.ended_at is None or not lived_full_lifetime(
+        started_at=exc.started_at, ended_at=exc.ended_at, timeout_minutes=exc.timeout_minutes
+    ):
+        return None
+    if _as_utc(workflow_run.created_at) <= _as_utc(exc.ended_at):
+        return None
+    return exc
+
+
+def _browser_lease_failure_category(exc: Exception, workflow_run: WorkflowRun) -> list[dict] | None:
     """The lease seam still holds the typed exception; persist its identity so a reader does not
     have to rediscover it from prose or from the session row, which closes the same way after
     every run."""
+    if _session_expired_before_run(exc, workflow_run) is not None:
+        return [
+            {
+                "category": FailureCategory.BROWSER_SESSION_EXPIRED.value,
+                "confidence_float": 1.0,
+                "reason_code": BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
+                "reasoning": BROWSER_SESSION_EXPIRED_EXPLANATION,
+            }
+        ]
     if isinstance(exc, BrowserSessionClosed):
         reason_code = BROWSER_SESSION_CLOSED_REASON_CODE
         reasoning = "The browser session had already closed before the run could lease it"
@@ -7342,9 +7381,13 @@ class WorkflowService:
                         browser_session_id=browser_session_id,
                         workflow_run_id=workflow_run_id,
                     )
+                expired_before_run = _session_expired_before_run(e, workflow_run)
                 failure_reason = (
-                    f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
+                    expired_before_run.expired_before_run_message(run_created=True)
+                    if expired_before_run is not None
+                    else f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
                 )
+                lease_failure_category = _browser_lease_failure_category(e, workflow_run)
                 if browser_dispatch:
                     failed = await self._mark_workflow_run_as_failed_for_dispatch(
                         workflow_run_id=workflow_run_id,
@@ -7352,7 +7395,7 @@ class WorkflowService:
                         attempt_number=attempt_number,
                         dispatch_claim_started_at=dispatch_claim_started_at,
                         failure_reason=failure_reason,
-                        failure_category=_browser_lease_failure_category(e),
+                        failure_category=lease_failure_category,
                     )
                     if failed is None:
                         return await self.get_workflow_run(workflow_run_id, organization_id)
@@ -7361,7 +7404,7 @@ class WorkflowService:
                     workflow_run = await self.mark_workflow_run_as_failed(
                         workflow_run_id=workflow_run_id,
                         failure_reason=failure_reason,
-                        failure_category=_browser_lease_failure_category(e),
+                        failure_category=lease_failure_category,
                     )
                 await self.clean_up_workflow(
                     workflow=workflow,
@@ -11656,6 +11699,11 @@ class WorkflowService:
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
+            # Nothing between here and the lease swaps or revives a caller's session, so a run sent to
+            # one that has already ended can only fail; refuse it before a run row exists.
+            unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+            if unusable is not None:
+                raise unusable
             # Auto-propagate profile from session when not explicitly provided
             if not browser_profile_id and browser_session.browser_profile_id:
                 browser_profile_id = browser_session.browser_profile_id

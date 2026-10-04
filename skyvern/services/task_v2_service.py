@@ -14,6 +14,7 @@ from sqlalchemy.exc import OperationalError
 from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
+    BrowserSessionNotFound,
     FailedToSendWebhook,
     ScreenshotTargetClosed,
     TaskTerminationError,
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
 from skyvern.forge.sdk.schemas.task_v2 import (
     TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL,
     TaskV2,
@@ -349,6 +351,17 @@ async def initialize_task_v2(
     await _validate_task_v2_model_for_org(organization, model)
     if user_url:
         user_url = await asyncio.to_thread(validate_fetch_url, user_url)
+    if browser_session_id:
+        # The workflow run created below refuses this too, but only after the task and its workflow exist.
+        browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+            session_id=browser_session_id,
+            organization_id=organization.organization_id,
+        )
+        if not browser_session:
+            raise BrowserSessionNotFound(browser_session_id=browser_session_id)
+        unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+        if unusable is not None:
+            raise unusable
 
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
