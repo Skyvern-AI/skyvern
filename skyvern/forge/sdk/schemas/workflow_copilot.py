@@ -455,6 +455,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_credential_pause_recovery: bool = Field(
         False, description="The client restores pending credential cards from chat history."
     )
+    supports_credential_generation: bool = Field(
+        False, description="The client can render a registration card and post its Generate and save answer."
+    )
     supports_credential_pause: bool = Field(
         False,
         description=(
@@ -540,6 +543,28 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
         ),
     )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+
+
+class WorkflowCopilotCredentialGenerateRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+
+
+class WorkflowCopilotCredentialGenerateResult(BaseModel):
+    result: Literal["connected", "rejected", "unknown", "created_not_connected"] = Field(
+        ...,
+        description=(
+            "'rejected' means nothing was saved; 'unknown' means the vault did not confirm the save, and the "
+            "card stays open without Generate"
+        ),
+    )
+    credential_id: str | None = Field(None, description="The saved credential, when one is known to exist")
+    name: str | None = None
+    username: str | None = None
+    expires_at: datetime | None = Field(
+        None, description="The reopened card's new deadline after 'rejected' or 'unknown'"
+    )
 
 
 class WorkflowCopilotCredentialResponseResult(BaseModel):
@@ -961,6 +986,20 @@ class WorkflowCopilotTitleUpdate(BaseModel):
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
+class CredentialRegistration(BaseModel):
+    username: str = Field(..., description="Username or email to register with, exactly as the user gave it")
+    credential_name: str = Field(..., description="Name to save the new credential under")
+    password_length: int = Field(24, description="Generated password length; 24 to 128")
+    charset: Literal["alphanumeric", "alphanumeric_symbols"] = Field(
+        "alphanumeric_symbols", description="Characters the site accepts in a password"
+    )
+
+
+class WorkflowCopilotCredentialRegistration(CredentialRegistration):
+    attempted: bool = Field(False, description="Generate and save was used; the card offers it once")
+    outcome: Literal["rejected", "unknown"] | None = Field(None, description="Why an attempt did not connect")
+
+
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
@@ -975,6 +1014,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "login_credentials_unresolved",
         "credential_missing_totp",
         "credential_rejected_by_site",
+        "credential_registration",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
@@ -988,6 +1028,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
     )
     signing_in: bool = Field(False, description="The user has started signing in themselves")
+    registration: WorkflowCopilotCredentialRegistration | None = Field(
+        None, description="Account details a Generate and save answer would store; never a password"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

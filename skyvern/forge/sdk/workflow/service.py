@@ -226,6 +226,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     resolve_reuse_browser_session,
     should_acquire_reused_session,
     start_hold_reason,
+    workflow_definition_sha256,
 )
 from skyvern.forge.sdk.workflow.private_settings import (
     resolve_cdp_connect_headers,
@@ -8127,7 +8128,12 @@ class WorkflowService:
         # The run_with field records what the user requested (e.g. "code"),
         # not whether a script was actually found. Execution mode is determined
         # separately by is_script_run and script_mode below.
-        await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id, run_with=workflow_run.run_with)
+        # The row can be rewritten while the run is queued, so re-stamp the digest from what executes.
+        await self.mark_workflow_run_as_running(
+            workflow_run_id=workflow_run_id,
+            run_with=workflow_run.run_with,
+            workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
+        )
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
         # Only enable when we actually have a script to run
@@ -11562,6 +11568,10 @@ class WorkflowService:
                         organization_id=organization_id,
                     )
 
+        if workflow is None:
+            workflow = await self.get_workflow(workflow_id=workflow_id)
+        definition_sha256 = workflow_definition_sha256(workflow.workflow_definition)
+
         # Sample the kill switch exactly once, before request-time precedence. This persisted
         # admission decision is authoritative: later flag changes stop new runs but never revoke an
         # in-flight run or strip the forced-session fallback that was selected at admission.
@@ -11570,8 +11580,6 @@ class WorkflowService:
         persisted_reuse_bound_key: str | None = None
         persisted_reuse_browser_session = workflow_request.reuse_browser_session
         if not browser_session_id:
-            if workflow is None:
-                workflow = await self.get_workflow(workflow_id=workflow_id)
             configured_reuse = should_acquire_reused_session(
                 browser_session_id=None,
                 start_fresh_browser=workflow_request.start_fresh_browser,
@@ -11643,6 +11651,7 @@ class WorkflowService:
                     ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                     copilot_session_id=copilot_session_id,
                     created_by=created_by,
+                    workflow_definition_sha256=definition_sha256,
                 )
                 # A block run creates its block-run rows only after setup, so the caller's intent
                 # is the only block-scoped signal enrolment can see here.
@@ -11717,6 +11726,7 @@ class WorkflowService:
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
             copilot_session_id=copilot_session_id,
             created_by=created_by,
+            workflow_definition_sha256=definition_sha256,
         )
         if not block_scoped:
             await ensure_attempt_row(
@@ -13540,7 +13550,12 @@ class WorkflowService:
                 LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
         return workflow_run
 
-    async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
+    async def mark_workflow_run_as_running(
+        self,
+        workflow_run_id: str,
+        run_with: str | None = None,
+        workflow_definition_sha256: str | None = None,
+    ) -> WorkflowRun:
         # Conditional UPDATE refuses to resurrect a finalized wr — prevents the
         # cleanup cron from racing with re-entry paths and stomping timed_out
         # back to running.
@@ -13548,6 +13563,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.running,
             run_with=run_with,
+            workflow_definition_sha256=workflow_definition_sha256,
         )
         if workflow_run is None:
             existing = await app.DATABASE.workflow_runs.get_workflow_run(

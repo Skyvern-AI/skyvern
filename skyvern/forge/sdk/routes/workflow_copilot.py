@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import structlog
 import yaml
-from fastapi import Depends, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
@@ -23,6 +23,7 @@ from sse_starlette import EventSourceResponse
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
+from skyvern.exceptions import HttpException as VaultHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
@@ -47,13 +48,17 @@ from skyvern.forge.sdk.copilot.context import (
     clear_proposed_credential,
     merge_approved_credentials_into_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.credential_generation import generate_registration_password
 from skyvern.forge.sdk.copilot.credential_pause import (
+    MANUAL_SIGN_IN_CLAIM_SECONDS,
     MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS,
     CredentialPauseRejection,
     SignedInProfile,
     check_credential_pause_resumable,
+    claim_credential_generation,
     claim_manual_sign_in,
     credential_pause_is_active,
+    finish_credential_generation,
     finish_manual_sign_in,
     pending_credential_requests,
     resolve_credential_pause,
@@ -119,8 +124,16 @@ from skyvern.forge.sdk.routes.browser_profiles import (
     _hard_delete_created_profile_after_store_failure,
     create_profile_from_running_session,
 )
+from skyvern.forge.sdk.routes.credentials import prepare_credential_create, store_new_credential
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.credentials import (
+    CreateCredentialRequest,
+    Credential,
+    CredentialType,
+    NonEmptyPasswordCredential,
+    PasswordCredential,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PRIVATE_SETTINGS_KEY,
@@ -145,6 +158,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotChatSummary,
     WorkflowCopilotClearProposedWorkflowRequest,
+    WorkflowCopilotCredentialGenerateRequest,
+    WorkflowCopilotCredentialGenerateResult,
     WorkflowCopilotCredentialResponseRequest,
     WorkflowCopilotCredentialResponseResult,
     WorkflowCopilotDisableAutoAcceptRequest,
@@ -163,6 +178,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -1044,9 +1060,20 @@ async def _persist_proposed_workflow_state(
         proposed_workflow_data = _build_proposed_workflow_data(updated_workflow, agent_result)
         if agent_result.proposal_owner_turn_id is not None and agent_result.proposal_revision is not None:
             stored_metadata = copilot_proposal_metadata(chat.proposed_workflow)
+            stored_yaml = (
+                chat.proposed_workflow.get("_copilot_yaml") if isinstance(chat.proposed_workflow, dict) else None
+            )
             same_bytes = (
                 isinstance(chat.proposed_workflow, dict)
-                and chat.proposed_workflow.get("_copilot_yaml") == proposed_workflow_data.get("_copilot_yaml")
+                and (
+                    stored_yaml == proposed_workflow_data.get("_copilot_yaml")
+                    # A rename saved since publication re-titles a turn that answered with the stored bytes;
+                    # Accept resolves the rename.
+                    or (
+                        stored_yaml is not None
+                        and stored_yaml == strip_copilot_yaml_headers(agent_result.workflow_yaml)
+                    )
+                )
                 and private_workflow_settings_from_proposal(chat.proposed_workflow)
                 == private_workflow_settings_from_proposal(proposed_workflow_data)
             )
@@ -1055,7 +1082,11 @@ async def _persist_proposed_workflow_state(
                 # markers. Those bytes carry the resolved title and Accept reparses them as they are.
                 proposed_workflow_data = {
                     **chat.proposed_workflow,
-                    **{key: value for key, value in proposed_workflow_data.items() if key.startswith("_copilot_")},
+                    **{
+                        key: value
+                        for key, value in proposed_workflow_data.items()
+                        if key.startswith("_copilot_") and key != "_copilot_yaml"
+                    },
                 }
                 if _proposal_disposition(agent_result) != "review_untested":
                     # The marker is only ever added, so a candidate published untested and since
@@ -2667,6 +2698,8 @@ async def _new_copilot_chat_post(
                         detail="No pending proposal to test end to end.",
                     )
                 _apply_test_end_to_end_action(chat_request, validated_proposal["_copilot_yaml"])
+                # The Test action runs the proposal under its own settings, never the editor's.
+                submitted_private_settings = {}
 
             await stream.send(
                 WorkflowCopilotProcessingUpdate(
@@ -4254,6 +4287,190 @@ async def workflow_copilot_credential_response(
     except CredentialPauseRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
     return WorkflowCopilotCredentialResponseResult(result="accepted")
+
+
+_READBACK_PAGE_SIZE = 100
+
+
+async def _find_generated_credential(
+    organization_id: str,
+    data: CreateCredentialRequest,
+    created_by: str | None,
+    created_since: datetime,
+    credential_service: CredentialVaultService,
+) -> str | None:
+    """Return the one credential this card saved, or None when no single row holds the password it generated."""
+    credentials = await app.DATABASE.credentials.get_credentials(
+        organization_id, page_size=_READBACK_PAGE_SIZE, credential_type=CredentialType.PASSWORD, search=data.name
+    )
+
+    def created_in_window(credential: Credential) -> bool:
+        return credential.created_at.replace(tzinfo=credential.created_at.tzinfo or UTC) >= created_since
+
+    # Rows come newest first, so a full page whose oldest row is still in the window may hide more matches.
+    if len(credentials) >= _READBACK_PAGE_SIZE and created_in_window(credentials[-1]):
+        return None
+    matches = [
+        credential
+        for credential in credentials
+        if credential.name == data.name
+        and credential.username == data.credential.username
+        and credential.created_by == created_by
+        and created_in_window(credential)
+    ]
+    if len(matches) != 1:
+        return None
+    stored = (await credential_service.get_credential_item(matches[0])).credential
+    # Matching metadata alone could name another create of the same account, so only the generated password counts.
+    if isinstance(stored, PasswordCredential) and hmac.compare_digest(
+        stored.password.encode(), data.credential.password.encode()
+    ):
+        return matches[0].credential_id
+    return None
+
+
+def _log_late_create(stored: asyncio.Future[Credential]) -> None:
+    if not stored.cancelled() and stored.exception() is None:
+        LOG.warning("copilot_credential_generation_late_create", credential_id=stored.result().credential_id)
+
+
+_DETACHED_CREDENTIAL_CREATES: set[asyncio.Task[None]] = set()
+
+
+async def _create_generated_credential(
+    organization_id: str,
+    data: CreateCredentialRequest,
+    created_by: str | None,
+    credential_service: CredentialVaultService,
+    stored: asyncio.Future[Credential],
+) -> None:
+    # The request's own BackgroundTasks never run once it has answered, so a late save brings its own.
+    hooks = BackgroundTasks()
+    try:
+        credential = await store_new_credential(organization_id, data, created_by, credential_service, hooks)
+    except Exception as exc:
+        stored.set_exception(exc)
+        return
+    except asyncio.CancelledError:
+        stored.cancel()
+        raise
+    stored.set_result(credential)
+    # Nothing awaits this task, so a failing post-save hook would otherwise vanish as an unretrieved exception.
+    try:
+        await hooks()
+    except Exception:
+        LOG.warning("copilot_credential_generation_post_save_hooks_failed", exc_info=True)
+
+
+# Every wait leaves the claim the same margin to finish in that the manual sign-in save does.
+_CLAIM_FINISH_MARGIN_SECONDS = MANUAL_SIGN_IN_CLAIM_SECONDS - MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS
+_READBACK_RESERVE_SECONDS = 15
+
+
+def _claim_seconds_left(deadline: datetime) -> float:
+    return max(0.0, (deadline - datetime.now(UTC)).total_seconds() - _CLAIM_FINISH_MARGIN_SECONDS)
+
+
+@base_router.post(
+    "/workflow/copilot/credential-generate",
+    include_in_schema=False,
+    response_model=WorkflowCopilotCredentialGenerateResult,
+)
+async def workflow_copilot_credential_generate(
+    generate_request: WorkflowCopilotCredentialGenerateRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+) -> WorkflowCopilotCredentialGenerateResult:
+    """Answer a registration card by generating its password here and saving it as a credential, once per card.
+
+    The password goes straight to the vault create: it is never returned, logged, or kept on the pause.
+    """
+    cache = getattr(app, "CACHE", None)
+    if cache is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Credential response not supported in this environment",
+        )
+    organization_id = organization.organization_id
+    pause_ids = {
+        "organization_id": organization_id,
+        "workflow_copilot_chat_id": generate_request.workflow_copilot_chat_id,
+        "turn_id": generate_request.turn_id,
+    }
+    try:
+        claim = await claim_credential_generation(cache, resume_token=generate_request.resume_token, **pause_ids)
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    spec = claim.registration
+    claimed_at = datetime.now(UTC)
+    credential_id: str | None = None
+    outcome: Literal["rejected", "unknown"] = "unknown"
+    try:
+        password = generate_registration_password(spec.password_length, spec.charset)
+        # Registered before anything can raise or log with it, so the log chain scrubs it from tracebacks too.
+        skyvern_context.ensure_context().register_secret_value(password)
+        data = CreateCredentialRequest(
+            name=spec.credential_name,
+            credential_type=CredentialType.PASSWORD,
+            credential=NonEmptyPasswordCredential(username=spec.username, password=password),
+        )
+        credential_service = await asyncio.wait_for(
+            prepare_credential_create(organization_id, data), _claim_seconds_left(claim.deadline)
+        )
+    except Exception as exc:
+        outcome = "rejected"
+        LOG.warning("copilot_credential_generation_rejected", error_type=type(exc).__name__)
+    else:
+        # A vault create cancelled midway can skip its own cleanup, so a timeout stops waiting but lets it finish.
+        stored: asyncio.Future[Credential] = asyncio.get_running_loop().create_future()
+        stored.add_done_callback(lambda future: future.cancelled() or future.exception())
+        create = asyncio.create_task(
+            _create_generated_credential(organization_id, data, current_user_id, credential_service, stored)
+        )
+        _DETACHED_CREDENTIAL_CREATES.add(create)
+        create.add_done_callback(_DETACHED_CREDENTIAL_CREATES.discard)
+        create_wait = max(0.0, _claim_seconds_left(claim.deadline) - _READBACK_RESERVE_SECONDS)
+        try:
+            credential_id = (await asyncio.wait_for(asyncio.shield(stored), create_wait)).credential_id
+        except Exception as exc:
+            vault_error = exc.__cause__ if isinstance(exc, HTTPException) else None
+            if isinstance(vault_error, VaultHttpException) and 400 <= vault_error.status_code < 500:
+                outcome = "rejected"
+                LOG.warning("copilot_credential_generation_rejected", vault_status=vault_error.status_code)
+            else:
+                LOG.warning("copilot_credential_generation_unconfirmed", error_type=type(exc).__name__)
+        if credential_id is None and outcome == "unknown":
+            stored.add_done_callback(_log_late_create)
+            try:
+                credential_id = await asyncio.wait_for(
+                    _find_generated_credential(organization_id, data, current_user_id, claimed_at, credential_service),
+                    _claim_seconds_left(claim.deadline),
+                )
+            except Exception:
+                LOG.warning("copilot_credential_generation_readback_failed", exc_info=True)
+            LOG.info("copilot_credential_generation_readback", credential_id=credential_id)
+    try:
+        deadline = await finish_credential_generation(
+            cache, claim=claim, credential_id=credential_id, outcome=outcome, **pause_ids
+        )
+    except Exception:
+        if credential_id is None:
+            raise
+        LOG.warning("copilot_credential_generation_finish_failed", credential_id=credential_id, exc_info=True)
+        deadline = None
+    if credential_id is not None:
+        LOG.info("copilot_credential_generation_created", credential_id=credential_id, connected=bool(deadline))
+        return WorkflowCopilotCredentialGenerateResult(
+            result="connected" if deadline else "created_not_connected",
+            credential_id=credential_id,
+            name=spec.credential_name,
+            username=spec.username,
+        )
+    if deadline is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Credential pause already resolved")
+    return WorkflowCopilotCredentialGenerateResult(
+        result=outcome, name=spec.credential_name, username=spec.username, expires_at=deadline
+    )
 
 
 @base_router.post(

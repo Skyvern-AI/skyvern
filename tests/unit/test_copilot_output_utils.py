@@ -1411,25 +1411,25 @@ class TestFormatToolResultForUser:
         result = {
             "ok": False,
             "error": (
-                "The run has not made progress. Run ID: wr_stalled. Outcome is uncertain. "
-                "Do NOT re-invoke block-running tools without first calling get_run_results."
+                "The run did not reach a terminal status within the 1190s absolute ceiling. Run ID: wr_stalled. "
+                "Outcome is uncertain. Do NOT re-invoke block-running tools without first calling get_run_results."
             ),
             "data": {
                 "failure_reason": (
-                    "The run stopped after no observable progress for 120s. Run ID: wr_stalled. Outcome is uncertain."
+                    "The run did not finish within the 1190s absolute ceiling. Run ID: wr_stalled. Outcome is uncertain."
                 ),
                 "control_signal": {
-                    "kind": "watchdog_stagnation",
-                    "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                    "kind": "watchdog_ceiling",
+                    "user_facing_summary": "The run did not finish within the 1190s absolute ceiling.",
                 },
-                "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                "user_facing_summary": "The run did not finish within the 1190s absolute ceiling.",
             },
         }
 
         summary = self._format("run_blocks_and_collect_debug", result)
         detail = summarize_tool_result_detail(result, tool_name="run_blocks_and_collect_debug")
 
-        assert summary == "The run stopped after no observable progress for 120s."
+        assert summary == "The run did not finish within the 1190s absolute ceiling."
         assert detail == summary
         assert "wr_stalled" not in summary
         assert "get_run_results" not in detail

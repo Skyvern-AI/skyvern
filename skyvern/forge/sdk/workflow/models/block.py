@@ -208,6 +208,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     inline_authorized_file_path,
+    pin_file_chooser,
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
@@ -6787,6 +6788,13 @@ class CodeBlock(Block):
             download_log=download_log,
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
+            file_chooser=pin_file_chooser(_raw_code_block_page(page)),
+            # Taken before execute_user_function_with_timeout starts its clock, so it errs early.
+            deadline=(
+                monotonic() + settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+                if settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS > 0
+                else None
+            ),
         )
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
@@ -9996,7 +10004,7 @@ async def wrapper({default_args}):
                     failure_page=failed_page,
                     workflow_run_context=workflow_run_context,
                     redaction_parameters=serialized_parameter_values,
-                    opened_pages=opened_pages,
+                    opened_pages=[*opened_pages, *recording_page._claimed_popups()],
                 )
             if inline_failure_page_state:
                 from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state

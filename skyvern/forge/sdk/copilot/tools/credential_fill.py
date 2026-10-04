@@ -25,6 +25,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
+from skyvern.forge.sdk.copilot.credential_generation import (
+    REGISTRATION_PASSWORD_MAX_LENGTH,
+    REGISTRATION_PASSWORD_MIN_LENGTH,
+)
 from skyvern.forge.sdk.copilot.credential_pause import (
     RAW_SECRET_CONNECTED_NEXT,
     CredentialPauseResolution,
@@ -76,6 +80,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     TotpType,
 )
+from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
@@ -490,6 +495,40 @@ _CREDENTIAL_CARD_FALLBACK = (
     "Ask the user in prose to add the login on the Credentials page and reply with its exact saved name."
 )
 
+_REGISTRATION_OUTCOME_NOTES: dict[str, dict[str, str]] = {
+    "rejected": {
+        "registration_outcome": "rejected",
+        "registration_detail": (
+            "Generate and save saved nothing: validation or the vault refused it, or the pre-check timed out."
+        ),
+    },
+    "unknown": {
+        "registration_outcome": "unknown",
+        "registration_detail": "Generate and save was not confirmed, so a credential under this name may exist.",
+    },
+}
+
+
+def _registration_ask_error(
+    registration: CredentialRegistration, policy: RequestPolicy, credential_id: str | None
+) -> dict[str, Any] | None:
+    if credential_id:
+        return {"ok": False, "error": "Pass either `registration` or `credential_id`, not both."}
+    if policy.raw_secret_detected:
+        return {"ok": False, "error": "Generating a credential is unavailable on a turn that contains a secret."}
+    if not registration.username.strip() or not registration.credential_name.strip():
+        return {"ok": False, "error": "`registration` needs a non-empty `username` and `credential_name`."}
+    if not REGISTRATION_PASSWORD_MIN_LENGTH <= registration.password_length <= REGISTRATION_PASSWORD_MAX_LENGTH:
+        return {
+            "ok": True,
+            "status": "unsupported_constraints",
+            "detail": (
+                f"Generated passwords are {REGISTRATION_PASSWORD_MIN_LENGTH} to "
+                f"{REGISTRATION_PASSWORD_MAX_LENGTH} characters, so no card was shown."
+            ),
+        }
+    return None
+
 
 def _missing_totp_card_fallback(credential_name: str) -> str:
     return (
@@ -590,6 +629,7 @@ async def _request_credential(
     credential_id: str | None = None,
     rejected_by_site: bool = False,
     anchor_tool_call_id: str | None = None,
+    registration: CredentialRegistration | None = None,
 ) -> dict[str, Any]:
     policy = copilot_ctx.request_policy
     if not isinstance(policy, RequestPolicy) or (policy.raw_secret_detected and not policy.raw_secret_redacted_draft):
@@ -597,6 +637,29 @@ async def _request_credential(
     ask_origin = canonicalize_origin(login_page_url)
     if not is_resolved_page_url(login_page_url) or ask_origin is None:
         return {"ok": False, "error": "Provide the absolute HTTP(S) sign-in page URL for the credential card."}
+    card_registration: WorkflowCopilotCredentialRegistration | None = None
+    if registration is not None:
+        registration_error = _registration_ask_error(registration, policy, credential_id)
+        if registration_error is not None:
+            return registration_error
+        if copilot_ctx.credential_generation_spent:
+            return {
+                "ok": True,
+                "status": "already_generated",
+                "detail": "Generate and save already ran on this turn, so no second generate card was shown.",
+            }
+        if not copilot_ctx.client_supports_credential_generation:
+            return {
+                "ok": True,
+                "status": "unavailable",
+                "detail": "Generating a credential from the card is not available on this turn.",
+            }
+        card_registration = WorkflowCopilotCredentialRegistration(
+            username=registration.username.strip(),
+            credential_name=registration.credential_name.strip(),
+            password_length=registration.password_length,
+            charset=registration.charset,
+        )
     if policy.raw_secret_redacted_draft:
         if credential_id:
             return {
@@ -694,6 +757,7 @@ async def _request_credential(
             admit_connected=admit_connected,
             allow_second_ask=handback,
             anchor_tool_call_id=anchor_tool_call_id,
+            registration=card_registration,
         )
     except BaseException:
         if recovery is not None:
@@ -726,16 +790,21 @@ async def _request_credential(
         clear_tool_blocker_signals_for_reason_codes(
             copilot_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE})
         )
+    registration_outcome = copilot_ctx.credential_registration_outcome if card_registration is not None else None
+    registration_note = _REGISTRATION_OUTCOME_NOTES[registration_outcome] if registration_outcome is not None else {}
     if resolution is None:
-        return {
+        unanswered: dict[str, Any] = {
             "ok": True,
             "status": "unanswered",
             "outcome": copilot_ctx.credential_pause_outcome or "timeout",
-            "next": (
+            **registration_note,
+        }
+        if card_registration is None:
+            unanswered["next"] = (
                 "The user did not answer the card. Continue without the credential: keep the credential "
                 "parameter placeholder in the draft and do not ask again this turn."
-            ),
-        }
+            )
+        return unanswered
     if resolution.signed_in is not None:
         return {
             "ok": True,
@@ -756,26 +825,31 @@ async def _request_credential(
             ),
         }
     if credential is None:
-        return {
-            "ok": True,
-            "status": "skipped",
-            "next": (
+        skipped: dict[str, Any] = {"ok": True, "status": "skipped", **registration_note}
+        if card_registration is None:
+            skipped["next"] = (
                 "The user chose not to connect a credential now. Keep the credential parameter placeholder "
                 "in the draft, do not ask again this turn, and say a test run may stop at the login step."
-            ),
-        }
-    return {
+            )
+        return skipped
+    connected: dict[str, Any] = {
         "ok": True,
         "status": "connected",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
-        "next": (
-            RAW_SECRET_CONNECTED_NEXT
-            if policy.raw_secret_redacted_draft
-            else "Bind this credential as the workflow's credential parameter and continue the build; run the "
-            "blocks that were waiting on the login."
-        ),
     }
+    if policy.raw_secret_redacted_draft:
+        connected["next"] = RAW_SECRET_CONNECTED_NEXT
+    elif card_registration is not None:
+        if resolution.generated:
+            connected["generated"] = True
+            connected["site_effect"] = "none"
+    else:
+        connected["next"] = (
+            "Bind this credential as the workflow's credential parameter and continue the build; run the "
+            "blocks that were waiting on the login."
+        )
+    return connected
 
 
 async def _missing_totp_ask_outcome(

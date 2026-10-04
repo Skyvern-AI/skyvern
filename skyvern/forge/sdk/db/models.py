@@ -952,6 +952,7 @@ class WorkflowRunModel(Base):
     start_fresh_browser = Column(Boolean, nullable=True)
     reuse_browser_session = Column(Boolean, nullable=True)
     reuse_bound_key = Column(String, nullable=True)
+    workflow_definition_sha256 = Column(String, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -1928,6 +1929,15 @@ class CredentialModel(Base):
 
 class DebugSessionModel(Base):
     __tablename__ = "debug_sessions"
+    __table_args__ = (
+        Index(
+            "ix_debug_sessions_org_wpid_user_created_at",
+            "organization_id",
+            "workflow_permanent_id",
+            "user_id",
+            "created_at",
+        ),
+    )
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)

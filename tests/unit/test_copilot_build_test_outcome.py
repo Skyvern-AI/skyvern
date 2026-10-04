@@ -87,6 +87,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, r
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    COPILOT_PROPOSAL_CHANGED_ERROR,
     _authored_literal_locator_selectors,
     _carry_unresolved_failure_into_result,
     _failed_block_code,
@@ -122,6 +123,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
     WorkflowRunStatus,
+    workflow_definition_sha256,
 )
 from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus
 from skyvern.schemas.workflows import BlockType
@@ -136,8 +138,10 @@ from tests.unit.copilot_test_helpers import (
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    historical_code_version,
     inert_approval_workflow,
     install_get_run_results_harness,
+    install_historical_run,
     install_run_blocks_harness,
     make_copilot_ctx,
     make_stub_html_artifact,
@@ -2061,6 +2065,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     )
     run_workflow = SimpleNamespace(
         workflow_id="wf_run_snapshot",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
         created_by=None,
         modified_at=datetime(2026, 4, 21, 12, 0),
         organization_id=ctx.organization_id,
@@ -2077,12 +2083,14 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     )
     run = SimpleNamespace(
         workflow_run_id="wr_failed_complete_packet",
+        workflow_id="wf_run_snapshot",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_failed_complete_packet",
         status="failed",
         failure_reason="Code block failed.",
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
+        workflow_definition_sha256=None,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
@@ -2209,7 +2217,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         workflow_run_id="wr_failed_complete_packet",
     )
     assert nonassociated is not None
-    assert "execution_source" not in nonassociated["run"]
+    assert nonassociated["run"]["execution_source"]["source_kind"] == "run_version"
+    assert nonassociated["run"]["execution_source"]["workflow_id"] == "wf_run_snapshot"
 
 
 def test_unavailable_registered_output_rows_do_not_become_false_missing_output_facts() -> None:
@@ -6048,7 +6057,7 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
 
     assert result == {
         "ok": False,
-        "error": "The pending Copilot proposal changed before the test started; reload and try again.",
+        "error": COPILOT_PROPOSAL_CHANGED_ERROR,
     }
     assert captured["expected_owner_turn_id"] == "turn-source"
     assert captured["expected_revision"] == 3
@@ -8720,9 +8729,9 @@ async def test_read_run_reports_the_executed_versions_loop_inputs_not_the_curren
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
-    executed = (
-        await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
-    ).model_copy(update={"modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)})
+    executed = (await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="wf-1")).model_copy(
+        update={"workflow_permanent_id": "wpid-1", "modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)}
+    )
     ctx = install_get_run_results_harness(
         monkeypatch,
         blocks=[
@@ -8738,7 +8747,7 @@ async def test_read_run_reports_the_executed_versions_loop_inputs_not_the_curren
     page = sanitize_tool_result_for_llm("get_run_results", project_run_results_page(result, {}))["data"]
 
     assert page["loop_inputs"]["workflow_run_id"] == "wr-1"
-    assert page["loop_inputs"]["workflow_id"] == "w_source"
+    assert page["loop_inputs"]["workflow_id"] == "wf-1"
     [loop] = page["loop_inputs"]["loops"]
     assert (loop["loop_variable_reference"], loop["selected_input"], loop["loop_values_counts"]) == (
         "current_value",
@@ -8773,8 +8782,12 @@ async def test_read_run_withholds_loop_inputs_when_the_workflow_row_changed_afte
     monkeypatch: pytest.MonkeyPatch, workflow_yaml: str, created_by: str | None, expected_unavailable: bool
 ) -> None:
     monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
-    executed = (await inert_approval_workflow(workflow_yaml, workflow_id="w_source")).model_copy(
-        update={"created_by": created_by, "modified_at": HARNESS_RUN_CREATED_AT + timedelta(minutes=5)}
+    executed = (await inert_approval_workflow(workflow_yaml, workflow_id="wf-1")).model_copy(
+        update={
+            "workflow_permanent_id": "wpid-1",
+            "created_by": created_by,
+            "modified_at": HARNESS_RUN_CREATED_AT + timedelta(minutes=5),
+        }
     )
     ctx = install_get_run_results_harness(
         monkeypatch,
@@ -8874,8 +8887,10 @@ async def test_prior_run_packet_and_handoff_carry_the_notice_for_a_truncated_loo
 ) -> None:
     monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
     executed = (
-        await inert_approval_workflow(_parse_then_loop_yaml("current_value." + "a" * 400), workflow_id="w_source")
-    ).model_copy(update={"modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)})
+        await inert_approval_workflow(_parse_then_loop_yaml("current_value." + "a" * 400), workflow_id="wf-1")
+    ).model_copy(
+        update={"workflow_permanent_id": "wpid-1", "modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)}
+    )
     ctx = install_get_run_results_harness(
         monkeypatch,
         blocks=[
@@ -8949,3 +8964,187 @@ def test_many_long_loop_facts_stay_inside_the_packet_budget(ai_fallback_rows: in
     assert all(len(loop.loop_variable_reference or "") <= 200 for loop in projected.run.loop_inputs.loops)
     assert all(loop.selected_input == "loop_variable_reference" for loop in projected.run.loop_inputs.loops)
     assert all(loop.loop_values_counts == [1_000_000] * 10 for loop in projected.run.loop_inputs.loops)
+
+
+_EXECUTED_A_CODE = 'greeting = "Hello " + legacy_applicant_name\nreturn {"greeting": greeting}\n'
+_EDITABLE_B_CODE = 'display = greeting_prefix + " " + applicant_display_name\nreturn {"greeting": display}\n'
+_EDITABLE_B_YAML = """title: Historical run source
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: full_name
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: greeting_prefix
+      workflow_parameter_type: string
+  blocks:
+    - block_type: code
+      label: greet_applicant
+      parameter_keys: [full_name, greeting_prefix]
+      code: |
+        display = greeting_prefix + " " + applicant_display_name
+        return {"greeting": display}
+"""
+
+
+def _editable_b_ctx() -> CopilotContext:
+    return make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml=_EDITABLE_B_YAML)
+
+
+@pytest.mark.asyncio
+async def test_get_run_results_and_hydration_name_the_version_a_finished_run_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_historical_run(
+        monkeypatch, historical_code_version({"greet_applicant": _EXECUTED_A_CODE}), failed_label="greet_applicant"
+    )
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+    ctx = _editable_b_ctx()
+
+    raw = await tools_module.get_run_results_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="get_run_results"), json.dumps({"workflow_run_id": "wr-1"})
+    )
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+
+    tool_source = json.loads(raw)["data"]["execution_source"]
+    assert hydrated is not None
+    assert hydrated["run"]["execution_source"] == tool_source
+    assert tool_source == {
+        "source_kind": "run_version",
+        "disposition": "available",
+        "workflow_run_id": "wr-1",
+        "workflow_id": "wf-1",
+        "workflow_version": 3,
+        "failed_block_label": "greet_applicant",
+        "failed_statement": 'greeting = "Hello " + legacy_applicant_name',
+        "declared_parameter_keys": ["applicant_name"],
+        "block_code_sha256": {"greet_applicant": hashlib.sha256(_EXECUTED_A_CODE.encode()).hexdigest()},
+        "current_draft_code_matches": {"greet_applicant": False},
+        "failed_block_code": _EXECUTED_A_CODE,
+    }
+    executed_fields = json.dumps(tool_source)
+    assert "applicant_display_name" not in executed_fields
+    assert hashlib.sha256(_EDITABLE_B_CODE.encode()).hexdigest() not in executed_fields
+
+
+@pytest.mark.asyncio
+async def test_a_historical_read_takes_no_signature_or_unverified_label_from_the_current_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_historical_run(
+        monkeypatch, historical_code_version({"greet_applicant": _EXECUTED_A_CODE}), failed_label="greet_applicant"
+    )
+    ctx = _editable_b_ctx()
+    ctx.last_unverified_block_labels = ["greet_applicant", "only_in_b"]
+    ctx.unbound_required_parameter_keys = ["full_name"]
+    ctx.runner_code_block_associations_by_label = {"greet_applicant": "assoc_b"}
+    history_before = copy.deepcopy(ctx.recorded_build_test_outcome_history)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+    draft_outcome = run_execution_module._build_recorded_build_test_outcome(
+        ctx,
+        {**result, "data": {key: value for key, value in result["data"].items() if key != "execution_source"}},
+        recorded_run_outcome=None,
+    )
+
+    assert draft_outcome is not None and draft_outcome.authored_structure_signature
+    assert outcome is not None
+    assert outcome.workflow_run_id == "wr-1"
+    assert outcome.authored_structure_signature is None
+    assert outcome.block_shape_hashes == {}
+    assert outcome.executed_block_associations == ()
+    assert hydrated is not None
+    assert [item for item in hydrated.get("unfinished_items", []) if item.get("kind") == "unverified_block"] == []
+    assert ctx.recorded_build_test_outcome_history == history_before
+    assert ctx.latest_recorded_build_test_outcome is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("definition_matches", [True, False], ids=["metadata-only-edit", "definition-rewritten"])
+async def test_the_definition_recorded_at_dispatch_decides_whether_an_edited_row_is_what_ran(
+    monkeypatch: pytest.MonkeyPatch, definition_matches: bool
+) -> None:
+    # A folder or title edit bumps modified_at past the run; only a definition change may withhold its source.
+    version = historical_code_version(
+        {"greet_applicant": _EXECUTED_A_CODE}, modified_at=HARNESS_RUN_CREATED_AT + timedelta(minutes=5)
+    )
+    recorded = historical_code_version({"greet_applicant": _EXECUTED_A_CODE if definition_matches else "pass\n"})
+    install_historical_run(
+        monkeypatch,
+        version,
+        failed_label="greet_applicant",
+        run_definition_sha256=workflow_definition_sha256(recorded.workflow_definition),
+    )
+    observe_locators = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "_observe_authored_locators", observe_locators)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, _editable_b_ctx())
+
+    source = result["data"]["execution_source"]
+    if definition_matches:
+        assert source["disposition"] == "available"
+        assert source["failed_statement"] == 'greeting = "Hello " + legacy_applicant_name'
+        assert observe_locators.await_args.kwargs["failed_block_code"] == _EXECUTED_A_CODE
+        assert "requested_output_parameter_definitions" in result["data"]
+    else:
+        assert source == {
+            "source_kind": "run_version",
+            "disposition": "unavailable",
+            "workflow_run_id": "wr-1",
+            "workflow_id": "wf-1",
+            "reason": "overwritten_after_run_start",
+        }
+        assert "requested_output_parameter_definitions" not in result["data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "reason"),
+    [
+        (None, "version_missing"),
+        (historical_code_version({"greet_applicant": _EXECUTED_A_CODE}, workflow_id="wf-other"), "identity_mismatch"),
+        (
+            historical_code_version(
+                {"greet_applicant": _EXECUTED_A_CODE}, modified_at=HARNESS_RUN_CREATED_AT + timedelta(seconds=1)
+            ),
+            "overwritten_after_run_start",
+        ),
+        (historical_code_version({"greet_applicant": _EXECUTED_A_CODE}), None),
+    ],
+)
+async def test_an_unprovable_executed_version_is_unavailable_and_never_falls_back_to_the_draft(
+    monkeypatch: pytest.MonkeyPatch, version: SimpleNamespace | None, reason: str | None
+) -> None:
+    install_historical_run(monkeypatch, version, failed_label="greet_applicant")
+    observe_locators = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "_observe_authored_locators", observe_locators)
+    ctx = _editable_b_ctx()
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+
+    source = result["data"]["execution_source"]
+    observed_code = observe_locators.await_args.kwargs["failed_block_code"] if observe_locators.await_args else None
+    assert outcome is not None and outcome.authored_structure_signature is None
+    assert "applicant_display_name" not in json.dumps(source)
+    fetched_terminal_page = run_execution_module._fetch_dispatched_terminal_page_evidence.await_count > 0
+    if reason is None:
+        assert source["disposition"] == "available"
+        assert source["failed_statement"] == 'greeting = "Hello " + legacy_applicant_name'
+        assert observed_code == _EXECUTED_A_CODE
+        assert "requested_output_parameter_definitions" in result["data"]
+        assert fetched_terminal_page
+        return
+    # An unproven row may have lost the sensitive parameters or outputs the run had, so nothing is read from it.
+    assert observed_code is None
+    assert "requested_output_parameter_definitions" not in result["data"]
+    assert not fetched_terminal_page
+    assert source == {
+        "source_kind": "run_version",
+        "disposition": "unavailable",
+        "workflow_run_id": "wr-1",
+        "workflow_id": "wf-1",
+        "reason": reason,
+    }

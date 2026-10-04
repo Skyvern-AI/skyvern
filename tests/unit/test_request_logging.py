@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import logging
 import typing
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -10,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import psycopg.errors
 import pytest
-import structlog
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
@@ -18,7 +16,7 @@ from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from skyvern.forge import api_app, forge_app_initializer, request_logging
+from skyvern.forge import api_app, request_logging
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_FIELDS,
@@ -39,7 +37,6 @@ from skyvern.forge.request_logging import (
     log_raw_request_middleware,
     set_request_organization,
 )
-from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
@@ -129,6 +126,11 @@ class TestIsSensitiveKey:
             "client_secret",
             "access_token",
             "refresh_token",
+            # Payment-provider payer details and webhook signatures
+            "billing_details",
+            "payment_method_details",
+            "receipt_email",
+            "Stripe-Signature",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
@@ -1161,27 +1163,6 @@ _LOG_DRIVER_LINE_LIMIT_BYTES = 16 * 1024
 # Deep enough that the traceback alone passes the limit, as production pool-timeout errors do.
 _ROUTE_CALL_DEPTH = 25
 _TEST_ORGANIZATION_ID = "o_385835488455492960"
-
-
-@pytest.fixture
-def rendered_log_stream(monkeypatch: pytest.MonkeyPatch) -> typing.Iterator[io.StringIO]:
-    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", True)
-    monkeypatch.setattr(request_logging.settings, "JSON_LOGGING", True)
-    root_logger = logging.getLogger()
-    saved_handlers = root_logger.handlers[:]
-    saved_structlog_config = structlog.get_config()
-    setup_logger()
-    # create_api_app configures logging once per process; keep it from replacing this handler.
-    monkeypatch.setattr(forge_app_initializer, "_SERVER_LOGGING_CONFIGURED", True)
-    stream = io.StringIO()
-    handler = root_logger.handlers[0]
-    assert isinstance(handler, logging.StreamHandler)
-    handler.setStream(stream)
-    try:
-        yield stream
-    finally:
-        root_logger.handlers[:] = saved_handlers
-        structlog.configure(**saved_structlog_config)
 
 
 def _raise_from_depth(depth: int) -> None:

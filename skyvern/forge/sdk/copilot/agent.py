@@ -124,6 +124,8 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.credential_pause import credential_recovery_token_digest
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
+    FINAL_REPLY_OBSERVATION,
+    RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
     CopilotNonRetriableNavError,
     _elapsed_run_seconds,
     artifact_health_blocked,
@@ -4359,6 +4361,7 @@ async def _run_agent_loop_with_surface(
     is_fallback: bool = False,
     session: Session | None = None,
     final_reply: bool = False,
+    final_reply_observation: str = FINAL_REPLY_OBSERVATION,
 ) -> Any:
     # No model owns the attempt until setup completes and enforcement is ready to
     # enter the model loop. This also clears a prior model before fallback setup.
@@ -4429,6 +4432,7 @@ async def _run_agent_loop_with_surface(
                                     session=session,
                                     hooks=FinalReplyRunHooks(ctx),
                                     run_config=run_config,
+                                    observation=final_reply_observation,
                                 )
                             else:
                                 result = await run_with_enforcement(
@@ -4574,6 +4578,44 @@ def _build_request_policy_clarification_result(
             ),
         ),
         exit_site="request_policy_clarification",
+    )
+
+
+PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY = (
+    "Nothing was run: the pending Copilot proposal changed before this test started, so it would not have "
+    "run the proposal as offered. Reload and test the current proposal."
+)
+
+
+def _build_pending_proposal_test_refusal_result(
+    ctx: CopilotContext,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult:
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY,
+        attempted_kind=ResponseKind.REFUSE,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="pending_proposal_test_not_restored",
+    )
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=None,
+        global_llm_context=prior_global_llm_context,
+        workflow_yaml=prior_workflow_yaml or None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        proposal_disposition="no_proposal",
+        turn_outcome=outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
     )
 
 
@@ -5274,6 +5316,7 @@ async def _run_copilot_turn_impl(
         selected_block_label=getattr(chat_request, "selected_block_label", None),
         client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
         client_supports_credential_pause_recovery=chat_request.supports_credential_pause_recovery,
+        client_supports_credential_generation=chat_request.supports_credential_generation,
         credential_recovery_token_digest=credential_recovery_token_digest(
             chat_request.credential_recovery_token.get_secret_value()
             if chat_request.credential_recovery_token
@@ -5504,6 +5547,12 @@ async def _run_copilot_turn_impl(
         copilot_native_tools,
         get_skyvern_mcp_alias_map,
     )
+
+    if chat_request.product_action == "test_end_to_end" and ctx.staged_workflow is None:
+        # Without this gate the route-time proposal bytes would be staged, and the run would be created and then
+        # refused at bind.
+        LOG.info("copilot_pending_proposal_test_refused", reason="proposal_not_restored")
+        return _build_pending_proposal_test_refusal_result(ctx, global_llm_context, chat_request.workflow_yaml)
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id, ctx)
     ctx.browser_session_id = validated_browser_session_id
@@ -5759,6 +5808,7 @@ async def _run_copilot_turn_impl(
         *,
         is_fallback: bool,
         final_reply: bool = False,
+        final_reply_observation: str = FINAL_REPLY_OBSERVATION,
     ) -> RunResultStreaming:
         attempt = await _run_agent_loop_with_surface(
             ctx=ctx,
@@ -5778,6 +5828,7 @@ async def _run_copilot_turn_impl(
             is_fallback=is_fallback,
             session=model_session,
             final_reply=final_reply,
+            final_reply_observation=final_reply_observation,
         )
         return attempt
 
@@ -5791,6 +5842,38 @@ async def _run_copilot_turn_impl(
             require_full_workflow_test=chat_request.product_action == "test_end_to_end",
             evaluated_reason_codes=_output_policy_reason_codes_from_guardrail_exception(exc),
         )
+
+    async def _reask_after_withheld_secret_reply(exc: OutputGuardrailTripwireTriggered) -> AgentResult:
+        # The SDK saves a final reply to the session only after its output guardrail passes, so the
+        # withheld text is not in the history the re-ask reads. A second hit keeps the refusal.
+        if _output_policy_verdict_from_guardrail_exception(exc).reason_codes != [OutputPolicyReason.RAW_SECRET_LEAK]:
+            return _output_policy_blocked(exc)
+        LOG.info("copilot_raw_secret_reply_reasked")
+        try:
+            reply = await _run_attempt(
+                model_name,
+                run_config,
+                llm_key,
+                is_fallback=False,
+                final_reply=True,
+                final_reply_observation=RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
+            )
+            return await _translate_to_agent_result(
+                reply,
+                ctx,
+                global_llm_context,
+                chat_request,
+                organization_id,
+                final_reply=True,
+            )
+        except asyncio.CancelledError:
+            LOG.info("Copilot run cancelled")
+            return _build_cancelled_exit_result(ctx, global_llm_context)
+        except OutputGuardrailTripwireTriggered as reask_exc:
+            return _output_policy_blocked(reask_exc)
+        except Exception as reask_error:
+            LOG.warning("copilot_raw_secret_reply_reask_failed", error_type=type(reask_error).__name__)
+            return _output_policy_blocked(exc)
 
     try:
         from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
@@ -5870,7 +5953,7 @@ async def _run_copilot_turn_impl(
                     ctx=ctx,
                 )
             except OutputGuardrailTripwireTriggered as exc:
-                return _output_policy_blocked(exc)
+                return await _reask_after_withheld_secret_reply(exc)
             except CopilotTurnHalt as exc:
                 LOG.info(
                     "Copilot run stopped after typed turn halt",

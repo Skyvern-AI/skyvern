@@ -255,6 +255,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_chat_post": "workflow.update",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_clear_proposed_workflow": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_convert_yaml_to_blocks": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_generate": "credential.create",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_response": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_disable_auto_accept": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_message_feedback": "workflow_copilot.manage",

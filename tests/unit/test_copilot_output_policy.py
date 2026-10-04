@@ -360,7 +360,7 @@ def test_watchdog_model_facing_text_is_allowed_as_a_run_result_reply() -> None:
         request_policy=None,
         response_type="REPLY",
         user_response=asyncio.run(
-            _watchdog_error_message("stagnation", SimpleNamespace(), "wr_123", None, 300, dispatch_to_worker=True)
+            _watchdog_error_message("ceiling", SimpleNamespace(), "wr_123", None, 300, dispatch_to_worker=True)
         ),
         output_kind=CopilotOutputKind.WORKFLOW_RUN_RESULT,
     )

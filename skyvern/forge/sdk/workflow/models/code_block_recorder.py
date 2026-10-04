@@ -462,6 +462,7 @@ class _Recorder:
         # has to be the same object, or identity comparisons fail and the worker hands out a
         # second handle for the page it already registered.
         self.page_proxies: dict[int, tuple[Any, Any]] = {}
+        self.claimed_popups: dict[int, Page] = {}
         self.failure_operation_generation = 0
         self._next_action_order = 0
         self._on_action = on_action
@@ -1244,6 +1245,13 @@ class RecordingPage:
     def _wrap_page(self, page: Any) -> Any:
         return self.__recording_page(page)
 
+    def __claim_popup(self, page: Page) -> RecordingPage:
+        # Playwright still yields a popup that closed before the block read it; it is wrapped but not
+        # claimed, so failure evidence never names a tab that is already gone.
+        if not page.is_closed():
+            self.__recorder.claimed_popups[id(page)] = page
+        return self.__recording_page(page)
+
     def __recording_page(self, page: Any) -> Any:
         if page is self.__page:
             return self
@@ -1316,6 +1324,9 @@ class RecordingPage:
 
     def failure_locator(self, exception: BaseException) -> Locator | None:
         return self.__recorder.failed_locator if self.__recorder.failed_locator_exception is exception else None
+
+    def _claimed_popups(self) -> list[Page]:
+        return list(self.__recorder.claimed_popups.values())
 
     def failure_page(self, exception: BaseException) -> Page | None:
         """The raw page the call that raised ``exception`` ran on, whether through the page, one of
@@ -1499,9 +1510,7 @@ class RecordingPage:
                     generation,
                     self.__page,
                     event_value=(
-                        self.__recording_page
-                        if name == "expect_popup"
-                        else partial(_wrap_if_page, self.__recording_page)
+                        self.__claim_popup if name == "expect_popup" else partial(_wrap_if_page, self.__recording_page)
                     ),
                 )
 
