@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _fallback_page_info,
     _read_progress_sources,
     _run_blocks_and_collect_debug,
+    _shared,
     _watchdog_error_message,
     run_execution,
 )
@@ -174,23 +175,27 @@ class _ErrorCtx:
     origin_run_redaction_registry = None
 
 
-@pytest.mark.asyncio
-async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reconnect(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from skyvern.forge import app as forge_app
-
-    page = SimpleNamespace(url="https://example.test/current", title=AsyncMock(return_value="Current page"))
+def _install_fallback_page(
+    monkeypatch: pytest.MonkeyPatch, page: SimpleNamespace
+) -> tuple[SimpleNamespace, SimpleNamespace]:
     browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
     session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
     monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
-
     ctx = SimpleNamespace(
         organization_id="o_test",
         browser_session_id="pbs_copilot",
         turn_origin=TurnOrigin.interactive,
         attached_browser_drivers={},
     )
+    return session_manager, ctx
+
+
+@pytest.mark.asyncio
+async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = SimpleNamespace(url="https://example.test/current", title=AsyncMock(return_value="Current page"))
+    session_manager, ctx = _install_fallback_page(monkeypatch, page)
 
     current_url, page_title = await _fallback_page_info(ctx)
 
@@ -209,30 +214,38 @@ async def test_fallback_page_info_bounds_a_title_that_never_resolves_and_keeps_t
     """A wedged renderer hangs `title()` rather than raising it. The bound has to return, and it
     has to keep the url — `page.url` is synchronous, so it is already in hand when the title
     stalls, and most callers of this helper want only the url."""
-    from skyvern.forge import app as forge_app
-    from skyvern.forge.sdk.copilot.tools import _shared
 
     async def _never_resolves() -> str:
         await asyncio.Event().wait()
         return "unreachable"
 
     page = SimpleNamespace(url="https://example.test/wedged", title=_never_resolves)
-    browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
-    session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
-    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
+    _, ctx = _install_fallback_page(monkeypatch, page)
     monkeypatch.setattr(_shared, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
-
-    ctx = SimpleNamespace(
-        organization_id="o_test",
-        browser_session_id="pbs_copilot",
-        turn_origin=TurnOrigin.interactive,
-        attached_browser_drivers={},
-    )
 
     current_url, page_title = await asyncio.wait_for(_fallback_page_info(ctx), timeout=5)
 
     assert current_url == "https://example.test/wedged"
     assert page_title == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title_raises", [False, True])
+async def test_fallback_page_info_never_pairs_a_title_with_another_documents_url(
+    monkeypatch: pytest.MonkeyPatch, title_raises: bool
+) -> None:
+    page = SimpleNamespace(url="https://portal.fixture.test/login")
+
+    async def _title_across_navigation() -> str:
+        page.url = "https://portal.fixture.test/dashboard"
+        if title_raises:
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        return "Ops Portal"
+
+    page.title = _title_across_navigation
+    _, ctx = _install_fallback_page(monkeypatch, page)
+
+    assert await _fallback_page_info(ctx) == ("https://portal.fixture.test/dashboard", "")
 
 
 @pytest.mark.asyncio
