@@ -1,17 +1,21 @@
 """Fixtures shared by every suite."""
 
 import inspect
+import io
+import logging
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 
-from skyvern.forge import app
+from skyvern.forge import app, forge_app_initializer, request_logging
 from skyvern.forge.sdk.core import organization_age_cache
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
+from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.services import organization_log_scope
 
@@ -24,6 +28,28 @@ def _isolate_organization_age_cache() -> Iterator[None]:
     organization_log_scope._missing_organization_until.clear()
     organization_log_scope._failed_read_until.clear()
     organization_log_scope._warmups_in_flight.clear()
+
+
+@pytest.fixture
+def rendered_log_stream(monkeypatch: pytest.MonkeyPatch) -> Iterator[io.StringIO]:
+    """Every log line as production renders it (JSON, raw request logging on), written to a stream."""
+    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", True)
+    monkeypatch.setattr(request_logging.settings, "JSON_LOGGING", True)
+    root_logger = logging.getLogger()
+    saved_handlers = root_logger.handlers[:]
+    saved_structlog_config = structlog.get_config()
+    setup_logger()
+    # create_api_app configures logging once per process; keep it from replacing this handler.
+    monkeypatch.setattr(forge_app_initializer, "_SERVER_LOGGING_CONFIGURED", True)
+    stream = io.StringIO()
+    handler = root_logger.handlers[0]
+    assert isinstance(handler, logging.StreamHandler)
+    handler.setStream(stream)
+    try:
+        yield stream
+    finally:
+        root_logger.handlers[:] = saved_handlers
+        structlog.configure(**saved_structlog_config)
 
 
 class ForcedSinkFailure(RuntimeError):
