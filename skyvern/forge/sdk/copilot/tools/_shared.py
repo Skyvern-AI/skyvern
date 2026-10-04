@@ -533,9 +533,10 @@ async def _fallback_page_info(
     # page.url is a synchronous property, so it is already in hand when the title stalls, and most
     # callers here destructure the title away and want only the url.
     url = ""
+    page: Page | None = None
 
     async def _read() -> str:
-        nonlocal url
+        nonlocal url, page
         browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
             return ""
@@ -548,13 +549,16 @@ async def _fallback_page_info(
     # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
     # raising — and every caller reaches this path, since a tool result's browser_context carries
     # no url. Without the bound, one unreachable page deadlocks the whole turn.
+    title = ""
     try:
         title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
     except TimeoutError:
         LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
-        return url, ""
     except Exception:
-        return url, ""
+        pass
+    # A document committed during title() would pair one document's url with another's title.
+    if page is not None and page.url != url:
+        return page.url, ""
     return url, title
 
 
