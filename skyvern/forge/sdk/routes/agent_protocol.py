@@ -3247,6 +3247,13 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+_HTML_ARTIFACT_TYPES = frozenset(
+    artifact_type
+    for artifact_type, content_type in _ARTIFACT_CONTENT_TYPES.items()
+    if content_type.startswith("text/html")
+)
+# Scraped pages are third-party HTML served inline from the API origin; sandbox them so their scripts never run.
+_HTML_ARTIFACT_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
 _VIDEO_CONTENT_TYPES_BY_EXTENSION = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
@@ -3496,6 +3503,8 @@ async def get_artifact_content(
         signed_expiry_unix=signed_expiry_unix,
     )
     headers["Accept-Ranges"] = "bytes"
+    if artifact.artifact_type in _HTML_ARTIFACT_TYPES:
+        headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
     content_length = len(content)
     parsed_range = _parse_range_header(request.headers.get("range"), content_length)
     if parsed_range == _RANGE_UNSATISFIABLE:

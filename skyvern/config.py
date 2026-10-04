@@ -334,6 +334,9 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
+    # Strict-Transport-Security value for API responses. Off by default: HSTS binds every port on the host,
+    # so a self-hosted install serving anything else there over plain HTTP would be forced onto HTTPS.
+    STRICT_TRANSPORT_SECURITY: str | None = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
     UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 

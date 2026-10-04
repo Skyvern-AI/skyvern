@@ -41,6 +41,7 @@ from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_requ
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.security import assert_signing_key_usable
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
@@ -114,7 +115,14 @@ SECURITY_HEADERS = {
     # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
 }
+
+
+def security_headers() -> dict[str, str]:
+    if settings.STRICT_TRANSPORT_SECURITY:
+        return {**SECURITY_HEADERS, "Strict-Transport-Security": settings.STRICT_TRANSPORT_SECURITY}
+    return SECURITY_HEADERS
 
 
 class SecurityHeadersMiddleware:
@@ -131,8 +139,9 @@ class SecurityHeadersMiddleware:
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                for key, value in SECURITY_HEADERS.items():
-                    headers[key] = value
+                for key, value in security_headers().items():
+                    # A route-set header (e.g. a stricter per-response CSP) must win over the default.
+                    headers.setdefault(key, value)
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
@@ -500,6 +509,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize Laminar tracing", error=str(e))
 
+    assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
 
     add_credentialed_cors_middleware(fastapi_app)
@@ -647,7 +657,7 @@ def create_api_app() -> FastAPI:
         response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
-            headers=SECURITY_HEADERS,
+            headers=security_headers(),
         )
         log_raw_request_exception(response.status_code)
         return response
