@@ -188,6 +188,7 @@ from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, Workf
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
 from skyvern.forge.taskv3.goal_check import (
+    BLOCK_COMPLETION_CHECK_PROMPT_NAME,
     GOAL_CHECK_PROMPT_NAME,
     PRE_JUDGE_SKIP_REASONS,
     GoalJudge,
@@ -1421,6 +1422,7 @@ def _build_task_v3_goal_judge(
     browser_state: BrowserState,
     peek_page: Callable[[], Awaitable[Any]],
     shot_holder: list[bytes],
+    prompt_name: str = GOAL_CHECK_PROMPT_NAME,
 ) -> GoalJudge:
     handler = LLMAPIHandlerFactory.get_llm_api_handler(judge_key)
 
@@ -1439,12 +1441,14 @@ def _build_task_v3_goal_judge(
                 engine_selection=browser_state.engine_selection,
             )
         except Exception:
-            LOG.warning("taskv3 goal check screenshot failed", task_id=task.task_id, exc_info=True)
+            LOG.warning(
+                "taskv3 goal check screenshot failed", task_id=task.task_id, prompt_name=prompt_name, exc_info=True
+            )
             return None
         shot_holder.append(shot)
         response = await handler(
             prompt=prompt,
-            prompt_name=GOAL_CHECK_PROMPT_NAME,
+            prompt_name=prompt_name,
             step=step,
             screenshots=[shot],
         )
@@ -3110,6 +3114,39 @@ class ForgeAgent:
                             peek_page=_fingerprint_page,
                             shot_holder=goal_judge_shot,
                         )
+            # A block that completes on a download is not done by its one action.
+            single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
+            block_completion_judge: GoalJudge | None = None
+            if single_action_block:
+                # The run's own model, outside the goal-check arm's payload; its non-flex twin, as flex queueing
+                # outlasts the judge's timeout. Without a judge the block's step-cap completion is never offered.
+                # The registry key: an OpenRouter caller rewrites llm_key to the bare model id.
+                run_key = llm_caller.original_llm_key
+                twin_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(run_key)
+                block_judge_key = twin_key if twin_key and LLMConfigRegistry.is_registered(twin_key) else run_key
+                block_judge_skip = (
+                    "screenshots_disabled"
+                    if context is not None and not context.llm_screenshots_enabled_for_prompt()
+                    else _goal_judge_key_skip_reason(block_judge_key)
+                )
+                if block_judge_skip is not None:
+                    LOG.info(
+                        "taskv3 block completion judge skipped",
+                        task_id=task.task_id,
+                        reason=block_judge_skip,
+                        judge_key=block_judge_key,
+                    )
+                else:
+                    assert block_judge_key is not None
+                    block_completion_judge = _build_task_v3_goal_judge(
+                        judge_key=block_judge_key,
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        peek_page=_fingerprint_page,
+                        shot_holder=[],
+                        prompt_name=BLOCK_COMPLETION_CHECK_PROMPT_NAME,
+                    )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -3145,7 +3182,9 @@ class ForgeAgent:
                 ),
                 goal_check_redactor=(
                     (lambda: _task_v3_goal_check_redactor(task, context))
-                    if goal_judge is not None or unlisted_reask_criteria is not None
+                    if goal_judge is not None
+                    or block_completion_judge is not None
+                    or unlisted_reask_criteria is not None
                     else None
                 ),
                 unlisted_reask_criteria=unlisted_reask_criteria,
@@ -3199,8 +3238,8 @@ class ForgeAgent:
                 caller_known_urls=verdict_known_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
-                # A block that completes on a download is not done by its one action.
-                single_action_block=isinstance(task_block, ActionBlock) and not task_block.complete_on_download,
+                single_action_block=single_action_block,
+                block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
         finally:
