@@ -198,10 +198,17 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
     return first_hop or None
 
 
+def _is_fixture_endpoint(request: Request) -> bool:
+    return request.url.path.rstrip("/") == "/api/v1/eval-fixtures" or request.url.path.startswith(
+        "/api/v1/eval-fixtures/"
+    )
+
+
 def _is_sensitive_endpoint(request: Request) -> bool:
     endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
     return (
-        endpoint in _SENSITIVE_ENDPOINTS
+        _is_fixture_endpoint(request)
+        or endpoint in _SENSITIVE_ENDPOINTS
         or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
         or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
@@ -361,7 +368,18 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     start_time = time.monotonic()
     try:
-        body_bytes = await request.body()
+        if _is_fixture_endpoint(request):
+            bounded = bytearray()
+            async with asyncio.timeout(2):
+                async for chunk in request.stream():
+                    if len(bounded) + len(chunk) > 4096:
+                        return Response(status_code=413)
+                    bounded.extend(chunk)
+            body_bytes = bytes(bounded)
+        else:
+            body_bytes = await request.body()
+    except TimeoutError:
+        return Response(status_code=408)
     except ClientDisconnect:
         # The client closed the connection before the body finished streaming, so no
         # response will reach it. Short-circuit with a benign 499 instead of letting
