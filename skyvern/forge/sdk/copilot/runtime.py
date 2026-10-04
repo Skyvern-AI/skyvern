@@ -65,6 +65,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -1951,6 +1952,7 @@ async def acquire_fresh_exit_browser_session(
             prior_browser_session_id=prior_browser_session_id,
             proxy_location=proxy_location,
             browser_profile_id=browser_profile_id,
+            session_kind=BrowserSessionKind.copilot,
         )
     except BrowserSessionCreditAdmissionRefusal:
         return _browser_session_acquisition_failure_result(
@@ -2059,6 +2061,7 @@ async def _provision_browser_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=30,
                 created_by="copilot",
+                session_kind=BrowserSessionKind.copilot,
                 **creation_kwargs,
             )
         if ctx.browser_session_id:
