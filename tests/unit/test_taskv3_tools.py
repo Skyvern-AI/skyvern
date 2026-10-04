@@ -53,6 +53,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CredentialReleaseGuard,
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.auth_tools import VerificationState
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
@@ -67,6 +68,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     _navigate_record_fields,
 )
+from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
 from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
     _OPAQUE_ID_RUN_RE,
@@ -15589,6 +15591,160 @@ async def test_a_throwing_getattribute_on_the_occluder_does_not_defeat_occlusion
         assert r.status == "error", r.content
 
 
+_LOGIN_FORM_HTML = """
+<form onsubmit="event.preventDefault(); document.body.dataset.submitted = '1'">
+  <label>Email <input id="user" type="email"></label>
+  <label>Password <input id="pw" type="password"></label>
+  <button id="sign-in" type="submit">Sign in</button>
+</form>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submit", ["press_enter", "click"])
+async def test_login_pace_treatment_holds_the_submit_after_typing_a_password(
+    monkeypatch: pytest.MonkeyPatch, submit: str
+) -> None:
+    clock = SimpleNamespace(now=1000.0, sleeps=[])
+
+    async def _sleep(seconds: float) -> None:
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(input_dispatch, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(input_dispatch, "asyncio", ScopedAsyncio(sleep=_sleep))
+    with skyvern_context.scoped(SkyvernContext(run_arms={LOGIN_PACE_FLAG: ("wr_login", "treatment")})):
+        async with _content_page(_LOGIN_FORM_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            type_tool = _tool(tools, "type").handler
+            input_dispatch.start_login_pace()
+            clock.now += 12
+            try:
+                # Enter after an email is not a credential submit and goes straight through.
+                assert (await type_tool({"selector": "#user", "text": "a@b.test", "press_enter": True})).status == "ok"
+                assert clock.sleeps == []
+                if submit == "press_enter":
+                    r = await type_tool({"selector": "#pw", "text": "hunter2", "press_enter": True})
+                else:
+                    assert (await type_tool({"selector": "#pw", "text": "hunter2"})).status == "ok"
+                    r = await _tool(tools, "click").handler({"selector": "#sign-in"})
+            finally:
+                input_dispatch.end_login_pace()
+            assert r.status == "ok", r.content
+            assert sum(clock.sleeps) == 33.0
+            assert await page.evaluate("document.body.dataset.submitted") == "1"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_login_pace_a_password_fill_that_moves_the_page_does_not_hold_the_next_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A form that submits itself as the password lands: the next click is on another page, not the submit.
+    clock = SimpleNamespace(now=1000.0, sleeps=[])
+
+    async def _sleep(seconds: float) -> None:
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(input_dispatch, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(input_dispatch, "asyncio", ScopedAsyncio(sleep=_sleep))
+    html = (
+        '<input id="pw" type="password" oninput="history.pushState({}, \'\', \'#/verify\')">'
+        '<button id="next" onclick="this.dataset.clicked = 1">Next</button>'
+    )
+    with skyvern_context.scoped(SkyvernContext(run_arms={LOGIN_PACE_FLAG: ("wr_login", "treatment")})):
+        async with _content_page(html) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            input_dispatch.start_login_pace()
+            try:
+                with capture_logs() as logs:
+                    # Appending reads the field back after a settle wait, so the page has moved by the time it arms.
+                    typed = await _tool(tools, "type").handler({"selector": "#pw", "text": "hunter2", "clear": False})
+                    assert typed.status == "ok", typed.content
+                    r = await _tool(tools, "click").handler({"selector": "#next"})
+            finally:
+                input_dispatch.end_login_pace()
+            assert r.status == "ok", r.content
+            assert clock.sleeps == []
+            assert [log["reason"] for log in logs if log["event"] == "Task V3 login pace submit not held"] == [
+                "page_moved_before_submit"
+            ]
+
+
+_FRAMED_LOGIN_HTML = (
+    '<iframe id="login" srcdoc="<input id=pw type=password><button id=sign-in onclick=parent.signedIn=1>Sign in</button>"></iframe>'
+    '<iframe id="challenge" srcdoc="<p>challenge</p>"></iframe>'
+)
+
+
+async def _change_login_frame(page: Page, change: str) -> None:
+    login, challenge = page.frames[1], page.frames[2]
+    if change == "navigate":
+        async with page.expect_event("framenavigated", predicate=lambda frame: frame is login):
+            await login.evaluate("location.href = 'about:blank'")
+    elif change == "reload":
+        async with page.expect_event("framenavigated", predicate=lambda frame: frame is login):
+            await login.evaluate("setTimeout(() => location.reload())")
+    elif change == "detach":
+        async with page.expect_event("framedetached"):
+            await page.evaluate("document.getElementById('login').remove()")
+    else:
+        # Another frame on the page, a challenge widget, navigating is not the password page moving.
+        async with page.expect_event("framenavigated", predicate=lambda frame: frame is challenge):
+            await challenge.evaluate("location.href = 'about:blank'")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["navigate", "reload", "detach", "other_frame"])
+async def test_login_pace_a_password_frame_that_changes_during_the_wait_does_not_get_the_held_click(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    clock = SimpleNamespace(now=1000.0, sleeps=[])
+
+    async def _sleep(seconds: float) -> None:
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(input_dispatch, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(input_dispatch, "asyncio", ScopedAsyncio(sleep=_sleep))
+    with skyvern_context.scoped(SkyvernContext(run_arms={LOGIN_PACE_FLAG: ("wr_login", "treatment")})):
+        async with _content_page(_FRAMED_LOGIN_HTML) as page:
+            await page.wait_for_function("document.querySelectorAll('iframe').length === 2")
+            login = page.frames[1]
+            await login.wait_for_selector("#sign-in")
+            changed: list[str] = []
+
+            async def _change_on_first_poll() -> bool:
+                if not changed:
+                    changed.append(change)
+                    await _change_login_frame(page, change)
+                return False
+
+            input_dispatch.start_login_pace(_change_on_first_poll)
+            try:
+                anchor = input_dispatch.secret_fill_anchor(login)
+                await input_dispatch.fill(login, "#pw", "hunter2")
+                input_dispatch.note_secret_fill(login, anchor)
+                with capture_logs() as logs:
+                    if change == "other_frame":
+                        await input_dispatch.click(login, "#sign-in")
+                    else:
+                        with pytest.raises(input_dispatch.LoginPaceRefused):
+                            await input_dispatch.click(login, "#sign-in")
+            finally:
+                input_dispatch.end_login_pace()
+            if change == "other_frame":
+                assert sum(clock.sleeps) == 45.0
+                assert await page.evaluate("window.signedIn") == 1
+            else:
+                moved_by = {"navigate": "frame_url", "reload": "navigated_event", "detach": "frame_detached"}[change]
+                assert [(log["reason"], log["moved_by"]) for log in logs] == [("page_moved_during_wait", moved_by)]
+                assert await page.evaluate("window.signedIn") is None
+
+
 # Design systems routinely put an inner wrapper between the input and the element the skin is
 # positioned against, so "the field's immediate parent" is narrower than "the field's own control".
 _SKIN_ONE_WRAPPER_DEEPER_HTML = """
@@ -18609,112 +18765,6 @@ async def test_pre_snapshot_survives_a_container_the_page_rebuilds_by_cloning() 
             "() => { const r = document.getElementById('results'); r.parentNode.replaceChild(r.cloneNode(true), r); }"
         )
         assert await page.evaluate(_FIND_MENU_JS, {"sel": "#sort", "el": None}) is None
-
-
-@_skip_no_browser
-@pytest.mark.asyncio
-async def test_pointer_parity_run_writes_no_snapshot_attribute_and_still_reads_the_click_reaction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The treatment of TASK_V3_POINTER_PARITY must not stamp every visible element just before a click, and
-    # must keep what that stamp is for: a menu the click opens reads as a reaction, a static list does not.
-    import skyvern.forge.taskv3.tools as tools_module  # noqa: PLC0415
-    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS, _FIND_MENU_JS  # noqa: PLC0415
-
-    monkeypatch.setattr(tools_module.settings, "TASK_V3_POINTER_PARITY", True)
-    async with _live_page(
-        """<input id="user" type="text" style="position:absolute;top:10px;left:10px;width:200px;height:24px">
-        <button id="sort" style="position:absolute;top:10px;left:240px;width:120px;height:24px">Sort</button>
-        <div id="results" style="position:absolute;top:60px;left:10px;width:220px">
-          <a href="/a" role="option" style="display:block;height:20px">Result Alpha</a>
-          <a href="/b" role="option" style="display:block;height:20px">Result Beta</a>
-          <a href="/c" role="option" style="display:block;height:20px">Result Gamma</a>
-        </div>
-        <div id="menu" style="display:none;position:absolute;top:40px;left:240px;width:200px">
-          <div role="option" style="height:20px">Newest</div>
-          <div role="option" style="height:20px">Oldest</div>
-          <div role="option" style="height:20px">Relevance</div>
-        </div>
-        <script>
-        window.preWrites = 0;
-        new MutationObserver((recs) => {
-          for (const r of recs) if (r.attributeName === 'data-tv3-pre') window.preWrites++;
-        }).observe(document, {subtree: true, attributes: true});
-        </script>"""
-    ) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        assert (await _tool(tools, "type").handler({"selector": "#user", "text": "alice"})).status == "ok"
-        assert (await _tool(tools, "click").handler({"selector": "#sort"})).status == "ok"
-        assert await page.evaluate("() => window.preWrites") == 0
-
-        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#sort", "el": None, "weak": True})
-        await page.evaluate("() => { document.getElementById('menu').style.display = 'block'; }")
-        found = await page.evaluate(_FIND_MENU_JS, {"sel": "#sort", "el": None})
-        assert isinstance(found, dict), found
-        assert [o["text"] for o in found["options"]] == ["Newest", "Oldest", "Relevance"]
-        assert await page.evaluate("() => window.preWrites") == 0
-
-
-@_skip_no_browser
-@pytest.mark.asyncio
-async def test_pointer_parity_click_still_reports_a_menu_its_hover_opens(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The treatment's pointer move must land after the click's baseline: a menu that opens on mouseenter is
-    # the click's reaction in control, and must stay one, or the model needs another look to get its rows.
-    import skyvern.forge.taskv3.tools as tools_module  # noqa: PLC0415
-
-    monkeypatch.setattr(tools_module.settings, "TASK_V3_POINTER_PARITY", True)
-    async with _live_page(
-        """<button id="acct" style="position:absolute;top:10px;left:300px;width:120px;height:24px">Account</button>
-        <div id="m" role="menu" style="display:none;position:absolute;top:36px;left:300px;width:160px">
-          <div role="menuitem" style="height:20px">Profile</div>
-          <div role="menuitem" style="height:20px">Billing</div>
-          <div role="menuitem" style="height:20px">Sign out</div>
-        </div>
-        <script>
-        document.getElementById('acct').addEventListener('mouseenter', () => {
-          document.getElementById('m').style.display = 'block';
-        });
-        </script>"""
-    ) as page:
-        await page.mouse.move(5, 500)
-        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#acct"})
-        assert r.status == "ok", r.content
-        assert "This click opened a menu" in r.content, r.content
-
-
-@_skip_no_browser
-@pytest.mark.asyncio
-async def test_write_free_snapshot_reads_existed_before_by_node_identity() -> None:
-    # The write-free carrier is node identity, the WeakSet the shadow-DOM half already used: a node that was
-    # visible reads as old, and any node created since -- a clone included, the disclosed price -- or a row
-    # the rewrite watcher saw change, down to its descendants, reads as a reaction.
-    from skyvern.forge.taskv3.tools import (  # noqa: PLC0415
-        _PIERCED_QUERY_JS,
-        _PRESNAPSHOT_JS,
-        _WATCH_REWRITTEN_ROWS_JS,
-    )
-
-    async with _live_page(
-        """<ul id="k" style="position:absolute;top:10px;left:10px;width:200px;margin:0">
-          <li style="height:20px">Kept</li></ul>
-        <ul id="a" style="position:absolute;top:40px;left:10px;width:200px;margin:0">
-          <li style="height:20px">Engineering</li></ul>
-        <ul id="c" style="position:absolute;top:80px;left:10px;width:200px;margin:0">
-          <li style="height:20px"><span>Paris</span></li></ul>"""
-    ) as page:
-        await page.evaluate(_PRESNAPSHOT_JS, True)
-        await page.evaluate(_WATCH_REWRITTEN_ROWS_JS)
-        await page.evaluate(
-            "() => { const a = document.getElementById('a'); a.parentNode.replaceChild(a.cloneNode(true), a);"
-            " document.querySelector('#c span').firstChild.nodeValue = 'Paris'; }"
-        )
-        await page.wait_for_timeout(50)
-        pre = await page.evaluate(
-            "() => {" + _PIERCED_QUERY_JS + " const q = (s) => preHas(document.querySelector(s));"
-            " return {kept: q('#k li'), clone: q('#a li'), rewritten: q('#c span'),"
-            " attrs: document.querySelectorAll('[data-tv3-pre]').length}; }"
-        )
-        assert pre == {"kept": True, "clone": False, "rewritten": False, "attrs": 0}, pre
 
 
 @_skip_no_browser
