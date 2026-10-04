@@ -30,8 +30,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import {
   BULK_CONCURRENCY_LIMIT,
@@ -184,12 +186,10 @@ function WorkflowsFlat() {
     () => parseTagFilter(tagFilterParam),
     [tagFilterParam],
   );
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
-  // While tagging is hidden, ignore stale `?tags=` so the backend list isn't tag-filtered.
-  const serializedTagFilter = taggingEnabled
-    ? serializeTagFilter(tagFilters)
-    : "";
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // While tagging is off, ignore stale `?tags=` so the backend list isn't tag-filtered.
+  const { tags: serializedTagFilter, hold: holdForTaggingFlag } =
+    useUrlTagFilter(serializeTagFilter(tagFilters));
 
   const setTagFilters = useCallback(
     (terms: TagFilterTerm[]) => {
@@ -342,7 +342,10 @@ function WorkflowsFlat() {
         })
         .then((response) => response.data);
     },
-    placeholderData: (previousData) => previousData,
+    enabled: !holdForTaggingFlag,
+    // A held tag-filtered list must not carry over the previous unfiltered rows.
+    placeholderData: (previousData) =>
+      holdForTaggingFlag ? undefined : previousData,
   });
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
@@ -375,7 +378,7 @@ function WorkflowsFlat() {
         })
         .then((response) => response.data);
     },
-    enabled: workflows.length === itemsPerPage,
+    enabled: !holdForTaggingFlag && workflows.length === itemsPerPage,
   });
 
   const isNextDisabled =
@@ -866,7 +869,7 @@ function WorkflowsFlat() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {isFetching &&
+              {(isFetching || holdForTaggingFlag) &&
               !isPlaceholderData &&
               displayWorkflows.length === 0 ? (
                 // Show skeleton rows only on initial load (not during search refinement)

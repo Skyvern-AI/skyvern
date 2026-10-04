@@ -284,6 +284,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import REUSE_MIN_REMAINING_LIFETIME_SECONDS
 from skyvern.schemas.proxy_pinning import (
     derive_proxy_session_id,
@@ -4946,6 +4947,7 @@ class WorkflowService:
                 browser_profile_id=browser_profile_id,
                 proxy_location=proxy_location,
                 inherit_profile_proxy=True,
+                session_kind=BrowserSessionKind.workflow_run,
                 **browser_type_kwargs,
             )
 
@@ -5773,6 +5775,7 @@ class WorkflowService:
                     inherit_profile_proxy=True,
                     bound_workflow_permanent_id=workflow_permanent_id,
                     bound_key=bound_key,
+                    session_kind=BrowserSessionKind.workflow_run,
                     **browser_type_kwargs,
                 )
                 if browser_dispatch:
@@ -11829,6 +11832,7 @@ class WorkflowService:
                     runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
                     browser_profile_id=forced_browser_profile_id,
                     inherit_profile_proxy=True,
+                    session_kind=BrowserSessionKind.workflow_run,
                     **creation_options,
                 )
             except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):

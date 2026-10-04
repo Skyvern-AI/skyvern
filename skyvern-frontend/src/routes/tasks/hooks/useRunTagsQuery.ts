@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { useQuery } from "@tanstack/react-query";
 import {
   normalizeWorkflowTags,
@@ -11,10 +12,11 @@ function useRunTagsQuery(
   { enabled = true }: { enabled?: boolean } = {},
 ) {
   const credentialGetter = useCredentialGetter();
+  const taggingEnabled = useWorkflowTaggingEnabled();
 
   return useQuery({
     queryKey: ["run-tags", workflowRunId],
-    enabled: enabled && !!workflowRunId,
+    enabled: enabled && taggingEnabled && !!workflowRunId,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client

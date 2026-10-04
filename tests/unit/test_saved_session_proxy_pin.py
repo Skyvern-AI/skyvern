@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_pinning import derive_proxy_session_id, is_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
 from tests.unit.conftest import MockAsyncSessionCtx
@@ -349,6 +350,7 @@ async def test_force_browser_session_passes_managed_profile_and_pins_proxy(
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
         browser_profile_id="bp_managed",
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
     forced.create_workflow_run.assert_awaited_once()
     assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
@@ -412,6 +414,7 @@ async def test_force_browser_session_rotating_profile_key_selects_after_run_crea
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
         browser_profile_id="bp_managed",
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
     forced.create_workflow_run.assert_awaited_once()
     assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
@@ -526,6 +529,7 @@ async def test_force_browser_session_created_profile_seeds_legacy_session(
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
         browser_profile_id="bp_managed",
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
     forced.create_workflow_run.assert_awaited_once()
     assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
@@ -636,6 +640,7 @@ async def test_force_browser_session_persist_off_does_not_pass_browser_profile(
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
         browser_profile_id=None,
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
     forced.update_workflow_run.assert_awaited_once_with(
         workflow_run_id="wr_forced",
@@ -704,6 +709,7 @@ async def test_force_browser_session_non_pinned_profile_resolution_failure_still
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
         browser_profile_id=None,
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
     forced.create_workflow_run.assert_awaited_once()
     assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
@@ -734,6 +740,7 @@ async def test_force_browser_session_non_pinned_unresolvable_profile_key_creates
         runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
         browser_profile_id=None,
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
     forced.create_workflow_run.assert_awaited_once()
     assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None

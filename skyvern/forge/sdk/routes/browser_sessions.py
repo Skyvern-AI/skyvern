@@ -41,6 +41,7 @@ from skyvern.schemas.action_log import (
     ActionLogPage,
     sanitize_action_log_event,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import (
     MAX_EXTENDED_TIMEOUT,
     MAX_TIMEOUT,
@@ -241,6 +242,7 @@ async def create_browser_session(
         generate_browser_profile=browser_session_request.generate_browser_profile,
         needs_live_view=browser_session_request.needs_live_view,
         created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
+        session_kind=BrowserSessionKind.api,
     )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning

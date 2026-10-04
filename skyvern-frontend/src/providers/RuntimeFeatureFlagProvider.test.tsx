@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useRuntimeConfig } from "@/hooks/useRuntimeConfig";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { RuntimeFeatureFlagProvider } from "./RuntimeFeatureFlagProvider";
 
 vi.mock("@/hooks/useRuntimeConfig", () => ({
@@ -63,6 +64,18 @@ describe("RuntimeFeatureFlagProvider", () => {
     );
 
     expect(result.current).toBe(false);
+  });
+
+  it("keeps workflow tagging on, since the OSS backend never gates it", () => {
+    useRuntimeConfigMock.mockReturnValue({
+      data: undefined,
+    } as ReturnType<typeof useRuntimeConfig>);
+
+    const { result } = renderHook(() => useWorkflowTaggingEnabled(), {
+      wrapper,
+    });
+
+    expect(result.current).toBe(true);
   });
 
   it("leaves unrelated cloud feature flags unresolved", () => {

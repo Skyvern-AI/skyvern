@@ -42,6 +42,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
     EXTENSION_MIN_REMAINING_SECONDS,
@@ -668,6 +669,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
         *,
+        session_kind: BrowserSessionKind,
         profile_read_only: bool = False,
         created_by: str | None = None,
         attempt_number: int | None = None,
@@ -678,6 +680,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
+            session_kind=session_kind,
         )
         try:
             session = await self.database.browser_sessions.create_persistent_browser_session(
@@ -858,6 +861,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         prior_browser_session_id: str,
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
+        session_kind: BrowserSessionKind,
     ) -> FreshExitReceipt:
         return FreshExitReceipt(
             outcome=FreshExitOutcome.no_alternate,

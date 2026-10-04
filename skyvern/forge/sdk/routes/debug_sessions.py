@@ -34,6 +34,7 @@ from skyvern.forge.sdk.workflow.service import (
     DEBUG_SESSION_PROFILE_REASON_DIFFERENT,
     DEBUG_SESSION_PROFILE_REASON_NO_PROFILE,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import runtime_proxy_location
 
 LOG = structlog.get_logger()
@@ -188,6 +189,8 @@ async def _claim_compatible_prewarm(
         debug_session_id=claimed.debug_session_id,
         browser_session_id=claimed.browser_session_id,
         workflow_permanent_id=workflow_permanent_id,
+        # The browser was created as editor_prewarm; from this claim on it serves the editor.
+        session_kind=BrowserSessionKind.editor,
     )
     return claimed
 
@@ -267,6 +270,7 @@ async def prewarm_debug_session(
             wait_for_startup=False,
             needs_live_view=True,
             created_by=current_user_id,
+            session_kind=BrowserSessionKind.editor_prewarm,
         )
     except IntegrityError:
         return Response(status_code=status.HTTP_202_ACCEPTED)
@@ -639,6 +643,7 @@ async def new_debug_session(
             wait_for_startup=settings.ENV != "local",
             needs_live_view=True,
             created_by=current_user_id,
+            session_kind=BrowserSessionKind.editor,
         )
     except Exception:
         LOG.exception(
