@@ -33,7 +33,7 @@ from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
 from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
-from skyvern.forge.taskv3.goal_check import GoalVerdict
+from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
@@ -1008,6 +1008,10 @@ async def test_spent_grant_caught_at_the_step_gate_reports_the_granting_cap() ->
 _REACHED_TARGET = {"page_transitioned": True}
 
 
+async def _achieved_block_check() -> GoalVerdict:
+    return GoalVerdict("achieved", "", "", None, 0.1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("single_action_block", [True, False], ids=["single_action", "multi_action"])
 @pytest.mark.parametrize("cap", ["step_cap", "runaway"])
@@ -1025,7 +1029,13 @@ async def test_single_action_block_completes_when_its_step_cap_refuses_a_follow_
     )
     caps: dict[str, Any] = {"max_action_steps": 1} if cap == "step_cap" else {"max_turns": 1}
     script = [[("click", {})], [("click", {})], [("click", {})]]
-    outcome, _ = await _run(script, [click, make_finish_tool()], single_action_block=single_action_block, **caps)
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=single_action_block,
+        block_completion_check=_achieved_block_check,
+        **caps,
+    )
 
     if single_action_block and cap == "step_cap" and acted:
         assert outcome.status == "completed"
@@ -1052,7 +1062,13 @@ async def test_single_action_block_completes_on_the_step_cap_only_when_its_actio
     click_calls: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", click_calls, billable=True, ok_data=data)
     script = [[("click", {})], [("click", {})], [("click", {})]]
-    outcome, _ = await _run(script, [click, make_finish_tool()], single_action_block=True, max_action_steps=1)
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+    )
 
     assert outcome.status == ("completed" if url_changed else "budget_exhausted")
     if not url_changed:
@@ -1067,7 +1083,13 @@ async def test_a_navigation_that_landed_on_an_error_page_is_no_evidence_for_the_
     nav_calls: list[tuple[str, dict[str, Any]]] = []
     nav = _recording_tool("navigate", nav_calls, billable=True, ok_data=dead_end)
     script = [[("navigate", {})], [("navigate", {})], [("navigate", {})]]
-    outcome, _ = await _run(script, [nav, make_finish_tool()], single_action_block=True, max_action_steps=1)
+    outcome, _ = await _run(
+        script,
+        [nav, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+    )
 
     assert outcome.status == "budget_exhausted"
 
@@ -1085,6 +1107,7 @@ async def test_a_contradicting_goal_check_vetoes_the_step_cap_completion_only_un
         script,
         [click, make_finish_tool(goal_check=goal_check, goal_check_enforce=enforce)],
         single_action_block=True,
+        block_completion_check=_achieved_block_check,
         max_action_steps=1,
     )
 
@@ -1108,6 +1131,7 @@ async def test_single_action_block_completion_refused_by_a_finish_guard_stays_bu
         script,
         [click, make_finish_tool(verification_blocker=blocker)],
         single_action_block=True,
+        block_completion_check=_achieved_block_check,
         max_action_steps=1,
     )
 
@@ -1135,12 +1159,111 @@ async def test_single_action_block_completion_is_offered_once_even_when_its_guar
         script,
         [click, make_finish_tool(verification_blocker=blocker)],
         single_action_block=True,
+        block_completion_check=_achieved_block_check,
         max_action_steps=1,
     )
 
     assert outcome.status == "budget_exhausted"
     assert outcome.cap_trip == "Reached the maximum steps (1)"
     assert len(offers) == 1
+
+
+_LANDED_ON_PASSWORD_STEP = "clicked button 'Next' — now at https://example.com/login/password\nEnter your password"
+_LANDED_ON_OTHER_LINK = "clicked link 'Report 2023' — now at https://example.com/reports/2023\nReport 2023"
+_LANDED_ON_TARGET = "clicked link 'Report 2024' — now at https://example.com/reports/2024\nReport 2024"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("landed", "verdict", "quote", "completes"),
+    [
+        (_LANDED_ON_PASSWORD_STEP, "not_achieved", "Enter your password", False),
+        (_LANDED_ON_OTHER_LINK, "not_achieved", "Report 2023", False),
+        # The goal-check arm accepts an ungrounded contradiction; this conversion does not.
+        (_LANDED_ON_OTHER_LINK, "not_achieved", "Report 1999", False),
+        (_LANDED_ON_TARGET, "achieved", "", True),
+    ],
+    ids=["stopped_after_username_step", "clicked_a_different_link", "ungrounded_contradiction", "reached_target"],
+)
+async def test_step_cap_block_completion_converts_only_on_the_goal_judges_grounded_achieved(
+    landed: str, verdict: str, quote: str, completes: bool
+) -> None:
+    # A URL change shows the action took effect, not that the block reached its goal: the next step of the same
+    # login and a different link both move the URL.
+    trail = ToolTrail()
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": verdict, "quote": quote, "missing": "the page is not the goal's page"}
+
+    async def check() -> GoalVerdict:
+        return await run_goal_check(goal="open the block's target", trail=trail, judge=judge, timeout_seconds=5)
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(landed, data=_REACHED_TARGET)
+
+    tool = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=click, billable=True)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, caller = await _run(
+        script,
+        [tool, make_finish_tool()],
+        single_action_block=True,
+        max_action_steps=1,
+        tool_trail=trail,
+        block_completion_check=check,
+    )
+
+    assert len(prompts) == 1 and landed.splitlines()[0] in prompts[0]
+    assert outcome.status == ("completed" if completes else "budget_exhausted")
+    # The judge read a screenshot that can show a typed secret: its text never reaches the model.
+    assert all("the page is not the goal's page" not in str(m.get("content")) for m in caller.message_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["no_judge", "raises", "timeout", "judge_error", "secret_entered"])
+async def test_step_cap_block_completion_fails_closed_without_a_judged_verdict(failure: str) -> None:
+    async def check() -> GoalVerdict:
+        if failure == "raises":
+            raise RuntimeError("judge down")
+        # run_goal_check's shape for a check that reached no verdict: "achieved", with the reason it was skipped.
+        return GoalVerdict("achieved", "", "", failure, 0.1)
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        max_action_steps=1,
+        block_completion_check=None if failure == "no_judge" else check,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+
+
+@pytest.mark.asyncio
+async def test_step_cap_block_completion_evidence_log_carries_the_verdict_not_the_judges_text() -> None:
+    async def check() -> GoalVerdict:
+        return GoalVerdict("not_achieved", "code 482913 entered", "482913 is still shown", None, 0.1)
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            max_action_steps=1,
+            block_completion_check=check,
+        )
+
+    [evidence] = [entry for entry in logs if entry["event"] == "taskv3 block completion evidence"]
+    assert evidence["judge_verdict"] == "not_achieved"
+    assert "482913" not in repr(evidence)
 
 
 @pytest.mark.asyncio
