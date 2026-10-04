@@ -31,6 +31,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondar
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import DEFAULT_REQUEST_TIMEOUT
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
+from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
@@ -71,6 +72,16 @@ class RawOTPVerificationContext:
     # False until the stored-code queries return once, so a wait that times out first can say the
     # store went unchecked instead of claiming it was empty.
     store_queried: bool = False
+
+
+@dataclass(frozen=True)
+class MagicLinkSurfacing:
+    """Lets a code poll hand back a stored sign-in link bound to this run or task, for a caller that can open
+    one. Links created before ``created_after`` are never handed back, and a link in ``spent_values`` retires
+    itself and every older link."""
+
+    created_after: datetime | None
+    spent_values: frozenset[str]
 
 
 @dataclass
@@ -244,7 +255,7 @@ def _verbatim_otp_value(content: str, otp_type: OTPType | None, llm_value: str |
 def looks_like_magic_link(content: str) -> bool:
     """Whether a message body is a bare sign-in link, decided without an LLM call.
 
-    Used only to explain a wrong-verb timeout: an enforced parse returns None rather than the
+    Used to explain a wrong-verb timeout: an enforced parse returns None rather than the
     other OTP type, so the type that did arrive is otherwise unrecoverable.
     """
     return bool(_BARE_URL_PATTERN.match(content.strip()))
@@ -882,6 +893,7 @@ async def resolve_otp_value(
     multi_field_expected_digits: int | None = None,
     *,
     min_remaining_seconds: int = 0,
+    surface_magic_link: MagicLinkSurfacing | None = None,
 ) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
@@ -940,6 +952,7 @@ async def resolve_otp_value(
             max_wait_seconds=max_wait_seconds,
             poll_started_at=poll_started_at,
             multi_field_expected_digits=multi_field_expected_digits,
+            surface_magic_link=surface_magic_link,
         )
 
     _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)
@@ -963,6 +976,8 @@ async def poll_otp_value(
     poll_started_at: datetime | None = None,
     rejected_code_hash: str | None = None,
     multi_field_expected_digits: int | None = None,
+    *,
+    surface_magic_link: MagicLinkSurfacing | None = None,
 ) -> OTPValue | None:
     """Poll until an OTP of ``expected_otp_type`` arrives or the wall-clock budget expires.
 
@@ -1085,6 +1100,7 @@ async def poll_otp_value(
                     raw_context=raw_otp_context,
                     rejected_code_hash=rejected_code_hash,
                     multi_field_expected_digits=multi_field_expected_digits,
+                    surface_magic_link=surface_magic_link,
                 )
         except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
@@ -1250,6 +1266,27 @@ async def _get_otp_value_from_email(
     )
 
 
+def _surfaceable_link(
+    row: TOTPCode,
+    surfacing: MagicLinkSurfacing | None,
+    *,
+    task_id: str | None,
+    workflow_run_id: str | None,
+    expected_otp_type: OTPType | None,
+) -> bool:
+    if surfacing is None or expected_otp_type != OTPType.TOTP or row.otp_type != OTPType.MAGIC_LINK:
+        return False
+    # Unscoped rows are never handed back: an identifier shared across runs carries other sites' links.
+    bound_to_execution = (row.workflow_run_id is not None and row.workflow_run_id == workflow_run_id) or (
+        row.task_id is not None and row.task_id == task_id
+    )
+    if not bound_to_execution:
+        return False
+    anchor = to_naive_utc(surfacing.created_after)
+    created_at = to_naive_utc(row.created_at)
+    return anchor is None or (created_at is not None and created_at >= anchor)
+
+
 async def _get_otp_value_from_db(
     organization_id: str,
     totp_identifier: str,
@@ -1261,6 +1298,8 @@ async def _get_otp_value_from_db(
     raw_context: RawOTPVerificationContext | None = None,
     rejected_code_hash: str | None = None,
     multi_field_expected_digits: int | None = None,
+    *,
+    surface_magic_link: MagicLinkSurfacing | None = None,
 ) -> OTPValue | None:
     # Email/SMS deliveries can arrive through /v1/credentials/totp without run
     # scope, so include both exact run matches and unscoped rows in SQL.
@@ -1296,6 +1335,7 @@ async def _get_otp_value_from_db(
     ]
     candidates.sort(key=lambda candidate: candidate[0].created_at, reverse=True)
     attempts = 0
+    surfacing = surface_magic_link
     for row, is_raw in candidates:
         if row.workflow_run_id and workflow_run_id and row.workflow_run_id != workflow_run_id:
             continue
@@ -1305,6 +1345,7 @@ async def _get_otp_value_from_db(
             continue
         if row.expired_at and row.expired_at < datetime.utcnow():
             continue
+        link_to_surface: OTPValue | None = None
         if not is_raw:
             parsed_row = row
             stored_otp_value = _exclude_rejected_otp(
@@ -1318,6 +1359,20 @@ async def _get_otp_value_from_db(
             if expected_otp_type is None or stored_otp_value.get_otp_type() == expected_otp_type:
                 return stored_otp_value
             context.observed_otp_types.add(stored_otp_value.get_otp_type())
+            if surfacing is not None and parsed_row.code in surfacing.spent_values:
+                # Every link older than one the caller already opened or passed over is stale: a resend replaced it.
+                surfacing = None
+            if _surfaceable_link(
+                parsed_row,
+                surfacing,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                expected_otp_type=expected_otp_type,
+            ):
+                link_to_surface = stored_otp_value
+                # A bare link has no code in it to find, so the reparse below could only miss.
+                if not parsed_row.content or looks_like_magic_link(parsed_row.content):
+                    return link_to_surface
             if not parsed_row.content:
                 continue
         if expected_otp_type is None:
@@ -1333,7 +1388,8 @@ async def _get_otp_value_from_db(
         try:
             otp_value = await parse_otp_login(row.content, organization_id, enforced_otp_type=expected_otp_type)
         except InsufficientCreditsForOTPParse:
-            return None
+            # Unlike a transient failure, a later tick cannot parse this row either, so its link is the best answer.
+            return link_to_surface
         except Exception as e:
             LOG.warning(
                 "Raw OTP reparse failed" if is_raw else "Parsed OTP content reparse failed",
@@ -1349,10 +1405,14 @@ async def _get_otp_value_from_db(
             context.misses.add(cache_key)
             if otp_value is not None:
                 context.observed_otp_types.add(otp_value.get_otp_type())
+            if link_to_surface is not None:
+                return link_to_surface
             continue
         otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id)
         if otp_value is None:
             context.misses.add(cache_key)
+            if link_to_surface is not None:
+                return link_to_surface
             continue
         if is_raw:
             await app.DATABASE.otp.promote_raw_otp_code(
