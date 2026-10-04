@@ -206,6 +206,21 @@ curl 'https://api.skyvern.com/v1/recipes/jobs/runs?page=1&page_size=25' \
 
 Each entry includes the run ID, recipe (`apply` or `extract`), status, creation time, job URL, and failure reason when available. The response also includes `page`, `page_size`, and `has_next`. Increment `page` while `has_next` is `true`. Page size must be between 1 and 100.
 
+Each entry also has an `outcome` and a `next_step`. `outcome` is `null` until the run finishes. `next_step` says what to do about an unsuccessful outcome and is `null` otherwise.
+
+| `outcome`              | Meaning                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------- |
+| `completed`            | The run finished successfully.                                                  |
+| `canceled`             | The run was canceled.                                                           |
+| `job_unavailable`      | Skyvern found the posting closed, or could not find it at this URL.             |
+| `login_required`       | The site needed an account, a sign-in, or a verification code, or rejected the sign-in. |
+| `application_refused`  | The site refused the application, for example as a duplicate.                   |
+| `blocked_by_site`      | Bot protection, a CAPTCHA, a rate limit, or a locked account blocked the run.   |
+| `invalid_input`        | A request value could not be used, so the run stopped before opening the site.  |
+| `insufficient_credits` | The organization ran out of credits.                                            |
+| `incomplete`           | The run ran out of steps before it could submit the application.                |
+| `failed`               | Any other failure. Read `failure_reason`. An unsuccessful Extract run is `failed` unless it ran out of credits. |
+
 <Note>
   Each Apply API request creates a new run. Repeating a request can submit another application, so check the original run before retrying.
 </Note>
