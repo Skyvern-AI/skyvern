@@ -50,6 +50,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry, ViewportFrame
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    clear_session_scrub_values,
     origin_runs_bound_to_scrubber,
     register_matching_origin_run_redaction_values,
 )
@@ -162,6 +163,9 @@ _ABANDONED_DRIVER_RELEASES: set[asyncio.Task[bool] | asyncio.Task[None]] = set()
 # Per session: attached turns in this process, and the newest generation any of them attached.
 # Only the last one out releases, and it retires that newest generation rather than its own.
 _ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
+# Closed sessions whose scrub values wait for the last attached turn's release: that turn may still be
+# scrubbing a readback it took before the close.
+_SCRUB_VALUES_CLEARED_ON_RELEASE: set[str] = set()
 # Set while a last-out release has popped its ledger entry but the evict has not finished; an attach
 # in that window would record the generation the evict is about to retire.
 _DRIVER_RELEASES_IN_FLIGHT: dict[str, asyncio.Event] = {}
@@ -1473,7 +1477,16 @@ async def close_browser_session_quietly(
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
         return False
+    _clear_closed_session_scrub_values(session_id)
     return True
+
+
+def _clear_closed_session_scrub_values(session_id: str) -> None:
+    """Only a landed close, never a retired id: a retired session can still be alive and reattached."""
+    if session_id in _ATTACHED_TURNS_PER_SESSION:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.add(session_id)
+    else:
+        clear_session_scrub_values(session_id)
 
 
 def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:
@@ -1520,6 +1533,9 @@ async def release_browser_driver_quietly(
         )
         return
     _ATTACHED_TURNS_PER_SESSION.pop(attached.session_id, None)
+    if attached.session_id in _SCRUB_VALUES_CLEARED_ON_RELEASE:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.discard(attached.session_id)
+        clear_session_scrub_values(attached.session_id)
     manager = app.PERSISTENT_SESSIONS_MANAGER
     if not manager.supports_evict_and_reconnect():
         # This process drives the browser itself; detaching its driver would strand the browser

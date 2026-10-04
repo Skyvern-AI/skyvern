@@ -191,6 +191,7 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
             runtime._ATTACHED_TURNS_PER_SESSION.clear()
             runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
             runtime._DRIVER_RELEASE_EPOCHS.clear()
+            runtime._SCRUB_VALUES_CLEARED_ON_RELEASE.clear()
 
     _clear()
     yield
