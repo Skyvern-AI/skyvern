@@ -67,6 +67,7 @@ from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
+from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
@@ -149,6 +150,7 @@ async def _run_execute_task_v3(
     goal_judge_prompt: str | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
+    llm_caller_factory: Any = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -213,7 +215,7 @@ async def _run_execute_task_v3(
     loop_mock = AsyncMock(side_effect=_loop)
     loop_mock.browser_state = browser_state
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
-    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", llm_caller_factory or MagicMock())
     monkeypatch.setattr("skyvern.forge.sdk.api.files.resolve_run_download_id", lambda *_a, **_k: "download-1")
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: "/tmp/taskv3-test")
     monkeypatch.setattr(
@@ -6406,6 +6408,59 @@ def _arm_goal_judge(
         "skyvern.forge.agent.SkyvernFrame.take_scrolling_screenshot", AsyncMock(return_value=b"judge-png")
     )
     return judge_handler, get_handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller_key", "registry_key", "twin_key", "context_overrides", "judge_key"),
+    [
+        (_JUDGE_KEY, _JUDGE_KEY, None, {}, _JUDGE_KEY),
+        # An OpenRouter caller rewrites llm_key to the bare model id; the registry name is what resolves.
+        ("vendor/bare-model-id", _JUDGE_KEY, None, {}, _JUDGE_KEY),
+        ("RUN_FLEX_KEY", "RUN_FLEX_KEY", _JUDGE_KEY, {}, _JUDGE_KEY),
+        (_JUDGE_KEY, _JUDGE_KEY, None, {"enrich_tree_mode": EnrichTreeMode.ENRICHED_TREE_NO_IMAGES}, None),
+        (_BYO_JUDGE_KEY, _BYO_JUDGE_KEY, None, {}, None),
+    ],
+    ids=["run_key", "caller_rewrites_key", "standard_tier_twin", "screenshots_disabled", "byo_key"],
+)
+async def test_block_completion_judge_runs_on_the_runs_own_key_outside_the_goal_check_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_key: str,
+    registry_key: str,
+    twin_key: str | None,
+    context_overrides: dict[str, Any],
+    judge_key: str | None,
+) -> None:
+    judge_handler, get_handler = _arm_goal_judge(monkeypatch, forced=False)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.get_standard_tier_twin_llm_key", MagicMock(return_value=twin_key)
+    )
+    caller = MagicMock(llm_key=caller_key, original_llm_key=registry_key)
+
+    with capture_logs() as logs:
+        step, _task, loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            task_block=_make_block(ActionBlock),
+            context_overrides=context_overrides,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            llm_caller_factory=MagicMock(return_value=caller),
+        )
+
+    assert loop_mock.call_args.kwargs["goal_judge"] is None
+    block_judge = loop_mock.call_args.kwargs["block_completion_judge"]
+    if judge_key is None:
+        assert block_judge is None
+        assert [log for log in logs if log["event"] == "taskv3 block completion judge skipped"]
+        get_handler.assert_not_called()
+        return
+    loop_mock.browser_state.must_get_working_page.return_value.is_closed = MagicMock(return_value=False)
+    await block_judge("judge prompt")
+    get_handler.assert_called_once_with(judge_key)
+    kwargs = judge_handler.await_args.kwargs
+    assert kwargs["prompt_name"] == BLOCK_COMPLETION_CHECK_PROMPT_NAME
+    assert kwargs["step"] is step
 
 
 def _resolved_goal_check_flags(logs: list[dict[str, Any]]) -> set[str]:
