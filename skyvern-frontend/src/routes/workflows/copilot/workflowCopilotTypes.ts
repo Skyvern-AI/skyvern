@@ -168,6 +168,7 @@ export interface WorkflowCopilotChatRequest {
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
+  supports_credential_generation?: boolean;
   credential_recovery_token?: string;
   supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
@@ -435,6 +436,13 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The live browser the user may sign in to themselves; absent when the card does not offer it.
   sign_in_browser_session_id?: string | null;
   signing_in?: boolean;
+  // Present on a card that offers Generate and save; never carries a password.
+  registration?: {
+    username: string;
+    credential_name: string;
+    attempted?: boolean;
+    outcome?: "rejected" | "unknown" | "created_not_connected" | null;
+  } | null;
   timestamp: string;
 }
 
@@ -443,6 +451,15 @@ export interface WorkflowCopilotCredentialResponseResult {
   expires_at?: string | null;
   host?: string | null;
   browser_profile_id?: string | null;
+}
+
+export interface WorkflowCopilotCredentialGenerateResult {
+  result: "connected" | "rejected" | "unknown" | "created_not_connected";
+  credential_id?: string | null;
+  name?: string | null;
+  username?: string | null;
+  // The reopened card's new deadline after "rejected" or "unknown".
+  expires_at?: string | null;
 }
 
 export interface WorkflowCopilotCredentialPauseResolvedUpdate {

@@ -123,6 +123,7 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
+  WorkflowCopilotCredentialGenerateResult,
   WorkflowCopilotCredentialResponseResult,
   WorkflowCopilotCredentialPauseResolvedUpdate,
   WorkflowCopilotTitleUpdate,
@@ -378,6 +379,9 @@ const RECOVERY_POLL_STEADY_MS = 30_000;
 // up the real reply if the turn finishes after all.
 const RECOVERY_POLL_BUDGET_MS = 1_500_000;
 const CANONICAL_READ_TIMEOUT_MS = 5_000;
+// Matches the server's MANUAL_SIGN_IN_CLAIM_SECONDS, which bounds a Generate and save.
+const REGISTRATION_SAVE_WINDOW_MS = 120_000;
+const REGISTRATION_SAVE_POLL_MS = 2_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
 // Only an older backend writes an interrupted row a late reply may still replace.
 const isReplaceableInterruptedRow = (
@@ -2548,10 +2552,79 @@ export function WorkflowCopilotChat({
   const recoverCredentialTurn = useRef<
     (chatId: string, turnId: string) => boolean
   >(() => false);
+  const updateRegistration = useCallback(
+    (
+      frame: WorkflowCopilotCredentialRequiredUpdate,
+      update: Partial<
+        NonNullable<WorkflowCopilotCredentialRequiredUpdate["registration"]>
+      >,
+      expiresAt?: string | null,
+    ) => {
+      // The card's Generate button, its countdown, and a reloaded card all read the frame.
+      const apply = (candidate: WorkflowCopilotCredentialRequiredUpdate) =>
+        candidate.resume_token === frame.resume_token && candidate.registration
+          ? {
+              ...candidate,
+              registration: { ...candidate.registration, ...update },
+              expires_at: expiresAt ?? candidate.expires_at,
+            }
+          : candidate;
+      setLivePauseFrame((prev) => (prev ? apply(prev) : prev));
+      setRecoveredPauseFrames((prev) => prev.map(apply));
+    },
+    [],
+  );
+  // A Generate whose answer never arrived may still be saving: read the card back until the save settles.
+  const refreshRegistrationCard = useCallback(
+    async (frame: WorkflowCopilotCredentialRequiredUpdate) => {
+      const stopAt = Date.now() + REGISTRATION_SAVE_WINDOW_MS;
+      const generation = recoveryGeneration.current;
+      const stale = () =>
+        recoveryGeneration.current !== generation ||
+        (workflowCopilotChatIdRef.current !== null &&
+          workflowCopilotChatIdRef.current !== frame.workflow_copilot_chat_id);
+      setCredentialsReloadKey((key) => key + 1);
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        for (;;) {
+          if (stale()) return;
+          const response =
+            await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+              client,
+              workflowPermanentId,
+              {
+                params: {
+                  workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
+                },
+              },
+            );
+          const current = response.data.pending_credential_requests?.find(
+            (candidate) => candidate.resume_token === frame.resume_token,
+          );
+          if (stale() || !current?.registration) return;
+          updateRegistration(frame, current.registration, current.expires_at);
+          if (current.registration.outcome) {
+            setCredentialsReloadKey((key) => key + 1);
+            return;
+          }
+          if (Date.now() >= stopAt) return;
+          await new Promise((resolve) =>
+            setTimeout(resolve, REGISTRATION_SAVE_POLL_MS),
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Failed to refresh the credential card:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    },
+    [credentialGetter, updateRegistration, workflowPermanentId],
+  );
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
-      action: "connected" | "skip" | "signing_in" | "signed_in",
+      action: "connected" | "skip" | "signing_in" | "signed_in" | "generate",
       credentialId?: string,
       name?: string,
     ): Promise<WorkflowCopilotCredentialResponseResult | undefined> => {
@@ -2573,22 +2646,40 @@ export function WorkflowCopilotChat({
         // Copilot routes live on base_router (no /api/v1 prefix), like cancel.
         const client = await getClient(credentialGetter, "sans-api-v1");
         if (!isCopilotTurnCurrent(reservation)) return;
-        const response =
-          await client.post<WorkflowCopilotCredentialResponseResult>(
-            "/workflow/copilot/credential-response",
-            {
-              turn_id: frame.turn_id,
-              workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
-              resume_token: frame.resume_token,
-              action,
-              credential_id: action === "connected" ? credentialId : undefined,
-            },
-          );
-        // A backend that predates sign-in answers 204 with no body.
-        const result: WorkflowCopilotCredentialResponseResult = response.data
-          ?.result
-          ? response.data
-          : { result: "accepted" };
+        const pauseIds = {
+          turn_id: frame.turn_id,
+          workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
+          resume_token: frame.resume_token,
+        };
+        let generated: WorkflowCopilotCredentialGenerateResult | null = null;
+        let result: WorkflowCopilotCredentialResponseResult = {
+          result: "accepted",
+        };
+        if (action === "generate") {
+          // The server allows one attempt per card, so Generate goes away as soon as it is sent.
+          updateRegistration(frame, { attempted: true });
+          generated = (
+            await client.post<WorkflowCopilotCredentialGenerateResult>(
+              "/workflow/copilot/credential-generate",
+              pauseIds,
+            )
+          ).data;
+          // Any answer, even an unconfirmed one, can mean a new saved login the picker should list.
+          setCredentialsReloadKey((key) => key + 1);
+        } else {
+          const response =
+            await client.post<WorkflowCopilotCredentialResponseResult>(
+              "/workflow/copilot/credential-response",
+              {
+                ...pauseIds,
+                action,
+                credential_id:
+                  action === "connected" ? credentialId : undefined,
+              },
+            );
+          // A backend that predates sign-in answers 204 with no body.
+          if (response.data?.result) result = response.data;
+        }
         if (
           !isCopilotTurnCurrent(reservation) ||
           recoveryGeneration.current !== generation ||
@@ -2604,6 +2695,25 @@ export function WorkflowCopilotChat({
             frame.turn_id,
           );
         }
+        if (generated && generated.result !== "connected") {
+          updateRegistration(
+            frame,
+            { outcome: generated.result },
+            generated.expires_at,
+          );
+          // The pause ended before the save landed, so its resume token answers nothing now.
+          if (generated.result === "created_not_connected") {
+            setPauseCardResolutions((prev) =>
+              prev[frame.resume_token]
+                ? prev
+                : withCappedResolution(prev, frame.resume_token, {
+                    outcome: "timeout",
+                    name: generated.name ?? undefined,
+                  }),
+            );
+          }
+          return result;
+        }
         if (
           action === "signing_in" ||
           result.result === "no_sign_in_found" ||
@@ -2611,8 +2721,13 @@ export function WorkflowCopilotChat({
         ) {
           return result;
         }
-        const resolution: CredentialResolution =
-          action === "connected"
+        const resolution: CredentialResolution = generated
+          ? {
+              outcome: "connected",
+              credentialId: generated.credential_id ?? undefined,
+              name: generated.name ?? undefined,
+            }
+          : action === "connected"
             ? { outcome: "connected", credentialId, name }
             : action === "signed_in"
               ? { outcome: "signed_in" }
@@ -2643,6 +2758,11 @@ export function WorkflowCopilotChat({
           error,
           frame.workflow_copilot_chat_id,
         );
+        // Generate is never retried: the save may have gone through, so read the card back instead.
+        if (action === "generate") {
+          void refreshRegistrationCard(frame);
+          return;
+        }
         toast({
           title: "Couldn't send your credential response",
           description: "Please try again.",
@@ -2652,7 +2772,13 @@ export function WorkflowCopilotChat({
         credentialResponseInFlight.current = false;
       }
     },
-    [credentialGetter, isCopilotTurnCurrent, logCopilotRequestFailure],
+    [
+      credentialGetter,
+      isCopilotTurnCurrent,
+      logCopilotRequestFailure,
+      refreshRegistrationCard,
+      updateRegistration,
+    ],
   );
   const startManualSignIn = useCallback(
     async (frame: WorkflowCopilotCredentialRequiredUpdate) => {
@@ -8416,6 +8542,7 @@ export function WorkflowCopilotChat({
             selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal: Boolean(pendingProposalTurnId),
             supports_credential_pause: true,
+            supports_credential_generation: true,
             supports_credential_pause_recovery: Boolean(
               credentialRecoveryToken,
             ),
@@ -9462,6 +9589,7 @@ export function WorkflowCopilotChat({
           : openCredentialModal(frame, frame.turn_id)
       }
       onSkip={() => void respondToCredentialPause(frame, "skip")}
+      onGenerate={() => void respondToCredentialPause(frame, "generate")}
       signIn={
         frame.sign_in_browser_session_id &&
         frame.sign_in_browser_session_id === liveBrowserSessionId

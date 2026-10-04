@@ -61,7 +61,16 @@ export type CredentialRequiredReason =
   | "assistant_directed"
   | "missing_credential_run_failure"
   | "credential_missing_totp"
-  | "credential_rejected_by_site";
+  | "credential_rejected_by_site"
+  | "credential_registration";
+
+// What Generate and save would store. Never carries a password; the server generates it.
+export interface CredentialRegistrationDetails {
+  username: string;
+  credential_name: string;
+  attempted?: boolean;
+  outcome?: "rejected" | "unknown" | "created_not_connected" | null;
+}
 
 export interface CredentialRequiredFrame {
   type: "credential_required";
@@ -75,6 +84,7 @@ export interface CredentialRequiredFrame {
   timeout_seconds?: number;
   expires_at?: string;
   signing_in?: boolean;
+  registration?: CredentialRegistrationDetails | null;
   timestamp?: string;
 }
 
@@ -135,6 +145,8 @@ export interface CredentialCardProps {
   tray?: AttentionTrayPresentation;
   // Offered only when the card's browser is the one on screen, so the user signs in where the agent looks.
   signIn?: ManualSignInOffer;
+  // Registration cards only: saves a server-generated password under the frame's username and name.
+  onGenerate?: () => void;
 }
 
 export interface ManualSignInOffer {
@@ -173,6 +185,8 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
     "This saved login has no 2FA method, so the workflow can't pass the verification step. Add one in the credential editor — codes never go through chat.",
   credential_rejected_by_site:
     "Update the saved password or one-time code here and I'll try the sign-in again.",
+  credential_registration:
+    "Generate and save creates a strong password and stores it in your credentials — it never appears in chat. Saving it does not create the account; I'll still submit the sign-up form.",
 };
 
 // Mirrors the credentials route: it caps `search` at 200 characters and pages at 100. A longer term
@@ -774,6 +788,7 @@ function CredentialAskCard({
   canChange = false,
   tray,
   signIn,
+  onGenerate,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -925,7 +940,15 @@ function CredentialAskCard({
           />
         );
       case "timeout":
-        return <ResolvedCredentialCard tone="warn" {...TIMEOUT_OUTCOME} />;
+        return frame.registration?.outcome === "created_not_connected" ? (
+          <ResolvedCredentialCard
+            tone="warn"
+            title={`Saved as ${frame.registration.credential_name}, not connected`}
+            detail="The request ended before this login was connected. It is on the Credentials page."
+          />
+        ) : (
+          <ResolvedCredentialCard tone="warn" {...TIMEOUT_OUTCOME} />
+        );
       case "signed_in":
         return (
           <ResolvedCredentialCard
@@ -1049,11 +1072,41 @@ function CredentialAskCard({
   }
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);
+  const registration = frame.registration ?? null;
+  const offerGenerate = Boolean(
+    registration && onGenerate && !registration.attempted,
+  );
+  const registrationLines = registration
+    ? [
+        <span key="destination" className="text-[11px] leading-relaxed">
+          Sign-up page: {frame.login_page_urls?.[0] ?? site}
+        </span>,
+        <span key="username" className="text-[11px] leading-relaxed">
+          Username: {registration.username}
+        </span>,
+        <span key="saved-as" className="text-[11px] leading-relaxed">
+          Saved as: {registration.credential_name}
+        </span>,
+        ...(registration.outcome
+          ? [
+              <span key="outcome" className="text-[11px] font-medium">
+                {registration.outcome === "rejected"
+                  ? "Nothing was saved — the credential couldn't be created. Pick or add a login instead."
+                  : registration.outcome === "created_not_connected"
+                    ? `Saved as ${registration.credential_name}, not connected.`
+                    : "The vault didn't confirm the save. Check your credentials before adding another."}
+              </span>,
+            ]
+          : []),
+      ]
+    : [];
   const connectButton = (
     <Button
       type="button"
       size="sm"
-      variant={signIn && frame.signing_in ? "outline" : "default"}
+      variant={
+        (signIn && frame.signing_in) || offerGenerate ? "outline" : "default"
+      }
       disabled={disabled}
       onClick={() => onConnect(undefined)}
       data-tour="credential-connect"
@@ -1133,7 +1186,11 @@ function CredentialAskCard({
       tray={tray}
       rootRef={rootRef}
       message={frame.message}
-      title={`Copilot needs to sign in to ${site}`}
+      title={
+        registration
+          ? `Create a login for ${site}`
+          : `Copilot needs to sign in to ${site}`
+      }
       countdown={
         countdownActive ? (
           <PauseCountdown remainingMs={remainingMs} expired={expired} />
@@ -1146,6 +1203,7 @@ function CredentialAskCard({
         >
           {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
         </span>,
+        ...registrationLines,
         ...(mode === "terminal"
           ? [
               <span
@@ -1159,6 +1217,16 @@ function CredentialAskCard({
       ]}
       footer={
         <>
+          {offerGenerate ? (
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onGenerate?.()}
+            >
+              Generate and save
+            </Button>
+          ) : null}
           {connectButton}
           {signIn ? (
             <Button
