@@ -309,6 +309,13 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
+def as_stored_json(value: typing.Any) -> typing.Any:
+    """Return value as a JSON column hands it back after a write: NULs stripped, non-JSON types encoded."""
+    if value is None:
+        return None
+    return _scrub_nul_chars(json.loads(_custom_json_serializer(value)))
+
+
 def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
     """Fail-open size guard for jsonb-column writes (SKY-9779)."""
     # Fast-path: None and scalars can't approach the cap; skip the full re-serialization

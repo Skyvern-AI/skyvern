@@ -1009,7 +1009,7 @@ class ArtifactManager:
                 aio_task = asyncio.create_task(app.STORAGE.store_artifact_from_path(artifact, artifact_data.path))
                 self._track_upload_aiotask(request.primary_key, aio_task)
 
-        return [model.artifact_id for model in artifact_models]
+        return [artifact.artifact_id for artifact in artifacts]
 
     def _prepare_step_artifacts(
         self,

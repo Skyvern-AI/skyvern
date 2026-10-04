@@ -24,7 +24,13 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
-from skyvern.forge.sdk.db.utils import convert_to_step, convert_to_task, hydrate_action, serialize_proxy_location
+from skyvern.forge.sdk.db.utils import (
+    as_stored_json,
+    convert_to_step,
+    convert_to_task,
+    hydrate_action,
+    serialize_proxy_location,
+)
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
@@ -89,6 +95,14 @@ class TasksRepository(BaseRepository):
         complete_criterion = _sanitize(complete_criterion)
         terminate_criterion = _sanitize(terminate_criterion)
         workflow_system_prompt = _sanitize(workflow_system_prompt)
+        # Workflow blocks pass datetimes and NULs in these. Normalizing them to their stored JSON form lets the
+        # returned Task match the row without a re-read.
+        navigation_payload = as_stored_json(navigation_payload)
+        extracted_information_schema = as_stored_json(extracted_information_schema)
+        error_code_mapping = as_stored_json(error_code_mapping)
+        model = as_stored_json(model)
+        extra_http_headers = as_stored_json(extra_http_headers)
+        cdp_connect_headers = as_stored_json(cdp_connect_headers)
 
         # created_at is passed so an already-running task cannot start before it was created; None
         # falls through to the column default.
@@ -132,9 +146,11 @@ class TasksRepository(BaseRepository):
                 attempt_number=attempt_number,
             )
             session.add(new_task)
+            # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
+            await session.flush()
+            task = convert_to_task(new_task, self.debug_enabled)
             await session.commit()
-            await session.refresh(new_task)
-            return convert_to_task(new_task, self.debug_enabled)
+            return task
 
     @db_operation("create_step")
     async def create_step(
