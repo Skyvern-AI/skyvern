@@ -2,6 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
+from skyvern.exceptions import (
+    BrowserSessionDegraded,
+    MissingBrowserStatePage,
+    ScreenshotTargetClosed,
+    get_user_facing_exception_message,
+)
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.block import _should_skip_retry_on_anti_bot_detection
 
@@ -105,3 +114,34 @@ class TestFallbackFromReason:
             failure_reason="Access denied after login - user does not have permission",
         )
         assert _should_skip_retry_on_anti_bot_detection(task) is False
+
+
+_BROWSER_LOSSES = [
+    pytest.param(MissingBrowserStatePage(), id="page-missing"),
+    pytest.param(ScreenshotTargetClosed("Target page, context or browser has been closed"), id="target-closed"),
+    pytest.param(BrowserSessionDegraded(3, "screenshot"), id="browser-degraded"),
+]
+
+
+@pytest.mark.parametrize("browser_loss", _BROWSER_LOSSES)
+@pytest.mark.parametrize(
+    "reason_suffix",
+    [
+        pytest.param("", id="exception-message-only"),
+        pytest.param(" A captcha challenge was still on the page.", id="reason-also-names-a-captcha"),
+    ],
+)
+def test_the_unsolved_captcha_relabel_leaves_the_retry_decision_unchanged(
+    browser_loss: Exception, reason_suffix: str
+) -> None:
+    """Categorization is output-only: relabeling a browser loss as anti-bot must not stop a block retry."""
+    reason = get_user_facing_exception_message(browser_loss) + reason_suffix
+    before = classify_from_failure_reason(reason, exception=browser_loss, fallback_to_unknown=True)
+    after = classify_from_failure_reason(
+        reason, exception=browser_loss, fallback_to_unknown=True, unsolved_captcha_exception="CaptchaNotSolvedInTime"
+    )
+
+    assert after is not None and after[0]["category"] == "ANTI_BOT_DETECTION"
+    assert _should_skip_retry_on_anti_bot_detection(
+        _make_failed_task(failure_reason=reason, failure_category=after)
+    ) is _should_skip_retry_on_anti_bot_detection(_make_failed_task(failure_reason=reason, failure_category=before))

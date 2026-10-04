@@ -51,6 +51,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.workflows import BlockStatus
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
+from tests.unit.helpers import unsolved_captcha_relabel_categories
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -583,3 +584,27 @@ async def test_block_outcome_is_invisible_to_templates_and_the_branch_snapshot()
     assert context.get_block_outcome("login") == BlockOutcome(
         status=BlockStatus.failed, error_codes=["AUTH_FAILURE"], failure_reason="wrong password"
     )
+
+
+@pytest.mark.asyncio
+async def test_templates_see_the_failure_categories_from_before_an_output_only_relabel() -> None:
+    before, after = unsolved_captcha_relabel_categories()
+    # Customer data that happens to look like a category list is not a failure_category and stays as is.
+    lookalike_rows = after
+
+    async def observe(categories: list[dict] | None) -> tuple[str, str]:
+        context = _outcome_context()
+        login_output = make_block_output_parameter("login_output")
+        await context.register_output_parameter_value_post_execution(
+            login_output, {"status": "failed", "failure_category": categories, "rows": lookalike_rows}
+        )
+        block = WaitBlock(label="login", output_parameter=login_output, wait_sec=1)
+        rendered = block.format_block_parameter_template_from_workflow_run_context(
+            "{{ login }} | {{ login_output }} | {{ workflow_run_outputs }}", context
+        )
+        branch_context = BranchEvaluationContext(workflow_run_context=context, block_label="login")
+        return rendered, json.dumps(branch_context.build_llm_safe_context_snapshot(), sort_keys=True, default=str)
+
+    rendered_after = await observe(after)
+    assert rendered_after == await observe(before)
+    assert after[0]["reason_code"] in rendered_after[0]
