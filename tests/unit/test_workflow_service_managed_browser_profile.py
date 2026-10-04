@@ -48,6 +48,7 @@ from skyvern.forge.sdk.workflow.service import (
     WorkflowBrowserCleanupResult,
     WorkflowService,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.workflows import BlockStatus, WorkflowRetryPolicy
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.real_browser_manager import RealBrowserManager
@@ -408,6 +409,7 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
         browser_profile_id="bp_managed",
         proxy_location=None,
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
 
 

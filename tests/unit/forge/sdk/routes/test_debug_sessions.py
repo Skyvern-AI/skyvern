@@ -3,10 +3,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import IntegrityError
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.runs import ProxyLocation
 
 
@@ -45,6 +47,7 @@ async def test_prewarm_debug_session_dispatches_an_unattached_live_browser() -> 
         wait_for_startup=False,
         needs_live_view=True,
         created_by="user_123",
+        session_kind=BrowserSessionKind.editor_prewarm,
     )
     app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched.assert_awaited_once_with(
         session_id="pbs_prewarm",
@@ -238,7 +241,7 @@ async def test_get_debug_session_claims_a_compatible_prewarm(already_started: bo
     app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(return_value=browser_session)
     app_mock.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline = AsyncMock(return_value=None)
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with patch.object(debug_sessions_mod, "app", app_mock), capture_logs() as logs:
         result = await debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id(
             "wpid_test",
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -253,6 +256,9 @@ async def test_get_debug_session_claims_a_compatible_prewarm(already_started: bo
         workflow_permanent_id="wpid_test",
         vnc_streaming_supported=True,
     )
+    # The editor's session count is cold-start editor creations plus these claims.
+    [claim_line] = [log for log in logs if log["event"] == "Claimed prewarmed debug session"]
+    assert (claim_line["session_kind"], claim_line["browser_session_id"]) == (BrowserSessionKind.editor, "pbs_prewarm")
     app_mock.AGENT_FUNCTION.supports_live_view.assert_not_called()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_called()
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session.assert_not_called()
@@ -539,6 +545,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         # A debug session exists to be watched in the studio, so it always declares it.
         needs_live_view=True,
         created_by="user_123",
+        session_kind=BrowserSessionKind.editor,
     )
     app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
         browser_session_id="pbs_new",
