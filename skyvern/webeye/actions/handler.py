@@ -6293,6 +6293,15 @@ class ActionHandler:
                 exception_message=str(e),
             )
             actions_result.append(ActionFailure(e))
+        except InvalidElementForTextInput as e:
+            # The planner picked an element that cannot take text. The typed rejection is the failure
+            # reason the run records, so the traceback adds nothing.
+            LOG.warning(
+                "Text input target does not support text input",
+                action=action,
+                exception_message=str(e),
+            )
+            actions_result.append(ActionFailure(e))
         except Exception as e:
             if is_driver_timeout_error(e):
                 LOG.warning("Browser timeout while handling action", action=action, exc_info=True)
