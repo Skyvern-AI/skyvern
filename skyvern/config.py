@@ -230,6 +230,8 @@ class Settings(BaseSettings):
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
+    # Synthetic browser fixture: never installed outside staging, disabled by default.
+    COPILOT_EVAL_AUTH_FIXTURE_ENABLED: bool = False
     BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
