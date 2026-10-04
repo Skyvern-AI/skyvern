@@ -3022,8 +3022,12 @@ class _RegistrationVault:
                 logging.getLogger("skyvern.test.vault").exception("vault create failed")
             raise HTTPException(status_code=502, detail=f"Custom credential service returned HTTP 500 for {data.name}")
         self.stored += 1
-        tasks.add_task(self.hooks_run.append, self.credential.credential_id)
+        tasks.add_task(self._run_hook, self.credential.credential_id)
         return self.credential
+
+    # Starlette sends a sync task to a worker thread, so a sync append lands whenever that thread runs.
+    async def _run_hook(self, credential_id: str) -> None:
+        self.hooks_run.append(credential_id)
 
     async def create_credential(
         self, organization_id: str, data: CreateCredentialRequest, created_by: str | None
