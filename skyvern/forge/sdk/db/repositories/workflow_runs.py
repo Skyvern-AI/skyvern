@@ -92,6 +92,7 @@ from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYT
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
+    MIXED_RUN_DEFINITION_DIGEST,
     WorkflowDefinition,
     WorkflowRun,
     WorkflowRunOutputParameter,
@@ -863,6 +864,7 @@ class WorkflowRunsRepository(BaseRepository):
         copilot_session_id: str | None = None,
         start_fresh_browser: bool | None = None,
         created_by: str | None = None,
+        workflow_definition_sha256: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -877,6 +879,7 @@ class WorkflowRunsRepository(BaseRepository):
                 start_fresh_browser=start_fresh_browser,
                 reuse_browser_session=reuse_browser_session,
                 reuse_bound_key=reuse_bound_key,
+                workflow_definition_sha256=workflow_definition_sha256,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
                 webhook_callback_url=webhook_callback_url,
@@ -1220,6 +1223,7 @@ class WorkflowRunsRepository(BaseRepository):
         only_from: Sequence[WorkflowRunStatus] | None = None,
         job_id: str | None = None,
         depends_on_workflow_run_id: str | None = None,
+        workflow_definition_sha256: str | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
@@ -1245,6 +1249,14 @@ class WorkflowRunsRepository(BaseRepository):
             values["job_id"] = job_id
         if depends_on_workflow_run_id:
             values["depends_on_workflow_run_id"] = depends_on_workflow_run_id
+        if workflow_definition_sha256 is not None:
+            # Only invalidate: a retry re-enters with the row as it is now while earlier attempts' block rows still
+            # describe the old code, and a NULL digest (a run created before digests) cannot say what those ran.
+            stored = WorkflowRunModel.workflow_definition_sha256
+            values["workflow_definition_sha256"] = case(
+                (and_(stored.is_not(None), stored != workflow_definition_sha256), MIXED_RUN_DEFINITION_DIGEST),
+                else_=stored,
+            )
         # The reopen/reset path clears attribution when it returns the row to `created`, so a
         # later terminal transition starts from SQL NULL and this COALESCE fills the freshly
         # derived document; on any row that already carries one it preserves the first writer.

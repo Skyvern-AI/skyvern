@@ -1247,6 +1247,7 @@ class CopilotContext(AgentContext):
     last_run_skipped_unbound_credentials: bool = False
     client_supports_credential_pause: bool = False
     client_supports_credential_pause_recovery: bool = False
+    client_supports_credential_generation: bool = False
     credential_recovery_token_digest: str | None = field(default=None, repr=False)
     credential_recovery_armed: bool = False
     credential_pause_used: bool = False
@@ -1259,6 +1260,9 @@ class CopilotContext(AgentContext):
     credential_pause_reaskable_by_run: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
+    credential_registration_outcome: Literal["rejected", "unknown"] | None = None
+    # Generate and save created, or may have created, a credential; a second generate card could mint a duplicate.
+    credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
@@ -1433,6 +1437,9 @@ class CopilotContext(AgentContext):
     proposal_revision: int | None = None
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
+    # for what a test under this token would run, so binding a run to it is refused.
+    settings_diverged_proposal_token: tuple[str, int] | None = None
     # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
     # staged draft at turn end. None on entrypoints that load no chat row.
     auto_accept: bool | None = None

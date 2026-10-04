@@ -61,7 +61,13 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowRequestBody,
+    WorkflowRun,
+    WorkflowRunStatus,
+    workflow_definition_sha256,
+)
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
     ProxyLocationInput,
@@ -809,9 +815,11 @@ async def run_task_v2_helper(
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
+    )
     await _set_up_workflow_context(workflow, workflow_run_id, organization)
 
     user_prompt = task_v2.prompt

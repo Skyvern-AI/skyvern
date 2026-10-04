@@ -139,6 +139,11 @@ FINAL_REPLY_OBSERVATION = (
     NUDGE_SENTINEL + "Your last response was empty. Tools are unavailable for this one response; "
     "reply to the user now with your final response for this turn."
 )
+RAW_SECRET_REPLY_WITHHELD_OBSERVATION = (
+    NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it contained "
+    "text shaped like a raw secret: a value written after a password, passcode, secret, API key, or token label. "
+    "Tools are unavailable for this one response; reply to the user now with your final response for this turn."
+)
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
@@ -1418,6 +1423,7 @@ async def run_final_reply_drain(
     session: Session | None,
     hooks: FinalReplyRunHooks,
     run_config: RunConfig,
+    observation: str = FINAL_REPLY_OBSERVATION,
 ) -> RunResultStreaming:
     reply_run_config = replace(
         run_config,
@@ -1429,7 +1435,7 @@ async def run_final_reply_drain(
     try:
         return await _run_streamed_with_deadline(
             agent,
-            FINAL_REPLY_OBSERVATION,
+            observation,
             ctx,
             session,
             _SendTrackingStream(stream),

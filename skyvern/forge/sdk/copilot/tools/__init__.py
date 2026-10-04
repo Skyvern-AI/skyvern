@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.utils.yaml_loader import dump_workflow_yaml
 
@@ -219,12 +220,10 @@ from .mcp_hooks import get_skyvern_mcp_alias_map as get_skyvern_mcp_alias_map
 from .page_challenge import FRESH_BROWSER_TOOL_NAME, SOLVE_TOOL_NAME, solve_page_challenge, start_fresh_browser
 from .page_observation import _record_composition_page_observation as _record_composition_page_observation
 from .page_observation import _resolve_url_title as _resolve_url_title
-from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
 from .run_execution import (
     RUN_RESULTS_MAX_ROW_KEYS,
 )
 from .run_execution import WatchdogExitReason as WatchdogExitReason
-from .run_execution import _any_quiet_block_requested as _any_quiet_block_requested
 from .run_execution import _attach_action_traces as _attach_action_traces
 from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
@@ -238,7 +237,6 @@ from .run_execution import (
     _diagnosis_repair_tool_error,
     _get_run_results,
 )
-from .run_execution import _progress_marker as _progress_marker
 from .run_execution import _read_progress_sources as _read_progress_sources
 from .run_execution import _record_diagnosis_repair_contract as _record_diagnosis_repair_contract
 from .run_execution import _record_run_blocks_result as _record_run_blocks_result
@@ -995,6 +993,7 @@ async def request_credential_tool(
     reason: str,
     credential_id: str | None = None,
     rejected_by_site: bool = False,
+    registration: CredentialRegistration | None = None,
 ) -> str:
     """Ask the user, in chat, how to sign in to a sign-in page: add or pick a saved credential, or
     sign in themselves in the live browser and save that sign-in as a browser profile.
@@ -1011,6 +1010,14 @@ async def request_credential_tool(
     refused that bound credential's saved password or code; a failed run's `credential_update` lever
     names the one credential bound to its failed block. The card asks the user to update it and
     comes back `updated` once they save; re-run the sign-in then.
+    When the user asked you to create one new account and the sign-up form needs a password, pass
+    `registration` with the sign-up page as `login_page_url`: the card offers to generate a password
+    and save it with that username and credential name, and you only ever get the credential's id.
+    `password_length` is 24 to 128; a longer or shorter site rule comes back `unsupported_constraints`.
+    `charset` is `alphanumeric` or `alphanumeric_symbols`; when the site's rules fit neither, call
+    without `registration` so the user adds the login. Never write a password yourself.
+    A second `registration` ask on a turn that already generated a credential, or may have, comes
+    back `already_generated` with no card.
     The call waits for the user's answer and comes back `connected` with the credential
     to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
     carries. It comes back `signed_in` when the user signed in themselves in the live browser:
@@ -1023,6 +1030,7 @@ async def request_credential_tool(
         "reason": reason,
         "credential_id": credential_id,
         "rejected_by_site": rejected_by_site,
+        "registration": registration.model_dump() if registration else None,
     }
     result: dict[str, Any] = {}
     try:
@@ -1037,6 +1045,7 @@ async def request_credential_tool(
                 credential_id,
                 rejected_by_site,
                 anchor_tool_call_id=_originating_call_id(ctx),
+                registration=registration,
             )
     finally:
         # A card on screen right now owns the gate; this call must not open it for one it never
@@ -1371,6 +1380,9 @@ async def get_run_results_tool(
     returned run, excluding runs started by any Copilot chat, newest first; it
     holds at most 5, so more may exist. When that lookup fails the result has
     newer_finished_runs_unavailable instead, so a missing list is not "none".
+    execution_source with source_kind run_version describes the saved version the run executed, which may
+    differ from the current draft (current_draft_code_matches compares each code block); disposition
+    unavailable means that version cannot be proven, so no executed source is given.
     """
     copilot_ctx = ctx.context
     params: dict[str, Any] = {}

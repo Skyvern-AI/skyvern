@@ -120,9 +120,8 @@ async def _call_internal_browser_tool(
 _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
 
 
-# Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
-# as a last-resort trip wire for runaway loops — progressing runs should never
-# approach this. The OpenAI Agents SDK wraps the tool in
+# Absolute upper bound on a single ``run_blocks`` tool invocation, including a run
+# whose rows have gone silent. The OpenAI Agents SDK wraps the tool in
 # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``; the
 # inner poll loop leaves a 10 s headroom below this ceiling for orderly
 # cleanup before the SDK cancels.

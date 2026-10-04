@@ -265,38 +265,19 @@ class TasksRepository(BaseRepository):
             total = (await session.execute(query)).scalar_one()
             return float(total)
 
-    @db_operation("get_workflow_run_progress_timestamps")
-    async def get_workflow_run_progress_timestamps(
+    @db_operation("get_workflow_run_block_progress_timestamp")
+    async def get_workflow_run_block_progress_timestamp(
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-    ) -> tuple[datetime | None, datetime | None]:
-        """Return ``(max(step.modified_at), max(workflow_run_block.modified_at))``
-        for a given workflow run. Both values are scalar aggregates — no row
-        hydration — and are designed for the copilot watchdog poll path where
-        the only question is "has anything changed since the last poll?".
-
-        Step updates are the per-LLM-call heartbeat (status transitions plus
-        incremental token/cost accumulators — every ``update_step`` call bumps
-        ``StepModel.modified_at``). Block updates cover non-task block types
-        (CODE, TEXT_PROMPT) that never create a task row. Together the two
-        aggregates cover every kind of block the copilot can run.
-        """
+    ) -> datetime | None:
         async with self.Session() as session:
-            step_stmt = (
-                select(func.max(StepModel.modified_at))
-                .join(TaskModel, StepModel.task_id == TaskModel.task_id)
-                .where(TaskModel.workflow_run_id == workflow_run_id)
-                .where(StepModel.organization_id == organization_id)
-            )
             block_stmt = (
                 select(func.max(WorkflowRunBlockModel.modified_at))
                 .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
                 .where(WorkflowRunBlockModel.organization_id == organization_id)
             )
-            step_ts = (await session.execute(step_stmt)).scalar_one_or_none()
-            block_ts = (await session.execute(block_stmt)).scalar_one_or_none()
-            return step_ts, block_ts
+            return (await session.execute(block_stmt)).scalar_one_or_none()
 
     @db_operation("get_total_unique_step_order_count_by_task_ids")
     async def get_total_unique_step_order_count_by_task_ids(
