@@ -15,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 import structlog
 from pydantic import JsonValue
 
+from skyvern.forge.failure_classifier import without_output_only_anti_bot
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
@@ -1638,7 +1639,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
     """Strip large/binary fields from tool results before sending to the LLM."""
     sanitized = sanitize_generic_tool_result_for_llm(
         tool_name,
-        result,
+        without_output_only_anti_bot(result),
         drop_top_level_keys=(
             "action",
             "browser_context",

@@ -25,6 +25,7 @@ import yaml
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import CopilotInlineSequentialCredentialUnsupported
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import without_output_only_anti_bot, without_output_only_anti_bot_categories
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.copilot.active_run_session import (
@@ -578,7 +579,12 @@ async def _chronological_run_block_rows(workflow_run_id: str, organization_id: s
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
-    return list(reversed(rows))
+    return [_without_output_only_anti_bot_output(row) for row in reversed(rows)]
+
+
+def _without_output_only_anti_bot_output(row: WorkflowRunBlock) -> WorkflowRunBlock:
+    output = without_output_only_anti_bot(row.output)
+    return row if output is row.output else row.model_copy(update={"output": output})
 
 
 def _reconcile_narrative_block_attempts(ctx: CopilotContext, blocks: list[WorkflowRunBlock]) -> None:
@@ -2191,7 +2197,7 @@ async def _attach_registered_output_parameter_values(
             block_info.update(index_by_key.get(output_parameter_key, {}))
         if block_info.get("block_label") in excluded_block_labels:
             continue
-        value = getattr(row, "value", None)
+        value = without_output_only_anti_bot(getattr(row, "value", None))
         item = {
             "workflow_run_id": workflow_run_id,
             "output_parameter_id": output_parameter_id,
@@ -4931,7 +4937,7 @@ async def _run_blocks_and_collect_debug(
         if not run_ok and run and getattr(run, "failure_reason", None):
             result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
         if not run_ok and run and getattr(run, "failure_category", None):
-            result_data["failure_category"] = run.failure_category
+            result_data["failure_category"] = without_output_only_anti_bot_categories(run.failure_category)
         _attach_loop_inputs(result_data, execution, workflow_run.workflow_run_id, run_block_rows)
         _attach_block_fact_projection(
             result_data,

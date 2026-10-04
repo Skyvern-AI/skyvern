@@ -8,7 +8,7 @@ from typing import Any
 import structlog
 
 from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
-from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, FailedToNavigateToUrl
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, CaptchaSolveError, FailedToNavigateToUrl
 
 LOG = structlog.get_logger(__name__)
 
@@ -70,11 +70,29 @@ def _proxy_transport_evidence(reason: str, exception: Exception | None) -> str |
     return "keyword_match" if any(code in driver_text for code in _PROXY_TRANSPORT_CODES_LOWER) else None
 
 
+def is_captcha_solve_failure(exception_name: str | None) -> bool:
+    """Whether an action result's recorded exception type is a CaptchaSolveError.
+
+    Subclasses are walked at call time because solver integrations register their failures (loop breaker,
+    timeout) as subclasses when imported, and an action result keeps only the class name.
+    """
+    if not exception_name:
+        return False
+    pending: list[type[CaptchaSolveError]] = [CaptchaSolveError]
+    while pending:
+        error_type = pending.pop()
+        if error_type.__name__ == exception_name:
+            return True
+        pending.extend(error_type.__subclasses__())
+    return False
+
+
 def classify_from_failure_reason(
     failure_reason: str | None,
     exception: Exception | None = None,
     fallback_to_unknown: bool = False,
     exception_name: str | None = None,
+    unsolved_captcha_exception: str | None = None,
 ) -> list[dict] | None:
     """Classify failure from failure_reason text and/or exception type.
 
@@ -83,6 +101,10 @@ def classify_from_failure_reason(
     ``exception_name`` classifies from a bare exception class name when the instance is
     unavailable — e.g. a Temporal activity failure whose cause type only crosses the
     serialization boundary as a string. Ignored when ``exception`` is provided.
+
+    ``unsolved_captcha_exception`` names a captcha-solve failure the run was still stuck on when
+    it ended. It outranks a BROWSER_ERROR: a browser lost while the run is blocked by a captcha
+    only reports how the run stopped, not why it failed.
 
     When ``fallback_to_unknown`` is True and no keywords match, returns a single
     UNKNOWN category instead of None.  Use True for paths that are *always* failures
@@ -400,6 +422,19 @@ def classify_from_failure_reason(
             }
         )
 
+    if unsolved_captcha_exception and any(
+        category["category"] == FailureCategory.BROWSER_ERROR.value for category in categories
+    ):
+        categories.append(
+            {
+                "category": FailureCategory.ANTI_BOT_DETECTION.value,
+                "confidence_float": 0.95,
+                "reason_code": UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
+                "reasoning": f"Exception: {unsolved_captcha_exception} before the browser was lost",
+                "evidence_source": "exception_type",
+            }
+        )
+
     if not categories:
         if fallback_to_unknown:
             return [
@@ -437,7 +472,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 3
+CLASSIFIER_VERSION = 4
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -456,6 +491,59 @@ _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCat
 BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
 PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
+UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
+
+# ANTI_BOT_DETECTION entries carrying one of these are labels only: runtime consumers must treat the
+# failure exactly as they did before it was labeled anti-bot. Code that acts on a failure_category it
+# reads (or hands to a model) must go through without_output_only_anti_bot or skip these entries.
+OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset({UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE})
+
+
+def is_output_only_anti_bot_entry(category: object) -> bool:
+    return (
+        isinstance(category, dict)
+        and category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
+        and category.get("reason_code") in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+    )
+
+
+def without_output_only_anti_bot_categories(categories: list) -> list:
+    return [category for category in categories if not is_output_only_anti_bot_entry(category)]
+
+
+def without_output_only_anti_bot(value: Any) -> Any:
+    """``value`` with output-only anti-bot entries removed from every ``failure_category`` list in it; customer
+    data shaped like a category elsewhere is left alone, and a value with no marked entry is returned as is."""
+    return _scrub_output_only_anti_bot(value) if _has_output_only_anti_bot(value) else value
+
+
+# Iterative and copy-free: every registered block output pays this walk, and almost none carry a marked entry.
+def _has_output_only_anti_bot(value: Any) -> bool:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            categories = item.get("failure_category")
+            if isinstance(categories, list) and any(is_output_only_anti_bot_entry(c) for c in categories):
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
+def _scrub_output_only_anti_bot(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_scrub_output_only_anti_bot(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: without_output_only_anti_bot_categories(item)
+            if key == "failure_category" and isinstance(item, list)
+            else _scrub_output_only_anti_bot(item)
+            for key, item in value.items()
+        }
+    return value
+
 
 # The only reason_code literals persisted attribution recognizes; unknown values are dropped,
 # not copied. secure_codeblock_*/locator_wait_for_timeout are emitted by classify_from_failure_reason
@@ -471,6 +559,7 @@ _REASON_CODE_LITERALS = frozenset(
         BROWSER_SESSION_CLOSED_REASON_CODE,
         BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
         PROXY_TRANSPORT_FAILED_REASON_CODE,
+        UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
     }
 )
 
