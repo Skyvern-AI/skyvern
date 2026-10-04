@@ -39,6 +39,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
     is_final_status,
+    unusable_browser_session_error,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -471,8 +472,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             if persistent_browser_session is None:
                 raise Exception(f"Persistent browser session not found for {browser_session_id}")
 
-            if is_final_status(persistent_browser_session.status):
-                raise BrowserSessionClosed(browser_session_id)
+            unusable = unusable_browser_session_error(persistent_browser_session)
+            if unusable is not None:
+                raise unusable
 
             runnable_generation_id = expected_runnable_generation_id or uuid.uuid4().hex
             await self.occupy_browser_session(
@@ -904,12 +906,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 current = await self.database.browser_sessions.get_persistent_browser_session(
                     session_id, organization_id
                 )
-                if current is not None and (
-                    current.completed_at is not None
-                    or current.close_requested_at is not None
-                    or is_final_status(current.status)
-                ):
-                    raise BrowserSessionClosed(session_id) from None
+                unusable = unusable_browser_session_error(current) if current is not None else None
+                if unusable is not None:
+                    # A startup timeout stays a BrowserSessionClosed here: the reuse path catches only that type.
+                    raise (
+                        unusable if isinstance(unusable, BrowserSessionClosed) else BrowserSessionClosed(session_id)
+                    ) from None
             except BaseException as classification_error:
                 if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
                     classification_error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)

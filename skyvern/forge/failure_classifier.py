@@ -17,6 +17,7 @@ class FailureCategory(StrEnum):
     ANTI_BOT_DETECTION = "ANTI_BOT_DETECTION"
     PROXY_ERROR = "PROXY_ERROR"
     BROWSER_ERROR = "BROWSER_ERROR"
+    BROWSER_SESSION_EXPIRED = "BROWSER_SESSION_EXPIRED"
     NAVIGATION_FAILURE = "NAVIGATION_FAILURE"
     PAGE_LOAD_TIMEOUT = "PAGE_LOAD_TIMEOUT"
     ELEMENT_STATE_TIMEOUT = "ELEMENT_STATE_TIMEOUT"
@@ -472,7 +473,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 4
+CLASSIFIER_VERSION = 5
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -490,6 +491,7 @@ _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCat
 # (skyvern/forge/sdk/workflow/service.py::_browser_lease_failure_category) imports these.
 BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
+BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE = "browser_session_expired_before_run"
 PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
 UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
 
@@ -558,6 +560,7 @@ _REASON_CODE_LITERALS = frozenset(
         "locator_wait_for_timeout",
         BROWSER_SESSION_CLOSED_REASON_CODE,
         BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+        BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
         PROXY_TRANSPORT_FAILED_REASON_CODE,
         UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
     }
@@ -582,6 +585,7 @@ _NON_INFRA_CATEGORIES = {
     "DATA_EXTRACTION_FAILURE",
     "LLM_REASONING_ERROR",
     "WRONG_PAGE_STATE",
+    "BROWSER_SESSION_EXPIRED",
 }
 
 

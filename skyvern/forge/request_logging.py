@@ -99,6 +99,7 @@ class _RequestIdentity:
     principal_resolution_conflict: bool = False
     bearer_identity_status: str | None = None
     principal_resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    load_shed: bool = False
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
@@ -131,6 +132,13 @@ def set_request_organization(
         identity.organization_name = organization_name
     if org_age is not None:
         identity.org_age = org_age
+
+
+def mark_request_load_shed() -> None:
+    """Log this request's 503 at warning level: the server shed it on purpose under load, before doing any work."""
+    identity = _request_identity.get()
+    if identity is not None:
+        identity.load_shed = True
 
 
 def set_request_principal(
@@ -309,7 +317,10 @@ def _log_request(
     headers: dict[str, str],
     start_time: float,
 ) -> None:
-    if status_code >= 500:
+    identity = _request_identity.get()
+    if status_code == 503 and identity is not None and identity.load_shed:
+        log_method = LOG.warning
+    elif status_code >= 500:
         log_method = LOG.error
     elif status_code >= 400 and status_code not in _ROUTINE_CLIENT_ERROR_STATUSES:
         log_method = LOG.warning

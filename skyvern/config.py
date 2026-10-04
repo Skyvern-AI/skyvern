@@ -301,6 +301,13 @@ class Settings(BaseSettings):
     # /stream sockets all count -- so size it against connections per task, not request concurrency.
     # Set it empty or 0 to disable shedding.
     API_LIMIT_CONCURRENCY: int | None = Field(default=512, gt=0)
+    # Run submissions one API process dispatches at once; later ones wait without holding a pooled connection, and
+    # get a retryable 503 before anything is written if no slot frees. 0 (the default) leaves them unbounded and 32
+    # is the suggested first value, checked against the skyvern.run_submission.in_flight gauge, which records either
+    # way; the DISABLE_RUN_SUBMISSION_GATE feature flag switches an enabled gate off without a restart.
+    RUN_SUBMISSION_MAX_CONCURRENCY: int = Field(default=0, ge=0)
+    # Below the SDK's 60 s client timeout, so a waiting caller is answered before it gives up.
+    RUN_SUBMISSION_SLOT_WAIT_SECONDS: float = Field(default=20.0, gt=0)
     # Must exceed the load balancer's idle timeout (infra/terraform/production/alb.tf); otherwise
     # the ALB reuses a connection the server already closed and answers the client with a 502.
     UVICORN_TIMEOUT_KEEP_ALIVE: int = 125

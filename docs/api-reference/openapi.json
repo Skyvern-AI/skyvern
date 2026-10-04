@@ -193,6 +193,17 @@
           "400": {
             "description": "Invalid agent run request"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -6627,6 +6638,17 @@
           },
           "404": {
             "description": "Workflow run not found"
+          },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -19339,6 +19361,22 @@
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
       },
+      "JobRecipeOutcome": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "canceled",
+          "job_unavailable",
+          "login_required",
+          "application_refused",
+          "blocked_by_site",
+          "invalid_input",
+          "insufficient_credits",
+          "incomplete",
+          "failed"
+        ],
+        "title": "JobRecipeOutcome"
+      },
       "JobRecipeRunListResponse": {
         "properties": {
           "runs": {
@@ -19435,6 +19473,29 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobRecipeOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Typed result of a finished run; null while it is still running. Apply failures name their cause (job_unavailable, login_required, application_refused, blocked_by_site, invalid_input, insufficient_credits, incomplete); a cause Skyvern cannot classify is failed, and so is every Extract failure except one Skyvern itself reports, such as running out of credits."
+          },
+          "next_step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Step",
+            "description": "What to do about an unsuccessful outcome; null for completed, canceled, and running runs."
           }
         },
         "additionalProperties": false,
@@ -19446,7 +19507,9 @@
           "status",
           "created_at",
           "job_url",
-          "failure_reason"
+          "failure_reason",
+          "outcome",
+          "next_step"
         ],
         "title": "JobRecipeRunSummary"
       },
