@@ -108,6 +108,19 @@ async def test_the_code_tool_mode_decides_whether_it_joins_or_replaces_the_direc
     assert len({oss.sha256, added.sha256, replaced.sha256}) == 3
 
 
+def test_executed_source_parameters_are_advertised_only_with_the_tool_that_produces_them() -> None:
+    def advertised(browser_code_available: bool) -> dict[str, dict[str, Any]]:
+        tools = copilot_native_tools(supports_question_tool=True, browser_code_available=browser_code_available)
+        return {tool.name: tool.params_json_schema["properties"] for tool in tools}
+
+    with_code_tool, without_code_tool = advertised(True), advertised(False)
+
+    assert with_code_tool["edit_block_and_run"]["executed_source_reference"]["description"]
+    assert with_code_tool["update_and_run_blocks"]["executed_source_references"]["description"]
+    assert "executed_source_reference" not in without_code_tool["edit_block_and_run"]
+    assert "executed_source_references" not in without_code_tool["update_and_run_blocks"]
+
+
 class _LeaseProbeSession:
     """Records whether the browser lease was still held when each cell ran."""
 

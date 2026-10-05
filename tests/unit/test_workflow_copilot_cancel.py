@@ -1342,7 +1342,6 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
     app.DATABASE.observer = SimpleNamespace(
         get_workflow_run_blocks=AsyncMock(return_value=[]),
     )
-    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
 
     # Make sure no cache is configured so the watcher never spawns and
     # user_cancel_observed[0] stays False.
