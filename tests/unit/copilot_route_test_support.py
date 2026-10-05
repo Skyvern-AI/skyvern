@@ -166,7 +166,6 @@ def setup_new_copilot_mocks(
     app.DATABASE.observer = SimpleNamespace(
         get_workflow_run_blocks=AsyncMock(return_value=[]),
     )
-    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
     app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(
         return_value=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
