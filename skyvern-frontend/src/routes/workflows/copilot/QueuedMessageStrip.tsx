@@ -1,4 +1,9 @@
-import { Cross2Icon, FileIcon, Pencil1Icon } from "@radix-ui/react-icons";
+import {
+  Cross2Icon,
+  FileIcon,
+  PaperPlaneIcon,
+  Pencil1Icon,
+} from "@radix-ui/react-icons";
 import type { ReactNode } from "react";
 
 import { CornerDownRightIcon } from "@/components/icons/CornerDownRightIcon";
@@ -13,6 +18,8 @@ type Props = {
   // Omitted for a product action's receipt, which has no words of the user's to edit.
   onEdit?: () => void;
   onRemove: () => void;
+  // Present while the running turn can take the message now instead of after it ends.
+  onSendNow?: () => void;
 };
 
 export function QueuedMessageStrip({
@@ -20,6 +27,7 @@ export function QueuedMessageStrip({
   attachments,
   onEdit,
   onRemove,
+  onSendNow,
 }: Props) {
   return (
     <div
@@ -42,6 +50,23 @@ export function QueuedMessageStrip({
               : `${attachments.length} files`}
           </span>
         </span>
+      ) : null}
+      {onSendNow ? (
+        <TooltipProvider>
+          <ControlTooltip
+            content="Copilot reads it at its next step instead of after this turn"
+            side="top"
+          >
+            <button
+              type="button"
+              onClick={onSendNow}
+              className="flex h-6 shrink-0 items-center gap-1 rounded px-1.5 text-[12px] text-foreground hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <PaperPlaneIcon aria-hidden className="h-3 w-3" />
+              Send now
+            </button>
+          </ControlTooltip>
+        </TooltipProvider>
       ) : null}
       <TooltipProvider>
         <span className="flex shrink-0 opacity-55 transition-opacity group-focus-within/queued:opacity-100 group-hover/queued:opacity-100">

@@ -138,6 +138,9 @@ import {
   WorkflowCopilotQuestionRequired,
   WorkflowCopilotQuestionResolved,
   CopilotProductAction,
+  CopilotSteerMessage,
+  WorkflowCopilotSteerDeliveredUpdate,
+  WorkflowCopilotSteerRequest,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { AutoAcceptChip } from "./AutoAcceptChip";
@@ -172,6 +175,7 @@ import {
   type CopilotComposerStatus,
 } from "./CopilotWorkingStatus";
 import { QueuedMessageStrip } from "./QueuedMessageStrip";
+import { SteerReceipt } from "./SteerReceipt";
 import {
   RecordingRefinementProgressCard,
   type RecordingRefinementStatus,
@@ -959,6 +963,25 @@ type QueuedPrompt = {
   recording?: RecordingSnapshot;
 };
 
+// "Send now" delivers words only: audio, files and recording state ride on a turn's own request.
+function canSendQueuedPromptNow(prompt: QueuedPrompt): boolean {
+  return (
+    prompt.origin === "typed" &&
+    prompt.reason === "working" &&
+    !prompt.audioBlob &&
+    !prompt.attachments?.length &&
+    !prompt.recording?.recording_in_progress
+  );
+}
+
+// A message sent into the running turn that its loop has not handed to the model yet.
+type PendingSteer = {
+  steerId: string;
+  text: string;
+  cancelToken: string;
+  sentAt: string;
+};
+
 type SendOptions = {
   selectedConnectedAccountId?: string;
   queuedMessageId?: string;
@@ -992,7 +1015,8 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCredentialRequiredUpdate
   | WorkflowCopilotCredentialPauseResolvedUpdate
   | WorkflowCopilotQuestionRequired
-  | WorkflowCopilotQuestionResolved;
+  | WorkflowCopilotQuestionResolved
+  | WorkflowCopilotSteerDeliveredUpdate;
 
 // The live pause frame is a structural superset of the card's frame; only
 // reason needs narrowing (the card tolerates unknown tokens either way).
@@ -1980,6 +2004,10 @@ export function WorkflowCopilotChat({
   } | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
+  const pendingSteersRef = useRef<PendingSteer[]>([]);
+  // The running turn's chat, which a brand-new chat learns from turn_start rather than at the end.
+  const turnChatIdRef = useRef<string | null>(null);
+  const [pendingSteers, setPendingSteers] = useState<PendingSteer[]>([]);
   // Read by cancelSend, which must not re-create on every render of the arming signal.
   const turnObservablyRunningRef = useRef(false);
   const stopArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2260,6 +2288,8 @@ export function WorkflowCopilotChat({
       streamingAbortController.current?.abort();
       streamingAbortController.current = null;
       inFlightRef.current = false;
+      pendingSteersRef.current = [];
+      setPendingSteers([]);
       canonicalRecoveryAbort.current?.abort();
       canonicalRecoveryAbort.current = null;
       canonicalRecoveryInFlight.current = false;
@@ -3217,6 +3247,8 @@ export function WorkflowCopilotChat({
     streamingAbortController.current?.abort();
     streamingAbortController.current = null;
     inFlightRef.current = false;
+    pendingSteersRef.current = [];
+    setPendingSteers([]);
     setIsLoading(false);
     setRecoveredPauseFrames([]);
     setQuestionInteractions([]);
@@ -6648,6 +6680,98 @@ export function WorkflowCopilotChat({
     [adjustTextareaHeight, returnFilesToTray, updateQueuedPrompt],
   );
 
+  // Removes and returns the matching steers, so whichever of delivery, refusal or the turn's end
+  // reaches a steer first is the only one that acts on it.
+  const takePendingSteers = useCallback(
+    (match: (steer: PendingSteer) => boolean) => {
+      const taken = pendingSteersRef.current.filter(match);
+      if (taken.length > 0) {
+        pendingSteersRef.current = pendingSteersRef.current.filter(
+          (steer) => !match(steer),
+        );
+        setPendingSteers(pendingSteersRef.current);
+      }
+      return taken;
+    },
+    [],
+  );
+
+  const restoreSteersToComposer = useCallback((steers: PendingSteer[]) => {
+    if (steers.length === 0) return;
+    const restore = (current: string) =>
+      appendQueuedText(steers.map((steer) => steer.text).join("\n"), current);
+    if (answeringQuestionRef.current) setPromptHeldForQuestion(restore);
+    else setInputValue(restore);
+  }, []);
+
+  // A steer the turn never received drains as the next turn, ahead of anything typed since.
+  const requeueSteers = useCallback(
+    (steers: PendingSteer[]) => {
+      if (steers.length === 0) return;
+      const text = steers.map((steer) => steer.text).join("\n");
+      const queued = queuedPromptRef.current;
+      if (queued === null) {
+        updateQueuedPrompt({
+          origin: "typed",
+          id: crypto.randomUUID(),
+          content: text,
+          reason: "working",
+        });
+      } else if (queued.origin === "typed") {
+        updateQueuedPrompt({
+          ...queued,
+          content: appendQueuedText(text, queued.content),
+        });
+      } else {
+        restoreSteersToComposer(steers);
+      }
+    },
+    [restoreSteersToComposer, updateQueuedPrompt],
+  );
+
+  const sendQueuedPromptNow = useCallback(async () => {
+    const prompt = queuedPromptRef.current;
+    const cancelToken = pendingCancelToken.current;
+    const chatId = turnChatIdRef.current;
+    if (!prompt || !canSendQueuedPromptNow(prompt) || !cancelToken || !chatId)
+      return;
+    const steer: PendingSteer = {
+      steerId: crypto.randomUUID(),
+      text: prompt.content,
+      cancelToken,
+      sentAt: new Date().toISOString(),
+    };
+    updateQueuedPrompt(null);
+    pendingSteersRef.current = [...pendingSteersRef.current, steer];
+    setPendingSteers(pendingSteersRef.current);
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post("/workflow/copilot/steer", {
+        workflow_copilot_chat_id: chatId,
+        cancel_token: cancelToken,
+        steer_id: steer.steerId,
+        message: steer.text,
+      } satisfies WorkflowCopilotSteerRequest);
+    } catch (error) {
+      const status = (error as { response?: { status?: number } })?.response
+        ?.status;
+      // Without a response the server may have recorded it, so delivery or the turn's end settles it.
+      if (status === undefined) return;
+      const refused = takePendingSteers(
+        (pending) => pending.steerId === steer.steerId,
+      );
+      requeueSteers(refused);
+      // 409 means the turn ended or is full, so the message simply goes out as the next turn.
+      if (refused.length > 0 && status !== 409) {
+        toast({
+          variant: "destructive",
+          title: "Couldn't send now",
+          description: "Your message is queued for when Copilot finishes.",
+        });
+      }
+    }
+  }, [credentialGetter, requeueSteers, takePendingSteers, updateQueuedPrompt]);
+
   const cancelSend = useCallback(
     async (
       source: WorkflowCopilotCancelSource,
@@ -6661,6 +6785,7 @@ export function WorkflowCopilotChat({
       // the composer synchronously, before isLoading flips and the drain effect
       // would otherwise send it as a fresh turn.
       restoreQueuedPromptToComposer();
+      restoreSteersToComposer(takePendingSteers(() => true));
 
       if (requireArmed && !turnObservablyRunningRef.current) return;
 
@@ -6759,6 +6884,8 @@ export function WorkflowCopilotChat({
       isCopilotTurnCurrent,
       logCopilotRequestFailure,
       restoreQueuedPromptToComposer,
+      restoreSteersToComposer,
+      takePendingSteers,
     ],
   );
 
@@ -7628,6 +7755,7 @@ export function WorkflowCopilotChat({
 
       const cancelToken = crypto.randomUUID();
       pendingCancelToken.current = cancelToken;
+      turnChatIdRef.current = null;
       try {
         if (workflowPermanentId)
           sessionStorage.setItem(
@@ -8682,6 +8810,9 @@ export function WorkflowCopilotChat({
                 }
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
+                turnChatIdRef.current =
+                  payload.workflow_copilot_chat_id ??
+                  workflowCopilotChatIdRef.current;
                 // Move the pre-submit canvas snapshot into the per-turn
                 // map keyed by the BE-assigned turn_id; cap the map so a
                 // long-running chat does not retain every turn's snapshot.
@@ -8716,6 +8847,14 @@ export function WorkflowCopilotChat({
               case "codegen_progress":
                 applyStoredNarrativeEvent(payload);
                 return false;
+              case "steer_delivered": {
+                const delivered = new Set(
+                  payload.steer_messages.map((item) => item.steer_id),
+                );
+                takePendingSteers((steer) => delivered.has(steer.steerId));
+                applyStoredNarrativeEvent(payload);
+                return false;
+              }
               case "workflow_draft": {
                 // The draft frame summarizes the whole draft; the newest block
                 // is the one being worked on.
@@ -8886,6 +9025,9 @@ export function WorkflowCopilotChat({
           queryKey: ["workflowSchedules", workflowPermanentId],
         });
         const current = isCopilotOwnerCurrent(reservation);
+        const undelivered = takePendingSteers(
+          (steer) => steer.cancelToken === cancelToken,
+        );
         const armRecovery = shouldArmRecovery();
         const retainReservation =
           armRecovery && pendingCanonicalRecovery.current !== null;
@@ -8917,6 +9059,10 @@ export function WorkflowCopilotChat({
           // an error/thrown path already did, but a cancel or abort reaches only
           // here. A no-op once a genuine success cleared the ref above.
           rollbackPendingTerminalContinuation();
+          // Steers this turn never received. A severed stream may still deliver them server-side,
+          // so those go back to the composer rather than out again on their own.
+          if (armRecovery) restoreSteersToComposer(undelivered);
+          else requeueSteers(undelivered);
           setIsLoading(false);
           // Backstop: a turn that ends without a terminal run_outcome (thrown
           // stream) would otherwise leave a live poll running past the run.
@@ -8940,6 +9086,9 @@ export function WorkflowCopilotChat({
     [
       acceptUnresolved,
       applyStoredNarrativeEvent,
+      takePendingSteers,
+      requeueSteers,
+      restoreSteersToComposer,
       captureCopilotEvent,
       createCanonicalRecovery,
       onWorkflowPersisted,
@@ -9887,6 +10036,16 @@ export function WorkflowCopilotChat({
   const showQueuedStrip = Boolean(
     queuedPrompt && !messages.some((message) => message.id === queuedPrompt.id),
   );
+  // A turn parked on a question or credential card cannot read the message until the user answers.
+  const canSendNow = Boolean(
+    queuedPrompt &&
+    canSendQueuedPromptNow(queuedPrompt) &&
+    turnObservablyRunning &&
+    !isStopping &&
+    !hasPendingQuestion &&
+    livePauseFrame === null &&
+    turnChatIdRef.current,
+  );
   const showsStopGlyph =
     isStopping || (turnObservablyRunning && !hasComposerText);
   const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
@@ -9949,11 +10108,25 @@ export function WorkflowCopilotChat({
   });
   const liveTurnShown =
     narrative.turnId !== null && narrative.terminal === null;
+  // A sent message renders where the model received it; a pending one sits at the turn's newest step.
+  const anchoredSteer = (steer: CopilotSteerMessage): AnchoredTurnItem => ({
+    key: `steer-${steer.steer_id}`,
+    toolCallId: null,
+    at: steer.delivered_at,
+    node: <SteerReceipt text={steer.text} sending={false} />,
+  });
   if (liveTurnShown) {
     liveAnchored.push(
       ...questionInteractions
         .filter((item) => item.turn_id === narrative.turnId)
         .map(anchoredQuestion),
+      ...narrative.steerMessages.map(anchoredSteer),
+      ...pendingSteers.map((steer) => ({
+        key: `steer-${steer.steerId}`,
+        toolCallId: null,
+        at: steer.sentAt,
+        node: <SteerReceipt text={steer.text} sending />,
+      })),
     );
   }
   // Straight to the answer path rather than through handleSend, whose authoring and YAML-commit
@@ -10419,7 +10592,10 @@ export function WorkflowCopilotChat({
                       node: autoBoundCard,
                     });
                   }
-                  anchored.push(...turnInteractions.map(anchoredQuestion));
+                  anchored.push(
+                    ...turnInteractions.map(anchoredQuestion),
+                    ...message.narrative.steerMessages.map(anchoredSteer),
+                  );
                   return (
                     <div
                       key={message.id}
@@ -11047,6 +11223,9 @@ export function WorkflowCopilotChat({
                 : () => restoreQueuedPromptToComposer()
             }
             onRemove={() => restoreQueuedPromptToComposer({ keepText: false })}
+            onSendNow={
+              canSendNow ? () => void sendQueuedPromptNow() : undefined
+            }
           />
         ) : null}
         <div

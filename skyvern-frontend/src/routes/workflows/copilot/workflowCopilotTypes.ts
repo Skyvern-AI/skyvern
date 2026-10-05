@@ -181,6 +181,27 @@ export interface WorkflowCopilotCancelRequest {
   source: WorkflowCopilotCancelSource;
 }
 
+export interface WorkflowCopilotSteerRequest {
+  workflow_copilot_chat_id: string;
+  cancel_token: string;
+  steer_id: string;
+  message: string;
+}
+
+// A message sent into a running turn, as the server screened and stored it.
+export interface CopilotSteerMessage {
+  steer_id: string;
+  text: string;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+export interface WorkflowCopilotSteerDeliveredUpdate {
+  type: "steer_delivered";
+  turn_id: string;
+  steer_messages: CopilotSteerMessage[];
+}
+
 export type WorkflowCopilotMessageFeedbackRating = "up" | "down";
 
 export interface WorkflowCopilotMessageFeedback {
@@ -318,7 +339,8 @@ export type WorkflowCopilotStreamMessageType =
   | "codegen_progress"
   | "title_update"
   | "credential_required"
-  | "question_required";
+  | "question_required"
+  | "steer_delivered";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -365,6 +387,7 @@ export interface WorkflowCopilotTurnStartUpdate {
   // edit-vs-build chip; the snap-back source is captured client-side at
   // submit time so unsaved local canvas edits survive.
   prior_block_count?: number | null;
+  workflow_copilot_chat_id?: string | null;
 }
 
 export interface WorkflowCopilotDesignStartUpdate {
