@@ -102,7 +102,7 @@ def _artifact(number: int, *, created_at: datetime) -> Artifact:
 def _route_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMock, AsyncMock]:
     get_session = AsyncMock(return_value=SimpleNamespace(browser_session_id=SESSION_ID, organization_id=ORG_ID))
     create_artifact = AsyncMock(return_value="a_test")
-    monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", get_session)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "get_persistent_browser_session", get_session)
     monkeypatch.setattr(
         forge_app.ARTIFACT_MANAGER,
         "create_browser_session_action_log_artifact",

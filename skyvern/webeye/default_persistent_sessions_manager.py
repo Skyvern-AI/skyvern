@@ -644,7 +644,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
         return True
 
-    async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
+    async def get_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        reconcile_in_background: bool = False,
+    ) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
 
