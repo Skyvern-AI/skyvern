@@ -94,6 +94,11 @@ const FAILURE_CATEGORY_DISPLAY = {
     description:
       "Something went wrong on Skyvern's side, such as a network or capacity problem. Retrying usually helps.",
   },
+  WEBSITE_ERROR: {
+    label: "Website error",
+    description:
+      "The website had a problem on its side, such as a 502 Bad Gateway, an outage, or maintenance. Nothing is wrong with your workflow. Retrying later usually helps.",
+  },
   PARAMETER_BINDING_ERROR: {
     label: "Parameter setup failed",
     description:
