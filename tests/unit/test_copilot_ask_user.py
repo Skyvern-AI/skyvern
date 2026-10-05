@@ -163,6 +163,7 @@ async def setup_question_chat(sqlite_engine, monkeypatch):
     api.add_api_route("/reply", routes.workflow_copilot_question_response, methods=["POST"])
     api.add_api_route("/history", routes.workflow_copilot_chat_history, methods=["GET"])
     api.add_api_route("/cancel", routes.workflow_copilot_cancel, methods=["POST"], status_code=204)
+    api.add_api_route("/steer", routes.workflow_copilot_steer, methods=["POST"])
     client = AsyncClient(transport=ASGITransport(app=api), base_url="http://fixture")
     frames = asyncio.Queue()
     ctx = CopilotContext(

@@ -214,6 +214,14 @@ def test_build_user_context_preserves_structured_evidence_after_redacting_secret
     assert "a002" in context
 
 
+def test_build_user_context_renders_scope_check_after_the_user_message() -> None:
+    context = agent_module._build_user_context(
+        "", "user history", "", "", "make me a game", scope_check="SCOPE-SENTINEL"
+    )
+
+    assert context.rstrip().endswith("make me a game\n```\n\nSCOPE-SENTINEL")
+
+
 _COVERED_DRAFT_YAML = """title: Draft
 workflow_definition:
   parameters: []
