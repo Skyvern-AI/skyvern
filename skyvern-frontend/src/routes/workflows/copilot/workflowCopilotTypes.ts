@@ -54,10 +54,59 @@ export interface QuestionAnswer {
   text?: string | null;
 }
 
+export type AccountGroupOutcome =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "unknown"
+  | "canceled";
+
+export interface AccountGroupRow {
+  credential_id: string;
+  label: string;
+  prior_outcome: AccountGroupOutcome | null;
+  preselected: boolean;
+}
+
+export interface AccountGroupReview {
+  workflow_permanent_id: string;
+  workflow_id: string;
+  version: number;
+  workflow_title: string;
+  credential_parameter_key: string;
+  action_summary: string;
+  common_inputs: Record<string, unknown>;
+  clean_group_run_id?: string | null;
+  credential_parameter_used_by?: string[];
+  rows: AccountGroupRow[];
+  workflow_run_group_id: string | null;
+  decision?: AccountGroupDecision | null;
+}
+
+export interface AccountGroupRunRow {
+  credential_id: string;
+  label: string;
+  workflow_run_id: string;
+  outcome: AccountGroupOutcome;
+}
+
+export interface AccountGroupCancelReview {
+  workflow_run_group_id: string;
+  unfinished_rows: AccountGroupRunRow[];
+  decision?: AccountGroupDecision | null;
+}
+
+export interface AccountGroupDecision {
+  approved: boolean;
+  credential_ids: string[];
+}
+
 export interface QuestionResponse {
   answers?: QuestionAnswer[];
   text?: string | null;
   skipped?: boolean;
+  account_group_decision?: AccountGroupDecision;
 }
 
 export interface QuestionInteraction {
@@ -69,6 +118,8 @@ export interface QuestionInteraction {
   response: QuestionResponse | null;
   created_at: string;
   resolved_at: string | null;
+  account_group_review?: AccountGroupReview;
+  account_group_cancel?: AccountGroupCancelReview;
 }
 
 export interface WorkflowCopilotQuestionRequired {
@@ -172,6 +223,7 @@ export interface WorkflowCopilotChatRequest {
   credential_recovery_token?: string;
   supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
+  supports_account_group_card?: boolean;
 }
 
 export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";

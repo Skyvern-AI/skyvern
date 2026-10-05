@@ -187,6 +187,14 @@ import {
   ConnectedAccountChoiceCard,
   ConnectedAccountChoiceMarker,
 } from "./cards/ConnectedAccountChoiceCard";
+import {
+  AccountGroupCancelReceipt,
+  AccountGroupReceiptCard,
+} from "./cards/AccountGroupReceiptCard";
+import {
+  AccountGroupCancelCard,
+  AccountGroupReviewCard,
+} from "./cards/AccountGroupReviewCard";
 import { QuestionReceipt } from "./cards/QuestionReceipt";
 import { QUESTION_PROMPT_ID, QuestionTray } from "./cards/QuestionTray";
 import { useQuestionStepper } from "./useQuestionStepper";
@@ -7016,9 +7024,11 @@ export function WorkflowCopilotChat({
           workflowCopilotChatIdRef.current !== workflowCopilotChatId
         )
           return true;
+        // A stream frame that resolved this question first is newer than the ack; it can carry the group id.
         setQuestionInteractions((current) =>
           current.map((item) =>
-            item.interaction_id === interaction.interaction_id
+            item.interaction_id === interaction.interaction_id &&
+            item.status === "pending"
               ? accepted.data
               : item,
           ),
@@ -7065,17 +7075,22 @@ export function WorkflowCopilotChat({
   const trayQuestion = questionInteractions.find(
     (item) => item.status === "pending",
   );
+  // An account card is answered on the card alone, so the composer stays a message field.
+  const composerQuestion =
+    trayQuestion?.account_group_review || trayQuestion?.account_group_cancel
+      ? undefined
+      : trayQuestion;
   const questionStepper = useQuestionStepper(
-    trayQuestion,
+    composerQuestion,
     inputValue,
     setInputValue,
   );
-  const trayPart = trayQuestion?.parts[questionStepper.index];
+  const trayPart = composerQuestion?.parts[questionStepper.index];
   // handleSend is memoised and outlives a render; the stepper is rebuilt on every keystroke.
   const questionStepperRef = useRef(questionStepper);
   questionStepperRef.current = questionStepper;
   const [questionTrayCollapsed, setQuestionTrayCollapsed] = useState(false);
-  const trayQuestionId = trayQuestion?.interaction_id ?? null;
+  const trayQuestionId = composerQuestion?.interaction_id ?? null;
   const [draftQuestionId, setDraftQuestionId] = useState(trayQuestionId);
   answeringQuestionRef.current = trayQuestionId !== null;
   // Adjusts state during render so the composer swaps before it paints, which an effect can't
@@ -7443,7 +7458,10 @@ export function WorkflowCopilotChat({
       }
       const candidate = messageOverride ?? inputValue;
       const pendingQuestion = questionInteractions.find(
-        (item) => item.status === "pending",
+        (item) =>
+          item.status === "pending" &&
+          !item.account_group_review &&
+          !item.account_group_cancel,
       );
       // The composer is the text field for the question on screen, so Enter steps through the
       // tray and the last step sends every part's answer together.
@@ -8676,6 +8694,7 @@ export function WorkflowCopilotChat({
             ),
             credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
+            supports_account_group_card: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             if (
@@ -9282,7 +9301,7 @@ export function WorkflowCopilotChat({
     if (e.key === "Escape" && queuedPrompt) {
       e.preventDefault();
       e.stopPropagation();
-      if (!trayQuestion) restoreQueuedPromptToComposer();
+      if (!composerQuestion) restoreQueuedPromptToComposer();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -9945,9 +9964,7 @@ export function WorkflowCopilotChat({
     : browserStatusText;
   // The composer is the text field for the pending question, so while one is pending it says so
   // rather than inviting a new request.
-  const latestTurnIsAsk = questionInteractions.some(
-    (item) => item.status === "pending",
-  );
+  const latestTurnIsAsk = composerQuestion !== undefined;
   // A bypassed proposal's gate stays attached to its owning turn (not
   // necessarily the last message) so a chip can jump back to it.
   const gateOwnerTurnId =
@@ -10061,7 +10078,7 @@ export function WorkflowCopilotChat({
     !waitingOnQueueOnly;
   // Attachments alone can't answer a question, so the last step needs a choice or text.
   const questionAnswerMissing =
-    Boolean(trayQuestion) &&
+    Boolean(composerQuestion) &&
     questionStepper.isLast &&
     questionStepper.answeredCount === 0 &&
     (!turnObservablyRunning || hasComposerText);
@@ -10075,7 +10092,7 @@ export function WorkflowCopilotChat({
           ? "Starting…"
           : questionAnswerMissing
             ? "Send disabled — answer or skip the question"
-            : trayQuestion && (!turnObservablyRunning || hasComposerText)
+            : composerQuestion && (!turnObservablyRunning || hasComposerText)
               ? questionStepper.isLast
                 ? "Send answer"
                 : "Next question"
@@ -10091,12 +10108,29 @@ export function WorkflowCopilotChat({
                     ? "Queue for next turn"
                     : "Stop";
 
-  const renderQuestionReceipt = (interaction: QuestionInteraction) => (
-    <QuestionReceipt
-      key={interaction.interaction_id}
-      interaction={interaction}
-    />
-  );
+  const renderQuestionReceipt = (interaction: QuestionInteraction) =>
+    interaction.account_group_review ? (
+      <AccountGroupReceiptCard
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.account_group_review}
+        turnLive={
+          narrative.turnId === interaction.turn_id &&
+          narrative.terminal === null
+        }
+      />
+    ) : interaction.account_group_cancel ? (
+      <AccountGroupCancelReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.account_group_cancel}
+      />
+    ) : (
+      <QuestionReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+      />
+    );
   // A question renders under the step that asked it, like a plan or credential card.
   const anchoredQuestion = (
     interaction: QuestionInteraction,
@@ -10769,7 +10803,7 @@ export function WorkflowCopilotChat({
                               queuedPrompt.reason === "working"
                                 ? "Queued — sends when this turn finishes."
                                 : "Prompt queued. Waiting for live browser...",
-                            onCancel: trayQuestion
+                            onCancel: composerQuestion
                               ? undefined
                               : () => restoreQueuedPromptToComposer(),
                           }
@@ -11155,7 +11189,45 @@ export function WorkflowCopilotChat({
         <span className="sr-only" aria-live="polite">
           {queuedPrompt && composerStatus !== "working" ? "Message queued" : ""}
         </span>
-        {trayQuestion ? (
+        {trayQuestion?.account_group_review ? (
+          <AccountGroupReviewCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.account_group_review}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onApprove={(credentialIds) =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: {
+                  approved: true,
+                  credential_ids: credentialIds,
+                },
+              })
+            }
+            onDecline={() =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: { approved: false, credential_ids: [] },
+              })
+            }
+            upNext={attentionUpNext}
+          />
+        ) : trayQuestion?.account_group_cancel ? (
+          <AccountGroupCancelCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.account_group_cancel}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onDecide={(approved) =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: { approved, credential_ids: [] },
+              })
+            }
+            upNext={attentionUpNext}
+          />
+        ) : trayQuestion ? (
           <QuestionTray
             interaction={trayQuestion}
             stepper={questionStepper}
@@ -11218,7 +11290,7 @@ export function WorkflowCopilotChat({
             text={queuedPrompt.content}
             attachments={queuedPrompt.attachments ?? []}
             onEdit={
-              queuedPrompt.origin === "product" || trayQuestion
+              queuedPrompt.origin === "product" || composerQuestion
                 ? undefined
                 : () => restoreQueuedPromptToComposer()
             }
@@ -11272,9 +11344,9 @@ export function WorkflowCopilotChat({
             onChange={(e) => setInputValue(e.target.value)}
             onFocus={() => setQuestionTrayCollapsed(false)}
             onKeyDown={handleKeyPress}
-            aria-label={trayQuestion ? "Your response" : undefined}
+            aria-label={composerQuestion ? "Your response" : undefined}
             aria-describedby={
-              trayQuestion && !questionTrayCollapsed
+              composerQuestion && !questionTrayCollapsed
                 ? QUESTION_PROMPT_ID
                 : undefined
             }
