@@ -416,6 +416,16 @@ def _current_secret_values_for_redaction() -> set[str]:
     return secret_values
 
 
+def _run_id_header() -> dict[str, str]:
+    """Opt-in run id header so an OpenAI-compatible gateway can attribute LLM calls to a run. SKY-17717."""
+    header_name = settings.OPENAI_COMPATIBLE_RUN_ID_HEADER
+    if not header_name:
+        return {}
+    context = skyvern_context.current()
+    run_id = (context.workflow_run_id or context.task_id) if context else None
+    return {header_name: run_id} if run_id else {}
+
+
 def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
     if text is None:
         return None
@@ -3406,6 +3416,10 @@ class LLMAPIHandlerFactory:
         if not isinstance(llm_config, LLMRouterConfig) and "gemini" in llm_config.model_name.lower():
             params["safety_settings"] = GEMINI_SAFETY_SETTINGS
 
+        # Every litellm path (router, direct handler, LLMCaller) builds its request from these params.
+        if run_id_header := _run_id_header():
+            params["extra_headers"] = run_id_header
+
         return params
 
     @classmethod
@@ -4205,6 +4219,9 @@ class LLMCaller:
                 # Only set the header when there are actual images in the request
                 if has_images:
                     extra_headers["Copilot-Vision-Request"] = "true"
+
+            # The openai client path ignores active_parameters["extra_headers"], so merge it here too.
+            extra_headers.update(_run_id_header())
 
             # Filter out parameters that OpenAI client doesn't support
             openai_params = {}

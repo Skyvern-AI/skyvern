@@ -628,6 +628,8 @@ class Settings(BaseSettings):
     OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX: bool = False
     OPENAI_COMPATIBLE_MODEL_KEY: str = "OPENAI_COMPATIBLE"
     OPENAI_COMPATIBLE_REASONING_EFFORT: str | None = None
+    # Opt-in: header name that carries the workflow_run_id (or task_id) on every LLM request. SKY-17717.
+    OPENAI_COMPATIBLE_RUN_ID_HEADER: str | None = None
     OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN: str = "githubcopilot.com"
 
     # AZURE
