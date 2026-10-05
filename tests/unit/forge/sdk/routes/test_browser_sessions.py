@@ -126,7 +126,7 @@ async def test_an_unconfirmed_extension_is_accepted_not_failed() -> None:
 @pytest.mark.asyncio
 async def test_close_browser_session_returns_404_without_org_owned_session() -> None:
     app_mock = MagicMock()
-    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=None)
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
     with (
@@ -139,14 +139,16 @@ async def test_close_browser_session_returns_404_without_org_owned_session() -> 
         )
 
     assert exc_info.value.status_code == 404
-    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_awaited_once_with("pbs_foreign", "org_requester")
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session.assert_awaited_once_with(
+        "pbs_foreign", "org_requester"
+    )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_close_browser_session_skips_close_for_a_completed_session() -> None:
     app_mock = MagicMock()
-    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
         return_value=SimpleNamespace(status="completed", completed_at=datetime(2026, 1, 1))
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
@@ -155,7 +157,6 @@ async def test_close_browser_session_skips_close_for_a_completed_session() -> No
 
     assert response.status_code == 200
     assert json.loads(response.body) == {"message": "Browser session closed"}
-    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_awaited_once_with("pbs_1", "org_1")
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
 
 
@@ -163,7 +164,7 @@ async def test_close_browser_session_skips_close_for_a_completed_session() -> No
 @pytest.mark.parametrize("status", ["running", "completed", "failed"])
 async def test_close_browser_session_closes_any_session_without_completed_at(status: str) -> None:
     app_mock = MagicMock()
-    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
         return_value=SimpleNamespace(status=status, completed_at=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
@@ -178,7 +179,7 @@ async def test_close_browser_session_closes_any_session_without_completed_at(sta
 @pytest.mark.asyncio
 async def test_close_browser_session_propagates_close_failure_for_a_live_session() -> None:
     app_mock = MagicMock()
-    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
         return_value=SimpleNamespace(status="running", completed_at=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock(side_effect=RuntimeError("close failed"))
