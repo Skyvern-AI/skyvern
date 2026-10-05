@@ -392,7 +392,12 @@ def evaluate_output_policy(
         verdict.add(OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK)
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_self_prescriptive_phrase(user_response):
         verdict.add(OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK)
-    if response_type in ("REPLY", "ASK_QUESTION") and looks_like_workflow_yaml_in_chat(user_response):
+    # Without a proposal, block YAML in a reply is usually an example answering a question.
+    if (
+        has_workflow_proposal
+        and response_type in ("REPLY", "ASK_QUESTION")
+        and looks_like_workflow_yaml_in_chat(user_response)
+    ):
         verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
