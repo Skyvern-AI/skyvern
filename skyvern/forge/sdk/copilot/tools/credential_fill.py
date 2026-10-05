@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     QuestionResponseSiteURLSource,
     RequestPolicy,
     SiteURLSource,
+    SteerMessageSiteURLSource,
     UserMessageSiteURLSource,
     admit_credential_for_live_page,
     loggable_origin,
@@ -469,6 +470,8 @@ def _log_fill_grant(
         source_fields = {"source_kind": source.kind, "source_user_message": source.message_index}
     elif isinstance(source, QuestionResponseSiteURLSource):
         source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
+    elif isinstance(source, SteerMessageSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_steer_id": source.steer_id}
     LOG.info(
         "copilot credential fill grant",
         route=route,

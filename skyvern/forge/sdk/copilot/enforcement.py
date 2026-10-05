@@ -94,6 +94,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
+from skyvern.forge.sdk.copilot.steer import take_steer_input, watch_for_steer
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -1309,6 +1310,8 @@ async def _run_streamed_with_deadline(
     runner_kwargs: dict[str, Any],
     start_time: float,
     iteration: int,
+    *,
+    watch_steer: bool = False,
 ) -> Any:
     """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
@@ -1337,12 +1340,17 @@ async def _run_streamed_with_deadline(
                 result.cancel(mode="after_turn")
 
         ctx.check_model_work_deadline = None if ctx.budget_expiry_state.drain_active else check_model_work_deadline
+        steer_watcher = asyncio.create_task(watch_for_steer(result, ctx)) if watch_steer else None
         try:
             try:
                 async with asyncio.timeout(remaining) as deadline:
                     ctx.model_stream_deadline = deadline
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
+                if steer_watcher is not None:
+                    steer_watcher.cancel()
+                    await asyncio.wait({steer_watcher})
+                ctx.model_call_in_flight = False
                 ctx.model_stream_deadline = None
                 ctx.check_model_work_deadline = None
                 # A request_credential call the SDK rejected before its handler ran leaves the gate
@@ -2021,6 +2029,7 @@ async def run_with_enforcement(
                     current_runner_kwargs,
                     start_time,
                     iteration,
+                    watch_steer=True,
                 )
             except asyncio.CancelledError:
                 _record_copilot_cancellation(ctx, start_time, iteration)
@@ -2076,6 +2085,7 @@ async def run_with_enforcement(
                         current_runner_kwargs,
                         start_time,
                         iteration,
+                        watch_steer=True,
                     )
                 except asyncio.CancelledError:
                     _record_copilot_cancellation(ctx, start_time, iteration)
@@ -2114,6 +2124,14 @@ async def run_with_enforcement(
                 iteration,
                 "deadline",
             )
+
+        steer_input = await take_steer_input(ctx)
+        if steer_input:
+            current_input = (
+                steer_input if session is not None else _prune_input_list(result.to_input_list()) + steer_input
+            )
+            iteration += 1
+            continue
 
         # The post-run screenshot drain must follow the enforcement check:
         # without a nudge, re-invoking with just the screenshot would replace

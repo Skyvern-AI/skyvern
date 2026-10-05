@@ -55,6 +55,7 @@ _SENSITIVE_ENDPOINTS = {
     # body stays opaque; the route persists only its canonical redacted form.
     "POST /v1/workflow/copilot/chat-post",
     "POST /v1/workflow/copilot/question-response",
+    "POST /v1/workflow/copilot/steer",
     "POST /v1/workflow/copilot/credential-response",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
     # Payment-provider events carry customer billing details (name, email, address, card metadata).
