@@ -31,6 +31,7 @@ class FailureCategory(StrEnum):
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     LLM_REASONING_ERROR = "LLM_REASONING_ERROR"
     INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
+    WEBSITE_ERROR = "WEBSITE_ERROR"
     PARAMETER_BINDING_ERROR = "PARAMETER_BINDING_ERROR"
     UNKNOWN = "UNKNOWN"
 
@@ -473,7 +474,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 5
+CLASSIFIER_VERSION = 6
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -581,6 +582,7 @@ _INFRA_COMPONENT_BY_CATEGORY = {
 _NON_INFRA_CATEGORIES = {
     "MAX_STEPS_EXCEEDED",
     "BUDGET_EXHAUSTED",
+    "WEBSITE_ERROR",
     "ELEMENT_NOT_FOUND",
     "DATA_EXTRACTION_FAILURE",
     "LLM_REASONING_ERROR",

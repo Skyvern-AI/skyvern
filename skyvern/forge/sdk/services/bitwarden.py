@@ -94,6 +94,15 @@ _DECRYPTION_FAILURE_VALUE = "[error: cannot decrypt]"
 # audit-event upload failure. Everything else stays fatal.
 _EVENT_POST_FAILED_ADVISORY = "Event post failed."
 
+# CLI 2026.x prints this on `bw login --apikey` (vault still locked) when the server has no recorded user key id;
+# the `bw unlock` that follows records it. Only this exact line is tolerated, never other backfill failures.
+_USER_KEY_ID_BACKFILL_ADVISORY = re.compile(
+    r"^\[UserKeyIdBackfillMigration\] Could not determine whether user "
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} "
+    r"needs migration: KeyIdBackfillError: User key is not available in key store$",
+    re.IGNORECASE,
+)
+
 
 def _contains_decryption_failure(value: Any) -> bool:
     if isinstance(value, str):
@@ -469,12 +478,12 @@ def _credit_card_credential_from_bitwarden_item(item: dict) -> CreditCardCredent
         key.removeprefix("metadata_"): value for key, value in extra_values.items() if key.startswith("metadata_")
     }
     return CreditCardCredential(
-        card_holder_name=card["cardholderName"],
-        card_number=card["number"],
-        card_exp_month=card["expMonth"],
-        card_exp_year=card["expYear"],
-        card_cvv=card["code"],
-        card_brand=card["brand"],
+        card_holder_name=card.get("cardholderName"),
+        card_number=card.get("number"),
+        card_exp_month=card.get("expMonth"),
+        card_exp_year=card.get("expYear"),
+        card_cvv=card.get("code"),
+        card_brand=card.get("brand"),
         billing_address=CreditCardBillingAddress(**address_values) if address_values else None,
         billing_email=extra_values.get("billing_email"),
         billing_phone=extra_values.get("billing_phone"),
@@ -500,8 +509,8 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
-                username=login["username"] or "",
-                password=login["password"] or "",
+                username=login.get("username") or "",
+                password=login.get("password") or "",
                 totp=totp,
                 metadata=_password_metadata_from_bitwarden_item(item),
             ),
@@ -663,6 +672,7 @@ class BitwardenService:
         ]
         ignorable_regexes = [
             re.compile(r'^Could not find data file, ".+?/data\.json"; creating it instead\.$'),
+            _USER_KEY_ID_BACKFILL_ADVISORY,
         ]
         for line in lines:
             if any(s in line for s in ignorable_substrings):
@@ -982,9 +992,9 @@ class BitwardenService:
         else:
             card = item.get("card")
             card_fields = ("cardholderName", "number", "expMonth", "expYear", "code", "brand")
-            if not isinstance(card, dict) or any(field not in card for field in card_fields):
+            if not isinstance(card, dict) or not any(field in card for field in card_fields):
                 raise BitwardenGetItemError("Invalid Bitwarden card payload")
-            if any(card[field] is not None and not isinstance(card[field], str) for field in card_fields):
+            if any(card.get(field) is not None and not isinstance(card[field], str) for field in card_fields):
                 raise BitwardenGetItemError("Invalid Bitwarden card field")
             fields = item.get("fields")
             if fields is not None and (
@@ -1592,12 +1602,12 @@ class BitwardenService:
             credit_card_data = item["card"]
 
             mapped_credit_card_data: dict[str, str] = {
-                BitwardenConstants.CREDIT_CARD_HOLDER_NAME: credit_card_data["cardholderName"],
-                BitwardenConstants.CREDIT_CARD_NUMBER: credit_card_data["number"],
-                BitwardenConstants.CREDIT_CARD_EXPIRATION_MONTH: credit_card_data["expMonth"],
-                BitwardenConstants.CREDIT_CARD_EXPIRATION_YEAR: credit_card_data["expYear"],
-                BitwardenConstants.CREDIT_CARD_CVV: credit_card_data["code"],
-                BitwardenConstants.CREDIT_CARD_BRAND: credit_card_data["brand"],
+                BitwardenConstants.CREDIT_CARD_HOLDER_NAME: credit_card_data.get("cardholderName"),
+                BitwardenConstants.CREDIT_CARD_NUMBER: credit_card_data.get("number"),
+                BitwardenConstants.CREDIT_CARD_EXPIRATION_MONTH: credit_card_data.get("expMonth"),
+                BitwardenConstants.CREDIT_CARD_EXPIRATION_YEAR: credit_card_data.get("expYear"),
+                BitwardenConstants.CREDIT_CARD_CVV: credit_card_data.get("code"),
+                BitwardenConstants.CREDIT_CARD_BRAND: credit_card_data.get("brand"),
             }
             mapped_credit_card_data.update(_extract_credit_card_extra_custom_field_values(item))
 
@@ -1688,8 +1698,8 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 
         return PasswordCredential(
-            username=login["username"] or "",
-            password=login["password"] or "",
+            username=login.get("username") or "",
+            password=login.get("password") or "",
             totp=totp,
         )
 
@@ -1994,8 +2004,8 @@ class BitwardenService:
                 credential_type=CredentialType.PASSWORD,
                 name=name,
                 credential=PasswordCredential(
-                    username=login_item["username"] or "",
-                    password=login_item["password"] or "",
+                    username=login_item.get("username") or "",
+                    password=login_item.get("password") or "",
                     totp=BitwardenService.normalize_totp_config(login_item.get("totp") or ""),
                     metadata=_password_metadata_from_bitwarden_item(response["data"]),
                 ),
