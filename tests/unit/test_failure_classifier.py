@@ -22,6 +22,7 @@ from skyvern.forge.failure_classifier import (
     classify_from_failure_reason,
     derive_failure_attribution,
 )
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError as ProviderLLMError
 from skyvern.webeye.scraper.scraper import build_scraping_failed_reason
 
 
@@ -97,6 +98,14 @@ class LLMProviderError(Exception):
 
 
 class RateLimitExceeded(Exception):
+    pass
+
+
+class RateLimitError(Exception):
+    pass
+
+
+class ThrottlingException(Exception):
     pass
 
 
@@ -244,6 +253,215 @@ def test_broad_blocked_and_forbidden_do_not_match_antibot() -> None:
 
         if result:
             assert "ANTI_BOT_DETECTION" not in [r["category"] for r in result], reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(
+            "navigation block terminated. Reason: The site returned Cloudflare Error 1015 (HTTP 429: temporarily "
+            "rate limited/banned) when accessing the update URL, so the form could not be submitted.",
+            id="cloudflare-1015",
+        ),
+        pytest.param(
+            "navigation block terminated. Reason: Page indicates 403 error or rate limit; cannot proceed with opt-out.",
+            id="model-hedged-403-or-rate-limit",
+        ),
+        pytest.param(
+            "navigation block terminated. Reason: The site says this page was requested too many times.",
+            id="requested-too-many-times",
+        ),
+        pytest.param("The site returned a 403 Forbidden page; the form cannot be reached.", id="forbidden-page"),
+        pytest.param(
+            "for_loop block failed. failure reason: Page indicates 403 error or rate limit; cannot proceed.",
+            id="site-page-in-loop",
+        ),
+        pytest.param(
+            "goto_url block terminated. Reason: The page shows HTTP 429 Too Many Requests.", id="goto-url-page"
+        ),
+        pytest.param(
+            "task block failed. failure reason: The website displayed 'Too many requests, please try again later' "
+            "(HTTP 429) and blocked further navigation.",
+            id="task-site-429-page",
+        ),
+        pytest.param(
+            "navigation block failed. failure reason: The page returned 403 Forbidden after submitting the form.",
+            id="navigation-site-403-page",
+        ),
+        pytest.param(
+            "task block failed. failure reason: Failed to send the form: the site shows HTTP 429 Too Many Requests",
+            id="task-reason-opening-with-failed-to-send",
+        ),
+        pytest.param(
+            "Failed to send the form: the site shows HTTP 429 Too Many Requests", id="raw-task-reason-failed-to-send"
+        ),
+        pytest.param(
+            "workflow_trigger block failed. failure reason: navigation block terminated. Reason: The page shows "
+            "HTTP 429 Too Many Requests.",
+            id="site-page-in-child-workflow",
+        ),
+    ],
+)
+def test_site_throttle_or_block_page_is_antibot_not_llm_error(reason: str) -> None:
+    categories = _classify(reason)
+
+    assert categories[0]["category"] == "ANTI_BOT_DETECTION"
+    assert "LLM_ERROR" not in [category["category"] for category in categories]
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "unattributed"
+
+
+def test_words_that_merely_end_in_rate_are_not_a_site_throttle() -> None:
+    assert classify_from_failure_reason("The corporate limit field is required but empty") is None
+
+
+@pytest.mark.parametrize(
+    ("reason", "exception"),
+    [
+        pytest.param(
+            "navigation block failed. failure reason: "
+            + str(ProviderLLMError("GEMINI_2_5_FLASH", cause=RateLimitError("Rate limit reached for the model"))),
+            None,
+            id="provider-error-text",
+        ),
+        pytest.param(
+            "The task failed due to LLM service errors. This is typically caused by rate limiting, service outages, "
+            "or resource exhaustion from the LLM provider.",
+            None,
+            id="max-steps-llm-summary",
+        ),
+        pytest.param("navigation block failed. failure reason: HTTP 429", RateLimitError("429"), id="exception-object"),
+        pytest.param(
+            "text_prompt block failed. failure reason: "
+            + str(ProviderLLMError("GPT_5", cause=RateLimitError("Rate limit reached for the model"))),
+            None,
+            id="provider-error-in-non-browser-block",
+        ),
+    ],
+)
+def test_llm_rate_limit_is_still_llm_error(reason: str, exception: Exception | None) -> None:
+    categories = _classify(reason, exception, fallback_to_unknown=True)
+    names = [category["category"] for category in categories]
+
+    assert names[0] == "LLM_ERROR"
+    assert "ANTI_BOT_DETECTION" not in names
+    assert "WEBSITE_ERROR" not in names
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "llm"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param("Google Sheets rate limit on write: quota exceeded", id="sheets-raw"),
+        pytest.param(
+            "google_sheets_write block failed. failure reason: Google Sheets rate limit on write: quota exceeded",
+            id="sheets-workflow-level",
+        ),
+        pytest.param("HTTP request failed: 429 Too Many Requests from the target API", id="http-request-raw"),
+        pytest.param(
+            "send_email block failed. failure reason: 429 Too Many Requests from the mail API", id="email-workflow"
+        ),
+        pytest.param(
+            "for_loop block failed. failure reason: Google Sheets rate limit on write: quota exceeded",
+            id="sheets-in-loop",
+        ),
+        pytest.param(
+            "conditional block terminated. Reason: for_loop block failed. failure reason: "
+            "Google Sheets rate limit on read: quota exceeded",
+            id="sheets-in-loop-in-conditional",
+        ),
+        pytest.param(
+            "while_loop block failed. failure reason: Failed to send human interaction email: 429 Too Many Requests",
+            id="human-interaction-email-in-loop",
+        ),
+        pytest.param(
+            "Failed to send human interaction email: 429 Too Many Requests from the mail API",
+            id="human-interaction-email-raw",
+        ),
+        pytest.param(
+            "file_download block failed. failure reason: Failed to send downloaded file(s) to s3: 429 Too Many Requests",
+            id="file-download-storage-throttle",
+        ),
+        pytest.param(
+            "file_download block failed. failure reason: Failed to download file from Google Drive: "
+            '<HttpError 429 when requesting https://www.googleapis.com/drive/v3/files/abc?alt=media returned "User '
+            'rate limit exceeded.">',
+            id="drive-api-in-browser-block",
+        ),
+        pytest.param(
+            "google_sheets_read block failed. failure reason: Google Sheets read failed: 429 Too Many Requests: "
+            "rate limit exceeded",
+            id="sheets-read-429",
+        ),
+        pytest.param(
+            "http_request block failed. failure reason: HTTP request failed: 429 Too Many Requests",
+            id="http-request-block-429",
+        ),
+        pytest.param(
+            "http_request block failed. failure reason: HTTP 403: {'detail': 'User rate limit exceeded.'}",
+            id="http-request-block-api-quota",
+        ),
+        pytest.param(
+            "Failed to initialize workflow run context. failure reason: "
+            + str(skyvern_exceptions.OnePasswordRateLimitError("Too many requests")),
+            id="vault-throttle-at-run-start",
+        ),
+    ],
+)
+def test_integration_or_api_throttle_is_website_error(reason: str) -> None:
+    categories = _classify(reason, fallback_to_unknown=True)
+    names = [category["category"] for category in categories]
+
+    assert names[0] == "WEBSITE_ERROR"
+    assert "ANTI_BOT_DETECTION" not in names
+    assert "LLM_ERROR" not in names
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "non_infra"
+
+
+def test_llm_provider_throttle_is_neither_bot_protection_nor_a_website_error() -> None:
+    reason = "navigation block failed. failure reason: " + str(
+        ProviderLLMError("BEDROCK_SONNET", cause=ThrottlingException("Too many requests, please wait"))
+    )
+
+    names = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "ANTI_BOT_DETECTION" not in names
+    assert "WEBSITE_ERROR" not in names
+
+
+# A pageless failure's text says nothing about a site, and "http_request block" itself contains "request block".
+# A failure from a block that drives the page keeps today's keyword label.
+@pytest.mark.parametrize(
+    ("reason", "is_antibot"),
+    [
+        pytest.param("http_request block failed. failure reason: HTTP 404: Not Found", False, id="http-request-404"),
+        pytest.param(
+            "for_loop block failed. failure reason: http_request block failed. failure reason: HTTP 401: Unauthorized",
+            False,
+            id="http-request-in-loop",
+        ),
+        pytest.param(
+            "send_email block failed. failure reason: File access denied: path must not be empty",
+            False,
+            id="send-email-file-access-denied",
+        ),
+        pytest.param("code block failed. failure reason: CAPTCHA could not be solved.", True, id="code-block-captcha"),
+        pytest.param(
+            "task block failed. failure reason: Failed to send the form because a captcha appeared",
+            True,
+            id="task-reason-starting-like-an-integration",
+        ),
+        pytest.param(
+            "workflow_trigger block failed. failure reason: navigation block terminated. Reason: A Cloudflare "
+            "challenge blocked the page.",
+            True,
+            id="child-workflow-captcha",
+        ),
+    ],
+)
+def test_antibot_keywords_skip_only_pageless_failures(reason: str, is_antibot: bool) -> None:
+    names = _categories_for(reason, fallback_to_unknown=True)
+
+    assert ("ANTI_BOT_DETECTION" in names) is is_antibot
 
 
 def test_multiple_categories_are_sorted_by_confidence_descending() -> None:
@@ -412,7 +630,7 @@ def test_user_code_crash_mentioning_process_exit_is_not_infrastructure() -> None
         pytest.param("http_request block failed. failure reason: HTTP 500: ", id="http-request-block-500"),
     ],
 )
-def test_website_error_comes_only_from_the_model_never_from_failure_prose(reason: str) -> None:
+def test_a_server_error_is_website_error_only_when_the_model_says_so(reason: str) -> None:
     categories = classify_from_failure_reason(reason, fallback_to_unknown=True) or []
 
     assert "WEBSITE_ERROR" not in [category["category"] for category in categories]
