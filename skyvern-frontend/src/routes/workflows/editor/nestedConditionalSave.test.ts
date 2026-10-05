@@ -16,10 +16,16 @@ import {
   isWorkflowBlockNode,
   type WorkflowBlockNode,
 } from "./nodes";
+import {
+  createBranchCondition,
+  isConditionalNode,
+} from "./nodes/ConditionalNode/types";
 import { rewireBlockDropInScope } from "./sortable/rewire";
+import { duplicateBlockBelow } from "./workflowDuplicate";
 import { TOP_LEVEL_SCOPE } from "./sortable/scope";
 import {
   getElements,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getWorkflowBlocks,
   getWorkflowSettings,
   validateWorkflowBlocks,
@@ -592,5 +598,315 @@ describe("nested conditional save round-trip", () => {
 
     const secondSave = getWorkflowBlocks(secondLoad.nodes, secondLoad.edges);
     expect(routingOf(secondSave)).toEqual(routingOf(firstSave));
+  });
+});
+
+// Branches that converge on a shared block while the conditional has no merge
+// label of its own (a legal API/MCP shape).
+describe("conditional without a merge label", () => {
+  function savedRoutingSorted(blocks: Array<WorkflowBlock>) {
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    return routingOf(getWorkflowBlocks(nodes, edges)).sort((a, b) =>
+      a.label.localeCompare(b.label),
+    );
+  }
+
+  function inputRoutingSorted(blocks: Array<WorkflowBlock>) {
+    return routingOf(blocks as never).sort((a, b) =>
+      a.label.localeCompare(b.label),
+    );
+  }
+
+  function branchOf(nodes: Array<AppNode>, label: string) {
+    const node = getNodeByLabel(nodes, label);
+    return node.parentId ? node.data.conditionalBranchId : null;
+  }
+
+  const skipFirst = (): Array<WorkflowBlock> => [
+    code("start_step", "decide"),
+    conditional("decide", null, [
+      { id: "b1", next: "join" },
+      { id: "b2", next: "branch_step", isDefault: true },
+    ]),
+    code("branch_step", "join"),
+    code("join", null),
+  ];
+
+  const skipLast = (): Array<WorkflowBlock> => [
+    code("start_step", "decide"),
+    conditional("decide", null, [
+      { id: "b1", next: "branch_step" },
+      { id: "b2", next: "join", isDefault: true },
+    ]),
+    code("branch_step", "join"),
+    code("join", null),
+  ];
+
+  test("a skip branch listed first keeps its target through load -> save", () => {
+    expect(savedRoutingSorted(skipFirst())).toEqual(
+      inputRoutingSorted(skipFirst()),
+    );
+  });
+
+  test("the shared block renders after the conditional, not inside a branch", () => {
+    for (const blocks of [skipFirst(), skipLast()]) {
+      const { nodes } = getElements(blocks, DEFAULT_SETTINGS, true);
+      expect(branchOf(nodes, "branch_step")).not.toBeNull();
+      expect(branchOf(nodes, "join")).toBeNull();
+    }
+  });
+
+  test("a skip branch listed last round-trips losslessly", () => {
+    expect(savedRoutingSorted(skipLast())).toEqual(
+      inputRoutingSorted(skipLast()),
+    );
+  });
+
+  test("converging branches inside a loop keep their targets", () => {
+    const blocks = [forLoop("loop", skipFirst())];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges);
+    const loop = saved.find((block) => block.label === "loop");
+
+    expect(branchOf(nodes, "join")).toBeNull();
+    expect(
+      loop?.block_type === "for_loop"
+        ? inputRoutingSorted(loop.loop_blocks as Array<WorkflowBlock>)
+        : null,
+    ).toEqual(inputRoutingSorted(skipFirst()));
+  });
+
+  test("a single branch child with an empty default branch stays in its branch", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "branch_step" },
+        { id: "b2", next: null, isDefault: true },
+      ]),
+      code("branch_step", null),
+    ];
+    const { nodes } = getElements(blocks, DEFAULT_SETTINGS, true);
+
+    expect(branchOf(nodes, "branch_step")).toBe("b1");
+    expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+  });
+
+  test("a branch targeting the conditional's own next block stays an empty branch", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", "after", [
+        { id: "b1", next: "after" },
+        { id: "b2", next: null, isDefault: true },
+      ]),
+      code("after", null),
+    ];
+    const { nodes } = getElements(blocks, DEFAULT_SETTINGS, true);
+
+    expect(branchOf(nodes, "after")).toBeNull();
+  });
+
+  test("a nested conditional sharing the outer join round-trips in either order", () => {
+    const outer = conditional("outer", null, [
+      { id: "o1", next: "inner" },
+      { id: "o2", next: "alternate", isDefault: true },
+    ]);
+    const inner = conditional("inner", null, [
+      { id: "i1", next: "inner_step" },
+      { id: "i2", next: "outer_join", isDefault: true },
+    ]);
+    const tail = [
+      code("inner_step", "outer_join"),
+      code("alternate", "outer_join"),
+      code("outer_join", null),
+    ];
+    for (const blocks of [
+      [code("start_step", "outer"), outer, inner, ...tail],
+      [code("start_step", "outer"), inner, outer, ...tail],
+    ]) {
+      const { nodes } = getElements(blocks, DEFAULT_SETTINGS, true);
+
+      expect(branchOf(nodes, "outer_join")).toBeNull();
+      expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+    }
+  });
+
+  test("nested conditionals ending an outer branch keep their merges", () => {
+    const explicitInnerMerge = (): Array<WorkflowBlock> => [
+      code("start_step", "outer"),
+      conditional("outer", null, [
+        { id: "o1", next: "inner" },
+        { id: "o2", next: "p", isDefault: true },
+      ]),
+      conditional("inner", "join", [
+        { id: "n1", next: "q" },
+        { id: "n2", next: "r", isDefault: true },
+      ]),
+      code("q", "join"),
+      code("r", "join"),
+      code("p", "join"),
+      code("join", null),
+    ];
+    const outer = conditional("outer", null, [
+      { id: "o1", next: "inner" },
+      { id: "o2", next: "join", isDefault: true },
+    ]);
+    const inner = conditional("inner", null, [
+      { id: "i1", next: "a" },
+      { id: "i2", next: "b", isDefault: true },
+    ]);
+    const tail = [code("a", "join"), code("b", "join"), code("join", null)];
+
+    for (const blocks of [
+      explicitInnerMerge(),
+      [code("start_step", "outer"), outer, inner, ...tail],
+      [code("start_step", "outer"), inner, outer, ...tail],
+    ]) {
+      expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+    }
+  });
+
+  test("an empty Else the editor adds to a conditional without a default saves as null", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "join" },
+        { id: "b2", next: "branch_step" },
+      ]),
+      code("branch_step", "join"),
+      code("join", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const decide = nodes.find(isConditionalNode)!;
+    decide.data.branches = [
+      ...decide.data.branches,
+      createBranchCondition({ id: "else", is_default: true }),
+    ];
+    const saved = getWorkflowBlocks(nodes, edges).find(
+      (block) => block.label === "decide",
+    );
+
+    expect(
+      saved?.block_type === "conditional"
+        ? saved.branch_conditions.find((branch) => branch.id === "else")
+            ?.next_block_label
+        : undefined,
+    ).toBeNull();
+  });
+
+  test("a branch that owns no blocks keeps its target when only some branches converge", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "join" },
+        { id: "b2", next: "branch_step" },
+        { id: "b3", next: "other", isDefault: true },
+      ]),
+      code("branch_step", "join"),
+      code("join", null),
+      code("other", null),
+    ];
+
+    expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+  });
+
+  test("two branches sharing a first block keep it when another branch starts at the join", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "shared" },
+        { id: "b2", next: "shared" },
+        { id: "b3", next: "join", isDefault: true },
+      ]),
+      code("shared", "join"),
+      code("join", null),
+    ];
+
+    expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const renamed = getUpdatedNodesAfterLabelUpdateForParameterKeys(
+      getNodeByLabel(nodes, "shared").id,
+      "renamed",
+      nodes,
+    ) as Array<AppNode>;
+    const decide = getWorkflowBlocks(renamed, edges).find(
+      (block) => block.label === "decide",
+    );
+
+    expect(
+      decide?.block_type === "conditional"
+        ? decide.branch_conditions.map((branch) => branch.next_block_label)
+        : null,
+    ).toEqual(["renamed", "renamed", "join"]);
+  });
+
+  test("a duplicated conditional's shared branch target points at its own copy", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "shared" },
+        { id: "b2", next: "shared" },
+        { id: "b3", next: "join", isDefault: true },
+      ]),
+      code("shared", "join"),
+      code("join", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    let nextId = 0;
+    let nextLabel = 0;
+    const duplicated = duplicateBlockBelow({
+      nodes,
+      edges,
+      nodeId: getNodeByLabel(nodes, "decide").id,
+      generateId: () => `dup-${nextId++}`,
+      generateLabel: () => `copy_${nextLabel++}`,
+    })!;
+    const saved = getWorkflowBlocks(duplicated.nodes, duplicated.edges);
+    const copy = saved.find(
+      (block) => block.label === duplicated.duplicatedLabel,
+    );
+    const copyTargets =
+      copy?.block_type === "conditional"
+        ? copy.branch_conditions.map((branch) => branch.next_block_label)
+        : [];
+
+    expect(copyTargets[0]).toBe(copyTargets[1]);
+    expect(copyTargets).not.toContain("shared");
+  });
+
+  test("renaming a nested conditional's merge target keeps the merge", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "outer"),
+      conditional("outer", null, [
+        { id: "o1", next: "inner" },
+        { id: "o2", next: "p", isDefault: true },
+      ]),
+      conditional("inner", "join", [
+        { id: "n1", next: "q" },
+        { id: "n2", next: "r", isDefault: true },
+      ]),
+      code("q", "join"),
+      code("r", "join"),
+      code("p", "join"),
+      code("join", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const renamed = getUpdatedNodesAfterLabelUpdateForParameterKeys(
+      getNodeByLabel(nodes, "join").id,
+      "renamed",
+      nodes,
+    ) as Array<AppNode>;
+    const routing = Object.fromEntries(
+      getWorkflowBlocks(renamed, edges).map((block) => [
+        block.label,
+        block.next_block_label,
+      ]),
+    );
+
+    expect(routing).toMatchObject({
+      inner: "renamed",
+      q: "renamed",
+      r: "renamed",
+    });
   });
 });
