@@ -43,7 +43,7 @@ console.log(result.output);
 |-----------|------|----------|---------|-------------|
 | `prompt` | `str` | Yes | - | Natural language instructions for what the AI should do. |
 | `url` | `str` | No | `None` | Starting page URL. If omitted, the AI navigates from a blank page. |
-| `engine` | `RunEngine` | No | `skyvern_v1` / `"skyvern-1.0"` | AI engine. Python enum options: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`. TypeScript uses the wire values: `"skyvern-1.0"`, `"skyvern-2.0"`, `"openai-cua"`, `"anthropic-cua"`, `"ui-tars"`. |
+| `engine` | `RunEngine` | No | `skyvern_v1` / `"skyvern-1.0"` | AI engine. Python enum options: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`. TypeScript uses the wire values: `"skyvern-1.0"`, `"skyvern-2.0"`, `"openai-cua"`, `"anthropic-cua"`, `"ui-tars"`. The `openai_cua` and `anthropic_cua` engines are enterprise-only; non-enterprise callers receive HTTP 403. |
 | `wait_for_completion` | `bool` | No | `False` | Block until the run finishes. |
 | `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
 | `max_steps` | `int` | No | `None` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
@@ -56,7 +56,7 @@ console.log(result.output);
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
 | `totp_url` | `str` | No | `None` | Endpoint Skyvern polls to fetch TOTP codes. |
 | `title` | `str` | No | `None` | Display name for this run in the dashboard. |
-| `model` | `dict` | No | `None` | Override the output model definition. |
+| `model` | `dict` | No | `None` | Override the LLM used for the run (e.g. `{"model_name": "<model>"}`). Anthropic Claude Opus 4.x models (`claude-opus-4-5-20251101`, `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `us.anthropic.claude-opus-4-20250514-v1:0`) are enterprise-only; non-enterprise callers receive HTTP 403. |
 | `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
 | `include_action_history_in_verification` | `bool` | No | `None` | Include action history when verifying task completion. |
