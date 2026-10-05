@@ -2758,14 +2758,6 @@ class AgentFunction:
         if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
             raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
-    def get_copilot_security_rules(self) -> str:
-        """Return security guardrails for the workflow copilot system prompt.
-
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
-        """
-        return ""
-
     def copilot_candidate_network_guard(
         self,
         browser_context: BrowserContext,

@@ -573,10 +573,6 @@ async def edit_block_and_run_tool(
     draft through the normal author-time safety boundary, then runs ``block_labels`` (or just
     ``label`` when omitted).
 
-    To promote code you already ran, pass ``executed_source_reference`` from a prior ``run_browser_code``
-    cell instead of ``expected_code`` and ``replacement_code``: that cell's complete source replaces the
-    block's code byte-for-byte. Pass exactly one of the two edit routes.
-
     This is one model-invoked edit and one run. It does not choose an edit, create a block, retry, or
     decide whether the result achieved the user's goal. Its response is the same sanitized run/debug
     evidence returned by ``run_blocks_and_collect_debug``; a failed run still leaves the edited draft
@@ -616,17 +612,14 @@ async def edit_block_and_run_tool(
         )
         return json.dumps(sanitize_tool_result_for_llm("edit_block_and_run", result))
 
-    if reference_route == anchored_route or (anchored_route and (expected_code is None or replacement_code is None)):
-        return fail_before_run(
-            {
-                "ok": False,
-                "error": (
-                    "Pass exactly one edit source: executed_source_reference, or both expected_code and "
-                    "replacement_code."
-                ),
-                "error_code": "invalid_edit_source",
-            }
-        )
+    # Worded from what the call passed, so the reference is named only to a caller that sent one.
+    edit_source_error = None
+    if reference_route and anchored_route:
+        edit_source_error = "Pass executed_source_reference without expected_code or replacement_code."
+    elif not reference_route and (expected_code is None or replacement_code is None):
+        edit_source_error = "Pass both expected_code and replacement_code."
+    if edit_source_error:
+        return fail_before_run({"ok": False, "error": edit_source_error, "error_code": "invalid_edit_source"})
     if label not in requested_labels:
         return fail_before_run(
             {
@@ -1538,9 +1531,6 @@ async def update_and_run_blocks_tool(
     """Update the workflow and immediately run the specified blocks in one step.
     Pass the complete workflow as a `workflow` object with the same keys as the workflow YAML, as in
     update_workflow; string values, including multiline code, are plain JSON strings.
-    To save code you already ran with ``run_browser_code`` as a new block, map the block's label to that
-    cell's ``executed_source_reference`` in ``executed_source_references`` and leave the block's ``code``
-    empty: the cell's exact source becomes the block's code, so what gets tested is what you ran.
     This persists the workflow and remotely executes the selected frontier, waiting for it to
     finish, so it is materially higher latency than a bounded page read. It is the surface for
     testing durable behaviour, and for reaching a state that only execution can establish --
@@ -1997,7 +1987,7 @@ async def inspect_page_for_composition_tool(
     `evaluate` call to read only that select; do not repeat the full-page inspection.
     If a block run changes pages, inspect the reached page before authoring downstream
     form/search/result blocks. If the evidence shows required fields or controls that
-    the user did not supply enough information for, ASK_QUESTION with that observed missing input. If
+    the user did not supply enough information for, ask the user for that observed missing input. If
     evidence is sufficient, compose and run workflow blocks from the observed fields.
     `challenge_state` reports what the page looks like, which is not what a run will do:
     it does not establish that a submit/search path is closed, and a run settles that.
@@ -2103,7 +2093,7 @@ async def fill_credential_field_tool(
     """Fill ONE field of a SAVED credential into a live browser during code-only scouting.
 
     `target="debug"` (the default) fills the browser this chat drives; `target="last_run"` fills the
-    browser the most recent test run executed in, the same one `run_browser_code(target="last_run")` acts on.
+    browser the most recent test run executed in.
 
     The secret value is resolved server-side from the stored credential and never
     enters the conversation; the result reports only `typed_length`. Use this
@@ -2380,6 +2370,38 @@ def _with_action_reason(tool: FunctionTool) -> FunctionTool:
     return dataclasses.replace(tool, params_json_schema=schema, strict_json_schema=False, on_invoke_tool=invoke)
 
 
+# Each parameter takes a reference only the browser-code tool produces, so a surface without that tool
+# advertises neither the parameter nor its text.
+_EXECUTED_SOURCE_PARAMS = {
+    "edit_block_and_run": (
+        "executed_source_reference",
+        (
+            f"The `executed_source_reference` of a `{BROWSER_CODE_TOOL_NAME}` cell you already ran. That cell's "
+            "complete source replaces the block's code byte-for-byte. Pass this instead of `expected_code` and "
+            "`replacement_code`."
+        ),
+    ),
+    "update_and_run_blocks": (
+        "executed_source_references",
+        (
+            f"Saves code you already ran with `{BROWSER_CODE_TOOL_NAME}` as a new block: maps the block's label to "
+            "that cell's `executed_source_reference`. Leave the block's `code` empty; the cell's exact source "
+            "becomes the block's code, so what gets tested is what you ran."
+        ),
+    ),
+}
+
+
+def _with_executed_source_param(tool: FunctionTool, *, browser_code_available: bool) -> FunctionTool:
+    name, description = _EXECUTED_SOURCE_PARAMS[tool.name]
+    schema = copy.deepcopy(tool.params_json_schema)
+    if browser_code_available:
+        schema["properties"][name]["description"] = description
+    else:
+        del schema["properties"][name]
+    return dataclasses.replace(tool, params_json_schema=schema)
+
+
 def copilot_native_tools(
     *,
     supports_question_tool: bool,
@@ -2399,6 +2421,8 @@ def copilot_native_tools(
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
         ):
             continue
+        if tool.name in _EXECUTED_SOURCE_PARAMS:
+            tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
         elif tool.name in _PAGE_STATE_TOOL_NAMES:

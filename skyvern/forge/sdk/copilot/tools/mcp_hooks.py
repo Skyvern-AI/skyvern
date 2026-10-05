@@ -514,6 +514,18 @@ async def _validate_block_pre_hook(
     }
 
 
+async def _validate_block_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    # The server's hint names its own tool and block types this turn may not author.
+    error = raw.get("error")
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        result["error"] = error["message"]
+    return result
+
+
 PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
     "call": "await publish_file(filename, text=|data=|sheets=|report=|folder=, sources=None)",
     "shadowed_by_parameter": "publish_file",
@@ -548,8 +560,8 @@ PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
         "run that published it. A block that fails afterwards removes the files it published."
     ),
     "usage": (
-        "Pass exactly one content argument per call. Call it inside a code block and prove it with a test run; "
-        "run_browser_code refuses it. A failed publish raises with the reason. Never write files or paths."
+        "Pass exactly one content argument per call. Call it inside a code block and prove it with a test run. "
+        "A failed publish raises with the reason. Never write files or paths."
     ),
 }
 
@@ -639,6 +651,8 @@ async def _get_block_schema_post_hook(
             _apply_for_loop_schema_guidance(data)
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
+            # The server's hint names its own tool and a block type this turn may not author.
+            data.pop("hint", None)
             for banned in _copilot_banned_block_types(ctx):
                 block_types.pop(banned, None)
             if capability.agent_blocks:
@@ -2418,11 +2432,21 @@ def _build_skyvern_mcp_overlays(
             post_hook=_get_workflow_knowledge_post_hook,
         ),
         "get_block_schema": SchemaOverlay(
+            description=(
+                "Get the schema for a workflow block type, or list the available types when block_type is omitted."
+            ),
             description_suffix=_block_schema_banned_types_note(capability),
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),
-        "validate_block": SchemaOverlay(pre_hook=_validate_block_pre_hook),
+        "validate_block": SchemaOverlay(
+            description=(
+                "Check one workflow block definition, passed as a JSON string in block_json, against its block "
+                "type's schema. It does not run the block. Returns field-level errors."
+            ),
+            pre_hook=_validate_block_pre_hook,
+            post_hook=_validate_block_post_hook,
+        ),
         "list_org_workflows": SchemaOverlay(
             description=(
                 "Search this organization's saved workflows by title, folder, or parameter name. Reach for it "
@@ -2522,7 +2546,9 @@ def _build_skyvern_mcp_overlays(
                 "chat. Ask the user to store the value as a saved credential and "
                 "reply with its name; do not type or submit the raw value."
             ),
-            hide_params=frozenset({"session_id", "cdp_url", "delay", "intent"}),
+            # input_method is the Chrome-extension fill; its description names clear, intent and delay,
+            # none of which this surface exposes under those names.
+            hide_params=frozenset({"session_id", "cdp_url", "delay", "intent", "input_method"}),
             forced_args={"selector_mode": "direct"},
             required_overrides=["text"],
             arg_transforms={"clear_first": "clear"},
@@ -2595,6 +2621,7 @@ def _build_skyvern_mcp_overlays(
             post_hook=_wait_for_either_state_post_hook,
         ),
         "skyvern_frame_list": SchemaOverlay(
+            description="List all frames (including iframes) on the current page.",
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,

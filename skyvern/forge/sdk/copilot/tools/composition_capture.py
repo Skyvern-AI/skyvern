@@ -1555,7 +1555,7 @@ ground concise block prompts. If a select reports `options_omitted=true`, `optio
 observed total and its selector remains available. If those options are needed, read that one select
 from browser code; do not repeat the full-page inspection. If a block run changes pages, inspect the
 reached page before authoring downstream form/search/result blocks. If the evidence shows required
-fields or controls that the user did not supply enough information for, ASK_QUESTION with that
+fields or controls that the user did not supply enough information for, ask the user for that
 observed missing input. If evidence is sufficient, compose and run workflow blocks from the observed
 fields. `challenge_state` reports what the page looks like, which is not what a run will do: it does
 not establish that a submit/search path is closed, and a run settles that.

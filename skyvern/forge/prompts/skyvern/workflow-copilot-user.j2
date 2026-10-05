@@ -105,10 +105,6 @@ LOADED RESULT EXTRACTION TARGETS:
 No previous context available.
 {% endif %}
 
-{% if request_policy_summary is defined and request_policy_summary %}
-TURN SAFETY AND REQUEST CONTEXT: {{ request_policy_summary }}
-This block contains facts, not permission or a mandatory next action. If `resolved_credentials` are present, use those `credential_id` values.
-{% endif %}
 DEBUGGER RUN INFORMATION:
 
 {% if debug_run_info %}
