@@ -855,6 +855,7 @@ class WorkflowRunGroupItemModel(Base):
     __table_args__ = (
         UniqueConstraint("workflow_run_group_id", "item_key", name="uq_workflow_run_group_items_group_item_key"),
         UniqueConstraint("workflow_run_id", name="uq_workflow_run_group_items_workflow_run_id"),
+        Index("ix_workflow_run_group_items_item_key_created_at", "item_key", "created_at"),
     )
 
     workflow_run_group_id = Column(String, primary_key=True)

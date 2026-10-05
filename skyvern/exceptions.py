@@ -160,6 +160,14 @@ class WorkflowChangedSinceReview(SkyvernHTTPException):
         )
 
 
+class GroupAccountsRanSinceReview(SkyvernHTTPException):
+    def __init__(self, item_keys: list[str]) -> None:
+        super().__init__(
+            f"{item_keys} started in another group after the review, so this group was not submitted.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
 _BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
 # Patterns that indicate a browser session connection failure (e.g. CDP WebSocket errors).

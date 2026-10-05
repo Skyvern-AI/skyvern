@@ -24,7 +24,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import HttpException as VaultHttpException
-from skyvern.exceptions import SkyvernHTTPException
+from skyvern.exceptions import SkyvernHTTPException, WorkflowPinnedByRunGroup
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
@@ -87,6 +87,7 @@ from skyvern.forge.sdk.copilot.request_policy import _screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
+from skyvern.forge.sdk.copilot.tools.account_groups import recover_account_group_links
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
     private_workflow_settings_from_proposal,
@@ -222,6 +223,12 @@ ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
 
 LOG = structlog.get_logger()
 _T = TypeVar("_T")
+
+_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP = (
+    "I did not apply this change automatically because a group of account runs is still running the saved "
+    "version. Accept the change when you are ready; it is saved as a new version and the running group is "
+    "not affected."
+)
 
 
 async def _resolve_copilot_agent_handler(
@@ -1286,6 +1293,9 @@ async def _persist_turn_messages(
                 if pending.question_interactions:
                     if narrative_payload is None:
                         narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
+                    await recover_account_group_links(
+                        chat.organization_id, chat.workflow_copilot_chat_id, pending.question_interactions
+                    )
                     narrative_payload["questionInteractions"] = [
                         item.model_dump(mode="json") for item in pending.question_interactions
                     ]
@@ -1776,6 +1786,18 @@ async def _finalise_normal_turn(
             marker = _STAGED_COMMIT_LANDED.get()
             if marker is not None:
                 marker[0] = True
+        except WorkflowPinnedByRunGroup:
+            # Nothing landed, so there is nothing to roll back. The draft waits for a manual Accept, which
+            # saves a new version and leaves the running group's version alone.
+            LOG.info(
+                "copilot auto-accept deferred while a workflow run group runs this version",
+                auto_accept_deferred_reason="workflow_run_group_running",
+            )
+            otel_trace.get_current_span().set_attribute(
+                "copilot.auto_accept_deferred_reason", "workflow_run_group_running"
+            )
+            agent_result.proposal_disposition = "review_tested"
+            user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP}"
         except Exception:
             # Undo any mid-turn degraded write so a failed commit fails the turn
             # atomically instead of leaving canonical on a partial intermediate.
@@ -3972,28 +3994,33 @@ async def workflow_copilot_chat_history(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Copilot history changed while loading"
             )
+    question_interactions = list(
+        {
+            item.interaction_id: item
+            for item in (
+                [
+                    QuestionInteraction.model_validate(raw)
+                    for message in chat_messages
+                    if message.narrative_payload is not None
+                    for raw in message.narrative_payload.get("questionInteractions", [])
+                ]
+                + [
+                    item
+                    for entry in (chat.pending_turns.values() if chat else [])
+                    for item in entry.question_interactions
+                ]
+            )
+        }.values()
+    )
+    if chat is not None:
+        await recover_account_group_links(
+            organization.organization_id, chat.workflow_copilot_chat_id, question_interactions
+        )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
-        question_interactions=list(
-            {
-                item.interaction_id: item
-                for item in (
-                    [
-                        QuestionInteraction.model_validate(raw)
-                        for message in chat_messages
-                        if message.narrative_payload is not None
-                        for raw in message.narrative_payload.get("questionInteractions", [])
-                    ]
-                    + [
-                        item
-                        for entry in (chat.pending_turns.values() if chat else [])
-                        for item in entry.question_interactions
-                    ]
-                )
-            }.values()
-        ),
+        question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (
                 entry.cancel_token
@@ -4024,7 +4051,9 @@ async def workflow_copilot_question_response(
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
     response = QuestionResponse(
-        answers=question_response.answers, text=question_response.text, skipped=question_response.skipped
+        answers=question_response.answers,
+        text=question_response.text,
+        skipped=question_response.skipped,
     )
 
     async def resolve(*, preflight_only: bool = False) -> QuestionInteraction:
@@ -4034,6 +4063,7 @@ async def workflow_copilot_question_response(
                 chat.workflow_copilot_chat_id,
                 question_response.interaction_id,
                 response,
+                account_group_decision=question_response.account_group_decision,
                 preflight_only=preflight_only,
             )
         except NotFoundError as exc:

@@ -17,6 +17,7 @@ from sqlalchemy.orm import defer
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.ask_user import (
     QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
     QuestionInteraction,
     QuestionResponse,
     question_wait_is_live,
@@ -1294,6 +1295,7 @@ class WorkflowParametersRepository(BaseRepository):
         interaction_id: str,
         response: QuestionResponse,
         *,
+        account_group_decision: AccountGroupDecision | None = None,
         preflight_only: bool = False,
     ) -> QuestionInteraction:
         """Validate before external screening, then recheck and commit the screened reply."""
@@ -1327,7 +1329,7 @@ class WorkflowParametersRepository(BaseRepository):
                 self._store_question_turn(chat, entry)
                 await session.commit()
                 raise ValueError("The question's execution was interrupted")
-            resolved = resolve_question_response(item, response)
+            resolved = resolve_question_response(item, response, account_group_decision)
             if preflight_only:
                 entry.question_client_seen_at = datetime.now(timezone.utc)
                 self._store_question_turn(chat, entry)
@@ -1339,6 +1341,19 @@ class WorkflowParametersRepository(BaseRepository):
             self._store_question_turn(chat, entry)
             await session.commit()
             return resolved
+
+    @db_operation("record_copilot_account_group_submission")
+    async def record_copilot_account_group_submission(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_group_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            if item.account_group_review is None:
+                raise ValueError("This question has no account review")
+            item.account_group_review.workflow_run_group_id = workflow_run_group_id
+            self._store_question_turn(chat, entry)
+            await session.commit()
 
     @db_operation("interrupt_copilot_question")
     async def interrupt_copilot_question(

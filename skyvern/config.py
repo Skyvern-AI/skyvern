@@ -1006,6 +1006,8 @@ class Settings(BaseSettings):
     WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
     """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
     dispatch of already-submitted groups continue."""
+    COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
+    """Offer Copilot's run_workflow_for_accounts tool. Turning it off keeps group status, cancel and receipts."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

@@ -15,9 +15,16 @@ import structlog
 from agents import FunctionTool, function_tool
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
+from pydantic import JsonValue
 
 from skyvern.forge import app as app
-from skyvern.forge.sdk.copilot.ask_user import AskUserArguments, QuestionInput
+from skyvern.forge.sdk.copilot.ask_user import (
+    ACCOUNT_GROUP_CANCEL_TOOL_NAME,
+    ACCOUNT_GROUP_STATUS_TOOL_NAME,
+    ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    AskUserArguments,
+    QuestionInput,
+)
 from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM_NAME,
     BrowserTarget,
@@ -66,6 +73,15 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.tools.account_groups import (
+    SUBMIT_TOOL_DESCRIPTION as ACCOUNT_GROUP_SUBMIT_TOOL_DESCRIPTION,
+)
+from skyvern.forge.sdk.copilot.tools.account_groups import (
+    account_group_status,
+    account_group_submit_enabled,
+    cancel_account_group,
+    run_for_accounts,
+)
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_SCHEMA as LOCATOR_INSPECTION_TOOL_SCHEMA
@@ -166,7 +182,6 @@ from .discovery import _discovery_detect_anti_bot as _discovery_detect_anti_bot
 from .discovery import _discovery_detect_login_wall as _discovery_detect_login_wall
 from .discovery import _discovery_resolve_href as _discovery_resolve_href
 from .discovery import _discovery_walk as _discovery_walk
-from .discovery import _rank_discovery_entrypoint_candidates as _rank_discovery_entrypoint_candidates
 from .discovery import _resolve_discovery_entry_url as _resolve_discovery_entry_url
 from .errors import copilot_tool_failure
 from .frontier import _CANONICAL_WORKFLOW_SETTING_FIELDS as _CANONICAL_WORKFLOW_SETTING_FIELDS
@@ -1073,6 +1088,50 @@ async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionIn
     return json.dumps(await ask_user(ctx.context, AskUserArguments(parts=parts), ctx.tool_call_id))
 
 
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    description_override=ACCOUNT_GROUP_SUBMIT_TOOL_DESCRIPTION,
+    strict_mode=False,
+)
+async def run_workflow_for_accounts_tool(
+    ctx: ToolContext[CopilotContext],
+    credential_ids: list[str],
+    credential_parameter_key: str,
+    action_summary: str,
+    common_inputs: dict[str, JsonValue] | None = None,
+) -> str:
+    authority_error = _authority_tool_error(ctx.context, ACCOUNT_GROUP_SUBMIT_TOOL_NAME)
+    if authority_error is not None:
+        return json.dumps({"ok": False, "dispatched": False, "error": authority_error})
+    result = await run_for_accounts(
+        ctx.context,
+        tool_call_id=ctx.tool_call_id,
+        credential_ids=credential_ids,
+        credential_parameter_key=credential_parameter_key,
+        common_inputs=common_inputs or {},
+        action_summary=action_summary,
+    )
+    return result.model_dump_json(exclude_none=True, exclude={"repeated_after_prior_effect": {"__all__": {"identity"}}})
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=ACCOUNT_GROUP_STATUS_TOOL_NAME)
+async def get_account_group_status_tool(ctx: ToolContext[CopilotContext], workflow_run_group_id: str) -> str:
+    """Read each account's run id, status and outcome for a group started by run_workflow_for_accounts.
+    A failed outcome means the run stopped before it could have acted; unknown means it may have acted."""
+    return (await account_group_status(ctx.context, workflow_run_group_id)).model_dump_json(exclude_none=True)
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=ACCOUNT_GROUP_CANCEL_TOOL_NAME)
+async def cancel_account_group_tool(ctx: ToolContext[CopilotContext], workflow_run_group_id: str) -> str:
+    """Ask the user to stop every unfinished run of a group this chat started with run_workflow_for_accounts.
+    Nothing is canceled unless the user approves; returns every row's status and whether they approved."""
+    result = await cancel_account_group(
+        ctx.context, tool_call_id=ctx.tool_call_id, workflow_run_group_id=workflow_run_group_id
+    )
+    return result.model_dump_json(exclude_none=True)
+
+
 # This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
 # Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
 @function_tool(failure_error_function=copilot_tool_failure, name_override="set_work_plan")
@@ -1760,23 +1819,18 @@ async def discover_workflow_entrypoint_tool(
     site_or_url: str,
     intent_hint: str,
 ) -> str:
-    """Find the page a new workflow should start at when the user named a site but not the page.
+    """Find the page a new workflow should start at on a site whose URL or domain you have.
 
-    Use this BEFORE writing blocks when the user named a website (with a URL,
-    a bare domain, or a single brand word) but no specific page. Accepts:
-    a URL with or without scheme (``example.com/login`` is fine), a bare
-    domain (``example.com``), or a single brand word. A brand word is resolved
-    only from an exact provider-backed official-site association that safely
-    navigates over public-network HTTPS to the associated origin. Results use
-    ``contract_version=discover_workflow_entrypoint_v3``. English phrases
-    ("the X website") return
-    ``failure_reason=could_not_resolve_site_name`` — ASK_QUESTION for a URL.
+    Use this BEFORE writing blocks when you know the site but not the specific
+    page. Accepts a URL with or without scheme (``example.com/login`` is fine)
+    or a bare domain (``example.com``). A site name returns
+    ``failure_reason=could_not_resolve_site_name``: pass a URL you already have
+    for it, such as one the user gave or a credential's ``tested_url``, or find
+    it with ``search_web``.
 
     Returns ``candidate_url`` plus a short ``evidence_trail`` and any
-    ``candidate_form_fields``. Evidence-backed brand results also include
-    bounded ``candidate_provenance`` and ``navigation_evidence``. Use
-    ``candidate_url`` as the ``url`` value on a ``goto_url`` block. Do NOT
-    paste the evidence into workflow YAML.
+    ``candidate_form_fields``. Use ``candidate_url`` as the ``url`` value on a
+    ``goto_url`` block. Do NOT paste the evidence into workflow YAML.
 
     Discovery navigates and reads pages; it will NOT type, click form buttons,
     run JavaScript, or submit forms.
@@ -1793,7 +1847,8 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
     """Search the web for pages matching a query, when you need candidate sites rather than one known page.
 
     Use this while scouting -- to find companies, suppliers, listings, or
-    documentation pages the user described but did not name. ``results`` holds
+    documentation pages the user described but did not name, or the URL of a
+    site the user named without giving one. ``results`` holds
     up to ``max_results`` (1 to 100) entries with ``title``, ``url`` and ``snippet``, each
     ``url`` a direct absolute link to the result site.
 
@@ -2201,6 +2256,10 @@ inspect_locator_matches_tool = FunctionTool(
 )
 
 
+ACCOUNT_GROUP_TOOL_NAMES = frozenset(
+    {ACCOUNT_GROUP_SUBMIT_TOOL_NAME, ACCOUNT_GROUP_STATUS_TOOL_NAME, ACCOUNT_GROUP_CANCEL_TOOL_NAME}
+)
+
 NATIVE_TOOLS = [
     ask_user_tool,
     set_work_plan_tool,
@@ -2228,6 +2287,9 @@ NATIVE_TOOLS = [
     start_fresh_browser_tool,
     extend_browser_session_tool,
     upload_attached_file_tool,
+    run_workflow_for_accounts_tool,
+    get_account_group_status_tool,
+    cancel_account_group_tool,
 ]
 
 
@@ -2244,12 +2306,20 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         FRESH_BROWSER_TOOL_NAME,
         SESSION_EXTENSION_TOOL_NAME,
         UPLOAD_TOOL_NAME,
+        ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     }
 )
 
 
 AUTHORING_GUIDANCE_TOOL_NAMES = frozenset({"add_block", "update_workflow", "update_and_run_blocks"})
-_PAGE_STATE_TOOL_NAMES = BROWSER_BOUND_TOOL_NAMES - BLOCK_RUNNING_TOOLS - {SESSION_EXTENSION_TOOL_NAME}
+_PAGE_STATE_TOOL_NAMES = (
+    BROWSER_BOUND_TOOL_NAMES
+    - BLOCK_RUNNING_TOOLS
+    - {
+        SESSION_EXTENSION_TOOL_NAME,
+        ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    }
+)
 
 
 def _with_page_state(tool: FunctionTool) -> FunctionTool:
@@ -2315,14 +2385,18 @@ def copilot_native_tools(
     supports_question_tool: bool,
     browser_code_available: bool,
     authoring_capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
+    supports_account_group_card: bool = False,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
     appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
     tools: list[FunctionTool] = []
     for tool in NATIVE_TOOLS:
-        if (tool.name == "ask_user" and not supports_question_tool) or (
-            tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available
+        if (
+            (tool.name == "ask_user" and not supports_question_tool)
+            or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
+            or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
+            or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
         ):
             continue
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:

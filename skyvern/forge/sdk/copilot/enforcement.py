@@ -804,6 +804,13 @@ def _summarize_tool_output(output: str) -> str:
     # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
     if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
         return output
+    # An account group result is the only record of which runs exist and what each did.
+    if (
+        MCP_RESULT_PROVENANCE_KEY not in parsed
+        and "workflow_run_group_id" in parsed
+        and isinstance(parsed.get("rows"), list)
+    ):
+        return output
 
     synopsis: dict[str, Any] = {}
     # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
