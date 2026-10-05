@@ -767,7 +767,7 @@ def test_flags_block_yaml_pasted_into_user_response() -> None:
         request_policy=_policy(),
         response_type="REPLY",
         user_response=user_response,
-        has_workflow_proposal=False,
+        has_workflow_proposal=True,
     )
 
     assert not verdict.allowed
@@ -786,7 +786,7 @@ def test_block_yaml_in_reply_is_not_hard_blocking() -> None:
             "label: submit_form\n"
             "```\n"
         ),
-        has_workflow_proposal=False,
+        has_workflow_proposal=True,
     )
 
     assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in verdict.reason_codes
@@ -2313,40 +2313,34 @@ def test_yaml_block_scalar_standard_term_does_not_hard_block_ask_question() -> N
     assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
 
 
-def test_translate_to_agent_result_rewrites_block_yaml_pasted_in_reply() -> None:
-    leak = (
-        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
-        "Here's how the block now looks:\n\n"
-        "    - label: navigate_and_fill_form\n"
-        "      block_type: navigation\n"
-        "      navigation_goal: Fill the abuse form.\n"
-        '      url: "{{ form_url }}"\n'
-        "      parameter_keys:\n"
-        "        - name\n"
-        "        - form_url\n"
+def test_translate_to_agent_result_keeps_a_block_example_when_no_workflow_was_proposed() -> None:
+    answer = (
+        "A loop block runs the blocks inside it once for each item in a list. To visit a list of URLs:\n\n"
+        "```yaml\n"
+        "- block_type: for_loop\n"
+        "  label: visit_each_url\n"
+        "  loop_over_parameter_key: urls\n"
+        "  loop_blocks:\n"
+        "    - block_type: goto_url\n"
+        "      label: open_url\n"
+        '      url: "{{ visit_each_url.current_value }}"\n'
+        "```\n"
     )
-    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+    result = _fake_run_result({"type": "REPLY", "user_response": answer})
 
-    with patch("skyvern.forge.sdk.copilot.agent.LOG.info") as log_info:
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result,
-                _ctx(),
-                global_llm_context=None,
-                chat_request=_chat_request(),
-                organization_id="org-1",
-            )
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
         )
+    )
 
-    assert "block_type" not in agent_result.user_response
-    assert "navigation_goal" not in agent_result.user_response
-    assert "parameter_keys" not in agent_result.user_response
-    assert "haven't applied it yet" in agent_result.user_response
+    assert agent_result.user_response == answer
     assert agent_result.updated_workflow is None
-    final_log = next(call for call in log_info.call_args_list if call.args[0] == "copilot output policy final verdict")
-    assert final_log.kwargs["soft_rewrite_reason_codes"] == ["workflow_yaml_in_reply"]
-    assert final_log.kwargs["contained_failure"] is True
-    assert agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"] == ["workflow_yaml_in_reply"]
+    assert agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"] == []
     assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is True
 
 
@@ -2381,7 +2375,6 @@ def test_translate_to_agent_result_rewrites_block_yaml_when_workflow_attached() 
     assert "block_type" not in agent_result.user_response
     assert "navigation_goal" not in agent_result.user_response
     assert "parameter_keys" not in agent_result.user_response
-    assert "haven't applied it yet" not in agent_result.user_response
     assert "made the change" in agent_result.user_response
     assert agent_result.updated_workflow is workflow
 

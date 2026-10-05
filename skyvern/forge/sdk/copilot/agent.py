@@ -2809,10 +2809,7 @@ _INTERNAL_VOCAB_LEAK_REPLY = (
     "Tell me what you'd like to do next — describe the page action, data to collect, sign-in step, "
     "or check you want, and I'll translate that into a supported workflow update."
 )
-_BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL = (
-    "I drafted a change to the workflow but haven't applied it yet. Want me to update the workflow now?"
-)
-_BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL = "I made the change you described to the workflow."
+_BLOCK_YAML_IN_REPLY_REWRITE = "I made the change you described to the workflow."
 _PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re.IGNORECASE)
 _PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
 
@@ -4086,11 +4083,7 @@ async def _translate_to_agent_result(
                 soft_rewrite_reasons.append(_residual_vocab_reason)
                 output_policy_verdict.remove(_residual_vocab_reason)
         if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
-            user_response = (
-                _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
-                if last_workflow is not None
-                else _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL
-            )
+            user_response = _BLOCK_YAML_IN_REPLY_REWRITE
             soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
             output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
     final_output_kind = (
