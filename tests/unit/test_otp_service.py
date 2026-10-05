@@ -1205,6 +1205,63 @@ class TestParseOtpLogin:
         assert result is None  # no digit-run candidate to recover from; better than storing a short code
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("code", "next_word"),
+        [("482913", "This"), ("202613", "Note"), ("551207", "Enter")],
+    )
+    async def test_code_glued_to_the_next_word_is_recovered_not_the_footer_year(
+        self, monkeypatch: pytest.MonkeyPatch, code: str, next_word: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=code)
+        content = (
+            f"Your verification code is {code}{next_word} code expires in 10 minutes. "
+            "(c)2026 Example Co, 1 Example Way, Exampletown 99999"
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "llm_value", "expected"),
+        [
+            (
+                (
+                    "Your verification code is 482913This code expires in 10 minutes. "
+                    "(c)2026 Example Co, 1 Example Way, Exampletown 99999"
+                ),
+                "48291",
+                "482913",
+            ),
+            ("Your verification code is 202613This code expires in 10 minutes. (c)2026Example Co", "2026", "202613"),
+            ("Your verification code is 482913. Order 48291377Shipped today. (c)2026Example Co", "48291", "482913"),
+        ],
+        ids=["glued_code", "glued_code_read_as_glued_year", "separate_code_beside_glued_number"],
+    )
+    async def test_truncated_read_recovers_the_whole_code_not_a_glued_number(
+        self, monkeypatch: pytest.MonkeyPatch, content: str, llm_value: str, expected: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("llm_value", ["482913ab56", "48291356"], ids=["case_misread", "letters_dropped"])
+    async def test_case_misread_or_letter_dropped_alphanumeric_code_is_not_cut_to_its_digits(
+        self, monkeypatch: pytest.MonkeyPatch, llm_value: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content="Your code: 482913Ab56 (c)2026 Example Co", organization_id="o_test")
+
+        assert result is None or result.value == "482913Ab56"  # never the fragment "482913" or the year
+
+    @pytest.mark.asyncio
     async def test_does_not_charge_when_llm_call_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
         from skyvern.services import otp_service
