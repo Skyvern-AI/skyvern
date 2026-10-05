@@ -1844,6 +1844,19 @@ class TestParseFinalResponse:
         assert parsed["type"] == "REPLY"
         assert parsed["user_response"] == "ok"
 
+    def test_a_draft_object_before_the_final_envelope_does_not_win(self) -> None:
+        text = (
+            '{"type": "REPLY", "user_response": "draft"}\n\nOn reflection:\n'
+            '{"type": "REPLY", "user_response": "final", "global_llm_context": {"user_goal": "x"}}'
+        )
+        parsed = parse_final_response(text)
+        assert parsed["user_response"] == "final"
+        assert parsed["global_llm_context"] == {"user_goal": "x"}
+
+    def test_an_object_nested_in_a_malformed_envelope_is_not_read_as_the_reply(self) -> None:
+        text = '{"type": "REPLY", "user_response": "answer", "global_llm_context": {"user_response": "context"},}'
+        assert parse_final_response(text)["user_response"] == "answer"
+
     def test_pass_b_rejects_non_envelope_dict_in_prose(self) -> None:
         text = 'I cannot help with {"foo": "bar"}'
         parsed = parse_final_response(text)

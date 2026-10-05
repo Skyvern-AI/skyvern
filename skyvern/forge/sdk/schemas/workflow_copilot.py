@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
+from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
@@ -461,6 +461,9 @@ class WorkflowCopilotChatRequest(BaseModel):
         ),
     )
     supports_question_tool: bool = Field(False, description="The client can display and answer ask_user requests.")
+    supports_account_group_card: bool = Field(
+        False, description="The client can display account group review and receipt cards."
+    )
     credential_recovery_token: SecretStr | None = Field(
         None,
         repr=False,
@@ -551,6 +554,7 @@ class WorkflowCopilotSteerRequest(BaseModel):
 class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
     workflow_copilot_chat_id: str
     interaction_id: str
+    account_group_decision: AccountGroupDecision | None = None
 
 
 class WorkflowCopilotCredentialResponseRequest(BaseModel):

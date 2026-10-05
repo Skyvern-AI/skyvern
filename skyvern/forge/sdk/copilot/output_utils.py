@@ -210,6 +210,24 @@ def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
     return isinstance(type_value, str) and type_value.upper() in COPILOT_RESPONSE_TYPES
 
 
+def _last_envelope_in(text: str) -> dict[str, Any] | None:
+    # A reply can hold a draft object before the final one, so the span from the first brace to the
+    # last is not one JSON value; each object is decoded where it starts and the last envelope wins.
+    decoder = json.JSONDecoder(strict=False)
+    found: dict[str, Any] | None = None
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            # The next brace may open an object nested in this unparseable one, which is not a reply.
+            break
+        if isinstance(value, dict) and _looks_like_envelope(value):
+            found = value
+        index = text.find("{", end)
+    return found
+
+
 def _text_looks_envelope_shaped(text: str) -> bool:
     # require leading `{` so prose that merely quotes the field names (e.g.,
     # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
@@ -245,13 +263,9 @@ def parse_final_response(text: str) -> dict[str, Any]:
             return parsed
         cleaned = label_stripped
 
-    first = cleaned.find("{")
-    last = cleaned.rfind("}")
-    # skip when the slice equals the full string — _try_loads_dict above already tried it
-    if first != -1 and last > first and not (first == 0 and last == len(cleaned) - 1):
-        parsed = _try_loads_dict(cleaned[first : last + 1])
-        if parsed is not None and _looks_like_envelope(parsed):
-            return parsed
+    parsed = _last_envelope_in(cleaned)
+    if parsed is not None:
+        return parsed
 
     if _text_looks_envelope_shaped(cleaned):
         sniffed_type = _sniff_response_type(cleaned)

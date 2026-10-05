@@ -13,7 +13,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
-from urllib.parse import urlparse
 
 import structlog
 from agents.agent import AgentBase
@@ -34,7 +33,6 @@ from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
 from skyvern.forge import app
-from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
@@ -63,7 +61,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_browser_context,
     mcp_to_copilot,
     raw_secret_browser_denied,
-    resolve_browser_state_for_context,
     retire_browser_session_id,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_is_tainted,
@@ -151,7 +148,6 @@ class _BrowserCallOutcome:
     replacement_browser_session_id: str | None = None
     completion_browser_session_id: str | None = None
     completion_browser_session_generation: int | None = None
-    evidence_drain_complete: bool | None = None
     cancelled: bool = False
     protocol_error_detail: str | None = None
     last_run_facts: dict[str, str] = field(default_factory=dict)
@@ -365,7 +361,6 @@ def _record_browser_call_outcome(
             replacement_browser_session_id=outcome.replacement_browser_session_id,
             completion_browser_session_id=outcome.completion_browser_session_id,
             completion_browser_session_generation=outcome.completion_browser_session_generation,
-            evidence_drain_complete=outcome.evidence_drain_complete,
             response_truncated=outcome.response_truncated,
             payload_omitted=outcome.payload_omitted,
             **_copilot_log_fields(cast("CopilotContext", ctx)),
@@ -864,9 +859,7 @@ def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseExce
     return scrub_model_facing_tool_result(ctx, {"ok": False, "error": error})
 
 
-_MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "evidence_drain", "context_exit"]
-# The segments charged to the wall clock. ``evidence_drain`` names where a call died but is never
-# charged here, so the residual stays the remainder of what the record actually reports.
+_MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "context_exit"]
 _MCP_CALL_SEGMENTS: tuple[_MCPCallPhase, ...] = ("session_prepare", "context_enter", "dispatch", "context_exit")
 
 
@@ -882,7 +875,6 @@ class _PhaseClock:
         self._excluded_seconds = 0.0
         self.current: _MCPCallPhase | None = None
         self.elapsed: dict[_MCPCallPhase, int] = {}
-        self.drain_ms: int | None = None
 
     def _charge(self, now: float) -> None:
         if self._bucket is not None:
@@ -924,12 +916,6 @@ class _PhaseClock:
             self._bucket = None
             self._wall = int((now - self._started - self._excluded_seconds) * 1000)
         return self._wall
-
-    def record_drain(self, started: float, *, failed: bool) -> None:
-        """Settling the page runs after the wall is frozen: the caller waits for it, but it is not part of the call."""
-        self.drain_ms = int((time.monotonic() - started) * 1000)
-        if failed:
-            self.current = "evidence_drain"
 
     def settle(self) -> None:
         """The call answered, so no segment holds a failure and ``timing_phase`` would misname a returned error."""
@@ -982,7 +968,6 @@ def _log_mcp_timing(
             phase_context_enter_ms=spent["context_enter"],
             phase_dispatch_ms=dispatch_ms,
             phase_context_exit_ms=spent["context_exit"],
-            post_call_evidence_drain_ms=phases.drain_ms,
             phase_residual_ms=wall_clock_ms - sum(spent.values()),
             timing_phase=phases.current if call_status != "ok" else None,
             phase_dispatch_untimed_ms=untimed_ms,
@@ -1442,17 +1427,6 @@ def _copilot_to_call_tool_result(
     return CallToolResult(content=content, isError=is_error)
 
 
-def _evidence_candidate_url_origin(url: str) -> str | None:
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            return None
-        port = f":{parsed.port}" if parsed.port else ""
-    except ValueError:
-        return None
-    return f"https://{parsed.hostname.lower()}{port}"
-
-
 @asynccontextmanager
 async def service_worker_blocked_context(
     browser_state: BrowserState,
@@ -1461,7 +1435,7 @@ async def service_worker_blocked_context(
 ) -> AsyncIterator[BrowserContext]:
     original_context = browser_state.browser_context
     if original_context is None:
-        raise RuntimeError("Evidence-candidate browser does not support an isolated context")
+        raise RuntimeError("This browser does not support an isolated context")
     original_page = await browser_state.get_working_page()
     browser = original_context.browser
     fallback_browser: Browser | None = None
@@ -1524,8 +1498,6 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._client: Client | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_raw_tools: list[MCPTool] | None = None
-        self._evidence_candidate_origin: str | None = None
-        self._evidence_candidate_guarded_hops: list[CopilotCandidateNetworkHop] | None = None
 
     @property
     def name(self) -> str:
@@ -1555,82 +1527,6 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._client = None
         self._exit_stack = None
         self._cached_raw_tools = None
-
-    @asynccontextmanager
-    async def evidence_candidate_navigation_guard(
-        self,
-        expected_origin: str,
-    ) -> AsyncIterator[list[CopilotCandidateNetworkHop]]:
-        if self._evidence_candidate_origin is not None:
-            raise RuntimeError("Evidence-candidate navigation guard is already active")
-        normalized_origin = _evidence_candidate_url_origin(expected_origin)
-        if normalized_origin != expected_origin:
-            raise ValueError("Evidence-candidate origin must be an exact HTTPS origin")
-        ctx = self._context_provider()
-        session_error = await ensure_browser_session(ctx)
-        if session_error is not None:
-            raise RuntimeError(str(session_error.get("error", "Evidence-candidate browser session unavailable")))
-        examined_session_id = ctx.browser_session_id
-        try:
-            browser_state = await resolve_browser_state_for_context(ctx)
-            if browser_state is None:
-                await retire_browser_session_id(ctx, examined_session_id)
-                raise RuntimeError("Evidence-candidate navigation guard requires a browser context")
-            async with service_worker_blocked_context(
-                browser_state,
-                organization_id=ctx.organization_id,
-            ) as browser_context:
-                cookies = await browser_context.cookies()
-                if (
-                    cookies
-                    or browser_context.service_workers
-                    or any(page.url not in {"", "about:blank"} for page in browser_context.pages)
-                ):
-                    raise RuntimeError("Evidence-candidate navigation guard requires a pristine browser context")
-                async with app.AGENT_FUNCTION.copilot_candidate_network_guard(
-                    browser_context, expected_origin=normalized_origin
-                ) as guarded_hops:
-                    self._evidence_candidate_origin = normalized_origin
-                    self._evidence_candidate_guarded_hops = guarded_hops
-                    try:
-                        yield guarded_hops
-                    finally:
-                        await app.AGENT_FUNCTION.wait_for_copilot_candidate_network_idle(browser_context)
-        finally:
-            self._evidence_candidate_origin = None
-            self._evidence_candidate_guarded_hops = None
-
-    async def _drain_evidence_candidate_response_tasks(self) -> None:
-        if self._evidence_candidate_origin is None:
-            return
-        browser_state = await resolve_browser_state_for_context(self._context_provider())
-        browser_context = browser_state.browser_context if browser_state is not None else None
-        if browser_context is None:
-            raise RuntimeError("Evidence-candidate browser context became unavailable")
-        await app.AGENT_FUNCTION.wait_for_copilot_candidate_network_idle(browser_context)
-
-    async def evidence_candidate_browser_url(self) -> str:
-        if self._evidence_candidate_origin is None:
-            raise RuntimeError("Evidence-candidate navigation guard is not active")
-        browser_state = await resolve_browser_state_for_context(self._context_provider())
-        page = await browser_state.get_working_page() if browser_state is not None else None
-        if page is None:
-            raise RuntimeError("Evidence-candidate working page is unavailable")
-        browser_url = page.url
-        last_enforced_url = next(
-            (
-                hop["url"]
-                for hop in reversed(self._evidence_candidate_guarded_hops or [])
-                if hop["resource_type"] == "document"
-            ),
-            None,
-        )
-        if (
-            _evidence_candidate_url_origin(browser_url) != self._evidence_candidate_origin
-            or browser_url != last_enforced_url
-        ):
-            raise RuntimeError("candidate_browser_url_not_peer_verified")
-        return browser_url
 
     async def list_tools(
         self,
@@ -2479,7 +2375,6 @@ class SkyvernOverlayMCPServer(MCPServer):
         merged_args = {**mcp_args, "session_id": call_browser_session_id}
         call_browser_session_generation = ctx.browser_session_continuity_generation
         browser_outcome: _BrowserCallOutcome | None = None
-        post_dispatch_status: Literal["ok", "error", "session_error"] = "ok"
         try:
             phases.enter("context_enter")
             # Only pass the override when there is one, as the model-facing path does: an
@@ -2505,45 +2400,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     phases.unwind()
                     raise
                 phases.enter("context_exit")
-            # The evidence drain runs outside the dispatch span this record covers.
             phases.close()
-            if self._evidence_candidate_origin is not None:
-                drain_started = time.monotonic()
-                try:
-                    await asyncio.sleep(0)
-                    await self._drain_evidence_candidate_response_tasks()
-                except asyncio.CancelledError:
-                    phases.record_drain(drain_started, failed=True)
-                    if browser_outcome is not None:
-                        browser_outcome = replace(
-                            browser_outcome,
-                            evidence_drain_complete=False,
-                            cancelled=True,
-                            completion_browser_session_id=ctx.browser_session_id,
-                            completion_browser_session_generation=ctx.browser_session_continuity_generation,
-                        )
-                        _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
-                    raise
-                except CopilotBrowserSessionUnavailable:
-                    phases.record_drain(drain_started, failed=True)
-                    if browser_outcome is None:
-                        raise
-                    post_dispatch_status = "session_error"
-                    if browser_outcome is not None:
-                        browser_outcome = replace(browser_outcome, evidence_drain_complete=False)
-                    LOG.warning("Internal MCP evidence drain lost its browser session", tool=mcp_tool_name)
-                except Exception:
-                    phases.record_drain(drain_started, failed=True)
-                    if browser_outcome is None:
-                        raise
-                    post_dispatch_status = "error"
-                    if browser_outcome is not None:
-                        browser_outcome = replace(browser_outcome, evidence_drain_complete=False)
-                    LOG.warning("Internal MCP evidence drain failed", tool=mcp_tool_name)
-                else:
-                    phases.record_drain(drain_started, failed=False)
-                    if browser_outcome is not None:
-                        browser_outcome = replace(browser_outcome, evidence_drain_complete=True)
         except asyncio.CancelledError:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "cancelled")
             if uses_shared_browser_outcome and browser_outcome is None:
@@ -2648,9 +2505,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
             failed = raw.is_error or raw_mcp.get("ok", True) is not True
-        if post_dispatch_status == "ok":
-            phases.settle()
-        call_status = "error" if failed else post_dispatch_status
+        phases.settle()
+        call_status: Literal["ok", "error"] = "error" if failed else "ok"
         _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", call_status)
         scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp, tool_name=mcp_tool_name)
         error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)

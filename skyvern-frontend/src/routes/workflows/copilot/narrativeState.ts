@@ -728,6 +728,8 @@ export const AUTHORING_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
 ]);
+export const ACCOUNT_GROUP_SUBMIT_TOOL = "run_workflow_for_accounts";
+
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
@@ -791,6 +793,9 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   ask_user: "Asking you",
   set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "Reviewing the accounts with you",
+  get_account_group_status: "Checking the account runs",
+  cancel_account_group: "Reviewing a cancel with you",
 };
 
 // What kind of work a call did, for the activity log's per-step rollup. Keyed
@@ -839,6 +844,9 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   disable_workflow_schedule: "other",
   cancel_workflow_schedule: "other",
   delete_workflow_schedule: "other",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "run",
+  get_account_group_status: "other",
+  cancel_account_group: "other",
 };
 
 export function toolCallKind(toolName: string): ToolCallKind {

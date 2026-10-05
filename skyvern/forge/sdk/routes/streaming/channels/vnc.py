@@ -33,6 +33,7 @@ from skyvern.config import settings
 from skyvern.exceptions import MissingRoutedVncAddressError
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
+from skyvern.forge.sdk.routes.streaming.run_stream_outcome import RunStreamConnection
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
     loop_verify_task,
@@ -175,9 +176,19 @@ class VncChannel:
     remote_clipboard_synced_at: float | None = None
     task: Task | None = None
     workflow_run: WorkflowRun | None = None
+    live_stream: RunStreamConnection = dataclasses.field(init=False, repr=False)
 
     def __post_init__(self, initial_interactor: Interactor) -> None:
         self.interactor = initial_interactor
+        # The viewer redials a dropped VNC socket, and a run view falls back to the session's screencast.
+        self.live_stream = RunStreamConnection(
+            organization_id=self.organization_id,
+            viewer_reconnects=True,
+            transport="vnc",
+            browser_session_id=self.browser_session.persistent_browser_session_id if self.browser_session else None,
+        )
+        if self.browser_session:
+            self.live_stream.observe_session(self.browser_session)
         add_vnc_channel(self)
 
     @property
@@ -420,17 +431,21 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                             continue
 
                 except WebSocketDisconnect:
+                    vnc_channel.live_stream.end_first("viewer_left")
                     LOG.debug(f"{class_name} Frontend disconnected.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedError:
+                    vnc_channel.live_stream.end_first("viewer_left")
                     LOG.debug(f"{class_name} Frontend closed the vnc channel.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedOK:
+                    vnc_channel.live_stream.end_first("viewer_left")
                     LOG.debug(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
                     pass
                 except Exception:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(f"{class_name} An unexpected exception occurred.", **vnc_channel.identity)
                     raise
 
@@ -440,17 +455,21 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 try:
                     await novnc_ws.send(data)
                 except WebSocketDisconnect:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.debug(f"{class_name} Browser disconnected from vnc.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedError:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.debug(f"{class_name} Browser closed vnc.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedOK:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.debug(f"{class_name} Browser closed vnc cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
                     pass
                 except Exception:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(
                         f"{class_name} An unexpected exception occurred in frontend-to-browser loop.",
                         **vnc_channel.identity,
@@ -468,23 +487,28 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     data = await novnc_ws.recv()
 
                 except WebSocketDisconnect:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.debug(
                         f"{class_name} Browser disconnected from the vnc channel session.", **vnc_channel.identity
                     )
                     await vnc_channel.close(reason="browser-disconnected")
                 except ConnectionClosedError:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.debug(f"{class_name} Browser closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed")
                 except ConnectionClosedOK:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.debug(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed-ok")
                 except asyncio.CancelledError:
                     pass
                 except Exception:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(
                         f"{class_name} An unexpected exception occurred in browser-to-frontend loop.",
                         **vnc_channel.identity,
                     )
+                    await vnc_channel.close(reason="browser-error")
                     raise
 
                 if not data:
@@ -494,20 +518,26 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     if vnc_channel.websocket.client_state != WebSocketState.CONNECTED:
                         continue
                     await vnc_channel.websocket.send_bytes(data)
+                    # The first relayed message is the display server's handshake: the browser is on the wire.
+                    vnc_channel.live_stream.frame_sent()
                 except WebSocketDisconnect:
+                    vnc_channel.live_stream.end_first("viewer_left")
                     LOG.debug(
                         f"{class_name} Frontend disconnected from the vnc channel session.", **vnc_channel.identity
                     )
                     await vnc_channel.close(reason="frontend-disconnected")
                 except ConnectionClosedError:
+                    vnc_channel.live_stream.end_first("viewer_left")
                     LOG.debug(f"{class_name} Frontend closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="frontend-closed")
                 except ConnectionClosedOK:
+                    vnc_channel.live_stream.end_first("viewer_left")
                     LOG.debug(f"{class_name} Frontend closed the vnc channel session cleanly.", **vnc_channel.identity)
                     await vnc_channel.close(reason="frontend-closed-ok")
                 except asyncio.CancelledError:
                     pass
                 except Exception:
+                    vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(f"{class_name} An unexpected exception occurred.", **vnc_channel.identity)
                     raise
 
@@ -523,6 +553,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         except ConnectionClosedOK:
             LOG.debug(f"{class_name} Connection closed cleanly in loop stream.", **vnc_channel.identity)
         except Exception:
+            vnc_channel.live_stream.end_first("stream_error")
             LOG.exception(f"{class_name} An exception occurred in loop stream.", **vnc_channel.identity)
         finally:
             LOG.debug(f"{class_name} Closing the loop stream.", **vnc_channel.identity)
@@ -566,7 +597,9 @@ async def get_vnc_channel_for_browser_session(
     LOG.debug("Got vnc context for browser session.", vnc_channel=vnc_channel)
 
     loops = [
-        asyncio.create_task(loop_verify_browser_session(vnc_channel)),
+        asyncio.create_task(
+            loop_verify_browser_session(vnc_channel, on_session=vnc_channel.live_stream.observe_session)
+        ),
         asyncio.create_task(loop_stream_vnc(vnc_channel)),
     ]
 

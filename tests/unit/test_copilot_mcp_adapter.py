@@ -442,7 +442,6 @@ _PAYLOAD_KEYS_THAT_WOULD_LEAK = {"args", "merged_args", "arguments", "mcp_args",
 _BROWSER_BOOT_SECONDS = 2.0
 _MCP_CALL_SECONDS = 3.0
 _AFTER_CALL_SECONDS = 5.0
-_AFTER_CALL_MS = 5000
 _WALL_MS = 5000
 _SESSION_ONLY_MS = 2000
 _MCP_CALL_MS = 3000
@@ -1137,28 +1136,19 @@ class TestSharedBrowserCallOutcome:
         assert second["data"]["metadata"]["width"] == 1280
 
     @pytest.mark.asyncio
-    async def test_typed_internal_accessor_preserves_legacy_dict_and_drain_incomplete(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_typed_internal_accessor_preserves_legacy_dict(self) -> None:
         payload = {"ok": True, "data": {"result": {"count": 3}}}
         server = self._server(
             model_tool_name="evaluate",
             raw_tool_name="skyvern_evaluate",
             payload=payload,
         )
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _failed_drain() -> None:
-            raise RuntimeError("drain failed")
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failed_drain)
 
         typed = await server.call_internal_browser_tool("skyvern_evaluate", {"expression": "scan()"})
         legacy = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
 
         assert typed.result == legacy == mcp_to_copilot(payload)
         assert typed.outcome.dispatched is True
-        assert typed.outcome.evidence_drain_complete is False
         assert typed.outcome.source_browser_session_generation == 0
 
     @pytest.mark.asyncio
@@ -1569,16 +1559,10 @@ class TestSharedBrowserCallOutcome:
 class TestMCPToolTiming:
     @pytest.mark.asyncio
     async def test_internal_call_logs_the_server_total_without_changing_the_result(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+        self, _fake_clock: list[float]
     ) -> None:
         payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"sdk": 812, "total": 815}}
         server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
 
         with capture_logs() as captured:
             result = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
@@ -2050,7 +2034,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["call_status"] == "error"
         assert record["timing_phase"] is None
-        assert record["post_call_evidence_drain_ms"] is None
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -2180,71 +2163,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["phase_dispatch_untimed_ms"] is None
         assert record["timing_server_overrun"] is True
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("failure", "call_status"),
-        [
-            (asyncio.CancelledError(), "cancelled"),
-            (CopilotBrowserSessionUnavailable("pbs_1"), "session_error"),
-            (RuntimeError("drain exploded"), "error"),
-        ],
-        ids=["cancelled", "session_error", "error"],
-    )
-    async def test_an_evidence_drain_that_fails_still_reports_the_budget_it_spent(
-        self,
-        failure: BaseException,
-        call_status: str,
-        monkeypatch: pytest.MonkeyPatch,
-        _fake_clock: list[float],
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-        server._context_provider().browser_session_replacements = {"pbs_1": "pbs_replacement"}
-
-        async def _failing_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-            raise failure
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failing_drain)
-
-        with capture_logs() as captured:
-            if isinstance(failure, asyncio.CancelledError):
-                with pytest.raises(asyncio.CancelledError):
-                    await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-            else:
-                await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == call_status
-        assert record["wall_clock_ms"] == _WALL_MS
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["phase_residual_ms"] == 0
-        assert record["timing_phase"] == "evidence_drain"
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    async def test_an_evidence_drain_that_succeeds_reports_what_the_caller_waited_for_it(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
-
-        with capture_logs() as captured:
-            await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == "ok"
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["wall_clock_ms"] == _WALL_MS
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio

@@ -39,6 +39,7 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_CANCEL_TOOL_NAME, ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -637,7 +638,19 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         questions = msg.narrative_payload.get("questionInteractions", []) if msg.narrative_payload is not None else []
         for raw in questions:
             interaction = QuestionInteraction.model_validate(raw)
-            if interaction.status == "resolved":
+            if interaction.account_group_review is not None or interaction.account_group_cancel is not None:
+                summary = (
+                    interaction.tool_result()
+                    if interaction.status == "resolved"
+                    else {"interaction_id": interaction.interaction_id, "status": interaction.status}
+                )
+                tool_name = (
+                    ACCOUNT_GROUP_SUBMIT_TOOL_NAME
+                    if interaction.account_group_review is not None
+                    else ACCOUNT_GROUP_CANCEL_TOOL_NAME
+                )
+                lines.append(f"{tool_name} review: {json.dumps(summary)}")
+            elif interaction.status == "resolved":
                 lines.append(f"ask_user result: {json.dumps(interaction.tool_result())}")
             else:
                 lines.append(f"ask_user request: {interaction.model_dump_json()}")
@@ -5687,6 +5700,7 @@ async def _run_copilot_turn_impl(
         mode=eval_mode,
         native_tools=copilot_native_tools(
             supports_question_tool=chat_request.supports_question_tool,
+            supports_account_group_card=chat_request.supports_account_group_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,
             authoring_capability=copilot_config.authoring_capability,

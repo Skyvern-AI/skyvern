@@ -275,7 +275,10 @@ async def verify_workflow_run(
     return workflow_run, addressable_browser_session
 
 
-async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -> None:
+async def loop_verify_browser_session(
+    verifiable: MessageChannel | VncChannel,
+    on_session: t.Callable[[AddressablePersistentBrowserSession | None], None] | None = None,
+) -> None:
     """
     Loop until the browser session is cleared or the websocket is closed.
     """
@@ -287,6 +290,8 @@ async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -
         )
 
         verifiable.browser_session = browser_session
+        if on_session is not None:
+            on_session(browser_session)
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 
