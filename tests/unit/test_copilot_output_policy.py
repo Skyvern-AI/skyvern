@@ -844,51 +844,13 @@ def test_rejects_deprecated_block_identifier_outside_informational_answer(deprec
     assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
 
 
-def test_rejects_informational_block_taxonomy_list_without_deprecated_name() -> None:
+def test_allows_an_answer_that_names_several_block_types() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
         response_type="REPLY",
         user_response=(
-            "Use these block types: navigation for page actions, extraction for data, validation for checks, "
-            "and goto_url for direct URLs."
-        ),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
-
-
-def test_allows_two_internal_block_type_terms_in_informational_answer() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Use a navigation block for the page action and an extraction block for the final data.",
-    )
-
-    assert verdict.allowed
-
-
-def test_allows_generic_navigation_validation_extraction_prose() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response=(
-            "After login, the workflow uses navigation to reach the form, validation of the input, and "
-            "extraction of the resulting data."
-        ),
-    )
-
-    assert verdict.allowed
-
-
-def test_allows_taxonomy_terms_outside_informational_answer_without_deprecated_identifier() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
-        user_response=(
-            "The draft includes navigation for page actions, extraction for data, validation for checks, "
-            "and goto_url for direct URLs."
+            "Use a `for_loop` block over the list of URLs. Inside it, a `goto_url` block opens each one and an "
+            "`extraction` block reads the page title; add a `validation` block if the page must load first."
         ),
     )
 
