@@ -383,6 +383,19 @@ def classify_from_failure_reason(
             }
         )
 
+    # The worker process running the run died mid-flight (container restart; in practice an OOM
+    # kill) and its replacement failed the orphaned activity with this typed cause. Keyed on the cause,
+    # never on reason text, so a reason that merely quotes the wording is not pinned on the worker.
+    if exc_name == WORKER_CONTAINER_RESTARTED_REASON_CODE:
+        categories.append(
+            {
+                "category": FailureCategory.INFRASTRUCTURE_ERROR.value,
+                "confidence_float": 0.95,
+                "reason_code": WORKER_CONTAINER_RESTARTED_REASON_CODE,
+                "reasoning": "Worker container restarted mid-run",
+            }
+        )
+
     # Runner-slot contention, not a fault; the distinct reason_code keeps it separable from
     # real runner failures in analytics.
     if "codeblock runner is already executing another codeblock" in reason:
@@ -577,7 +590,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 7
+CLASSIFIER_VERSION = 8
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -597,6 +610,7 @@ BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
 BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE = "browser_session_expired_before_run"
 PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
+WORKER_CONTAINER_RESTARTED_REASON_CODE = "worker_container_restarted"
 UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
 SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
@@ -673,6 +687,7 @@ _REASON_CODE_LITERALS = frozenset(
         SITE_THROTTLE_REASON_CODE,
         EXTERNAL_SERVICE_THROTTLE_REASON_CODE,
         UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
+        WORKER_CONTAINER_RESTARTED_REASON_CODE,
     }
 )
 

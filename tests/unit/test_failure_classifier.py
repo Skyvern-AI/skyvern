@@ -18,6 +18,7 @@ from skyvern.forge.failure_classifier import (
     CLASSIFIER_VERSION,
     FAILURE_ATTRIBUTION_SCHEMA_VERSION,
     PROXY_TRANSPORT_FAILED_REASON_CODE,
+    WORKER_CONTAINER_RESTARTED_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
     derive_failure_attribution,
@@ -550,6 +551,24 @@ def test_secure_codeblock_runner_unavailable_carries_a_reason_code() -> None:
     infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
     assert len(infra) == 1
     assert infra[0]["reason_code"] == "secure_codeblock_runner_unavailable"
+
+
+def test_worker_restart_is_attributed_from_the_typed_cause_not_from_reason_text() -> None:
+    """Only the typed cause the restart recovery raises names a worker loss; a reason that merely
+    quotes worker-restart wording (page text, user code) must not be pinned on the worker."""
+    reason = "Workflow run failed: the worker running this run was restarted before the run finished."
+    result = classify_from_failure_reason(
+        reason, exception_name=WORKER_CONTAINER_RESTARTED_REASON_CODE, fallback_to_unknown=True
+    )
+
+    assert result is not None
+    assert [entry["category"] for entry in result] == ["INFRASTRUCTURE_ERROR"]
+    attribution = derive_failure_attribution(result)
+    assert attribution["primary_infra_component"] == "worker"
+    assert attribution["reason_code"] == WORKER_CONTAINER_RESTARTED_REASON_CODE
+
+    quoted = _classify("Element text: 'the worker running it was restarted'", fallback_to_unknown=True)
+    assert WORKER_CONTAINER_RESTARTED_REASON_CODE not in [entry.get("reason_code") for entry in quoted]
 
 
 def test_ordinary_user_code_failure_is_not_infrastructure() -> None:
