@@ -8680,7 +8680,7 @@ def _has_exact_class_token(class_attr: str | None, token: str) -> bool:
     return class_attr is not None and token in str(class_attr).split()
 
 
-# Owner-scoped ui-select state read before and after Enter (`owned` reachable for a ui-select nested in another's
+# Owner-scoped ui-select state read before and after the commit (`owned` reachable for a ui-select nested in another's
 # dropdown). Disabled = stock 0.19.8 forms only: `disabled` attr/class, `select2-disabled`, non-"false" `aria-disabled`.
 _UI_SELECT_STATE_JS = """
 (el) => {
@@ -8696,6 +8696,54 @@ _UI_SELECT_STATE_JS = """
 }
 """
 
+# Commit the concrete filtered option row by clicking it (its own click/ng-click selects that exact row object),
+# rather than pressing Enter -- which AngularJS ui-select routes through its internal activeIndex and can land on a
+# stale/different row. Fail-closed: click only when there is one unambiguous target -- the unique enabled visible
+# row the widget filtered to, or (when the widget left several rows rendered) the single visible row whose full
+# visible label exactly equals the entered value -- never a row chosen merely for being first/visible, by a
+# substring, or by hidden helper text. Returns {clicked, clickedLabel}.
+_UI_SELECT_COMMIT_JS = """
+([el, text]) => {
+  const container = el.closest('.ui-select-container');
+  if (container === null) { return { clicked: false }; }
+  const owned = (n) => n.closest('.ui-select-container') === container;
+  const rows = [...container.querySelectorAll('.ui-select-choices-row')].filter((r) => owned(r) && r.getClientRects().length > 0);
+  const isDisabled = (r) => r.hasAttribute('disabled') || r.classList.contains('disabled') || r.classList.contains('select2-disabled') || (r.hasAttribute('aria-disabled') && (r.getAttribute('aria-disabled') || '').trim().toLowerCase() !== 'false');
+  const enabled = rows.filter((r) => !isDisabled(r));
+  let target = null;
+  let targetLabel = null;
+  if (enabled.length === 1 && rows.length > 0 && !isDisabled(rows[0])) {
+    target = enabled[0];
+  } else {
+    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const visibleText = (node) => {
+      let out = '';
+      const walk = (n) => {
+        for (const c of n.childNodes) {
+          if (c.nodeType === 3) { out += c.textContent; }
+          else if (c.nodeType === 1 && c.getClientRects().length > 0) { walk(c); }
+        }
+      };
+      walk(node);
+      return out;
+    };
+    const needle = norm(text);
+    if (needle) {
+      const matches = rows.filter((r) => norm(visibleText(r)) === needle);
+      if (matches.length === 1 && !isDisabled(matches[0])) {
+        target = matches[0];
+        targetLabel = visibleText(matches[0]).trim();
+      }
+    }
+  }
+  if (target === null) { return { clicked: false }; }
+  const label = targetLabel !== null ? targetLabel : (target.textContent || '').trim();
+  if (!label) { return { clicked: false }; }
+  target.click();
+  return { clicked: true, clickedLabel: label };
+}
+"""
+
 
 def _ui_select_commit_result(
     action: InputTextAction,
@@ -8705,7 +8753,7 @@ def _ui_select_commit_result(
     text: str,
 ) -> ActionResult | None:
     """On a commit-shaped close (choices closed + search emptied) return ``ActionSuccess`` when a visible owner match
-    equals the candidate label (arm 1) or is genuinely new versus the pre-Enter latent baseline (arm 2); return
+    equals the candidate label (arm 1) or is genuinely new versus the pre-commit latent baseline (arm 2); return
     ``None`` on a byte-identical clean no-op, else ``NoAvailableOptionFoundForCustomSelection``."""
     if isinstance(post, dict) and not post.get("choicesOpen") and post.get("searchValue") == "":
 
@@ -8738,7 +8786,7 @@ def _ui_select_commit_result(
         return None
     return ActionFailure(
         NoAvailableOptionFoundForCustomSelection(
-            reason="ui-select Enter commit could not be verified", target_value=candidate
+            reason="ui-select option commit could not be verified", target_value=candidate
         )
     )
 
@@ -9146,9 +9194,11 @@ async def _handle_input_text_action(
             )
         ]
 
-    # ui-select (AngularJS) resets activeIndex to the first visible row per keystroke, so Enter commits rows[0].
-    # Press it only when that first visible row is the unique enabled one, then prove the commit landed before
-    # recording it (see _ui_select_commit_result). Run before the generic probe.
+    # AngularJS ui-select routes an Enter commit through its internal activeIndex, which production shows can commit a
+    # different row than the concrete one Skyvern probed after filtering (the activeIndex is pinned to a stale
+    # pre-existing selection; the widget's refreshDelay is a likely contributor, not proven), so Enter commits the
+    # wrong account while verification correctly rejects it. Commit the concrete filtered row by clicking it instead,
+    # then prove the commit landed before recording it (see _ui_select_commit_result). Run before the generic probe.
     if (
         text
         and tag_name == InteractiveElement.INPUT
@@ -9175,23 +9225,22 @@ async def _handle_input_text_action(
                     pre = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
             except Exception:
                 LOG.info("Failed to filter/probe ui-select rows, falling back", element_id=skyvern_element.get_id())
-            if (
-                isinstance(pre, dict)
-                and pre.get("enabledRowCount") == 1
-                and pre.get("firstVisibleEnabled")
-                and pre.get("firstVisibleLabel")
-            ):
-                candidate = str(pre["firstVisibleLabel"])
-                await skyvern_element.press_key("Enter")
-                post: Any = None
-                try:
-                    await _wait_custom_select_render_settle(skyvern_element)
-                    post = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
-                except Exception:
-                    LOG.info("Failed to read ui-select state after Enter", element_id=skyvern_element.get_id())
-                commit_result = _ui_select_commit_result(action, pre, post, candidate, text)
-                if commit_result is not None:
-                    return [commit_result]  # None → proven clean no-op: fall through to the generic path
+            if isinstance(pre, dict) and pre.get("choicesOpen"):
+                committed_click = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_COMMIT_JS, text)
+                if isinstance(committed_click, dict) and committed_click.get("clicked"):
+                    candidate = str(committed_click.get("clickedLabel") or "")
+                    post: Any = None
+                    try:
+                        await _wait_custom_select_render_settle(skyvern_element)
+                        post = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
+                    except Exception:
+                        LOG.info(
+                            "Failed to read ui-select state after committing the row",
+                            element_id=skyvern_element.get_id(),
+                        )
+                    commit_result = _ui_select_commit_result(action, pre, post, candidate, text)
+                    if commit_result is not None:
+                        return [commit_result]  # None → proven clean no-op: fall through to the generic path
         finally:
             await incremental_scraped.stop_listen_dom_increment()
         # Not commit-ready or a proven no-op: clear the probe so the ordinary path does not double the typed value.
