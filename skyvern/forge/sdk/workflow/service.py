@@ -12190,16 +12190,26 @@ class WorkflowService:
 
         return workflow_run
 
-    async def _cascade_child_entities_on_terminal(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
+    async def _cascade_child_entities_on_terminal(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        organization_id: str | None = None,
+    ) -> None:
         if status != WorkflowRunStatus.timed_out:
             return
 
         try:
-            await self._do_cascade_child_entities(workflow_run_id, status)
+            await self._do_cascade_child_entities(workflow_run_id, status, organization_id=organization_id)
         except Exception:
             LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
 
-    async def _do_cascade_child_entities(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
+    async def _do_cascade_child_entities(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        organization_id: str | None = None,
+    ) -> None:
         block_status = BLOCK_STATUS_MAP[status]
         task_status = TASK_STATUS_MAP[status]
         step_status = STEP_STATUS_MAP[status]
@@ -12207,6 +12217,7 @@ class WorkflowService:
 
         blocks_updated = await app.DATABASE.observer.bulk_update_workflow_run_blocks_by_workflow_run_id(
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
             new_status=block_status.value,
             only_if_status_in=NONFINAL_BLOCK_STATUSES,
             failure_reason=failure_reason,
@@ -13370,7 +13381,11 @@ class WorkflowService:
             if updated is None:
                 return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
             if pre_finally_status == WorkflowRunStatus.timed_out:
-                await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
+                await self._cascade_child_entities_on_terminal(
+                    workflow_run_id,
+                    WorkflowRunStatus.timed_out,
+                    organization_id=updated.organization_id,
+                )
             return updated
 
         return workflow_run
@@ -13587,7 +13602,11 @@ class WorkflowService:
             # Opt-in: run-level failures normally leave child rows to their own executors,
             # but out-of-band finalization (an interrupted worker) has no executor left to do it.
             try:
-                await self._do_cascade_child_entities(workflow_run_id, WorkflowRunStatus.failed)
+                await self._do_cascade_child_entities(
+                    workflow_run_id,
+                    WorkflowRunStatus.failed,
+                    organization_id=workflow_run.organization_id,
+                )
             except Exception:
                 LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
         return workflow_run
@@ -13721,7 +13740,11 @@ class WorkflowService:
         )
         if cascade_children:
             try:
-                await self._do_cascade_child_entities(workflow_run_id, WorkflowRunStatus.failed)
+                await self._do_cascade_child_entities(
+                    workflow_run_id,
+                    WorkflowRunStatus.failed,
+                    organization_id=workflow_run.organization_id,
+                )
             except Exception:
                 LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
         return workflow_run
@@ -14009,7 +14032,11 @@ class WorkflowService:
                     return updated_workflow_run
 
         otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.timed_out)
-        await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
+        await self._cascade_child_entities_on_terminal(
+            workflow_run_id,
+            WorkflowRunStatus.timed_out,
+            organization_id=updated_workflow_run.organization_id,
+        )
         return updated_workflow_run
 
     async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
