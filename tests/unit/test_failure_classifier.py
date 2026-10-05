@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern import exceptions as skyvern_exceptions
-from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
+from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS, SKYVERN_DIR
 from skyvern.exceptions import ScrapingFailed
 from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_CLOSED_REASON_CODE,
@@ -396,6 +397,44 @@ def test_user_code_crash_mentioning_process_exit_is_not_infrastructure() -> None
     assert "INFRASTRUCTURE_ERROR" not in categories
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(
+            "navigation block failed. failure reason: Max retries per step (3) exceeded. Possible failure reasons: "
+            "The user's attempts failed because the website returned a '502 Bad Gateway' error.",
+            id="max-retries-summary-502",
+        ),
+        pytest.param(
+            "navigation block terminated. Reason: Page shows 502 Bad Gateway error; cannot proceed with request.",
+            id="terminate-bad-gateway",
+        ),
+        pytest.param("http_request block failed. failure reason: HTTP 500: ", id="http-request-block-500"),
+    ],
+)
+def test_website_error_comes_only_from_the_model_never_from_failure_prose(reason: str) -> None:
+    categories = classify_from_failure_reason(reason, fallback_to_unknown=True) or []
+
+    assert "WEBSITE_ERROR" not in [category["category"] for category in categories]
+
+
+PROMPTS_DIR = SKYVERN_DIR / "forge" / "prompts" / "skyvern"
+
+
+def test_every_prompt_that_asks_the_model_for_a_category_offers_website_error() -> None:
+    category_lists = {
+        template.name: re.search(r'"failure_categories": array //.*?Categories: (.*)', template.read_text())
+        for template in PROMPTS_DIR.glob("*.j2")
+    }
+    category_lists = {name: match.group(1) for name, match in category_lists.items() if match}
+
+    assert len(category_lists) >= 5
+    for name, listed in category_lists.items():
+        offered = set(re.findall(r"\b([A-Z][A-Z_]+[A-Z]) \(", listed))
+        assert "WEBSITE_ERROR" in offered, name
+        assert offered <= {category.value for category in FailureCategory}, name
+
+
 def _driver_nav_failure(code: str, url: str = "https://example.test/login") -> skyvern_exceptions.FailedToNavigateToUrl:
     return skyvern_exceptions.FailedToNavigateToUrl(
         url=url,
@@ -682,6 +721,20 @@ def test_derive_budget_exhaustion_maps_to_non_infra() -> None:
 def test_derive_element_not_found_maps_to_non_infra() -> None:
     fc = [{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8, "reasoning": "Exception: ElementNotFound"}]
     assert derive_failure_attribution(fc)["primary_infra_component"] == "non_infra"
+
+
+def test_derive_a_model_written_website_error_is_non_infra_not_worker() -> None:
+    fc = [
+        {
+            "category": "WEBSITE_ERROR",
+            "confidence_float": 1.0,
+            "reasoning": "The site's server returned 502 Bad Gateway.",
+        },
+        {"category": "NAVIGATION_FAILURE", "confidence_float": 0.8, "reasoning": "The page did not load."},
+    ]
+    document = derive_failure_attribution(fc)
+    assert document["failure_category"] == "WEBSITE_ERROR"
+    assert document["primary_infra_component"] == "non_infra"
 
 
 def test_derive_none_input_is_explicit_unattributed_document() -> None:
