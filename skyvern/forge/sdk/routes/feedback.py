@@ -21,6 +21,11 @@ async def _resolve_target_context(
         if workflow_run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
         return workflow_run.workflow_permanent_id
+    if target_type == "browser_recording":
+        recording = await app.DATABASE.browser_recordings.get_recording(target_id, organization_id)
+        if recording is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found")
+        return recording.workflow_permanent_id
     task = await app.DATABASE.tasks.get_task(target_id, organization_id=organization_id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")

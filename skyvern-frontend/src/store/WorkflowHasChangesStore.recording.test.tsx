@@ -37,6 +37,7 @@ import {
   type WorkflowSaveData,
 } from "./WorkflowHasChangesStore";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { useRecordingFeedbackStore } from "./RecordingFeedbackStore";
 import { useRecordingStore } from "./useRecordingStore";
 import {
   confirmCodeCacheDeletion,
@@ -86,6 +87,7 @@ vi.mock("@/routes/workflows/studio/useStudioPanes", () => ({
 }));
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: vi.fn(),
+  getRecordBrowserContext: () => ({}),
   markRecordBrowserProcessed: vi.fn(),
   setRecordBrowserContext: vi.fn(),
 }));
@@ -602,6 +604,9 @@ describe("workflow recording attachment", () => {
   );
 
   it("writes the pending-save marker without a degraded-mode notice when storage works", async () => {
+    useRecordingFeedbackStore
+      .getState()
+      .show({ workflow_permanent_id: "wpid-1" });
     let resolvePut!: (value: unknown) => void;
     mocks.put.mockReset().mockImplementationOnce(
       () =>
@@ -638,6 +643,7 @@ describe("workflow recording attachment", () => {
       await saving;
     });
     expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
+    expect(useRecordingFeedbackStore.getState().target).toBeNull();
   });
 
   it.each([false, true])(

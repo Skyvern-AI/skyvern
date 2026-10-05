@@ -1254,7 +1254,10 @@ export type PylonEmailHash = {
   hash: string;
 };
 
-export type RunFeedbackTargetType = "workflow_run" | "task";
+export type RunFeedbackTargetType =
+  | "workflow_run"
+  | "task"
+  | "browser_recording";
 export type FeedbackRating = "up" | "down";
 
 export type RunFeedbackApiResponse = {
