@@ -135,6 +135,10 @@ _CODE_SEPARATOR_PATTERN = re.compile(r"[\s\-]")
 _CODE_CANDIDATE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])\d{3,4}(?:[ \t]\d{3,4})+(?![A-Za-z0-9])|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
 )
+# HTML-to-text output can glue a code to the next word ("482913This"), which the tokenizer reads as one token.
+# Six digits minimum keeps a footer year glued to the company name ("2026Example") out of the candidates.
+_GLUED_DIGIT_RUN_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9]{6,8})(?=[A-Z][a-z])")
+_ALL_DIGITS_PATTERN = re.compile(r"[0-9]+")
 TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE = '{"verification_code":"123456"}'
 # Recovers the verification_code value when the surrounding JSON is malformed
 # (e.g. unescaped quotes inside a relayed email). Assumes verification_code is
@@ -236,6 +240,18 @@ def _verbatim_otp_value(content: str, otp_type: OTPType | None, llm_value: str |
     prefixed = [candidate for candidate in numeric_candidates if candidate.startswith(stripped_value)]
     if prefixed:
         return prefixed[0] if len(prefixed) == 1 else None
+    # Glued runs rank below whole tokens and stand in only for an all-digit read no longer than themselves, so
+    # a read that kept an alphanumeric code's letters or later digits ("482913Ab56") never shrinks to "482913".
+    if _ALL_DIGITS_PATTERN.fullmatch(stripped_value):
+        glued_runs = [
+            run for run in dict.fromkeys(_GLUED_DIGIT_RUN_PATTERN.findall(content)) if len(run) >= len(stripped_value)
+        ]
+        if stripped_value in glued_runs:
+            return stripped_value
+        prefixed = [run for run in glued_runs if run.startswith(stripped_value)]
+        if prefixed:
+            return prefixed[0] if len(prefixed) == 1 else None
+        numeric_candidates = list(dict.fromkeys([*numeric_candidates, *glued_runs]))
     # Approximate recovery never guesses: an equally-similar runner-up ("123456" and "123457" against a
     # misread "123458") means the source cannot say which code was located, so let polling retry instead.
     scored = sorted(
