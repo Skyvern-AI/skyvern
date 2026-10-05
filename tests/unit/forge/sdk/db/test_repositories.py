@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.db.models import (
     ScriptBlockModel,
     ScriptModel,
     TaskModel,
+    WorkflowRunBlockModel,
     WorkflowScriptModel,
 )
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
@@ -871,3 +873,37 @@ async def test_create_returns_the_stored_row_without_reading_it_back(
     stored = await read_back(db, organization_id, created)
     assert stored is not None
     assert created.model_dump() == stored.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_block_bulk_update_scopes_to_the_given_organization_and_none_matches_every_block(
+    agent_db: AgentDB,
+) -> None:
+    async with agent_db.Session() as session:
+        session.add_all(
+            WorkflowRunBlockModel(
+                workflow_run_block_id=block_id,
+                workflow_run_id="wr_shared",
+                organization_id=organization_id,
+                status="running",
+                block_type="task",
+            )
+            for block_id, organization_id in (("wrb_own", "o_own"), ("wrb_other", "o_other"), ("wrb_null", None))
+        )
+        await session.commit()
+
+    async def statuses() -> dict[str, str]:
+        async with agent_db.Session() as session:
+            rows = (await session.execute(select(WorkflowRunBlockModel))).scalars().all()
+            return {row.workflow_run_block_id: row.status for row in rows}
+
+    update = agent_db.observer.bulk_update_workflow_run_blocks_by_workflow_run_id
+    scoped = await update(
+        workflow_run_id="wr_shared", organization_id="o_own", new_status="timed_out", only_if_status_in=["running"]
+    )
+    assert scoped == 1
+    assert await statuses() == {"wrb_own": "timed_out", "wrb_other": "running", "wrb_null": "running"}
+
+    unscoped = await update(workflow_run_id="wr_shared", new_status="timed_out", only_if_status_in=["running"])
+    assert unscoped == 2
+    assert set((await statuses()).values()) == {"timed_out"}
