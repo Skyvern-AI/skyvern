@@ -255,6 +255,7 @@ import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import { RecordingFeedbackPrompt } from "@/routes/workflows/editor/recording/RecordingFeedbackPrompt";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -7204,6 +7205,9 @@ export function WorkflowCopilotChat({
     return () => window.clearTimeout(timer);
   }, [nextPauseExpiry]);
   const lastTurnIndex = findLastTurnIndex(messages);
+  const lastRefinementIndex = messages
+    .map((message) => message.kind)
+    .lastIndexOf("recording_refinement");
   // Only the tail turn's ask docks; a stranded one further up stays actionable inline.
   const tailTerminalAsk =
     trayPauseFrame || isLoadingHistory || lastTurnIndex < 0
@@ -10443,15 +10447,22 @@ export function WorkflowCopilotChat({
                   message.recordingRefinement
                 ) {
                   return (
-                    <RecordingRefinementProgressCard
-                      key={message.id}
-                      awaitingReview={Boolean(
-                        proposedWorkflow &&
-                        pendingProposalTurnId ===
-                          message.recordingRefinement.turnId,
-                      )}
-                      {...message.recordingRefinement}
-                    />
+                    <div key={message.id} className="flex flex-col gap-3">
+                      <RecordingRefinementProgressCard
+                        awaitingReview={Boolean(
+                          proposedWorkflow &&
+                          pendingProposalTurnId ===
+                            message.recordingRefinement.turnId,
+                        )}
+                        {...message.recordingRefinement}
+                      />
+                      {index === lastRefinementIndex &&
+                      message.recordingRefinement.status !== "working" ? (
+                        <RecordingFeedbackPrompt
+                          workflowPermanentId={workflowPermanentId}
+                        />
+                      ) : null}
+                    </div>
                   );
                 }
                 if (
