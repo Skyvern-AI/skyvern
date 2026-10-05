@@ -178,8 +178,15 @@ class PersistentSessionsManager(Protocol):
         """Set the browser state, or raise when the session has stopped accepting generations."""
         ...
 
-    async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
-        """Get a browser session by session ID."""
+    async def get_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        reconcile_in_background: bool = False,
+    ) -> PersistentBrowserSession | None:
+        """Get a browser session by session ID, reconciled against its runtime unless reconcile_in_background
+        asks for the row as read, with that check run afterwards."""
         ...
 
     async def create_session(
