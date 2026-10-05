@@ -18,12 +18,13 @@ from datetime import UTC
 from datetime import date as stdlib_date
 from datetime import datetime
 from datetime import time as stdlib_time
-from datetime import timezone
+from datetime import timedelta, timezone
 from functools import partial
 from types import FunctionType, SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import AsyncMock, MagicMock
 
+import pyotp.totp as pyotp_totp
 import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
@@ -1689,6 +1690,20 @@ _RFC_TOTP_SEED = "JBSWY3DPEHPK3PXP"
 _CREDENTIAL_KEY = "login_credential"
 _WORKFLOW_RUN_ID = "wr_otp_test"
 _ORG_ID = "o_otp_test"
+_TOTP_ANCHOR = datetime(2026, 6, 14, 12, 0, 0)
+
+
+def _freeze_totp_clock(monkeypatch: pytest.MonkeyPatch, offset_seconds: int = 0) -> None:
+    """Pin pyotp's clock so a test's expected code and the block's minted code share one 30s window.
+    pyotp.TOTP.now() reads pyotp.totp.datetime.datetime.now()."""
+    frozen = _TOTP_ANCHOR + timedelta(seconds=offset_seconds)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return frozen
+
+    monkeypatch.setattr(pyotp_totp, "datetime", SimpleNamespace(datetime=_FrozenDatetime))
 
 
 def _register_credential_parameter(wrc, key: str = _CREDENTIAL_KEY) -> None:
@@ -1872,6 +1887,7 @@ class TestCodeBlockOtpMintAtCallTime:
 
         from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
 
@@ -1883,30 +1899,16 @@ class TestCodeBlockOtpMintAtCallTime:
     @pytest.mark.asyncio
     async def test_remint_differs_after_clock_advance(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Advancing the clock past a rotation yields a different code — proves re-mint, not the
-        stale pre-minted attribute. pyotp.TOTP.now() reads pyotp.totp.datetime.datetime.now()."""
-        import datetime as real_datetime
-
-        import pyotp.totp as pyotp_totp
-
+        stale pre-minted attribute."""
         from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
 
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
 
-        anchor = real_datetime.datetime(2026, 6, 14, 12, 0, 0)
-
-        def _frozen(offset_seconds: int):
-            class _FrozenDatetime(real_datetime.datetime):
-                @classmethod
-                def now(cls, tz: object = None) -> "real_datetime.datetime":
-                    return anchor + real_datetime.timedelta(seconds=offset_seconds)
-
-            return _FrozenDatetime
-
-        monkeypatch.setattr(pyotp_totp, "datetime", SimpleNamespace(datetime=_frozen(0)))
+        _freeze_totp_clock(monkeypatch)
         first = await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
 
-        monkeypatch.setattr(pyotp_totp, "datetime", SimpleNamespace(datetime=_frozen(60)))
+        _freeze_totp_clock(monkeypatch, offset_seconds=60)
         second = await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
 
         assert first != second
@@ -2526,6 +2528,7 @@ class TestCodeBlockOtpCredentialIdWorkflowParameter:
 
         from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         _rebind_as_workflow_parameter(wrc, WorkflowParameterType.CREDENTIAL_ID)
         _patch_context_resolution(monkeypatch, wrc)
@@ -2749,6 +2752,7 @@ class TestCodeBlockOtpNoLeak:
     async def test_execute_masks_otp_in_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2771,6 +2775,7 @@ class TestCodeBlockOtpNoLeak:
         """User code that raises with the OTP in the message must not leak it into failure_reason."""
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2801,6 +2806,7 @@ class TestCodeBlockOtpNoLeak:
         from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
         from skyvern.webeye.actions.actions import Action
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
         recorded_actions: list[Action] = []
@@ -2858,6 +2864,7 @@ class TestCodeBlockOtpNoLeak:
     async def test_legacy_totp_not_leaked_in_failure_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2881,6 +2888,7 @@ class TestCodeBlockLegacyTotpRegression:
     async def test_legacy_totp_attribute_and_registration(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
