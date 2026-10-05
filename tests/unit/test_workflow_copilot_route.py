@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.exceptions import WorkflowPinnedByRunGroup
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -635,6 +636,60 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     ]
     assert persisted_payload is not None
     assert persisted_payload["proposalDisposition"] == "auto_applicable"
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = fake_workflow(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        staged_workflow=MagicMock(),
+        has_staged_proposal=True,
+    )
+    restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "_commit_staged_workflow",
+        AsyncMock(side_effect=WorkflowPinnedByRunGroup("wf-canonical")),
+    )
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.workflow_applied is False
+    assert response_frame.proposal_disposition == "review_tested"
+    assert workflow_copilot_route._AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP in response_frame.message
+    restore.assert_not_awaited()
+    pending = [
+        call.kwargs["proposed_workflow"]
+        for call in workflow_params.update_workflow_copilot_chat.await_args_list
+        if "proposed_workflow" in call.kwargs
+    ]
+    assert pending and pending[-1] is not None
 
 
 @pytest.mark.asyncio
