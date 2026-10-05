@@ -130,6 +130,20 @@ def copilot_proposal_metadata(value: object) -> CopilotProposalMetadata | None:
         return None
 
 
+MAX_STEER_MESSAGES_PER_TURN = 20
+
+
+class CopilotSteerMessage(BaseModel):
+    """A message the user sent into a running turn, stored as screened text only."""
+
+    steer_id: str
+    text: str
+    raw_secret_detected: bool = Field(default=False, exclude_if=lambda detected: not detected)
+    created_at: datetime
+    # None until the running loop hands the message to the model.
+    delivered_at: datetime | None = None
+
+
 class CopilotPendingTurn(BaseModel):
     """Durable write-ahead marker for one in-flight copilot turn.
 
@@ -162,6 +176,7 @@ class CopilotPendingTurn(BaseModel):
     # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
     superseded_build_test_run_ids: list[str] = Field(default_factory=list)
+    steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -524,6 +539,13 @@ class WorkflowCopilotCancelRequest(BaseModel):
             "than as an API caller."
         ),
     )
+
+
+class WorkflowCopilotSteerRequest(BaseModel):
+    workflow_copilot_chat_id: str
+    cancel_token: str = Field(..., description="The cancel_token sent on the running turn's /chat-post request")
+    steer_id: str = Field(..., max_length=64, description="Client-generated id; a retry with the same id is a no-op")
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
@@ -935,6 +957,9 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
     prior_block_count: int | None = Field(
         None,
         description="Block count of the canonical workflow at turn entry; drives the FE edit-vs-build chip.",
+    )
+    workflow_copilot_chat_id: str | None = Field(
+        None, description="The chat this turn runs in, known to a client that opened the chat with this turn"
     )
 
 

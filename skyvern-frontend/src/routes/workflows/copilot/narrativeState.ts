@@ -9,6 +9,7 @@ import {
   BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
+  CopilotSteerMessage,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
@@ -20,6 +21,7 @@ import {
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotSteerDeliveredUpdate,
   WorkflowCopilotToolCallUpdate,
   CodeWriteDiff,
   WorkflowCopilotToolResultUpdate,
@@ -120,6 +122,7 @@ export type NarrativeEvent =
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCodegenProgressUpdate
+  | WorkflowCopilotSteerDeliveredUpdate
   | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
@@ -455,6 +458,8 @@ export interface TurnNarrativeState {
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
+  // Messages the user sent into this turn, in the order the model received them.
+  steerMessages: CopilotSteerMessage[];
 }
 
 export interface GoogleConnectionNotice {
@@ -495,6 +500,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   review: null,
   turnFacts: null,
   budgetExpiry: null,
+  steerMessages: [],
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -1522,6 +1528,19 @@ export function applyNarrativeEvent(
       };
     }
 
+    case "steer_delivered": {
+      const known = new Set(prev.steerMessages.map((item) => item.steer_id));
+      return {
+        ...prev,
+        steerMessages: [
+          ...prev.steerMessages,
+          ...event.steer_messages.filter((item) => !known.has(item.steer_id)),
+        ],
+        // A delivery can abort the model call those drafting frames described.
+        codegenProgress: null,
+      };
+    }
+
     case "tool_result": {
       const planItems = parseStringList(event.work_plan);
       const workPlan = planItems
@@ -1598,6 +1617,10 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
+          steerMessages:
+            hydrated.steerMessages.length > 0
+              ? hydrated.steerMessages
+              : prev.steerMessages,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1989,7 +2012,20 @@ export function hydrateNarrativeFromPayload(
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
+    steerMessages: parseSteerMessages(payload.steerMessages),
   };
+}
+
+function parseSteerMessages(value: unknown): CopilotSteerMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is CopilotSteerMessage =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof item.steer_id === "string" &&
+      typeof item.text === "string" &&
+      typeof item.delivered_at === "string",
+  );
 }
 
 // History rows persisted before narrative_payload carried responseKind still

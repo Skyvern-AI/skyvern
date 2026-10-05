@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, res
 from skyvern.forge.sdk.copilot.request_policy import _screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
+from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
     private_workflow_settings_from_proposal,
@@ -145,6 +146,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotPendingTurn,
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
@@ -169,6 +171,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotMessageFeedbackResponse,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotQuestionResponseRequest,
+    WorkflowCopilotSteerRequest,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotStreamResponseUpdate,
@@ -1286,6 +1289,13 @@ async def _persist_turn_messages(
                     narrative_payload["questionInteractions"] = [
                         item.model_dump(mode="json") for item in pending.question_interactions
                     ]
+                delivered_steers = [
+                    item.model_dump(mode="json") for item in pending.steer_messages if item.delivered_at is not None
+                ]
+                if delivered_steers:
+                    if narrative_payload is None:
+                        narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
+                    narrative_payload["steerMessages"] = delivered_steers
 
     if turn_outcome is not None:
         turn_outcome = turn_outcome.model_copy(
@@ -4053,6 +4063,57 @@ async def workflow_copilot_question_response(
             if answer.text is not None:
                 answer.text = await screen_text(answer.text)
     return await resolve()
+
+
+@base_router.post("/workflow/copilot/steer", include_in_schema=False, response_model=CopilotSteerMessage)
+async def workflow_copilot_steer(
+    steer_request: WorkflowCopilotSteerRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> CopilotSteerMessage:
+    """Send a message into a running turn; its loop hands the message to the model at the next model call."""
+    # Stamped before screening: screens run concurrently, so their finish order is not the send order.
+    received_at = datetime.now(UTC)
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization.organization_id, steer_request.workflow_copilot_chat_id
+    )
+    if chat is None:
+        raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+
+    async def record(steer: CopilotSteerMessage | None = None) -> CopilotSteerMessage | None:
+        try:
+            return await app.DATABASE.workflow_params.record_copilot_steer_message(
+                organization.organization_id,
+                chat.workflow_copilot_chat_id,
+                steer_request.cancel_token,
+                steer_request.steer_id,
+                steer,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    recorded = await record()
+    if recorded is None:
+        handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
+        safety = await _screen_raw_secret_safety(
+            steer_request.message, handler, organization_id=organization.organization_id
+        )
+        if safety.status == "blocked":
+            raise HTTPException(status_code=503, detail="The safety screen is unavailable. Please retry your message.")
+        screened = CopilotSteerMessage(
+            steer_id=steer_request.steer_id,
+            text=safety.canonical_user_message,
+            raw_secret_detected=safety.status == "detected",
+            created_at=received_at,
+        )
+        recorded = await record(screened) or screened
+    # Without the doorbell the turn never reads the message; the client then sends it as the next turn.
+    with contained_effect("copilot steer doorbell", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
+        await app.CACHE.set(
+            copilot_steer_key(organization.organization_id, steer_request.cancel_token),
+            recorded.steer_id,
+            ex=STEER_DOORBELL_TTL,
+        )
+    return recorded
 
 
 @base_router.post("/workflow/copilot/message-feedback", include_in_schema=False)

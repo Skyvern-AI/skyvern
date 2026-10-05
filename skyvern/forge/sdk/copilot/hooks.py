@@ -103,6 +103,8 @@ class CopilotRunHooks(RunHooksBase):
         system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
+        self._ctx.model_call_in_flight = True
+        self._ctx.model_call_streamed_tool_call = False
         try:
             self._ctx.model_calls_this_turn += 1
             if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
@@ -114,6 +116,7 @@ class CopilotRunHooks(RunHooksBase):
             )
 
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
+        self._ctx.model_call_in_flight = False
         if self._ctx.check_model_work_deadline is not None:
             self._ctx.check_model_work_deadline()
         try:

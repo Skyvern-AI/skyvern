@@ -299,6 +299,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_statu
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
     CopilotAttachedFile,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     WorkflowCopilotChatHistoryMessage,
     chat_history_role,
@@ -640,6 +641,14 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
                 lines.append(f"ask_user result: {json.dumps(interaction.tool_result())}")
             else:
                 lines.append(f"ask_user request: {interaction.model_dump_json()}")
+        steers = msg.narrative_payload.get("steerMessages", []) if msg.narrative_payload is not None else []
+        for raw in steers:
+            try:
+                steer = CopilotSteerMessage.model_validate(raw)
+            except ValidationError:
+                continue
+            if steer.delivered_at is not None:
+                lines.append(f"user (sent while you were working): {steer.text}")
         lines.append(f"{role}: {msg.content}")
         historical_facts = _historical_turn_facts_projection(msg.narrative_payload) if role == "ai" else None
         if historical_facts is not None:
@@ -1543,6 +1552,7 @@ def _build_user_context(
     user_goal_summary: str = "",
     untrusted_evidence: str = "",
     attached_files_summary: str = "",
+    scope_check: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -1568,6 +1578,7 @@ def _build_user_context(
         user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
         untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
+        scope_check=scope_check,
     )
 
 
@@ -5767,6 +5778,7 @@ async def _run_copilot_turn_impl(
         user_goal_summary=user_goal_summary,
         untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
+        scope_check=copilot_config.scope_check,
     )
     initial_input: str | list[dict[str, Any]] = user_message
     if video_attachment_message is not None or direct_test_handoff is not None:

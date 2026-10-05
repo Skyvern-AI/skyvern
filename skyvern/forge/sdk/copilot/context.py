@@ -265,6 +265,7 @@ class TurnNarrativePayload(TypedDict):
     # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     questionInteractions: NotRequired[list[dict[str, Any]]]
+    steerMessages: NotRequired[list[dict[str, Any]]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
@@ -1199,6 +1200,7 @@ class CopilotContext(AgentContext):
 
     workflow_copilot_chat_id: str | None = None
     copilot_cancel_token: str | None = None
+    handled_steer_ids: set[str] = field(default_factory=set)
     copilot_question_pause_seconds: float = 0.0
     human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None

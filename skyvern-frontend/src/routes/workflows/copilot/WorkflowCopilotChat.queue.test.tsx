@@ -3879,3 +3879,115 @@ describe("WorkflowCopilotChat — delivered output files", () => {
     expect(screen.queryByRole("button", { name: "quarterly.xlsx" })).toBeNull();
   });
 });
+
+describe("WorkflowCopilotChat — send now delivers a queued message into the running turn", () => {
+  const steerPosts = () =>
+    cancelPost.mock.calls.filter(
+      ([path]) => (path as string) === "/workflow/copilot/steer",
+    ) as unknown as [string, Record<string, string>][];
+
+  async function queueDuringTurn(text: string) {
+    await renderChat();
+    await submit("build the workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const call = streamCalls[0]!;
+    await act(async () => {
+      call.onMessage({ ...turnStart(), workflow_copilot_chat_id: "chat-1" });
+    });
+    await submit(text);
+    return call;
+  }
+
+  async function sendNow() {
+    await act(async () => {
+      fireEvent.click(queuedStrip().getByRole("button", { name: "Send now" }));
+    });
+  }
+
+  it("posts to the running turn and shows the message where the model received it", async () => {
+    const call = await queueDuringTurn("also grab the page title");
+    await sendNow();
+
+    const [, body] = steerPosts()[0]!;
+    expect(body).toMatchObject({
+      workflow_copilot_chat_id: "chat-1",
+      cancel_token: (call.body as unknown as { cancel_token: string })
+        .cancel_token,
+      message: "also grab the page title",
+    });
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+    expect(screen.getByText("Sending now…")).toBeTruthy();
+
+    await act(async () => {
+      call.onMessage({
+        type: "steer_delivered",
+        turn_id: "turn-1",
+        steer_messages: [
+          {
+            steer_id: body.steer_id,
+            text: "also grab the page title",
+            created_at: "2026-05-25T00:00:01Z",
+            delivered_at: "2026-05-25T00:00:02Z",
+          },
+        ],
+      });
+    });
+    expect(screen.getByText("Sent while Copilot was working")).toBeTruthy();
+
+    await completeOldestStream("Built it with the title.");
+    await act(async () => {});
+
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByTestId("copilot-steer-receipt")).toHaveLength(1);
+    expect(screen.getByText("also grab the page title")).toBeTruthy();
+  });
+
+  it("sends the message as the next turn when the running turn ends before receiving it", async () => {
+    await queueDuringTurn("also grab the page title");
+    await sendNow();
+    expect(steerPosts()).toHaveLength(1);
+
+    await completeOldestStream("Built it.");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    expect(streamCalls[1]?.body.message).toBe("also grab the page title");
+    expect(screen.queryAllByTestId("copilot-steer-receipt")).toHaveLength(0);
+  });
+
+  it("sends a message once when its request fails without a response but the turn still receives it", async () => {
+    const call = await queueDuringTurn("also grab the page title");
+    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
+    await sendNow();
+    const [, body] = steerPosts()[0]!;
+
+    await act(async () => {
+      call.onMessage({
+        type: "steer_delivered",
+        turn_id: "turn-1",
+        steer_messages: [
+          {
+            steer_id: body.steer_id,
+            text: "also grab the page title",
+            created_at: "2026-05-25T00:00:01Z",
+            delivered_at: "2026-05-25T00:00:02Z",
+          },
+        ],
+      });
+    });
+    await completeOldestStream("Built it with the title.");
+    await act(async () => {});
+
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands an undelivered message back to the composer on stop", async () => {
+    await queueDuringTurn("also grab the page title");
+    await sendNow();
+
+    await act(async () => useCopilotActionStore.getState().requestCancel());
+    await completeOldestStream("stopped");
+
+    expect(textarea().value).toBe("also grab the page title");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+});

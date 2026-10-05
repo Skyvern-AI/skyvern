@@ -584,6 +584,7 @@ class TestSanitizeBody:
         [
             "/v1/workflow/copilot/chat-post",
             "/v1/workflow/copilot/question-response",
+            "/v1/workflow/copilot/steer",
             "/v1/workflow/copilot/credential-response",
             "/v1/workflow/copilot/convert-yaml-to-blocks",
         ],

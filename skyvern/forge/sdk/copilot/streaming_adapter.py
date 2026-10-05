@@ -331,6 +331,7 @@ async def stream_to_sse(
                     LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
 
             if event.name == "tool_called":
+                ctx.model_call_streamed_tool_call = True
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
@@ -900,6 +901,7 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
             turn_index=ctx.turn_index,
             timestamp=now,
             prior_block_count=ctx.prior_block_count,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
         )
     )
 

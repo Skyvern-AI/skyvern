@@ -463,6 +463,12 @@ class AgentContext:
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
+    # True from on_llm_start to on_llm_end: no tool of that response has started, so aborting the
+    # stream then discards only the call itself.
+    model_call_in_flight: bool = False
+    # The SDK streams each tool call to the chat before its response completes, so aborting after one
+    # would leave a call on screen that never runs.
+    model_call_streamed_tool_call: bool = False
     # Build-test dispatch calls in the model response now executing, armed before any of them runs.
     # The SDK schedules them concurrently, so more than one means a sibling may hold this session.
     build_test_tool_calls_in_model_response: int = 0
