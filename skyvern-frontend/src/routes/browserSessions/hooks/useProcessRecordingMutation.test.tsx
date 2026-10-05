@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, useLocation } from "react-router-dom";
 
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { useRecordingFeedbackStore } from "@/store/RecordingFeedbackStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import {
   useRecordingStore,
@@ -53,6 +54,11 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: mocks.captureRecordBrowser,
+  getRecordBrowserContext: () => ({
+    recording_attempt_id: "rra-1",
+    workflow_permanent_id: "wpid-1",
+    browser_session_id: "pbs-1",
+  }),
   markRecordBrowserProcessed: mocks.markRecordBrowserProcessed,
   setRecordBrowserContext: vi.fn(),
 }));
@@ -265,6 +271,13 @@ describe("useProcessRecordingMutation telemetry", () => {
       "record_browser.processed",
       expect.objectContaining({ recording_id: "br-1" }),
     );
+    expect(useRecordingFeedbackStore.getState().target).toMatchObject({
+      recording_attempt_id: "rra-1",
+      recording_id: "br-1",
+      workflow_permanent_id: "wpid-1",
+      browser_session_id: "pbs-1",
+      rating: null,
+    });
   });
 
   it("lands recorded blocks when an older backend omits the recording id", async () => {
