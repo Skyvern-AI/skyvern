@@ -724,75 +724,75 @@
     },
     {
       "source": "/api-reference/api-reference/agent/run-task",
-      "destination": "/api-reference/agent/run-a-task"
+      "destination": "/sdk-reference/tasks/run-task"
     },
     {
       "source": "/api-reference/api-reference/agent/get-run",
-      "destination": "/api-reference/agent/get-a-run-by-id"
+      "destination": "/api-reference/runs/get-run-info-by-id"
     },
     {
       "source": "/api-reference/api-reference/agent/cancel-run",
-      "destination": "/api-reference/agent/cancel-a-run-by-id"
+      "destination": "/api-reference/runs/cancel-a-run-by-id"
     },
     {
       "source": "/api-reference/api-reference/agent/retry-run-webhook",
-      "destination": "/api-reference/agent/retry-run-webhook"
+      "destination": "/api-reference/runs/replay-a-run-webhook"
     },
     {
       "source": "/api-reference/api-reference/agent/login",
-      "destination": "/api-reference/agent/login-task"
+      "destination": "/sdk-reference/helpers/login"
     },
     {
       "source": "/api-reference/api-reference/agent/get-run-timeline",
-      "destination": "/api-reference/agent/get-run-timeline"
+      "destination": "/api-reference/runs/get-run-timeline"
     },
     {
       "source": "/api-reference/api-reference/workflows/get-workflows",
-      "destination": "/api-reference/workflows/get-workflows"
+      "destination": "/api-reference/agents/get-all-agents"
     },
     {
       "source": "/api-reference/api-reference/workflows/create-workflow",
-      "destination": "/api-reference/workflows/create-a-new-workflow"
+      "destination": "/api-reference/agents/create-a-new-agent"
     },
     {
       "source": "/api-reference/api-reference/workflows/get-workflow",
-      "destination": "/api-reference/workflows/get-workflows"
+      "destination": "/api-reference/agents/get-an-agent-by-id"
     },
     {
       "source": "/api-reference/api-reference/workflows/get-workflow-versions",
-      "destination": "/api-reference/workflows/get-workflows"
+      "destination": "/api-reference/agents/get-agent-versions"
     },
     {
       "source": "/api-reference/api-reference/workflows/update-workflow",
-      "destination": "/api-reference/workflows/update-a-workflow"
+      "destination": "/api-reference/agents/update-an-agent"
     },
     {
       "source": "/api-reference/api-reference/workflows/delete-workflow",
-      "destination": "/api-reference/workflows/delete-a-workflow"
+      "destination": "/api-reference/agents/delete-an-agent"
     },
     {
       "source": "/api-reference/api-reference/workflow-runs/run-workflow",
-      "destination": "/api-reference/workflows/run-a-workflow"
+      "destination": "/api-reference/runs/run-an-agent"
     },
     {
       "source": "/api-reference/api-reference/workflow-runs/get-workflow-runs",
-      "destination": "/api-reference/workflows/get-workflows"
+      "destination": "/api-reference/runs/get-all-runs-by-agent"
     },
     {
       "source": "/api-reference/api-reference/workflow-runs/get-run",
-      "destination": "/api-reference/agent/get-a-run-by-id"
+      "destination": "/api-reference/runs/get-run-info-by-id"
     },
     {
       "source": "/api-reference/api-reference/workflow-runs/cancel-run",
-      "destination": "/api-reference/agent/cancel-a-run-by-id"
+      "destination": "/api-reference/runs/cancel-a-run-by-id"
     },
     {
       "source": "/api-reference/api-reference/workflow-runs/retry-run-webhook",
-      "destination": "/api-reference/agent/retry-run-webhook"
+      "destination": "/api-reference/runs/replay-a-run-webhook"
     },
     {
       "source": "/api-reference/api-reference/workflow-runs/get-run-timeline",
-      "destination": "/api-reference/agent/get-run-timeline"
+      "destination": "/api-reference/runs/get-run-timeline"
     },
     {
       "source": "/api-reference/api-reference/browser-sessions/create-browser-session",
@@ -856,11 +856,11 @@
     },
     {
       "source": "/api-reference/api-reference/artifacts/get-artifact-content-v-1-artifacts-artifact-id-content-get",
-      "destination": "/api-reference/artifacts/get-an-artifact"
+      "destination": "/api-reference/artifacts/get-artifact-content"
     },
     {
       "source": "/api-reference/api-reference/files/upload-file",
-      "destination": "/api-reference/files/upload-file"
+      "destination": "/api-reference/files/upload-a-file"
     },
     {
       "source": "/getting-started/:slug*",

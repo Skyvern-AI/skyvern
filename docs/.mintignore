@@ -1,0 +1,8 @@
+# Internal working files that live next to the docs but are not documentation.
+# They stay in the repo; Mintlify just doesn't publish or index them.
+plans/
+design/
+changelog-emails/
+screenshots/
+pr-screenshots/
+media-cdn-manifest.md
