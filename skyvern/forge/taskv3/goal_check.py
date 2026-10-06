@@ -22,6 +22,9 @@ from skyvern.utils.strings import escape_code_fences, neutralize_untrusted_web_p
 LOG = structlog.get_logger()
 
 GOAL_CHECK_PROMPT_NAME = "taskv3-goal-check"
+# The same prompt, asked on a step-cap block completion outside the goal-check arm; its own name keeps the arm's calls
+# countable on their own.
+BLOCK_COMPLETION_CHECK_PROMPT_NAME = "taskv3-block-completion-check"
 GOAL_CHECK_TIMEOUT_SECONDS = 20.0
 TRAIL_SIZE = 8
 RESULT_MAX_CHARS = 2000
@@ -79,9 +82,11 @@ class ToolTrail:
         self.calls_since_page_read = 0
         self.page_changes_since_page_read = 0
         # Sticky: once a secret reached the page, a finish-time screenshot can show it (v3 tools apply
-        # no visual secret mask), so the judge is not called for the rest of the run. Seeded when one
+        # no visual secret mask), so the goal-check arm's judge is not called for the rest of the run. Seeded when one
         # may already be on the page before this loop starts.
         self.secret_entered = secret_entered
+        # Only this loop's own calls: the typed secret can still be on screen, possibly in the run's first screenshot.
+        self.secret_entered_in_loop = False
         # Unbounded, unlike `entries`: a value typed early in the run is still one this block entered.
         self.entered_values: set[str] = set()
         self.last_page_change: TrailEntry | None = None
@@ -110,6 +115,7 @@ class ToolTrail:
         if url is not None:
             self._urls_seen.add(url)
         self.secret_entered = self.secret_entered or entry.secret_entered
+        self.secret_entered_in_loop = self.secret_entered_in_loop or entry.secret_entered
         if entry.status == "ok" and not entry.secret_entered:
             self.entered_values.update(entry.entered)
         if entry.perception and entry.status == "ok":
@@ -330,6 +336,7 @@ async def run_goal_check(
     timeout_seconds: float,
     instructions: str = "",
     redact: Redactor | None = None,
+    failure_log: str = "taskv3 goal check judge failed",
 ) -> GoalVerdict:
     """Every failure to reach a grounded verdict accepts the completion (verdict "achieved") and says why."""
     started = time.monotonic()
@@ -340,9 +347,9 @@ async def run_goal_check(
     try:
         prompt, evidence = render_goal_check_prompt(goal, trail, instructions, redact)
     except Exception:
-        LOG.warning("taskv3 goal check judge failed", exc_info=True)
+        LOG.warning(failure_log, exc_info=True)
         return _fail_open("judge_error")
-    response, skipped_reason = await _ask(prompt, judge, timeout_seconds, "taskv3 goal check judge failed")
+    response, skipped_reason = await _ask(prompt, judge, timeout_seconds, failure_log)
     if response is None:
         return _fail_open(skipped_reason or "judge_declined")
     verdict = response.get("verdict")

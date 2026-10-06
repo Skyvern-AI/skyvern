@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Self
@@ -48,6 +48,7 @@ from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import BaseModel
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
@@ -108,6 +109,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
+    RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
@@ -127,6 +129,7 @@ from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPo
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
+    RAW_SECRET_REFUSAL_SENTINEL,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     CompletionCriterion,
     RequestPolicy,
@@ -209,6 +212,14 @@ def test_build_user_context_preserves_structured_evidence_after_redacting_secret
     assert "private-value" not in context
     assert "[REDACTED_SECRET]" in context
     assert "a002" in context
+
+
+def test_build_user_context_renders_scope_check_after_the_user_message() -> None:
+    context = agent_module._build_user_context(
+        "", "user history", "", "", "make me a game", scope_check="SCOPE-SENTINEL"
+    )
+
+    assert context.rstrip().endswith("make me a game\n```\n\nSCOPE-SENTINEL")
 
 
 _COVERED_DRAFT_YAML = """title: Draft
@@ -6063,6 +6074,53 @@ class TestRunBlocksCredentialApproval:
         assert dispatched["browser_session_id"] == "pbs_carried"
 
     @pytest.mark.asyncio
+    async def test_run_blocks_reports_a_resumed_browser_refused_at_submission_as_already_closed(
+        self, monkeypatch
+    ) -> None:
+        # Submission now refuses a session that has ended, so no run exists to carry the lease-seam
+        # reason code; the turn still needs the typed browser loss that offers the fresh-browser retry.
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+        from skyvern.services import workflow_service as workflow_service_module
+
+        workflow = self._typed_resume_workflow()
+        organization = Organization(
+            organization_id="org-1",
+            organization_name="org",
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+        database = self._db(workflow=workflow, organization_lookup=organization)
+        database.workflow_params = SimpleNamespace(
+            get_workflow_output_parameters=AsyncMock(return_value=[workflow.get_output_parameter("login")])
+        )
+        ended_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        refused = BrowserSessionExpired(
+            "pbs_carried",
+            started_at=ended_at - timedelta(minutes=60),
+            ended_at=ended_at,
+            timeout_minutes=60,
+            created_by="copilot",
+            refused_at_submission=True,
+        )
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
+        )
+        monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(side_effect=refused))
+
+        ctx = _ctx(browser_session_id=None)
+        ctx.frontier_resume_session_id = "pbs_carried"
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["build_test_connect_failure"]["state"] == "already_closed"
+        assert result["data"]["browser_session_id"] == "pbs_carried"
+
+    @pytest.mark.asyncio
     async def test_run_blocks_rejects_unapproved_workflow_credential_before_dispatch(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
@@ -7475,6 +7533,58 @@ class TestCopilotConfig:
             monkeypatch, OutputGuardrailTripwireTriggered(MagicMock())
         )
         assert blocked.result is blocked_result
+
+    @staticmethod
+    def _withheld_reply(*reason_codes: OutputPolicyReason) -> OutputGuardrailTripwireTriggered:
+        guardrail_result = MagicMock()
+        guardrail_result.output.output_info = {"allowed": False, "reason_codes": [code.value for code in reason_codes]}
+        return OutputGuardrailTripwireTriggered(guardrail_result)
+
+    @pytest.mark.asyncio
+    async def test_reply_withheld_for_a_raw_secret_shape_gets_one_tool_less_reask(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "The page shows receipt FV-0F9080EE."}),
+            attempts=(_EnforcementAttempt(error=self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK)),),
+        )
+
+        [call] = run.drain_calls
+        assert call.current_input == RAW_SECRET_REPLY_WITHHELD_OBSERVATION
+        assert call.model_settings.tool_choice == "none"
+        assert call.max_turns == 1
+        assert run.result.user_response == "The page shows receipt FV-0F9080EE."
+
+    @pytest.mark.asyncio
+    async def test_reask_that_still_carries_a_raw_secret_keeps_the_refusal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK),
+            attempts=(_EnforcementAttempt(error=self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK)),),
+        )
+
+        assert len(run.drain_calls) == 1
+        assert RAW_SECRET_REFUSAL_SENTINEL in run.result.user_response
+
+    @pytest.mark.asyncio
+    async def test_reply_withheld_for_another_reason_is_not_reasked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "unused"}),
+            attempts=(
+                _EnforcementAttempt(
+                    error=self._withheld_reply(
+                        OutputPolicyReason.RAW_SECRET_LEAK, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH
+                    )
+                ),
+            ),
+        )
+
+        assert run.drain_calls == []
+        assert run.result.user_response != "unused"
 
     @pytest.mark.asyncio
     async def test_tool_bearing_empty_completion_final_reply_is_not_retried_for_untested_draft(

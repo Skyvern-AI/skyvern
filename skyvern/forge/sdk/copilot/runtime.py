@@ -50,6 +50,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry, ViewportFrame
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    clear_session_scrub_values,
     origin_runs_bound_to_scrubber,
     register_matching_origin_run_redaction_values,
 )
@@ -65,6 +66,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -161,6 +163,9 @@ _ABANDONED_DRIVER_RELEASES: set[asyncio.Task[bool] | asyncio.Task[None]] = set()
 # Per session: attached turns in this process, and the newest generation any of them attached.
 # Only the last one out releases, and it retires that newest generation rather than its own.
 _ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
+# Closed sessions whose scrub values wait for the last attached turn's release: that turn may still be
+# scrubbing a readback it took before the close.
+_SCRUB_VALUES_CLEARED_ON_RELEASE: set[str] = set()
 # Set while a last-out release has popped its ledger entry but the evict has not finished; an attach
 # in that window would record the generation the evict is about to retire.
 _DRIVER_RELEASES_IN_FLIGHT: dict[str, asyncio.Event] = {}
@@ -458,6 +463,12 @@ class AgentContext:
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
+    # True from on_llm_start to on_llm_end: no tool of that response has started, so aborting the
+    # stream then discards only the call itself.
+    model_call_in_flight: bool = False
+    # The SDK streams each tool call to the chat before its response completes, so aborting after one
+    # would leave a call on screen that never runs.
+    model_call_streamed_tool_call: bool = False
     # Build-test dispatch calls in the model response now executing, armed before any of them runs.
     # The SDK schedules them concurrently, so more than one means a sibling may hold this session.
     build_test_tool_calls_in_model_response: int = 0
@@ -1472,7 +1483,16 @@ async def close_browser_session_quietly(
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
         return False
+    _clear_closed_session_scrub_values(session_id)
     return True
+
+
+def _clear_closed_session_scrub_values(session_id: str) -> None:
+    """Only a landed close, never a retired id: a retired session can still be alive and reattached."""
+    if session_id in _ATTACHED_TURNS_PER_SESSION:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.add(session_id)
+    else:
+        clear_session_scrub_values(session_id)
 
 
 def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:
@@ -1519,6 +1539,9 @@ async def release_browser_driver_quietly(
         )
         return
     _ATTACHED_TURNS_PER_SESSION.pop(attached.session_id, None)
+    if attached.session_id in _SCRUB_VALUES_CLEARED_ON_RELEASE:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.discard(attached.session_id)
+        clear_session_scrub_values(attached.session_id)
     manager = app.PERSISTENT_SESSIONS_MANAGER
     if not manager.supports_evict_and_reconnect():
         # This process drives the browser itself; detaching its driver would strand the browser
@@ -1951,6 +1974,7 @@ async def acquire_fresh_exit_browser_session(
             prior_browser_session_id=prior_browser_session_id,
             proxy_location=proxy_location,
             browser_profile_id=browser_profile_id,
+            session_kind=BrowserSessionKind.copilot,
         )
     except BrowserSessionCreditAdmissionRefusal:
         return _browser_session_acquisition_failure_result(
@@ -2059,6 +2083,7 @@ async def _provision_browser_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=30,
                 created_by="copilot",
+                session_kind=BrowserSessionKind.copilot,
                 **creation_kwargs,
             )
         if ctx.browser_session_id:

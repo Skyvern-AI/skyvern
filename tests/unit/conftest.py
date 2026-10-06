@@ -10,9 +10,9 @@ import os
 import shutil
 import sys
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,20 +28,28 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from playwright.async_api import Download
 from playwright.async_api import Error as PlaywrightError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 import skyvern._cli_bootstrap as cli_bootstrap
+from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
@@ -191,6 +199,7 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
             runtime._ATTACHED_TURNS_PER_SESSION.clear()
             runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
             runtime._DRIVER_RELEASE_EPOCHS.clear()
+            runtime._SCRUB_VALUES_CLEARED_ON_RELEASE.clear()
 
     _clear()
     yield
@@ -947,3 +956,108 @@ def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> Asyn
             )
 
     return AsyncMock(side_effect=_capture)
+
+
+RUN_GROUP_ORG = "o_test"
+RUN_GROUP_OTHER_ORG = "o_other"
+RUN_GROUP_WPID = "wpid_test"
+
+
+@dataclass
+class FakeExecutor:
+    database: AgentDB
+    executed: list[str] = field(default_factory=list)
+    submitted: list[str] = field(default_factory=list)
+    before_queue: Callable[[str], Awaitable[None]] | None = None
+
+    async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
+        self.executed.append(workflow_run_id)
+        if self.before_queue is not None:
+            await self.before_queue(workflow_run_id)
+        if await self.database.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id, WorkflowRunStatus.queued
+        ):
+            self.submitted.append(workflow_run_id)
+
+
+@dataclass
+class RecordingRateLimiter:
+    calls: list[str] = field(default_factory=list)
+
+    async def rate_limit_submit_run(self, organization_id: str) -> None:
+        self.calls.append(organization_id)
+
+
+@dataclass
+class GroupEnv:
+    database: AgentDB
+    executor: FakeExecutor
+    organization: Organization
+    spawned: list[Coroutine[Any, Any, None]]
+    limiter: RecordingRateLimiter
+
+
+def run_group_definition(*blocks: BlockTypeVar) -> dict[str, Any]:
+    return WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json")
+
+
+def run_group_task_block() -> TaskBlock:
+    return TaskBlock(label="login", url="https://example.com", output_parameter=make_block_output_parameter("login"))
+
+
+async def count_rows(env: GroupEnv, model: type[Base]) -> int:
+    async with env.database.Session() as session:
+        return int(await session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+@pytest_asyncio.fixture
+async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> AsyncIterator[GroupEnv]:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    organization = await database.organizations.create_organization("Test", organization_id=RUN_GROUP_ORG)
+    await database.organizations.create_organization("Other", organization_id=RUN_GROUP_OTHER_ORG)
+    async with database.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_1",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                title="Workflow",
+                version=1,
+                workflow_definition=run_group_definition(run_group_task_block()),
+            )
+        )
+        session.add_all(
+            CredentialModel(
+                credential_id=credential_id,
+                organization_id=org_id,
+                name="Login",
+                credential_type="password",
+                item_id=f"item_{credential_id}",
+            )
+            for credential_id, org_id in (
+                ("cred_1", RUN_GROUP_ORG),
+                ("cred_2", RUN_GROUP_ORG),
+                ("cred_foreign", RUN_GROUP_OTHER_ORG),
+            )
+        )
+        await session.commit()
+    await database.workflow_params.create_workflow_parameter(
+        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID, key="login", default_value=None
+    )
+    service = WorkflowService()
+    executor = FakeExecutor(database)
+    spawned: list[Coroutine[Any, Any, None]] = []
+    limiter = RecordingRateLimiter()
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "RATE_LIMITER", limiter, raising=False)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
+    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
+    monkeypatch.setattr(group_service, "_spawn", spawned.append)
+    monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
+    yield GroupEnv(database, executor, organization, spawned, limiter)
+    for coroutine in spawned:
+        coroutine.close()
+    await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks, return_exceptions=True)

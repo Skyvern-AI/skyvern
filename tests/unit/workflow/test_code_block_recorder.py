@@ -190,6 +190,9 @@ class FakePage:
     def set_default_timeout(self, timeout: float) -> None:
         self.default_timeout = timeout
 
+    def is_closed(self) -> bool:
+        return False
+
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
 
@@ -3043,13 +3046,19 @@ async def test_failure_locator_tracks_exact_exception_without_reparsing_selector
     assert recording.failure_locator(caught.value) is None
 
 
+def _passthrough_codeblock_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        block_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters, **_budget: value),
+    )
+
+
 @pytest.mark.asyncio
 async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_locator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The inline diagnostic reads the recorded locator, never a selector parsed from the error."""
-    from skyvern.forge.sdk.workflow.models import block as block_module
-
     secret = "credential-secret"
     exception = PlaywrightTimeoutError("locator timed out")
 
@@ -3069,11 +3078,7 @@ async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_loca
     recording = RecordingPage(SnapshotPage())
     locator = TimedOutLocator()
     monkeypatch.setattr(RecordingPage, "failure_locator", lambda _self, exc: locator if exc is exception else None)
-    monkeypatch.setattr(
-        block_module.app,
-        "AGENT_FUNCTION",
-        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters, **_budget: value),
-    )
+    _passthrough_codeblock_redaction(monkeypatch)
     context = SimpleNamespace(mask_secrets_in_data=lambda value: value.replace(secret, "*****"))
     block = _make_code_block("pass")
 
@@ -3095,6 +3100,98 @@ async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_loca
         workflow_run_context=context,
         redaction_parameters={},
     ) == {"final_url": "https://fixture.test/checkout?token=*****", "page_title": state["page_title"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("navigates_during", "expected_state"),
+    [
+        ("title", {"final_url": "https://portal.fixture.test/dashboard"}),
+        ("title_raises", {"final_url": "https://portal.fixture.test/dashboard"}),
+        (
+            "covering_element",
+            {
+                "final_url": "https://portal.fixture.test/login",
+                "page_title": "Ops Portal",
+                "covering_element": "div.banner",
+            },
+        ),
+    ],
+)
+async def test_inline_failure_snapshot_never_pairs_a_title_with_another_documents_url(
+    monkeypatch: pytest.MonkeyPatch, navigates_during: str, expected_state: dict[str, str]
+) -> None:
+    class NavigatingPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.url = "https://portal.fixture.test/login"
+
+        async def title(self) -> str:
+            if navigates_during != "covering_element":
+                self.url = "https://portal.fixture.test/dashboard"
+            if navigates_during == "title_raises":
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return "Ops Portal"
+
+    page = NavigatingPage()
+
+    class NavigatingLocator:
+        async def evaluate(self, _script: str) -> str:
+            page.url = "https://portal.fixture.test/dashboard"
+            return "div.banner"
+
+    _passthrough_codeblock_redaction(monkeypatch)
+    state = await _make_code_block("pass")._capture_inline_failure_page_state(
+        page=RecordingPage(page),
+        failure_locator=NavigatingLocator() if navigates_during == "covering_element" else None,
+        workflow_run_context=SimpleNamespace(mask_secrets_in_data=lambda value: value),
+        redaction_parameters={},
+    )
+
+    assert state == expected_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failing_url_reads", "expected_state"),
+    [
+        ({2}, {"final_url": "https://portal.fixture.test/login"}),
+        ({1}, {"final_url": "https://portal.fixture.test/dashboard"}),
+        ({1, 2}, {}),
+    ],
+)
+async def test_inline_failure_snapshot_drops_the_title_when_the_first_url_read_or_the_url_reread_fails(
+    monkeypatch: pytest.MonkeyPatch, failing_url_reads: set[int], expected_state: dict[str, str]
+) -> None:
+    class UrlReadFailsPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.url_reads = 0
+            self.urls = ["https://portal.fixture.test/login", "https://portal.fixture.test/dashboard"]
+
+        @property
+        def url(self) -> str:
+            self.url_reads += 1
+            if self.url_reads in failing_url_reads:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return self.urls[self.url_reads - 1]
+
+        @url.setter
+        def url(self, _value: str) -> None:
+            pass
+
+        async def title(self) -> str:
+            return "Ops Portal"
+
+    _passthrough_codeblock_redaction(monkeypatch)
+    state = await _make_code_block("pass")._capture_inline_failure_page_state(
+        page=RecordingPage(UrlReadFailsPage()),
+        failure_locator=None,
+        workflow_run_context=SimpleNamespace(mask_secrets_in_data=lambda value: value),
+        redaction_parameters={},
+    )
+
+    assert state == expected_state
 
 
 @pytest.mark.asyncio

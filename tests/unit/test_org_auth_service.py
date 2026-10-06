@@ -19,7 +19,7 @@ from skyvern.forge import request_logging
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
-from skyvern.forge.sdk.core.security import create_access_token
+from skyvern.forge.sdk.core.security import assert_signing_key_usable, create_access_token
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth as streaming_auth
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
@@ -1661,3 +1661,22 @@ async def test_principal_does_not_leak_into_a_later_unauthenticated_request(
 
     assert response.json() is None
     assert not set(_PRINCIPAL_FIELDS) & set(raw_request_log.info.call_args.kwargs)
+
+
+@pytest.mark.parametrize(
+    ("secret_key", "usable"),
+    [
+        ("q3Zt9vJxR2mN8kL0pWfYcH7sA1dE5gU6iO4bT2nVwXy", True),
+        ("-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----", False),
+        ('{"kty":"oct","k":"abc"}', False),
+    ],
+)
+def test_signing_key_shape_is_checked_at_startup(
+    monkeypatch: pytest.MonkeyPatch, secret_key: str, usable: bool
+) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", secret_key)
+    if usable:
+        assert_signing_key_usable()
+    else:
+        with pytest.raises(RuntimeError, match="SECRET_KEY"):
+            assert_signing_key_usable()

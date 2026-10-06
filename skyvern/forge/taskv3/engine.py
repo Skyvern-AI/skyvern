@@ -306,6 +306,8 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
+    # Asked before a single-action block completes on its step cap; outside the goal-check arm, never counted in it.
+    block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
     code_typed_values: tuple[CodeTypedValue, ...] = (),
 ) -> LoopOutcome:
@@ -437,28 +439,28 @@ async def run_task_v3_agent_loop(
         verification_blocker = None
     refuse_input_entry = block_type == BlockType.EXTRACTION
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
-    goal_check_on = goal_judge is not None and goal_check_eligible(
+    # A block with its own completion verifier is left to it, by every judge.
+    judge_eligible = goal_check_eligible(
         page_free=page_free,
         completion_blocker_present=completion_blocker is not None,
         extraction_requested=extraction_requested,
     )
-    # Same eligibility as the goal check: a block with its own completion verifier is left to it.
-    reask_on = unlisted_reask_criteria is not None and goal_check_eligible(
-        page_free=page_free,
-        completion_blocker_present=completion_blocker is not None,
-        extraction_requested=extraction_requested,
+    goal_check_on = goal_judge is not None and judge_eligible
+    reask_on = unlisted_reask_criteria is not None and judge_eligible
+    block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
+    tool_trail = (
+        ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on or block_check_on else None
     )
-    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on else None
     goal_verdicts: list[GoalVerdict] = []
     reasks: list[UnlistedReask] = []
 
-    async def _goal_check() -> GoalVerdict:
-        assert goal_judge is not None and tool_trail is not None
+    async def _judge_goal(judge: GoalJudge, *, secret_entered: bool, failure_log: str) -> GoalVerdict:
+        assert tool_trail is not None
         timeout = GOAL_CHECK_TIMEOUT_SECONDS
         if deadline_at is not None:
             timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
         redact = goal_check_redactor() if goal_check_redactor is not None else None
-        if tool_trail.secret_entered:
+        if secret_entered:
             verdict = GoalVerdict("achieved", "", "", "secret_entered", 0.0)
         elif timeout <= 0:
             verdict = GoalVerdict("achieved", "", "", "deadline", 0.0)
@@ -470,13 +472,31 @@ async def run_task_v3_agent_loop(
             verdict = await run_goal_check(
                 goal=model_goal,
                 trail=tool_trail,
-                judge=goal_judge,
+                judge=judge,
                 timeout_seconds=timeout,
                 instructions=goal_instructions,
                 redact=redact,
+                failure_log=failure_log,
             )
+        return verdict
+
+    async def _goal_check() -> GoalVerdict:
+        assert goal_judge is not None
+        assert tool_trail is not None
+        verdict = await _judge_goal(
+            goal_judge, secret_entered=tool_trail.secret_entered, failure_log="taskv3 goal check judge failed"
+        )
         goal_verdicts.append(verdict)
         return verdict
+
+    async def _block_completion_check() -> GoalVerdict:
+        assert block_completion_judge is not None and tool_trail is not None
+        # A secret typed before this block does not skip it: every block after a sign-in would then be refused.
+        return await _judge_goal(
+            block_completion_judge,
+            secret_entered=tool_trail.secret_entered_in_loop,
+            failure_log="taskv3 block completion judge failed",
+        )
 
     async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
         # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
@@ -627,6 +647,7 @@ async def run_task_v3_agent_loop(
             refuse_input_entry=refuse_input_entry,
             tool_trail=tool_trail,
             single_action_block=single_action_block,
+            block_completion_check=_block_completion_check if block_check_on else None,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire

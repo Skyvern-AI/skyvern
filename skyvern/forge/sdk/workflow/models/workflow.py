@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
@@ -365,6 +367,8 @@ class WorkflowRun(BaseModel):
     reuse_bound_key: str | None = Field(default=None, exclude=True)
     # Internal routing: the worker queue the run was dispatched to. Never an API field.
     task_queue: str | None = Field(default=None, exclude=True)
+    # Digest of the definition the run was created against; the saved row can be overwritten in place later.
+    workflow_definition_sha256: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")
@@ -434,6 +438,14 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+
+# Stored when attempts of one run executed different definitions; it never equals a real digest.
+MIXED_RUN_DEFINITION_DIGEST = "mixed"
+
+
+def workflow_definition_sha256(definition: WorkflowDefinition) -> str:
+    return hashlib.sha256(json.dumps(definition.model_dump(mode="json"), sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def start_hold_reason(*, sequential_key: str | None, depends_on_workflow_run_id: str | None) -> str:

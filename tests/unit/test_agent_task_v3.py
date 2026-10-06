@@ -64,9 +64,11 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import CLOSE as PAGE_DERIVED_CLOSE
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIVED_OPEN
 from skyvern.forge.taskv3 import engine as taskv3_engine
+from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
+from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
@@ -80,7 +82,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    POINTER_PARITY_FLAG,
+    LOGIN_PACE_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
@@ -149,6 +151,7 @@ async def _run_execute_task_v3(
     goal_judge_prompt: str | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
+    llm_caller_factory: Any = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -187,6 +190,9 @@ async def _run_execute_task_v3(
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
+        pace = input_dispatch._login_pace.get()
+        loop_mock.login_pace_during_loop = pace is not None
+        loop_mock.login_pace_polls_cancel = pace is not None and pace.should_cancel is not None
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -213,7 +219,7 @@ async def _run_execute_task_v3(
     loop_mock = AsyncMock(side_effect=_loop)
     loop_mock.browser_state = browser_state
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
-    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", llm_caller_factory or MagicMock())
     monkeypatch.setattr("skyvern.forge.sdk.api.files.resolve_run_download_id", lambda *_a, **_k: "download-1")
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: "/tmp/taskv3-test")
     monkeypatch.setattr(
@@ -329,30 +335,35 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_buckets_the_pointer_parity_arm_per_run_with_the_workflow(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("variant, arm", [(None, "unrandomized"), ("control", "control"), ("treatment", "treatment")])
+async def test_execute_task_v3_holds_logins_only_on_the_login_pace_treatment(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None, arm: str
 ) -> None:
-    # The arm is targeted at named workflows, so the resolve must carry the workflow id, or no group matches.
-    monkeypatch.setattr(settings, "TASK_V3_POINTER_PARITY", False)
-    provider = AsyncMock(return_value="treatment")
+    # An absent or unset flag evaluates to no variant, which must leave the run unpaced. The arm is targeted at
+    # named workflows, so the resolve carries the workflow id or no release condition can match.
+    monkeypatch.setattr(settings, "TASK_V3_LOGIN_PACE", False)
+    provider = AsyncMock(side_effect=lambda flag, *_a, **_k: variant if flag == LOGIN_PACE_FLAG else None)
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
 
     _step, task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         LoopOutcome(status="completed", reason="done", billable_actions=[]),
-        workflow_run_id="wr_pointer_parity",
-        context_overrides={"workflow_permanent_id": "wpid_pointer_parity"},
+        workflow_run_id="wr_login_pace",
+        context_overrides={"workflow_permanent_id": "wpid_login_pace"},
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
 
-    assert loop_mock.context.run_arms[POINTER_PARITY_FLAG] == (task.workflow_run_id, "treatment")
+    assert loop_mock.context.run_arms[LOGIN_PACE_FLAG] == (task.workflow_run_id, arm)
+    assert loop_mock.login_pace_during_loop is (arm == "treatment")
+    assert loop_mock.login_pace_polls_cancel is (arm == "treatment")
+    assert input_dispatch._login_pace.get() is None
     provider.assert_any_await(
-        POINTER_PARITY_FLAG,
+        LOGIN_PACE_FLAG,
         task.workflow_run_id,
         properties={
             "organization_id": task.organization_id,
-            "workflow_permanent_id": task.workflow_permanent_id or "wpid_pointer_parity",
+            "workflow_permanent_id": task.workflow_permanent_id or "wpid_login_pace",
         },
     )
 
@@ -6406,6 +6417,59 @@ def _arm_goal_judge(
         "skyvern.forge.agent.SkyvernFrame.take_scrolling_screenshot", AsyncMock(return_value=b"judge-png")
     )
     return judge_handler, get_handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller_key", "registry_key", "twin_key", "context_overrides", "judge_key"),
+    [
+        (_JUDGE_KEY, _JUDGE_KEY, None, {}, _JUDGE_KEY),
+        # An OpenRouter caller rewrites llm_key to the bare model id; the registry name is what resolves.
+        ("vendor/bare-model-id", _JUDGE_KEY, None, {}, _JUDGE_KEY),
+        ("RUN_FLEX_KEY", "RUN_FLEX_KEY", _JUDGE_KEY, {}, _JUDGE_KEY),
+        (_JUDGE_KEY, _JUDGE_KEY, None, {"enrich_tree_mode": EnrichTreeMode.ENRICHED_TREE_NO_IMAGES}, None),
+        (_BYO_JUDGE_KEY, _BYO_JUDGE_KEY, None, {}, None),
+    ],
+    ids=["run_key", "caller_rewrites_key", "standard_tier_twin", "screenshots_disabled", "byo_key"],
+)
+async def test_block_completion_judge_runs_on_the_runs_own_key_outside_the_goal_check_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_key: str,
+    registry_key: str,
+    twin_key: str | None,
+    context_overrides: dict[str, Any],
+    judge_key: str | None,
+) -> None:
+    judge_handler, get_handler = _arm_goal_judge(monkeypatch, forced=False)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.get_standard_tier_twin_llm_key", MagicMock(return_value=twin_key)
+    )
+    caller = MagicMock(llm_key=caller_key, original_llm_key=registry_key)
+
+    with capture_logs() as logs:
+        step, _task, loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            task_block=_make_block(ActionBlock),
+            context_overrides=context_overrides,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            llm_caller_factory=MagicMock(return_value=caller),
+        )
+
+    assert loop_mock.call_args.kwargs["goal_judge"] is None
+    block_judge = loop_mock.call_args.kwargs["block_completion_judge"]
+    if judge_key is None:
+        assert block_judge is None
+        assert [log for log in logs if log["event"] == "taskv3 block completion judge skipped"]
+        get_handler.assert_not_called()
+        return
+    loop_mock.browser_state.must_get_working_page.return_value.is_closed = MagicMock(return_value=False)
+    await block_judge("judge prompt")
+    get_handler.assert_called_once_with(judge_key)
+    kwargs = judge_handler.await_args.kwargs
+    assert kwargs["prompt_name"] == BLOCK_COMPLETION_CHECK_PROMPT_NAME
+    assert kwargs["step"] is step
 
 
 def _resolved_goal_check_flags(logs: list[dict[str, Any]]) -> set[str]:

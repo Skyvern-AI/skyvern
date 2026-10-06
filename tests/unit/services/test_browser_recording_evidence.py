@@ -1,7 +1,8 @@
 from skyvern.services.browser_recording.evidence import RecordedPointerEvidence, build_recording_evidence
+from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.state_machines.click import StateMachineClick
 from skyvern.services.browser_recording.types import Action, ActionKind, Mouse
-from tests.unit.services.test_browser_recording import make_console_event
+from tests.unit.services.test_browser_recording import make_cdp_event, make_click_event, make_console_event
 from tests.unit.services.test_browser_recording_code_first import (
     PBS_ID,
     WP_ID,
@@ -168,6 +169,30 @@ def test_navigation_attribution_and_action_order() -> None:
     assert packet.actions[0].navigated_to == "https://example.com/next"
     assert packet.actions[2].observed_effects == []
     assert packet.actions[2].navigated_to is None
+
+
+def test_cdp_navigation_seconds_share_the_click_millisecond_clock() -> None:
+    events = [
+        make_cdp_event("nav:frame_started_navigating", 1_700_000_000.0, {"url": "https://example.com"}),
+        make_click_event({"id": "next", "skyId": "sky-next", "tagName": "BUTTON"}, 1_700_000_002_000.0),
+        make_cdp_event("nav:frame_started_navigating", 1_700_000_002.5, {"url": "https://example.com/next"}),
+    ]
+    actions = Processor(PBS_ID, "org_123", WP_ID).events_to_actions(events)
+
+    packet = build_recording_evidence(
+        actions,
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert [action.kind for action in packet.actions] == [
+        ActionKind.URL_CHANGE,
+        ActionKind.CLICK,
+        ActionKind.URL_CHANGE,
+    ]
+    assert packet.actions[1].navigated_to == "https://example.com/next"
 
 
 def test_focus_click_credential_transfers_to_fill() -> None:

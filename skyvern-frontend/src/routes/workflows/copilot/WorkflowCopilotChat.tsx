@@ -123,6 +123,7 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
+  WorkflowCopilotCredentialGenerateResult,
   WorkflowCopilotCredentialResponseResult,
   WorkflowCopilotCredentialPauseResolvedUpdate,
   WorkflowCopilotTitleUpdate,
@@ -137,6 +138,9 @@ import {
   WorkflowCopilotQuestionRequired,
   WorkflowCopilotQuestionResolved,
   CopilotProductAction,
+  CopilotSteerMessage,
+  WorkflowCopilotSteerDeliveredUpdate,
+  WorkflowCopilotSteerRequest,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { AutoAcceptChip } from "./AutoAcceptChip";
@@ -171,6 +175,7 @@ import {
   type CopilotComposerStatus,
 } from "./CopilotWorkingStatus";
 import { QueuedMessageStrip } from "./QueuedMessageStrip";
+import { SteerReceipt } from "./SteerReceipt";
 import {
   RecordingRefinementProgressCard,
   type RecordingRefinementStatus,
@@ -182,6 +187,14 @@ import {
   ConnectedAccountChoiceCard,
   ConnectedAccountChoiceMarker,
 } from "./cards/ConnectedAccountChoiceCard";
+import {
+  AccountGroupCancelReceipt,
+  AccountGroupReceiptCard,
+} from "./cards/AccountGroupReceiptCard";
+import {
+  AccountGroupCancelCard,
+  AccountGroupReviewCard,
+} from "./cards/AccountGroupReviewCard";
 import { QuestionReceipt } from "./cards/QuestionReceipt";
 import { QUESTION_PROMPT_ID, QuestionTray } from "./cards/QuestionTray";
 import { useQuestionStepper } from "./useQuestionStepper";
@@ -242,6 +255,7 @@ import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import { RecordingFeedbackPrompt } from "@/routes/workflows/editor/recording/RecordingFeedbackPrompt";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -378,6 +392,9 @@ const RECOVERY_POLL_STEADY_MS = 30_000;
 // up the real reply if the turn finishes after all.
 const RECOVERY_POLL_BUDGET_MS = 1_500_000;
 const CANONICAL_READ_TIMEOUT_MS = 5_000;
+// Matches the server's MANUAL_SIGN_IN_CLAIM_SECONDS, which bounds a Generate and save.
+const REGISTRATION_SAVE_WINDOW_MS = 120_000;
+const REGISTRATION_SAVE_POLL_MS = 2_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
 // Only an older backend writes an interrupted row a late reply may still replace.
 const isReplaceableInterruptedRow = (
@@ -955,6 +972,25 @@ type QueuedPrompt = {
   recording?: RecordingSnapshot;
 };
 
+// "Send now" delivers words only: audio, files and recording state ride on a turn's own request.
+function canSendQueuedPromptNow(prompt: QueuedPrompt): boolean {
+  return (
+    prompt.origin === "typed" &&
+    prompt.reason === "working" &&
+    !prompt.audioBlob &&
+    !prompt.attachments?.length &&
+    !prompt.recording?.recording_in_progress
+  );
+}
+
+// A message sent into the running turn that its loop has not handed to the model yet.
+type PendingSteer = {
+  steerId: string;
+  text: string;
+  cancelToken: string;
+  sentAt: string;
+};
+
 type SendOptions = {
   selectedConnectedAccountId?: string;
   queuedMessageId?: string;
@@ -988,7 +1024,8 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCredentialRequiredUpdate
   | WorkflowCopilotCredentialPauseResolvedUpdate
   | WorkflowCopilotQuestionRequired
-  | WorkflowCopilotQuestionResolved;
+  | WorkflowCopilotQuestionResolved
+  | WorkflowCopilotSteerDeliveredUpdate;
 
 // The live pause frame is a structural superset of the card's frame; only
 // reason needs narrowing (the card tolerates unknown tokens either way).
@@ -1976,6 +2013,10 @@ export function WorkflowCopilotChat({
   } | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
+  const pendingSteersRef = useRef<PendingSteer[]>([]);
+  // The running turn's chat, which a brand-new chat learns from turn_start rather than at the end.
+  const turnChatIdRef = useRef<string | null>(null);
+  const [pendingSteers, setPendingSteers] = useState<PendingSteer[]>([]);
   // Read by cancelSend, which must not re-create on every render of the arming signal.
   const turnObservablyRunningRef = useRef(false);
   const stopArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2256,6 +2297,8 @@ export function WorkflowCopilotChat({
       streamingAbortController.current?.abort();
       streamingAbortController.current = null;
       inFlightRef.current = false;
+      pendingSteersRef.current = [];
+      setPendingSteers([]);
       canonicalRecoveryAbort.current?.abort();
       canonicalRecoveryAbort.current = null;
       canonicalRecoveryInFlight.current = false;
@@ -2548,10 +2591,79 @@ export function WorkflowCopilotChat({
   const recoverCredentialTurn = useRef<
     (chatId: string, turnId: string) => boolean
   >(() => false);
+  const updateRegistration = useCallback(
+    (
+      frame: WorkflowCopilotCredentialRequiredUpdate,
+      update: Partial<
+        NonNullable<WorkflowCopilotCredentialRequiredUpdate["registration"]>
+      >,
+      expiresAt?: string | null,
+    ) => {
+      // The card's Generate button, its countdown, and a reloaded card all read the frame.
+      const apply = (candidate: WorkflowCopilotCredentialRequiredUpdate) =>
+        candidate.resume_token === frame.resume_token && candidate.registration
+          ? {
+              ...candidate,
+              registration: { ...candidate.registration, ...update },
+              expires_at: expiresAt ?? candidate.expires_at,
+            }
+          : candidate;
+      setLivePauseFrame((prev) => (prev ? apply(prev) : prev));
+      setRecoveredPauseFrames((prev) => prev.map(apply));
+    },
+    [],
+  );
+  // A Generate whose answer never arrived may still be saving: read the card back until the save settles.
+  const refreshRegistrationCard = useCallback(
+    async (frame: WorkflowCopilotCredentialRequiredUpdate) => {
+      const stopAt = Date.now() + REGISTRATION_SAVE_WINDOW_MS;
+      const generation = recoveryGeneration.current;
+      const stale = () =>
+        recoveryGeneration.current !== generation ||
+        (workflowCopilotChatIdRef.current !== null &&
+          workflowCopilotChatIdRef.current !== frame.workflow_copilot_chat_id);
+      setCredentialsReloadKey((key) => key + 1);
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        for (;;) {
+          if (stale()) return;
+          const response =
+            await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+              client,
+              workflowPermanentId,
+              {
+                params: {
+                  workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
+                },
+              },
+            );
+          const current = response.data.pending_credential_requests?.find(
+            (candidate) => candidate.resume_token === frame.resume_token,
+          );
+          if (stale() || !current?.registration) return;
+          updateRegistration(frame, current.registration, current.expires_at);
+          if (current.registration.outcome) {
+            setCredentialsReloadKey((key) => key + 1);
+            return;
+          }
+          if (Date.now() >= stopAt) return;
+          await new Promise((resolve) =>
+            setTimeout(resolve, REGISTRATION_SAVE_POLL_MS),
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Failed to refresh the credential card:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    },
+    [credentialGetter, updateRegistration, workflowPermanentId],
+  );
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
-      action: "connected" | "skip" | "signing_in" | "signed_in",
+      action: "connected" | "skip" | "signing_in" | "signed_in" | "generate",
       credentialId?: string,
       name?: string,
     ): Promise<WorkflowCopilotCredentialResponseResult | undefined> => {
@@ -2573,22 +2685,40 @@ export function WorkflowCopilotChat({
         // Copilot routes live on base_router (no /api/v1 prefix), like cancel.
         const client = await getClient(credentialGetter, "sans-api-v1");
         if (!isCopilotTurnCurrent(reservation)) return;
-        const response =
-          await client.post<WorkflowCopilotCredentialResponseResult>(
-            "/workflow/copilot/credential-response",
-            {
-              turn_id: frame.turn_id,
-              workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
-              resume_token: frame.resume_token,
-              action,
-              credential_id: action === "connected" ? credentialId : undefined,
-            },
-          );
-        // A backend that predates sign-in answers 204 with no body.
-        const result: WorkflowCopilotCredentialResponseResult = response.data
-          ?.result
-          ? response.data
-          : { result: "accepted" };
+        const pauseIds = {
+          turn_id: frame.turn_id,
+          workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
+          resume_token: frame.resume_token,
+        };
+        let generated: WorkflowCopilotCredentialGenerateResult | null = null;
+        let result: WorkflowCopilotCredentialResponseResult = {
+          result: "accepted",
+        };
+        if (action === "generate") {
+          // The server allows one attempt per card, so Generate goes away as soon as it is sent.
+          updateRegistration(frame, { attempted: true });
+          generated = (
+            await client.post<WorkflowCopilotCredentialGenerateResult>(
+              "/workflow/copilot/credential-generate",
+              pauseIds,
+            )
+          ).data;
+          // Any answer, even an unconfirmed one, can mean a new saved login the picker should list.
+          setCredentialsReloadKey((key) => key + 1);
+        } else {
+          const response =
+            await client.post<WorkflowCopilotCredentialResponseResult>(
+              "/workflow/copilot/credential-response",
+              {
+                ...pauseIds,
+                action,
+                credential_id:
+                  action === "connected" ? credentialId : undefined,
+              },
+            );
+          // A backend that predates sign-in answers 204 with no body.
+          if (response.data?.result) result = response.data;
+        }
         if (
           !isCopilotTurnCurrent(reservation) ||
           recoveryGeneration.current !== generation ||
@@ -2604,6 +2734,25 @@ export function WorkflowCopilotChat({
             frame.turn_id,
           );
         }
+        if (generated && generated.result !== "connected") {
+          updateRegistration(
+            frame,
+            { outcome: generated.result },
+            generated.expires_at,
+          );
+          // The pause ended before the save landed, so its resume token answers nothing now.
+          if (generated.result === "created_not_connected") {
+            setPauseCardResolutions((prev) =>
+              prev[frame.resume_token]
+                ? prev
+                : withCappedResolution(prev, frame.resume_token, {
+                    outcome: "timeout",
+                    name: generated.name ?? undefined,
+                  }),
+            );
+          }
+          return result;
+        }
         if (
           action === "signing_in" ||
           result.result === "no_sign_in_found" ||
@@ -2611,8 +2760,13 @@ export function WorkflowCopilotChat({
         ) {
           return result;
         }
-        const resolution: CredentialResolution =
-          action === "connected"
+        const resolution: CredentialResolution = generated
+          ? {
+              outcome: "connected",
+              credentialId: generated.credential_id ?? undefined,
+              name: generated.name ?? undefined,
+            }
+          : action === "connected"
             ? { outcome: "connected", credentialId, name }
             : action === "signed_in"
               ? { outcome: "signed_in" }
@@ -2643,6 +2797,11 @@ export function WorkflowCopilotChat({
           error,
           frame.workflow_copilot_chat_id,
         );
+        // Generate is never retried: the save may have gone through, so read the card back instead.
+        if (action === "generate") {
+          void refreshRegistrationCard(frame);
+          return;
+        }
         toast({
           title: "Couldn't send your credential response",
           description: "Please try again.",
@@ -2652,7 +2811,13 @@ export function WorkflowCopilotChat({
         credentialResponseInFlight.current = false;
       }
     },
-    [credentialGetter, isCopilotTurnCurrent, logCopilotRequestFailure],
+    [
+      credentialGetter,
+      isCopilotTurnCurrent,
+      logCopilotRequestFailure,
+      refreshRegistrationCard,
+      updateRegistration,
+    ],
   );
   const startManualSignIn = useCallback(
     async (frame: WorkflowCopilotCredentialRequiredUpdate) => {
@@ -3091,6 +3256,8 @@ export function WorkflowCopilotChat({
     streamingAbortController.current?.abort();
     streamingAbortController.current = null;
     inFlightRef.current = false;
+    pendingSteersRef.current = [];
+    setPendingSteers([]);
     setIsLoading(false);
     setRecoveredPauseFrames([]);
     setQuestionInteractions([]);
@@ -6522,6 +6689,98 @@ export function WorkflowCopilotChat({
     [adjustTextareaHeight, returnFilesToTray, updateQueuedPrompt],
   );
 
+  // Removes and returns the matching steers, so whichever of delivery, refusal or the turn's end
+  // reaches a steer first is the only one that acts on it.
+  const takePendingSteers = useCallback(
+    (match: (steer: PendingSteer) => boolean) => {
+      const taken = pendingSteersRef.current.filter(match);
+      if (taken.length > 0) {
+        pendingSteersRef.current = pendingSteersRef.current.filter(
+          (steer) => !match(steer),
+        );
+        setPendingSteers(pendingSteersRef.current);
+      }
+      return taken;
+    },
+    [],
+  );
+
+  const restoreSteersToComposer = useCallback((steers: PendingSteer[]) => {
+    if (steers.length === 0) return;
+    const restore = (current: string) =>
+      appendQueuedText(steers.map((steer) => steer.text).join("\n"), current);
+    if (answeringQuestionRef.current) setPromptHeldForQuestion(restore);
+    else setInputValue(restore);
+  }, []);
+
+  // A steer the turn never received drains as the next turn, ahead of anything typed since.
+  const requeueSteers = useCallback(
+    (steers: PendingSteer[]) => {
+      if (steers.length === 0) return;
+      const text = steers.map((steer) => steer.text).join("\n");
+      const queued = queuedPromptRef.current;
+      if (queued === null) {
+        updateQueuedPrompt({
+          origin: "typed",
+          id: crypto.randomUUID(),
+          content: text,
+          reason: "working",
+        });
+      } else if (queued.origin === "typed") {
+        updateQueuedPrompt({
+          ...queued,
+          content: appendQueuedText(text, queued.content),
+        });
+      } else {
+        restoreSteersToComposer(steers);
+      }
+    },
+    [restoreSteersToComposer, updateQueuedPrompt],
+  );
+
+  const sendQueuedPromptNow = useCallback(async () => {
+    const prompt = queuedPromptRef.current;
+    const cancelToken = pendingCancelToken.current;
+    const chatId = turnChatIdRef.current;
+    if (!prompt || !canSendQueuedPromptNow(prompt) || !cancelToken || !chatId)
+      return;
+    const steer: PendingSteer = {
+      steerId: crypto.randomUUID(),
+      text: prompt.content,
+      cancelToken,
+      sentAt: new Date().toISOString(),
+    };
+    updateQueuedPrompt(null);
+    pendingSteersRef.current = [...pendingSteersRef.current, steer];
+    setPendingSteers(pendingSteersRef.current);
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post("/workflow/copilot/steer", {
+        workflow_copilot_chat_id: chatId,
+        cancel_token: cancelToken,
+        steer_id: steer.steerId,
+        message: steer.text,
+      } satisfies WorkflowCopilotSteerRequest);
+    } catch (error) {
+      const status = (error as { response?: { status?: number } })?.response
+        ?.status;
+      // Without a response the server may have recorded it, so delivery or the turn's end settles it.
+      if (status === undefined) return;
+      const refused = takePendingSteers(
+        (pending) => pending.steerId === steer.steerId,
+      );
+      requeueSteers(refused);
+      // 409 means the turn ended or is full, so the message simply goes out as the next turn.
+      if (refused.length > 0 && status !== 409) {
+        toast({
+          variant: "destructive",
+          title: "Couldn't send now",
+          description: "Your message is queued for when Copilot finishes.",
+        });
+      }
+    }
+  }, [credentialGetter, requeueSteers, takePendingSteers, updateQueuedPrompt]);
+
   const cancelSend = useCallback(
     async (
       source: WorkflowCopilotCancelSource,
@@ -6535,6 +6794,7 @@ export function WorkflowCopilotChat({
       // the composer synchronously, before isLoading flips and the drain effect
       // would otherwise send it as a fresh turn.
       restoreQueuedPromptToComposer();
+      restoreSteersToComposer(takePendingSteers(() => true));
 
       if (requireArmed && !turnObservablyRunningRef.current) return;
 
@@ -6633,6 +6893,8 @@ export function WorkflowCopilotChat({
       isCopilotTurnCurrent,
       logCopilotRequestFailure,
       restoreQueuedPromptToComposer,
+      restoreSteersToComposer,
+      takePendingSteers,
     ],
   );
 
@@ -6763,9 +7025,11 @@ export function WorkflowCopilotChat({
           workflowCopilotChatIdRef.current !== workflowCopilotChatId
         )
           return true;
+        // A stream frame that resolved this question first is newer than the ack; it can carry the group id.
         setQuestionInteractions((current) =>
           current.map((item) =>
-            item.interaction_id === interaction.interaction_id
+            item.interaction_id === interaction.interaction_id &&
+            item.status === "pending"
               ? accepted.data
               : item,
           ),
@@ -6812,17 +7076,22 @@ export function WorkflowCopilotChat({
   const trayQuestion = questionInteractions.find(
     (item) => item.status === "pending",
   );
+  // An account card is answered on the card alone, so the composer stays a message field.
+  const composerQuestion =
+    trayQuestion?.account_group_review || trayQuestion?.account_group_cancel
+      ? undefined
+      : trayQuestion;
   const questionStepper = useQuestionStepper(
-    trayQuestion,
+    composerQuestion,
     inputValue,
     setInputValue,
   );
-  const trayPart = trayQuestion?.parts[questionStepper.index];
+  const trayPart = composerQuestion?.parts[questionStepper.index];
   // handleSend is memoised and outlives a render; the stepper is rebuilt on every keystroke.
   const questionStepperRef = useRef(questionStepper);
   questionStepperRef.current = questionStepper;
   const [questionTrayCollapsed, setQuestionTrayCollapsed] = useState(false);
-  const trayQuestionId = trayQuestion?.interaction_id ?? null;
+  const trayQuestionId = composerQuestion?.interaction_id ?? null;
   const [draftQuestionId, setDraftQuestionId] = useState(trayQuestionId);
   answeringQuestionRef.current = trayQuestionId !== null;
   // Adjusts state during render so the composer swaps before it paints, which an effect can't
@@ -6936,6 +7205,9 @@ export function WorkflowCopilotChat({
     return () => window.clearTimeout(timer);
   }, [nextPauseExpiry]);
   const lastTurnIndex = findLastTurnIndex(messages);
+  const lastRefinementIndex = messages
+    .map((message) => message.kind)
+    .lastIndexOf("recording_refinement");
   // Only the tail turn's ask docks; a stranded one further up stays actionable inline.
   const tailTerminalAsk =
     trayPauseFrame || isLoadingHistory || lastTurnIndex < 0
@@ -7190,7 +7462,10 @@ export function WorkflowCopilotChat({
       }
       const candidate = messageOverride ?? inputValue;
       const pendingQuestion = questionInteractions.find(
-        (item) => item.status === "pending",
+        (item) =>
+          item.status === "pending" &&
+          !item.account_group_review &&
+          !item.account_group_cancel,
       );
       // The composer is the text field for the question on screen, so Enter steps through the
       // tray and the last step sends every part's answer together.
@@ -7502,6 +7777,7 @@ export function WorkflowCopilotChat({
 
       const cancelToken = crypto.randomUUID();
       pendingCancelToken.current = cancelToken;
+      turnChatIdRef.current = null;
       try {
         if (workflowPermanentId)
           sessionStorage.setItem(
@@ -8416,11 +8692,13 @@ export function WorkflowCopilotChat({
             selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal: Boolean(pendingProposalTurnId),
             supports_credential_pause: true,
+            supports_credential_generation: true,
             supports_credential_pause_recovery: Boolean(
               credentialRecoveryToken,
             ),
             credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
+            supports_account_group_card: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             if (
@@ -8555,6 +8833,9 @@ export function WorkflowCopilotChat({
                 }
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
+                turnChatIdRef.current =
+                  payload.workflow_copilot_chat_id ??
+                  workflowCopilotChatIdRef.current;
                 // Move the pre-submit canvas snapshot into the per-turn
                 // map keyed by the BE-assigned turn_id; cap the map so a
                 // long-running chat does not retain every turn's snapshot.
@@ -8589,6 +8870,14 @@ export function WorkflowCopilotChat({
               case "codegen_progress":
                 applyStoredNarrativeEvent(payload);
                 return false;
+              case "steer_delivered": {
+                const delivered = new Set(
+                  payload.steer_messages.map((item) => item.steer_id),
+                );
+                takePendingSteers((steer) => delivered.has(steer.steerId));
+                applyStoredNarrativeEvent(payload);
+                return false;
+              }
               case "workflow_draft": {
                 // The draft frame summarizes the whole draft; the newest block
                 // is the one being worked on.
@@ -8759,6 +9048,9 @@ export function WorkflowCopilotChat({
           queryKey: ["workflowSchedules", workflowPermanentId],
         });
         const current = isCopilotOwnerCurrent(reservation);
+        const undelivered = takePendingSteers(
+          (steer) => steer.cancelToken === cancelToken,
+        );
         const armRecovery = shouldArmRecovery();
         const retainReservation =
           armRecovery && pendingCanonicalRecovery.current !== null;
@@ -8790,6 +9082,10 @@ export function WorkflowCopilotChat({
           // an error/thrown path already did, but a cancel or abort reaches only
           // here. A no-op once a genuine success cleared the ref above.
           rollbackPendingTerminalContinuation();
+          // Steers this turn never received. A severed stream may still deliver them server-side,
+          // so those go back to the composer rather than out again on their own.
+          if (armRecovery) restoreSteersToComposer(undelivered);
+          else requeueSteers(undelivered);
           setIsLoading(false);
           // Backstop: a turn that ends without a terminal run_outcome (thrown
           // stream) would otherwise leave a live poll running past the run.
@@ -8813,6 +9109,9 @@ export function WorkflowCopilotChat({
     [
       acceptUnresolved,
       applyStoredNarrativeEvent,
+      takePendingSteers,
+      requeueSteers,
+      restoreSteersToComposer,
       captureCopilotEvent,
       createCanonicalRecovery,
       onWorkflowPersisted,
@@ -9006,7 +9305,7 @@ export function WorkflowCopilotChat({
     if (e.key === "Escape" && queuedPrompt) {
       e.preventDefault();
       e.stopPropagation();
-      if (!trayQuestion) restoreQueuedPromptToComposer();
+      if (!composerQuestion) restoreQueuedPromptToComposer();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -9462,6 +9761,7 @@ export function WorkflowCopilotChat({
           : openCredentialModal(frame, frame.turn_id)
       }
       onSkip={() => void respondToCredentialPause(frame, "skip")}
+      onGenerate={() => void respondToCredentialPause(frame, "generate")}
       signIn={
         frame.sign_in_browser_session_id &&
         frame.sign_in_browser_session_id === liveBrowserSessionId
@@ -9668,9 +9968,7 @@ export function WorkflowCopilotChat({
     : browserStatusText;
   // The composer is the text field for the pending question, so while one is pending it says so
   // rather than inviting a new request.
-  const latestTurnIsAsk = questionInteractions.some(
-    (item) => item.status === "pending",
-  );
+  const latestTurnIsAsk = composerQuestion !== undefined;
   // A bypassed proposal's gate stays attached to its owning turn (not
   // necessarily the last message) so a chip can jump back to it.
   const gateOwnerTurnId =
@@ -9759,6 +10057,16 @@ export function WorkflowCopilotChat({
   const showQueuedStrip = Boolean(
     queuedPrompt && !messages.some((message) => message.id === queuedPrompt.id),
   );
+  // A turn parked on a question or credential card cannot read the message until the user answers.
+  const canSendNow = Boolean(
+    queuedPrompt &&
+    canSendQueuedPromptNow(queuedPrompt) &&
+    turnObservablyRunning &&
+    !isStopping &&
+    !hasPendingQuestion &&
+    livePauseFrame === null &&
+    turnChatIdRef.current,
+  );
   const showsStopGlyph =
     isStopping || (turnObservablyRunning && !hasComposerText);
   const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
@@ -9774,7 +10082,7 @@ export function WorkflowCopilotChat({
     !waitingOnQueueOnly;
   // Attachments alone can't answer a question, so the last step needs a choice or text.
   const questionAnswerMissing =
-    Boolean(trayQuestion) &&
+    Boolean(composerQuestion) &&
     questionStepper.isLast &&
     questionStepper.answeredCount === 0 &&
     (!turnObservablyRunning || hasComposerText);
@@ -9788,7 +10096,7 @@ export function WorkflowCopilotChat({
           ? "Starting…"
           : questionAnswerMissing
             ? "Send disabled — answer or skip the question"
-            : trayQuestion && (!turnObservablyRunning || hasComposerText)
+            : composerQuestion && (!turnObservablyRunning || hasComposerText)
               ? questionStepper.isLast
                 ? "Send answer"
                 : "Next question"
@@ -9804,12 +10112,29 @@ export function WorkflowCopilotChat({
                     ? "Queue for next turn"
                     : "Stop";
 
-  const renderQuestionReceipt = (interaction: QuestionInteraction) => (
-    <QuestionReceipt
-      key={interaction.interaction_id}
-      interaction={interaction}
-    />
-  );
+  const renderQuestionReceipt = (interaction: QuestionInteraction) =>
+    interaction.account_group_review ? (
+      <AccountGroupReceiptCard
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.account_group_review}
+        turnLive={
+          narrative.turnId === interaction.turn_id &&
+          narrative.terminal === null
+        }
+      />
+    ) : interaction.account_group_cancel ? (
+      <AccountGroupCancelReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.account_group_cancel}
+      />
+    ) : (
+      <QuestionReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+      />
+    );
   // A question renders under the step that asked it, like a plan or credential card.
   const anchoredQuestion = (
     interaction: QuestionInteraction,
@@ -9821,11 +10146,25 @@ export function WorkflowCopilotChat({
   });
   const liveTurnShown =
     narrative.turnId !== null && narrative.terminal === null;
+  // A sent message renders where the model received it; a pending one sits at the turn's newest step.
+  const anchoredSteer = (steer: CopilotSteerMessage): AnchoredTurnItem => ({
+    key: `steer-${steer.steer_id}`,
+    toolCallId: null,
+    at: steer.delivered_at,
+    node: <SteerReceipt text={steer.text} sending={false} />,
+  });
   if (liveTurnShown) {
     liveAnchored.push(
       ...questionInteractions
         .filter((item) => item.turn_id === narrative.turnId)
         .map(anchoredQuestion),
+      ...narrative.steerMessages.map(anchoredSteer),
+      ...pendingSteers.map((steer) => ({
+        key: `steer-${steer.steerId}`,
+        toolCallId: null,
+        at: steer.sentAt,
+        node: <SteerReceipt text={steer.text} sending />,
+      })),
     );
   }
   // Straight to the answer path rather than through handleSend, whose authoring and YAML-commit
@@ -10108,15 +10447,22 @@ export function WorkflowCopilotChat({
                   message.recordingRefinement
                 ) {
                   return (
-                    <RecordingRefinementProgressCard
-                      key={message.id}
-                      awaitingReview={Boolean(
-                        proposedWorkflow &&
-                        pendingProposalTurnId ===
-                          message.recordingRefinement.turnId,
-                      )}
-                      {...message.recordingRefinement}
-                    />
+                    <div key={message.id} className="flex flex-col gap-3">
+                      <RecordingRefinementProgressCard
+                        awaitingReview={Boolean(
+                          proposedWorkflow &&
+                          pendingProposalTurnId ===
+                            message.recordingRefinement.turnId,
+                        )}
+                        {...message.recordingRefinement}
+                      />
+                      {index === lastRefinementIndex &&
+                      message.recordingRefinement.status !== "working" ? (
+                        <RecordingFeedbackPrompt
+                          workflowPermanentId={workflowPermanentId}
+                        />
+                      ) : null}
+                    </div>
                   );
                 }
                 if (
@@ -10291,7 +10637,10 @@ export function WorkflowCopilotChat({
                       node: autoBoundCard,
                     });
                   }
-                  anchored.push(...turnInteractions.map(anchoredQuestion));
+                  anchored.push(
+                    ...turnInteractions.map(anchoredQuestion),
+                    ...message.narrative.steerMessages.map(anchoredSteer),
+                  );
                   return (
                     <div
                       key={message.id}
@@ -10465,7 +10814,7 @@ export function WorkflowCopilotChat({
                               queuedPrompt.reason === "working"
                                 ? "Queued — sends when this turn finishes."
                                 : "Prompt queued. Waiting for live browser...",
-                            onCancel: trayQuestion
+                            onCancel: composerQuestion
                               ? undefined
                               : () => restoreQueuedPromptToComposer(),
                           }
@@ -10851,7 +11200,45 @@ export function WorkflowCopilotChat({
         <span className="sr-only" aria-live="polite">
           {queuedPrompt && composerStatus !== "working" ? "Message queued" : ""}
         </span>
-        {trayQuestion ? (
+        {trayQuestion?.account_group_review ? (
+          <AccountGroupReviewCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.account_group_review}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onApprove={(credentialIds) =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: {
+                  approved: true,
+                  credential_ids: credentialIds,
+                },
+              })
+            }
+            onDecline={() =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: { approved: false, credential_ids: [] },
+              })
+            }
+            upNext={attentionUpNext}
+          />
+        ) : trayQuestion?.account_group_cancel ? (
+          <AccountGroupCancelCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.account_group_cancel}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onDecide={(approved) =>
+              void handleQuestionAnswer(trayQuestion, {
+                account_group_decision: { approved, credential_ids: [] },
+              })
+            }
+            upNext={attentionUpNext}
+          />
+        ) : trayQuestion ? (
           <QuestionTray
             interaction={trayQuestion}
             stepper={questionStepper}
@@ -10914,11 +11301,14 @@ export function WorkflowCopilotChat({
             text={queuedPrompt.content}
             attachments={queuedPrompt.attachments ?? []}
             onEdit={
-              queuedPrompt.origin === "product" || trayQuestion
+              queuedPrompt.origin === "product" || composerQuestion
                 ? undefined
                 : () => restoreQueuedPromptToComposer()
             }
             onRemove={() => restoreQueuedPromptToComposer({ keepText: false })}
+            onSendNow={
+              canSendNow ? () => void sendQueuedPromptNow() : undefined
+            }
           />
         ) : null}
         <div
@@ -10965,9 +11355,9 @@ export function WorkflowCopilotChat({
             onChange={(e) => setInputValue(e.target.value)}
             onFocus={() => setQuestionTrayCollapsed(false)}
             onKeyDown={handleKeyPress}
-            aria-label={trayQuestion ? "Your response" : undefined}
+            aria-label={composerQuestion ? "Your response" : undefined}
             aria-describedby={
-              trayQuestion && !questionTrayCollapsed
+              composerQuestion && !questionTrayCollapsed
                 ? QUESTION_PROMPT_ID
                 : undefined
             }

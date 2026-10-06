@@ -309,6 +309,13 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
+def as_stored_json(value: typing.Any) -> typing.Any:
+    """Return value as a JSON column hands it back after a write: NULs stripped, non-JSON types encoded."""
+    if value is None:
+        return None
+    return _scrub_nul_chars(json.loads(_custom_json_serializer(value)))
+
+
 def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
     """Fail-open size guard for jsonb-column writes (SKY-9779)."""
     # Fast-path: None and scalars can't approach the cap; skip the full re-serialization
@@ -700,6 +707,7 @@ def convert_to_workflow_run(
         start_fresh_browser=workflow_run_model.start_fresh_browser,
         reuse_browser_session=workflow_run_model.reuse_browser_session,
         reuse_bound_key=workflow_run_model.reuse_bound_key,
+        workflow_definition_sha256=workflow_run_model.workflow_definition_sha256,
         task_queue=workflow_run_model.task_queue,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,

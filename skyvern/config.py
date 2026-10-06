@@ -230,6 +230,8 @@ class Settings(BaseSettings):
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
+    # Synthetic browser fixture: never installed outside staging, disabled by default.
+    COPILOT_EVAL_AUTH_FIXTURE_ENABLED: bool = False
     BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
@@ -301,6 +303,13 @@ class Settings(BaseSettings):
     # /stream sockets all count -- so size it against connections per task, not request concurrency.
     # Set it empty or 0 to disable shedding.
     API_LIMIT_CONCURRENCY: int | None = Field(default=512, gt=0)
+    # Run submissions one API process dispatches at once; later ones wait without holding a pooled connection, and
+    # get a retryable 503 before anything is written if no slot frees. 0 (the default) leaves them unbounded and 32
+    # is the suggested first value, checked against the skyvern.run_submission.in_flight gauge, which records either
+    # way; the DISABLE_RUN_SUBMISSION_GATE feature flag switches an enabled gate off without a restart.
+    RUN_SUBMISSION_MAX_CONCURRENCY: int = Field(default=0, ge=0)
+    # Below the SDK's 60 s client timeout, so a waiting caller is answered before it gives up.
+    RUN_SUBMISSION_SLOT_WAIT_SECONDS: float = Field(default=20.0, gt=0)
     # Must exceed the load balancer's idle timeout (infra/terraform/production/alb.tf); otherwise
     # the ALB reuses a connection the server already closed and answers the client with a 502.
     UVICORN_TIMEOUT_KEEP_ALIVE: int = 125
@@ -327,6 +336,9 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
+    # Strict-Transport-Security value for API responses. Off by default: HSTS binds every port on the host,
+    # so a self-hosted install serving anything else there over plain HTTP would be forced onto HTTPS.
+    STRICT_TRANSPORT_SECURITY: str | None = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
     UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
@@ -357,11 +369,6 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
-    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
-    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
-    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
-    # None keeps the LIST fallback for every run.
-    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -549,10 +556,9 @@ class Settings(BaseSettings):
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
     TASK_V3_DATE_SEGMENT_AIM: bool = False
-    # Move the pointer onto an input or click target before acting, as v1 does, and take the click and typing
-    # pre-snapshots without writing an attribute to every visible element. Force-on term only: runs are randomized per run by the
-    # flag of the same name, read through run_arm_enabled(POINTER_PARITY_FLAG, ...).
-    TASK_V3_POINTER_PARITY: bool = False
+    # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
+    # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
+    TASK_V3_LOGIN_PACE: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
@@ -1000,6 +1006,8 @@ class Settings(BaseSettings):
     WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
     """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
     dispatch of already-submitted groups continue."""
+    COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
+    """Offer Copilot's run_workflow_for_accounts tool. Turning it off keeps group status, cancel and receipts."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

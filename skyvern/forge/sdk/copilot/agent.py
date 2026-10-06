@@ -39,6 +39,7 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_CANCEL_TOOL_NAME, ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -124,6 +125,8 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.credential_pause import credential_recovery_token_digest
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
+    FINAL_REPLY_OBSERVATION,
+    RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
     CopilotNonRetriableNavError,
     _elapsed_run_seconds,
     artifact_health_blocked,
@@ -297,6 +300,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_statu
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
     CopilotAttachedFile,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     WorkflowCopilotChatHistoryMessage,
     chat_history_role,
@@ -634,10 +638,30 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         questions = msg.narrative_payload.get("questionInteractions", []) if msg.narrative_payload is not None else []
         for raw in questions:
             interaction = QuestionInteraction.model_validate(raw)
-            if interaction.status == "resolved":
+            if interaction.account_group_review is not None or interaction.account_group_cancel is not None:
+                summary = (
+                    interaction.tool_result()
+                    if interaction.status == "resolved"
+                    else {"interaction_id": interaction.interaction_id, "status": interaction.status}
+                )
+                tool_name = (
+                    ACCOUNT_GROUP_SUBMIT_TOOL_NAME
+                    if interaction.account_group_review is not None
+                    else ACCOUNT_GROUP_CANCEL_TOOL_NAME
+                )
+                lines.append(f"{tool_name} review: {json.dumps(summary)}")
+            elif interaction.status == "resolved":
                 lines.append(f"ask_user result: {json.dumps(interaction.tool_result())}")
             else:
                 lines.append(f"ask_user request: {interaction.model_dump_json()}")
+        steers = msg.narrative_payload.get("steerMessages", []) if msg.narrative_payload is not None else []
+        for raw in steers:
+            try:
+                steer = CopilotSteerMessage.model_validate(raw)
+            except ValidationError:
+                continue
+            if steer.delivered_at is not None:
+                lines.append(f"user (sent while you were working): {steer.text}")
         lines.append(f"{role}: {msg.content}")
         historical_facts = _historical_turn_facts_projection(msg.narrative_payload) if role == "ai" else None
         if historical_facts is not None:
@@ -1535,12 +1559,12 @@ def _build_user_context(
     global_llm_context: str,
     debug_run_info_text: str,
     user_message: str,
-    request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
     runnable_draft_summary: str = "",
     user_goal_summary: str = "",
     untrusted_evidence: str = "",
     attached_files_summary: str = "",
+    scope_check: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -1559,13 +1583,13 @@ def _build_user_context(
         chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history_text)),
         global_llm_context=escape_code_fences(redact_raw_secrets_for_structured_prompt(global_llm_context)),
         debug_run_info=escape_code_fences(redact_raw_secrets_for_structured_prompt(debug_run_info_text)),
-        request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
         runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
         user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
         untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
+        scope_check=scope_check,
     )
 
 
@@ -2785,10 +2809,7 @@ _INTERNAL_VOCAB_LEAK_REPLY = (
     "Tell me what you'd like to do next — describe the page action, data to collect, sign-in step, "
     "or check you want, and I'll translate that into a supported workflow update."
 )
-_BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL = (
-    "I drafted a change to the workflow but haven't applied it yet. Want me to update the workflow now?"
-)
-_BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL = "I made the change you described to the workflow."
+_BLOCK_YAML_IN_REPLY_REWRITE = "I made the change you described to the workflow."
 _PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re.IGNORECASE)
 _PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
 
@@ -4062,11 +4083,7 @@ async def _translate_to_agent_result(
                 soft_rewrite_reasons.append(_residual_vocab_reason)
                 output_policy_verdict.remove(_residual_vocab_reason)
         if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
-            user_response = (
-                _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
-                if last_workflow is not None
-                else _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL
-            )
+            user_response = _BLOCK_YAML_IN_REPLY_REWRITE
             soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
             output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
     final_output_kind = (
@@ -4359,6 +4376,7 @@ async def _run_agent_loop_with_surface(
     is_fallback: bool = False,
     session: Session | None = None,
     final_reply: bool = False,
+    final_reply_observation: str = FINAL_REPLY_OBSERVATION,
 ) -> Any:
     # No model owns the attempt until setup completes and enforcement is ready to
     # enter the model loop. This also clears a prior model before fallback setup.
@@ -4429,6 +4447,7 @@ async def _run_agent_loop_with_surface(
                                     session=session,
                                     hooks=FinalReplyRunHooks(ctx),
                                     run_config=run_config,
+                                    observation=final_reply_observation,
                                 )
                             else:
                                 result = await run_with_enforcement(
@@ -4574,6 +4593,44 @@ def _build_request_policy_clarification_result(
             ),
         ),
         exit_site="request_policy_clarification",
+    )
+
+
+PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY = (
+    "Nothing was run: the pending Copilot proposal changed before this test started, so it would not have "
+    "run the proposal as offered. Reload and test the current proposal."
+)
+
+
+def _build_pending_proposal_test_refusal_result(
+    ctx: CopilotContext,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult:
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY,
+        attempted_kind=ResponseKind.REFUSE,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="pending_proposal_test_not_restored",
+    )
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=None,
+        global_llm_context=prior_global_llm_context,
+        workflow_yaml=prior_workflow_yaml or None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        proposal_disposition="no_proposal",
+        turn_outcome=outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
     )
 
 
@@ -5274,6 +5331,7 @@ async def _run_copilot_turn_impl(
         selected_block_label=getattr(chat_request, "selected_block_label", None),
         client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
         client_supports_credential_pause_recovery=chat_request.supports_credential_pause_recovery,
+        client_supports_credential_generation=chat_request.supports_credential_generation,
         credential_recovery_token_digest=credential_recovery_token_digest(
             chat_request.credential_recovery_token.get_secret_value()
             if chat_request.credential_recovery_token
@@ -5505,6 +5563,12 @@ async def _run_copilot_turn_impl(
         get_skyvern_mcp_alias_map,
     )
 
+    if chat_request.product_action == "test_end_to_end" and ctx.staged_workflow is None:
+        # Without this gate the route-time proposal bytes would be staged, and the run would be created and then
+        # refused at bind.
+        LOG.info("copilot_pending_proposal_test_refused", reason="proposal_not_restored")
+        return _build_pending_proposal_test_refusal_result(ctx, global_llm_context, chat_request.workflow_yaml)
+
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id, ctx)
     ctx.browser_session_id = validated_browser_session_id
 
@@ -5627,6 +5691,7 @@ async def _run_copilot_turn_impl(
         mode=eval_mode,
         native_tools=copilot_native_tools(
             supports_question_tool=chat_request.supports_question_tool,
+            supports_account_group_card=chat_request.supports_account_group_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,
             authoring_capability=copilot_config.authoring_capability,
@@ -5718,6 +5783,7 @@ async def _run_copilot_turn_impl(
         user_goal_summary=user_goal_summary,
         untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
+        scope_check=copilot_config.scope_check,
     )
     initial_input: str | list[dict[str, Any]] = user_message
     if video_attachment_message is not None or direct_test_handoff is not None:
@@ -5759,6 +5825,7 @@ async def _run_copilot_turn_impl(
         *,
         is_fallback: bool,
         final_reply: bool = False,
+        final_reply_observation: str = FINAL_REPLY_OBSERVATION,
     ) -> RunResultStreaming:
         attempt = await _run_agent_loop_with_surface(
             ctx=ctx,
@@ -5778,6 +5845,7 @@ async def _run_copilot_turn_impl(
             is_fallback=is_fallback,
             session=model_session,
             final_reply=final_reply,
+            final_reply_observation=final_reply_observation,
         )
         return attempt
 
@@ -5791,6 +5859,38 @@ async def _run_copilot_turn_impl(
             require_full_workflow_test=chat_request.product_action == "test_end_to_end",
             evaluated_reason_codes=_output_policy_reason_codes_from_guardrail_exception(exc),
         )
+
+    async def _reask_after_withheld_secret_reply(exc: OutputGuardrailTripwireTriggered) -> AgentResult:
+        # The SDK saves a final reply to the session only after its output guardrail passes, so the
+        # withheld text is not in the history the re-ask reads. A second hit keeps the refusal.
+        if _output_policy_verdict_from_guardrail_exception(exc).reason_codes != [OutputPolicyReason.RAW_SECRET_LEAK]:
+            return _output_policy_blocked(exc)
+        LOG.info("copilot_raw_secret_reply_reasked")
+        try:
+            reply = await _run_attempt(
+                model_name,
+                run_config,
+                llm_key,
+                is_fallback=False,
+                final_reply=True,
+                final_reply_observation=RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
+            )
+            return await _translate_to_agent_result(
+                reply,
+                ctx,
+                global_llm_context,
+                chat_request,
+                organization_id,
+                final_reply=True,
+            )
+        except asyncio.CancelledError:
+            LOG.info("Copilot run cancelled")
+            return _build_cancelled_exit_result(ctx, global_llm_context)
+        except OutputGuardrailTripwireTriggered as reask_exc:
+            return _output_policy_blocked(reask_exc)
+        except Exception as reask_error:
+            LOG.warning("copilot_raw_secret_reply_reask_failed", error_type=type(reask_error).__name__)
+            return _output_policy_blocked(exc)
 
     try:
         from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
@@ -5870,7 +5970,7 @@ async def _run_copilot_turn_impl(
                     ctx=ctx,
                 )
             except OutputGuardrailTripwireTriggered as exc:
-                return _output_policy_blocked(exc)
+                return await _reask_after_withheld_secret_reply(exc)
             except CopilotTurnHalt as exc:
                 LOG.info(
                     "Copilot run stopped after typed turn halt",

@@ -1,4 +1,5 @@
 import { useRecordedBlocksStore } from "./RecordedBlocksStore";
+import { useRecordingFeedbackStore } from "./RecordingFeedbackStore";
 import { useRecordingStore } from "./useRecordingStore";
 import { useWorkflowParametersStore } from "./WorkflowParametersStore";
 import { getInitialParameters } from "@/routes/workflows/editor/utils";
@@ -483,6 +484,9 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           useWorkflowHasChangesStore
             .getState()
             .recordPersistedSave(saveData.workflow.workflow_permanent_id);
+        useRecordingFeedbackStore
+          .getState()
+          .retire(saveData.workflow.workflow_permanent_id);
         const activeOwner = useWorkflowYamlEditorStore.getState().editorOwner;
         if (
           owner &&

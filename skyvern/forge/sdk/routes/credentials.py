@@ -704,14 +704,23 @@ async def create_credential(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> CredentialResponse:
+    credential_service = await prepare_credential_create(current_org.organization_id, data)
+    credential = await store_new_credential(
+        current_org.organization_id, data, current_user_id, credential_service, background_tasks
+    )
+    return _convert_to_response(credential)
+
+
+async def prepare_credential_create(organization_id: str, data: CreateCredentialRequest) -> CredentialVaultService:
+    """Every check a create runs before it touches a vault; raising here means nothing was stored."""
     if isinstance(data.credential, NonEmptyPasswordCredential):
         await _normalize_authenticator_totp_for_organization_or_raise(
             data.credential,
-            organization_id=current_org.organization_id,
+            organization_id=organization_id,
         )
 
     await app.AGENT_FUNCTION.validate_credential_write(
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         credential_type=data.credential_type,
         credential=data.credential,
         existing_credential=None,
@@ -720,18 +729,26 @@ async def create_credential(
     # Validate the profile link BEFORE provisioning, so an invalid/managed/cross-org/owned profile
     # rejects with a 400 without leaving an orphan credential (and vault secret) behind.
     if data.browser_profile_id is not None:
-        await _validate_credential_browser_profile_id(data.browser_profile_id, current_org.organization_id)
+        await _validate_credential_browser_profile_id(data.browser_profile_id, organization_id)
 
-    credential_service = await _get_credential_vault_service(
+    return await _get_credential_vault_service(
         vault_type_override=data.vault_type,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
     )
 
+
+async def store_new_credential(
+    organization_id: str,
+    data: CreateCredentialRequest,
+    created_by: str | None,
+    credential_service: CredentialVaultService,
+    background_tasks: BackgroundTasks,
+) -> Credential:
     try:
         credential = await credential_service.create_credential(
-            organization_id=current_org.organization_id,
+            organization_id=organization_id,
             data=data,
-            created_by=current_user_id,
+            created_by=created_by,
         )
     except SkyvernHttpException as e:
         detail = (
@@ -739,11 +756,9 @@ async def create_credential(
             if e.error_message
             else f"Custom credential service returned HTTP {e.status_code}"
         )
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=detail) from e
 
-    await record_request_audit_event(
-        current_org.organization_id, "credential.create", "credential", credential.credential_id
-    )
+    await record_request_audit_event(organization_id, "credential.create", "credential", credential.credential_id)
     if credential.vault_type == CredentialVaultType.BITWARDEN:
         # Early resyncing the Bitwarden vault
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
@@ -757,7 +772,7 @@ async def create_credential(
         profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
         credential = await _update_credential_or_profile_conflict(
             credential_id=credential.credential_id,
-            organization_id=current_org.organization_id,
+            organization_id=organization_id,
             **profile_update,
             # Only touch the pin when the caller sent it — supplying a profile alone must not reset it.
             pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
@@ -766,14 +781,13 @@ async def create_credential(
 
     background_tasks.add_task(
         app.AGENT_FUNCTION.on_credential_saved,
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         credential_id=credential.credential_id,
         credential_type=data.credential_type,
-        actor_user_id=current_user_id,
+        actor_user_id=created_by,
         vault=credential.vault_type.value if credential.vault_type is not None else None,
     )
-
-    return _convert_to_response(credential)
+    return credential
 
 
 LOGIN_TEST_PROMPT = (

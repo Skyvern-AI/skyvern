@@ -41,6 +41,7 @@ from skyvern.schemas.action_log import (
     ActionLogPage,
     sanitize_action_log_event,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import (
     MAX_EXTENDED_TIMEOUT,
     MAX_TIMEOUT,
@@ -241,6 +242,7 @@ async def create_browser_session(
         generate_browser_profile=browser_session_request.generate_browser_profile,
         needs_live_view=browser_session_request.needs_live_view,
         created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
+        session_kind=BrowserSessionKind.api,
     )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
@@ -281,7 +283,9 @@ async def close_browser_session(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    # A plain row read: close_session's own signal already handles a workflow that is gone, so the
+    # manager's reconciling read would only add a Temporal round trip to every close.
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
@@ -487,9 +491,11 @@ async def get_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     analytics.capture("skyvern-oss-agent-browser-session-get")
+    # Polled every few seconds per live session; a dead runtime shows up on a later poll.
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
         browser_session_id,
         current_org.organization_id,
+        reconcile_in_background=True,
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
@@ -593,7 +599,8 @@ async def create_browser_session_action_logs(
     events = [sanitize_action_log_event(event) for event in batch.events]
     _validate_action_log_timestamps(events)
 
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    # Ownership is all this needs (closed sessions still accept logs), so no runtime reconciliation.
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
@@ -620,7 +627,7 @@ async def get_browser_session_action_logs(
     page_size: int = Query(default=ACTION_LOG_DEFAULT_PAGE_SIZE, ge=1, le=ACTION_LOG_MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ActionLogPage:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )

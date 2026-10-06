@@ -146,6 +146,26 @@ describe("RunSummaryStrip failure category", () => {
     expect(within(tooltip).getByText(/billing or credits issue/)).toBeTruthy();
   });
 
+  test("a website's own server error blames the website, not Skyvern", async () => {
+    renderStrip(
+      makeRun({
+        status: Status.Failed,
+        failure_category: [
+          {
+            category: "WEBSITE_ERROR",
+            confidence_float: 1,
+            reasoning: "The site returned 502 Bad Gateway.",
+          },
+        ],
+      }),
+    );
+    expect(screen.queryByText("Temporary system issue")).toBeNull();
+    fireEvent.focus(screen.getByText("Website error"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(within(tooltip).getByText(/website/i)).toBeTruthy();
+    expect(within(tooltip).queryByText(/Skyvern's side/)).toBeNull();
+  });
+
   test("a workflow author's own error code is shown verbatim with its description", async () => {
     renderStrip(
       makeRun({

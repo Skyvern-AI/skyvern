@@ -8,7 +8,7 @@ from typing import Any
 import structlog
 
 from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
-from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, FailedToNavigateToUrl
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, CaptchaSolveError, FailedToNavigateToUrl
 
 LOG = structlog.get_logger(__name__)
 
@@ -17,6 +17,7 @@ class FailureCategory(StrEnum):
     ANTI_BOT_DETECTION = "ANTI_BOT_DETECTION"
     PROXY_ERROR = "PROXY_ERROR"
     BROWSER_ERROR = "BROWSER_ERROR"
+    BROWSER_SESSION_EXPIRED = "BROWSER_SESSION_EXPIRED"
     NAVIGATION_FAILURE = "NAVIGATION_FAILURE"
     PAGE_LOAD_TIMEOUT = "PAGE_LOAD_TIMEOUT"
     ELEMENT_STATE_TIMEOUT = "ELEMENT_STATE_TIMEOUT"
@@ -30,6 +31,7 @@ class FailureCategory(StrEnum):
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     LLM_REASONING_ERROR = "LLM_REASONING_ERROR"
     INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
+    WEBSITE_ERROR = "WEBSITE_ERROR"
     PARAMETER_BINDING_ERROR = "PARAMETER_BINDING_ERROR"
     UNKNOWN = "UNKNOWN"
 
@@ -55,6 +57,73 @@ _NO_ADDRESS_RECORD_MARKER_LOWER = NO_ADDRESS_RECORD_NAV_ERROR_MARKER.lower()
 # text (a model-written outcome reason, the navigated URL) can mention a transport code the proxy never raised.
 _NAV_FAILURE_DRIVER_MESSAGE_RE = re.compile(r"failed to navigate to url \S+\. error message: (.*)", re.DOTALL)
 _URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://\S+")
+# Throttle or block wording is never an LLM provider failure. In a browser-agent reason it is the site's own page
+# (bot protection); in an integration's reason it is the called service throttling us (a website error).
+_SITE_THROTTLE_RE = re.compile(
+    r"\brate[\s-]?limit|too many requests|requested too many times|\b(?:http|status(?: code)?|error)\s*:?\s*429\b"
+)
+_SITE_FORBIDDEN_RE = re.compile(r"\b403 (?:error|forbidden)\b|\b(?:http|status(?: code)?|error)\s*:?\s*403\b")
+# Integration, vault and storage APIs report their own quota or status, which no site produced. Each "<block_type>
+# block failed|terminated|timed out" prefix (loops, conditionals and workflow triggers forward their child's) is read
+# before the reason it wraps, and an unlisted block type counts as an integration so a new one is never labeled bot
+# protection.
+_BLOCK_FAILURE_PREFIX_RE = re.compile(
+    r"\s*([a-z][a-z0-9_]*) block (?:failed|terminated|timed out)\b(?:\.\s*(?:failure reason|reason):\s*)?"
+)
+_BROWSER_AGENT_BLOCK_TYPES = frozenset(
+    {"task", "task_v2", "navigation", "extraction", "login", "action", "validation", "file_download", "goto_url"}
+)
+_BLOCK_WRAPPER_TYPES = frozenset({"for_loop", "while_loop", "conditional", "workflow_trigger"})
+# A code block drives the page, so a CAPTCHA it reports is the site's even though it is not a browser-agent block.
+_PAGE_DRIVING_CODE_BLOCK_TYPES = frozenset({"code"})
+# Our own code writes these before a task starts, so no browser agent wrote the text that follows.
+_PRE_TASK_FAILURE_PREFIXES = (
+    "failed to download file from google drive",
+    "setup workflow failed",
+    "failed to initialize workflow run context",
+)
+# Run setup and context initialization fail before any page loads; their reasons are credential-vault and API errors.
+# The "failed to send" entries name their producer, because a task's own reason can open with a bare "Failed to send".
+_NON_SITE_FAILURE_PREFIXES = (
+    *_PRE_TASK_FAILURE_PREFIXES,
+    "google sheets ",
+    "reconnect the google account",
+    "http request failed",
+    "failed to send human interaction email",
+    "failed to send webhook",
+    "failed to send downloaded file",
+    "failed to upload file to ",
+    "1password ",
+    "bitwarden ",
+    "azure error:",
+)
+# Wording only our own LLM failure paths produce: every LLMProviderError message names "LLMProvider" whatever the
+# cause class, and the max-steps summary says "LLM service errors".
+_LLM_ORIGIN_TEXT_MARKERS = ("llm rate limit", "llmprovider", "ratelimiterror", "llm service error")
+
+
+def _non_agent_block_type(reason: str) -> tuple[str | None, str]:
+    """The first prefixed block type that is neither a browser agent nor a wrapper, and the reason it prefixes."""
+    while prefix := _BLOCK_FAILURE_PREFIX_RE.match(reason):
+        block_type = prefix.group(1)
+        if block_type not in _BROWSER_AGENT_BLOCK_TYPES and block_type not in _BLOCK_WRAPPER_TYPES:
+            return block_type, reason
+        reason = reason[prefix.end() :]
+    return None, reason.lstrip()
+
+
+def _is_non_site_failure(reason: str) -> bool:
+    block_type, inner_reason = _non_agent_block_type(reason)
+    return block_type is not None or inner_reason.startswith(_NON_SITE_FAILURE_PREFIXES)
+
+
+# Narrower than _is_non_site_failure, because it removes an anti-bot label instead of adding one. A task's own
+# failure reason can start with "Failed to send" in the model's words, and the task block retry loop reads it.
+def _is_pageless_failure(reason: str) -> bool:
+    block_type, inner_reason = _non_agent_block_type(reason)
+    if block_type is not None:
+        return block_type not in _PAGE_DRIVING_CODE_BLOCK_TYPES
+    return inner_reason.startswith(_PRE_TASK_FAILURE_PREFIXES)
 
 
 def _proxy_transport_evidence(reason: str, exception: Exception | None) -> str | None:
@@ -70,11 +139,29 @@ def _proxy_transport_evidence(reason: str, exception: Exception | None) -> str |
     return "keyword_match" if any(code in driver_text for code in _PROXY_TRANSPORT_CODES_LOWER) else None
 
 
+def is_captcha_solve_failure(exception_name: str | None) -> bool:
+    """Whether an action result's recorded exception type is a CaptchaSolveError.
+
+    Subclasses are walked at call time because solver integrations register their failures (loop breaker,
+    timeout) as subclasses when imported, and an action result keeps only the class name.
+    """
+    if not exception_name:
+        return False
+    pending: list[type[CaptchaSolveError]] = [CaptchaSolveError]
+    while pending:
+        error_type = pending.pop()
+        if error_type.__name__ == exception_name:
+            return True
+        pending.extend(error_type.__subclasses__())
+    return False
+
+
 def classify_from_failure_reason(
     failure_reason: str | None,
     exception: Exception | None = None,
     fallback_to_unknown: bool = False,
     exception_name: str | None = None,
+    unsolved_captcha_exception: str | None = None,
 ) -> list[dict] | None:
     """Classify failure from failure_reason text and/or exception type.
 
@@ -83,6 +170,10 @@ def classify_from_failure_reason(
     ``exception_name`` classifies from a bare exception class name when the instance is
     unavailable — e.g. a Temporal activity failure whose cause type only crosses the
     serialization boundary as a string. Ignored when ``exception`` is provided.
+
+    ``unsolved_captcha_exception`` names a captcha-solve failure the run was still stuck on when
+    it ended. It outranks a BROWSER_ERROR: a browser lost while the run is blocked by a captcha
+    only reports how the run stopped, not why it failed.
 
     When ``fallback_to_unknown`` is True and no keywords match, returns a single
     UNKNOWN category instead of None.  Use True for paths that are *always* failures
@@ -130,7 +221,20 @@ def classify_from_failure_reason(
     if not _has_auth_context:
         _antibot_keywords.append("access denied")
 
-    if any(kw in reason for kw in _antibot_keywords):
+    _is_llm_exception = any(kw in exc_name for kw in ["LLM", "APIError", "RateLimit"])
+    _has_llm_origin_text = any(marker in reason for marker in _LLM_ORIGIN_TEXT_MARKERS)
+    _is_llm_origin = _is_llm_exception or _has_llm_origin_text
+    _is_non_site = _is_non_site_failure(reason)
+    _has_throttle_wording = bool(_SITE_THROTTLE_RE.search(reason))
+    # A 403 is ambiguous like "access denied": with auth context it is a permission failure, not a bot block.
+    _is_site_block = (
+        not _is_llm_origin
+        and not _is_non_site
+        and (_has_throttle_wording or (not _has_auth_context and bool(_SITE_FORBIDDEN_RE.search(reason))))
+    )
+
+    # "http_request block failed" contains "request block", so integration failures skip the keyword list.
+    if not _is_pageless_failure(reason) and any(kw in reason for kw in _antibot_keywords):
         categories.append(
             {
                 "category": FailureCategory.ANTI_BOT_DETECTION.value,
@@ -139,6 +243,28 @@ def classify_from_failure_reason(
                 # Provenance marker: a keyword match is not positive challenge
                 # evidence, so evidence-gated consumers must not assert on it.
                 "evidence_source": "keyword_only",
+            }
+        )
+    elif _is_site_block:
+        categories.append(
+            {
+                "category": FailureCategory.ANTI_BOT_DETECTION.value,
+                "confidence_float": 0.7,
+                "reasoning": "Site rate-limit or 403 wording in failure reason",
+                "evidence_source": "keyword_only",
+                # Lets runtime consumers keep treating this entry as they did before it was anti-bot.
+                "reason_code": SITE_THROTTLE_REASON_CODE,
+            }
+        )
+    # An integration or third-party API throttled our call: not our infrastructure, the model, or bot protection.
+    elif _has_throttle_wording and _is_non_site and not _is_llm_origin:
+        categories.append(
+            {
+                "category": FailureCategory.WEBSITE_ERROR.value,
+                "confidence_float": 0.7,
+                "reasoning": "External service rate-limit wording in an integration failure reason",
+                "evidence_source": "keyword_match",
+                "reason_code": EXTERNAL_SERVICE_THROTTLE_REASON_CODE,
             }
         )
 
@@ -257,6 +383,19 @@ def classify_from_failure_reason(
             }
         )
 
+    # The worker process running the run died mid-flight (container restart; in practice an OOM
+    # kill) and its replacement failed the orphaned activity with this typed cause. Keyed on the cause,
+    # never on reason text, so a reason that merely quotes the wording is not pinned on the worker.
+    if exc_name == WORKER_CONTAINER_RESTARTED_REASON_CODE:
+        categories.append(
+            {
+                "category": FailureCategory.INFRASTRUCTURE_ERROR.value,
+                "confidence_float": 0.95,
+                "reason_code": WORKER_CONTAINER_RESTARTED_REASON_CODE,
+                "reasoning": "Worker container restarted mid-run",
+            }
+        )
+
     # Runner-slot contention, not a fault; the distinct reason_code keeps it separable from
     # real runner failures in analytics.
     if "codeblock runner is already executing another codeblock" in reason:
@@ -326,7 +465,8 @@ def classify_from_failure_reason(
         )
 
     # LLM error
-    if any(kw in exc_name for kw in ["LLM", "APIError", "RateLimit"]) or "rate limit" in reason:
+    # Free text says "rate limit" about a site's page as well, so it counts only with LLM-origin wording.
+    if _is_llm_exception or ("rate limit" in reason and _has_llm_origin_text):
         categories.append(
             {
                 "category": FailureCategory.LLM_ERROR.value,
@@ -400,6 +540,19 @@ def classify_from_failure_reason(
             }
         )
 
+    if unsolved_captcha_exception and any(
+        category["category"] == FailureCategory.BROWSER_ERROR.value for category in categories
+    ):
+        categories.append(
+            {
+                "category": FailureCategory.ANTI_BOT_DETECTION.value,
+                "confidence_float": 0.95,
+                "reason_code": UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
+                "reasoning": f"Exception: {unsolved_captcha_exception} before the browser was lost",
+                "evidence_source": "exception_type",
+            }
+        )
+
     if not categories:
         if fallback_to_unknown:
             return [
@@ -437,7 +590,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 3
+CLASSIFIER_VERSION = 8
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -455,11 +608,70 @@ _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCat
 # (skyvern/forge/sdk/workflow/service.py::_browser_lease_failure_category) imports these.
 BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
+BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE = "browser_session_expired_before_run"
 PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
+WORKER_CONTAINER_RESTARTED_REASON_CODE = "worker_container_restarted"
+UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
+SITE_THROTTLE_REASON_CODE = "site_throttle"
+EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
+
+# ANTI_BOT_DETECTION entries carrying one of these are labels only: runtime consumers must treat the
+# failure exactly as they did before it was labeled anti-bot. Code that acts on a failure_category it
+# reads (or hands to a model) must go through without_output_only_anti_bot or skip these entries.
+OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
+    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE}
+)
+
+
+def is_output_only_anti_bot_entry(category: object) -> bool:
+    return (
+        isinstance(category, dict)
+        and category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
+        and category.get("reason_code") in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+    )
+
+
+def without_output_only_anti_bot_categories(categories: list) -> list:
+    return [category for category in categories if not is_output_only_anti_bot_entry(category)]
+
+
+def without_output_only_anti_bot(value: Any) -> Any:
+    """``value`` with output-only anti-bot entries removed from every ``failure_category`` list in it; customer
+    data shaped like a category elsewhere is left alone, and a value with no marked entry is returned as is."""
+    return _scrub_output_only_anti_bot(value) if _has_output_only_anti_bot(value) else value
+
+
+# Iterative and copy-free: every registered block output pays this walk, and almost none carry a marked entry.
+def _has_output_only_anti_bot(value: Any) -> bool:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            categories = item.get("failure_category")
+            if isinstance(categories, list) and any(is_output_only_anti_bot_entry(c) for c in categories):
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
+def _scrub_output_only_anti_bot(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_scrub_output_only_anti_bot(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: without_output_only_anti_bot_categories(item)
+            if key == "failure_category" and isinstance(item, list)
+            else _scrub_output_only_anti_bot(item)
+            for key, item in value.items()
+        }
+    return value
+
 
 # The only reason_code literals persisted attribution recognizes; unknown values are dropped,
-# not copied. secure_codeblock_*/locator_wait_for_timeout are emitted by classify_from_failure_reason
-# above (same file); the browser-session codes are emitted by the browser-lease producer.
+# not copied. secure_codeblock_*/locator_wait_for_timeout/site_throttle/external_service_throttle are emitted by
+# classify_from_failure_reason above (same file); the browser-session codes are emitted by the browser-lease producer.
 _REASON_CODE_LITERALS = frozenset(
     {
         "secure_codeblock_runner_unavailable",
@@ -470,7 +682,12 @@ _REASON_CODE_LITERALS = frozenset(
         "locator_wait_for_timeout",
         BROWSER_SESSION_CLOSED_REASON_CODE,
         BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+        BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
         PROXY_TRANSPORT_FAILED_REASON_CODE,
+        SITE_THROTTLE_REASON_CODE,
+        EXTERNAL_SERVICE_THROTTLE_REASON_CODE,
+        UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
+        WORKER_CONTAINER_RESTARTED_REASON_CODE,
     }
 )
 
@@ -489,10 +706,12 @@ _INFRA_COMPONENT_BY_CATEGORY = {
 _NON_INFRA_CATEGORIES = {
     "MAX_STEPS_EXCEEDED",
     "BUDGET_EXHAUSTED",
+    "WEBSITE_ERROR",
     "ELEMENT_NOT_FOUND",
     "DATA_EXTRACTION_FAILURE",
     "LLM_REASONING_ERROR",
     "WRONG_PAGE_STATE",
+    "BROWSER_SESSION_EXPIRED",
 }
 
 

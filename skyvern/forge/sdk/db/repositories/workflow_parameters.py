@@ -17,6 +17,7 @@ from sqlalchemy.orm import defer
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.ask_user import (
     QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
     QuestionInteraction,
     QuestionResponse,
     question_wait_is_live,
@@ -69,10 +70,12 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
+    MAX_STEER_MESSAGES_PER_TURN,
     CopilotAttachedFile,
     CopilotCandidateDisposition,
     CopilotPendingTurn,
     CopilotProposalMetadata,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
@@ -1292,6 +1295,7 @@ class WorkflowParametersRepository(BaseRepository):
         interaction_id: str,
         response: QuestionResponse,
         *,
+        account_group_decision: AccountGroupDecision | None = None,
         preflight_only: bool = False,
     ) -> QuestionInteraction:
         """Validate before external screening, then recheck and commit the screened reply."""
@@ -1325,7 +1329,7 @@ class WorkflowParametersRepository(BaseRepository):
                 self._store_question_turn(chat, entry)
                 await session.commit()
                 raise ValueError("The question's execution was interrupted")
-            resolved = resolve_question_response(item, response)
+            resolved = resolve_question_response(item, response, account_group_decision)
             if preflight_only:
                 entry.question_client_seen_at = datetime.now(timezone.utc)
                 self._store_question_turn(chat, entry)
@@ -1337,6 +1341,19 @@ class WorkflowParametersRepository(BaseRepository):
             self._store_question_turn(chat, entry)
             await session.commit()
             return resolved
+
+    @db_operation("record_copilot_account_group_submission")
+    async def record_copilot_account_group_submission(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_group_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            if item.account_group_review is None:
+                raise ValueError("This question has no account review")
+            item.account_group_review.workflow_run_group_id = workflow_run_group_id
+            self._store_question_turn(chat, entry)
+            await session.commit()
 
     @db_operation("interrupt_copilot_question")
     async def interrupt_copilot_question(
@@ -1373,6 +1390,80 @@ class WorkflowParametersRepository(BaseRepository):
                 self._store_question_turn(chat, entry)
             await session.commit()
             return changed
+
+    @db_operation("record_copilot_steer_message", expected_errors=(ValueError,))
+    async def record_copilot_steer_message(
+        self,
+        organization_id: str,
+        chat_id: str,
+        cancel_token: str,
+        steer_id: str,
+        steer: CopilotSteerMessage | None = None,
+    ) -> CopilotSteerMessage | None:
+        """Validate the running turn before external screening (``steer`` None), then recheck and record.
+
+        An already-recorded ``steer_id`` returns the stored message, so a retry never records twice.
+        """
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry = next(
+                (
+                    candidate
+                    for candidate in map(CopilotPendingTurn.model_validate, (chat.pending_turns or {}).values())
+                    if candidate.cancel_token == cancel_token and candidate.recovering_at is None
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError("The Copilot turn has ended")
+            existing = next((item for item in entry.steer_messages if item.steer_id == steer_id), None)
+            if existing is not None:
+                return existing
+            if len(entry.steer_messages) >= MAX_STEER_MESSAGES_PER_TURN:
+                raise ValueError("This Copilot turn cannot take more messages")
+            if steer is None:
+                return None
+            entry.steer_messages.append(steer)
+            entry.steer_messages.sort(key=lambda item: item.created_at)
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return steer
+
+    @db_operation("undelivered_copilot_steer_ids")
+    async def undelivered_copilot_steer_ids(self, organization_id: str, chat_id: str, turn_id: str) -> set[str]:
+        async with self.Session() as session:
+            pending_turns = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel.pending_turns)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                )
+            ).first()
+        raw = (pending_turns or {}).get(turn_id)
+        if raw is None:
+            return set()
+        entry = CopilotPendingTurn.model_validate(raw)
+        return {item.steer_id for item in entry.steer_messages if item.delivered_at is None}
+
+    @db_operation("take_copilot_steer_messages")
+    async def take_copilot_steer_messages(
+        self, organization_id: str, chat_id: str, turn_id: str
+    ) -> list[CopilotSteerMessage]:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            raw = (chat.pending_turns or {}).get(turn_id)
+            if raw is None:
+                return []
+            entry = CopilotPendingTurn.model_validate(raw)
+            undelivered = [item for item in entry.steer_messages if item.delivered_at is None]
+            if not undelivered:
+                return []
+            delivered_at = datetime.now(timezone.utc)
+            for item in undelivered:
+                item.delivered_at = delivered_at
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return undelivered
 
     @db_operation("claim_pending_copilot_turn")
     async def claim_pending_copilot_turn(

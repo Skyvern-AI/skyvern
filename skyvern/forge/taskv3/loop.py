@@ -3291,6 +3291,8 @@ async def run_agent_tool_loop(
     # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
     # finish(completed) instead of failing the block, as the step engine completes it after that step.
     single_action_block: bool = False,
+    # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
+    block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -4302,15 +4304,31 @@ async def run_agent_tool_loop(
                         and not st.block_completion_offered
                     ):
                         st.block_completion_offered = True
+                        # A successful action that moved nothing (a no-op click, a username typed before the
+                        # login submits) is no sign the block is done, and a URL change can land on the wrong page
+                        # or the next step of the same form. Every failure to reach a grounded "achieved" fails closed.
+                        block_verdict: GoalVerdict | None = None
+                        judge_skipped: str | None = None
+                        if st.block_action_transitioned:
+                            if block_completion_check is None:
+                                judge_skipped = "no_judge"
+                            else:
+                                try:
+                                    block_verdict = await block_completion_check()
+                                    judge_skipped = block_verdict.skipped_reason
+                                except Exception:
+                                    LOG.warning("taskv3 block completion judge raised", exc_info=True)
+                                    judge_skipped = "judge_error"
+                        judged = block_verdict if judge_skipped is None else None
                         LOG.info(
                             "taskv3 block completion evidence",
                             url_changed=st.block_action_transitioned,
                             billable_actions=st.billable_actions,
+                            judge_verdict=judged.verdict if judged is not None else None,
+                            judge_skipped_reason=judge_skipped,
+                            judge_latency_s=block_verdict.latency_s if block_verdict is not None else None,
                         )
-                        # A successful action that moved nothing (a no-op click, a username typed before the
-                        # login submits) is no sign the block is done; the finish gate's goal check, under enforce,
-                        # still vetoes a URL change that landed on the wrong page.
-                        if st.block_action_transitioned:
+                        if judged is not None and judged.verdict == "achieved":
                             block_reason = (
                                 f"performed the block's action ({st.billable_actions[0]}); "
                                 "a further action was past the block's step limit"

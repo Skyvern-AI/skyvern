@@ -90,7 +90,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
-from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason
+from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason, is_captcha_solve_failure
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -152,7 +152,6 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -168,6 +167,7 @@ from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import parse_totp_config
@@ -186,7 +186,9 @@ from skyvern.forge.sdk.workflow.models.credential_release import CredentialRelea
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
+from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.goal_check import (
+    BLOCK_COMPLETION_CHECK_PROMPT_NAME,
     GOAL_CHECK_PROMPT_NAME,
     PRE_JUDGE_SKIP_REASONS,
     GoalJudge,
@@ -199,7 +201,7 @@ from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
-    POINTER_PARITY_FLAG,
+    LOGIN_PACE_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -1420,6 +1422,7 @@ def _build_task_v3_goal_judge(
     browser_state: BrowserState,
     peek_page: Callable[[], Awaitable[Any]],
     shot_holder: list[bytes],
+    prompt_name: str = GOAL_CHECK_PROMPT_NAME,
 ) -> GoalJudge:
     handler = LLMAPIHandlerFactory.get_llm_api_handler(judge_key)
 
@@ -1438,12 +1441,14 @@ def _build_task_v3_goal_judge(
                 engine_selection=browser_state.engine_selection,
             )
         except Exception:
-            LOG.warning("taskv3 goal check screenshot failed", task_id=task.task_id, exc_info=True)
+            LOG.warning(
+                "taskv3 goal check screenshot failed", task_id=task.task_id, prompt_name=prompt_name, exc_info=True
+            )
             return None
         shot_holder.append(shot)
         response = await handler(
             prompt=prompt,
-            prompt_name=GOAL_CHECK_PROMPT_NAME,
+            prompt_name=prompt_name,
             step=step,
             screenshots=[shot],
         )
@@ -2179,6 +2184,9 @@ class ForgeAgent:
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
+            unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+            if unusable is not None:
+                raise unusable
 
         task = await app.DATABASE.tasks.create_task(
             url=str(task_request.url),
@@ -2339,18 +2347,12 @@ class ForgeAgent:
             )
             await resolve_run_arm(
                 context,
-                POINTER_PARITY_FLAG,
+                LOGIN_PACE_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
-                forced=settings.TASK_V3_POINTER_PARITY,
+                forced=settings.TASK_V3_LOGIN_PACE,
                 properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
             )
-            if run_arm_enabled(POINTER_PARITY_FLAG, settings.TASK_V3_POINTER_PARITY):
-                # The dose: the run's registered cursor strategy draws the moves, or a plain move does without one.
-                LOG.info(
-                    "Task V3 pointer parity cursor",
-                    cursor_strategy=type(EventStrategyFactory.get_cursor_strategy()).__name__,
-                )
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
         page_free_validation = bool(
@@ -2523,6 +2525,8 @@ class ForgeAgent:
                 if workflow_run and workflow_run.status in (WorkflowRunStatus.canceled, WorkflowRunStatus.timed_out):
                     return True
             return False
+
+        input_dispatch.start_login_pace(_should_cancel)
 
         download_id = resolve_run_download_id(context, fallback_run_id=task.task_id)
         attempt_started_at = await get_download_retry_started_at(
@@ -3106,6 +3110,39 @@ class ForgeAgent:
                             peek_page=_fingerprint_page,
                             shot_holder=goal_judge_shot,
                         )
+            # A block that completes on a download is not done by its one action.
+            single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
+            block_completion_judge: GoalJudge | None = None
+            if single_action_block:
+                # The run's own model, outside the goal-check arm's payload; its non-flex twin, as flex queueing
+                # outlasts the judge's timeout. Without a judge the block's step-cap completion is never offered.
+                # The registry key: an OpenRouter caller rewrites llm_key to the bare model id.
+                run_key = llm_caller.original_llm_key
+                twin_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(run_key)
+                block_judge_key = twin_key if twin_key and LLMConfigRegistry.is_registered(twin_key) else run_key
+                block_judge_skip = (
+                    "screenshots_disabled"
+                    if context is not None and not context.llm_screenshots_enabled_for_prompt()
+                    else _goal_judge_key_skip_reason(block_judge_key)
+                )
+                if block_judge_skip is not None:
+                    LOG.info(
+                        "taskv3 block completion judge skipped",
+                        task_id=task.task_id,
+                        reason=block_judge_skip,
+                        judge_key=block_judge_key,
+                    )
+                else:
+                    assert block_judge_key is not None
+                    block_completion_judge = _build_task_v3_goal_judge(
+                        judge_key=block_judge_key,
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        peek_page=_fingerprint_page,
+                        shot_holder=[],
+                        prompt_name=BLOCK_COMPLETION_CHECK_PROMPT_NAME,
+                    )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -3141,7 +3178,9 @@ class ForgeAgent:
                 ),
                 goal_check_redactor=(
                     (lambda: _task_v3_goal_check_redactor(task, context))
-                    if goal_judge is not None or unlisted_reask_criteria is not None
+                    if goal_judge is not None
+                    or block_completion_judge is not None
+                    or unlisted_reask_criteria is not None
                     else None
                 ),
                 unlisted_reask_criteria=unlisted_reask_criteria,
@@ -3195,11 +3234,12 @@ class ForgeAgent:
                 caller_known_urls=verdict_known_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
-                # A block that completes on a download is not done by its one action.
-                single_action_block=isinstance(task_block, ActionBlock) and not task_block.complete_on_download,
+                single_action_block=single_action_block,
+                block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
         finally:
+            input_dispatch.end_login_pace()
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
             # Frames are already in memory, so a loop that raised or ran out of budget still
@@ -4460,6 +4500,37 @@ class ForgeAgent:
                 )
         return latest_status
 
+    @staticmethod
+    def _latest_unsolved_captcha(steps: list[Step]) -> str | None:
+        """The captcha-solve failure the run was still stuck on, read from its last two steps that ran actions.
+
+        Two steps cover a failed captcha step and the retry after it. A later successful solve clears it, as does a
+        later success of the same action on the same element: an input-setup captcha guard reports its solve as an
+        abort of that input.
+        """
+        acted = [step.output.actions_and_results for step in steps if step.output and step.output.actions_and_results]
+        later_successful_targets: set[tuple[ActionType, str | None]] = set()
+        for actions_and_results in reversed(acted[-2:]):
+            for action, results in reversed(actions_and_results):
+                target = (action.action_type, action.element_id)
+                for result in reversed(results):
+                    if result.success:
+                        later_successful_targets.add(target)
+                    elif is_captcha_solve_failure(result.exception_type):
+                        solved_later = target in later_successful_targets or any(
+                            action_type == ActionType.SOLVE_CAPTCHA for action_type, _ in later_successful_targets
+                        )
+                        return None if solved_later else result.exception_type
+        return None
+
+    async def _unsolved_captcha_exception(self, task: Task) -> str | None:
+        try:
+            steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+            return self._latest_unsolved_captcha(steps)
+        except Exception:
+            LOG.warning("Failed to read steps for captcha evidence", task_id=task.task_id, exc_info=True)
+            return None
+
     async def _enrich_failure_reason_with_download_status(self, task: Task, reason: str) -> str:
         """Append one bounded sentence to a terminal failure reason when the run's latest download-intent
         action received no file and passively observed a server 5xx status.
@@ -4519,6 +4590,15 @@ class ForgeAgent:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
             failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            if any(category.get("category") == FailureCategory.BROWSER_ERROR for category in failure_category or []):
+                unsolved_captcha_exception = await self._unsolved_captcha_exception(task)
+                if unsolved_captcha_exception:
+                    failure_category = classify_from_failure_reason(
+                        reason,
+                        exception=exception,
+                        fallback_to_unknown=True,
+                        unsolved_captcha_exception=unsolved_captcha_exception,
+                    )
             LOG.info(
                 "Task failure classified",
                 task_id=task.task_id,

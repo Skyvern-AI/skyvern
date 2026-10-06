@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     summarize_tool_result_detail,
     user_facing_success,
 )
+from tests.unit.helpers import unsolved_captcha_relabel_categories
 
 
 def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
@@ -1410,25 +1411,25 @@ class TestFormatToolResultForUser:
         result = {
             "ok": False,
             "error": (
-                "The run has not made progress. Run ID: wr_stalled. Outcome is uncertain. "
-                "Do NOT re-invoke block-running tools without first calling get_run_results."
+                "The run did not reach a terminal status within the 1190s absolute ceiling. Run ID: wr_stalled. "
+                "Outcome is uncertain. Do NOT re-invoke block-running tools without first calling get_run_results."
             ),
             "data": {
                 "failure_reason": (
-                    "The run stopped after no observable progress for 120s. Run ID: wr_stalled. Outcome is uncertain."
+                    "The run did not finish within the 1190s absolute ceiling. Run ID: wr_stalled. Outcome is uncertain."
                 ),
                 "control_signal": {
-                    "kind": "watchdog_stagnation",
-                    "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                    "kind": "watchdog_ceiling",
+                    "user_facing_summary": "The run did not finish within the 1190s absolute ceiling.",
                 },
-                "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                "user_facing_summary": "The run did not finish within the 1190s absolute ceiling.",
             },
         }
 
         summary = self._format("run_blocks_and_collect_debug", result)
         detail = summarize_tool_result_detail(result, tool_name="run_blocks_and_collect_debug")
 
-        assert summary == "The run stopped after no observable progress for 120s."
+        assert summary == "The run did not finish within the 1190s absolute ceiling."
         assert detail == summary
         assert "wr_stalled" not in summary
         assert "get_run_results" not in detail
@@ -1842,6 +1843,19 @@ class TestParseFinalResponse:
         parsed = parse_final_response(envelope)
         assert parsed["type"] == "REPLY"
         assert parsed["user_response"] == "ok"
+
+    def test_a_draft_object_before_the_final_envelope_does_not_win(self) -> None:
+        text = (
+            '{"type": "REPLY", "user_response": "draft"}\n\nOn reflection:\n'
+            '{"type": "REPLY", "user_response": "final", "global_llm_context": {"user_goal": "x"}}'
+        )
+        parsed = parse_final_response(text)
+        assert parsed["user_response"] == "final"
+        assert parsed["global_llm_context"] == {"user_goal": "x"}
+
+    def test_an_object_nested_in_a_malformed_envelope_is_not_read_as_the_reply(self) -> None:
+        text = '{"type": "REPLY", "user_response": "answer", "global_llm_context": {"user_response": "context"},}'
+        assert parse_final_response(text)["user_response"] == "answer"
 
     def test_pass_b_rejects_non_envelope_dict_in_prose(self) -> None:
         text = 'I cannot help with {"foo": "bar"}'
@@ -2440,3 +2454,24 @@ async def test_saved_workflow_reader_uses_document_privacy_projection(monkeypatc
     metadata = listed["data"]["workflows"][0]
     assert set(private).isdisjoint(metadata)
     assert "workflow_definition" not in metadata
+
+
+def _run_tool_result(failure_category: list[dict]) -> dict[str, Any]:
+    task_output = {"task_id": "tsk_1", "status": "failed", "failure_category": failure_category}
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "failure_category": failure_category,
+            "blocks": [{"label": "submit", "status": "failed", "output": task_output, "extracted_data": task_output}],
+            "registered_output_parameter_values": [{"block_label": "submit", "value": task_output}],
+        },
+    }
+
+
+@pytest.mark.parametrize("tool_name", ["get_run_results", "run_blocks_and_collect_debug"])
+def test_the_model_reads_the_same_run_categories_after_an_output_only_relabel(tool_name: str) -> None:
+    before, after = unsolved_captcha_relabel_categories()
+    assert sanitize_tool_result_for_llm(tool_name, _run_tool_result(after)) == sanitize_tool_result_for_llm(
+        tool_name, _run_tool_result(before)
+    )

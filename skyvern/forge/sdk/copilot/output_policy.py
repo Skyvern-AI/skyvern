@@ -61,35 +61,6 @@ UNVALIDATED_DISCLOSURE_PHRASES = (
     "hasn't been verified",
     "unvalidated",
 )
-_INTERNAL_BLOCK_TYPE_TERMS = frozenset(
-    {
-        "navigation",
-        "extraction",
-        "validation",
-        "login",
-        "goto_url",
-        "file_download",
-        "file_upload",
-        "text_prompt",
-        "for_loop",
-        "conditional",
-        "action",
-        "wait",
-    }
-)
-_INTERNAL_BLOCK_TYPE_CONTEXT_MARKERS = (
-    "block type",
-    "block types",
-    "internal block",
-    "internal blocks",
-    "workflow block",
-    "workflow blocks",
-    "supported block",
-    "supported blocks",
-)
-# Three distinct internal names in an informational reply implies taxonomy
-# enumeration, while one or two may be incidental product-language prose.
-_INFORMATIONAL_TAXONOMY_TERM_THRESHOLD = 3
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _IDENTIFIER_DELIMITERS = frozenset({"`", '"', "'"})
 
@@ -386,13 +357,18 @@ def evaluate_output_policy(
     # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
     if _contains_raw_secret(user_response):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
-    if _contains_internal_block_taxonomy_leak(user_response, output_kind, response_type):
+    if _contains_internal_block_taxonomy_leak(user_response, response_type):
         verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_classifier_vocab_leak(user_response):
         verdict.add(OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK)
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_self_prescriptive_phrase(user_response):
         verdict.add(OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK)
-    if response_type in ("REPLY", "ASK_QUESTION") and looks_like_workflow_yaml_in_chat(user_response):
+    # Without a proposal, block YAML in a reply is usually an example answering a question.
+    if (
+        has_workflow_proposal
+        and response_type in ("REPLY", "ASK_QUESTION")
+        and looks_like_workflow_yaml_in_chat(user_response)
+    ):
         verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
@@ -556,23 +532,14 @@ def _has_unvalidated_affordance(user_response: str | None) -> bool:
     return bool(_UNVALIDATED_PROPOSAL_AFFORDANCE_RE.search(user_response) and has_disclosure)
 
 
-def _contains_internal_block_taxonomy_leak(
-    user_response: str | None,
-    output_kind: CopilotOutputKind,
-    response_type: str,
-) -> bool:
+def _contains_internal_block_taxonomy_leak(user_response: str | None, response_type: str) -> bool:
     if not user_response:
         return False
     if _contains_deprecated_block_identifier(user_response):
         return True
     if _contains_yaml_authoring_vocab_leak(user_response, response_type):
         return True
-    if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response):
-        return True
-    if output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER:
-        return False
-    taxonomy_terms = _internal_block_taxonomy_terms(user_response)
-    return len(taxonomy_terms) >= _INFORMATIONAL_TAXONOMY_TERM_THRESHOLD
+    return response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response)
 
 
 def _contains_internal_tool_vocab_leak(user_response: str) -> bool:
@@ -587,31 +554,6 @@ def _contains_deprecated_block_identifier(text: str) -> bool:
     if "taskv2" in tokens:
         return True
     return any(left == "task" and right == "v2" for left, right in zip(tokens, tokens[1:]))
-
-
-def _internal_block_taxonomy_terms(text: str) -> set[str]:
-    lower = text.lower()
-    has_taxonomy_context = any(marker in lower for marker in _INTERNAL_BLOCK_TYPE_CONTEXT_MARKERS)
-    matches = list(_IDENTIFIER_TOKEN_RE.finditer(text))
-    terms: set[str] = set()
-    for index, match in enumerate(matches):
-        term = _normalized_internal_block_term(match.group(0))
-        if term is None:
-            continue
-        if has_taxonomy_context or _is_delimited_identifier(text, match.start(), match.end()):
-            terms.add(term)
-            continue
-        next_token = _compact_identifier_token(matches[index + 1].group(0)) if index + 1 < len(matches) else None
-        if next_token in {"block", "blocks", "for"}:
-            terms.add(term)
-    return terms
-
-
-def _normalized_internal_block_term(raw: str) -> str | None:
-    term = raw.lower()
-    if term in _INTERNAL_BLOCK_TYPE_TERMS:
-        return term
-    return None
 
 
 def _compact_identifier_token(raw: str) -> str:

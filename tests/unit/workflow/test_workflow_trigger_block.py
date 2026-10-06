@@ -27,6 +27,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.workflows import BlockType
 
 
@@ -645,6 +646,10 @@ async def test_sync_trigger_closes_fresh_session_when_fence_fires() -> None:
 
     mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh")
 
+    assert (
+        mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["session_kind"]
+        == BrowserSessionKind.workflow_run
+    )
     mock_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
     mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
     assert captured["success"] is False

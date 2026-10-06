@@ -65,6 +65,7 @@ from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
+from skyvern.forge.sdk.core.run_submission_gate import OPENAPI_SHED_RESPONSE, run_submission_slot
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import (
     OrganizationAuthTokenType,
@@ -676,6 +677,7 @@ def _hydrate_run_request_for_response(
     responses={
         200: {"description": "Successfully ran agent"},
         400: {"description": "Invalid agent run request"},
+        503: OPENAPI_SHED_RESPONSE,
     },
 )
 @base_router.post("/run/agents/", include_in_schema=False)
@@ -709,52 +711,56 @@ async def run_workflow(
     legacy_workflow_request = _workflow_run_request_to_legacy_request(workflow_run_request)
 
     trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
-    try:
-        workflow_run = await workflow_service.run_workflow(
-            workflow_id=workflow_id,
-            organization=current_org,
-            workflow_request=legacy_workflow_request,
-            template=template,
-            version=None,
-            max_steps=x_max_steps_override,
-            api_key=x_api_key,
-            request_id=request_id,
-            request=request,
-            background_tasks=background_tasks,
-            trigger_type=trigger_type,
-            tag_write_context=_tag_write_context_from_caller(caller),
-            created_by=user_id,
+    # The slot covers every database read after dispatch too: a checkout timeout there would answer 500 for
+    # a run that is already queued, and the client's retry would start it twice.
+    async with run_submission_slot(current_org.organization_id):
+        try:
+            workflow_run = await workflow_service.run_workflow(
+                workflow_id=workflow_id,
+                organization=current_org,
+                workflow_request=legacy_workflow_request,
+                template=template,
+                version=None,
+                max_steps=x_max_steps_override,
+                api_key=x_api_key,
+                request_id=request_id,
+                request=request,
+                background_tasks=background_tasks,
+                trigger_type=trigger_type,
+                tag_write_context=_tag_write_context_from_caller(caller),
+                created_by=user_id,
+                refuse_unusable_parameters_before_create=True,
+            )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        await uploaded_file_service.attach_files_to_run(
+            file_ids=workflow_run_request.file_ids or [],
+            organization_id=current_org.organization_id,
+            run_id=workflow_run.workflow_run_id,
         )
-    except MissingBrowserAddressError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    await uploaded_file_service.attach_files_to_run(
-        file_ids=workflow_run_request.file_ids or [],
-        organization_id=current_org.organization_id,
-        run_id=workflow_run.workflow_run_id,
-    )
-    background_tasks.add_task(
-        app.AGENT_FUNCTION.on_run_created,
-        organization_id=current_org.organization_id,
-        run_id=workflow_run.workflow_run_id,
-        run_type=RunType.workflow_run,
-        caller_type=caller.caller_type,
-    )
+        background_tasks.add_task(
+            app.AGENT_FUNCTION.on_run_created,
+            organization_id=current_org.organization_id,
+            run_id=workflow_run.workflow_run_id,
+            run_type=RunType.workflow_run,
+            caller_type=caller.caller_type,
+        )
 
-    if settings.OTEL_ENABLED:
-        span = trace.get_current_span()
-        if span:
-            if workflow_run.workflow_run_id:
-                span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
-            if workflow_run.workflow_id:
-                span.set_attribute("workflow_id", workflow_run.workflow_id)
+        if settings.OTEL_ENABLED:
+            span = trace.get_current_span()
+            if span:
+                if workflow_run.workflow_run_id:
+                    span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
+                if workflow_run.workflow_id:
+                    span.set_attribute("workflow_id", workflow_run.workflow_id)
 
-    # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
-    # the effective browser_type, so a run that omitted browser_type reports the inherited engine
-    # instead of the request's null.
-    workflow = await app.WORKFLOW_SERVICE.get_workflow(
-        workflow_id=workflow_run.workflow_id,
-        organization_id=current_org.organization_id,
-    )
+        # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
+        # the effective browser_type, so a run that omitted browser_type reports the inherited engine
+        # instead of the request's null.
+        workflow = await app.WORKFLOW_SERVICE.get_workflow(
+            workflow_id=workflow_run.workflow_id,
+            organization_id=current_org.organization_id,
+        )
     workflow_run_request_hydrated = _hydrate_run_request_for_response(workflow_run_request, workflow_run, workflow)
 
     return WorkflowRunResponse(
@@ -3241,6 +3247,13 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+_HTML_ARTIFACT_TYPES = frozenset(
+    artifact_type
+    for artifact_type, content_type in _ARTIFACT_CONTENT_TYPES.items()
+    if content_type.startswith("text/html")
+)
+# Scraped pages are third-party HTML served inline from the API origin; sandbox them so their scripts never run.
+_HTML_ARTIFACT_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
 _VIDEO_CONTENT_TYPES_BY_EXTENSION = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
@@ -3490,6 +3503,8 @@ async def get_artifact_content(
         signed_expiry_unix=signed_expiry_unix,
     )
     headers["Accept-Ranges"] = "bytes"
+    if artifact.artifact_type in _HTML_ARTIFACT_TYPES:
+        headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
     content_length = len(content)
     parsed_range = _parse_range_header(request.headers.get("range"), content_length)
     if parsed_range == _RANGE_UNSATISFIABLE:
@@ -4101,6 +4116,7 @@ def _user_writable_run_metadata(run_metadata: dict[str, str] | None) -> dict[str
         200: {"description": "Successfully retried workflow run"},
         400: {"description": "Workflow run is not retryable"},
         404: {"description": "Workflow run not found"},
+        503: OPENAPI_SHED_RESPONSE,
     },
 )
 @base_router.post("/workflows/runs/{workflow_run_id}/retry/", include_in_schema=False)
@@ -4197,25 +4213,26 @@ async def retry_workflow_run(
         if is_job_recipe_workflow_run_trigger_type(original_trigger_type)
         else workflow_run_trigger_type_from_user_agent(x_user_agent)
     )
-    try:
-        workflow_run = await workflow_service.run_workflow(
-            workflow_id=original_workflow_run.workflow_permanent_id,
-            organization=current_org,
-            workflow_request=legacy_workflow_request,
-            template=template,
-            version=original_workflow.version,
-            max_steps=x_max_steps_override,
-            api_key=x_api_key,
-            request_id=context.request_id,
-            request=request,
-            background_tasks=background_tasks,
-            trigger_type=trigger_type,
-            ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
-            tag_write_context=_tag_write_context_from_caller(caller),
-            created_by=user_id,
-        )
-    except MissingBrowserAddressError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    async with run_submission_slot(current_org.organization_id):
+        try:
+            workflow_run = await workflow_service.run_workflow(
+                workflow_id=original_workflow_run.workflow_permanent_id,
+                organization=current_org,
+                workflow_request=legacy_workflow_request,
+                template=template,
+                version=original_workflow.version,
+                max_steps=x_max_steps_override,
+                api_key=x_api_key,
+                request_id=context.request_id,
+                request=request,
+                background_tasks=background_tasks,
+                trigger_type=trigger_type,
+                ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
+                tag_write_context=_tag_write_context_from_caller(caller),
+                created_by=user_id,
+            )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     background_tasks.add_task(
         app.AGENT_FUNCTION.on_run_created,
         organization_id=current_org.organization_id,
@@ -4801,6 +4818,7 @@ async def get_actions(
     openapi_extra={
         "x-fern-sdk-method-name": "run_workflow_legacy",
     },
+    responses={503: OPENAPI_SHED_RESPONSE},
 )
 @legacy_base_router.post(
     "/workflows/{workflow_id}/run/",
@@ -4835,24 +4853,26 @@ async def run_workflow_legacy(
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     legacy_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
-    try:
-        workflow_run = await workflow_service.run_workflow(
-            workflow_id=workflow_id,
-            organization=current_org,
-            workflow_request=workflow_request,
-            template=template,
-            version=version,
-            max_steps=x_max_steps_override,
-            api_key=x_api_key,
-            request_id=request_id,
-            request=request,
-            background_tasks=background_tasks,
-            trigger_type=legacy_trigger_type,
-            tag_write_context=_tag_write_context_from_caller(caller),
-            created_by=user_id,
-        )
-    except MissingBrowserAddressError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    async with run_submission_slot(current_org.organization_id):
+        try:
+            workflow_run = await workflow_service.run_workflow(
+                workflow_id=workflow_id,
+                organization=current_org,
+                workflow_request=workflow_request,
+                template=template,
+                version=version,
+                max_steps=x_max_steps_override,
+                api_key=x_api_key,
+                request_id=request_id,
+                request=request,
+                background_tasks=background_tasks,
+                trigger_type=legacy_trigger_type,
+                tag_write_context=_tag_write_context_from_caller(caller),
+                created_by=user_id,
+                refuse_unusable_parameters_before_create=True,
+            )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     background_tasks.add_task(
         app.AGENT_FUNCTION.on_run_created,
         organization_id=current_org.organization_id,

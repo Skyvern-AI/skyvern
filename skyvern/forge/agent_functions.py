@@ -233,18 +233,6 @@ class TOTPVerificationResponse:
 
 
 @dataclass(frozen=True)
-class CopilotSiteOriginAssociation:
-    requested_name: str
-    entity_id: str
-    entity_label: str
-    official_site_url: str
-    origin: str
-    source: str
-    provider_relation_type: str
-    provider_relation_text: str
-
-
-@dataclass(frozen=True)
 class ScriptExecutionPolicyDecision:
     allowed: bool
     selection_reason: str
@@ -261,13 +249,6 @@ class CopilotCandidateNetworkHop(TypedDict):
     resolved_public_ips: list[str]
     connected_peer_ip: str
     enforcement_version: str
-
-
-@dataclass(frozen=True)
-class CopilotEntrypointCandidate:
-    url: str
-    source_rank: int
-    association: CopilotSiteOriginAssociation
 
 
 @dataclass(frozen=True)
@@ -2777,22 +2758,6 @@ class AgentFunction:
         if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
             raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
-    def get_copilot_security_rules(self) -> str:
-        """Return security guardrails for the workflow copilot system prompt.
-
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
-        """
-        return ""
-
-    async def acquire_copilot_entrypoint_candidates(
-        self,
-        *,
-        site_name: str,
-    ) -> list[CopilotEntrypointCandidate]:
-        del site_name
-        return []
-
     def copilot_candidate_network_guard(
         self,
         browser_context: BrowserContext,
@@ -2811,10 +2776,6 @@ class AgentFunction:
         del browser_context, expected_origin
         raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
         yield []  # pragma: no cover
-
-    async def wait_for_copilot_candidate_network_idle(self, browser_context: BrowserContext) -> None:
-        del browser_context
-        raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""

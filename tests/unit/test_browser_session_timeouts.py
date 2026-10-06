@@ -1,13 +1,20 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
+from skyvern.exceptions import BrowserSessionClosed, BrowserSessionExpired, BrowserSessionStartupTimeout
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    unusable_browser_session_error,
+)
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
+    LIFETIME_END_TOLERANCE_SECONDS,
     MAX_EXTENDED_LIFETIME_SECONDS,
     MAX_EXTENDED_TIMEOUT,
     MAX_LIFETIME_SECONDS,
@@ -16,6 +23,7 @@ from skyvern.schemas.browser_session_timeouts import (
     MIN_TIMEOUT,
     creation_timeout_minutes,
     lifetime_cap_seconds,
+    lived_full_lifetime,
     max_lifetime_exceeded_warning,
     max_timeout_exceeded_warning,
     seconds_until_expiry,
@@ -290,3 +298,73 @@ def test_requested_timeout_below_the_minimum_is_still_rejected() -> None:
 def test_timeout_defaults_and_explicit_none_are_untouched() -> None:
     assert CreateBrowserSessionRequest().timeout == DEFAULT_TIMEOUT
     assert CreateBrowserSessionRequest(timeout=None).timeout is None
+
+
+@pytest.mark.parametrize(
+    ("lived_seconds", "expected"),
+    [
+        (60 * 60, True),
+        (60 * 60 - LIFETIME_END_TOLERANCE_SECONDS, True),
+        (60 * 60 - LIFETIME_END_TOLERANCE_SECONDS - 1, False),
+        (60, False),
+    ],
+)
+def test_a_session_lived_its_full_lifetime_only_within_the_end_tolerance(lived_seconds: int, expected: bool) -> None:
+    started_at = datetime(2026, 9, 28, 13, 0, tzinfo=UTC)
+    ended_at = started_at + timedelta(seconds=lived_seconds)
+
+    assert lived_full_lifetime(started_at=started_at, ended_at=ended_at, timeout_minutes=60) is expected
+    assert not lived_full_lifetime(started_at=None, ended_at=ended_at, timeout_minutes=60)
+    assert not lived_full_lifetime(started_at=started_at, ended_at=ended_at, timeout_minutes=None)
+
+
+def _ended_session(**overrides: object) -> PersistentBrowserSession:
+    started_at = datetime(2026, 9, 28, 13, 0, tzinfo=UTC)
+    fields: dict[str, object] = {
+        "persistent_browser_session_id": "pbs_x",
+        "organization_id": "o_test",
+        "status": "timeout",
+        "timeout_minutes": 60,
+        "started_at": started_at,
+        "completed_at": started_at + timedelta(minutes=60),
+        "created_at": started_at,
+        "modified_at": started_at,
+    }
+    return PersistentBrowserSession(**{**fields, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({}, BrowserSessionExpired, id="timeout"),
+        pytest.param({"started_at": None}, BrowserSessionStartupTimeout, id="timeout-before-start"),
+        pytest.param(
+            {"status": "completed", "close_reason": BrowserSessionCloseReason.expired},
+            BrowserSessionExpired,
+            id="oss-reaper-full-lifetime",
+        ),
+        pytest.param(
+            {
+                "status": "completed",
+                "close_reason": BrowserSessionCloseReason.expired,
+                "completed_at": datetime(2026, 9, 28, 13, 10, tzinfo=UTC),
+            },
+            BrowserSessionClosed,
+            id="expired-reason-stamped-early",
+        ),
+        pytest.param({"status": "completed"}, BrowserSessionClosed, id="completed-by-the-caller"),
+        pytest.param({"status": "failed"}, BrowserSessionClosed, id="failed"),
+        pytest.param(
+            {"status": "running", "completed_at": None, "close_requested_at": datetime(2026, 9, 28, 13, 5, tzinfo=UTC)},
+            BrowserSessionClosed,
+            id="close-requested",
+        ),
+        pytest.param({"status": "running", "completed_at": None}, type(None), id="live"),
+    ],
+)
+def test_unusable_browser_session_error_tells_expiry_from_an_early_close(
+    overrides: dict[str, object], expected: type
+) -> None:
+    error = unusable_browser_session_error(_ended_session(**overrides))
+
+    assert type(error) is expected

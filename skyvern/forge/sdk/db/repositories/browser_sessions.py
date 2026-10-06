@@ -1064,9 +1064,11 @@ class BrowserSessionsRepository(BaseRepository):
             # Creation and its association commit together, before any browser launch.
             if run is not None:
                 run.browser_session_id = browser_session.persistent_browser_session_id
+            # Validate after this flush (the proxy pin's UPDATE stamps modified_at) and before commit expires the row.
+            await session.flush()
+            created = PersistentBrowserSession.model_validate(browser_session)
             await session.commit()
-            await session.refresh(browser_session)
-            return PersistentBrowserSession.model_validate(browser_session)
+            return created
 
     @db_operation("update_persistent_browser_session", expected_errors=(BrowserSessionAlreadyEndedError,))
     async def update_persistent_browser_session(
@@ -1261,7 +1263,6 @@ class BrowserSessionsRepository(BaseRepository):
                 # into the text that callers log. The type and statement still identify the fault.
                 exc.hide_parameters = True
                 raise
-            await session.refresh(updated)
 
     @db_operation("update_persistent_browser_session_compute_cost")
     async def update_persistent_browser_session_compute_cost(

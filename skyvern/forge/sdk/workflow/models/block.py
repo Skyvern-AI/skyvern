@@ -119,7 +119,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import OUTPUT_ONLY_ANTI_BOT_REASON_CODES, classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -208,6 +208,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     inline_authorized_file_path,
+    pin_file_chooser,
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
@@ -291,6 +292,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
@@ -1924,14 +1926,21 @@ class Block(BaseModel, abc.ABC):
         pass
 
 
+def _is_retry_blocking_anti_bot_entry(category: dict) -> bool:
+    return (
+        category.get("category") == "ANTI_BOT_DETECTION"
+        and category.get("reason_code") not in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+    )
+
+
 def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     categories = task.failure_category
     if categories:
-        return any(c.get("category") == "ANTI_BOT_DETECTION" for c in categories)
+        return any(_is_retry_blocking_anti_bot_entry(c) for c in categories)
 
     if task.failure_reason:
         result = classify_from_failure_reason(task.failure_reason)
-        if result and any(c.get("category") == "ANTI_BOT_DETECTION" for c in result):
+        if result and any(_is_retry_blocking_anti_bot_entry(c) for c in result):
             return True
 
     return False
@@ -6779,6 +6788,13 @@ class CodeBlock(Block):
             download_log=download_log,
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
+            file_chooser=pin_file_chooser(_raw_code_block_page(page)),
+            # Taken before execute_user_function_with_timeout starts its clock, so it errs early.
+            deadline=(
+                monotonic() + settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+                if settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS > 0
+                else None
+            ),
         )
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
@@ -8592,10 +8608,14 @@ async def wrapper({default_args}):
             return "".join(char for char in redacted if unicodedata.category(char)[0] != "C").strip()[:1000] or None
 
         state: dict[str, str] = {}
+        first_url: str | None = None
+        later_url: str | None = None
+        page_title: str | None = None
         try:
             async with asyncio.timeout(0.5):
                 try:
-                    final_url = mask_fact(page.url)
+                    first_url = page.url
+                    final_url = mask_fact(first_url)
                     if final_url:
                         state["final_url"] = final_url
                 except asyncio.CancelledError:
@@ -8604,12 +8624,15 @@ async def wrapper({default_args}):
                     pass
                 try:
                     page_title = mask_fact(await page.title())
-                    if page_title:
-                        state["page_title"] = page_title
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - failure evidence is best effort.
                     pass
+                finally:
+                    with contextlib.suppress(Exception):
+                        later_url = page.url
+                        if later_url != first_url and (later_final_url := mask_fact(later_url)):
+                            state["final_url"] = later_final_url
                 try:
                     receiver_url = mask_fact(receiver.url) if receiver is not None else None
                     if receiver_url:
@@ -8631,6 +8654,9 @@ async def wrapper({default_args}):
             raise
         except TimeoutError:
             pass
+        # A document committed after the first url read would pair one document's URL with another's title.
+        if page_title and first_url is not None and later_url == first_url:
+            state["page_title"] = page_title
         return state
 
     async def _persist_captured_failure_final_url(
@@ -9988,7 +10014,7 @@ async def wrapper({default_args}):
                     failure_page=failed_page,
                     workflow_run_context=workflow_run_context,
                     redaction_parameters=serialized_parameter_values,
-                    opened_pages=opened_pages,
+                    opened_pages=[*opened_pages, *recording_page._claimed_popups()],
                 )
             if inline_failure_page_state:
                 from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state
@@ -18889,6 +18915,7 @@ class WorkflowTriggerBlock(Block):
                     organization_id=organization_id,
                     proxy_location=proxy_location,
                     timeout_minutes=30,
+                    session_kind=BrowserSessionKind.workflow_run,
                     **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id

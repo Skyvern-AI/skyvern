@@ -38,6 +38,7 @@ def _install_fakes(
     workflow_run: object | None,
     hook: AsyncMock,
     previous: RunFeedback | None = None,
+    recording: object | None = None,
 ) -> SimpleNamespace:
     run_feedback = SimpleNamespace(
         upsert_run_feedback=AsyncMock(return_value=_stored()),
@@ -47,6 +48,7 @@ def _install_fakes(
     database = SimpleNamespace(
         workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=workflow_run)),
         tasks=SimpleNamespace(get_task=AsyncMock(return_value=None)),
+        browser_recordings=SimpleNamespace(get_recording=AsyncMock(return_value=recording)),
         run_feedback=run_feedback,
     )
     monkeypatch.setattr(app, "DATABASE", database)
@@ -67,6 +69,27 @@ async def test_feedback_on_a_run_outside_the_org_is_404_and_stores_nothing(monke
     assert exc.value.status_code == 404
     run_feedback.upsert_run_feedback.assert_not_awaited()
     hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_feedback_is_scoped_to_the_orgs_recording_and_stores_its_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook = AsyncMock()
+    request = RunFeedbackRequest(target_type="browser_recording", target_id="br_1", rating="down", reason="other")
+    run_feedback = _install_fakes(monkeypatch, workflow_run=None, hook=hook, recording=None)
+
+    with pytest.raises(HTTPException) as exc:
+        await feedback_routes.submit_run_feedback(request, BackgroundTasks(), ORG)
+    assert exc.value.status_code == 404
+    run_feedback.upsert_run_feedback.assert_not_awaited()
+
+    run_feedback = _install_fakes(
+        monkeypatch, workflow_run=None, hook=hook, recording=SimpleNamespace(workflow_permanent_id="wpid_1")
+    )
+    await feedback_routes.submit_run_feedback(request, BackgroundTasks(), ORG)
+    stored = run_feedback.upsert_run_feedback.await_args.kwargs
+    assert (stored["target_type"], stored["context_id"], stored["reason"]) == ("browser_recording", "wpid_1", "other")
 
 
 @pytest.mark.asyncio

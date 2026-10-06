@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     is_redaction_withheld,
     scrub_model_facing_tool_result,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
@@ -82,7 +83,8 @@ MAX_CODE_CHARS = 20_000
 MAX_VALUE_CHARS = 32_000
 SESSION_LIFETIME_SECONDS = float(TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS)
 
-TOOL_DESCRIPTION = """Run Python against the live browser in a persistent interpreter.
+TOOL_DESCRIPTION = (
+    """Run Python against the live browser in a persistent interpreter.
 
 `target` names the browser: 'debug' (default) is the one this chat drives; 'last_run' is the one the
 most recent test run executed in, when that run minted its own. A continuation on the page a run
@@ -128,7 +130,11 @@ Browser API (async, Playwright-shaped):
 - `await search_web(query, max_results=10)` is the saved block's search helper: it calls the server-side
   search API, touches no tab, and returns the same result shape as the `search_web` tool.
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
-  `click_and_download`, and `files`.
+  `click_and_download`, and `files`. A saved block claims a download with
+  `"""
+    + DownloadClaimHelperContract().call
+    + """`, which is not available here;
+  `get_block_schema` for block type `code` returns its parameters.
 
 Not available: imports, names starting with `_`, event listeners (`page.on`, `expect_*`), cookies,
 request interception, and new browser contexts. Using one returns an error that says so.
@@ -148,6 +154,7 @@ block should read and promoted unchanged.
 Limits: code up to 20,000 characters; `value` up to 32,000 characters of JSON and `stdout` up to 16 KB,
 cut beyond that, so return or print a summary; the first 50 operations are listed; a chat turn holds at
 most 32 files of 16 MB each."""
+)
 
 TOOL_SCHEMA: dict[str, Any] = {
     "type": "object",

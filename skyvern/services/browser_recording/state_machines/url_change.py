@@ -60,11 +60,14 @@ class StateMachineUrlChange(StateMachine):
             texts=[],
         )
 
+        # CDP events carry server time.time() seconds; every other action uses the page's Date.now() ms.
+        timestamp_ms = event.timestamp * 1000
+
         return ActionUrlChange(
             kind=ActionKind.URL_CHANGE.value,
             target=action_target,
-            timestamp_start=event.timestamp,
-            timestamp_end=event.timestamp,
+            timestamp_start=timestamp_ms,
+            timestamp_end=timestamp_ms,
             url=url,
         )
 

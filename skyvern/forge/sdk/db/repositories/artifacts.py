@@ -164,9 +164,11 @@ class ArtifactsRepository(BaseRepository):
                 browser_session_id=browser_session_id,
             )
             session.add(new_artifact)
+            # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
+            await session.flush()
+            artifact = convert_to_artifact(new_artifact, self.debug_enabled)
             await session.commit()
-            await session.refresh(new_artifact)
-            return convert_to_artifact(new_artifact, self.debug_enabled)
+            return artifact
 
     @db_operation("refresh_download_artifact_content")
     async def refresh_download_artifact_content(
@@ -230,6 +232,8 @@ class ArtifactsRepository(BaseRepository):
         """
         Bulk create multiple artifacts in a single database transaction.
 
+        The commit expires the passed-in models, so read the returned Artifacts, not the models.
+
         Args:
             artifact_models: List of ArtifactModel instances to insert
 
@@ -241,13 +245,10 @@ class ArtifactsRepository(BaseRepository):
 
         async with self.Session() as session:
             session.add_all(artifact_models)
+            await session.flush()
+            artifacts = [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
             await session.commit()
-
-            # Refresh all artifacts to get their created_at and modified_at values
-            for artifact in artifact_models:
-                await session.refresh(artifact)
-
-            return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
+            return artifacts
 
     @db_operation("get_artifacts_for_task_v2")
     async def get_artifacts_for_task_v2(

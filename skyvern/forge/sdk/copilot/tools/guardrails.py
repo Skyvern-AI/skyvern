@@ -7,6 +7,7 @@ from typing import Any
 import structlog
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData
 
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.author_time_block import CREDENTIAL_SCOUT_BLOCK_ID, AuthorTimeBlock
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -171,6 +172,7 @@ def _authority_tool_error(
         "upload_attached_file",
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
+        ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     } and raw_secret_browser_denied(ctx):
         return _emit_tool_blocker_signal(
             ctx,

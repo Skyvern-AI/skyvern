@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
@@ -391,7 +392,13 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
     assert ctx.attached_browser_drivers == {"bs_1": runtime.AttachedBrowserDriver("bs_1", ready_state)}
-    assert mock_manager.create_session.call_args.kwargs.keys() == {"organization_id", "timeout_minutes", "created_by"}
+    assert mock_manager.create_session.call_args.kwargs.keys() == {
+        "organization_id",
+        "timeout_minutes",
+        "created_by",
+        "session_kind",
+    }
+    assert mock_manager.create_session.call_args.kwargs["session_kind"] == BrowserSessionKind.copilot
 
 
 @pytest.mark.asyncio
@@ -968,6 +975,7 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
         "organization_id": ctx.organization_id,
         "timeout_minutes": 30,
         "created_by": "copilot",
+        "session_kind": BrowserSessionKind.copilot,
         "browser_profile_id": "bp_saved",
         "profile_read_only": True,
         "generate_browser_profile": True,

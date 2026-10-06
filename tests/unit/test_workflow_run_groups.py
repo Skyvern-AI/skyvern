@@ -1,19 +1,24 @@
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
-from dataclasses import dataclass, field
+import contextlib
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
-import pytest_asyncio
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import select, update
+from sqlalchemy.engine import make_url
 
 from skyvern.config import settings
-from skyvern.exceptions import SkyvernHTTPException, WorkflowChangedSinceReview, WorkflowPinnedByRunGroup
+from skyvern.exceptions import (
+    GroupAccountsRanSinceReview,
+    SkyvernHTTPException,
+    WorkflowChangedSinceReview,
+    WorkflowPinnedByRunGroup,
+)
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core import skyvern_context
@@ -21,21 +26,17 @@ from skyvern.forge.sdk.core.permissions.permission_checkers import PermissionChe
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import (
-    Base,
-    CredentialModel,
     WorkflowModel,
     WorkflowRunGroupItemModel,
     WorkflowRunGroupModel,
     WorkflowRunModel,
 )
-from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.db.repositories import workflow_run_groups as workflow_run_groups_repository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.workflow.models.block import (
-    BlockTypeVar,
     ForLoopBlock,
     HttpRequestBlock,
-    TaskBlock,
     WorkflowTriggerBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
@@ -54,53 +55,16 @@ from skyvern.schemas.workflow_run_groups import (
     WorkflowRunGroupStatus,
 )
 from skyvern.services import workflow_run_group_service as group_service
-from tests.unit.conftest import make_block_output_parameter
-
-ORG = "o_test"
-OTHER_ORG = "o_other"
-WPID = "wpid_test"
-
-
-@dataclass
-class FakeExecutor:
-    database: AgentDB
-    executed: list[str] = field(default_factory=list)
-    submitted: list[str] = field(default_factory=list)
-    before_queue: Callable[[str], Awaitable[None]] | None = None
-
-    async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
-        self.executed.append(workflow_run_id)
-        if self.before_queue is not None:
-            await self.before_queue(workflow_run_id)
-        if await self.database.workflow_runs.update_workflow_run_if_not_final(
-            workflow_run_id, WorkflowRunStatus.queued
-        ):
-            self.submitted.append(workflow_run_id)
-
-
-@dataclass
-class RecordingRateLimiter:
-    calls: list[str] = field(default_factory=list)
-
-    async def rate_limit_submit_run(self, organization_id: str) -> None:
-        self.calls.append(organization_id)
-
-
-@dataclass
-class GroupEnv:
-    database: AgentDB
-    executor: FakeExecutor
-    organization: Organization
-    spawned: list[Coroutine[Any, Any, None]]
-    limiter: RecordingRateLimiter
-
-
-def _definition(*blocks: BlockTypeVar) -> dict[str, Any]:
-    return WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json")
-
-
-def _task_block() -> TaskBlock:
-    return TaskBlock(label="login", url="https://example.com", output_parameter=make_block_output_parameter("login"))
+from tests.unit.conftest import RUN_GROUP_ORG as ORG
+from tests.unit.conftest import RUN_GROUP_OTHER_ORG as OTHER_ORG
+from tests.unit.conftest import RUN_GROUP_WPID as WPID
+from tests.unit.conftest import (
+    GroupEnv,
+    count_rows,
+    make_block_output_parameter,
+    run_group_definition,
+    run_group_task_block,
+)
 
 
 def _looped_trigger(browser_session_id: str | None = None, wait_for_completion: bool = True) -> ForLoopBlock:
@@ -120,53 +84,9 @@ def _http_block() -> HttpRequestBlock:
     )
 
 
-@pytest_asyncio.fixture
-async def env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> AsyncIterator[GroupEnv]:
-    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
-    organization = await database.organizations.create_organization("Test", organization_id=ORG)
-    await database.organizations.create_organization("Other", organization_id=OTHER_ORG)
-    async with database.Session() as session:
-        session.add(
-            WorkflowModel(
-                workflow_id="wf_1",
-                workflow_permanent_id=WPID,
-                organization_id=ORG,
-                title="Workflow",
-                version=1,
-                workflow_definition=_definition(_task_block()),
-            )
-        )
-        session.add_all(
-            CredentialModel(
-                credential_id=credential_id,
-                organization_id=org_id,
-                name="Login",
-                credential_type="password",
-                item_id=f"item_{credential_id}",
-            )
-            for credential_id, org_id in (("cred_1", ORG), ("cred_2", ORG), ("cred_foreign", OTHER_ORG))
-        )
-        await session.commit()
-    await database.workflow_params.create_workflow_parameter(
-        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID, key="login", default_value=None
-    )
-    service = WorkflowService()
-    executor = FakeExecutor(database)
-    spawned: list[Coroutine[Any, Any, None]] = []
-    limiter = RecordingRateLimiter()
-    monkeypatch.setattr(app, "DATABASE", database)
-    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "RATE_LIMITER", limiter, raising=False)
-    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
-    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
-    monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
-    monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
-    monkeypatch.setattr(group_service, "_spawn", spawned.append)
-    monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
-    yield GroupEnv(database, executor, organization, spawned, limiter)
-    for coroutine in spawned:
-        coroutine.close()
-    await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks, return_exceptions=True)
+@pytest.fixture
+def env(run_group_env: GroupEnv) -> GroupEnv:
+    return run_group_env
 
 
 def _request(
@@ -175,11 +95,6 @@ def _request(
     if items is None:
         items = [{"key": f"acct-{i}", "parameters": {"login": "cred_1" if i % 2 else "cred_2"}} for i in range(count)]
     return WorkflowRunGroupCreateRequest.model_validate({"workflow_id": WPID, "submission_key": key, "items": items})
-
-
-async def _count(env: GroupEnv, model: type[Base]) -> int:
-    async with env.database.Session() as session:
-        return int(await session.scalar(select(func.count()).select_from(model)) or 0)
 
 
 async def _set_child_status(env: GroupEnv, workflow_run_id: str, status: WorkflowRunStatus) -> None:
@@ -223,14 +138,14 @@ async def test_submit_preallocates_ids_without_child_rows_then_dispatches_one(en
     run_ids = [item.workflow_run_id for item in response.items]
     assert len(set(run_ids)) == 25
     assert response.workflow_id == "wf_1"
-    assert await _count(env, WorkflowRunModel) == 0
+    assert await count_rows(env, WorkflowRunModel) == 0
 
     await group_service.advance_workflow_run_group(response.workflow_run_group_id)
 
     assert env.executor.executed == [run_ids[0]]
     child = await env.database.workflow_runs.get_workflow_run(run_ids[0])
     assert child is not None and child.workflow_id == "wf_1" and child.start_fresh_browser is True
-    assert await _count(env, WorkflowRunModel) == 1
+    assert await count_rows(env, WorkflowRunModel) == 1
     group = await group_service.get_workflow_run_group(response.workflow_run_group_id, ORG)
     assert [item.workflow_run_id for item in group.items] == run_ids
 
@@ -296,9 +211,9 @@ async def test_one_bad_credential_rejects_the_whole_group(env: GroupEnv, bad_cre
         await group_service.submit_workflow_run_group(env.organization, _request(items=items))
 
     assert 400 <= exc_info.value.status_code < 500
-    assert await _count(env, WorkflowRunGroupModel) == 0
-    assert await _count(env, WorkflowRunGroupItemModel) == 0
-    assert await _count(env, WorkflowRunModel) == 0
+    assert await count_rows(env, WorkflowRunGroupModel) == 0
+    assert await count_rows(env, WorkflowRunGroupItemModel) == 0
+    assert await count_rows(env, WorkflowRunModel) == 0
     assert env.spawned == [] and env.executor.executed == []
 
 
@@ -315,13 +230,13 @@ async def test_a_mistyped_value_in_any_item_rejects_the_whole_group(env: GroupEn
 
     if count.isdigit():
         await group_service.submit_workflow_run_group(env.organization, _request(items=items))
-        assert await _count(env, WorkflowRunGroupItemModel) == 2
+        assert await count_rows(env, WorkflowRunGroupItemModel) == 2
         return
     with pytest.raises(SkyvernHTTPException) as exc_info:
         await group_service.submit_workflow_run_group(env.organization, _request(items=items))
     assert exc_info.value.status_code == 400
-    assert await _count(env, WorkflowRunGroupModel) == 0
-    assert await _count(env, WorkflowRunGroupItemModel) == 0
+    assert await count_rows(env, WorkflowRunGroupModel) == 0
+    assert await count_rows(env, WorkflowRunGroupItemModel) == 0
 
 
 @pytest.mark.asyncio
@@ -335,7 +250,7 @@ async def test_identical_retry_after_workflow_saves_returns_the_same_group(env: 
                 title="Workflow",
                 version=2,
                 created_by=COPILOT_TEST_WORKFLOW_CREATOR,
-                workflow_definition=_definition(_task_block()),
+                workflow_definition=run_group_definition(run_group_task_block()),
             )
         )
         await session.commit()
@@ -350,7 +265,7 @@ async def test_identical_retry_after_workflow_saves_returns_the_same_group(env: 
                 organization_id=ORG,
                 title="Workflow",
                 version=3,
-                workflow_definition=_definition(),
+                workflow_definition=run_group_definition(),
             )
         )
         await session.commit()
@@ -359,7 +274,7 @@ async def test_identical_retry_after_workflow_saves_returns_the_same_group(env: 
     assert retry.workflow_run_group_id == first.workflow_run_group_id
     assert retry.workflow_id == "wf_1"
     assert [item.workflow_run_id for item in retry.items] == [item.workflow_run_id for item in first.items]
-    assert await _count(env, WorkflowRunGroupModel) == 1
+    assert await count_rows(env, WorkflowRunGroupModel) == 1
 
 
 @pytest.mark.asyncio
@@ -375,7 +290,7 @@ async def test_identical_retry_with_submission_disabled_returns_the_same_group(
 
     assert retry.workflow_run_group_id == first.workflow_run_group_id
     assert exc_info.value.status_code == 503
-    assert await _count(env, WorkflowRunGroupModel) == 1
+    assert await count_rows(env, WorkflowRunGroupModel) == 1
 
 
 @pytest.mark.asyncio
@@ -397,7 +312,7 @@ async def test_conflicting_input_for_a_submission_key_is_rejected(
         await group_service.submit_workflow_run_group(env.organization, changed)
 
     assert exc_info.value.status_code == 409
-    assert await _count(env, WorkflowRunGroupModel) == 1
+    assert await count_rows(env, WorkflowRunGroupModel) == 1
     assert await _run_ids(env, group_id) == run_ids
     assert len(env.spawned) == 1
 
@@ -410,8 +325,8 @@ async def test_concurrent_identical_submissions_share_one_group(env: GroupEnv) -
 
     assert len({response.workflow_run_group_id for response in responses}) == 1
     assert len({tuple(item.workflow_run_id for item in response.items) for response in responses}) == 1
-    assert await _count(env, WorkflowRunGroupModel) == 1
-    assert await _count(env, WorkflowRunGroupItemModel) == 3
+    assert await count_rows(env, WorkflowRunGroupModel) == 1
+    assert await count_rows(env, WorkflowRunGroupItemModel) == 3
 
 
 @pytest.mark.asyncio
@@ -424,7 +339,7 @@ async def test_concurrent_recoveries_of_a_stale_claim_execute_once(env: GroupEnv
     await asyncio.gather(group_service.recover_workflow_run_groups(), group_service.recover_workflow_run_groups())
 
     assert env.executor.executed == [run_ids[0]]
-    assert await _count(env, WorkflowRunModel) == 1
+    assert await count_rows(env, WorkflowRunModel) == 1
 
 
 @pytest.mark.asyncio
@@ -445,7 +360,7 @@ async def test_slow_owner_cannot_execute_after_recovery_reclaims_its_item(env: G
 
     assert await group_service._dispatch_item(group, reclaimed, "new-owner") is True
     assert env.executor.executed == [run_ids[0]]
-    assert await _count(env, WorkflowRunModel) == 1
+    assert await count_rows(env, WorkflowRunModel) == 1
 
 
 @pytest.mark.asyncio
@@ -478,7 +393,7 @@ async def test_stale_owner_interrupted_prep_leaves_the_new_owners_child_alone(
     assert status_after_stale_owner == [WorkflowRunStatus.created]
     assert env.executor.executed == [run_ids[0]]
     assert (await _states(env, group_id))[0] == WorkflowRunGroupItemState.dispatched
-    assert await _count(env, WorkflowRunModel) == 1
+    assert await count_rows(env, WorkflowRunModel) == 1
 
 
 @pytest.mark.asyncio
@@ -495,7 +410,7 @@ async def test_crash_between_child_row_and_task_run_fails_that_item_and_runs_the
     group = await group_service.get_workflow_run_group(group_id, ORG)
     assert group.items[0].state == WorkflowRunGroupItemState.failed_to_start
     assert group.items[0].outcome == WorkflowRunGroupItemOutcome.failed
-    assert await _count(env, WorkflowRunModel) == 2
+    assert await count_rows(env, WorkflowRunModel) == 2
 
 
 class RefusingPermissionChecker(PermissionChecker):
@@ -514,7 +429,7 @@ async def test_org_refused_after_submit_starts_no_remaining_children(
 
     assert env.executor.executed == []
     assert await _states(env, group_id) == [WorkflowRunGroupItemState.failed_to_start] * 3
-    assert await _count(env, WorkflowRunModel) == 0
+    assert await count_rows(env, WorkflowRunModel) == 0
 
 
 @pytest.mark.asyncio
@@ -603,7 +518,7 @@ async def test_child_cancel_between_flip_and_queued_write(env: GroupEnv) -> None
     group = await group_service.get_workflow_run_group(group_id, ORG)
     assert group.status == WorkflowRunGroupStatus.finished
     assert [item.outcome for item in group.items] == [WorkflowRunGroupItemOutcome.canceled] * 3
-    assert await _count(env, WorkflowRunModel) == 1
+    assert await count_rows(env, WorkflowRunModel) == 1
 
 
 @pytest.mark.asyncio
@@ -629,7 +544,7 @@ async def test_in_place_edit_of_a_pinned_version_is_refused_until_the_group_fini
 
     for edit in (
         {"title": "Edited"},
-        {"workflow_definition": WorkflowDefinition(parameters=[], blocks=[_task_block()])},
+        {"workflow_definition": WorkflowDefinition(parameters=[], blocks=[run_group_task_block()])},
     ):
         with pytest.raises(WorkflowPinnedByRunGroup) as refused:
             await app.WORKFLOW_SERVICE.update_workflow_definition(workflow_id="wf_1", organization_id=ORG, **edit)
@@ -658,7 +573,7 @@ async def test_submit_bound_to_a_reviewed_version_refuses_an_edit_that_landed_af
         )
 
     assert refused.value.status_code == 409
-    assert await _count(env, WorkflowRunGroupModel) == 0
+    assert await count_rows(env, WorkflowRunGroupModel) == 0
     assert env.spawned == []
     current = await env.database.workflows.get_workflow(workflow_id="wf_1", organization_id=ORG)
     assert current is not None
@@ -765,7 +680,9 @@ async def test_failure_after_possible_side_effects_is_unknown_and_not_replayed(e
     if evidence == "http_request_block":
         async with env.database.Session() as session:
             await session.execute(
-                update(WorkflowModel).values(workflow_definition=_definition(_task_block(), _http_block()))
+                update(WorkflowModel).values(
+                    workflow_definition=run_group_definition(run_group_task_block(), _http_block())
+                )
             )
             await session.commit()
     group_id = await _submit(env, _request(count=1))
@@ -792,7 +709,7 @@ async def test_failure_after_possible_side_effects_is_unknown_and_not_replayed(e
     group = await group_service.get_workflow_run_group(group_id, ORG)
     assert group.items[0].outcome == WorkflowRunGroupItemOutcome.unknown
     assert env.executor.executed == run_ids
-    assert await _count(env, WorkflowRunModel) == 1
+    assert await count_rows(env, WorkflowRunModel) == 1
 
 
 @pytest.mark.asyncio
@@ -831,15 +748,28 @@ def test_browser_session_inputs_are_rejected() -> None:
 @pytest.mark.parametrize(
     "workflow_values",
     [
-        {"workflow_definition": {**_definition(_task_block()), "retry_policy": {"retry_on": [{"status": "failed"}]}}},
+        {
+            "workflow_definition": {
+                **run_group_definition(run_group_task_block()),
+                "retry_policy": {"retry_on": [{"status": "failed"}]},
+            }
+        },
         {"persist_browser_session": True},
         {"browser_profile_id": "bp_1"},
         {"sequential_key": "{{ login }}"},
-        {"workflow_definition": _definition()},
+        {"workflow_definition": run_group_definition()},
         {"browser_profile_key": "profile-{{ login }}"},
-        {"workflow_definition": _definition(_task_block(), _looped_trigger(browser_session_id="{{ session_id }}"))},
-        {"workflow_definition": _definition(_task_block(), _looped_trigger(wait_for_completion=False))},
-        {"workflow_definition": {**_definition(_task_block()), "finally_block_label": "login"}},
+        {
+            "workflow_definition": run_group_definition(
+                run_group_task_block(), _looped_trigger(browser_session_id="{{ session_id }}")
+            )
+        },
+        {
+            "workflow_definition": run_group_definition(
+                run_group_task_block(), _looped_trigger(wait_for_completion=False)
+            )
+        },
+        {"workflow_definition": {**run_group_definition(run_group_task_block()), "finally_block_label": "login"}},
     ],
 )
 async def test_versions_a_group_cannot_run_are_rejected(env: GroupEnv, workflow_values: dict[str, object]) -> None:
@@ -851,8 +781,8 @@ async def test_versions_a_group_cannot_run_are_rejected(env: GroupEnv, workflow_
         await _submit(env)
 
     assert exc_info.value.status_code == 400
-    assert await _count(env, WorkflowRunGroupModel) == 0
-    assert await _count(env, WorkflowRunGroupItemModel) == 0
+    assert await count_rows(env, WorkflowRunGroupModel) == 0
+    assert await count_rows(env, WorkflowRunGroupItemModel) == 0
 
 
 @pytest.mark.asyncio
@@ -1074,7 +1004,7 @@ async def test_scrubbed_group_keeps_no_caller_keys_and_a_replay_of_its_key_confl
     with pytest.raises(SkyvernHTTPException) as exc_info:
         await _submit(env)
     assert exc_info.value.status_code == 409
-    assert await _count(env, WorkflowRunGroupModel) == 1
+    assert await count_rows(env, WorkflowRunGroupModel) == 1
     with pytest.raises(ValidationError):
         _request(key=stored[0])
     with pytest.raises(ValidationError):
@@ -1101,7 +1031,7 @@ async def test_an_edit_landing_between_validation_and_insert_refuses_the_submit(
         await _submit(env)
 
     assert exc_info.value.status_code == 409
-    assert await _count(env, WorkflowRunGroupModel) == 0
+    assert await count_rows(env, WorkflowRunGroupModel) == 0
 
 
 @pytest.mark.asyncio
@@ -1198,7 +1128,7 @@ async def test_unfresh_trigger_under_a_group_child_fails_before_creating_a_run(
         if supplies_session
         else None
     )
-    runs_before = await _count(env, WorkflowRunModel)
+    runs_before = await count_rows(env, WorkflowRunModel)
     block = WorkflowTriggerBlock(
         label="detached",
         workflow_permanent_id=WPID,
@@ -1215,4 +1145,65 @@ async def test_unfresh_trigger_under_a_group_child_fails_before_creating_a_run(
     await block.execute(workflow_run_id=trigger_run_id, workflow_run_block_id="wrb_detached", organization_id=ORG)
 
     assert result.await_args is not None and result.await_args.kwargs["success"] is False
-    assert await _count(env, WorkflowRunModel) == runs_before
+    assert await count_rows(env, WorkflowRunModel) == runs_before
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_repeat_checked_creations_on_postgres_admit_one_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if make_url(str(settings.DATABASE_STRING)).get_backend_name() != "postgresql":
+        pytest.skip("requires PostgreSQL row and advisory locks")
+    read_latest = workflow_run_groups_repository._latest_group_ids_by_item_key
+    reads: list[None] = []
+    both_read = asyncio.Event()
+
+    # Holds each creation after its history read, so without the locks both read before either inserts.
+    async def read_then_wait_for_the_other(*args: Any) -> dict[str, str]:
+        latest = await read_latest(*args)
+        reads.append(None)
+        if len(reads) >= 2:
+            both_read.set()
+        else:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(both_read.wait(), 0.5)
+        return latest
+
+    monkeypatch.setattr(workflow_run_groups_repository, "_latest_group_ids_by_item_key", read_then_wait_for_the_other)
+    database = AgentDB(str(settings.DATABASE_STRING))
+    organization = await database.organizations.create_organization(organization_name=f"race-{uuid4().hex}")
+    workflow_id, wpid = f"wf_{uuid4().hex}", f"wpid_{uuid4().hex}"
+    async with database.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id=workflow_id,
+                workflow_permanent_id=wpid,
+                organization_id=organization.organization_id,
+                title="Workflow",
+                version=1,
+                workflow_definition=run_group_definition(run_group_task_block()),
+            )
+        )
+        await session.commit()
+
+    async def create(label: str) -> object:
+        try:
+            return await database.workflow_run_groups.create_group(
+                organization_id=organization.organization_id,
+                workflow_permanent_id=wpid,
+                requested_version=1,
+                workflow_id=workflow_id,
+                submission_key=f"copilot:{label}:key",
+                input_fingerprint=label,
+                items=[("cred_race", {})],
+                expected_latest_groups=("copilot:", {}),
+            )
+        except GroupAccountsRanSinceReview as e:
+            return e
+
+    try:
+        results = await asyncio.gather(create("a"), create("b"))
+    finally:
+        await database.engine.dispose()
+
+    assert sum(isinstance(result, GroupAccountsRanSinceReview) for result in results) == 1

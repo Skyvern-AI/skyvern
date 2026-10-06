@@ -4,9 +4,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.webeye import schemas as browser_session_schemas
@@ -375,6 +381,75 @@ async def test_browser_session_response_lists_files_newest_first_with_undated_fi
 
     assert response.downloaded_files == [newer, older, undated]
     assert response.recordings == [newer, older, undated]
+
+
+_KEYRING = '{"current_kid": "k1", "keys": {"k1": {"secret": "00"}}}'
+
+
+def s3_holding_one_file_per_prefix() -> MagicMock:
+    async def list_files(uri: str) -> list[str]:
+        name = "s3_session.webm" if uri.endswith("/videos") else "s3_report.pdf"
+        return [f"{uri.split('/', 3)[3]}/{name}"]
+
+    client = MagicMock()
+    client.list_files = AsyncMock(side_effect=list_files)
+    client.get_object_info = AsyncMock(return_value={"Metadata": {}, "LastModified": None, "ContentLength": 10})
+    client.create_presigned_urls = AsyncMock(side_effect=lambda keys: [f"https://b.s3.amazonaws.com/{k}" for k in keys])
+    return client
+
+
+@pytest.mark.usefixtures("base_agent_function")
+@pytest.mark.parametrize(
+    ("keyring", "rows", "expected"),
+    [
+        pytest.param(_KEYRING, "none", ([], []), id="keyring-no-rows-skips-s3"),
+        pytest.param(_KEYRING, "present", (["row_report.pdf"], ["row_session.webm"]), id="keyring-serves-rows"),
+        pytest.param(_KEYRING, "lookup-raises", (["s3_report.pdf"], ["s3_session.webm"]), id="failed-lookup-lists"),
+        pytest.param(None, "none", (["s3_report.pdf"], ["s3_session.webm"]), id="no-keyring-lists"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_browser_session_files_come_from_artifact_rows_and_list_s3_only_as_a_fallback(
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    keyring: str | None,
+    rows: str,
+    expected: tuple[list[str], list[str]],
+) -> None:
+    db = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    monkeypatch.setattr(app, "DATABASE", db)
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
+    monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", keyring)
+    session = completed_session()
+    prefix = (
+        f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{session.organization_id}"
+        f"/browser_sessions/{session.persistent_browser_session_id}"
+    )
+    if rows == "present":
+        for artifact_type, path in (
+            (ArtifactType.DOWNLOAD, "downloads/row_report.pdf"),
+            (ArtifactType.RECORDING, "videos/row_session.webm"),
+        ):
+            await db.artifacts.create_artifact(
+                artifact_id=f"a_{artifact_type}",
+                artifact_type=artifact_type,
+                uri=f"{prefix}/{path}",
+                organization_id=session.organization_id,
+                browser_session_id=session.persistent_browser_session_id,
+            )
+    elif rows == "lookup-raises":
+        monkeypatch.setattr(
+            db.artifacts, "list_artifacts_for_browser_session_by_type", AsyncMock(side_effect=RuntimeError("db down"))
+        )
+    storage = S3Storage()
+    storage.async_client = s3_holding_one_file_per_prefix()
+
+    response = await BrowserSessionResponse.from_browser_session(session, storage, concurrent_listings=True)
+
+    downloads = [f.filename for f in response.downloaded_files or []]
+    recordings = [f.filename for f in response.recordings or []]
+    assert (downloads, recordings) == expected
+    assert storage.async_client.list_files.await_count == (2 if expected[0] == ["s3_report.pdf"] else 0)
 
 
 def test_no_server_side_row_field_becomes_a_response_field() -> None:

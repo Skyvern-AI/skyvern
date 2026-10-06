@@ -39,9 +39,11 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
     is_final_status,
+    unusable_browser_session_error,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
     EXTENSION_MIN_REMAINING_SECONDS,
@@ -470,8 +472,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             if persistent_browser_session is None:
                 raise Exception(f"Persistent browser session not found for {browser_session_id}")
 
-            if is_final_status(persistent_browser_session.status):
-                raise BrowserSessionClosed(browser_session_id)
+            unusable = unusable_browser_session_error(persistent_browser_session)
+            if unusable is not None:
+                raise unusable
 
             runnable_generation_id = expected_runnable_generation_id or uuid.uuid4().hex
             await self.occupy_browser_session(
@@ -641,7 +644,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
         return True
 
-    async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
+    async def get_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        reconcile_in_background: bool = False,
+    ) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
 
@@ -668,6 +677,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
         *,
+        session_kind: BrowserSessionKind,
         profile_read_only: bool = False,
         created_by: str | None = None,
         attempt_number: int | None = None,
@@ -678,6 +688,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
+            session_kind=session_kind,
         )
         try:
             session = await self.database.browser_sessions.create_persistent_browser_session(
@@ -858,6 +869,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         prior_browser_session_id: str,
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
+        session_kind: BrowserSessionKind,
     ) -> FreshExitReceipt:
         return FreshExitReceipt(
             outcome=FreshExitOutcome.no_alternate,
@@ -900,12 +912,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 current = await self.database.browser_sessions.get_persistent_browser_session(
                     session_id, organization_id
                 )
-                if current is not None and (
-                    current.completed_at is not None
-                    or current.close_requested_at is not None
-                    or is_final_status(current.status)
-                ):
-                    raise BrowserSessionClosed(session_id) from None
+                unusable = unusable_browser_session_error(current) if current is not None else None
+                if unusable is not None:
+                    # A startup timeout stays a BrowserSessionClosed here: the reuse path catches only that type.
+                    raise (
+                        unusable if isinstance(unusable, BrowserSessionClosed) else BrowserSessionClosed(session_id)
+                    ) from None
             except BaseException as classification_error:
                 if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
                     classification_error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)

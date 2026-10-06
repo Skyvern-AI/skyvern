@@ -14,6 +14,7 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useRecordingFeedbackStore } from "@/store/RecordingFeedbackStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import {
   beginYamlCommit,
@@ -1300,6 +1301,15 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       ),
     ).toBeNull();
     expect(screen.getByTestId("recording-refinement-progress")).toBeTruthy();
+    // A refinement rebuilt from history is not the live recording, so it asks for no rating.
+    expect(screen.queryByTestId("recording-feedback-prompt")).toBeNull();
+    act(() =>
+      useRecordingFeedbackStore
+        .getState()
+        .show({ workflow_permanent_id: "wpid_1" }),
+    );
+    expect(screen.getByTestId("recording-feedback-prompt")).toBeTruthy();
+    act(() => useRecordingFeedbackStore.getState().dismiss());
   });
 
   it("hydrates an agent-loop cancellation as cancelled", async () => {

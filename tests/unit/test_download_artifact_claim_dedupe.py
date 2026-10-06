@@ -243,13 +243,10 @@ async def test_current_attempt_downloads_pair_only_current_artifacts(
         )
     storage = _install_storage(sqlite_db, monkeypatch)
     monkeypatch.setattr(base_module, "resolve_download_attempt", AsyncMock(return_value=(run_id, 2, cutoff)))
-    skip_empty = AsyncMock(wraps=storage._skip_empty_downloads_listing)
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", skip_empty)
 
     files = await storage.get_current_attempt_downloaded_files(organization_id=org_id, run_id=run_id)
 
     assert [file.artifact_id for file in files] == expected_ids
-    skip_empty.assert_not_called()
     storage.async_client.list_files.assert_not_called()
     if "r2" in row_names:
         whole_run_files = await storage.get_downloaded_files(organization_id=org_id, run_id=run_id)

@@ -12,7 +12,9 @@ import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app
+from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -21,6 +23,7 @@ from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
     CredentialModel,
     PersistentBrowserSessionModel,
+    TaskModel,
     TaskRunModel,
     WorkflowModel,
     WorkflowRunAttemptModel,
@@ -31,6 +34,7 @@ from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_rep
 from skyvern.forge.sdk.db.repositories.workflow_runs import PrepareNextAttemptResult, WorkflowRunDispatchFinalization
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import BrowserSessionCloseReason
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
@@ -48,6 +52,7 @@ from skyvern.forge.sdk.workflow.service import (
     WorkflowBrowserCleanupResult,
     WorkflowService,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.workflows import BlockStatus, WorkflowRetryPolicy
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.real_browser_manager import RealBrowserManager
@@ -408,6 +413,7 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
         browser_profile_id="bp_managed",
         proxy_location=None,
         inherit_profile_proxy=True,
+        session_kind=BrowserSessionKind.workflow_run,
     )
 
 
@@ -1832,6 +1838,60 @@ async def test_execute_workflow_closes_owned_session_when_begin_session_fails(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_by", "bound", "ended_after_run_created", "expected_category", "expected_reason_code"),
+    [
+        pytest.param(
+            "api", False, False, "BROWSER_SESSION_EXPIRED", "browser_session_expired_before_run", id="customer"
+        ),
+        pytest.param(
+            None, False, False, "BROWSER_SESSION_EXPIRED", "browser_session_expired_before_run", id="legacy-null"
+        ),
+        pytest.param(None, True, False, "BROWSER_ERROR", "browser_session_closed", id="reuse-bound-session"),
+        pytest.param("copilot", False, False, "BROWSER_ERROR", "browser_session_closed", id="copilot-session"),
+        pytest.param("api", False, True, "BROWSER_ERROR", "browser_session_closed", id="expired-while-queued"),
+    ],
+)
+async def test_lease_of_an_expired_session_is_the_callers_only_when_sent_after_it_ended(
+    monkeypatch: pytest.MonkeyPatch,
+    created_by: str | None,
+    bound: bool,
+    ended_after_run_created: bool,
+    expected_category: str,
+    expected_reason_code: str,
+) -> None:
+    workflow = _execute_workflow()
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    _patch_session_backed_run(monkeypatch, svc)
+    run_created_at = _execute_workflow_run(WorkflowRunStatus.running).created_at
+    ended_at = run_created_at + timedelta(minutes=1) if ended_after_run_created else run_created_at - timedelta(hours=6)
+    expired = BrowserSessionExpired(
+        "pbs_caller",
+        started_at=ended_at - timedelta(minutes=240),
+        ended_at=ended_at,
+        timeout_minutes=240,
+        created_by=created_by,
+        bound=bound,
+    )
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "begin_session", AsyncMock(side_effect=expired))
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_failed)
+    _patch_browser_cleanup(monkeypatch, svc, [])
+
+    assert await _run_execute_workflow(svc, browser_session_id="pbs_caller") is failed_run
+
+    failure_category = mark_failed.await_args.kwargs["failure_category"]
+    failure_reason = mark_failed.await_args.kwargs["failure_reason"]
+    assert (failure_category[0]["category"], failure_category[0]["reason_code"]) == (
+        expected_category,
+        expected_reason_code,
+    )
+    assert "pbs_caller" in failure_reason
+
+
+@pytest.mark.asyncio
 async def test_owned_session_close_deferred_while_child_runs_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2362,7 +2422,15 @@ async def test_retry_preparation_preserves_session_after_transient_forced_pin_fa
         monkeypatch.setattr(
             database.browser_sessions,
             "get_persistent_browser_session",
-            AsyncMock(return_value=SimpleNamespace(browser_profile_id=None, runnable_id="wr_other")),
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    browser_profile_id=None,
+                    runnable_id="wr_other",
+                    status="running",
+                    completed_at=None,
+                    close_requested_at=None,
+                )
+            ),
         )
     run = await service.create_workflow_run(
         workflow_request=WorkflowRequestBody(
@@ -2396,6 +2464,66 @@ async def test_retry_preparation_preserves_session_after_transient_forced_pin_fa
     assert reopened is not None
     assert reopened.browser_session_id == expected_session_id
     assert pin_calls == (2 if session_source == "forced" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_point", ["workflow_run", "task"])
+async def test_submission_refuses_a_session_past_its_lifetime_and_accepts_a_live_one(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
+    entry_point: str,
+) -> None:
+    database, service, workflow = forced_session_setup
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    ended_at = datetime(2026, 9, 28, 17, 1)
+    async with database.Session() as session:
+        session.add_all(
+            [
+                PersistentBrowserSessionModel(
+                    persistent_browser_session_id="pbs_expired",
+                    organization_id="o_test",
+                    status="timeout",
+                    timeout_minutes=240,
+                    started_at=ended_at - timedelta(minutes=240),
+                    completed_at=ended_at,
+                    created_by="api",
+                ),
+                PersistentBrowserSessionModel(
+                    persistent_browser_session_id="pbs_live",
+                    organization_id="o_test",
+                    status="running",
+                    timeout_minutes=240,
+                    started_at=datetime.now(UTC).replace(tzinfo=None),
+                    created_by="api",
+                ),
+            ]
+        )
+        await session.commit()
+
+    async def submit(browser_session_id: str) -> str | None:
+        if entry_point == "task":
+            task = await ForgeAgent().create_task(
+                TaskRequest(url="https://example.com", browser_session_id=browser_session_id), "o_test"
+            )
+            return task.browser_session_id
+        run = await service.create_workflow_run(
+            workflow_request=WorkflowRequestBody(browser_session_id=browser_session_id),
+            workflow_permanent_id="wpid_test",
+            workflow_id="wf_1",
+            organization_id="o_test",
+            workflow=workflow,
+        )
+        return run.browser_session_id
+
+    with pytest.raises(BrowserSessionExpired) as refused:
+        await submit("pbs_expired")
+
+    assert refused.value.status_code == 410
+    assert "pbs_expired" in refused.value.message
+    async with database.Session() as session:
+        assert (await session.scalars(select(WorkflowRunModel))).all() == []
+        assert (await session.scalars(select(TaskModel))).all() == []
+    assert await submit("pbs_live") == "pbs_live"
 
 
 @pytest.mark.asyncio

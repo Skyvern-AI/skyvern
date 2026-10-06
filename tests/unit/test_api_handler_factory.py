@@ -665,7 +665,8 @@ async def test_llm_caller_preserves_generated_cost_and_tokens_during_real_redact
     assert REDACTED_SECRET_PLACEHOLDER in accounting["prompt_name"]
     usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
     assert REDACTED_SECRET_PLACEHOLDER in usage["copilot.prompt_name"]
-    assert records[-1]["llm_cost"] == records[-1]["input_tokens"] == REDACTED_SECRET_PLACEHOLDER
+    # Another session's short values never match inside a caller's numbers.
+    assert records[-1]["llm_cost"] == 0.25 and records[-1]["input_tokens"] == 7
 
 
 @pytest.mark.asyncio
