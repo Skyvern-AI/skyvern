@@ -63,6 +63,7 @@ console.log(result.output);
 | `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. Useful for lazy-loaded content. |
 | `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address instead of spinning up a new one. |
 | `run_with` | `str` | No | `None` | Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
+| `file_ids` | `list[str]` | No | `None` | IDs of files uploaded through `POST /v1/upload_file` to attach to this run (up to 50). Reference an attached file by its ID anywhere a file URL is accepted (for example in the prompt) and no presigned URL is created for it. Skyvern deletes an attached file when the run finishes. A file can be attached to one run at a time and must not already be deleted. |
 | `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
 
 ### Returns `TaskRunResponse`
