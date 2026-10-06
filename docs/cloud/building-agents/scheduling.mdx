@@ -14,7 +14,7 @@ keywords:
   - disable
 ---
 
-You can schedule any agent built in the Cloud UI to run automatically on a recurring basis. Schedules are configured with a cron expression and timezone, and Skyvern triggers the agent at each interval.
+You can schedule any agent built in the Cloud UI to run automatically on a recurring basis. You pick how often it repeats (or write a cron expression) and a timezone, and Skyvern triggers the agent at each interval.
 
 This page covers scheduling through the Cloud UI. You can also create schedules programmatically via the SDK or API. See [Run from Code](/cloud/building-agents/run-from-code) for the code approach.
 
@@ -22,11 +22,12 @@ Schedules are created as **active** by default: they start triggering runs immed
 
 When creating a schedule you'll fill in these fields:
 
-- **Agent** (required): The agent to run. When creating from the agent editor this is pre-selected.
-- **Cron Expression** (required): A standard 5-field cron expression that defines how often the agent runs (e.g., `0 9 * * 1-5` for every weekday at 9 AM). The UI validates the expression in real time and shows a human-readable translation. Quick presets are available for common patterns like hourly, daily, and weekly.
-- **Timezone** (required): The IANA timezone the cron expression is evaluated in (e.g., `America/New_York`). Defaults to your browser's local timezone. The dropdown is searchable by city name.
-- **Name**: A human-readable label to identify this schedule in the table and run history.
-- **Description**: Optional notes about what this schedule does or why it exists.
+- **Agent** (required): The agent to run. Search for it by name. When creating from the agent editor this is pre-selected.
+- **Name (optional)**: A human-readable label to identify this schedule in the table and run history. Skyvern generates one if you leave it empty.
+- **Description (optional)**: Notes about what this schedule does or why it exists.
+- **Repeat** (required): How often the agent runs: **Hourly**, **Daily**, **Weekly**, **Monthly**, or **Fixed interval**. The fields below it change to match. For example, **Daily** asks for a time in **At**, **Weekly** also asks **On these days**, **Monthly** asks **On day of month**, and **Fixed interval** asks for **Every** and an optional **First run**.
+- **Timezone** (required): The IANA timezone the schedule is evaluated in (e.g., `America/New_York`). Defaults to your browser's local timezone. The dropdown is searchable by city name.
+- **Advanced (cron expression)**: Expand this to write a standard 5-field cron expression instead (e.g., `0 9 * * 1-5` for every weekday at 9 AM). The UI validates the expression in real time and shows a human-readable translation.
 
 <Warning>
 The minimum interval between runs is **5 minutes**. Expressions that resolve to shorter intervals are rejected.
@@ -44,12 +45,12 @@ The minimum interval between runs is **5 minutes**. Expressions that resolve to 
       </Step>
       <Step title="Click Create Schedule">
         Click <kbd>Create Schedule</kbd> in the top right corner.
-        <img src="/images/cloud/create-schedule-button.png" alt="Schedules page with Create Schedule button in the top right corner" />
+        <img src="/images/cloud/create-schedule-button.png" alt="Schedules page with the search bar, Filter by Status, and the Create Schedule button in the top right corner" />
       </Step>
       <Step title="Select an agent and configure the schedule">
-        Choose the agent you want to schedule from the dropdown. Only saved agents appear in this list. Then fill in the cron expression, timezone, and optionally a name and description. Check the **Next Scheduled Runs** preview to verify the upcoming execution times match your expectations.
+        Search for the agent you want to schedule in the **Agent** field. Only saved agents appear in this list. Then choose how often it should **Repeat**, the time, and the timezone, and optionally add a name and description. Check the **Next Scheduled Runs** preview to verify the upcoming execution times match your expectations.
         <Frame>
-        <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with agent dropdown, cron expression, timezone, name, and description fields" width="300" />
+        <img src="/images/cloud/create-sched-form.png" alt="Create Schedule form with Agent, Name, Description, Repeat, At, Timezone, Advanced (cron expression), and Next Scheduled Runs" width="300" />
         </Frame>
       </Step>
       <Step title="Create">
@@ -63,13 +64,13 @@ The minimum interval between runs is **5 minutes**. Expressions that resolve to 
         Navigate to [**Agents**](https://app.skyvern.com/workflows/) in the sidebar and click the agent you want to schedule.
       </Step>
       <Step title="Click the Schedule button">
-        In the editor header bar, click the <kbd>Schedule</kbd> button (clock icon).
+        In the editor header bar, click the <kbd>Schedule</kbd> button (calendar icon).
         <img src="/images/cloud/wf-page-sched.png" alt="Agent editor page with Schedule button (clock icon) in the header bar" />
       </Step>
       <Step title="Click Add and configure the schedule">
-        A panel opens showing any existing schedules for this agent. Click <kbd>Add</kbd> to create a new one. Fill in the cron expression, timezone, and optionally a name and description. The agent is already selected.
+        A panel opens showing any existing schedules for this agent. Click <kbd>Add</kbd> to create a new one. Choose how often it should **Repeat**, the time, and the timezone, and optionally add a name and description. The agent is already selected.
         <Frame>
-        <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with cron expression, timezone, name, and description fields" width="300" />
+        <img src="/images/cloud/create-sched-form.png" alt="Create Schedule form with Repeat, At, Timezone, Advanced (cron expression), and Next Scheduled Runs" width="300" />
         </Frame>
       </Step>
       <Step title="Create">

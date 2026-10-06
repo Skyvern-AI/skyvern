@@ -1,7 +1,7 @@
 ---
 title: API Key
 subtitle: Authenticate programmatic access to Skyvern
-description: Find, copy, and use your Skyvern API key from the Cloud UI Settings page to authenticate REST API and SDK requests.
+description: Find, copy, rotate, and use your Skyvern API key from Settings → API keys in the Cloud UI to authenticate REST API and SDK requests.
 slug: cloud/account-settings/api-keys
 keywords:
   - API key
@@ -16,13 +16,17 @@ Every API call to Skyvern requires an API key. The key identifies your organizat
 
 ## Finding your API key
 
-Open **Settings** in the sidebar. Your API key is shown in a masked field. Click the **eye icon** to reveal the full value, or the **copy icon** to copy it to your clipboard.
+Go to **Settings → API keys**: click your organization name at the top of the sidebar, choose **Organization settings**, then click **API keys**. You can also get there from **Integrations → API keys** in the sidebar. Your API key is shown in a masked field. Click the **eye icon** to reveal the full value, or the **copy icon** to copy it to your clipboard.
 
-<img src="/images/cloud/settings-api-key.png" alt="API key display with reveal and copy buttons" />
+<img src="/images/cloud/settings-api-key.png" alt="API Keys card with the masked key, reveal and copy buttons, and the Rotate API Key button" />
 
 <Warning>
 Treat your API key like a password. Anyone with this key can create runs, read results, and manage agents on behalf of your organization.
 </Warning>
+
+## Rotating your API key
+
+If your key may have leaked, click **Rotate API Key**. Type `I want to rotate my key` to confirm, then click **Rotate key**. Your old key stops working right away, so update any scripts, workers, or integrations with the new key.
 
 ## Using your key
 

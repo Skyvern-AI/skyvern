@@ -1,7 +1,7 @@
 ---
 title: Billing & Usage
 subtitle: Understand what you're paying for and manage your plan
-description: Understand Skyvern's credit-based billing model, compare Free, Hobby, Pro, and Enterprise plans, and manage your subscription from the Cloud UI Billing page.
+description: Understand Skyvern's credit-based billing model, compare Free, Hobby, Pro, and Enterprise plans, and manage your subscription from Settings → Billing in the Cloud UI.
 slug: cloud/account-settings/billing-usage
 keywords:
   - billing
@@ -19,9 +19,9 @@ Skyvern bills per **credit**: each browser action the AI takes during a run cons
 
 ## Plans
 
-Open **Billing** in the sidebar to see available plans and your current balance.
+Go to **Settings → Billing** to see available plans and your credit usage. To get there, click your organization name at the top of the sidebar, choose **Organization settings**, then click **Billing**. On the Free and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page.
 
-<img src="/images/cloud/settings-billing-overview.png" alt="Billing page showing plan options and current balance" />
+<img src="/images/cloud/settings-billing-overview.png" alt="Billing page showing the Choose a Plan cards for Free, Hobby, Pro, and Enterprise, and the Credit Usage meter" />
 
 | Plan | Price | Credits | Estimated actions | Concurrent runs |
 |------|-------|---------|-------------------|-----------------|
@@ -30,17 +30,17 @@ Open **Billing** in the sidebar to see available plans and your current balance.
 | **Pro** | $149/month | 150,000/month | ~6,200 | 25 |
 | **Enterprise** | Custom | Unlimited | Unlimited | Unlimited |
 
-**Free** is available to all new accounts with a one-time credit grant and zero commitment. **Hobby** and **Pro** are monthly subscriptions. Click **Switch to Hobby** or **Switch to Pro** to change plans. Your remaining dollar balance is applied as a credit toward your first subscription payment.
+**Free** is available to all new accounts with a one-time credit grant and zero commitment. **Hobby** and **Pro** are monthly subscriptions. Click **Upgrade** on the Hobby or Pro card to subscribe. Once you're subscribed, the page shows your current plan and an option to upgrade further.
 
 <Note>
-Need HIPAA compliance, SOC-2 reports, custom code blocks, or dedicated support? Use the **Book a call** link at the bottom of the Billing page to discuss **Enterprise**, or visit [skyvern.com/pricing](https://skyvern.com/pricing) for a complete feature comparison.
+Need HIPAA compliance, SOC-2 reports, custom code blocks, or dedicated support? Click **Book a Demo** on the **Enterprise** card, or visit [skyvern.com/pricing](https://skyvern.com/pricing) for a complete feature comparison.
 </Note>
 
 ### What's included in each plan
 
 <AccordionGroup>
 <Accordion title="Free: Try Skyvern with zero commitment">
-**5,000 one-time credits** (~200 actions)
+**5,000 one-time credits** (~100 steps)
 
 Perfect for evaluating Skyvern and prototyping automations.
 
@@ -51,7 +51,7 @@ Perfect for evaluating Skyvern and prototyping automations.
 </Accordion>
 
 <Accordion title="Hobby: For side projects and small automations">
-**30,000 credits/month** (~1,200 actions) • **$29/month**
+**30,000 credits/month** (~600 steps) • **$29/month**
 
 - 10 concurrent runs
 - Basic CAPTCHA solver
@@ -62,7 +62,7 @@ Perfect for evaluating Skyvern and prototyping automations.
 </Accordion>
 
 <Accordion title="Pro: For teams shipping production automations">
-**150,000 credits/month** (~6,200 actions) • **$149/month**
+**150,000 credits/month** (~3,000 steps) • **$149/month**
 
 Everything in Hobby, plus:
 
@@ -96,28 +96,22 @@ Everything in Pro, plus:
 
 ## How credits are consumed
 
-A credit maps to one discrete browser action: clicking a button, typing into a field, selecting a dropdown, or extracting data from a page. Navigation counts too.
+Skyvern charges per step the AI attempts: **50 credits ($0.05) per step**. In each step the AI looks at the page and takes one or more actions, such as clicking, typing, selecting or extracting. A short login is usually a few steps; a long multi-page run takes more. Failed and retried steps count, because each one is attempted.
 
-| Example | Approximate credits |
-|---------|---------------------|
-| Login flow (email, password, submit) | ~3 |
-| Form fill (10 fields + submit) | ~11 |
-| Multi-page extraction (5 pages) | ~15–25 |
-
-Credits consumed by a run are visible on the [Run Details](/cloud/viewing-results/run-details) page. The **Actions** counter at the top of the Overview timeline shows exactly how many actions the AI took.
+To see how your credits are being used, open **Settings → Billing** and expand **Usage Breakdown** under **Credit Usage**.
 
 <Tip>
 Reduce credit usage by being specific in your prompts. "Find information about pricing" causes the AI to explore multiple pages. "Extract the monthly price from the pricing table on /pricing" gets there directly.
 </Tip>
 
-## Your current balance
+## Credit usage
 
-The **Your Current Balance** section shows your remaining dollar balance. Credits are deducted as runs execute in real time. If your balance reaches zero, new runs won't start until you add credits or switch to a subscription plan.
+The **Credit Usage** section shows how many credits you've used out of your allowance, the percentage used, and how many remain. On the Free plan, credits are a one-time grant and don't reset monthly. Credits are deducted as runs execute in real time. If you run out, new runs won't start until you add credits or upgrade your plan.
 
 ## FAQ
 
 <Accordion title="How do credits work?">
-Each browser action the AI takes (clicking, typing, navigating, extracting) costs one credit. Credits are deducted in real time as runs execute. Free accounts receive a one-time credit grant. Paid plans include a monthly credit allowance that resets each billing cycle. Unused included credits don't roll over.
+Each step the AI attempts (clicking, typing, navigating, extracting) costs 50 credits ($0.05), as shown at the top of Settings → Billing. Credits are deducted in real time as runs execute. Free accounts receive a one-time credit grant. Paid plans include a monthly credit allowance that resets each billing cycle. Unused included credits don't roll over.
 </Accordion>
 
 <Accordion title="Can I buy more credits?">

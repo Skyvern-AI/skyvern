@@ -15,7 +15,7 @@ keywords:
 
 import WebhookSignatureVerification from "/snippets/webhook-signature-verification.mdx";
 
-Skyvern supports three 2FA methods for automated logins. **Authenticator App (TOTP)** is fully automatic: Skyvern generates codes locally. **Email** and **Text Message** require you to push codes via the UI or API. All three are configured on the [password credential](/cloud/managing-credentials/password-credentials) itself.
+Skyvern supports these 2FA methods for automated logins. **Authenticator App (TOTP)** is fully automatic: Skyvern generates codes locally. **Email** codes can be read from a connected Gmail or Outlook inbox, or pushed via the UI or API. **Text Message** codes are pushed via the UI or API. **Passkey** is available on the Enterprise plan. All of them are configured on the [password credential](/cloud/managing-credentials/password-credentials) itself.
 
 ## Authenticator App (TOTP)
 
@@ -33,17 +33,17 @@ The preferred method. Skyvern generates valid 6-digit codes on demand during log
 <Steps>
   <Step title="Create a password credential">
     Go to the Credentials page and create a new password credential.
-    <img src="/images/cloud/totp-setup-1.png" alt="Credentials page showing password credentials with the Add button highlighted" />
+    <img src="/images/cloud/totp-setup-1.png" alt="Credentials page showing saved password credentials and the Add button" />
   </Step>
   <Step title="Expand Two-Factor Authentication">
     Below the password fields, click the **Two-Factor Authentication** accordion.
   </Step>
   <Step title="Select Authenticator App">
-    Choose **Authenticator App** from the three options.
+    Choose **Authenticator App**, then pick the app the site uses: **Google Authenticator**, **Microsoft Authenticator**, **Okta Verify**, or **Oracle Mobile Authenticator**.
   </Step>
   <Step title="Add your TOTP setup key">
     Enter the secret key into the **Authenticator Key** field, or click **Scan QR** to upload a QR code image from the site's 2FA setup screen. Then click **Save**.
-    <img src="/images/cloud/totp-setup-2.png" alt="Add Credential dialog with Authenticator App selected and the Authenticator Key field" />
+    <img src="/images/cloud/totp-setup-2.png" alt="Add Credential dialog with Authenticator App and Google Authenticator selected, the Authenticator Key field, and the Scan QR button" />
   </Step>
 </Steps>
 
@@ -68,7 +68,7 @@ When a site sends 2FA codes via email or SMS, someone (or something) needs to de
 
 1. The Login block enters the username and password
 2. The site sends a 2FA code to the configured email or phone number
-3. You push the code to Skyvern via the **2FA tab** or the API
+3. Skyvern finds the code in your connected Gmail or Outlook inbox, or you push the code to Skyvern via the **2FA tab** or the API
 4. Skyvern enters the code and completes the login
 
 ### Setting it up
@@ -76,7 +76,7 @@ When a site sends 2FA codes via email or SMS, someone (or something) needs to de
 <Steps>
   <Step title="Create a password credential">
     Go to the Credentials page and create a new password credential.
-    <img src="/images/cloud/totp-setup-1.png" alt="Credentials page showing password credentials with the Add button highlighted" />
+    <img src="/images/cloud/totp-setup-1.png" alt="Credentials page showing saved password credentials and the Add button" />
   </Step>
   <Step title="Expand Two-Factor Authentication">
     Below the password fields, click the **Two-Factor Authentication** accordion.
@@ -85,8 +85,8 @@ When a site sends 2FA codes via email or SMS, someone (or something) needs to de
     Choose the method that matches how the site delivers codes.
   </Step>
   <Step title="Enter the identifier">
-    Provide the **email address** or **phone number** that receives the codes. For Email, this auto-fills from the Username field.
-    <img src="/images/cloud/totp-setup-3.png" alt="Add Credential dialog with Email selected and the TOTP Identifier field" />
+    Provide the **email address** or **phone number** that receives the codes. For Email, choose an inbox from **Select a connected account** in the **TOTP Identifier** field, or click the code icon above it (**Enter manually**) to type the address yourself. The field auto-fills from the Username field.
+    <img src="/images/cloud/totp-setup-3.png" alt="Add Credential dialog with Email selected and the TOTP Identifier field showing Select a connected account" />
   </Step>
 </Steps>
 
@@ -98,14 +98,19 @@ Once an agent is running and waiting for a 2FA code, you need to deliver it. The
 
 ### Via the UI
 
-Open the **2FA** tab on the Credentials page. The **Push a 2FA Code** form has two fields:
+Open the **2FA** tab on the Credentials page. At the top, the **Automatic 2FA from your inbox** card has a **Connect an inbox** button. Connect a Gmail or Outlook inbox there and Skyvern finds verification codes and magic links on its own, with no manual forwarding.
+
+To push a code by hand, use the **Push a 2FA Code** form below it:
 
 | Field | What to enter |
 |-------|--------------|
 | **Identifier** | The email address or phone number that received the code |
 | **Verification content** | The full email/SMS body, or just the code itself. Skyvern extracts the digits automatically. |
+| **OTP Type** | **Numeric code** for a 2FA code, or **Magic link** for a one-time login link |
 
-<img src="/images/cloud/credentials-2fa-push-form.png" alt="2FA tab showing the Push a 2FA Code form and code history table" />
+Then click **Send 2FA Code** (the button reads **Send Magic Link** when **Magic link** is selected).
+
+<img src="/images/cloud/credentials-2fa-push-form.png" alt="2FA tab showing the Automatic 2FA from your inbox card and the Push a 2FA Code form" />
 
 <Tip>
 If multiple agents are running simultaneously, click **Add optional metadata** to link the code to a specific run using the workflow run ID, workflow ID, or task ID.
@@ -195,7 +200,9 @@ Your endpoint must accept a POST request with `task_id`, `workflow_run_id`, and 
 
 ## Magic links (one-time login links)
 
-Some sites use one-time login links instead of numeric codes. Skyvern supports these by splitting the flow into two steps:
+Some sites use one-time login links instead of numeric codes. If the link arrives in an inbox you connected with **Connect an inbox**, Skyvern finds it for you. You can also paste the message into the **Push a Magic Link** form on the **Magic Links** tab of the Credentials page, and Skyvern attaches the link to the relevant run.
+
+Without a connected inbox, you can split the flow into two steps:
 
 1. **Trigger the magic link**: Run a task that initiates the login. The site emails a one-time link.
 2. **Use the link**: Monitor the inbox (e.g., via Zapier), extract the URL, then start a new task with that URL as the starting point.

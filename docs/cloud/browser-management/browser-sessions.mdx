@@ -22,9 +22,9 @@ Looking to use browser sessions from code? See the [API & SDK guide](/developers
 
 ## The Browsers page
 
-Click **Browsers** in the left sidebar to open the Browsers page. It lists all browser sessions in your organization.
+Click **Browsers → Sessions** in the left sidebar to open the Browsers page. It lists all browser sessions in your organization.
 
-<img src="/images/cloud/browsers-page-overview.png" alt="Browsers page with the sessions table showing columns for ID, open status, occupied status, started time, timeout, and CDP URL" />
+<img src="/images/cloud/browsers-page-overview.png" alt="Browsers page with the Create button and the sessions table showing columns for ID, open status, occupied status, created by, started time, timeout, and CDP URL" />
 
 Each row shows:
 
@@ -33,6 +33,7 @@ Each row shows:
 | **ID** | Session identifier (starts with `pbs_`) |
 | **Open** | Whether the browser is currently running |
 | **Occupied** | Whether a task or agent is actively using the session |
+| **Created By** | Who started the session |
 | **Started** | When the session launched |
 | **Timeout** | How long the session stays open before auto-closing |
 | **CDP URL** | Chrome DevTools Protocol address for direct connection |
@@ -41,19 +42,18 @@ Each row shows:
 
 ## Creating a session
 
-Click the **Create Browser Session** button at the top of the Browsers page. A panel opens with the following settings:
+Click the **Create** button at the top of the Browsers page. The **Create Browser Session** panel opens with the following settings:
 
 <Frame>
-<img src="/images/cloud/create-session-drawer.png" alt="Create Browser Session panel showing fields for timeout, proxy location, browser type, extensions, and browser profile" width="300" />
+<img src="/images/cloud/create-session-drawer.png" alt="Create Browser Session panel showing fields for proxy location, timeout, browser type, and extensions" width="300" />
 </Frame>
 
 | Setting | What it does |
 |---------|-------------|
-| **Timeout** | How long the session stays open, in minutes. Min: 5; max: 240 (4 hours) — requests above 240 are capped at 240 with a warning. A running session can be extended through the API up to 360 minutes (6 hours); see [extend_browser_session](/sdk-reference/browser-sessions/extend-browser-session). Longer durations are available on the enterprise plan (contact sales@skyvern.com). Default: 60. |
+| **Timeout (Minutes)** | How long the session stays open, in minutes. Min: 5; max: 240 (4 hours). The **Create** button stays disabled until the value is between 5 and 240. A running session can be extended through the API up to 360 minutes (6 hours); see [extend_browser_session](/sdk-reference/browser-sessions/extend-browser-session). Longer durations are available on the enterprise plan (contact sales@skyvern.com). Default: 60. |
 | **Proxy Location** | Route the browser through a residential proxy in a specific country. Default: US. |
-| **Browser Type** | Chrome (default, widest compatibility) or Microsoft Edge. |
-| **Extensions** | Optional add-ons: **Ad Blocker** (removes overlay ads that interfere with clicks) and **Captcha Solver** (auto-solves CAPTCHAs). |
-| **Browser Profile** | Load a saved [browser profile](/cloud/browser-management/browser-profiles) to restore cookies and login state from a previous session. |
+| **Browser Type** | **Default** (the server's default browser), **Microsoft Edge**, **Google Chrome**, or **Stealth Chromium**. |
+| **Extensions** | Optional add-ons: **Ad Blocker** (blocks ads and common trackers that interfere with clicks) and **Captcha Solver** (auto-solves CAPTCHAs; Enterprise plan). |
 
 Click **Create** to launch the session. It appears in the table within a few seconds.
 
@@ -65,7 +65,7 @@ Sessions bill while open, even when idle. Set the timeout to match your use case
 
 ## Viewing a live session
 
-Click any session row in the table to open its detail page. The detail page has three tabs:
+Click any session row in the table to open its detail page. The detail page has five tabs: **Stream**, **Recordings**, **Downloads**, **Timeline**, and **Runs**. The first three are described below.
 
 ### Stream
 
@@ -87,31 +87,15 @@ Files downloaded by the browser during the session. Click any file to save it lo
 
 ---
 
-## Using a session with a task
-
-Once you have a running session, you can run tasks inside it from the [Discover page](/cloud/getting-started/run-a-task):
-
-1. Copy the session ID (`pbs_...`) from the Browsers page
-2. Go to the **Discover** page
-3. Click the **gear icon** to open Advanced Settings
-4. Paste the ID into the **Browser Session ID** field
-5. Write your prompt and run
-
-The task executes inside your existing session. Cookies, login state, and page context from previous tasks are still there.
-
-<img src="/images/cloud/discover-session-id-field.png" alt="Advanced settings panel on the Discover page with a pbs_ session ID entered in the Browser Session ID field" />
-
----
-
 ## Using a session with an agent
 
-You can also run agents inside an existing session:
+To run an agent inside an existing session, use the **Browser Session ID** field on the agent's run form:
 
-1. Copy the session ID from the Browsers page
+1. Copy the session ID (`pbs_...`) from the Browsers page
 2. Go to **Agents** and click **Run** on your agent
-3. On the parameters page, scroll to **Run Settings**
+3. On the run form, expand **Advanced Settings**
 4. Paste the ID into the **Browser Session ID** field
-5. Click **Run Agent**
+5. Click **Run agent**
 
 The agent picks up where the browser left off: same page, same cookies, same form data.
 
