@@ -8,9 +8,7 @@ RUN_TASK_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.runTask({
-    body: {
-        prompt: "Find the top 3 posts on Hacker News."
-    }
+    prompt: "Find the top 3 posts on Hacker News."
 })
 """
 RUN_WORKFLOW_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -22,10 +20,8 @@ RUN_WORKFLOW_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client"
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.runWorkflow({
-    body: {
-        workflow_id: "wpid_123",
-        parameters: { parameter1: "value1", parameter2: "value2" }
-    }
+    agent_id: "wpid_123",
+    parameters: { parameter1: "value1", parameter2: "value2" }
 });
 """
 GET_RUN_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern

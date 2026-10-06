@@ -43,7 +43,7 @@ Install the SDK first if you haven't:
 
 <CodeGroup>
 ```bash Python
-pip install skyvern
+pip install "skyvern[local]"
 ```
 
 ```bash TypeScript
@@ -51,7 +51,7 @@ npm install @skyvern/client
 ```
 </CodeGroup>
 
-`pip install skyvern` is enough for Skyvern Cloud and remote API usage. If you are using embedded local mode with `Skyvern.local()` or `launch_local_browser()`, install `pip install "skyvern[local]"`. For a local self-hosted server, install `pip install "skyvern[server]"`.
+The browser and page methods on this page need the `local` extra, which adds Playwright, even when the browser runs in Skyvern Cloud. Plain `pip install skyvern` is enough only for REST API calls such as `run_task` and `run_workflow`. For a local self-hosted server, install `pip install "skyvern[server]"`.
 
 All code snippets below run inside an async function. See the [complete example](#complete-example) for the full runnable script.
 </Info>
@@ -235,7 +235,7 @@ await page.agent.login("skyvern", { credentialId: "cred_123" });
 ```
 </CodeGroup>
 
-The agent handles multi-page login flows, CAPTCHAs, and 2FA automatically. Four credential providers: `skyvern` (built-in vault), `bitwarden`, `onepassword`, `azure_vault`. Store credentials via the [Credentials API](/sdk-reference/credentials/create-credential).
+The agent handles multi-page login flows, CAPTCHAs, and 2FA automatically. Four credential providers: `skyvern` (built-in vault), `bitwarden`, `1password`, `azure_vault`. Store credentials via the [Credentials API](/sdk-reference/credentials/create-credential).
 
 ### Run a multi-step task
 
@@ -297,7 +297,7 @@ await page.click("#save-button");
 ```python Python
 result = await page.agent.download_files(
     "Download the Q4 2025 financial report",
-    download_suffix=".pdf",
+    download_suffix="report",
     download_timeout=30,
 )
 
@@ -308,7 +308,7 @@ for file in result.downloaded_files or []:
 ```typescript TypeScript
 const result = await page.agent.downloadFiles(
   "Download the Q4 2025 financial report",
-  { downloadSuffix: ".pdf", downloadTimeout: 30 },
+  { downloadSuffix: "report", downloadTimeout: 30 },
 );
 
 for (const file of result.downloadedFiles ?? []) {
@@ -382,7 +382,7 @@ async def main():
     # Download a file
     result = await page.agent.download_files(
         "Download the latest monthly statement",
-        download_suffix=".pdf",
+        download_suffix="statement",
     )
 
     # Check results
@@ -432,7 +432,7 @@ async function main() {
   // Download a file
   const result = await page.agent.downloadFiles(
     "Download the latest monthly statement",
-    { downloadSuffix: ".pdf" },
+    { downloadSuffix: "statement" },
   );
 
   // Check results

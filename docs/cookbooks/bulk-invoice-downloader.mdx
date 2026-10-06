@@ -82,7 +82,7 @@ Before defining the agent, store the login email and password Skyvern will use. 
         <img src="/images/cookbooks/credentials.png" alt="Creating a password credential on Skyvern" />
       </Step>
       <Step title="Create a credential">
-        Click **Create Credential**. Set the name to `Vendor Portal`, add login page URL, and enter the username (`demo@manicule.dev`) and password (`helloworld`). Click **Save**.
+        Click **Add Credential**. Set the name to `Vendor Portal`, add login page URL, and enter the username (`demo@manicule.dev`) and password (`helloworld`). Click **Save**.
         <img src="/images/cookbooks/er-creds.png" alt="Fill username and password to add a credential to Skyvern" />
       </Step>
       <Step title="Copy the credential ID">
@@ -181,8 +181,9 @@ Before defining the agent, store the login email and password Skyvern will use. 
       "proxy_location": "RESIDENTIAL",
       "workflow_definition": {
         "version": 1,
-        "parameters": [],    // <-- filled in below
-        "blocks": []         // <-- filled in Step 3
+        "parameters": [],
+        "blocks": []
+      }
     }
     ```
 
@@ -361,7 +362,7 @@ Navigate to the orders page and apply the date filter.
 
 <Tabs>
   <Tab title="Cloud UI">
-    Add a **Navigation** block. Configure it as follows:
+    Add a **Browser Task** block. Configure it as follows:
 
     - **URL**: Leave empty (continues from the current page after login)
     - **Parameter Keys**: Select `start_date` and `end_date`
@@ -518,7 +519,7 @@ Iterate over each order and click its "Download Invoice" button. `continue_on_fa
 
 <Tabs>
   <Tab title="Cloud UI">
-    Add a **For Loop** block. Set the **Loop Variable** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Next Loop on Failure**.
+    Add a **Loop Block**. Set the **Loop Value** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Skip Iterations that Fail**.
 
     Inside the loop, add a **File Download** block:
 
@@ -583,9 +584,9 @@ Use `file_url_parser` to extract structured data from each downloaded PDF.
 
 <Tabs>
   <Tab title="Cloud UI">
-    Add another **For Loop** block. Set the **Loop Variable** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Next Loop on Failure**.
+    Add another **Loop Block**. Set the **Loop Value** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Skip Iterations that Fail**.
 
-    Inside the loop, add a **File URL Parser** block:
+    Inside the loop, add a **File Parser** block:
 
     - **File URL**: `SKYVERN_DOWNLOAD_DIRECTORY/invoice_(order_id).pdf`
     - **File Type**: PDF
@@ -745,17 +746,17 @@ Send a summary email with PDFs attached.
       <Step title="Block 1: Login">
         Add a **Login** block. Set **URL** to the `portal_url` parameter. Select the `credentials` parameter. Set the goal: "Log in using the provided credentials. Handle any cookie consent popups. COMPLETE when on the account dashboard or orders page." In **Advanced Settings**, add error messages for `INVALID_CREDENTIALS` and `ACCOUNT_LOCKED`.
       </Step>
-      <Step title="Block 2: Navigation (filter orders)">
-        Add a **Navigation** block. Leave **URL** empty (continues from login). Add `start_date` and `end_date` as parameter keys. Set the goal: "Navigate to Order History or My Orders. Filter orders between start_date and end_date. Click the Filter button. COMPLETE when filtered results are visible."
+      <Step title="Block 2: Browser Task (filter orders)">
+        Add a **Browser Task** block. Leave **URL** empty (continues from login). Add `start_date` and `end_date` as parameter keys. Set the goal: "Navigate to Order History or My Orders. Filter orders between start_date and end_date. Click the Filter button. COMPLETE when filtered results are visible."
       </Step>
       <Step title="Block 3: Extraction (order metadata)">
         Add an **Extraction** block. Set the goal: "Extract all visible orders: order ID, date, total amount, and status." Paste the orders JSON schema into **Data Schema**.
       </Step>
-      <Step title="Block 4: For Loop (download invoices)">
-        Add a **For Loop** block. Set **Loop Variable** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Next Loop on Failure**. Inside the loop, add a **File Download** block with goal: "Find order (current order ID). Click Download Invoice. COMPLETE when the PDF download starts." Set **Download Suffix** to `invoice_(order_id).pdf`.
+      <Step title="Block 4: Loop (download invoices)">
+        Add a **Loop Block**. Set **Loop Value** to `data_extraction_block_output.orders`. Enable **Continue on Failure** and **Skip Iterations that Fail**. Inside the loop, add a **File Download** block with goal: "Find order (current order ID). Click Download Invoice. COMPLETE when the PDF download starts." Set **Download Suffix** to `invoice_(order_id).pdf`.
       </Step>
-      <Step title="Block 5: For Loop (parse invoices)">
-        Add another **For Loop** block with the same loop variable. Inside the loop, add a **File URL Parser** block. Set **File URL** to `SKYVERN_DOWNLOAD_DIRECTORY/invoice_(order_id).pdf`, **File Type** to PDF, and paste the invoice JSON schema.
+      <Step title="Block 5: Loop (parse invoices)">
+        Add another **Loop Block** with the same loop value. Inside the loop, add a **File Parser** block. Set **File URL** to `SKYVERN_DOWNLOAD_DIRECTORY/invoice_(order_id).pdf`, **File Type** to PDF, and paste the invoice JSON schema.
       </Step>
       <Step title="Block 6: Send Email">
         Add a **Send Email** block. Set **Sender** to `hello@skyvern.com`, **Recipients** to the `recipient_email` parameter, **Subject** to "Ember Roasters Invoices from (start_date) to (end_date)", **Body** to `for_2_block_output`, and **File Attachments** to `SKYVERN_DOWNLOAD_DIRECTORY`.
@@ -1119,7 +1120,7 @@ Create the agent from your definition file and execute it.
         # Poll for completion
         while True:
             result = await client.get_run(run.run_id)
-            if result.status in ["completed", "failed", "terminated"]:
+            if result.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
                 break
             print(f"Status: {result.status}")
             await asyncio.sleep(10)
@@ -1150,14 +1151,12 @@ Create the agent from your definition file and execute it.
 
       // Run the workflow
       const run = await client.runWorkflow({
-        body: {
-          workflow_id: workflow.workflow_permanent_id,
-          parameters: {
-            portal_url: "https://ember--roasters.vercel.app",
-            start_date: "2025-01-01",
-            end_date: "2025-01-31",
-            recipient_email: "your-email@company.com", // <-- replace this
-          },
+        agent_id: workflow.workflow_permanent_id,
+        parameters: {
+          portal_url: "https://ember--roasters.vercel.app",
+          start_date: "2025-01-01",
+          end_date: "2025-01-31",
+          recipient_email: "your-email@company.com", // <-- replace this
         },
       });
       console.log(`Started run: ${run.run_id}`);
@@ -1165,7 +1164,7 @@ Create the agent from your definition file and execute it.
       // Poll for completion
       while (true) {
         const result = await client.getRun(run.run_id);
-        if (["completed", "failed", "terminated"].includes(result.status)) {
+        if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(result.status)) {
           console.log(`Final status: ${result.status}`);
           if (result.status === "completed") {
             console.log("Invoices downloaded and email sent successfully");
@@ -1182,7 +1181,7 @@ Create the agent from your definition file and execute it.
 
     ```bash cURL
     # Create workflow
-    WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/workflows" \
+    WORKFLOW=$(curl -s -X POST "https://api.skyvern.com/v1/agents" \
       -H "x-api-key: $SKYVERN_API_KEY" \
       -H "Content-Type: application/json" \
       -d "{\"yaml_definition\": $(cat invoice-workflow.yaml | jq -Rs .)}")
@@ -1191,7 +1190,7 @@ Create the agent from your definition file and execute it.
     echo "Created workflow: $WORKFLOW_ID"
 
     # Run workflow (replace parameter values below)
-    RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/workflows" \
+    RUN=$(curl -s -X POST "https://api.skyvern.com/v1/run/agents" \
       -H "x-api-key: $SKYVERN_API_KEY" \
       -H "Content-Type: application/json" \
       -d "{
@@ -1214,7 +1213,7 @@ Create the agent from your definition file and execute it.
       STATUS=$(echo "$RESULT" | jq -r '.status')
       echo "Status: $STATUS"
 
-      if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" ]]; then
+      if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
         echo "Workflow finished with status: $STATUS"
         break
       fi

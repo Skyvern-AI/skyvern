@@ -313,7 +313,7 @@ spec:
 Each pod runs its own browser instance. Tasks are distributed across pods.
 
 <Note>
-When scaling horizontally, ensure your storage backend supports concurrent access (S3, Azure Blob, or ReadWriteMany PVCs). Local storage with ReadWriteOnce PVCs won't work across multiple pods.
+When scaling horizontally, ensure your storage backend supports concurrent access (S3, Azure Blob, GCS, or ReadWriteMany PVCs). Local storage with ReadWriteOnce PVCs won't work across multiple pods.
 </Note>
 
 ### Resource limits

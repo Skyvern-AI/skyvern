@@ -43,6 +43,7 @@ Add to your `.env` file:
 
 ```bash
 ENABLE_OLLAMA=true
+LLM_KEY=OLLAMA
 OLLAMA_SERVER_URL=http://localhost:11434
 OLLAMA_MODEL=gemma4
 
@@ -53,7 +54,8 @@ OLLAMA_SUPPORTS_VISION=false
 | Variable | Description |
 |----------|-------------|
 | `ENABLE_OLLAMA` | Enable Ollama integration. |
-| `OLLAMA_SERVER_URL` | Ollama server URL. Defaults to `http://localhost:11434`. |
+| `LLM_KEY` | Set to `OLLAMA` so Skyvern uses your Ollama model. Without it, Skyvern keeps using the default `OPENAI_GPT5_5`. |
+| `OLLAMA_SERVER_URL` | Ollama server URL. Has no default, so set it. If Skyvern runs in Docker, use `http://host.docker.internal:11434` instead of `localhost`. |
 | `OLLAMA_MODEL` | Model name. Check available models with `ollama list`. |
 | `OLLAMA_SUPPORTS_VISION` | Enable vision support for multimodal models like `qwen2-vl` or `llava`. |
 
@@ -84,11 +86,13 @@ ENABLE_OPENAI_COMPATIBLE=true
 OPENAI_COMPATIBLE_MODEL_NAME=gemma4
 OPENAI_COMPATIBLE_API_KEY=sk-test
 OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
+LLM_KEY=OPENAI_COMPATIBLE
 ```
 
 | Variable | Description |
 |----------|-------------|
 | `ENABLE_OPENAI_COMPATIBLE` | Enable OpenAI-compatible provider. |
+| `LLM_KEY` | Set to `OPENAI_COMPATIBLE` so Skyvern uses this endpoint. |
 | `OPENAI_COMPATIBLE_MODEL_NAME` | Model identifier. |
 | `OPENAI_COMPATIBLE_API_KEY` | API key for the proxy. |
 | `OPENAI_COMPATIBLE_API_BASE` | Base URL. Must end with `/v1`. |
@@ -125,6 +129,8 @@ skyvern run server
 | Model not responding | Ensure `ollama serve` is running and the model exists (`ollama list`). |
 | LiteLLM 401 error | Set `OPENAI_COMPATIBLE_API_KEY` to a value the proxy accepts. |
 | Model not visible | Set `ENABLE_OLLAMA=true` or `ENABLE_OPENAI_COMPATIBLE=true` and restart. |
+| Skyvern still calls OpenAI | Set `LLM_KEY=OLLAMA` or `LLM_KEY=OPENAI_COMPATIBLE` and restart. |
+| Connection refused from Docker | `localhost` inside the container is the container itself. Use `http://host.docker.internal:<port>` on macOS/Windows. |
 | Wrong base URL | Confirm `OPENAI_COMPATIBLE_API_BASE` ends with `/v1`. |
 
 ---

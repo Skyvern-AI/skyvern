@@ -56,12 +56,10 @@ async function main() {
   });
 
   const run = await client.runWorkflow({
-    body: {
-      workflow_id: "wpid_123456789",
-      parameters: {
-        resume: "https://example.com/resume.pdf",
-        job_url: "https://jobs.lever.co/company/position",
-      },
+    agent_id: "wpid_123456789",
+    parameters: {
+      resume: "https://example.com/resume.pdf",
+      job_url: "https://jobs.lever.co/company/position",
     },
   });
 
@@ -187,14 +185,12 @@ run = await client.run_workflow(
 
 ```typescript TypeScript
 const run = await client.runWorkflow({
-  body: {
-    workflow_id: "wpid_123456789",
-    parameters: {
-      resume: "https://example.com/resume.pdf",
-      job_url: "https://jobs.lever.co/company/position",
-    },
-    webhook_url: "https://your-server.com/webhook",
+  agent_id: "wpid_123456789",
+  parameters: {
+    resume: "https://example.com/resume.pdf",
+    job_url: "https://jobs.lever.co/company/position",
   },
+  webhook_url: "https://your-server.com/webhook",
 });
 ```
 

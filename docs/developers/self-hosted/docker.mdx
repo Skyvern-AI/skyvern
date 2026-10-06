@@ -56,7 +56,11 @@ Copy the frontend environment file:
 cp skyvern-frontend/.env.example skyvern-frontend/.env
 ```
 
-The default values work for local development. Docker Compose mounts the generated local credentials into the UI container, so you can leave `VITE_SKYVERN_API_KEY` as `YOUR_API_KEY` for the first startup.
+The default values work for local development, except the API key. Docker Compose mounts the generated local credentials into the UI container, but the UI only falls back to them when `VITE_SKYVERN_API_KEY` is empty; a placeholder like `YOUR_API_KEY` is used as-is. Clear it before the first startup:
+
+```bash skyvern-frontend/.env
+VITE_SKYVERN_API_KEY=
+```
 
 ### 4. Start the services
 
@@ -79,7 +83,7 @@ Wait for all services to be healthy before continuing:
 docker compose ps
 ```
 
-All three services should show `healthy` in the STATUS column. The `skyvern` container runs database migrations and generates credentials on first startup. This takes 1-2 minutes.
+`postgres` and `skyvern` should show `healthy` in the STATUS column, and `skyvern-ui` should show `Up` (it has no health check). The `skyvern` container runs database migrations and generates credentials on first startup. This takes 1-2 minutes.
 
 Once healthy, retrieve your API key:
 
@@ -132,7 +136,7 @@ flowchart LR
 | Service | Image | Ports | Purpose |
 |---------|-------|-------|---------|
 | `postgres` | postgres:14-alpine | 5432 (internal) | Stores tasks, workflows, credentials, and run history |
-| `skyvern` | public.ecr.aws/skyvern/skyvern | 8000, 9222 | API server + embedded browser |
+| `skyvern` | public.ecr.aws/skyvern/skyvern | 8000, 6080 | API server + embedded browser (6080 is VNC streaming) |
 | `skyvern-ui` | public.ecr.aws/skyvern/skyvern-ui | 8080, 9090 | Web dashboard and artifact server |
 
 The `skyvern` container includes Playwright with Chromium. The browser runs inside the same container as the API server. No separate browser service is needed.
@@ -209,8 +213,8 @@ VIDEO_PATH=./videos
 ### Task execution
 
 ```bash
-# Maximum steps before a task times out
-MAX_STEPS_PER_RUN=10
+# Maximum steps per run (.env.example sets 50; the code default is 10)
+MAX_STEPS_PER_RUN=50
 
 # Server port
 PORT=8000

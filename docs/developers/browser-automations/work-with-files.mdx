@@ -32,7 +32,7 @@ await page.agent.login(credential_type="skyvern", credential_id="cred_123")
 
 result = await page.agent.download_files(
     "Download the Q4 2025 financial report",
-    download_suffix=".pdf",
+    download_suffix="q4-2025-report",
     download_timeout=30,
 )
 
@@ -53,7 +53,7 @@ await page.agent.login("skyvern", { credentialId: "cred_123" });
 
 const result = await page.agent.downloadFiles(
   "Download the Q4 2025 financial report",
-  { downloadSuffix: ".pdf", downloadTimeout: 30 },
+  { downloadSuffix: "q4-2025-report", downloadTimeout: 30 },
 );
 
 for (const file of result.downloadedFiles ?? []) {
@@ -74,7 +74,7 @@ await browser.close();
 |-----------|------|----------|-------------|
 | `prompt` | `str` / `string` | Yes | Describe what to download. The agent navigates the page to find and click the download link. |
 | `url` | `str` / `string` | No | URL to navigate to before downloading. Defaults to the current page URL. |
-| `download_suffix` | `str` / `string` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). **Not a validator**; mismatched extensions don't fail the run. Omit this to get a system-generated filename like `download-<timestamp>-<random>.pdf`. |
+| `download_suffix` | `str` / `string` | No | Filename for the saved file. Without an extension, Skyvern keeps the downloaded file's extension (e.g., `"invoice"` → `invoice.pdf`); with one, it's used as the full name (`"invoice.pdf"`). Don't pass a bare extension like `".pdf"`, which saves as `.pdf.pdf`. **Not a validator**; mismatched extensions don't fail the run. Omit this to get a system-generated filename like `download-<timestamp>-<random>.pdf`. |
 | `download_timeout` | `float` / `number` | No | Soft hint (seconds) for how long to wait for a download to start. Not a hard cap; the overall `timeout` below governs failure. |
 | `max_steps_per_run` | `int` / `number` | No | Cap AI steps for the download navigation. |
 | `timeout` | `float` / `number` | No | Total timeout in seconds (default: 1800). |

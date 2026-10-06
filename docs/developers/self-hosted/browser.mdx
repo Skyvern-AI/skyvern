@@ -297,7 +297,8 @@ Configure how the browser appears to websites. These settings affect geolocation
 ### Locale and timezone
 
 ```bash .env
-# Optional, unset by default. Set to match your target region.
+# BROWSER_LOCALE is unset by default; BROWSER_TIMEZONE defaults to America/New_York.
+# Set both to match your target region.
 BROWSER_LOCALE=en-US
 BROWSER_TIMEZONE=America/New_York
 ```
@@ -415,7 +416,7 @@ The default Docker Compose setup runs one browser instance inside the Skyvern co
 
 ### Option 1: Vertical scaling
 
-Add more RAM to your server and increase `MAX_STEPS_PER_RUN` and `BROWSER_MAX_PAGES_NUMBER`.
+Add more RAM and CPU to your server. (`BROWSER_MAX_PAGES_NUMBER` limits open tabs within one browser, and `MAX_STEPS_PER_RUN` limits steps within one run; neither affects concurrency.)
 
 ### Option 2: Horizontal scaling
 

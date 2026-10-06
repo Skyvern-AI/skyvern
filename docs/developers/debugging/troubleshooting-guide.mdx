@@ -88,10 +88,11 @@ curl -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
 | Status | What it means | Likely cause |
 |--------|---------------|--------------|
 | `completed` | Run finished, but output may be wrong | Prompt interpretation issue |
-| `failed` | System error | Browser crash, network failure |
+| `failed` | System error, or hit `max_steps` | Browser crash, network failure, or `failure_reason` says "Reached the maximum steps" |
 | `terminated` | AI gave up | Login blocked, CAPTCHA, page unavailable |
-| `timed_out` | Exceeded `max_steps` | Task too complex, or AI got stuck |
+| `timed_out` | Exceeded the run's time limit | Task too complex, or AI got stuck |
 | `canceled` | Manually stopped | N/A |
+| `paused` | Waiting for a person (not terminal) | A `human_interaction` block is waiting for input |
 
 ---
 
@@ -190,8 +191,8 @@ See [Using Artifacts](/developers/debugging/using-artifacts) for the full list o
 - Add visual hints: "The price is displayed in bold below the product title"
 </Accordion>
 
-<Accordion title="Run timed out">
-**Symptom:** Status is `timed_out`.
+<Accordion title="Run timed out or hit max steps">
+**Symptom:** Status is `timed_out`, or status is `failed` with "Reached the maximum steps" in `failure_reason`.
 
 **Check:** `recording` (stuck in a loop?) and `step_count` (how many steps?)
 
@@ -325,7 +326,7 @@ See [Using Artifacts](/developers/debugging/using-artifacts) for the full list o
 **Check:** What `proxy_location` is being used? Does site geo-target?
 
 **Fix:**
-- Use appropriate proxy: `RESIDENTIAL_US` for English US sites
+- Use appropriate proxy: `RESIDENTIAL` for English US sites
 - Add instruction: "If the site asks for language preference, select English"
 - Set language in URL: `https://example.com/en/`
 </Accordion>

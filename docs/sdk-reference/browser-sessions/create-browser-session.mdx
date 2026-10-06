@@ -8,7 +8,7 @@ A browser session is a persistent browser instance that stays alive between API 
 For conceptual background, see [Browser Sessions](/developers/optimization/browser-sessions).
 
 <Note>
-Python uses `snake_case` (e.g., `create_browser_session`); TypeScript uses `camelCase` (e.g., `createBrowserSession`). Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+Python uses `snake_case` (e.g., `create_browser_session`); TypeScript uses `camelCase` method names (e.g., `createBrowserSession`), but request fields stay `snake_case`. Parameter tables show Python names.
 </Note>
 
 Spin up a new cloud browser session.
@@ -29,16 +29,17 @@ console.log(session.browser_session_id); // pbs_abc123
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `url` | `str` | No | `None` | URL to open when the session starts. |
 | `timeout` | `int` | No | `60` | Session timeout in minutes (min 5, max 240; higher values are capped at 240 with a warning). A running session can be extended to 360 with [`extend_browser_session`](/sdk-reference/browser-sessions/extend-browser-session). Timer starts after the session is ready. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
 | `extensions` | `list[Extensions]` | No | `None` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
 | `browser_type` | `PersistentBrowserType` | No | `None` | Browser type. Options: `"chrome"`, `"msedge"`. |
 | `browser_profile_id` | `str` | No | `None` | Load a browser profile (cookies, localStorage) into this session. ID starts with `bp_`. |
-| `generate_browser_profile` | `bool` | No | `False` | REST API only for now — not yet accepted by the SDK methods (see note below). Save the session's browser profile when it ends so it can be turned into a reusable [browser profile](/sdk-reference/browser-profiles/create-browser-profile). Sessions started with `browser_profile_id` always save theirs. |
+| `generate_browser_profile` | `bool` | No | `False` | Save the session's browser profile when it ends so it can be turned into a reusable [browser profile](/sdk-reference/browser-profiles/create-browser-profile). Sessions started with `browser_profile_id` always save theirs. |
 | `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
 
 <Note>
-`generate_browser_profile` is not yet accepted as a keyword by the SDK methods (watch the [changelog](/changelog) for SDK availability). Until SDK support lands, pass it from Python via `request_options` with `additional_body_parameters={"generate_browser_profile": True}` (see [Request options](#request-options) below); from TypeScript, call the REST API directly. You can also toggle it on a live session via `PATCH /v1/browser_sessions/{browser_session_id}` — the value is read when the session ends. See [Save a session's profile](/developers/optimization/browser-sessions#save-a-sessions-profile).
+Pass `generate_browser_profile=True` (Python) or `generate_browser_profile: true` (TypeScript) when creating the session. You can also toggle it on a live session via `PATCH /v1/browser_sessions/{browser_session_id}` — the value is read when the session ends. See [Save a session's profile](/developers/optimization/browser-sessions#save-a-sessions-profile).
 </Note>
 
 ### Returns `BrowserSessionResponse`
@@ -84,20 +85,16 @@ const session = await skyvern.createBrowserSession({});
 
 // Step 1: Log in
 await skyvern.runTask({
-  body: {
-    prompt: "Log in with username demo@example.com",
-    url: "https://app.example.com/login",
-    browser_session_id: session.browser_session_id,
-  },
+  prompt: "Log in with username demo@example.com",
+  url: "https://app.example.com/login",
+  browser_session_id: session.browser_session_id,
   waitForCompletion: true,
 });
 
 // Step 2: Extract data (same browser, already logged in)
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Go to the invoices page and extract all invoice numbers",
-    browser_session_id: session.browser_session_id,
-  },
+  prompt: "Go to the invoices page and extract all invoice numbers",
+  browser_session_id: session.browser_session_id,
   waitForCompletion: true,
 });
 console.log(result.output);

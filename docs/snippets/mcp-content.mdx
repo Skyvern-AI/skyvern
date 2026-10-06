@@ -2,7 +2,7 @@ The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Code
 
 ## What you can do
 
-The MCP server exposes 75+ tools across many categories. Here are the key ones:
+The MCP server exposes 117 tools across many categories. Here are the key ones:
 
 | Category                       | Key tools                                                                                                                                                                             | What they do                                                                                                           |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
@@ -11,7 +11,7 @@ The MCP server exposes 75+ tools across many categories. Here are the key ones:
 | **Data extraction**            | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate`                                                                                                                           | Pull structured JSON from pages, capture screenshots, run JavaScript                                                   |
 | **Validation**                 | `skyvern_validate`                                                                                                                                                                    | Assert page conditions in natural language (returns true/false with reasoning)                                         |
 | **Credentials & login**        | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete`                                                                                     | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
-| **Agents**                     | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types                                                      |
+| **Agents**                     | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 33 block types                                                      |
 
 Additional tools cover tab management, iframe switching, drag-and-drop, file upload, clipboard access, network/console inspection, HAR recording, web storage, auth state persistence, folder management, and cached script management.
 
@@ -351,8 +351,8 @@ After setup, restart your MCP client. Skyvern should appear as an MCP server and
 
 <Tip>
   Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern
-  setup`. For the local self-hosted path, use Docker Compose or a source
-  checkout, then run `skyvern quickstart` or `skyvern init` and choose Claude
+  setup`. For the local self-hosted path, `pip install "skyvern[server]"`,
+  then run `skyvern quickstart` or `skyvern init` and choose Claude
   Code during the MCP step.
 </Tip>
 
@@ -388,16 +388,16 @@ If a config file exists but does not already contain a Skyvern entry, run `skyve
 Use this if you are self-hosting Skyvern and want the MCP server to talk to your own instance instead of Skyvern Cloud. This runs a local Python process on your machine that connects to your local Skyvern server.
 
 <Tip title="Supported Python Versions" icon="fa-brands fa-python">
-  Local mode requires Python 3.11, 3.12, or 3.13.
+  Local mode requires Python 3.11, 3.12, 3.13, or 3.14.
 </Tip>
 
 ```bash
-pip install ".[server]"
+pip install "skyvern[server]"
 ```
 
 ### Recommended local Claude Code flow
 
-Run the setup wizard from a Skyvern source checkout or Docker Compose setup:
+Run the setup wizard:
 
 ```bash
 skyvern quickstart
@@ -433,11 +433,11 @@ The configs below serve the full default tool surface. To narrow an install to o
 
 | Scope | Tools | Use when |
 | --- | ---: | --- |
-| `all` | 114 | Full tool surface; default local dev/QA choice |
-| `operate` | 29 | Run, monitor, and inspect existing automations |
-| `build` | 60 | Author and modify automations |
+| `all` | 117 | Full tool surface; default local dev/QA choice |
+| `operate` | 30 | Run, monitor, and inspect existing automations |
+| `build` | 62 | Author and modify automations |
 | `browser` | 54 | Drive a browser directly |
-| `lean` | 32 | Focused browser surface with direct actions, selector-scoped page reading, and schema-constrained output |
+| `lean` | 33 | Focused browser surface with direct actions, selector-scoped page reading, and schema-constrained output |
 
 <Tabs>
 <Tab title="Claude Code">
@@ -500,8 +500,7 @@ Replace `/usr/bin/python3` with the output of `which python3`. For Skyvern Cloud
 </Tabs>
 
 <Tip>
-  From Docker Compose or a source checkout, `skyvern init` and `skyvern
-  quickstart` can write the local MCP config for you. In a project directory,
+  `skyvern init` and `skyvern quickstart` can write the local MCP config for you. In a project directory,
   choosing Claude Code defaults to project-local `.mcp.json` and installs
   `.claude/skills/qa`.
 </Tip>
@@ -561,7 +560,7 @@ To drive the Chrome profile and tabs you already use from a local stdio MCP serv
 [Skyvern Chrome extension](/developers/optimization/chrome-extension). You explicitly choose which tabs to share, and
 the connection stays on your machine.
 
-Start a local browser with a tunnel so Skyvern Cloud can reach it:
+Start a local browser with a tunnel so Skyvern Cloud can reach it. The `skyvern browser` commands need the local extra (`pip install "skyvern[local]"`):
 
 ```bash
 skyvern browser serve --tunnel --use-local-profile
@@ -590,10 +589,10 @@ Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern
 
 ## QA your frontend changes
 
-For the local self-hosted path, use Docker Compose or a Skyvern source checkout, then run `skyvern quickstart` or `skyvern init`, choose `local`, choose the default Skyvern tool scope (`all`), then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+For the local self-hosted path, install the server extra, then run `skyvern quickstart` or `skyvern init`, choose `local`, choose the default Skyvern tool scope (`all`), then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
 
 ```bash
-pip install ".[server]"
+pip install "skyvern[server]"
 skyvern quickstart
 # or: skyvern init
 ```
@@ -641,8 +640,7 @@ If the sign-in page shows an authorization failure, start the flow again from yo
 </Accordion>
 
 <Accordion title="OAuth session expires">
-  OAuth sessions use the access-token lifetime described in the OAuth setup
-  section above. When authentication expires, re-run the MCP client's
+  OAuth access tokens expire. When authentication expires, re-run the MCP client's
   authentication flow. To stop using Skyvern from a client before then, clear
   that client's saved Skyvern authentication or remove the Skyvern MCP server
   entry.
@@ -656,7 +654,7 @@ If timeouts persist, check that your Skyvern account is active and has available
 </Accordion>
 
 <Accordion title="Python version errors (local mode only)">
-The Skyvern MCP server requires Python 3.11, 3.12, or 3.13. Check your version with `python3 --version`. Skyvern's generated local config already pins the active interpreter path automatically. If you are editing the config manually, make sure the `command` points to a supported version:
+The Skyvern MCP server requires Python 3.11, 3.12, 3.13, or 3.14. Check your version with `python3 --version`. Skyvern's generated local config already pins the active interpreter path automatically. If you are editing the config manually, make sure the `command` points to a supported version:
 
 ```bash
 which python3.11

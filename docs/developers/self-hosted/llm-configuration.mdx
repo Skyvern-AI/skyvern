@@ -150,15 +150,6 @@ LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 | **Claude 4** | |
 | `ANTHROPIC_CLAUDE4_OPUS` | |
 | `ANTHROPIC_CLAUDE4_SONNET` | |
-| **Claude 3.7** | |
-| `ANTHROPIC_CLAUDE3.7_SONNET` | |
-| **Claude 3.5** | |
-| `ANTHROPIC_CLAUDE3.5_SONNET` | |
-| `ANTHROPIC_CLAUDE3.5_HAIKU` | |
-| **Claude 3 (Legacy)** | |
-| `ANTHROPIC_CLAUDE3_OPUS` | |
-| `ANTHROPIC_CLAUDE3_SONNET` | |
-| `ANTHROPIC_CLAUDE3_HAIKU` | |
 
 ---
 
@@ -201,7 +192,7 @@ The quickest way to use Gemini. Get an API key from [Google AI Studio](https://a
 ```bash .env
 ENABLE_GEMINI=true
 GEMINI_API_KEY=your-gemini-api-key
-LLM_KEY=GEMINI_2.5_PRO
+LLM_KEY=GEMINI_3_PRO
 ```
 
 #### Available Gemini API models
@@ -232,8 +223,9 @@ For enterprise deployments through [Vertex AI](https://cloud.google.com/vertex-a
 ```bash .env
 ENABLE_VERTEX_AI=true
 LLM_KEY=VERTEX_GEMINI_3_PRO
-GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
-GCP_PROJECT_ID=your-gcp-project-id
+# Service account JSON content (or omit to use Application Default Credentials / Workload Identity)
+VERTEX_CREDENTIALS='{"type": "service_account", ...}'
+VERTEX_PROJECT_ID=your-gcp-project-id
 VERTEX_LOCATION=us-central1
 ```
 
@@ -247,7 +239,7 @@ If you're migrating from an older Skyvern version, `VERTEX_LOCATION` replaces th
 2. Enable the **Vertex AI API** in your project
 3. Create a service account with the **Vertex AI User** role
 4. Download the service account JSON key file
-5. Set `GOOGLE_APPLICATION_CREDENTIALS` to the path of that file
+5. Set `VERTEX_CREDENTIALS` to the contents of that file as a JSON string. If you leave it unset, Skyvern falls back to Application Default Credentials (for example `GOOGLE_APPLICATION_CREDENTIALS` or Workload Identity)
 
 <Note>
 For global endpoint access, set `VERTEX_LOCATION=global` and ensure `VERTEX_PROJECT_ID` is set. Not all models support the global endpoint.
@@ -312,47 +304,10 @@ AWS_SECRET_ACCESS_KEY=...
 | **Claude 4** | |
 | `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE` | Cross-region |
 | `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE` | Cross-region |
-| **Claude 3.7** | |
-| `BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE` | Cross-region |
-| **Claude 3.5** | |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET` | v2 |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1` | |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE` | Cross-region |
-| `BEDROCK_ANTHROPIC_CLAUDE3.5_HAIKU` | |
-| **Claude 3 (Legacy)** | |
-| `BEDROCK_ANTHROPIC_CLAUDE3_OPUS` | |
-| `BEDROCK_ANTHROPIC_CLAUDE3_SONNET` | |
-| `BEDROCK_ANTHROPIC_CLAUDE3_HAIKU` | |
 
 <Note>
 Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inference and require `AWS_REGION` only. No access keys needed if running on an IAM-authenticated instance.
 </Note>
-
----
-
-## MiniMax
-
-[MiniMax](https://www.minimax.io/) models with vision support.
-
-```bash .env
-ENABLE_MINIMAX=true
-MINIMAX_API_KEY=your-minimax-api-key
-LLM_KEY=MINIMAX_M2_5
-```
-
-### Available models
-
-| LLM_KEY | Notes |
-|---------|-------|
-| `MINIMAX_M2_5` | |
-| `MINIMAX_M2_5_HIGHSPEED` | Faster variant |
-
-### Optional settings
-
-```bash .env
-# Use a custom API endpoint
-MINIMAX_API_BASE=https://api.minimax.io/v1
-```
 
 ---
 
@@ -461,7 +416,7 @@ LLM_KEY=INCEPTION_MERCURY_2
 
 ```bash .env
 # Use a custom API endpoint
-INCEPTION_API_BASE=https://api.inception.ai/v1
+INCEPTION_API_BASE=https://api.inceptionlabs.ai/v1
 ```
 
 ---
@@ -612,9 +567,9 @@ The page content is too large for the model's context window. Options:
 - Simplify your prompt to require less page analysis
 - Start from a more specific URL with less content
 
-### "LLM caller not found"
+### "Environment variables LLM_API_KEY are required for LLMProvider ..."
 
-The configured `LLM_KEY` doesn't match any enabled provider. Verify:
+The configured `LLM_KEY` doesn't match any enabled provider, so Skyvern treats it as a generic model name and asks for `LLM_API_KEY`. Verify:
 1. The provider is enabled (`ENABLE_OPENAI=true`, etc.)
 2. The `LLM_KEY` value matches a supported model name exactly
 3. Model names are case-sensitive: `OPENAI_GPT5_5` not `openai_gpt5_5`

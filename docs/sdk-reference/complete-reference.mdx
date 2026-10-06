@@ -59,10 +59,8 @@ import { Skyvern } from "@skyvern/client";
 const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
 
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Get the title of the top post on Hacker News",
-    url: "https://news.ycombinator.com",
-  },
+  prompt: "Get the title of the top post on Hacker News",
+  url: "https://news.ycombinator.com",
   waitForCompletion: true,
 });
 console.log(result.output);
@@ -180,7 +178,7 @@ await page.hover("#menu-item", intention="Hover over the menu")
 await page.scroll(0, 500)
 
 # upload_file (Python only)
-await page.upload_file("#file-input", files="/path/to/file.pdf")
+await page.upload_file("#file-input", files="https://example.com/resume.pdf")
 
 # fill_form - AI full form fill (Python only)
 await page.fill_form(data={"name": "John", "email": "john@example.com"})
@@ -311,32 +309,29 @@ result = await client.run_task(
     include_action_history_in_verification: bool | None = None,
     max_screenshot_scrolls: int | None = None,
     browser_address: str | None = None,
-    run_with: str | None = None,
 ) -> TaskRunResponse
 ```
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: string,                              // Required
-    url?: string,
-    engine?: RunEngine,                          // "skyvern-1.0" default
-    max_steps?: number,
-    data_extraction_schema?: Record<string, unknown> | string,
-    browser_session_id?: string,
-    publish_workflow?: boolean,
-    proxy_location?: ProxyLocation,
-    webhook_url?: string,
-    error_code_mapping?: Record<string, string>,
-    totp_identifier?: string,
-    totp_url?: string,
-    title?: string,
-    model?: Record<string, unknown>,
-    user_agent?: string,
-    extra_http_headers?: Record<string, string>,
-    browser_address?: string,
-    run_with?: string,
-  },
+  prompt: string,                              // Required
+  url?: string,
+  engine?: RunEngine,                          // "skyvern-1.0" default
+  max_steps?: number,
+  data_extraction_schema?: Record<string, unknown> | string,
+  browser_session_id?: string,
+  publish_workflow?: boolean,
+  proxy_location?: ProxyLocation,
+  webhook_url?: string,
+  error_code_mapping?: Record<string, string>,
+  totp_identifier?: string,
+  totp_url?: string,
+  title?: string,
+  model?: Record<string, unknown>,
+  "x-user-agent"?: string,
+  extra_http_headers?: Record<string, string>,
+  browser_address?: string,
+  run_with?: string,                           // TypeScript only; not accepted by Python run_task
   waitForCompletion?: boolean,
   timeout?: number,                              // Default: 1800
 }): Promise<TaskRunResponse>
@@ -371,9 +366,7 @@ get_run_artifacts(run_id, artifact_type?) → list[Artifact]
 
 ### get_artifact
 
-```
-get_artifact(artifact_id) → Artifact
-```
+Removed in SDK 1.0.29. Use `get_run_artifacts` and read each artifact's `uri`, or download content with `GET /v1/artifacts/{artifact_id}/content`.
 
 ### get_runs_v2
 
@@ -384,7 +377,7 @@ get_runs_v2(page?, page_size?, status?, search_key?) → list[TaskRunListItem]
 ### retry_run_webhook
 
 ```
-retry_run_webhook(run_id, webhook_url?)
+retry_run_webhook(run_id, request=RetryRunWebhookRequest(webhook_url=...)?) → RunWebhookReplayResponse
 ```
 
 ---
@@ -415,27 +408,27 @@ result = await client.run_workflow(
     extra_http_headers: dict[str, str] | None = None,
     max_screenshot_scrolls: int | None = None,
     browser_address: str | None = None,
+    max_elapsed_time_minutes: int | None = None,
+    run_metadata: dict[str, str] | None = None,
 ) -> WorkflowRunResponse
 ```
 
 ```typescript TypeScript
 const result = await skyvern.runWorkflow({
-  body: {
-    workflow_id: string,                       // Required
-    parameters?: Record<string, unknown>,
-    browser_session_id?: string,
-    browser_profile_id?: string,
-    proxy_location?: ProxyLocation,
-    webhook_url?: string,
-    title?: string,
-    totp_identifier?: string,
-    totp_url?: string,
-    user_agent?: string,
-    extra_http_headers?: Record<string, string>,
-    browser_address?: string,
-    ai_fallback?: boolean,
-    run_with?: string,
-  },
+  agent_id: string,                            // Required. Permanent ID (wpid_...).
+  parameters?: Record<string, unknown>,
+  browser_session_id?: string,
+  browser_profile_id?: string,
+  proxy_location?: ProxyLocation,
+  webhook_url?: string,
+  title?: string,
+  totp_identifier?: string,
+  totp_url?: string,
+  "x-user-agent"?: string,
+  extra_http_headers?: Record<string, string>,
+  browser_address?: string,
+  ai_fallback?: boolean,
+  run_with?: string,
   template?: boolean,
   waitForCompletion?: boolean,
   timeout?: number,                            // Default: 1800
@@ -478,7 +471,7 @@ update_workflow(workflow_id, json_definition?, yaml_definition?) → Workflow
 ### delete_workflow
 
 ```
-delete_workflow(workflow_id)
+delete_workflow(workflow_id)  # Permanent ID (wpid_...). Deletes all versions.
 ```
 
 ### get_workflow_runs
@@ -502,7 +495,7 @@ update_workflow_folder(workflow_permanent_id, folder_id?) → Workflow
 ### create_browser_session
 
 ```
-create_browser_session(timeout?, proxy_location?, extensions?, browser_type?, browser_profile_id?) → BrowserSessionResponse
+create_browser_session(url?, timeout?, proxy_location?, proxy_session_id?, extensions?, browser_type?, browser_profile_id?, generate_browser_profile?) → BrowserSessionResponse
 ```
 
 ### get_browser_session
@@ -602,7 +595,7 @@ send_totp_code(totp_identifier, content, task_id?, workflow_id?, workflow_run_id
 ### login
 
 ```
-login(credential_type, url?, credential_id?, prompt?, browser_session_id?, browser_profile_id?, browser_address?, proxy_location?, webhook_url?, totp_identifier?, totp_url?, extra_http_headers?, max_screenshot_scrolling_times?, wait_for_completion?, timeout?) → WorkflowRunResponse
+login(credential_type, url?, credential_id?, prompt?, browser_session_id?, browser_address?, proxy_location?, webhook_url?, totp_identifier?, totp_url?, extra_http_headers?, max_screenshot_scrolling_times?, wait_for_completion?, timeout?) → WorkflowRunResponse
 ```
 
 Credential-specific parameters: `bitwarden_collection_id`, `bitwarden_item_id`, `onepassword_vault_id`, `onepassword_item_id`, `azure_vault_name`, `azure_vault_username_key`, `azure_vault_password_key`, `azure_vault_totp_secret_key`.
@@ -655,9 +648,9 @@ try {
 ```
 </CodeGroup>
 
-**Error types:** `BadRequestError` (400), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `UnprocessableEntityError` (422). All inherit from `ApiError` (Python) or `SkyvernError` (TypeScript).
+**Error types:** `BadRequestError` (400), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `UnprocessableEntityError` (422), `RangeNotSatisfiableError` (416), `InternalServerError` (500). All inherit from `ApiError` (Python) or `SkyvernError` (TypeScript).
 
-Run failure is not an exception - check `result.status` (`completed`, `failed`, `terminated`, `timed_out`, `canceled`).
+Run failure is not an exception - check `result.status` (`completed`, `failed`, `terminated`, `timed_out`, `canceled`). A workflow run can also be `paused` (waiting on a human interaction block), which is not terminal.
 
 ---
 
@@ -695,7 +688,7 @@ request_options=RequestOptions(
 - Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
 - `publish_workflow=True` is deprecated and routes through the legacy Skyvern 2.0 publish path for backwards compatibility. Prefer creating reusable workflows with the workflow APIs.
 - Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
-- `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
+- `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `skyvern_v3` (Python only), `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
 - `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
 - `page.agent` methods always wait for completion.
 - Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `fill_from_mapping`, `extract_form_fields`, `validate_mapping`, `fill_autocomplete`), iframe management (`frame_switch`, `frame_main`, `frame_list`).

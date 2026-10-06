@@ -6,7 +6,7 @@ slug: sdk-reference/helpers/login
 These methods wrap common multi-step patterns into single API calls. Under the hood, they create and run specialized workflows.
 
 <Note>
-Python uses `snake_case` (e.g., `login`, `download_files`); TypeScript uses `camelCase` (e.g., `login`, `downloadFiles`). Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+Python uses `snake_case` (e.g., `login`, `download_files`); TypeScript uses `camelCase` (e.g., `login`, `downloadFiles`), but request fields stay `snake_case`. Parameter tables show Python names.
 </Note>
 
 Automate logging into a website using stored credentials. This creates a login workflow, executes it, and optionally waits for completion.
@@ -53,7 +53,7 @@ console.log(result.status);
 | `timeout` | `float` | No | `1800` | Max wait time in seconds. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
 | `max_screenshot_scrolling_times` | `int` | No | `None` | Number of screenshot scrolls. |
-| `browser_profile_id` | `str` | No | `None` | Load a browser profile into the session. |
+| `browser_profile_id` | `str` | No | `None` | TypeScript only; Python's `Skyvern.login` does not accept it. Load a browser profile into the session. |
 | `request_options` | `RequestOptions` | No | `None` | Per-request configuration (see below). |
 
 **Bitwarden-specific parameters:**
@@ -121,10 +121,8 @@ await skyvern.login({
 
 // Now extract data from the authenticated session
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Go to the billing page and extract all invoices",
-    browser_session_id: session.browser_session_id,
-  },
+  prompt: "Go to the billing page and extract all invoices",
+  browser_session_id: session.browser_session_id,
   waitForCompletion: true,
 });
 console.log(result.output);

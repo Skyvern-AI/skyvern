@@ -28,7 +28,7 @@ Use `max_steps` to limit steps per run and prevent runaway costs.
 
 ## Limit steps with max_steps
 
-Set `max_steps` to cap the worst-case cost of any run. If a task gets stuck in a loop or hits repeated failures, `max_steps` stops it before it burns through your budget. The run terminates with `status: "timed_out"` when it hits the limit.
+Set `max_steps` to cap the worst-case cost of any run. If a task gets stuck in a loop or hits repeated failures, `max_steps` stops it before it burns through your budget. The run stops with `status: "failed"` and a `failure_reason` that starts with "Reached the maximum steps" when it hits the limit.
 
 ### For tasks
 
@@ -55,11 +55,9 @@ import { Skyvern } from "@skyvern/client";
 const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
 const result = await client.runTask({
-  body: {
-    prompt: "Extract the top 3 products",
-    url: "https://example.com/products",
-    max_steps: 15,
-  },
+  prompt: "Extract the top 3 products",
+  url: "https://example.com/products",
+  max_steps: 15,
   waitForCompletion: true,
 });
 console.log(`Steps taken: ${result.step_count}`);
@@ -79,7 +77,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 
 ### For agents
 
-Pass `max_steps_override` as a parameter (Python) or `x-max-steps-override` header (TypeScript/cURL). This limits total steps across all blocks.
+Pass `max_steps_override` as a parameter (Python) or `x-max-steps-override` header (TypeScript/cURL). This overrides the step limit for each task in the run, not the total across all blocks.
 
 <CodeGroup>
 ```python Python
@@ -88,7 +86,7 @@ from skyvern import Skyvern
 client = Skyvern(api_key="YOUR_API_KEY")
 
 result = await client.run_workflow(
-    workflow_id="wf_data_extraction",
+    workflow_id="wpid_data_extraction",
     max_steps_override=30,
     wait_for_completion=True,
 )
@@ -102,7 +100,7 @@ const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
 const result = await client.runWorkflow({
   "x-max-steps-override": 30,
-  body: { workflow_id: "wf_data_extraction" },
+  agent_id: "wpid_data_extraction",
   waitForCompletion: true,
 });
 console.log(`Steps taken: ${result.step_count}`);
@@ -113,7 +111,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "x-max-steps-override: 30" \
   -H "Content-Type: application/json" \
-  -d '{"workflow_id": "wf_data_extraction"}'
+  -d '{"workflow_id": "wpid_data_extraction"}'
 ```
 </CodeGroup>
 
@@ -147,11 +145,12 @@ result = await client.run_task(
 )
 
 # Subsequent runs: execute cached code instead of AI
+# (the Python run_task helper has no run_with argument, so send it as an extra body field)
 result = await client.run_task(
     prompt="Extract the top 3 products",
     url="https://example.com/products",
-    run_with="code",
     wait_for_completion=True,
+    request_options={"additional_body_parameters": {"run_with": "code"}},
 )
 ```
 
@@ -162,20 +161,16 @@ const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
 // First run: AI agent executes and generates code
 const result = await client.runTask({
-  body: {
-    prompt: "Extract the top 3 products",
-    url: "https://example.com/products",
-  },
+  prompt: "Extract the top 3 products",
+  url: "https://example.com/products",
   waitForCompletion: true,
 });
 
 // Subsequent runs: execute cached code instead of AI
 const codeResult = await client.runTask({
-  body: {
-    prompt: "Extract the top 3 products",
-    url: "https://example.com/products",
-    run_with: "code",
-  },
+  prompt: "Extract the top 3 products",
+  url: "https://example.com/products",
+  run_with: "code",
   waitForCompletion: true,
 });
 ```
@@ -237,11 +232,9 @@ import { Skyvern } from "@skyvern/client";
 const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
 const result = await client.runTask({
-  body: {
-    prompt: "Fill out the contact form",
-    url: "https://example.com/contact",
-    engine: "skyvern-1.0",
-  },
+  prompt: "Fill out the contact form",
+  url: "https://example.com/contact",
+  engine: "skyvern-1.0",
   waitForCompletion: true,
 });
 ```

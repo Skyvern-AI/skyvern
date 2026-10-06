@@ -25,7 +25,7 @@ Want Skyvern Cloud to automate a site where you're already logged in? With `skyv
 
 ## Quick start
 
-One command starts Chrome on your machine and creates a tunnel so Skyvern Cloud can connect:
+One command starts Chrome on your machine and creates a tunnel so Skyvern Cloud can connect. The `skyvern browser` commands need the `local` extra: `pip install "skyvern[local]"`.
 
 ```bash
 skyvern browser serve --tunnel
@@ -68,6 +68,7 @@ async def main():
     result = await client.run_task(
         prompt="Download the latest invoice from my account",
         browser_address="wss://abc123.ngrok-free.dev",
+        wait_for_completion=True,
     )
 
     print(f"Status: {result.status}")
@@ -83,10 +84,8 @@ async function main() {
   const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
   const result = await client.runTask({
-    body: {
-      prompt: "Download the latest invoice from my account",
-      browser_address: "wss://abc123.ngrok-free.dev",
-    },
+    prompt: "Download the latest invoice from my account",
+    browser_address: "wss://abc123.ngrok-free.dev",
     waitForCompletion: true,
   });
 
@@ -144,7 +143,10 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 | Option | Default | Description |
 |---|---|---|
 | `--port` | `9222` | Port for the proxy server. Chrome uses `port + 1000` internally. |
-| `--profile-dir` | `~/.skyvern/chrome-profile` | Chrome user data directory. Point this at an existing profile to reuse cookies and logins. |
+| `--profile-dir` | `~/.skyvern/chrome-profile` | Chrome user data directory. Uses the cookies and logins already in that directory. |
+| `--use-local-profile` | `false` | Copy cookies and logins from your local Chrome profile so Skyvern can reuse your existing sessions. |
+| `--chrome-profile-name` | `Default` | Chrome profile to copy from, for example `Profile 1`. Only used with `--use-local-profile`. |
+| `--full-profile-copy` | `false` | Copy the entire Chrome user data directory instead of only login-related files. Requires Chrome to be closed. |
 | `--download-dir` | `~/.skyvern/downloads/{browser_id}` | Directory for browser downloads. |
 | `--api-key` | (none) | API key for authenticating incoming requests. See [Security](#security). |
 | `--headless` | `false` | Run Chrome in headless mode (no visible window). |
@@ -157,8 +159,8 @@ The `--api-key` option can also be set via the `SKYVERN_BROWSER_SERVE_API_KEY` e
 ### Examples
 
 ```bash
-# Use a specific Chrome profile (reuse your existing logins)
-skyvern browser serve --profile-dir ~/Library/Application\ Support/Google/Chrome/Default
+# Reuse the logins from your local Chrome profile
+skyvern browser serve --use-local-profile
 
 # Run headless with auto-tunnel
 skyvern browser serve --headless --tunnel

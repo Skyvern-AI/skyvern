@@ -187,7 +187,7 @@ async function main() {
 
   // Step 2: Run the workflow and wait for completion
   const workflowRun = await client.runWorkflow({
-    body: { workflow_id: workflow.workflow_permanent_id },
+    agent_id: workflow.workflow_permanent_id,
     waitForCompletion: true,
   });
   console.log(`Workflow completed: ${workflowRun.status}`);
@@ -436,10 +436,8 @@ async function main() {
 
   // Run workflow with saved profile, no login needed
   const result = await client.runWorkflow({
-    body: {
-      workflow_id: "wpid_daily_metrics",
-      browser_profile_id: "bp_490705123456789012",
-    },
+    agent_id: "wpid_daily_metrics",
+    browser_profile_id: "bp_490705123456789012",
     waitForCompletion: true,
   });
 
@@ -475,7 +473,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 ```
 
 <Note>
-`browser_profile_id` is supported for agents only. It is not available for standalone tasks via `run_task`. You also cannot use both `browser_profile_id` and `browser_session_id` in the same request.
+The REST endpoint `POST /v1/run/tasks` accepts `browser_profile_id`, but the Python SDK's `run_task` helper does not expose it yet, so use the REST API or an agent run from Python. You also cannot use both `browser_profile_id` and `browser_session_id` in the same request.
 </Note>
 
 ---
@@ -585,7 +583,7 @@ This walkthrough demonstrates the full profile lifecycle: create an agent that s
 
   ```typescript TypeScript
   const run = await client.runWorkflow({
-    body: { workflow_id: workflow.workflow_permanent_id },
+    agent_id: workflow.workflow_permanent_id,
     waitForCompletion: true,
   });
   console.log(run.run_id); // wr_494674202383504144
@@ -759,10 +757,8 @@ This walkthrough demonstrates the full profile lifecycle: create an agent that s
 
   ```typescript TypeScript
   const result = await client.runWorkflow({
-    body: {
-      workflow_id: dataWorkflow.workflow_permanent_id,
-      browser_profile_id: profile.browser_profile_id,
-    },
+    agent_id: dataWorkflow.workflow_permanent_id,
+    browser_profile_id: profile.browser_profile_id,
     waitForCompletion: true,
   });
   console.log(result.status); // completed
@@ -1010,10 +1006,8 @@ const workflow = await client.createWorkflow({
 
 // Step 2: Run with an existing profile
 const result = await client.runWorkflow({
-  body: {
-    workflow_id: workflow.workflow_permanent_id,
-    browser_profile_id: "bp_current",
-  },
+  agent_id: workflow.workflow_permanent_id,
+  browser_profile_id: "bp_current",
   waitForCompletion: true,
 });
 

@@ -42,4 +42,4 @@ await page.fill("#email", "user@example.com", {
 | `totp_url` / `totpUrl` | `str` / `string` | No | TOTP provisioning URL (`otpauth://...`) to generate a one-time code on the fly. |
 | `**kwargs` | | No | Standard Playwright fill options (e.g., `timeout`, `force`). |
 
-Returns `str` / `string` -- the resolved selector used.
+Python returns `str` -- the resolved selector used. TypeScript returns `void`.

@@ -5,6 +5,10 @@ slug: sdk-reference/helpers/upload-file
 
 Upload a file to Skyvern's storage. Returns a presigned URL and S3 URI you can reference in tasks and agents.
 
+<Warning>
+Known issue: in the current Python and TypeScript SDKs, `upload_file` / `uploadFile` types `file` as a string and sends it as a plain form field instead of file contents, so the examples below fail. Until the SDKs are fixed, upload with a multipart `POST /v1/upload_file` request to the REST API.
+</Warning>
+
 <CodeGroup>
 ```python Python
 with open("data.csv", "rb") as f:

@@ -36,7 +36,7 @@ Most browser automations hit a login wall within the first few seconds. Skyvern 
 
 When a run needs a credential, Skyvern fetches it from your vault, injects it directly into the browser's form field, and discards it as soon as the field is filled. The value never enters an LLM prompt, never lands in a log line, and never gets written to any persistent Skyvern storage.
 
-You'll see this in practice: run recordings, action timelines, and LLM prompts show stable placeholder tokens like `BW_PASSWORD`, `BW_USERNAME`, and `BW_TOTP` wherever real credentials were used. The prefix reflects the vault source (`BW_` for Bitwarden, `OP_` for 1Password, `AZ_` for Azure Key Vault, `SK_` for Skyvern's built-in vault) so you can audit which credential fired without the secret ever leaving your vault.
+You'll see this in practice: run recordings, action timelines, and LLM prompts show stable placeholder tokens like `BW_PASSWORD`, `BW_USERNAME`, and `BW_TOTP` wherever real credentials were used. The prefix reflects the vault source (`BW_` for Bitwarden, `OP_` for 1Password, `AZ_` for Azure Key Vault) so you can audit which credential fired without the secret ever leaving your vault.
 
 ## Learn more
 

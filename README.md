@@ -79,7 +79,7 @@ Additionally, for Windows:
 #### 1. Install Skyvern
 
 ```bash
-pip install "skyvern[all]"
+pip install "skyvern[server]"
 ```
 
 #### 2. Run Skyvern
@@ -134,8 +134,8 @@ uv pip install skyvern
 
 **Installation:**
 - Python SDK / cloud API: `pip install skyvern`
-- Local server + packaged UI: `pip install "skyvern[all]"` then run `skyvern quickstart`
-- Local server + packaged UI with Postgres: `pip install "skyvern[all]"` then run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`
+- Local server + packaged UI: `pip install "skyvern[server]"` then run `skyvern quickstart`
+- Local server + packaged UI with Postgres: `pip install "skyvern[server]"` then run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`
 - Packaged UI for an existing API: `pip install "skyvern[ui]"` then set `VITE_API_BASE_URL` (and `VITE_SKYVERN_API_KEY` if your API requires a key) and run `skyvern run ui`
 - TypeScript: `npm install @skyvern/client`
 

@@ -55,10 +55,8 @@ async function main() {
   });
 
   const result = await client.runTask({
-    body: {
-      prompt: "Get the title of the top post",
-      url: "https://news.ycombinator.com",
-    },
+    prompt: "Get the title of the top post",
+    url: "https://news.ycombinator.com",
   });
 
   console.log(`Run ID: ${result.run_id}`);
@@ -198,11 +196,9 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await client.runTask({
-  body: {
-    prompt: "Get the title of the top post",
-    url: "https://news.ycombinator.com",
-    webhook_url: "https://your-server.com/webhook",
-  },
+  prompt: "Get the title of the top post",
+  url: "https://news.ycombinator.com",
+  webhook_url: "https://your-server.com/webhook",
 });
 ```
 

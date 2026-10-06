@@ -64,7 +64,7 @@ Pass a JSON Schema object to `page.extract` via the `schema` parameter, or to `r
   <Tab title="run_task">
     <CodeGroup>
     ```python Python
-    result = await client.run_task(
+    result = await skyvern.run_task(
         prompt="Get the title of the top post",
         url="https://news.ycombinator.com",
         data_extraction_schema={
@@ -80,17 +80,15 @@ Pass a JSON Schema object to `page.extract` via the `schema` parameter, or to `r
     ```
 
     ```typescript TypeScript
-    const result = await client.runTask({
-      body: {
-        prompt: "Get the title of the top post",
-        url: "https://news.ycombinator.com",
-        data_extraction_schema: {
-          type: "object",
-          properties: {
-            title: {
-              type: "string",
-              description: "The title of the top post",
-            },
+    const result = await skyvern.runTask({
+      prompt: "Get the title of the top post",
+      url: "https://news.ycombinator.com",
+      data_extraction_schema: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "The title of the top post",
           },
         },
       },
@@ -162,7 +160,7 @@ Extract one piece of information, such as the current price of Bitcoin:
 
 <CodeGroup>
 ```python Python
-result = await client.run_task(
+result = await skyvern.run_task(
     prompt="Get the current Bitcoin price in USD",
     url="https://coinmarketcap.com/currencies/bitcoin/",
     data_extraction_schema={
@@ -178,17 +176,15 @@ result = await client.run_task(
 ```
 
 ```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Get the current Bitcoin price in USD",
-    url: "https://coinmarketcap.com/currencies/bitcoin/",
-    data_extraction_schema: {
-      type: "object",
-      properties: {
-        price: {
-          type: "number",
-          description: "Current Bitcoin price in USD",
-        },
+const result = await skyvern.runTask({
+  prompt: "Get the current Bitcoin price in USD",
+  url: "https://coinmarketcap.com/currencies/bitcoin/",
+  data_extraction_schema: {
+    type: "object",
+    properties: {
+      price: {
+        type: "number",
+        description: "Current Bitcoin price in USD",
       },
     },
   },
@@ -231,7 +227,7 @@ Extract multiple items with the same structure, such as the top posts from a new
 
 <CodeGroup>
 ```python Python
-result = await client.run_task(
+result = await skyvern.run_task(
     prompt="Get the top 5 posts",
     url="https://news.ycombinator.com",
     data_extraction_schema={
@@ -264,31 +260,29 @@ result = await client.run_task(
 ```
 
 ```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Get the top 5 posts",
-    url: "https://news.ycombinator.com",
-    data_extraction_schema: {
-      type: "object",
-      properties: {
-        posts: {
-          type: "array",
-          description: "Top 5 posts from the front page",
-          items: {
-            type: "object",
-            properties: {
-              title: {
-                type: "string",
-                description: "Post title",
-              },
-              points: {
-                type: "integer",
-                description: "Number of points",
-              },
-              url: {
-                type: "string",
-                description: "Link to the post",
-              },
+const result = await skyvern.runTask({
+  prompt: "Get the top 5 posts",
+  url: "https://news.ycombinator.com",
+  data_extraction_schema: {
+    type: "object",
+    properties: {
+      posts: {
+        type: "array",
+        description: "Top 5 posts from the front page",
+        items: {
+          type: "object",
+          properties: {
+            title: {
+              type: "string",
+              description: "Post title",
+            },
+            points: {
+              type: "integer",
+              description: "Number of points",
+            },
+            url: {
+              type: "string",
+              description: "Link to the post",
             },
           },
         },
@@ -381,7 +375,7 @@ Extract hierarchical data, such as a product with its pricing and availability:
 
 <CodeGroup>
 ```python Python
-result = await client.run_task(
+result = await skyvern.run_task(
     prompt="Get product details including pricing and availability",
     url="https://www.amazon.com/dp/B0EXAMPLE",
     data_extraction_schema={
@@ -435,51 +429,49 @@ result = await client.run_task(
 ```
 
 ```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Get product details including pricing and availability",
-    url: "https://www.amazon.com/dp/B0EXAMPLE",
-    data_extraction_schema: {
-      type: "object",
-      properties: {
-        product: {
-          type: "object",
-          description: "Product information",
-          properties: {
-            name: {
-              type: "string",
-              description: "Product name",
-            },
-            pricing: {
-              type: "object",
-              description: "Pricing details",
-              properties: {
-                current_price: {
-                  type: "number",
-                  description: "Current price in USD",
-                },
-                original_price: {
-                  type: "number",
-                  description: "Original price before discount",
-                },
-                discount_percent: {
-                  type: "integer",
-                  description: "Discount percentage",
-                },
+const result = await skyvern.runTask({
+  prompt: "Get product details including pricing and availability",
+  url: "https://www.amazon.com/dp/B0EXAMPLE",
+  data_extraction_schema: {
+    type: "object",
+    properties: {
+      product: {
+        type: "object",
+        description: "Product information",
+        properties: {
+          name: {
+            type: "string",
+            description: "Product name",
+          },
+          pricing: {
+            type: "object",
+            description: "Pricing details",
+            properties: {
+              current_price: {
+                type: "number",
+                description: "Current price in USD",
+              },
+              original_price: {
+                type: "number",
+                description: "Original price before discount",
+              },
+              discount_percent: {
+                type: "integer",
+                description: "Discount percentage",
               },
             },
-            availability: {
-              type: "object",
-              description: "Stock information",
-              properties: {
-                in_stock: {
-                  type: "boolean",
-                  description: "Whether the item is in stock",
-                },
-                delivery_estimate: {
-                  type: "string",
-                  description: "Estimated delivery date",
-                },
+          },
+          availability: {
+            type: "object",
+            description: "Stock information",
+            properties: {
+              in_stock: {
+                type: "boolean",
+                description: "Whether the item is in stock",
+              },
+              delivery_estimate: {
+                type: "string",
+                description: "Estimated delivery date",
               },
             },
           },
@@ -619,7 +611,7 @@ The extracted data appears in the `output` field of the completed run. Poll unti
 
 <CodeGroup>
 ```python Python
-result = await client.run_task(
+result = await skyvern.run_task(
     prompt="Get the top post",
     url="https://news.ycombinator.com",
     data_extraction_schema={
@@ -634,7 +626,7 @@ result = await client.run_task(
 run_id = result.run_id
 
 while True:
-    run = await client.get_run(run_id)
+    run = await skyvern.get_run(run_id)
 
     if run.status in ["completed", "failed", "terminated", "timed_out", "canceled"]:
         break
@@ -646,16 +638,14 @@ print(f"Output: {run.output}")
 ```
 
 ```typescript TypeScript
-const result = await client.runTask({
-  body: {
-    prompt: "Get the top post",
-    url: "https://news.ycombinator.com",
-    data_extraction_schema: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "Post title" },
-        points: { type: "integer", description: "Points" },
-      },
+const result = await skyvern.runTask({
+  prompt: "Get the top post",
+  url: "https://news.ycombinator.com",
+  data_extraction_schema: {
+    type: "object",
+    properties: {
+      title: { type: "string", description: "Post title" },
+      points: { type: "integer", description: "Points" },
     },
   },
 });
@@ -663,7 +653,7 @@ const result = await client.runTask({
 const runId = result.run_id;
 
 while (true) {
-  const run = await client.getRun(runId);
+  const run = await skyvern.getRun(runId);
 
   if (["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
     console.log(`Output: ${JSON.stringify(run.output)}`);

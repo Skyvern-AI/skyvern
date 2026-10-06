@@ -25,8 +25,8 @@ Check these in order:
 
 Common causes:
 - **`terminated`**: The AI couldn't complete the goal (CAPTCHA, login blocked, element not found)
-- **`timed_out`**: Exceeded `max_steps`. Increase it or simplify the task
-- **`failed`**: System error (browser crash, network failure)
+- **`timed_out`**: Exceeded the run's time limit
+- **`failed`**: System error (browser crash, network failure), or the run reached `max_steps`. Check `failure_reason`; if it says "Reached the maximum steps", increase `max_steps` or simplify the task
 
 See the [Troubleshooting Guide](/developers/debugging/troubleshooting-guide) for detailed steps.
 </Accordion>
@@ -41,8 +41,8 @@ Multiple similar elements on the page can confuse the AI. Fix this by:
 Check the `llm_response_parsed` artifact to see what action the AI decided to take.
 </Accordion>
 
-<Accordion title="Why is my task timing out?">
-Tasks time out when they exceed `max_steps` (default: 50). This happens when:
+<Accordion title='Why does my task stop with "Reached the maximum steps"?'>
+Tasks fail with `failure_reason` "Reached the maximum steps" when they use up their `max_steps` budget. This happens when:
 
 - The task is too complex for the step limit
 - The AI gets stuck in a navigation loop
@@ -102,7 +102,7 @@ Parameters are available in prompts using `{{ parameter_name }}` syntax. See [Ag
 </Accordion>
 
 <Accordion title="How do I use credentials in an agent?">
-1. **Store credentials**: Go to Settings > Credentials and add your login
+1. **Store credentials**: Go to **Credentials** in the sidebar and add your login
 2. **Reference in agent**: Select the credential in the Login block's credential dropdown
 3. **Never hardcode**: Don't put passwords directly in prompts
 
@@ -153,7 +153,7 @@ For local installations, run `skyvern init` to generate a local API key, which w
 <Accordion title="How do I change the LLM model?">
 **Cloud:** The model is managed by Skyvern. Contact support for custom model requirements.
 
-**Self-hosted:** Run `skyvern init llm` to reconfigure, or set these environment variables:
+**Self-hosted:** Run `skyvern init` to reconfigure, or set these environment variables:
 - `LLM_KEY`: Primary model (e.g., `OPENAI_GPT5_5`, `ANTHROPIC_CLAUDE4.7_OPUS`)
 - `SECONDARY_LLM_KEY`: Optional lightweight model for faster operations
 </Accordion>
@@ -165,15 +165,15 @@ Set `proxy_location` when running a task:
 result = await client.run_task(
     prompt="...",
     url="https://example.com",
-    proxy_location="RESIDENTIAL_US"  # or RESIDENTIAL_ISP for static IPs
+    proxy_location="RESIDENTIAL"  # or RESIDENTIAL_ISP for static IPs
 )
 ```
 
-Available locations include `RESIDENTIAL_US`, `RESIDENTIAL_UK`, `RESIDENTIAL_ISP`, and more. Use `RESIDENTIAL_ISP` for sites that require consistent IP addresses.
+Available locations include `RESIDENTIAL` (United States), `RESIDENTIAL_GB`, `RESIDENTIAL_ISP`, and more. Use `RESIDENTIAL_ISP` for sites that require consistent IP addresses.
 </Accordion>
 
-<Accordion title="Can I increase the max steps limit beyond 75?">
-Yes. Contact support to increase the limit for your account. Higher limits may incur additional costs.
+<Accordion title="Can I increase the max steps limit?">
+Yes. Set `max_steps` on the task (or `max_steps_override` on an agent run). If you hit an account limit, contact support. Higher limits may incur additional costs.
 
 Alternatively, break complex tasks into multiple agent blocks, each with its own step budget.
 </Accordion>
@@ -258,7 +258,7 @@ Skyvern has built-in CAPTCHA solving for common types, but some sites use advanc
 </Accordion>
 
 <Accordion title="How do I set up 2FA/TOTP?">
-1. Go to Settings > Credentials
+1. Go to **Credentials** in the sidebar
 2. Create a new TOTP credential with your authenticator secret
 3. Reference the TOTP credential in your agent's login block
 
@@ -295,7 +295,7 @@ Sites may detect automation through:
 <Accordion title="How do I persist cookies across runs?">
 Use browser profiles:
 
-1. Create a browser profile in Settings > Browser Profiles
+1. Create a browser profile under **Browsers > Profiles** in the sidebar
 2. Log in manually or via an agent
 3. Reference the `browser_profile_id` in subsequent runs
 
@@ -306,7 +306,7 @@ The profile preserves cookies, localStorage, and session state across runs.
 Yes, for self-hosted installations:
 
 ```bash
-skyvern init  # Choose "connect to existing Chrome" option
+skyvern init browser  # Choose the cdp-connect option
 skyvern run server
 ```
 
@@ -328,8 +328,8 @@ If persistent, contact support with your run IDs.
 ## Self-Hosting & Deployment
 
 <Accordion title="What are the requirements for self-hosting Skyvern?">
-- Python 3.11, 3.12, or 3.13
-- PostgreSQL database
+- Python 3.11 to 3.14
+- A database: SQLite by default, or PostgreSQL
 - An LLM API key (OpenAI, Anthropic, Azure, Gemini, or Ollama)
 - Docker (optional, for containerized deployment)
 
@@ -338,10 +338,12 @@ Run `skyvern init` for an interactive setup wizard. See the [Quickstart](/develo
 
 <Accordion title="How do I update my self-hosted Skyvern instance?">
 ```bash
-pip install --upgrade skyvern
-alembic upgrade head  # Run database migrations
+pip install --upgrade "skyvern[server]"
+skyvern init          # Re-runs setup, including database migrations
 skyvern run server    # Restart the server
 ```
+
+From a source checkout, run `git pull` and `alembic upgrade head` instead of the first two commands.
 
 For Docker deployments, pull the latest image and restart your containers.
 </Accordion>
@@ -355,7 +357,7 @@ OPENAI_API_KEY=sk-...
 LLM_KEY=OPENAI_GPT5_5
 ```
 
-Skyvern supports OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Gemini, and Ollama. Run `skyvern init llm` for guided configuration.
+Skyvern supports OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Gemini, Ollama, and more. Run `skyvern init` for guided configuration.
 </Accordion>
 
 ---

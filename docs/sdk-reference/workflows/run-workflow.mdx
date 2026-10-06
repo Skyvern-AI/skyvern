@@ -8,7 +8,7 @@ An agent chains multiple steps (blocks) into a single automation. Agents support
 For conceptual background, see [Build an Agent](/cloud/building-agents/build-an-agent).
 
 <Note>
-Python uses `snake_case` (e.g., `run_workflow`); TypeScript uses `camelCase` (e.g., `runWorkflow`) and wraps request params in a `body` object. Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+Python uses `snake_case` (e.g., `run_workflow`); TypeScript uses `camelCase` method names and SDK options (e.g., `runWorkflow`, `waitForCompletion`), but request fields stay `snake_case` and go directly in the options object (no `body` wrapper). Parameter tables show Python names.
 </Note>
 
 Execute a workflow by its permanent ID. Skyvern opens a cloud browser and runs each block in sequence.
@@ -24,9 +24,7 @@ print(result.output)
 
 ```typescript TypeScript
 const result = await skyvern.runWorkflow({
-  body: {
-    workflow_id: "wpid_abc123",
-  },
+  agent_id: "wpid_abc123",
   waitForCompletion: true,
 });
 console.log(result.output);
@@ -37,7 +35,7 @@ console.log(result.output);
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `workflow_id` | `str` | Yes | - | The workflow's permanent ID (`wpid_...`). |
+| `workflow_id` | `str` | Yes | - | The workflow's permanent ID (`wpid_...`). In TypeScript this field is `agent_id`. |
 | `parameters` | `dict` | No | `None` | Input parameters defined in the workflow. Keys must match parameter names. |
 | `wait_for_completion` | `bool` | No | `False` | Block until the workflow finishes. |
 | `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
@@ -46,13 +44,15 @@ console.log(result.output);
 | `browser_session_id` | `str` | No | `None` | Run inside an existing [browser session](/developers/optimization/browser-sessions). |
 | `browser_profile_id` | `str` | No | `None` | Load a [browser profile](/developers/optimization/browser-profiles) (cookies, storage) into the session. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route the browser through a geographic proxy. |
-| `max_steps_override` | `int` | No | `None` | Cap total AI steps across all blocks. |
+| `max_steps_override` | `int` | No | `None` | Override the step limit for each task in the run (not a total across blocks). In TypeScript, pass it as `"x-max-steps-override"`. |
+| `max_elapsed_time_minutes` | `int` | No | `None` | Time out the run after this many minutes. Platform default is 240; maximum is 480. |
+| `run_metadata` | `dict[str, str]` | No | `None` | String key/value metadata attached to the run for analytics tag filtering. |
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the run finishes. |
 | `title` | `str` | No | `None` | Display name for this run in the dashboard. |
 | `totp_identifier` | `str` | No | `None` | Identifier for TOTP verification. |
 | `totp_url` | `str` | No | `None` | Workflow-level TOTP endpoint metadata. For saved agents/workflows, set **TOTP Verification URL** on the block that may encounter 2FA, or template that block field from a workflow parameter. |
 | `template` | `bool` | No | `None` | Run a template workflow. |
-| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
+| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. In TypeScript, pass it as `"x-user-agent"`. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
 | `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. |
 | `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
@@ -92,12 +92,10 @@ result = await client.run_workflow(
 
 ```typescript TypeScript
 const result = await skyvern.runWorkflow({
-  body: {
-    workflow_id: "wpid_invoice_extraction",
-    parameters: {
-      company_name: "Acme Corp",
-      date_range: "2025-01-01 to 2025-12-31",
-    },
+  agent_id: "wpid_invoice_extraction",
+  parameters: {
+    company_name: "Acme Corp",
+    date_range: "2025-01-01 to 2025-12-31",
   },
   waitForCompletion: true,
 });
@@ -128,10 +126,8 @@ result = await client.run_workflow(
 
 ```typescript TypeScript
 const result = await skyvern.runWorkflow({
-  body: {
-    workflow_id: "wpid_daily_report",
-    browser_profile_id: "bp_abc123",
-  },
+  agent_id: "wpid_daily_report",
+  browser_profile_id: "bp_abc123",
   waitForCompletion: true,
 });
 ```

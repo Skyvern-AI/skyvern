@@ -99,10 +99,11 @@ It will:
 
 <ApiKeyPrompt>{`Set up Skyvern for browser automation:
 
-1. Install the Skyvern Python SDK (requires Python 3.11, 3.12, or 3.13).
+1. Install the Skyvern Python SDK with the local extra (requires Python 3.11-3.14).
+   The browser methods below need it, even with a cloud browser.
    If you hit version errors, use pipx to install in an isolated environment:
-   pip install skyvern
-   # or: pipx install skyvern
+   pip install "skyvern[local]"
+   # or: pipx install "skyvern[local]"
 
 2. Install all Skyvern skills into this project:
    skyvern skill copy --output .claude/skills/

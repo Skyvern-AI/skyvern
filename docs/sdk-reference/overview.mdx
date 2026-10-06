@@ -68,10 +68,8 @@ import { Skyvern } from "@skyvern/client";
 const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
 
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Get the title of the top post on Hacker News",
-    url: "https://news.ycombinator.com",
-  },
+  prompt: "Get the title of the top post on Hacker News",
+  url: "https://news.ycombinator.com",
   waitForCompletion: true,
 });
 console.log(result.output);
@@ -86,7 +84,7 @@ console.log(result.output);
 | `environment` | `SkyvernEnvironment` | `CLOUD` / `Cloud` | Target environment. See [Environments](#environments). |
 | `base_url` / `baseUrl` | `str` / `string` | `None` | Override the API base URL for self-hosted deployments. |
 | `timeout` / `timeoutInSeconds` | `float` / `number` | `None` / `60` | HTTP request timeout in seconds. |
-| `max_retries` / `maxRetries` | `int` / `number` | `None` / `2` | Number of times to retry failed requests. |
+| `maxRetries` (TypeScript only) | `number` | `2` | Number of times to retry failed requests. The Python constructor has no `max_retries`; pass `RequestOptions(max_retries=...)` per request instead (see [Request options](#request-options)). |
 | `headers` | `dict` / `Record<string, string>` | `None` | Additional headers included with every request. |
 
 <Accordion title="Python-only constructor options">
@@ -165,6 +163,7 @@ If you configured headful mode during `skyvern quickstart`, a Chromium window op
 |-----------|------|---------|-------------|
 | `llm_config` | `LLMConfig \| LLMRouterConfig \| None` | `None` | Override the LLM. If omitted, uses `LLM_KEY` from `.env`. |
 | `settings` | `dict \| None` | `None` | Override `.env` settings at runtime. Example: `{"MAX_STEPS_PER_RUN": 100}` |
+| `use_in_memory_db` | `bool \| None` | `None` | `True` forces an ephemeral in-memory SQLite database. `False` forces persistent mode (requires `DATABASE_STRING` and `SKYVERN_API_KEY`). `None` auto-detects: persistent if `DATABASE_STRING` is set, otherwise in-memory. |
 
 ---
 
@@ -193,20 +192,16 @@ print(task.run_id)  # poll with client.get_run(task.run_id)
 ```typescript TypeScript
 // Returns only after the task finishes (up to 30 min by default)
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the contact form",
-    url: "https://example.com/contact",
-  },
+  prompt: "Fill out the contact form",
+  url: "https://example.com/contact",
   waitForCompletion: true,
   timeout: 600, // give up after 10 minutes
 });
 
 // Without waitForCompletion -- returns immediately
 const task = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the contact form",
-    url: "https://example.com/contact",
-  },
+  prompt: "Fill out the contact form",
+  url: "https://example.com/contact",
 });
 console.log(task.run_id); // poll with skyvern.getRun(task.run_id)
 ```
@@ -244,10 +239,8 @@ result = await client.run_task(
 // Pass as second argument to any method
 const result = await skyvern.runTask(
   {
-    body: {
-      prompt: "Extract data",
-      url: "https://example.com",
-    },
+    prompt: "Extract data",
+    url: "https://example.com",
   },
   {
     timeoutInSeconds: 120,

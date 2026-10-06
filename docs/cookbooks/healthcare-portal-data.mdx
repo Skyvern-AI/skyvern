@@ -53,10 +53,8 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await client.runTask({
-  body: {
-    url: "https://demo.openemr.io/openemr/index.php",
-    prompt: "Log in and extract the patient list",
-  },
+  url: "https://demo.openemr.io/openemr/index.php",
+  prompt: "Log in and extract the patient list",
 });
 ```
 </CodeGroup>
@@ -92,11 +90,9 @@ Route the browser through a residential IP to bypass WAF/bot detection. The demo
 
     ```typescript TypeScript
     const result = await client.runTask({
-      body: {
-        url: "https://demo.openemr.io/openemr/index.php",
-        prompt: "Log in with username 'admin' and password 'pass', confirm the Calendar page loads",
-        proxy_location: "RESIDENTIAL",
-      },
+      url: "https://demo.openemr.io/openemr/index.php",
+      prompt: "Log in with username 'admin' and password 'pass', confirm the Calendar page loads",
+      proxy_location: "RESIDENTIAL",
     });
     ```
     </CodeGroup>
@@ -115,9 +111,9 @@ Log in once, save the browser state as a profile, and skip login on future runs.
   <Tab title="Cloud UI">
     <Steps>
       <Step title="Create a login agent">
-        Go to **Agents** in the sidebar and create a new agent. Add a **Navigation** block with URL `https://demo.openemr.io/openemr/index.php` and goal: "Log in with username 'admin' and password 'pass'. Confirm the Calendar page loads."
+        Go to **Agents** in the sidebar and create a new agent. Add a **Browser Task** block with URL `https://demo.openemr.io/openemr/index.php` and goal: "Log in with username 'admin' and password 'pass'. Confirm the Calendar page loads."
 
-        On the **Start** node, expand the settings and enable **Save & Reuse Session**. Set **Proxy Location** to a country (e.g., **United States**).
+        On the **Start** node, expand the settings and enable **Save & reuse browser profile**. Set **Proxy Location** to a country (e.g., **United States**).
 
         <Frame>
           <video
@@ -133,7 +129,7 @@ Log in once, save the browser state as a profile, and skip login on future runs.
         Run the agent and wait for it to complete.
       </Step>
       <Step title="Create a profile via API">
-        Browser profile creation is done via the API. Use the `create_browser_profile` call from the API/SDK tab with the completed agent run ID. Name it `openemr-demo-admin`.
+        Creating a profile from a completed agent run is done via the API. Use the `create_browser_profile` call from the API/SDK tab with the completed agent run ID. Name it `openemr-demo-admin`.
       </Step>
     </Steps>
   </Tab>
@@ -227,10 +223,8 @@ Log in once, save the browser state as a profile, and skip login on future runs.
 
       // 2. Run with residential proxy
       const run = await client.runWorkflow({
-        body: {
-          workflow_id: workflow.workflow_permanent_id,
-          proxy_location: "RESIDENTIAL",
-        },
+        agent_id: workflow.workflow_permanent_id,
+        proxy_location: "RESIDENTIAL",
         waitForCompletion: true,
       });
       console.log(`Login: ${run.status}`);
@@ -276,7 +270,7 @@ Navigate to **Patient/Client > Finder** and extract the results table.
   <Tab title="Cloud UI">
     Create an agent with two blocks:
 
-    1. **Navigation** block, URL: `https://demo.openemr.io/openemr/index.php`. Goal: "Click Patient/Client in the top menu, then click Finder. Click Search to display all patients."
+    1. **Browser Task** block, URL: `https://demo.openemr.io/openemr/index.php`. Goal: "Click Patient/Client in the top menu, then click Finder. Click Search to display all patients."
     2. **Extraction** block, Goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
 
     On the **Start** node, set **Proxy Location** to a country (e.g., **United States**). Run the agent.
@@ -355,15 +349,13 @@ Navigate to **Patient/Client > Finder** and extract the results table.
       const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
       let run = await client.runTask({
-        body: {
-          url: "https://demo.openemr.io/openemr/index.php",
-          prompt:
-            "Click Patient/Client in the top menu, then click Finder. " +
-            "Click Search to display all patients.",
-          data_extraction_schema: PATIENT_SCHEMA,
-          proxy_location: "RESIDENTIAL",
-          browser_session_id: "YOUR_SESSION_ID",
-        },
+        url: "https://demo.openemr.io/openemr/index.php",
+        prompt:
+          "Click Patient/Client in the top menu, then click Finder. " +
+          "Click Search to display all patients.",
+        data_extraction_schema: PATIENT_SCHEMA,
+        proxy_location: "RESIDENTIAL",
+        browser_session_id: "YOUR_SESSION_ID",
       });
 
       while (!["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
@@ -397,7 +389,7 @@ The demo resets daily and community users add test patients, so exact records ma
 </Note>
 
 <Note>
-Browser profiles cannot be used directly with standalone tasks. Create a [browser session](/developers/optimization/browser-sessions) from the profile first, then pass the session ID. See [Pagination with browser sessions](#pagination-with-browser-sessions) below for the full pattern.
+The Python SDK `run_task` method does not take a `browser_profile_id` (the REST `/v1/run/tasks` endpoint does). From the SDK, create a [browser session](/developers/optimization/browser-sessions) from the profile first, then pass the session ID. See [Pagination with browser sessions](#pagination-with-browser-sessions) below for the full pattern.
 </Note>
 
 ---
@@ -410,7 +402,7 @@ Navigate to **Reports > Visits > Superbill**, set a date range, and extract the 
   <Tab title="Cloud UI">
     Create an agent with two blocks:
 
-    1. **Navigation** block, Goal: "Click Reports in the top menu, then Visits, then Superbill. Set the From date to 2020-01-01 and the To date to today. Click Submit."
+    1. **Browser Task** block, Goal: "Click Reports in the top menu, then Visits, then Superbill. Set the From date to 2020-01-01 and the To date to today. Click Submit."
     2. **Extraction** block, Goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
 
     On the **Start** node, set **Proxy Location** to a country (e.g., **United States**). Run the agent.
@@ -474,15 +466,13 @@ Navigate to **Reports > Visits > Superbill**, set a date range, and extract the 
     } as const;
 
     let run = await client.runTask({
-      body: {
-        url: "https://demo.openemr.io/openemr/index.php",
-        prompt:
-          "Click Reports in the top menu, then Visits, then Superbill. " +
-          "Set the From date to 2020-01-01 and the To date to today. Click Submit.",
-        data_extraction_schema: ENCOUNTER_SCHEMA,
-        proxy_location: "RESIDENTIAL",
-        browser_session_id: "YOUR_SESSION_ID",
-      },
+      url: "https://demo.openemr.io/openemr/index.php",
+      prompt:
+        "Click Reports in the top menu, then Visits, then Superbill. " +
+        "Set the From date to 2020-01-01 and the To date to today. Click Submit.",
+      data_extraction_schema: ENCOUNTER_SCHEMA,
+      proxy_location: "RESIDENTIAL",
+      browser_session_id: "YOUR_SESSION_ID",
     });
     ```
     </CodeGroup>
@@ -516,7 +506,7 @@ A [Browser Profile](/developers/optimization/browser-profiles) is a saved snapsh
   <Tab title="Cloud UI">
     <Steps>
       <Step title="Create a session">
-        Go to **Browsers** in the sidebar. Click **Create Session**. Set **Proxy Location** to a country (e.g., **United States**) and configure the timeout.
+        Go to **Browsers** in the sidebar. Click **Create Browser Session**. Set **Proxy Location** to a country (e.g., **United States**) and configure the timeout.
 
         <Frame>
           <video
@@ -643,12 +633,10 @@ A [Browser Profile](/developers/optimization/browser-profiles) is a saved snapsh
             "Extract all patient rows from the table.";
 
       let run = await client.runTask({
-        body: {
-          url: "https://demo.openemr.io/openemr/index.php",
-          prompt,
-          browser_session_id: sessionId,
-          data_extraction_schema: PATIENT_SCHEMA,
-        },
+        url: "https://demo.openemr.io/openemr/index.php",
+        prompt,
+        browser_session_id: sessionId,
+        data_extraction_schema: PATIENT_SCHEMA,
       });
 
       while (!["completed", "failed", "terminated", "timed_out", "canceled"].includes(run.status)) {
@@ -705,11 +693,11 @@ You cannot use `browser_profile_id` and `browser_session_id` in the same request
 
 ## Error handling
 
-OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on agent blocks to classify failures, and `max_retries` to retry automatically.
+OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on Browser Task (`navigation`) blocks to classify failures, and `max_retries` to retry automatically.
 
 <Tabs>
   <Tab title="Cloud UI">
-    On each Navigation and Extraction block, expand **Advanced Settings** and enable **Error Messages**. Add this JSON:
+    On each Browser Task block, expand **Advanced Settings** and enable **Error Messages**. Add this JSON:
 
     ```json
     { "session_expired": "Session expired, login required, or access denied page" }
@@ -730,13 +718,13 @@ OpenEMR can timeout or show session-expired pages. Use `error_code_mapping` on a
     </Note>
   </Tab>
   <Tab title="API / SDK">
-    Set `error_code_mapping` and `max_retries` directly on agent blocks:
+    Set `error_code_mapping` and `max_retries` directly on `navigation` blocks. Extraction blocks accept `max_retries` but not `error_code_mapping`:
 
     ```json
     {
-      "block_type": "extraction",
-      "label": "extract_patients",
-      "data_extraction_goal": "Extract all patient rows from the table",
+      "block_type": "navigation",
+      "label": "open_patient_finder",
+      "navigation_goal": "Open the Patient Finder and display all patients",
       "error_code_mapping": {
         "session_expired": "Session expired, login required, or access denied page"
       },
@@ -798,16 +786,16 @@ This agent combines everything: navigate to the Patient Finder, extract demograp
   <Tab title="Cloud UI">
     <Steps>
       <Step title="Create the agent">
-        Go to **Agents** and create a new agent named "OpenEMR Daily Extract." On the **Start** node, enable **Save & Reuse Session** and set **Proxy Location** to a country (e.g., **United States**).
+        Go to **Agents** and create a new agent named "OpenEMR Daily Extract." On the **Start** node, enable **Save & reuse browser profile** and set **Proxy Location** to a country (e.g., **United States**).
       </Step>
-      <Step title="Block 1: Navigation (open Patient Finder)">
-        Add a **Navigation** block. Set URL to `https://demo.openemr.io/openemr/index.php` and goal: "Click Patient/Client > Finder. Click Search to display all patients. If a login page appears, log in with 'admin'/'pass'." In **Advanced Settings**, enable **Error Messages** and add `{"session_expired": "Session expired, login required, or access denied page"}`.
+      <Step title="Block 1: Browser Task (open Patient Finder)">
+        Add a **Browser Task** block. Set URL to `https://demo.openemr.io/openemr/index.php` and goal: "Click Patient/Client > Finder. Click Search to display all patients. If a login page appears, log in with 'admin'/'pass'." In **Advanced Settings**, enable **Error Messages** and add `{"session_expired": "Session expired, login required, or access denied page"}`.
       </Step>
       <Step title="Block 2: Extraction (patient demographics)">
         Add an **Extraction** block. Set goal: "Extract all patient rows from the Patient Finder results table." Paste the patient schema into **Data Schema**.
       </Step>
-      <Step title="Block 3: Navigation (open Superbill)">
-        Add another **Navigation** block. Set goal: "Click Reports > Visits > Superbill. Set From to 2020-01-01, To to today. Click Submit." Add the same error messages mapping.
+      <Step title="Block 3: Browser Task (open Superbill)">
+        Add another **Browser Task** block. Set goal: "Click Reports > Visits > Superbill. Set From to 2020-01-01, To to today. Click Submit." Add the same error messages mapping.
       </Step>
       <Step title="Block 4: Extraction (encounter billing)">
         Add another **Extraction** block. Set goal: "Extract all encounter rows from the Superbill report." Paste the encounter schema into **Data Schema**.
@@ -894,7 +882,6 @@ This agent combines everything: navigate to the Patient Finder, extract demograp
                             "label": "extract_patients",
                             "data_extraction_goal": "Extract all patient rows from the Patient Finder results table",
                             "data_schema": PATIENT_SCHEMA,
-                            "error_code_mapping": {"session_expired": SESSION_ERROR},
                             "max_retries": 2,
                         },
                         {
@@ -912,7 +899,6 @@ This agent combines everything: navigate to the Patient Finder, extract demograp
                             "label": "extract_encounters",
                             "data_extraction_goal": "Extract all encounter rows from the Superbill report",
                             "data_schema": ENCOUNTER_SCHEMA,
-                            "error_code_mapping": {"session_expired": SESSION_ERROR},
                             "max_retries": 2,
                         },
                     ],
@@ -1006,7 +992,6 @@ This agent combines everything: navigate to the Patient Finder, extract demograp
                   label: "extract_patients",
                   data_extraction_goal: "Extract all patient rows from the Patient Finder results table",
                   data_schema: PATIENT_SCHEMA,
-                  error_code_mapping: { session_expired: SESSION_ERROR },
                   max_retries: 2,
                 },
                 {
@@ -1023,7 +1008,6 @@ This agent combines everything: navigate to the Patient Finder, extract demograp
                   label: "extract_encounters",
                   data_extraction_goal: "Extract all encounter rows from the Superbill report",
                   data_schema: ENCOUNTER_SCHEMA,
-                  error_code_mapping: { session_expired: SESSION_ERROR },
                   max_retries: 2,
                 },
               ],
@@ -1034,11 +1018,9 @@ This agent combines everything: navigate to the Patient Finder, extract demograp
       console.log(`Workflow: ${workflow.workflow_permanent_id}`);
 
       const run = await client.runWorkflow({
-        body: {
-          workflow_id: workflow.workflow_permanent_id,
-          browser_profile_id: "YOUR_PROFILE_ID",
-          proxy_location: "RESIDENTIAL",
-        },
+        agent_id: workflow.workflow_permanent_id,
+        browser_profile_id: "YOUR_PROFILE_ID",
+        proxy_location: "RESIDENTIAL",
         waitForCompletion: true,
       });
 
@@ -1101,7 +1083,7 @@ The OpenEMR demo resets daily at 8:00 AM UTC, so profiles expire every day. In p
   <Card
     title="Extract Structured Data"
     icon="table"
-    href="/running-automations/extract-structured-data"
+    href="/developers/browser-automations/extract-structured-data"
   >
     JSON schema design and the interactive schema builder
   </Card>

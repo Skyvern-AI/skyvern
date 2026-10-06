@@ -1,7 +1,7 @@
 ---
 title: Storage Configuration
 subtitle: Configure where Skyvern stores artifacts and recordings
-description: Configure Skyvern artifact storage using local filesystem, AWS S3, or Azure Blob Storage. Covers screenshots, browser recordings, HAR files, and extracted data storage for self-hosted deployments.
+description: Configure Skyvern artifact storage using local filesystem, AWS S3, Azure Blob Storage, or Google Cloud Storage. Covers screenshots, browser recordings, HAR files, and extracted data storage for self-hosted deployments.
 slug: developers/self-hosted/storage
 keywords:
   - AWS S3
@@ -13,17 +13,18 @@ keywords:
   - container
 ---
 
-Skyvern generates several types of artifacts during task execution: screenshots, browser recordings, HAR files, and extracted data. By default, these are stored on the local filesystem. For production deployments, you can configure S3 or Azure Blob Storage.
+Skyvern generates several types of artifacts during task execution: screenshots, browser recordings, HAR files, and extracted data. By default, these are stored on the local filesystem. For production deployments, you can configure S3, Azure Blob Storage, or Google Cloud Storage.
 
 ## Storage types
 
-Skyvern supports three storage backends:
+Skyvern supports four storage backends:
 
 | Type | `SKYVERN_STORAGE_TYPE` | Best for |
 |------|------------------------|----------|
 | Local filesystem | `local` | Development, single-server deployments |
 | AWS S3 | `s3` | Production on AWS, multi-server deployments |
 | Azure Blob | `azureblob` | Production on Azure |
+| Google Cloud Storage | `gcs` | Production on GCP |
 
 ---
 
@@ -96,11 +97,7 @@ AWS_SECRET_ACCESS_KEY=...
 
 Attach an IAM role with S3 permissions to your instance or pod. No credentials needed in environment.
 
-**AWS profile:**
-
-```bash .env
-AWS_PROFILE=your-profile-name
-```
+**AWS profile:** the standard `AWS_PROFILE` environment variable is read by the AWS SDK, not by Skyvern itself, so it must be set in the container's environment.
 
 ### Required IAM permissions
 
@@ -225,32 +222,46 @@ az storage container create --name skyvern-browser-sessions --account-name yours
 az storage container create --name skyvern-uploads --account-name yourstorageaccount
 ```
 
-### Using Managed Identity (recommended)
+<Note>
+Azure Blob storage requires both `AZURE_STORAGE_ACCOUNT_NAME` and `AZURE_STORAGE_ACCOUNT_KEY`. Managed Identity is not supported for artifact storage; Skyvern raises an error if the key is missing.
+</Note>
 
-For Azure VMs or AKS, use Managed Identity instead of storage account keys:
+---
 
-1. Enable Managed Identity on your VM or AKS cluster
-2. Grant the identity "Storage Blob Data Contributor" role on the storage account
-3. Omit `AZURE_STORAGE_ACCOUNT_KEY` from your configuration
+## Google Cloud Storage
+
+Store artifacts in GCS for GCP-based deployments. Authentication uses Application Default Credentials (Workload Identity on GKE, or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key).
+
+```bash .env
+SKYVERN_STORAGE_TYPE=gcs
+GCS_PROJECT_ID=your-gcp-project-id
+GCS_BUCKET_ARTIFACTS=skyvern-artifacts
+GCS_BUCKET_SCREENSHOTS=skyvern-screenshots
+GCS_BUCKET_BROWSER_SESSIONS=skyvern-browser-sessions
+GCS_BUCKET_UPLOADS=skyvern-uploads
+
+# Only needed under Workload Identity, where the runtime service account has no signing key
+GCS_SIGNER_SA_EMAIL=skyvern@your-gcp-project-id.iam.gserviceaccount.com
+```
 
 ---
 
 ## What gets stored where
 
-| Artifact type | S3 bucket / Azure container | Contents |
+| Artifact type | S3 / GCS bucket or Azure container | Contents |
 |---------------|---------------------------|----------|
 | Artifacts | `*-artifacts` | Extracted data, HTML snapshots, logs |
 | Screenshots | `*-screenshots` | Page screenshots at each step |
 | Browser Sessions | `*-browser-sessions` | Saved browser state for profiles |
 | Uploads | `*-uploads` | User-uploaded files for workflows |
 
-Videos (recordings) are currently always stored locally in `VIDEO_PATH` regardless of storage type.
+Videos (recordings) are written to `VIDEO_PATH` while the browser runs, then uploaded as artifacts to the configured storage backend.
 
 ---
 
 ## Pre-signed URLs
 
-When artifacts are stored in S3 or Azure Blob, Skyvern generates pre-signed URLs for access. These URLs:
+When artifacts are stored in S3, Azure Blob, or GCS, Skyvern generates pre-signed URLs for access. These URLs:
 
 - Expire after `PRESIGNED_URL_EXPIRATION` seconds (default: 24 hours)
 - Allow direct download without additional authentication

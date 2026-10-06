@@ -22,6 +22,12 @@ The `skyvern` CLI gives you direct access to browser automation, agent managemen
 pip install skyvern
 ```
 
+The `skyvern browser …` commands also need the local browser extra (Playwright):
+
+```bash
+pip install "skyvern[local]"
+```
+
 Set your API key and target:
 
 ```bash
@@ -44,7 +50,7 @@ skyvern init
 ```bash
 skyvern run server            # Start the local API server
 skyvern run mcp               # Start the MCP server (stdio transport)
-skyvern run mcp --http        # Start the MCP server (HTTP transport)
+skyvern run mcp --transport streamable-http  # Start the MCP server (HTTP transport)
 skyvern status                # Check if services are running
 skyvern stop                  # Stop running services
 ```
@@ -123,12 +129,12 @@ See the [full guide](/developers/optimization/browser-tunneling) for all options
 
 ```bash
 skyvern workflow list                              # List all workflows
-skyvern workflow get --workflow-id wpid_xxx         # Get workflow details
-skyvern workflow create --file workflow.json         # Create from JSON definition
-skyvern workflow update --workflow-id wpid_xxx --file updated.json
-skyvern workflow delete --workflow-id wpid_xxx
-skyvern workflow run --workflow-id wpid_xxx          # Execute a workflow
-skyvern workflow run --workflow-id wpid_xxx --params '{"url": "https://example.com"}'
+skyvern workflow get --id wpid_xxx                 # Get workflow details
+skyvern workflow create --definition @workflow.json  # Create from a JSON/YAML file (or inline string)
+skyvern workflow update --id wpid_xxx --definition @updated.json
+skyvern workflow delete --id wpid_xxx --force       # --force confirms the permanent delete
+skyvern workflow run --id wpid_xxx                  # Execute a workflow
+skyvern workflow run --id wpid_xxx --params '{"url": "https://example.com"}'
 skyvern workflow status --run-id wr_xxx              # Check run status
 skyvern workflow cancel --run-id wr_xxx              # Cancel a running workflow
 ```
@@ -150,7 +156,7 @@ Note: `credentials` (plural) is used for the interactive `add` command; `credent
 
 ```bash
 skyvern block schema --block-type task     # Show the JSON schema for a block type
-skyvern block validate --file block.json   # Validate a block definition
+skyvern block validate --block-json @block.json   # Validate a block definition (JSON string or @file)
 ```
 
 ### MCP setup
@@ -273,17 +279,17 @@ OpenClaw's MCP config provides the callable Skyvern tools; the workspace skill i
 
 ## JSON output
 
-All commands support `--json` for structured output, making it easy to compose with `jq` and other tools:
+All commands support `--json` for structured output, making it easy to compose with `jq` and other tools. The output is an envelope (`ok`, `action`, `data`, `error`, …), and the command's result is under `data`:
 
 ```bash
 # Extract the session ID from a new session
-SESSION=$(skyvern browser session create --json | jq -r '.session_id')
+SESSION=$(skyvern browser session create --json | jq -r '.data.session_id')
 
 # Extract data and pipe to a file
-skyvern browser extract --prompt "Get all links" --json | jq '.extracted' > links.json
+skyvern browser extract --prompt "Get all links" --json | jq '.data.extracted' > links.json
 
 # Check workflow run status in a script
-STATUS=$(skyvern workflow status --run-id wr_xxx --json | jq -r '.status')
+STATUS=$(skyvern workflow status --run-id wr_xxx --json | jq -r '.data.status')
 ```
 
 ## Troubleshooting
@@ -313,7 +319,7 @@ echo $SKYVERN_API_KEY
 You can also pass it directly:
 
 ```bash
-skyvern credentials add --api-key YOUR_KEY
+skyvern credentials --api-key YOUR_KEY add
 ```
 
 Get an API key from [Settings](https://app.skyvern.com/settings/) in the Skyvern dashboard.

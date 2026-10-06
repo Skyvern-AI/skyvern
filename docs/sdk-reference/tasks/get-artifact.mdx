@@ -3,6 +3,10 @@ title: "get_artifact"
 slug: sdk-reference/tasks/get-artifact
 ---
 
+<Warning>
+`get_artifact` / `getArtifact` was removed from the SDKs in version 1.0.29, so the examples below no longer work. Use [`get_run_artifacts`](/sdk-reference/tasks/get-run-artifacts) to list a run's artifacts (optionally filtered by `artifact_type`) and read each artifact's `uri`. To download an artifact's raw content, call the API endpoint `GET /v1/artifacts/{artifact_id}/content`.
+</Warning>
+
 Get a single artifact by ID.
 
 <CodeGroup>

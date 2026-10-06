@@ -26,7 +26,7 @@ console.log(run.status, run.output);
 
 ### Returns `GetRunResponse`
 
-A discriminated union based on `run_type`. All variants share the same core fields as `TaskRunResponse` above, plus a `run_type` field (`task_v1`, `task_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `workflow_run`).
+A discriminated union based on `run_type`. All variants share the same core fields as `TaskRunResponse` above, plus a `run_type` field (`task_v1`, `task_v2`, `task_v3`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`, `workflow_run`). The TypeScript SDK's union does not include `task_v3`.
 
 Workflow run responses additionally include `run_with` and `ai_fallback` fields.
 

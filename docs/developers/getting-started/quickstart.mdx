@@ -33,7 +33,7 @@ Sign up at [app.skyvern.com](https://app.skyvern.com) and go to [Settings](https
 
 <CodeGroup>
 ```bash Python
-pip install skyvern
+pip install "skyvern[local]"
 ```
 
 ```bash TypeScript
@@ -42,14 +42,14 @@ npm install @skyvern/client
 </CodeGroup>
 
 <Info>
-`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are using embedded local mode with `Skyvern.local()` or `launch_local_browser()`, install the local extra: `pip install "skyvern[local]"`. For a local Skyvern server, self-hosted instance, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`. For full local setup with migrations and the web UI, use Docker Compose or a source checkout.
+The browser methods used below (`launch_cloud_browser()`, `page.extract`, `page.agent.*`) need the `local` extra, which adds Playwright. That's true even when the browser runs in Skyvern Cloud. Plain `pip install skyvern` is enough only if you call the REST API through the client (`run_task`, `run_workflow`, `get_run`, and so on). For a local Skyvern server, self-hosted instance, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`.
 </Info>
 
 <Accordion title="Troubleshooting: Python version errors">
-The Skyvern SDK requires Python 3.11, 3.12, or 3.13. If you encounter version errors, try using pipx:
+The Skyvern SDK requires Python 3.11, 3.12, 3.13, or 3.14. If you encounter version errors, try using pipx:
 
 ```bash
-pipx install skyvern
+pipx install "skyvern[local]"
 ```
 
 pipx installs Python packages in isolated environments while making them globally available.
@@ -170,6 +170,7 @@ done
 **Run states:**
 - `created`, `queued`: Waiting for an available browser
 - `running`: AI is navigating and executing
+- `paused`: Waiting on a human interaction step (agent runs only)
 - `completed`: Task finished successfully
 - `failed` / `terminated` / `timed_out` / `canceled`: Non-success terminal states
 
@@ -197,12 +198,10 @@ You can run Skyvern with a browser on your own machine. This is useful for devel
 
 **Prerequisites:**
 - Skyvern server extra installed (`pip install "skyvern[server]"`)
-- Source checkout or Docker Compose for guided quickstart and database migrations
-- PostgreSQL database (local install or Docker)
 - An LLM API key (OpenAI, Anthropic, Azure OpenAI, Gemini, Ollama, or any OpenAI-compatible provider)
 
 <Note>
-Docker is optional. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically. Use `skyvern init --no-postgres` to skip database setup entirely if you're managing PostgreSQL separately. The PyPI wheel installs the local-server dependencies, but guided quickstart currently needs repository migration files from a source checkout.
+Docker and PostgreSQL are optional. Without a `DATABASE_STRING`, Skyvern uses a SQLite database at `~/.skyvern/data.db`. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically; you can also pass `--database-string postgresql+psycopg://user:pass@host:5432/dbname`, or let the wizard start a PostgreSQL container. Use `skyvern init --no-postgres` to skip the PostgreSQL step if you're managing the database yourself.
 </Note>
 
 ### Set up local Skyvern

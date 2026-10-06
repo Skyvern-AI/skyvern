@@ -1,14 +1,13 @@
 ---
 title: Proxy & Geolocation
 subtitle: Route browser traffic through residential proxies worldwide
-description: Route Skyvern browser traffic through residential proxies in 20 countries to bypass geo-restrictions, avoid bot detection, and access region-locked content. Configure proxy_location for tasks, agents, and browser sessions.
+description: Route Skyvern browser traffic through residential proxies in 21 countries to bypass geo-restrictions, avoid bot detection, and access region-locked content. Configure proxy_location for tasks, agents, and browser sessions.
 slug: developers/going-to-production/proxy-geolocation
 keywords:
   - proxy_location
   - residential proxy
   - geolocation
   - RESIDENTIAL
-  - RESIDENTIAL_US
   - geo-restriction
   - IP rotation
   - country
@@ -417,7 +416,7 @@ export const ProxyMapSelector = () => {
   )
 }
 
-Many websites serve different content based on your location: prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 20 countries, so sites see a legitimate local visitor. 
+Many websites serve different content based on your location: prices in local currency, region-locked inventory, or outright access blocks. Others detect and block datacenter IPs, treating them as bots. Skyvern's residential proxy network routes your browser through real consumer IP addresses in 21 countries, so sites see a legitimate local visitor. 
 
 <Note>
 Proxy routing is only available in Skyvern Cloud. Self-hosted deployments require your own proxy infrastructure.
@@ -444,11 +443,9 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await client.runTask({
-  body: {
-    prompt: "Get the price of this product",
-    url: "https://shop.example.co.uk/product/123",
-    proxy_location: "RESIDENTIAL_GB",
-  },
+  prompt: "Get the price of this product",
+  url: "https://shop.example.co.uk/product/123",
+  proxy_location: "RESIDENTIAL_GB",
 });
 ```
 
@@ -499,11 +496,9 @@ const workflow = await client.createWorkflow({
 
 // Override for a specific run (takes priority over workflow default)
 const run = await client.runWorkflow({
-  body: {
-    workflow_id: "wpid_123456789",
-    parameters: {...},
-    proxy_location: "RESIDENTIAL_DE",  // This run uses Germany instead
-  },
+  agent_id: "wpid_123456789",
+  parameters: {...},
+  proxy_location: "RESIDENTIAL_DE",  // This run uses Germany instead,
 });
 ```
 
@@ -548,10 +543,8 @@ session = await client.create_browser_session(
 
 ```typescript TypeScript
 const session = await client.createBrowserSession({
-  body: {
-    timeout: 60,
-    proxy_location: "RESIDENTIAL_DE",
-  },
+  timeout: 60,
+  proxy_location: "RESIDENTIAL_DE",
 });
 ```
 
@@ -632,7 +625,7 @@ Use these enum values for country-level targeting. Each routes through a residen
 
 ### State and city targeting
 
-For granular targeting (a specific US state, a city, or a country not in the presets), pass a `GeoTarget` object instead of an enum.
+For granular targeting (a specific US state or a city within a supported country), pass a `GeoTarget` object instead of an enum.
 
 <CodeGroup>
 ```python Python
@@ -661,29 +654,23 @@ result = await client.run_task(
 ```typescript TypeScript
 // US state (California)
 const result = await client.runTask({
-  body: {
-    prompt: "Get local pricing",
-    url: "https://example.com",
-    proxy_location: { country: "US", subdivision: "CA" },
-  },
+  prompt: "Get local pricing",
+  url: "https://example.com",
+  proxy_location: { country: "US", subdivision: "CA" },
 });
 
 // US city (New York City)
 const result = await client.runTask({
-  body: {
-    prompt: "Get local pricing",
-    url: "https://example.com",
-    proxy_location: { country: "US", subdivision: "NY", city: "New York" },
-  },
+  prompt: "Get local pricing",
+  url: "https://example.com",
+  proxy_location: { country: "US", subdivision: "NY", city: "New York" },
 });
 
 // City without subdivision (London)
 const result = await client.runTask({
-  body: {
-    prompt: "Get local pricing",
-    url: "https://example.com",
-    proxy_location: { country: "GB", city: "London" },
-  },
+  prompt: "Get local pricing",
+  url: "https://example.com",
+  proxy_location: { country: "GB", city: "London" },
 });
 ```
 
@@ -709,7 +696,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 | `subdivision` | string | ISO 3166-2 subdivision code without country prefix (e.g., `CA` for California, `NY` for New York). |
 | `city` | string | City name in English (e.g., `San Francisco`, `London`). |
 
-**Supported countries:** `US`, `AR`, `AU`, `BR`, `CA`, `DE`, `ES`, `FR`, `GB`, `IE`, `IN`, `IT`, `JP`, `MX`, `NL`, `NZ`, `PH`, `TR`, `ZA`
+**Supported countries:** `US`, `AR`, `AU`, `BR`, `CA`, `DE`, `ES`, `FR`, `GB`, `IE`, `IN`, `IT`, `JP`, `MX`, `NL`, `NZ`, `PH`, `KR`, `SA`, `TR`, `ZA`
 
 <Note>
 **City/state targeting has limited availability.** Proxy pools for specific cities or US states are smaller and may return `NoProxyAvailable` during high-demand periods. If this happens, broaden your target (city → state → country) or retry later.

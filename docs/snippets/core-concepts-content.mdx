@@ -39,7 +39,7 @@ Tasks are best for one-off automations, quick data extraction, and prototyping. 
   </Card>
   <Card
     title="Agents (Visual)"
-    href="#workflows"
+    href="#agents"
   >
     Build multi-step automations visually in the Cloud UI with drag-and-drop blocks. No code required. Share templates across your team.
   </Card>
@@ -188,7 +188,7 @@ A Schedule runs an agent automatically on a recurring basis. You define a cron e
 
 <CodeGroup>
 ```python Python
-result = await client.schedules.create(
+result = await skyvern.schedules.create(
     workflow_permanent_id="wpid_abc123",
     cron_expression="0 9 * * 1-5",  # Weekdays at 9 AM
     timezone="America/New_York",
@@ -223,7 +223,7 @@ flowchart TD
     D --> E["LLM sees: 'login happened'<br/>LLM never sees: actual credentials"]
 ```
 
-Supported credential types are usernames and passwords, TOTP codes (authenticator apps), and credit cards. You can store them in Skyvern's native encrypted storage, or sync from Bitwarden, 1Password, Azure Key Vault, or a custom HTTP vault.
+Supported credential types are usernames and passwords (optionally with a TOTP authenticator key), credit cards, and secrets. You can store them in Skyvern's native encrypted storage, or sync from Bitwarden, 1Password, Azure Key Vault, or a custom HTTP vault.
 
 See [Credentials](/sdk-reference/credentials/create-credential) for setup instructions.
 
@@ -243,7 +243,7 @@ flowchart LR
     B -- "restore" --> A
 ```
 
-**Browser Sessions** are live browser instances that maintain state across multiple operations. Cookies, storage, and page context persist for the duration of the session (up to 6 hours). They're useful for chaining operations in real-time or allowing human intervention between steps.
+**Browser Sessions** are live browser instances that maintain state across multiple operations. Cookies, storage, and page context persist for the duration of the session (up to 4 hours at creation, extendable to 6 hours). They're useful for chaining operations in real-time or allowing human intervention between steps.
 
 ```python
 browser = await skyvern.launch_cloud_browser()
@@ -264,7 +264,7 @@ await browser.close()
 ```python
 profile = await skyvern.create_browser_profile(
     name="my-authenticated-profile",
-    workflow_run_id=run.run_id
+    workflow_run_id="wr_abc123",  # ID of a completed agent run
 )
 
 # Future runs restore the authenticated state without logging in again.
@@ -298,7 +298,7 @@ In the Skyvern UI, go to **Runs**, click a run, and view the **Actions** and **R
 
 ## Engines
 
-Skyvern supports multiple AI engines. `skyvern-1.0` is the default for the Cloud UI and SDK. `skyvern-2.0` remains available for existing V2 agents and explicitly requested V2 task runs. Other options include `openai-cua` (OpenAI Computer Use Agent), `anthropic-cua` (Anthropic Computer Use Agent), and `ui-tars`.
+Skyvern supports multiple AI engines. `skyvern-1.0` is the default for the Cloud UI and SDK. `skyvern-2.0` remains available for existing V2 agents and explicitly requested V2 task runs. Other options include `skyvern-3.0`, `openai-cua` (OpenAI Computer Use Agent), `anthropic-cua` (Anthropic Computer Use Agent), `ui-tars`, and `yutori-navigator`.
 
 ```python
 from skyvern.schemas.runs import RunEngine
@@ -316,7 +316,7 @@ result = await skyvern.run_task(
 |--------------|-----|
 | Run a one-off automation | [Task](#tasks) |
 | Build multi-step automation in code | [Browser Automation](#browser-automation) |
-| Build multi-step automation visually | [Agent](#workflows) |
+| Build multi-step automation visually | [Agent](#agents) |
 | Trigger a UI-built agent from code | [Run from Code](/cloud/building-agents/run-from-code) |
 | Keep a browser open between operations | [Browser Session](#browser-sessions-and-profiles) |
 | Skip login on repeated runs | [Browser Profile](#browser-sessions-and-profiles) |

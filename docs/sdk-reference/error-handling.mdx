@@ -29,6 +29,8 @@ The SDK raises typed exceptions for API errors. In Python, all errors extend `Ap
 | `NotFoundError` | 404 | Resource (run, workflow, session) not found. |
 | `ConflictError` | 409 | Resource conflict (e.g., duplicate creation). |
 | `UnprocessableEntityError` | 422 | Request validation failed. |
+| `RangeNotSatisfiableError` | 416 | Requested byte range of an artifact's content is invalid. |
+| `InternalServerError` | 500 | Unexpected server error. |
 | `ApiError` (Python) / `SkyvernError` (TS) | Any | Base class for all API errors. Catch this as a fallback. |
 | `SkyvernTimeoutError` (TS only) | - | HTTP request timed out. |
 
@@ -43,6 +45,8 @@ from skyvern.client.errors import (
     NotFoundError,
     ConflictError,
     UnprocessableEntityError,
+    RangeNotSatisfiableError,
+    InternalServerError,
 )
 ```
 
@@ -59,6 +63,8 @@ import { SkyvernError, SkyvernTimeoutError, SkyvernApi } from "@skyvern/client";
 //   SkyvernApi.NotFoundError            - 404
 //   SkyvernApi.ConflictError            - 409
 //   SkyvernApi.UnprocessableEntityError - 422
+//   SkyvernApi.RangeNotSatisfiableError - 416
+//   SkyvernApi.InternalServerError      - 500
 ```
 </CodeGroup>
 
@@ -177,10 +183,8 @@ except TimeoutError:
 ```typescript TypeScript
 try {
   const result = await skyvern.runTask({
-    body: {
-      prompt: "Extract data",
-      url: "https://example.com",
-    },
+    prompt: "Extract data",
+    url: "https://example.com",
     waitForCompletion: true,
     timeout: 300, // Give up after 5 minutes
   });
@@ -221,10 +225,8 @@ const skyvern = new Skyvern({
 // Per-request retries
 const result = await skyvern.runTask(
   {
-    body: {
-      prompt: "Extract product data",
-      url: "https://example.com/products",
-    },
+    prompt: "Extract product data",
+    url: "https://example.com/products",
   },
   { maxRetries: 5 },
 );
@@ -248,10 +250,8 @@ setTimeout(() => controller.abort(), 10000);
 try {
   const result = await skyvern.runTask(
     {
-      body: {
-        prompt: "Extract data",
-        url: "https://example.com",
-      },
+      prompt: "Extract data",
+      url: "https://example.com",
     },
     { abortSignal: controller.signal },
   );
@@ -284,9 +284,7 @@ except ApiError as e:
 import { SkyvernError } from "@skyvern/client";
 
 try {
-  const result = await skyvern.runTask({
-    body: { prompt: "..." },
-  });
+  const result = await skyvern.runTask({ prompt: "..." });
 } catch (e) {
   if (e instanceof SkyvernError) {
     console.log(`API call failed: ${e.statusCode}`);
@@ -315,10 +313,8 @@ elif result.status == "completed":
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the form",
-    url: "https://example.com",
-  },
+  prompt: "Fill out the form",
+  url: "https://example.com",
   waitForCompletion: true,
 });
 
@@ -339,6 +335,7 @@ if (result.status === "failed") {
 | `created` | Run initialized, not yet queued. |
 | `queued` | Waiting for an available browser. |
 | `running` | AI is executing. |
+| `paused` | Workflow is waiting on a human interaction block. Not a terminal status. |
 | `completed` | Finished successfully. |
 | `failed` | Encountered an error during execution. |
 | `terminated` | Manually stopped. |

@@ -3,28 +3,25 @@ title: upload_file
 slug: sdk-reference/browser-automation/upload-file
 ---
 
-Upload one or more files to a file input. Pass a selector for direct Playwright behavior, a prompt for AI-powered file input detection, or both. Python only.
+Upload a file to a file input. Pass a selector for direct Playwright behavior, a prompt for AI-powered file input detection, or both. Python only.
 
 ```python
 # Direct selector
-await page.upload_file("#file-input", files="/path/to/file.pdf")
-
-# Multiple files
-await page.upload_file("#file-input", files=["/path/to/file1.pdf", "/path/to/file2.pdf"])
+await page.upload_file("#file-input", files="https://example.com/resume.pdf")
 
 # AI-powered file input detection
 await page.upload_file(prompt="Upload the resume to the file input")
 
 # Selector with AI fallback
-await page.upload_file("#file-input", files="/path/to/file.pdf",
+await page.upload_file("#file-input", files="https://example.com/resume.pdf",
     prompt="Upload the resume to the file input")
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `selector` | `str` | No | CSS or XPath selector for the file input. |
-| `files` | `str \| list[str]` | No | File path or list of file paths to upload. |
+| `files` | `str` | No | A single file to upload, as a URL. Skyvern downloads it before setting the input. Lists are not supported. |
 | `prompt` | `str` | No | Natural-language description of the file input to target. |
 | `ai` | `str` | No | Controls AI behavior. Default `"fallback"` tries the selector first, then AI. |
 
-Returns `str` - the resolved selector used.
+Returns `str`.

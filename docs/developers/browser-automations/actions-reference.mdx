@@ -188,14 +188,14 @@ Ask the LLM a question about the current page.
 ```python
 result = await page.prompt(
     "How many items are in the navigation menu?",
-    schema={"count": {"type": "integer"}}
+    schema={"type": "object", "properties": {"count": {"type": "integer"}}}
 )
 ```
 
 ```typescript
 const result = await page.prompt(
     "How many items are in the navigation menu?",
-    { schema: { count: { type: "integer" } } }
+    { schema: { type: "object", properties: { count: { type: "integer" } } } }
 )
 ```
 </CodeGroup>
@@ -393,14 +393,11 @@ await page.scroll(200, 0)   # Scroll right 200px
 
 ### upload_file
 
-Upload one or more files to a file input. Pass a selector for direct Playwright behavior, a prompt for AI-powered file input detection, or both. Python only.
+Upload a file to a file input. Pass a selector for direct Playwright behavior, a prompt for AI-powered file input detection, or both. Python only.
 
 ```python
 # Direct selector
 await page.upload_file("#file-input", files="/path/to/file.pdf")
-
-# Multiple files
-await page.upload_file("#file-input", files=["/path/to/file1.pdf", "/path/to/file2.pdf"])
 
 # AI-powered file input detection (no selector needed)
 await page.upload_file(prompt="Upload the resume to the file input")
@@ -499,8 +496,11 @@ await page.agent.login("skyvern", {
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `credential_type` | `CredentialType` | Yes | `skyvern`, `bitwarden`, `onepassword`, or `azure_vault` |
+| `credential_type` | `CredentialType` | No | `skyvern` (default), `bitwarden`, `1password`, or `azure_vault` |
 | `credential_id` | `str` | No | Credential ID (required for `skyvern` type) |
+| `bitwarden_collection_id`, `bitwarden_item_id` | `str` | No | Bitwarden item to use (for `bitwarden` type) |
+| `onepassword_vault_id`, `onepassword_item_id` | `str` | No | 1Password item to use (for `1password` type) |
+| `azure_vault_name`, `azure_vault_username_key`, `azure_vault_password_key`, `azure_vault_totp_secret_key` | `str` | No | Azure Key Vault secrets to use (for `azure_vault` type) |
 | `url` | `str` | No | Login page URL |
 | `prompt` | `str` | No | Additional login instructions |
 | `timeout` | `float` | No | Max wait time in seconds (default: 1800) |
@@ -551,15 +551,15 @@ console.log(result.output)
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | Multi-step goal description |
 | `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/developers/browser-automations/extract-structured-data). |
-| `max_steps` | `int` | No | Cap AI steps. The run terminates with `timed_out` if hit. Controls cost; each step is one AI decision + action cycle. |
-| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0` in the SDK and Cloud UI. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. Other options: `openai-cua`, `anthropic-cua`, `ui-tars`. |
+| `max_steps` | `int` | No | Cap AI steps. The run ends with status `failed` ("Reached the maximum steps") if hit. Controls cost; each step is one AI decision + action cycle. |
+| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0` in the SDK and Cloud UI. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. Other options: `skyvern-3.0`, `openai-cua`, `anthropic-cua`, `ui-tars`, `yutori-navigator`. |
 | `model` | `dict` / `Record<string, unknown>` | No | Override LLM model configuration |
 | `url` | `str` / `string` | No | URL to navigate to (defaults to current page URL) |
 | `webhook_url` | `str` / `string` | No | Callback URL. Skyvern POSTs the full run result on completion or failure. See [Webhooks](/developers/going-to-production/webhooks). |
 | `totp_identifier` | `str` / `string` | No | Identifier for push-based TOTP. See [Handle 2FA](/developers/credentials/handle-2fa). |
 | `totp_url` | `str` / `string` | No | Endpoint Skyvern calls to pull TOTP codes. See [Handle 2FA](/developers/credentials/handle-2fa). |
 | `title` | `str` / `string` | No | Display name for this run |
-| `error_code_mapping` | `dict` / `Record<string, string>` | No | Map custom error codes to conditions. Keys are your error codes, values describe when to trigger them. If matched, `output` contains `{"error": "your_code"}`. |
+| `error_code_mapping` | `dict` / `Record<string, string>` | No | Map custom error codes to conditions. Keys are your error codes, values describe when to trigger them. If matched, the run's `errors` list contains an entry with `error_code` set to your code. |
 | `user_agent` | `str` / `string` | No | Custom User-Agent header for the browser |
 | `timeout` | `float` | No | Max wait in seconds (default: 1800) |
 
@@ -577,7 +577,7 @@ Navigate and download files from the current page.
 ```python
 result = await page.agent.download_files(
     "Download the latest invoice PDF",
-    download_suffix=".pdf",
+    download_suffix="invoice",
     download_timeout=30,
 )
 ```
@@ -586,7 +586,7 @@ result = await page.agent.download_files(
 const result = await page.agent.downloadFiles(
     "Download the latest invoice PDF",
     {
-        downloadSuffix: ".pdf",
+        downloadSuffix: "invoice",
         downloadTimeout: 30,
     },
 )
@@ -596,7 +596,7 @@ const result = await page.agent.downloadFiles(
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | What to download |
-| `download_suffix` | `str` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). Not a validator; mismatched extensions don't fail the run. |
+| `download_suffix` | `str` | No | Filename for the saved file. A name without an extension (e.g., `"invoice"`) gets the downloaded file's extension (`invoice.pdf`); a full name like `"invoice.pdf"` is used as is. Don't pass only an extension such as `".pdf"`: it becomes the whole name (`.pdf.pdf`). |
 | `download_timeout` | `float` | No | Soft hint (seconds) for how long to wait for a download. The overall `timeout` is what actually fails the run. |
 | `max_steps_per_run` | `int` | No | Cap AI steps |
 | `timeout` | `float` | No | Max wait in seconds (default: 1800) |
@@ -636,6 +636,8 @@ const result = await page.agent.runWorkflow(
 | `webhook_url` | `str` / `string` | No | Callback URL for run completion. See [Webhooks](/developers/going-to-production/webhooks). |
 | `totp_url` | `str` / `string` | No | Endpoint for pulling TOTP codes |
 | `totp_identifier` | `str` / `string` | No | Identifier for push-based TOTP |
+| `max_elapsed_time_minutes` | `int` | No | Time out the workflow run after this many minutes |
+| `run_metadata` | `dict[str, str]` | No | String key/value metadata to attach to the run |
 | `timeout` | `float` | No | Max wait in seconds (default: 1800) |
 
 **Returns:** [`WorkflowRunResponse`](/sdk-reference/workflows/run-workflow#returns-workflowrunresponse)
@@ -812,15 +814,15 @@ await page.frame_switch(selector="#payment-iframe")
 # By frame name
 await page.frame_switch(name="checkout")
 
-# By zero-based index
-await page.frame_switch(index=0)
+# By index into page.frames (0 is the main frame, so the first iframe is usually 1)
+await page.frame_switch(index=1)
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `selector` | `str` | No | CSS selector for the iframe element |
 | `name` | `str` | No | The `name` attribute of the iframe |
-| `index` | `int` | No | Zero-based index of the iframe on the page |
+| `index` | `int` | No | Index into `page.frames`. `0` is the main frame. |
 
 <Note>
 Exactly one of `selector`, `name`, or `index` must be provided.

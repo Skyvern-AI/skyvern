@@ -114,10 +114,8 @@ const client = new Skyvern({
 
 async function main() {
   const result = await client.runTask({
-    body: {
-      prompt: "Get the title and URL of the top 3 posts on Hacker News.",
-      url: "https://news.ycombinator.com",
-    },
+    prompt: "Get the title and URL of the top 3 posts on Hacker News.",
+    url: "https://news.ycombinator.com",
     waitForCompletion: true,
   });
   console.log(`Status: ${result.status}`);

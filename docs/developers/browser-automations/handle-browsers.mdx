@@ -39,7 +39,7 @@ const page = await browser.getWorkingPage();
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `timeout` | `int` | `None` | Session timeout in minutes (min 5, max 240; higher values are rejected). Server default: 60 minutes |
+| `timeout` | `int` | `None` | Session timeout in minutes (min 5, max 240; higher values are capped at 240 and the response includes a warning). Server default: 60 minutes |
 | `proxy_location` | `ProxyLocation` | `None` | Route traffic through a geographic proxy |
 
 The browser stays alive until `timeout` expires or you call `browser.close()`.
@@ -232,7 +232,7 @@ Available locations:
 
 Two mechanisms for preserving browser state between automation runs:
 
-**Browser Sessions** keep a browser alive between API calls. Use `create_browser_session` from the [Tasks API](/sdk-reference/tasks/run-task) to create a session, then pass its ID to multiple `run_task` calls. See [Browser Sessions](/developers/optimization/browser-sessions).
+**Browser Sessions** keep a browser alive between API calls. Use [`create_browser_session`](/sdk-reference/browser-sessions/create-browser-session) to create a session, then pass its ID to multiple `run_task` calls. See [Browser Sessions](/developers/optimization/browser-sessions).
 
 **Browser Profiles** save a snapshot of browser state (cookies, localStorage) that persists indefinitely. Create a profile from a completed run, then load it into future runs to skip login. See [Browser Profiles](/developers/optimization/browser-profiles).
 

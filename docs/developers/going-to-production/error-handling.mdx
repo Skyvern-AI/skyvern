@@ -37,6 +37,7 @@ Every run transitions through these states:
 | `created` | Run initialized, not yet queued |
 | `queued` | Waiting for an available browser |
 | `running` | AI is navigating and executing |
+| `paused` | Waiting for a person, for example at a `human_interaction` block |
 | `completed` | Success. Check `output` for results |
 | `failed` | System error (browser crash, network failure, exception) |
 | `terminated` | AI determined the goal is unachievable (login blocked, page unavailable) |
@@ -348,15 +349,13 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await client.runTask({
-  body: {
-    prompt: "Log in and download the invoice for January 2024",
-    url: "https://vendor-portal.example.com",
-    error_code_mapping: {
-      login_failed: "The login credentials are incorrect, account is locked, or MFA is required",
-      invoice_not_found: "No invoice exists for the requested date range",
-      maintenance: "The website is down for maintenance or unavailable",
-      access_denied: "User does not have permission to view invoices",
-    },
+  prompt: "Log in and download the invoice for January 2024",
+  url: "https://vendor-portal.example.com",
+  error_code_mapping: {
+    login_failed: "The login credentials are incorrect, account is locked, or MFA is required",
+    invoice_not_found: "No invoice exists for the requested date range",
+    maintenance: "The website is down for maintenance or unavailable",
+    access_denied: "User does not have permission to view invoices",
   },
 });
 ```
@@ -435,16 +434,20 @@ The JSON examples below include comments (`//`) for clarity. Remove comments bef
 
 ### Where the error code appears
 
-When a mapped error occurs, your code appears in `output.error`. This field is available in both polling responses and webhook payloads:
+When a mapped error occurs, your code appears in the `errors` list as `error_code`, next to the AI's `reasoning` and a `confidence_float`. This field is available in both polling responses and webhook payloads:
 
 <CodeGroup>
 ```json Polling Response
 {
   "run_id": "tsk_v2_486305187432193504",
   "status": "terminated",
-  "output": {
-    "error": "login_failed"  // <-- Your custom code
-  },
+  "errors": [
+    {
+      "error_code": "login_failed",  // <-- Your custom code
+      "reasoning": "login_failed: Login credentials are incorrect or account is locked",
+      "confidence_float": 0.95
+    }
+  ],
   "failure_reason": "Login failed: The page displayed 'Invalid username or password'"
 }
 ```
@@ -453,9 +456,13 @@ When a mapped error occurs, your code appears in `output.error`. This field is a
 {
   "run_id": "tsk_v2_486305187432193504",
   "status": "terminated",
-  "output": {
-    "error": "login_failed"  // <-- Your custom code
-  },
+  "errors": [
+    {
+      "error_code": "login_failed",  // <-- Your custom code
+      "reasoning": "login_failed: Login credentials are incorrect or account is locked",
+      "confidence_float": 0.95
+    }
+  ],
   "failure_reason": "Login failed: The page displayed 'Invalid username or password'",
   "webhook_callback_url": "https://your-server.com/webhook",
   "created_at": "2026-01-20T11:58:57.414123",
@@ -464,15 +471,15 @@ When a mapped error occurs, your code appears in `output.error`. This field is a
 ```
 </CodeGroup>
 
-Both `output.error` (your code) and `failure_reason` (raw text) are present. Use `output.error` for branching, `failure_reason` for logging.
+Both `errors[].error_code` (your code) and `failure_reason` (raw text) are present. Use `error_code` for branching, `failure_reason` for logging.
 
 **Quick reference:** Where error codes appear
 
 | Context | Field | Example |
 |---------|-------|---------|
-| Polling response | `run.output.error` | `run.output.get("error")` in Python |
-| Webhook payload | `output.error` | Same structure as polling |
-| Successful run | `output` contains your extracted data | No `error` key present |
+| Polling response | `run.errors[].error_code` | `[e.get("error_code") for e in run.errors or []]` in Python |
+| Webhook payload | `errors[].error_code` | Same structure as polling |
+| Successful run | `output` contains your extracted data | No mapped `error_code` in `errors` |
 
 ---
 
@@ -511,7 +518,8 @@ async def run_with_error_handling(retries=1):
     if run.status == "completed":
         return {"success": True, "data": run.output}
 
-    error_code = run.output.get("error") if run.output else None
+    error_codes = [e.get("error_code") for e in (run.errors or [])]
+    error_code = error_codes[-1] if error_codes else None
 
     if error_code == "login_failed":
         if retries > 0:
@@ -537,14 +545,12 @@ async def run_with_error_handling(retries=1):
 ```typescript TypeScript
 async function runWithErrorHandling(retries = 1) {
   const result = await client.runTask({
-    body: {
-      prompt: "Log in and download the invoice",
-      url: "https://vendor-portal.example.com",
-      error_code_mapping: {
-        login_failed: "Login credentials are incorrect or account is locked",
-        invoice_not_found: "No invoice for the requested date",
-        maintenance: "Site is down for maintenance",
-      },
+    prompt: "Log in and download the invoice",
+    url: "https://vendor-portal.example.com",
+    error_code_mapping: {
+      login_failed: "Login credentials are incorrect or account is locked",
+      invoice_not_found: "No invoice for the requested date",
+      maintenance: "Site is down for maintenance",
     },
   });
 
@@ -565,7 +571,8 @@ async function runWithErrorHandling(retries = 1) {
     return { success: true, data: run.output };
   }
 
-  const errorCode = run.output?.error;
+  const errorCodes = (run.errors ?? []).map((e) => e.error_code);
+  const errorCode = errorCodes[errorCodes.length - 1];
 
   switch (errorCode) {
     case "login_failed":
@@ -667,7 +674,7 @@ blocks:
 | `terminate_criterion` | Condition that stops the agent immediately |
 | `error_code_mapping` | Maps termination conditions to your error codes |
 
-If `verify_login` sees a login error, the agent terminates with `output.error = "login_failed"`. Your Step 4 code handles it the same way as any other error code.
+If `verify_login` sees a login error, the agent terminates with `"error_code": "login_failed"` in `errors`. Your Step 4 code handles it the same way as any other error code.
 
 ---
 
@@ -687,6 +694,8 @@ Some agent run requests can never start. `POST /v1/run/agents` (and its older fo
 Fix the request and send it again. Retrying returns the same 400 until the parameter is fixed, for example until the missing credential exists in your organization.
 
 ## Common error patterns
+
+These are example codes you define in `error_code_mapping`. Skyvern does not ship them as built-in codes.
 
 | Error Code | Description | Typical Response |
 |------------|-------------|------------------|

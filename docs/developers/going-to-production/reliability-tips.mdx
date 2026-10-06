@@ -97,7 +97,7 @@ Multi-select fields (where you pick several options from a list) are slower and 
 
 ## Choosing the right block type
 
-Skyvern offers three block types with different tradeoffs between reliability and flexibility. The more interpretation you ask the AI to do, the more room for unexpected behavior.
+Skyvern has many block types. These three browser blocks have different tradeoffs between reliability and flexibility. The more interpretation you ask the AI to do, the more room for unexpected behavior.
 
 **Action blocks** are the most deterministic. You tell Skyvern exactly what to do: "Click the Submit button." There's no interpretation; it either finds the element and clicks it, or fails. Use these when you know exactly what action is needed and the page structure is predictable.
 
@@ -302,7 +302,7 @@ Browser sessions have a default timeout. If you're using human-in-the-loop agent
 ```python
 # Longer timeout for human-in-the-loop workflows
 session = await client.create_browser_session(
-    timeout=300,  # 5 minutes instead of default
+    timeout=240,  # minutes: 4 hours, the maximum at creation (default is 60)
     proxy_location="RESIDENTIAL"
 )
 ```
@@ -316,7 +316,7 @@ For agents with predictable human approval times, schedule runs to arrive in the
 ## Keyboard actions and workarounds
 
 <Note>
-Direct keyboard shortcuts (Ctrl+C, Alt+Tab, Esc, etc.) are not currently supported. Here are workarounds for common scenarios.
+With the default engine, the AI presses single keys (Enter, Tab, Escape, ArrowUp, ArrowDown) when no clickable element does the same job. The `skyvern-3.0` engine can also press key combinations such as `Control+a`. Keys only reach the page, so browser or OS shortcuts (reload, back, Alt+Tab) do nothing. Here are workarounds for common scenarios.
 </Note>
 
 | Scenario | Workaround |
@@ -336,12 +336,11 @@ For applications that genuinely require keyboard shortcuts with no UI alternativ
 2. **Check for an API**: Many web apps have APIs that bypass the UI entirely
 3. **Use browser profiles** with pre-configured settings or extensions that add UI buttons for keyboard-only features
 
-```python
+```yaml
 # Example: Using Code block for keyboard actions
 - block_type: code
   label: press_escape
   code: |
-    page = context["skyvern_page"].page
     await page.keyboard.press("Escape")
     result = {"escaped": True}
 ```
@@ -370,7 +369,7 @@ When a run fails:
 | **Autocomplete cycling** | AI second-guessing dropdown selections | Add "select and move on; don't modify" to prompt |
 | **Task navigates too far** | Task block continues until goal complete | Use Action/Navigation block for single-step actions |
 | **Session expired** | Human-in-the-loop timeout | Increase timeout or split into multiple agents |
-| **Max steps reached** | Complex page or AI retrying actions | Increase `max_steps_per_run` or simplify the goal |
+| **Max steps reached** | Complex page or AI retrying actions | Increase `max_steps` (tasks) or `max_steps_override` (agent runs), or simplify the goal |
 
 ### When to adjust prompts vs file a bug
 

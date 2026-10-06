@@ -31,7 +31,7 @@ async def main():
     client = Skyvern(api_key="YOUR_API_KEY")
 
     session = await client.create_browser_session(
-        timeout=60,                    # Max 60 minutes
+        timeout=60,                    # Minutes (default 60, max 240)
         proxy_location="RESIDENTIAL",  # US residential proxy
         browser_type="chrome",         # Chrome or Edge
         extensions=["ad-blocker"],     # Optional extensions
@@ -84,9 +84,9 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 |-----------|------|-------------|
 | `timeout` | integer | Session lifetime in minutes. Min: 5. Max: 240 (4 hours) — requests above 240 are capped at 240 with a warning. Default: `60`. A running session can be [extended](#extend-a-session) up to 360 minutes (6 hours). |
 | `proxy_location` | string | Geographic proxy location (Cloud only). See [Proxy & Geolocation](/developers/going-to-production/proxy-geolocation) for available options |
-| `browser_type` | string | Browser type: `chrome` or `msedge`. If omitted, Skyvern picks a managed default that may be a hardened stealth Chromium build rather than Chrome. Set it explicitly to select the engine when no `browser_profile_id` is used — a supplied profile's source browser type takes precedence. See [Choose the right browser type](#choose-the-right-browser-type) |
+| `browser_type` | string | Browser type: `chrome`, `msedge`, or `stealth-chromium`. If omitted, Skyvern picks a managed default that may be a hardened stealth Chromium build rather than Chrome. Set it explicitly to select the engine when no `browser_profile_id` is used — a supplied profile's source browser type takes precedence. See [Choose the right browser type](#choose-the-right-browser-type) |
 | `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
-| `generate_browser_profile` | boolean | REST API only for now — not yet accepted by the SDK methods. Save the session's browser profile (cookies, localStorage, session files) when the session ends, so it can be turned into a reusable [browser profile](/developers/optimization/browser-profiles). Default: `false`. See [Save a session's profile](#save-a-sessions-profile) |
+| `generate_browser_profile` | boolean | Accepted by the REST API and the Python SDK. Save the session's browser profile (cookies, localStorage, session files) when the session ends, so it can be turned into a reusable [browser profile](/developers/optimization/browser-profiles). Default: `false`. See [Save a session's profile](#save-a-sessions-profile) |
 
 **Example response:**
 
@@ -111,7 +111,9 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 | Status | Description |
 |--------|-------------|
 | `running` | Browser is live and accepting tasks. This is the status returned on creation. The browser launches within seconds. |
-| `closed` | Session was closed manually or by timeout. No further tasks can run. |
+| `completed` | Session was closed. No further tasks can run. |
+| `timeout` | Session reached its timeout and was closed. No further tasks can run. |
+| `failed` | Session failed to start or was aborted. |
 
 <Warning>
 Sessions close automatically when the timeout expires, **even if a task is still running**. The timeout countdown begins when the browser launches. Set timeouts with enough margin for your longest expected task, or [extend the session](#extend-a-session) once you know how much work is queued.
@@ -125,7 +127,7 @@ A session is created with at most 240 minutes, but a running session can be exte
 
 <CodeGroup>
 ```python Python
-session = await skyvern.extend_browser_session(
+session = await client.extend_browser_session(
     browser_session_id="pbs_490705123456789012",
     additional_minutes=60,
 )
@@ -197,20 +199,16 @@ async function main() {
   try {
     // Task 1: Login (wait for completion)
     await client.runTask({
-      body: {
-        prompt: "Login with username 'support@company.com'",
-        url: "https://dashboard.example.com/login",
-        browser_session_id: sessionId,
-      },
+      prompt: "Login with username 'support@company.com'",
+      url: "https://dashboard.example.com/login",
+      browser_session_id: sessionId,
       waitForCompletion: true,
     });
 
     // Task 2: Search (reuses login state)
     const result = await client.runTask({
-      body: {
-        prompt: "Find customer with email 'customer@example.com'",
-        browser_session_id: sessionId,
-      },
+      prompt: "Find customer with email 'customer@example.com'",
+      browser_session_id: sessionId,
       waitForCompletion: true,
     });
 
@@ -320,20 +318,16 @@ async function main() {
   try {
     // First, login manually via a task
     await client.runTask({
-      body: {
-        prompt: "Login with username 'admin@company.com'",
-        url: "https://app.example.com/login",
-        browser_session_id: sessionId,
-      },
+      prompt: "Login with username 'admin@company.com'",
+      url: "https://app.example.com/login",
+      browser_session_id: sessionId,
       waitForCompletion: true,
     });
 
     // Then run a workflow in the same session (already logged in)
     const result = await client.runWorkflow({
-      body: {
-        workflow_id: "wpid_export_monthly_report",
-        browser_session_id: sessionId,
-      },
+      agent_id: "wpid_export_monthly_report",
+      browser_session_id: sessionId,
       waitForCompletion: true,
     });
 
@@ -395,7 +389,7 @@ You cannot use both `browser_session_id` and `browser_profile_id` in the same re
 
 ## Save a session's profile
 
-By default, a browser session does **not** save its browser profile when it ends. To capture the session's state (cookies, localStorage, session files) for reuse, opt in with `generate_browser_profile`. Python and TypeScript SDK support for this flag is rolling out; until your SDK version includes it, call the REST API directly (the Python SDK can also pass it via `request_options` with `additional_body_parameters={"generate_browser_profile": True}`).
+By default, a browser session does **not** save its browser profile when it ends. To capture the session's state (cookies, localStorage, session files) for reuse, opt in with `generate_browser_profile`. The Python SDK accepts it as `create_browser_session(generate_browser_profile=True)`. TypeScript SDK support may depend on your SDK version; if yours doesn't accept it, call the REST API directly.
 
 ```bash
 curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
@@ -479,10 +473,8 @@ const sessionId = session.browser_session_id;
 
 try {
   await client.runTask({
-    body: {
-      prompt: "...",
-      browser_session_id: sessionId,
-    },
+    prompt: "...",
+    browser_session_id: sessionId,
     waitForCompletion: true,
   });
 
@@ -552,11 +544,9 @@ async function shoppingWithApproval() {
   try {
     // Step 1: Add to cart
     await client.runTask({
-      body: {
-        prompt: "Find wireless headphones under $100, add top result to cart",
-        url: "https://shop.example.com",
-        browser_session_id: sessionId,
-      },
+      prompt: "Find wireless headphones under $100, add top result to cart",
+      url: "https://shop.example.com",
+      browser_session_id: sessionId,
       waitForCompletion: true,
     });
 
@@ -570,10 +560,8 @@ async function shoppingWithApproval() {
     if (approval.toLowerCase() === "yes") {
       // Step 3: Checkout (cart persists from Step 1)
       const result = await client.runTask({
-        body: {
-          prompt: "Complete checkout and confirm order",
-          browser_session_id: sessionId,
-        },
+        prompt: "Complete checkout and confirm order",
+        browser_session_id: sessionId,
         waitForCompletion: true,
       });
       console.log(`Order placed: ${JSON.stringify(result.output)}`);
@@ -609,7 +597,7 @@ session = await client.create_browser_session(timeout=10)
 session = await client.create_browser_session(timeout=60)
 
 # Long-running agent that monitors a dashboard
-session = await client.create_browser_session(timeout=480)  # 8 hours
+session = await client.create_browser_session(timeout=240)  # 4 hours, the maximum at creation
 ```
 
 ```typescript TypeScript
@@ -620,7 +608,7 @@ const session1 = await client.createBrowserSession({ timeout: 10 });
 const session2 = await client.createBrowserSession({ timeout: 60 });
 
 // Long-running agent that monitors a dashboard
-const session3 = await client.createBrowserSession({ timeout: 480 }); // 8 hours
+const session3 = await client.createBrowserSession({ timeout: 240 }); // 4 hours, the maximum at creation
 ```
 
 ```bash cURL
@@ -640,7 +628,7 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
 curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"timeout": 480}'
+  -d '{"timeout": 240}'
 ```
 </CodeGroup>
 
@@ -662,11 +650,11 @@ await client.run_workflow(workflow_id="wpid_abc", wait_for_completion=True)
 ```typescript TypeScript
 // Less efficient: multiple tasks in a session (each task has startup overhead)
 const session = await client.createBrowserSession({});
-await client.runTask({ body: { prompt: "Step 1", browser_session_id: session.browser_session_id }, waitForCompletion: true });
-await client.runTask({ body: { prompt: "Step 2", browser_session_id: session.browser_session_id }, waitForCompletion: true });
+await client.runTask({ prompt: "Step 1", browser_session_id: session.browser_session_id, waitForCompletion: true });
+await client.runTask({ prompt: "Step 2", browser_session_id: session.browser_session_id, waitForCompletion: true });
 
 // More efficient: single workflow (blocks share one browser, no inter-task overhead)
-await client.runWorkflow({ body: { workflow_id: "wpid_abc" }, waitForCompletion: true });
+await client.runWorkflow({ agent_id: "wpid_abc", waitForCompletion: true });
 ```
 </CodeGroup>
 

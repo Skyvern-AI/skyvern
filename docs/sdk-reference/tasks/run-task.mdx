@@ -8,7 +8,7 @@ A task is a single browser automation. You describe what you want in natural lan
 For when to use tasks vs agents, see [Run a Task](/running-automations/run-a-task).
 
 <Note>
-Python uses `snake_case` (e.g., `run_task`, `wait_for_completion`); TypeScript uses `camelCase` (e.g., `runTask`, `waitForCompletion`) and wraps request params in a `body` object. Parameter tables show Python names. TypeScript names are the camelCase equivalents.
+Python uses `snake_case` (e.g., `run_task`, `wait_for_completion`); TypeScript uses `camelCase` method names and SDK options (e.g., `runTask`, `waitForCompletion`), but request fields stay `snake_case` and go directly in the options object (no `body` wrapper). Parameter tables show Python names.
 </Note>
 
 ---
@@ -27,10 +27,8 @@ print(result.output)
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Get the title of the top post",
-    url: "https://news.ycombinator.com",
-  },
+  prompt: "Get the title of the top post",
+  url: "https://news.ycombinator.com",
   waitForCompletion: true,
 });
 console.log(result.output);
@@ -43,7 +41,7 @@ console.log(result.output);
 |-----------|------|----------|---------|-------------|
 | `prompt` | `str` | Yes | - | Natural language instructions for what the AI should do. |
 | `url` | `str` | No | `None` | Starting page URL. If omitted, the AI navigates from a blank page. |
-| `engine` | `RunEngine` | No | `skyvern_v1` / `"skyvern-1.0"` | AI engine. Python enum options: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`. TypeScript uses the wire values: `"skyvern-1.0"`, `"skyvern-2.0"`, `"openai-cua"`, `"anthropic-cua"`, `"ui-tars"`. |
+| `engine` | `RunEngine` | No | `skyvern_v1` / `"skyvern-1.0"` | AI engine. Python enum options: `skyvern_v1`, `skyvern_v2`, `skyvern_v3`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`. TypeScript uses the wire values: `"skyvern-1.0"`, `"skyvern-2.0"`, `"openai-cua"`, `"anthropic-cua"`, `"ui-tars"`, `"yutori-navigator"`. |
 | `wait_for_completion` | `bool` | No | `False` | Block until the run finishes. |
 | `timeout` | `float` | No | `1800` | Max wait time in seconds when `wait_for_completion=True`. |
 | `max_steps` | `int` | No | `None` | Cap the number of AI steps to limit cost. Run terminates with `timed_out` if hit. |
@@ -57,12 +55,12 @@ console.log(result.output);
 | `totp_url` | `str` | No | `None` | Endpoint Skyvern polls to fetch TOTP codes. |
 | `title` | `str` | No | `None` | Display name for this run in the dashboard. |
 | `model` | `dict` | No | `None` | Override the output model definition. |
-| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
+| `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. In TypeScript, pass it as `"x-user-agent"`. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
 | `include_action_history_in_verification` | `bool` | No | `None` | Include action history when verifying task completion. |
 | `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. Useful for lazy-loaded content. |
 | `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address instead of spinning up a new one. |
-| `run_with` | `str` | No | `None` | Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
+| `run_with` | `str` | No | `None` | TypeScript only; Python's `Skyvern.run_task` does not accept it. Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
 | `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
 
 ### Returns `TaskRunResponse`
@@ -110,18 +108,16 @@ print(result.output)
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Extract the name, price, and rating of the top 3 products",
-    url: "https://example.com/products",
-    data_extraction_schema: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string" },
-          price: { type: "string" },
-          rating: { type: "number" },
-        },
+  prompt: "Extract the name, price, and rating of the top 3 products",
+  url: "https://example.com/products",
+  data_extraction_schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        price: { type: "string" },
+        rating: { type: "number" },
       },
     },
   },
@@ -150,11 +146,9 @@ result = await client.run_task(
 const session = await skyvern.createBrowserSession({});
 
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Log in and download the latest invoice",
-    url: "https://app.example.com/login",
-    browser_session_id: session.browser_session_id,
-  },
+  prompt: "Log in and download the latest invoice",
+  url: "https://app.example.com/login",
+  browser_session_id: session.browser_session_id,
   waitForCompletion: true,
 });
 ```
@@ -174,11 +168,9 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the contact form",
-    url: "https://example.com/contact",
-    max_steps: 10,
-  },
+  prompt: "Fill out the contact form",
+  url: "https://example.com/contact",
+  max_steps: 10,
   waitForCompletion: true,
 });
 ```
@@ -200,11 +192,9 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Get the page title",
-    url: "https://example.com",
-    engine: "skyvern-1.0",
-  },
+  prompt: "Get the page title",
+  url: "https://example.com",
+  engine: "skyvern-1.0",
   waitForCompletion: true,
 });
 ```
@@ -225,11 +215,9 @@ result = await client.run_task(
 
 ```typescript TypeScript
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the contact form with the provided data",
-    url: "https://example.com/contact",
-    publish_workflow: true,
-  },
+  prompt: "Fill out the contact form with the provided data",
+  url: "https://example.com/contact",
+  publish_workflow: true,
   waitForCompletion: true,
 });
 // The generated workflow is saved and can be re-triggered via runWorkflow
@@ -262,10 +250,8 @@ print(run.output)
 
 ```typescript TypeScript
 const task = await skyvern.runTask({
-  body: {
-    prompt: "Extract product data",
-    url: "https://example.com/products",
-  },
+  prompt: "Extract product data",
+  url: "https://example.com/products",
 });
 
 const terminalStatuses = ["completed", "failed", "terminated", "timed_out", "canceled"];
@@ -311,20 +297,16 @@ print(task.run_id)  # poll with client.get_run(task.run_id)
 ```typescript TypeScript
 // Returns only after the task finishes (up to 30 min by default)
 const result = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the contact form",
-    url: "https://example.com/contact",
-  },
+  prompt: "Fill out the contact form",
+  url: "https://example.com/contact",
   waitForCompletion: true,
   timeout: 600, // give up after 10 minutes
 });
 
 // Without waitForCompletion -- returns immediately
 const task = await skyvern.runTask({
-  body: {
-    prompt: "Fill out the contact form",
-    url: "https://example.com/contact",
-  },
+  prompt: "Fill out the contact form",
+  url: "https://example.com/contact",
 });
 console.log(task.run_id); // poll with skyvern.getRun(task.run_id)
 ```

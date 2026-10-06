@@ -40,4 +40,4 @@ await page.selectOption("#country", "us", {
 | `ai` | `str` / `string` | No | Controls AI behavior. `"fallback"` (default) tries the selector first, then AI. `None` / `null` disables AI. |
 | `**kwargs` | | No | Standard Playwright select options (e.g., `timeout`, `force`). |
 
-Returns `list[str]` / `string[]` -- the selected option values.
+Returns `str | None` (Python) / `void` (TypeScript).

@@ -24,7 +24,7 @@ You can use the [recipe page](https://app.skyvern.com/recipes/job-apps) or the A
 
 <Steps>
   <Step title="Open Job Application Recipes">
-    Go to **Recipes → Job Applications** in [Skyvern Cloud](https://app.skyvern.com/recipes/job-apps).
+    Go to **Recipes → Job Apps** in [Skyvern Cloud](https://app.skyvern.com/recipes/job-apps).
   </Step>
   <Step title="Add the job and resume">
     Paste the **Job URL**. Upload one PDF resume, up to 10 MiB, or select **Use a URL instead** to provide a publicly accessible resume URL.
@@ -46,7 +46,7 @@ You can use the [recipe page](https://app.skyvern.com/recipes/job-apps) or the A
   </Step>
 </Steps>
 
-To apply to several postings, enable **Bulk** and paste one job URL per line. Review the confirmation before sending. Each URL starts a separate run. On plans billed in credits, each run costs a fixed 100 credits, or 200 when you supply login credentials, and Skyvern charges it once when the run starts. Retries and browser time in that run are included. Sending the same URL again starts a new run, which costs the fee again.
+To apply to several postings, enable **Bulk** and paste one job URL per line. Review the confirmation before sending. Each URL starts a separate run. On plans billed in credits, each run is billed separately (see [Credits](#credits)), so sending the same URL again starts a new run that is billed again.
 
 To extract a posting without applying, use the extraction form on the same page. Enter the job URL and open its run to view the result.
 
@@ -227,17 +227,7 @@ Each entry also has an `outcome` and a `next_step`. `outcome` is `null` until th
 
 ## Credits
 
-For organizations billed in recipe credits, each admitted execution attempt costs **50 credits ($0.05)**. Login, extraction, and application attempts are billed separately. Retries and fallback attempts also cost 50 credits each, including attempts that fail or are canceled after admission. Resume parsing has no separate recipe charge.
-
-The launch check requires the following balance when overage is disabled:
-
-| Request             | Required credits |
-| ------------------- | ---------------: |
-| Extract             |               50 |
-| Apply without login |           50–100 |
-| Apply with login    |          100–150 |
-
-The range depends on the execution path selected for the job site and your inputs. The launch check does not debit credits. These balances and the dashboard estimate are not maximum prices; the final charge depends on the attempts executed.
+Recipe billing is managed by Skyvern Cloud. For current credit costs of Apply and Extract runs, see the [pricing page](https://www.skyvern.com/pricing). If your balance is too low to launch a run, the request returns `402`.
 
 ## Handle request errors
 
