@@ -17,7 +17,6 @@ from skyvern.forge.sdk.schemas.tasks import TaskType
 from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN, PageDerivedRender
 from skyvern.forge.taskv3.goal_composition import (
-    MAX_HANDOFF_LABEL_CHARS,
     CodeProgressRecord,
     CodeTypedValue,
     GoalDirectives,
@@ -26,52 +25,9 @@ from skyvern.forge.taskv3.goal_composition import (
     render_block_context,
     typed_value_rows,
 )
-from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff
-from tests.unit._taskv3_block_fakes import PLAIN_URL
 from tests.unit._taskv3_block_fakes import make_block as _make_block
 from tests.unit._taskv3_block_fakes import output_param
 from tests.unit.helpers import make_organization, make_task
-
-
-def test_render_block_context_section_empty_when_handoff_disabled() -> None:
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now), data_extraction_goal=None)
-    previous = PreviousBlockHandoff(label="prev", status="failed", reason="captcha blocked", final_url=PLAIN_URL)
-
-    _framing, section = render_block_context(
-        task, _make_block("blk"), None, handoff_enabled=False, previous_block=previous
-    )
-
-    assert section == ""
-
-
-def test_render_block_context_section_includes_label_status_reason_and_url_when_enabled() -> None:
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now), data_extraction_goal=None)
-    long_label = "checkout" + "x" * MAX_HANDOFF_LABEL_CHARS
-    previous = PreviousBlockHandoff(
-        label=long_label, status="failed", reason="captcha never cleared", final_url=PLAIN_URL
-    )
-
-    _framing, section = render_block_context(
-        task, _make_block("blk"), None, handoff_enabled=True, previous_block=previous
-    )
-
-    assert "checkout" in section
-    assert "status: failed" in section
-    assert "captcha never cleared" in section
-    assert PLAIN_URL in section  # nosemgrep: incomplete-url-substring-sanitization
-    assert long_label not in section
-
-
-def test_render_block_context_section_empty_when_no_previous_and_last_unknown() -> None:
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now), data_extraction_goal=None)
-
-    _framing, section = render_block_context(task, _make_block("blk"), None, handoff_enabled=True, previous_block=None)
-
-    assert section == ""
-
 
 _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
     "data_extraction_goal": (None, "the applicant reference number"),
@@ -80,7 +36,6 @@ _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
     "terminate_criterion": (None, "the form says the role is closed"),
     "criteria_precedence": (False, True),
     "framing": ("", "This is one block of a larger workflow."),
-    "block_context_section": ("", "<workflow_context>\nblocks: one, two\n</workflow_context>"),
 }
 
 
@@ -89,7 +44,7 @@ _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
 def test_compose_goal_is_byte_identical_to_the_inline_patching_it_replaced(
     navigation_goal: str, mask: tuple[int, ...]
 ) -> None:
-    # Every on/off combination of the seven directives, against both an empty and a non-empty
+    # Every on/off combination of the six directives, against both an empty and a non-empty
     # navigation goal. The empty one matters: the first directive's .strip() is what decides
     # whether the goal opens with a blank line, and that only shows up when the base is "".
     chosen = {name: options[bit] for (name, options), bit in zip(_DIRECTIVE_VALUES.items(), mask)}
@@ -107,7 +62,6 @@ def _goal_as_agent_py_built_it(
     terminate_criterion: str | None,
     criteria_precedence: bool,
     framing: str,
-    block_context_section: str,
 ) -> str:
     """The goal-patching expressions as `ForgeAgent._execute_task_v3` inlined them before `compose_goal`
     existed, frozen here as the oracle for the extraction, plus any directive a later commit deliberately
@@ -148,8 +102,6 @@ def _goal_as_agent_py_built_it(
         ).strip()
     if framing:
         goal = f"{goal}\n\n{framing}".strip()
-    if block_context_section:
-        goal = f"{goal}\n\n{block_context_section}".strip()
     return goal
 
 
@@ -158,7 +110,7 @@ def test_the_split_modules_stay_one_way_dependent_on_goal_composition() -> None:
     # secret-egress filtering were pulled out of it precisely so neither can grow prompt wording;
     # an import back into it is how the three responsibilities would silently re-conflate.
     package_dir = Path(skyvern.forge.taskv3.__file__).parent
-    for module in ("workflow_position", "handoff_redaction", "llm_call_params"):
+    for module in ("handoff_redaction", "llm_call_params"):
         source = (package_dir / f"{module}.py").read_text()
         imported = {
             name.name if isinstance(node, ast.Import) else f"{node.module}.{name.name}"
@@ -273,7 +225,7 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
         label="blk", output_parameter=output_param("blk"), data_extraction_goal="the license status"
     )
 
-    framing, _ = render_block_context(extraction_only, block, None)
+    framing = render_block_context(extraction_only, block)
 
     added = [p for p in framing.split("\n\n") if p.startswith("This block only reads the page")]
     assert len(added) == 1, added
@@ -292,11 +244,11 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
         make_task(now, org, navigation_goal=None, data_extraction_goal="x", task_type=TaskType.validation),
     ]
     for task in out_of_predicate:
-        assert "This block only reads the page" not in render_block_context(task, block, None)[0]
+        assert "This block only reads the page" not in render_block_context(task, block)
     # A task block carrying only an extraction goal keeps its fill tools, so it is not told it only reads.
-    assert "This block only reads the page" not in render_block_context(extraction_only, _make_block("blk"), None)[0]
+    assert "This block only reads the page" not in render_block_context(extraction_only, _make_block("blk"))
     # A bare task has no workflow to route its nulls, so it gets no block framing at all.
-    assert render_block_context(extraction_only, None, None) == ("", "")
+    assert render_block_context(extraction_only, None) == ""
 
 
 def test_a_page_value_cannot_close_its_own_span() -> None:
@@ -342,7 +294,7 @@ def test_an_oversized_typed_value_is_withheld_without_hiding_the_rows_after_it()
 
 def test_the_code_outline_is_one_labelled_section_after_everything_else_and_only_when_given() -> None:
     record = CodeProgressRecord(before=("open", "search"), failed_step="click row", failed_line=4, after=("save",))
-    directives = GoalDirectives(complete_criterion="the form is sent", framing="FRAMING", block_context_section="CTX")
+    directives = GoalDirectives(complete_criterion="the form is sent", framing="FRAMING")
 
     goal = compose_goal("Apply", replace(directives, code_progress=record))
     lines = goal.split("\n")
@@ -420,12 +372,12 @@ def test_judging_blocks_extend_a_criterions_accepted_number_forms_to_the_same_ki
         make_task(now, org, navigation_goal=None, data_extraction_goal="x", task_type=TaskType.validation),
     ]
     for task in judging:
-        assert marker in render_block_context(task, _make_block("blk"), None)[0]
-        assert marker in render_block_context(task, _make_block("blk"), None, page_free_validation=True)[0]
+        assert marker in render_block_context(task, _make_block("blk"))
+        assert marker in render_block_context(task, _make_block("blk"), page_free_validation=True)
     not_judging = [
         make_task(now, org, navigation_goal=None, data_extraction_goal="the license status"),
         make_task(now, org, navigation_goal="Click the download button", task_type=TaskType.action),
     ]
     for task in not_judging:
-        assert marker not in render_block_context(task, _make_block("blk"), None)[0]
-    assert render_block_context(judging[0], None, None) == ("", "")
+        assert marker not in render_block_context(task, _make_block("blk"))
+    assert render_block_context(judging[0], None) == ""

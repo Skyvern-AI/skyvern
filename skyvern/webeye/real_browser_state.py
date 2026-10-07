@@ -1974,4 +1974,5 @@ class RealBrowserState(BrowserState):
             scrolling_number=scrolling_number,
             engine_selection=self.engine_selection,
             runtime_context=self._runtime_event_context,
+            keep_partial_on_timeout=True,
         )

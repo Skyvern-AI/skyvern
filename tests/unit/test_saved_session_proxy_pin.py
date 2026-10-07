@@ -264,7 +264,9 @@ async def _setup_profile_with_reconcile_failure(
     update_profile = AsyncMock(side_effect=RuntimeError("db down"))
     outer_session = AsyncMock()
 
-    monkeypatch.setattr(app.DATABASE.workflow_runs, "Session", lambda: MockAsyncSessionCtx(outer_session))
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs, "Session", MagicMock(side_effect=lambda: MockAsyncSessionCtx(outer_session))
+    )
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
         "get_or_create_managed_browser_profile",

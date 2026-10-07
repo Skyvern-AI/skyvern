@@ -39,6 +39,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
+    _OPERATION_ATTRIBUTION_ALLOWLIST,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -4108,6 +4109,91 @@ async def test_secure_proxy_transport_failure_skips_the_ai_fallback(
     assert [(episode["status"], episode["skip_reason"]) for episode in state["heal_episodes"]] == expected_episodes
     if expected_episodes == [(HealStatus.skipped, HealSkipReason.proxy_transport)]:
         assert result.error_codes == ["browser_operation_failed", "net::ERR_TUNNEL_CONNECTION_FAILED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_status", "native_exception_class", "match_count", "emit_raises", "expected"),
+    [
+        pytest.param("counted", "TimeoutError", 2, False, ("TimeoutError", 2), id="emits_secure_envelope"),
+        pytest.param("counted", None, 2, False, (None, 2), id="missing_native_class_is_not_the_wrapper"),
+        pytest.param("counted", "Error: " + "x" * 200, -1, False, (None, None), id="out_of_shape_values_dropped"),
+        pytest.param("not-a-probe-status", "TimeoutError", 2, False, None, id="unknown_status_dropped"),
+        pytest.param("counted", "TimeoutError", 2, True, None, id="emit_failure_is_fail_open"),
+    ],
+)
+async def test_secure_failure_emits_operation_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+    probe_status: str,
+    native_exception_class: str | None,
+    match_count: int,
+    emit_raises: bool,
+    expected: tuple[str | None, int | None] | None,
+) -> None:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context()
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="browser_operation_failed",
+                    safe_message=None,
+                    failure_reason='Locator.click: Timeout 30000ms exceeded waiting for locator("#SENTINEL")',
+                    exception_class="codeblock.page_operation_broker.BrowserOperationError",
+                    failing_line=1,
+                    healability_hint=False,
+                    locator_match_count=match_count,
+                    locator_probe_status=probe_status,
+                    native_exception_class=native_exception_class,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset()
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    if emit_raises:
+
+        def _raise_emit(self: CodeBlock, **_kwargs: Any) -> None:
+            raise RuntimeError("attribution emit must never surface")
+
+        monkeypatch.setattr(CodeBlock, "_emit_operation_attribution_failure", _raise_emit)
+
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    assert result.success is False
+    assert "browser_operation_failed" in (result.error_codes or [])
+    events = [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"]
+    if expected is None:
+        assert events == []
+        return
+    assert len(events) == 1
+    envelope = events[0]["operation_attribution"]
+    assert set(envelope) == set(_OPERATION_ATTRIBUTION_ALLOWLIST)
+    assert envelope["engine"] == "secure"
+    assert (envelope["exception_class"], envelope["probe_match_count"]) == expected
+    assert envelope["probe_status"] == "counted"
+    assert "SENTINEL" not in json.dumps(envelope)
 
 
 @pytest.mark.asyncio

@@ -547,9 +547,6 @@ class Settings(BaseSettings):
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
     # Task V3 native engine (skyvern-3.0) model; empty falls back to LLM_KEY. Cloud pins the validated model.
     TASK_V3_LLM_KEY: str = ""
-    # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
-    # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
-    TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
     # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
     # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
@@ -563,20 +560,6 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
-    # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
-    # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
-    # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
-    # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
-    TASK_V3_BLOCK_HANDOFF: bool = False
-    # Ask a separate judge model, before accepting finish(status=completed), whether the page and the
-    # recent tool results contradict the goal (SKY-16928). On its own this is shadow mode: the verdict is
-    # logged and the outcome never changes. With TASK_V3_GOAL_CHECK_ENFORCE also on, a contradicted
-    # completion is held once and then failed, and an impossible one is terminated. Force-on terms only:
-    # runs are randomized per run by the flags of the same names, read through run_arm_enabled().
-    TASK_V3_GOAL_CHECK: bool = False
-    TASK_V3_GOAL_CHECK_ENFORCE: bool = False
-    # The judge's model. Unset means the judge never runs; there is no fallback to another model.
-    TASK_V3_GOAL_CHECK_LLM_KEY: str | None = None
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool

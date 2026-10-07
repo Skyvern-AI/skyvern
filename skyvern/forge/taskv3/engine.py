@@ -291,17 +291,12 @@ async def run_task_v3_agent_loop(
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
     has_navigation_goal: bool = False,
-    goal_judge: GoalJudge | None = None,
-    goal_check_enforce: bool = False,
     extraction_requested: bool = False,
     # Customer instructions that can redefine what "done" means, shown to the goal judge with the goal.
     goal_instructions: str = "",
     # Called once per goal check; the redactor it returns is applied to every judge input before
     # truncation. The caller owns the run's secret set.
     goal_check_redactor: Callable[[], Redactor] | None = None,
-    # A secret may already be on the page from before this loop (an earlier block, a self-healing
-    # script): the goal check then never captures a screenshot.
-    secret_on_page_at_start: bool = False,
     # (complete_criterion, terminate_criterion) for a block whose failed or terminated finish may be re-asked
     # once; None means the block is not eligible.
     unlisted_reask_criteria: tuple[str, str | None] | None = None,
@@ -310,7 +305,7 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
-    # Asked before a single-action block completes on its step cap; outside the goal-check arm, never counted in it.
+    # Asked before a single-action block completes on its step cap.
     block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
     code_typed_values: tuple[CodeTypedValue, ...] = (),
@@ -449,13 +444,9 @@ async def run_task_v3_agent_loop(
         completion_blocker_present=completion_blocker is not None,
         extraction_requested=extraction_requested,
     )
-    goal_check_on = goal_judge is not None and judge_eligible
     reask_on = unlisted_reask_criteria is not None and judge_eligible
     block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
-    tool_trail = (
-        ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on or block_check_on else None
-    )
-    goal_verdicts: list[GoalVerdict] = []
+    tool_trail = ToolTrail() if reask_on or block_check_on else None
     reasks: list[UnlistedReask] = []
 
     async def _judge_goal(judge: GoalJudge, *, secret_entered: bool, failure_log: str) -> GoalVerdict:
@@ -482,15 +473,6 @@ async def run_task_v3_agent_loop(
                 redact=redact,
                 failure_log=failure_log,
             )
-        return verdict
-
-    async def _goal_check() -> GoalVerdict:
-        assert goal_judge is not None
-        assert tool_trail is not None
-        verdict = await _judge_goal(
-            goal_judge, secret_entered=tool_trail.secret_entered, failure_log="taskv3 goal check judge failed"
-        )
-        goal_verdicts.append(verdict)
         return verdict
 
     async def _block_completion_check() -> GoalVerdict:
@@ -567,8 +549,6 @@ async def run_task_v3_agent_loop(
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
-        goal_check=_goal_check if goal_check_on else None,
-        goal_check_enforce=goal_check_enforce,
         unlisted_reask=_unlisted_reask if reask_on else None,
         document_identity=None if page_free else document_identity,
     )
@@ -680,23 +660,6 @@ async def run_task_v3_agent_loop(
             if not _cancelled:
                 # The guard bounds itself by `_deadline_remaining`; no second computation here.
                 await blank_page_guard.ensure_live()
-    if goal_check_on:
-        gate_verdicts = [v for v in goal_verdicts if not v.recheck]
-        last = gate_verdicts[-1] if gate_verdicts else None
-        held = sum(1 for v in gate_verdicts if v.action == "hold" and not v.no_headroom)
-        outcome.goal_check = {
-            "mode": "enforce" if goal_check_enforce else "shadow",
-            "checks": len(gate_verdicts),
-            "judged": sum(1 for v in gate_verdicts if v.skipped_reason is None),
-            "rechecks": len(goal_verdicts) - len(gate_verdicts),
-            "holds": held if goal_check_enforce else 0,
-            "would_holds": 0 if goal_check_enforce else held,
-            "would_fails": sum(1 for v in gate_verdicts if v.would_fail),
-            "no_headroom": sum(1 for v in gate_verdicts if v.no_headroom),
-            "last_verdict": last.verdict if last else None,
-            "last_action": last.action if last else None,
-            "last_skipped_reason": last.skipped_reason if last else None,
-        }
     if reask_on:
         # Present on every eligible block, so exposure is the share of loops carrying it, asked or not.
         last_reask = reasks[-1] if reasks else None
@@ -726,8 +689,6 @@ async def run_task_v3_agent_loop(
         tool_seconds=outcome.tool_seconds,
         action_steps=outcome.action_steps,
         no_tool_call_turns=outcome.no_tool_call_turns,
-        tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,
-        tool_choice_in_effect=outcome.tool_choice_in_effect,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
         # State at the run's first failed/terminated finish that got past the failure-evidence gate, next to the

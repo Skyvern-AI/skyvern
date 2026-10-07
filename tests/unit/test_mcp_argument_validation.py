@@ -60,8 +60,8 @@ def _mock_navigation(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         ("skyvern_script_get_code", {"workflow_id": "wpid_1"}, ["workflow_id"], ["script_id"]),
         (
             "skyvern_workflow_run",
-            {"workflow_id": "wpid_1", "ai_fallback": True, "timeout": 2700},
-            ["ai_fallback", "timeout"],
+            {"workflow_id": "wpid_1", "max_steps": 5, "timeout": 2700},
+            ["max_steps", "timeout"],
             [],
         ),
     ],

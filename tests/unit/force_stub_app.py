@@ -16,6 +16,11 @@ def admit_block_dispatch(status: WorkflowRunStatus = WorkflowRunStatus.running) 
     )
 
 
+def released_session_stub() -> SimpleNamespace:
+    """A ``Session`` stand-in whose ``released()`` is the no-op the real one is outside a pinned scope."""
+    return SimpleNamespace(released=MagicMock(side_effect=lambda: nullcontext()))
+
+
 def create_forge_stub_app() -> ForgeApp:
     class _LazyNamespace:
         def __getattr__(self, name):
@@ -25,6 +30,8 @@ def create_forge_stub_app() -> ForgeApp:
 
     fake_app_module = ForgeApp()
     fake_app_module.DATABASE = _LazyNamespace()
+    # Auto-mocked, Session.released() would hand `async with` a coroutine.
+    fake_app_module.DATABASE.workflow_runs.Session.released = released_session_stub().released
     # Retry-policy-aware production paths query the attempt repository even for legacy runs.
     # Keep the shared stub's no-policy behavior explicit instead of letting _LazyNamespace
     # manufacture truthy AsyncMocks for these reads.

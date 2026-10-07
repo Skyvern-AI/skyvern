@@ -17,8 +17,6 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 LOG = structlog.get_logger()
 
 DATE_SEGMENT_AIM_FLAG = "TASK_V3_DATE_SEGMENT_AIM"
-GOAL_CHECK_FLAG = "TASK_V3_GOAL_CHECK"
-GOAL_CHECK_ENFORCE_FLAG = "TASK_V3_GOAL_CHECK_ENFORCE"
 LOGIN_PACE_FLAG = "TASK_V3_LOGIN_PACE"
 
 # Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The

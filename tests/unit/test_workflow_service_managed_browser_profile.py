@@ -3284,9 +3284,20 @@ async def test_forced_retirement_claim_propagates_cancellation(monkeypatch, forc
         organization_id="o_test",
         workflow=workflow,
     )
+    if case == "pin_cancelled":
+        prepared_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=run.organization_id, workflow_run_id=run.workflow_run_id
+        )
+        monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", AsyncMock(return_value=prepared_session))
     pin_error = asyncio.CancelledError() if case == "pin_cancelled" else RuntimeError("pin failed")
-    monkeypatch.setattr(database.workflow_runs, "pin_browser_session_for_dispatch", AsyncMock(side_effect=pin_error))
     entered, release = asyncio.Event(), asyncio.Event()
+
+    async def pin(**kwargs):
+        if case == "pin_cancelled":
+            entered.set()
+        raise pin_error
+
+    monkeypatch.setattr(database.workflow_runs, "pin_browser_session_for_dispatch", AsyncMock(side_effect=pin))
     order, budgets = [], []
     timeout_context = None
     original_claim = database.workflow_runs.claim_browser_session_retirement
@@ -3338,11 +3349,11 @@ async def test_forced_retirement_claim_propagates_cancellation(monkeypatch, forc
         else RuntimeError
     )
     try:
-        if case != "pin_cancelled":
-            await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(entered.wait(), timeout=5)
         if case == "cancelled":
             task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=1)
+        # A propagation bug leaves the task parked forever; the bound only has to outlast a GC pause (~1s).
+        done, _ = await asyncio.wait({task}, timeout=10)
         assert task in done, "retirement claim did not propagate cancellation or timeout"
         with pytest.raises(expected) as raised:
             await task

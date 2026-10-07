@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -357,3 +357,136 @@ async def test_create_and_history_hide_api_origin_but_preserve_real_user_id(
     assert created.model_dump()["created_by"] == expected_response_created_by
     assert listed.model_dump()["created_by"] == expected_response_created_by
     assert stored.created_by == expected_stored_created_by
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_status,run_status", [("running", "running"), ("retry", "paused")])
+async def test_metadata_reads_orphaned_session_without_any_lifecycle_or_transport_calls(browser_status, run_status):
+    session = SimpleNamespace(
+        persistent_browser_session_id="pbs_1",
+        organization_id="org_1",
+        status=browser_status,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        completed_at=None,
+        runnable_id="wr_1",
+        timeout_minutes=30,
+        browser_address="PRIVATE_TRANSPORT",
+        browser_settings={"secret": "PRIVATE_SETTING"},
+    )
+    run = {
+        "workflow_run_id": "wr_1",
+        "organization_id": "org_1",
+        "browser_session_id": "pbs_1",
+        "association_browser_session_id": "pbs_1",
+        "workflow_permanent_id": "wpid_1",
+        "copilot_session_id": "wcc_1",
+        "status": run_status,
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "finished_at": None,
+        "credits_used": 3,
+        "cached_credits_used": 1,
+        "prompt": "PRIVATE_PROMPT",
+        "parameters": {"password": "PRIVATE_PASSWORD"},
+    }
+
+    class Forbidden:
+        def __getattr__(self, name):
+            raise AssertionError("Metadata must not access lifecycle, transport, provider or write functions")
+
+    class BrowserRows:
+        async def get_persistent_browser_session(self, session_id, organization_id):
+            assert (session_id, organization_id) == ("pbs_1", "org_1")
+            return session
+
+        def __getattr__(self, name):
+            raise AssertionError("Browser metadata cannot write")
+
+    class WorkflowRows:
+        async def get_workflow_metadata_for_browser_session(self, session_id, organization_id):
+            assert (session_id, organization_id) == ("pbs_1", "org_1")
+            return [run]
+
+        def __getattr__(self, name):
+            raise AssertionError("Workflow metadata cannot write")
+
+    app_readonly = SimpleNamespace(
+        DATABASE=SimpleNamespace(browser_sessions=BrowserRows(), workflow_runs=WorkflowRows()),
+        PERSISTENT_SESSIONS_MANAGER=Forbidden(),
+        STORAGE=Forbidden(),
+        WORKFLOW_SERVICE=Forbidden(),
+        AGENT_FUNCTION=Forbidden(),
+    )
+    with patch.object(browser_sessions_mod, "app", app_readonly):
+        response = await browser_sessions_mod.get_browser_session_metadata(
+            "pbs_1", current_org=SimpleNamespace(organization_id="org_1")
+        )
+    assert response.status == browser_status and response.completed_at is None
+    assert response.associated_workflow_runs[0].status == run_status
+    assert response.associated_workflow_runs[0].copilot_session_id == "wcc_1"
+    assert response.association_index_complete is True
+    assert "PRIVATE_" not in response.model_dump_json()
+    assert session.status == browser_status and session.timeout_minutes == 30 and session.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_wrong_org_or_missing_session_returns_404_before_associations():
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session = AsyncMock()
+    with patch.object(browser_sessions_mod, "app", app_mock), pytest.raises(HTTPException) as error:
+        await browser_sessions_mod.get_browser_session_metadata(
+            "pbs_1", current_org=SimpleNamespace(organization_id="org_2")
+        )
+    assert error.value.status_code == 404
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session.assert_awaited_once_with("pbs_1", "org_2")
+    app_mock.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_metadata_truncation_is_reported_without_pagination_or_reconciliation():
+    session = SimpleNamespace(
+        persistent_browser_session_id="pbs_1",
+        organization_id="org_1",
+        status="completed",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        completed_at=datetime(2026, 1, 2, tzinfo=UTC),
+        runnable_id=None,
+    )
+    run = {
+        "workflow_run_id": "wr_1",
+        "organization_id": "org_1",
+        "browser_session_id": "pbs_1",
+        "association_browser_session_id": "pbs_1",
+        "workflow_permanent_id": "wpid_1",
+        "copilot_session_id": None,
+        "status": "completed",
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "finished_at": datetime(2026, 1, 2, tzinfo=UTC),
+        "credits_used": None,
+        "cached_credits_used": None,
+    }
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=session)
+    app_mock.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session = AsyncMock(return_value=[run] * 101)
+    with patch.object(browser_sessions_mod, "app", app_mock):
+        response = await browser_sessions_mod.get_browser_session_metadata(
+            "pbs_1", current_org=SimpleNamespace(organization_id="org_1")
+        )
+    assert len(response.associated_workflow_runs) == 100 and response.association_index_complete is False
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_metadata_missing_stored_status_fails_without_association_or_lifecycle_access():
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
+        return_value=SimpleNamespace(status=None)
+    )
+    app_mock.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session = AsyncMock()
+    with patch.object(browser_sessions_mod, "app", app_mock), pytest.raises(HTTPException) as error:
+        await browser_sessions_mod.get_browser_session_metadata(
+            "pbs_1", current_org=SimpleNamespace(organization_id="org_1")
+        )
+    assert error.value.status_code == 503 and error.value.detail == {"code": "browser_session_metadata_unavailable"}
+    app_mock.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session.assert_not_awaited()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_not_called()

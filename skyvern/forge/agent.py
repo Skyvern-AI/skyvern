@@ -191,20 +191,15 @@ from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.goal_check import (
     BLOCK_COMPLETION_CHECK_PROMPT_NAME,
     GOAL_CHECK_PROMPT_NAME,
-    PRE_JUDGE_SKIP_REASONS,
     GoalJudge,
-    goal_check_eligible,
 )
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    GOAL_CHECK_ENFORCE_FLAG,
-    GOAL_CHECK_FLAG,
     LOGIN_PACE_FLAG,
     resolve_run_arm,
-    run_arm_enabled,
 )
 from skyvern.forge.taskv3.target_label import compose_target_intention
 from skyvern.forge.validation_evidence_router import (
@@ -1308,40 +1303,6 @@ async def _resolve_task_v3_llm_key(task: Task) -> str:
     return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
 
 
-async def _read_goal_check_judge_key(distinct_id: str, organization_id: str) -> str | None:
-    """The judge llm_key named by the TASK_V3_GOAL_CHECK payload for this run's variant, or None to use the
-    configured key. A payload that is set but is not a key name is returned as-is so the registry rejects it."""
-    try:
-        payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
-            GOAL_CHECK_FLAG, distinct_id, properties={"organization_id": organization_id}, record=False
-        )
-    except Exception:
-        LOG.warning("Failed to read the goal check payload; using the configured judge model", exc_info=True)
-        return None
-    if isinstance(payload, str):
-        # Production providers deliver a payload as a JSON string; a bare key name is not JSON.
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            pass
-    if payload is None or payload == "":
-        return None
-    return payload.strip() if isinstance(payload, str) else str(payload)
-
-
-def _task_v3_goal_judge_skip_reason(task: Task, context: SkyvernContext | None) -> str | None:
-    """Why the goal judge must not run for this task whatever its model, or None. The judge never overrides a
-    model choice the task or its org pinned, and never sends an image to a run whose screenshot policy
-    withholds them (the handler would drop it silently)."""
-    if task.llm_key:
-        return "task_model_pinned"
-    if context is not None and (context.org_default_llm_key or context.org_default_secondary_llm_key):
-        return "org_model_pinned"
-    if context is not None and not context.llm_screenshots_enabled_for_prompt():
-        return "screenshots_disabled"
-    return None
-
-
 def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
     """Why ``judge_key`` cannot run the judge, or None: it must be a registered, non-BYO vision key."""
     if not judge_key:
@@ -1368,59 +1329,6 @@ def _task_v3_run_secret_values(task: Task) -> set[str]:
     )
 
 
-async def _task_v3_browser_is_attached(
-    task: Task, context: SkyvernContext | None, browser_session_id: str | None, organization_id: str
-) -> bool:
-    """Whether this run drives a browser it did not create: a persistent session or a browser attached by
-    address, for the task or its workflow run. A failed lookup reads as attached."""
-    if browser_session_id or task.browser_session_id or task.browser_address:
-        return True
-    if context is not None and context.browser_session_id:
-        return True
-    if not task.workflow_run_id:
-        return False
-    try:
-        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-            workflow_run_id=task.workflow_run_id, organization_id=organization_id
-        )
-    except Exception:
-        LOG.warning("taskv3 could not read how the run's browser was obtained", task_id=task.task_id, exc_info=True)
-        return True
-    return bool(workflow_run is not None and (workflow_run.browser_address or workflow_run.browser_session_id))
-
-
-def _task_v3_secret_may_be_on_page(
-    task: Task,
-    context: SkyvernContext | None,
-    *,
-    workflow_owned_recovery: bool,
-    recovery_credential_parameter_keys: list[str] | None,
-    browser_attached: bool = False,
-) -> bool:
-    """Whether a secret may be on the page before this loop acts. Nothing records which secrets an
-    earlier block or a self-healing script typed, so any secret this run could have typed counts: a
-    registered runtime secret, a browser this run did not create, a workflow-owned recovery (its script fills credentials), or any secret
-    the run has resolved so far, however short. Reads the raw secrets, not the redaction set, which drops
-    short values; an error reads as True, because the safe answer skips the judge."""
-    if context is not None and (context.runtime_secret_values or context.totp_codes):
-        return True
-    # A browser this run did not create can still show what earlier activity typed, and nothing records it.
-    if browser_attached:
-        return True
-    if workflow_owned_recovery or recovery_credential_parameter_keys:
-        return True
-    try:
-        run_context = (
-            app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(task.workflow_run_id)
-            if task.workflow_run_id
-            else None
-        )
-        return bool(run_context is not None and run_context.secrets)
-    except Exception:
-        LOG.warning("taskv3 could not read the run's secrets; treating one as on the page", exc_info=True)
-        return True
-
-
 def _task_v3_goal_check_redactor(task: Task, context: SkyvernContext | None) -> Callable[[str], str]:
     """One secret set per goal check, built when the check starts."""
     # Raw runtime values too, not only the artifact-redaction set: a verification code the run read
@@ -1441,13 +1349,11 @@ def _build_task_v3_goal_judge(
     step: Step,
     browser_state: BrowserState,
     peek_page: Callable[[], Awaitable[Any]],
-    shot_holder: list[bytes],
     prompt_name: str = GOAL_CHECK_PROMPT_NAME,
 ) -> GoalJudge:
     handler = LLMAPIHandlerFactory.get_llm_api_handler(judge_key)
 
     async def _goal_judge(prompt: str) -> dict[str, Any] | None:
-        del shot_holder[:]
         try:
             # The peek accessor, like the settle probe: a lost page is no evidence, and recovering it
             # at finish time could navigate.
@@ -1465,7 +1371,6 @@ def _build_task_v3_goal_judge(
                 "taskv3 goal check screenshot failed", task_id=task.task_id, prompt_name=prompt_name, exc_info=True
             )
             return None
-        shot_holder.append(shot)
         response = await handler(
             prompt=prompt,
             prompt_name=prompt_name,
@@ -2311,8 +2216,6 @@ class ForgeAgent:
             _recorded_work_frames,
             pending_marker,
         )
-        from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, select_previous_block
-        from skyvern.utils.token_counter import approx_count_tokens
 
         # Every task re-resolves the live working page on every tool call, so a click that opens a
         # new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
@@ -2373,8 +2276,6 @@ class ForgeAgent:
                 forced=settings.TASK_V3_LOGIN_PACE,
                 properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
             )
-        # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
-        goal_judge_shot: list[bytes] = []
         page_free_validation = bool(
             task_block is not None
             and task.task_type == TaskType.validation
@@ -2399,33 +2300,7 @@ class ForgeAgent:
                 page_free_validation = bool(router_result.effective_without_page_information)
             except Exception:
                 LOG.warning("task_v3 validation evidence router failed; staying page-aware", task_id=task.task_id)
-        handoff_enabled = bool(settings.TASK_V3_BLOCK_HANDOFF and task_block is not None and task.workflow_run_id)
-        previous_block: PreviousBlockHandoff | None = None
-        if handoff_enabled and task.workflow_run_id:
-            # Read the durable block rows, not a process-local cache: a Temporal worker can restart
-            # between blocks. Fail open — a lookup error must not fail a healthy run.
-            try:
-                run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-                    workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
-                )
-                current_attempt_number = app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(task.workflow_run_id)
-                run_blocks = [
-                    block
-                    for block in run_blocks
-                    if (block.attempt_number if block.attempt_number is not None else 1) == current_attempt_number
-                ]
-                previous_block = select_previous_block(run_blocks, task.task_id)
-            except Exception:
-                LOG.warning("task_v3 previous-block handoff lookup failed", task_id=task.task_id, exc_info=True)
-        framing, block_context_section = render_block_context(
-            task,
-            task_block,
-            workflow_run_context,
-            page_free_validation=page_free_validation,
-            handoff_enabled=handoff_enabled,
-            previous_block=previous_block,
-            selected_block_labels=context.run_block_labels if context else None,
-        )
+        framing = render_block_context(task, task_block, page_free_validation=page_free_validation)
         # Surface the customer's completion/termination criteria (trusted task config, like the navigation
         # goal). Withhold a complete_criterion flagged untrusted (LLM-derived from page content) so it can't be
         # injected into the goal raw — unreachable on v3 today, but keeps the boundary if a future change ever
@@ -2450,7 +2325,6 @@ class ForgeAgent:
                 # each other in both engines, and the only one this was measured on (SKY-16193).
                 criteria_precedence=task.task_type == TaskType.validation,
                 framing=framing,
-                block_context_section=block_context_section,
                 code_progress=recovery_code_progress,
             ),
         )
@@ -3065,8 +2939,6 @@ class ForgeAgent:
             workflow_system_guidance = task.workflow_system_prompt
             block_type = str(task_block.block_type) if task_block is not None else None
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
-            goal_judge: GoalJudge | None = None
-            goal_check_enforce = False
             # Not on validation: there the criterion is the question itself, and a skipped screen answers another.
             reask_complete_criterion = goal_fields["complete_criterion"]
             unlisted_reask_criteria = (
@@ -3074,75 +2946,12 @@ class ForgeAgent:
                 if reask_complete_criterion and task.task_type != TaskType.validation
                 else None
             )
-            goal_judge_skip: str | None = "ineligible"
-            if goal_check_eligible(
-                page_free=page_free_validation,
-                completion_blocker_present=completion_blocker is not None,
-                extraction_requested=extraction_requested,
-            ):
-                goal_judge_skip = _task_v3_goal_judge_skip_reason(task, context)
-                if goal_judge_skip is not None:
-                    LOG.info("taskv3 goal check skipped", task_id=task.task_id, reason=goal_judge_skip)
-            if goal_judge_skip is None:
-                goal_check_distinct_id = task.workflow_run_id or task.task_id
-                if context:
-                    await resolve_run_arm(
-                        context,
-                        GOAL_CHECK_FLAG,
-                        distinct_id=goal_check_distinct_id,
-                        organization_id=task.organization_id,
-                        forced=settings.TASK_V3_GOAL_CHECK,
-                    )
-                if run_arm_enabled(GOAL_CHECK_FLAG, settings.TASK_V3_GOAL_CHECK):
-                    # The model rides on the treatment payload, so it is known only after assignment. A bad key
-                    # then skips every treatment run alike, which leaves the arm inert rather than selected.
-                    payload_key = await _read_goal_check_judge_key(goal_check_distinct_id, task.organization_id)
-                    judge_key = payload_key or settings.TASK_V3_GOAL_CHECK_LLM_KEY
-                    # The payload is re-read per block, so a mid-run payload edit can change the model between
-                    # blocks of one run; the key is logged per block so a read can split by it.
-                    judge_key_source = "payload" if payload_key else "setting"
-                    key_skip = _goal_judge_key_skip_reason(judge_key)
-                    if key_skip is not None:
-                        LOG.info(
-                            "taskv3 goal check skipped",
-                            task_id=task.task_id,
-                            reason=key_skip,
-                            judge_key=judge_key,
-                            judge_key_source=judge_key_source,
-                        )
-                    else:
-                        assert judge_key is not None
-                        LOG.info(
-                            "taskv3 goal check judge",
-                            task_id=task.task_id,
-                            judge_key=judge_key,
-                            judge_key_source=judge_key_source,
-                        )
-                        if context:
-                            await resolve_run_arm(
-                                context,
-                                GOAL_CHECK_ENFORCE_FLAG,
-                                distinct_id=goal_check_distinct_id,
-                                organization_id=task.organization_id,
-                                forced=settings.TASK_V3_GOAL_CHECK_ENFORCE,
-                            )
-                        goal_check_enforce = run_arm_enabled(
-                            GOAL_CHECK_ENFORCE_FLAG, settings.TASK_V3_GOAL_CHECK_ENFORCE
-                        )
-                        goal_judge = _build_task_v3_goal_judge(
-                            judge_key=judge_key,
-                            task=task,
-                            step=step,
-                            browser_state=browser_state,
-                            peek_page=_fingerprint_page,
-                            shot_holder=goal_judge_shot,
-                        )
             # A block that completes on a download is not done by its one action.
             single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
             block_completion_judge: GoalJudge | None = None
             if single_action_block:
-                # The run's own model, outside the goal-check arm's payload; its non-flex twin, as flex queueing
-                # outlasts the judge's timeout. Without a judge the block's step-cap completion is never offered.
+                # The run's own model, on its non-flex twin as flex queueing outlasts the judge's timeout.
+                # Without a judge the block's step-cap completion is never offered.
                 # The registry key: an OpenRouter caller rewrites llm_key to the bare model id.
                 run_key = llm_caller.original_llm_key
                 twin_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(run_key)
@@ -3167,7 +2976,6 @@ class ForgeAgent:
                         step=step,
                         browser_state=browser_state,
                         peek_page=_fingerprint_page,
-                        shot_holder=[],
                         prompt_name=BLOCK_COMPLETION_CHECK_PROMPT_NAME,
                     )
             outcome = await run_task_v3_agent_loop(
@@ -3185,29 +2993,14 @@ class ForgeAgent:
                 download_attempts=_download_attempts,
                 block_type=block_type,
                 has_navigation_goal=bool(task.navigation_goal),
-                goal_judge=goal_judge,
-                goal_check_enforce=goal_check_enforce,
                 extraction_requested=extraction_requested,
                 # Only the customer's own instructions can define what counts as done. Auth and captcha
                 # guidance are how-to, and the judge is told an outcome its instructions allow is no
                 # contradiction.
                 goal_instructions=task.workflow_system_prompt or "",
-                secret_on_page_at_start=_task_v3_secret_may_be_on_page(
-                    task,
-                    context,
-                    workflow_owned_recovery=workflow_owned_recovery,
-                    recovery_credential_parameter_keys=recovery_credential_parameter_keys,
-                    # Only looked up when a judge would run: it can cost a workflow-run read.
-                    browser_attached=goal_judge is not None
-                    and await _task_v3_browser_is_attached(
-                        task, context, browser_session_id, organization.organization_id
-                    ),
-                ),
                 goal_check_redactor=(
                     (lambda: _task_v3_goal_check_redactor(task, context))
-                    if goal_judge is not None
-                    or block_completion_judge is not None
-                    or unlisted_reask_criteria is not None
+                    if block_completion_judge is not None or unlisted_reask_criteria is not None
                     else None
                 ),
                 unlisted_reask_criteria=unlisted_reask_criteria,
@@ -3281,9 +3074,7 @@ class ForgeAgent:
             turns=outcome.turns,
             tool_calls=outcome.tool_calls,
             action_steps=outcome.action_steps,
-            taskv3_block_context_tokens=approx_count_tokens(block_context_section),
             block_type=block_type,
-            goal_check=outcome.goal_check,
         )
         completion_rejection: str | None = None
         if outcome.status == "completed":
@@ -3393,16 +3184,7 @@ class ForgeAgent:
                         # Bounded like the neighboring persists: the verdict-less death paths reach
                         # this on exactly the runs whose page is most likely stuck.
                         async with asyncio.timeout(30):
-                            if (
-                                outcome.status == "completed"
-                                # A post-loop veto (e.g. a blank page) judged a later page than the judge saw.
-                                and completion_rejection is None
-                                and goal_judge_shot
-                                and (outcome.goal_check or {}).get("last_skipped_reason") not in PRE_JUDGE_SKIP_REASONS
-                            ):
-                                decision_shot = goal_judge_shot[0]
-                            else:
-                                decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+                            decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
                             decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
                                 step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
                             )

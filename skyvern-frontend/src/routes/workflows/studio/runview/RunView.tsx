@@ -67,6 +67,7 @@ import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithW
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
+import { WorkflowRunHumanInteraction } from "../../workflowRun/WorkflowRunHumanInteraction";
 import { ScriptUpdateCard } from "../../workflowRun/ScriptUpdateCard";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
@@ -77,6 +78,7 @@ import {
   collectTimelineSearchTargets,
   filterTimelineToAttempt,
   findActiveItem,
+  findAwaitingHumanInteractionBlock,
   flattenTimelineChronologically,
   parseActiveIterationParam,
   type TimelineSearchTarget,
@@ -944,12 +946,20 @@ export function RunView({
   const jumpToFailedBlock = failedBlock
     ? () => selectTimelineBlock(failedBlock)
     : undefined;
+  const awaitingHumanInteraction = currentTimeline
+    ? findAwaitingHumanInteractionBlock(currentTimeline)
+    : null;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col gap-2 overflow-hidden p-2">
       <WorkflowRunVerificationCodeForm
         workflowRunId={workflowRun.workflow_run_id}
       />
+      {awaitingHumanInteraction ? (
+        <WorkflowRunHumanInteraction
+          workflowRunBlock={awaitingHumanInteraction}
+        />
+      ) : null}
       {embedded ? null : (
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1">
           <RunTagsEditor workflowRunId={workflowRun.workflow_run_id} />

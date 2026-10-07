@@ -3123,6 +3123,46 @@ class WorkflowRunsRepository(BaseRepository):
                 for run, title in workflow_runs_and_titles_tuples
             ]
 
+    @db_operation("get_workflow_metadata_for_browser_session")
+    async def get_workflow_metadata_for_browser_session(
+        self, browser_session_id: str, organization_id: str
+    ) -> list[dict[str, Any]]:
+        identifiers = self._indexed_identifier_run_ids(browser_session_id, standalone_tasks=False)
+        if identifiers is None:
+            raise ValueError("invalid_browser_session_identifier")
+        pinned_runs = select(WorkflowRunAttemptModel.workflow_run_id).where(
+            WorkflowRunAttemptModel.organization_id == organization_id,
+            WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
+        )
+        async with self.Session() as session:
+            query = (
+                select(
+                    WorkflowRunModel.workflow_run_id,
+                    WorkflowRunModel.organization_id,
+                    WorkflowRunModel.browser_session_id,
+                    WorkflowRunModel.workflow_permanent_id,
+                    WorkflowRunModel.copilot_session_id,
+                    WorkflowRunModel.status,
+                    WorkflowRunModel.created_at,
+                    WorkflowRunModel.finished_at,
+                    WorkflowRunModel.credits_used,
+                    WorkflowRunModel.cached_credits_used,
+                )
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(
+                    or_(
+                        WorkflowRunModel.workflow_run_id.in_(identifiers),
+                        WorkflowRunModel.workflow_run_id.in_(pinned_runs),
+                    )
+                )
+                .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+                .limit(101)
+            )
+            result = await session.execute(query)
+            return [
+                {**dict(row), "association_browser_session_id": browser_session_id} for row in result.mappings().all()
+            ]
+
     @db_operation("get_workflow_runs_by_parent_workflow_run_id")
     async def get_workflow_runs_by_parent_workflow_run_id(
         self,

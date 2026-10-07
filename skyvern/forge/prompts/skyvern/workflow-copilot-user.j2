@@ -93,13 +93,7 @@ Overall goal (long-term memory):
 ```
 {% endif %}
 
-{% if loaded_result_context is defined and loaded_result_context %}
-LOADED RESULT EXTRACTION TARGETS:
 
-```
-{{ loaded_result_context }}
-```
-{% endif %}
 
 {% if not chat_history and not global_llm_context %}
 No previous context available.

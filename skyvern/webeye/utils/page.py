@@ -1518,6 +1518,7 @@ async def _scrolling_screenshots_helper(
     max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
     engine_selection: BrowserEngineSelection | None = None,
+    partial_frames: list[tuple[bytes, int]] | None = None,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
     skyvern_page = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
@@ -1559,6 +1560,8 @@ async def _scrolling_screenshots_helper(
             )
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
+            if partial_frames is not None:
+                partial_frames.append((screenshot, int(scroll_y_px)))
             scroll_y_px_old = scroll_y_px
             LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
             scroll_y_px = await skyvern_page.scroll_to_next_page(
@@ -1647,6 +1650,51 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
             merged_img.close()
 
     return merged_img
+
+
+def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -> bytes:
+    images: list[Image.Image] = []
+    merged_img: Image.Image | None = None
+    buffer: BytesIO | None = None
+    try:
+        for screenshot in screenshots:
+            with Image.open(BytesIO(screenshot)) as img:
+                img.load()
+                images.append(img)
+
+        merged_img = _merge_images_by_position(images, positions)
+
+        buffer = BytesIO()
+        merged_img.save(buffer, format="PNG")
+        buffer.seek(0)
+        return buffer.read()
+    finally:
+        # The decoded images, stitched image, and PNG buffer land in reference cycles that
+        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
+        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
+        _close_screenshot_stitch_resources(images, merged_img, buffer)
+        if len(images) > 1:
+            gc.collect()
+
+
+def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | None:
+    positions = [position for _, position in partial_frames]
+    try:
+        png = _stitch_screenshots_to_png([frame for frame, _ in partial_frames], positions)
+    except Exception:
+        LOG.warning(
+            "Failed to stitch the viewports captured before the scrolling screenshot timed out",
+            frame_count=len(positions),
+            exc_info=True,
+        )
+        return None
+    LOG.warning(
+        "Scrolling screenshot timed out; keeping the viewports captured so far",
+        incomplete_reason="capture_timeout",
+        frame_count=len(positions),
+        scroll_positions=positions,
+    )
+    return png
 
 
 def _close_screenshot_stitch_resources(
@@ -2531,12 +2579,16 @@ class SkyvernFrame:
         scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         engine_selection: BrowserEngineSelection | None = None,
         runtime_context: BrowserRuntimeLogContext | None = None,
+        keep_partial_on_timeout: bool = False,
     ) -> bytes:
         """``timeout`` is milliseconds and is one deadline for frame setup, capture, fallback and the scroll restore.
-        Expiry raises TimeoutError; helper cleanup (CDP detach drain, cursor re-show) is separately bounded and may
-        overshoot by that bound. ``runtime_context`` is the owning browser's, for its runtime dimensions only."""
+        Expiry raises TimeoutError, unless ``keep_partial_on_timeout`` is set and at least one viewport was captured:
+        those viewports are then stitched and returned (not written to ``file_path``). Helper cleanup (CDP detach
+        drain, cursor re-show) is separately bounded and may overshoot by that bound. ``runtime_context`` is the
+        owning browser's, for its runtime dimensions only."""
         context = BrowserRuntimeLogContext.current()
         started = _monotonic()
+        partial_frames: list[tuple[bytes, int]] | None = [] if keep_partial_on_timeout else None
         try:
             return await SkyvernFrame._take_scrolling_screenshot(
                 page=page,
@@ -2545,6 +2597,7 @@ class SkyvernFrame:
                 mode=mode,
                 scrolling_number=scrolling_number,
                 engine_selection=engine_selection,
+                partial_frames=partial_frames,
             )
         except Exception as exc:
             # Observe only the terminal request, after local timeout conversion and all fallbacks;
@@ -2565,6 +2618,10 @@ class SkyvernFrame:
                     timeout_ms=timeout,
                     elapsed_ms=(_monotonic() - started) * 1000,
                 )
+            if partial_frames and isinstance(exc, TimeoutError):
+                partial = _stitch_partial_frames(partial_frames)
+                if partial is not None:
+                    return partial
             raise
 
     @staticmethod
@@ -2575,6 +2632,7 @@ class SkyvernFrame:
         mode: ScreenshotMode,
         scrolling_number: int,
         engine_selection: BrowserEngineSelection | None,
+        partial_frames: list[tuple[bytes, int]] | None = None,
     ) -> bytes:
         if scrolling_number <= 0:
             return await _current_viewpoint_screenshot_helper(
@@ -2601,8 +2659,9 @@ class SkyvernFrame:
         skyvern_frame: SkyvernFrame | None = None
         x: int | None = None
         y: int | None = None
+        capture_timeout = asyncio.timeout_at(deadline)
         try:
-            async with asyncio.timeout_at(deadline):
+            async with capture_timeout:
                 skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
                 try:
                     x, y = await skyvern_frame.get_scroll_x_y()
@@ -2611,41 +2670,20 @@ class SkyvernFrame:
                         mode=mode,
                         max_number=scrolling_number,
                         engine_selection=engine_selection,
+                        partial_frames=partial_frames,
                     )
-                    images: list[Image.Image] = []
-                    merged_img: Image.Image | None = None
-                    buffer: BytesIO | None = None
-                    try:
-                        for screenshot in screenshots:
-                            with Image.open(BytesIO(screenshot)) as img:
-                                img.load()
-                                images.append(img)
+                    img_data = _stitch_screenshots_to_png(screenshots, positions)
+                    if file_path is not None:
+                        with open(file_path, "wb") as f:
+                            f.write(img_data)
 
-                        merged_img = _merge_images_by_position(images, positions)
-
-                        buffer = BytesIO()
-                        merged_img.save(buffer, format="PNG")
-                        buffer.seek(0)
-
-                        img_data = buffer.read()
-                        if file_path is not None:
-                            with open(file_path, "wb") as f:
-                                f.write(img_data)
-
-                        end_time = time.time()
-                        LOG.debug(
-                            "Full page screenshot taking time",
-                            screenshot_time=end_time - start_time,
-                            file_path=file_path,
-                        )
-                        return img_data
-                    finally:
-                        # The decoded images, stitched image, and PNG buffer land in reference cycles that
-                        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
-                        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
-                        _close_screenshot_stitch_resources(images, merged_img, buffer)
-                        if len(images) > 1:
-                            gc.collect()
+                    end_time = time.time()
+                    LOG.debug(
+                        "Full page screenshot taking time",
+                        screenshot_time=end_time - start_time,
+                        file_path=file_path,
+                    )
+                    return img_data
                 except ScreenshotTargetClosed:
                     # The fallback below captures the same page, so a closed target can only fail there too.
                     x = None
@@ -2665,6 +2703,11 @@ class SkyvernFrame:
                         full_page=True,
                         engine_selection=engine_selection,
                     )
+        except TimeoutError:
+            # Only this capture's own deadline may keep the captured viewports.
+            if partial_frames is not None and not capture_timeout.expired():
+                partial_frames.clear()
+            raise
         finally:
             if skyvern_frame is not None and x is not None and y is not None:
                 # Courtesy restore of the pre-screenshot scroll position, kept outside the deadline block so a

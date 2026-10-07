@@ -8133,15 +8133,12 @@ class WorkflowService:
         workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
-        run_context_for_selection = skyvern_context.current()
-        if run_context_for_selection is not None:
-            run_context_for_selection.run_block_labels = block_labels
-
         # Load script blocks if script is provided
         script_blocks_by_label: dict[str, Any] = {}
         loaded_script_module = None
         blocks_to_update: set[str] = set()
         in_process_script_execution_denied = False
+        denied_cached_labels: frozenset[str] = frozenset()
 
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
@@ -8322,6 +8319,9 @@ class WorkflowService:
                     raise
                 # Not logged again here: the gate already emitted the denial with its reason and
                 # full run identity, and one line per denial is what the denial monitor counts.
+                denied_cached_labels = frozenset(
+                    label for label, sb in script_blocks_by_label.items() if sb.run_signature and not sb.requires_agent
+                )
                 script_blocks_by_label = {}
                 loaded_script_module = None
                 in_process_script_execution_denied = True
@@ -8452,14 +8452,6 @@ class WorkflowService:
             empty_blocks_detected=script is not None and is_script_run and not script_blocks_by_label,
         )
 
-        if in_process_script_execution_denied and not script_mode_active:
-            await self._mark_script_fallback_triggered(
-                workflow_run_id=workflow_run_id,
-                valid_to_run_code=True,
-                block_executed_with_code=False,
-                block_label=None,
-            )
-
         if script_mode_active and script is not None:
             # Regression-locked by tests/unit/workflow/test_mark_script_run_loaded.py
             # ::test_mark_script_run_loaded_calls_update_with_script_identity.
@@ -8504,6 +8496,7 @@ class WorkflowService:
                 loaded_script_module=loaded_script_module,
                 is_script_run=is_script_run,
                 blocks_to_update=blocks_to_update,
+                denied_cached_labels=denied_cached_labels,
             )
 
         #
@@ -8530,6 +8523,7 @@ class WorkflowService:
                 loaded_script_module=loaded_script_module,
                 is_script_run=is_script_run,
                 blocks_to_update=blocks_to_update,
+                denied_cached_labels=denied_cached_labels,
             )
 
             if should_stop:
@@ -8695,6 +8689,7 @@ class WorkflowService:
         loaded_script_module: Any,
         is_script_run: bool,
         blocks_to_update: set[str],
+        denied_cached_labels: frozenset[str] = frozenset(),
     ) -> tuple[WorkflowRun, set[str]]:
         finally_block_label = workflow.workflow_definition.finally_block_label
         dag_blocks = workflow.workflow_definition.blocks
@@ -8772,6 +8767,7 @@ class WorkflowService:
                 is_script_run=is_script_run,
                 blocks_to_update=blocks_to_update,
                 parent_workflow_run_block_id=parent_wrb_id,
+                denied_cached_labels=denied_cached_labels,
             )
 
             # Track conditional workflow_run_block_ids so branch targets
@@ -8861,6 +8857,7 @@ class WorkflowService:
         is_script_run: bool,
         blocks_to_update: set[str],
         parent_workflow_run_block_id: str | None = None,
+        denied_cached_labels: frozenset[str] = frozenset(),
     ) -> tuple[WorkflowRun, set[str], BlockResult | None, bool, dict[str, Any] | None]:
         organization_id = organization.organization_id
         workflow_run_block_result: BlockResult | None = None
@@ -8940,6 +8937,14 @@ class WorkflowService:
                 if isinstance(agent_execution, WorkflowRunDispatchStopped):
                     return agent_execution.workflow_run, blocks_to_update, None, True, branch_metadata
                 workflow_run_block_result, block_requires_agent = agent_execution
+                # The in-process policy denied this block's cached code, so it ran via the agent instead.
+                if block.label in denied_cached_labels and not block.disable_cache and is_block_type_cacheable(block):
+                    await self._mark_script_fallback_triggered(
+                        workflow_run_id=workflow_run_id,
+                        valid_to_run_code=True,
+                        block_executed_with_code=False,
+                        block_label=block.label,
+                    )
                 if attempt.fallback_episode_id and workflow_run_block_result:
                     await self._enrich_fallback_episode_with_agent_actions(
                         block=block,
@@ -12119,19 +12124,21 @@ class WorkflowService:
                         dispatch_claim_started_at=dispatch_claim_started_at,
                         expected_browser_session_id=expected_browser_session_id,
                     )
-                browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                    organization_id=organization_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    proxy_location=workflow_request.proxy_location,
-                    timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
-                    runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-                    browser_profile_id=forced_browser_profile_id,
-                    inherit_profile_proxy=True,
-                    session_kind=BrowserSessionKind.workflow_run,
-                    **creation_options,
-                    browser_settings=workflow_run.browser_settings,
-                    created_for_workflow_run_id=workflow_run.workflow_run_id,
-                )
+                # Creation waits for the browser to start, so a pinned setup's connection goes back to the pool.
+                async with app.DATABASE.workflow_runs.Session.released():
+                    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        proxy_location=workflow_request.proxy_location,
+                        timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
+                        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+                        browser_profile_id=forced_browser_profile_id,
+                        inherit_profile_proxy=True,
+                        session_kind=BrowserSessionKind.workflow_run,
+                        **creation_options,
+                        browser_settings=workflow_run.browser_settings,
+                        created_for_workflow_run_id=workflow_run.workflow_run_id,
+                    )
             except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
                 raise
             except Exception as error:

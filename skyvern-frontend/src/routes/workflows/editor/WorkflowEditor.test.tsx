@@ -2631,12 +2631,17 @@ describe("save failures stop navigation and block runs", () => {
       </QueryClientProvider>,
     );
     try {
+      // The name stays the action; why it is unavailable is the description.
       const run = screen.getByRole("button", {
-        name: `Run this block (save is paused): ${SAVE_HOLD}`,
+        name: "Run this block",
+        description: `Save is paused: ${SAVE_HOLD}`,
       });
       expect(run.matches(":disabled")).toBe(true);
       // A disabled button swallows its own tooltip trigger's events.
-      expect(run.closest("[tabindex='0']")).not.toBeNull();
+      const wrapper = run.closest<HTMLElement>("[tabindex='0']");
+      expect(wrapper?.getAttribute("aria-describedby")).toBe(
+        run.getAttribute("aria-describedby"),
+      );
       fireEvent.click(run);
       expect(saveSpy).not.toHaveBeenCalled();
 
@@ -2684,8 +2689,10 @@ describe("save failures stop navigation and block runs", () => {
       fireEvent.keyDown(control.getByRole("button", { name: "More actions" }), {
         key: "Enter",
       });
+      // The name stays the action; the visible reason line is its description.
       const held = await screen.findByRole("menuitem", {
-        name: `Save as Template (paused): ${SAVE_HOLD}`,
+        name: "Save as Template",
+        description: SAVE_HOLD,
       });
       expect(held.getAttribute("aria-disabled")).toBe("true");
       expect(held.textContent).toContain(SAVE_HOLD);
@@ -2693,11 +2700,11 @@ describe("save failures stop navigation and block runs", () => {
       expect(save).not.toHaveBeenCalled();
 
       setSaveHold(null);
-      expect(
-        screen
-          .getByRole("menuitem", { name: "Save as Template" })
-          .getAttribute("aria-disabled"),
-      ).toBeNull();
+      const released = screen.getByRole("menuitem", {
+        name: "Save as Template",
+      });
+      expect(released.getAttribute("aria-disabled")).toBeNull();
+      expect(released.getAttribute("aria-describedby")).toBeNull();
     } finally {
       control.unmount();
       client.clear();
@@ -4001,6 +4008,9 @@ describe("A49 metadata authorship through editor actions", () => {
           const discard = screen.getByRole("button", {
             name: "Discard pending save",
           });
+          // The editor reads a change as user-driven only within a wall-clock window after the
+          // gesture, so hold the clock until hydration's effects have classified it.
+          vi.useFakeTimers({ toFake: ["Date"] });
           fireEvent.pointerDown(discard);
           fireEvent.click(discard);
           fireEvent.pointerUp(document);
@@ -4030,6 +4040,8 @@ describe("A49 metadata authorship through editor actions", () => {
         });
         expectHydrated(canonical);
         expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+        await act(async () => {});
+        vi.useRealTimers();
         if (release === "discard")
           await waitFor(() => expect(dirtyRefresh).toHaveBeenCalledWith(true));
         expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(false);

@@ -104,3 +104,36 @@ async def test_released_block_holds_no_connection_and_the_session_keeps_committi
     assert checked_out_while_released == 0
     assert rows == [1, 2, 3]
     assert checked_out_after_scope == 0
+
+
+@pytest.mark.asyncio
+async def test_released_block_gives_repository_calls_their_own_session_and_returns_its_connection(
+    tmp_path: Path,
+) -> None:
+    db = BaseAlchemyDB(create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'released_reads.db'}"))
+    pool = db.engine.sync_engine.pool
+    async with db.engine.begin() as connection:
+        await connection.execute(text("CREATE TABLE runs (id INTEGER)"))
+
+    checked_out_between_reads: list[int] = []
+    async with db.Session.pinned() as session:
+        await session.execute(text("INSERT INTO runs VALUES (1)"))
+        await session.commit()
+        async with db.Session.released():
+            for _ in range(3):
+                # What a repository call does: joins the ambient session when there is one. Inside the block there
+                # must be none, or its first read would keep a new connection checked out until the block ends.
+                async with db.Session() as repository_session:
+                    assert repository_session is not session
+                    await repository_session.execute(text("SELECT count(*) FROM runs"))
+                checked_out_between_reads.append(pool.checkedout())
+        await session.execute(text("INSERT INTO runs VALUES (2)"))
+        await session.commit()
+        assert db.Session.current() is session
+
+    async with db.engine.connect() as reader:
+        rows = (await reader.execute(text("SELECT id FROM runs ORDER BY id"))).scalars().all()
+    await db.engine.dispose()
+
+    assert checked_out_between_reads == [0, 0, 0]
+    assert rows == [1, 2]
