@@ -102,7 +102,11 @@ async def test_extends_the_chat_session_and_reports_the_managers_grant(monkeypat
     manager = StrictManager([_session()], extend=_grant(45))
     monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", manager)
     catalog_tool = next(
-        t for t in copilot_native_tools(supports_question_tool=True, browser_code_available=True) if t.name == TOOL_NAME
+        t
+        for t in copilot_native_tools(
+            supports_question_tool=True, browser_code_available=True, run_tools_available=True
+        )
+        if t.name == TOOL_NAME
     )
 
     payload = await _call(_ctx(), 45, tool=catalog_tool)
@@ -240,7 +244,7 @@ async def test_cancellation_propagates_instead_of_becoming_a_result(monkeypatch:
 
 
 def test_a_turn_without_browser_authority_does_not_advertise_the_tool() -> None:
-    native = copilot_native_tools(supports_question_tool=True, browser_code_available=True)
+    native = copilot_native_tools(supports_question_tool=True, browser_code_available=True, run_tools_available=True)
     assert TOOL_NAME in {tool.name for tool in native}
 
     surface = resolve_copilot_tool_surface(

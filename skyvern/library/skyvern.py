@@ -24,7 +24,7 @@ LOG = structlog.get_logger()
 _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 2.0
 
 if TYPE_CHECKING:
-    from playwright.async_api import Playwright
+    from playwright.async_api import Browser, Playwright
 
     from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -45,6 +45,21 @@ async def _read_devtools_active_port(user_data_dir: pathlib.Path) -> int:
             last_error = exc
             await asyncio.sleep(0.01)
     raise RuntimeError(f"Chromium did not publish a valid CDP port in {active_port_file}") from last_error
+
+
+async def _hand_downloads_back_to_browser(browser: Browser, browser_session_id: str) -> None:
+    # connect_over_cdp points every download in the session at this client's temp dir, where the session never sees
+    # them; "default" hands them back to the browser's own download directory. Never detached: Chromium reverts the
+    # binding when the CDP session that set it detaches.
+    try:
+        cdp_session = await browser.new_browser_cdp_session()
+        await cdp_session.send("Browser.setDownloadBehavior", {"behavior": "default", "eventsEnabled": True})
+    except Exception:
+        LOG.warning(
+            "Could not hand downloads back to the browser session; files downloaded in it may not be captured",
+            browser_session_id=browser_session_id,
+            exc_info=True,
+        )
 
 
 def _get_browser_session_url(browser_session: BrowserSessionResponse) -> str:
@@ -731,6 +746,7 @@ class Skyvern(AsyncSkyvern):
         browser = await playwright.chromium.connect_over_cdp(
             browser_session.browser_address, headers={"x-api-key": self._api_key}
         )
+        await _hand_downloads_back_to_browser(browser, browser_session.browser_session_id)
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(
             self,

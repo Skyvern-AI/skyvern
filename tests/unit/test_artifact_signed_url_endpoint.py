@@ -12,10 +12,12 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.config import settings
+from skyvern.forge.api_app import SecurityHeadersMiddleware
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
@@ -284,3 +286,37 @@ class TestKeyringUnsetFallback:
         body = resp.json()
         assert body["signed_url"] == "https://bucket.s3.amazonaws.com/a_1.png?X-Amz-Signature=abc"
         assert body["expires_at"] is None
+
+
+class TestArtifactContentCsp:
+    @pytest.mark.parametrize(
+        ("artifact_type", "expected_csp"),
+        [
+            (
+                ArtifactType.HTML_SCRAPE,
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+            ),
+            (ArtifactType.SCREENSHOT_ACTION, "frame-ancestors 'none'"),
+        ],
+    )
+    def test_scraped_html_is_sandboxed_through_security_middleware(
+        self, artifact_type: ArtifactType, expected_csp: str
+    ) -> None:
+        artifact = _make_artifact().model_copy(update={"artifact_type": artifact_type})
+        test_app = FastAPI()
+        test_app.include_router(base_router, prefix="/v1")
+        test_app.add_middleware(SecurityHeadersMiddleware)
+        with (
+            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org()),
+            ),
+        ):
+            app_module.DATABASE.artifacts.get_artifact_by_id = AsyncMock(return_value=artifact)
+            app_module.ARTIFACT_MANAGER.retrieve_artifact = AsyncMock(return_value=b"<script>alert(1)</script>")
+            resp = TestClient(test_app).get("/v1/artifacts/a_1/content", headers={"x-api-key": "key"})
+
+        assert resp.status_code == 200
+        # Exact-string assertion is intentional: the CSP is security-critical.
+        assert resp.headers["Content-Security-Policy"] == expected_csp

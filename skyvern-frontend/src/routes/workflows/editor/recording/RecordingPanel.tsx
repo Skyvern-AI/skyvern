@@ -63,8 +63,11 @@ import { buildDraftStepTitlePatch } from "./recordingDraftStepEdits";
 
 const KIND_LABELS: Record<RecordingActionKind, string> = {
   click: "Click",
+  dialog: "Dialog",
+  drag_drop: "Drag and drop",
   hover: "Hover",
   input_text: "Input text",
+  press_key: "Press key",
   url_change: "Navigation",
   wait: "Wait",
 };

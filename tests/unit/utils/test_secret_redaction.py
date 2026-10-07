@@ -59,7 +59,12 @@ def test_collect_redactable_secret_values_keeps_real_placeholder_prefixed_secret
     values = collect_redactable_secret_values({"placeholder_ab12": "placeholder_prodtoken"})
 
     assert values == {"placeholder_prodtoken"}
-    assert redact_secrets_from_text("placeholder_prodtoken", values) == "placeholder_prodtoken"
+    # Only the ids the run registered are exempt, so a secret that merely looks like one is scrubbed.
+    assert redact_secrets_from_text("placeholder_prodtoken", values) == REDACTED_SECRET_PLACEHOLDER
+    assert (
+        redact_secrets_from_text("placeholder_prodtoken", values, placeholder_ids={"placeholder_ab12"})
+        == REDACTED_SECRET_PLACEHOLDER
+    )
 
 
 def test_collect_redactable_secret_values_skips_values_equal_to_placeholder_keys() -> None:
@@ -88,9 +93,49 @@ def test_redact_secrets_from_text_replaces_longest_secret_first() -> None:
 
 
 def test_redact_secrets_from_text_preserves_placeholder_tokens() -> None:
-    result = redact_secrets_from_text("placeholder_ab12_password pass", {"pass"})
+    result = redact_secrets_from_text(
+        "placeholder_ab12_password pass", {"pass"}, placeholder_ids={"placeholder_ab12_password"}
+    )
 
     assert result == f"placeholder_ab12_password {REDACTED_SECRET_PLACEHOLDER}"
+
+
+def test_redact_secrets_from_text_redacts_a_secret_behind_an_unregistered_placeholder_prefix() -> None:
+    """SKY-17864: the exemption used to key on the ``placeholder_`` shape, so a template that
+    rendered a secret straight after the literal prefix was never scrubbed.
+    """
+    leak = "Use placeholder_hunter2x9 now"
+    expected = f"Use placeholder_{REDACTED_SECRET_PLACEHOLDER} now"
+
+    assert redact_secrets_from_text(leak, {"hunter2x9"}) == expected
+    # Still scrubbed when the run has registered ids — just not this one.
+    assert redact_secrets_from_text(leak, {"hunter2x9"}, placeholder_ids={"placeholder_ab12_username"}) == expected
+
+
+def test_redact_secrets_from_text_keeps_a_registered_id_whose_suffix_matches_a_secret() -> None:
+    """What the exemption is for: a credential whose value is literally "password" must not rewrite
+    the field name out of a token the run still has to resolve.
+    """
+    text = "type placeholder_ab12_password into the form"
+
+    assert redact_secrets_from_text(text, {"password"}, placeholder_ids={"placeholder_ab12_password"}) == text
+    # Longest id first, or the shorter id matches and leaves "_password" exposed to the scrub.
+    assert (
+        redact_secrets_from_text(text, {"password"}, placeholder_ids={"placeholder_ab12", "placeholder_ab12_password"})
+        == text
+    )
+    assert redact_secrets_from_text(text, {"password"}) == (
+        f"type placeholder_ab12_{REDACTED_SECRET_PLACEHOLDER} into the form"
+    )
+
+
+def test_redact_secrets_from_bytes_forwards_the_placeholder_exemption() -> None:
+    data = b"placeholder_ab12_password then placeholder_hunter2x9"
+
+    assert (
+        redact_secrets_from_bytes(data, {"password", "hunter2x9"}, placeholder_ids={"placeholder_ab12_password"})
+        == f"placeholder_ab12_password then placeholder_{REDACTED_SECRET_PLACEHOLDER}".encode()
+    )
 
 
 def test_redact_secrets_from_text_anchors_short_secret_variants() -> None:
@@ -374,6 +419,43 @@ def test_get_secret_values_for_run_respects_workflow_opt_out(
 
     assert manager.get_secret_values_for_run("wr_1") == set()
     assert manager.get_secret_values_for_run("wr_1", respect_artifact_redaction_flag=False) == {"super-secret"}
+
+
+def test_registered_placeholder_ids_for_run_names_only_placeholder_keys(
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_1",
+        secrets={"placeholder_ab12_password": "super-secret", "MASTER_PASSWORD": "other-secret"},
+    )
+
+    # Unlike the secret-value set, this is not gated on the masking opt-in: it is what redaction
+    # exempts, so it has to be readable wherever redaction runs.
+    assert manager.registered_placeholder_ids_for_run("wr_1") == frozenset({"placeholder_ab12_password"})
+    assert manager.registered_placeholder_ids_for_run("wr_unknown") == frozenset()
+    assert manager.registered_placeholder_ids_for_run(None) == frozenset()
+
+
+def test_artifact_redaction_exempts_the_runs_registered_placeholder_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    """The prompt artifact is the record of what crossed the model boundary, so it keeps the run's
+    own token — but a secret rendered behind an unregistered prefix is scrubbed (SKY-17864).
+    """
+    monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_artifact",
+        secrets={"placeholder_ab12_password": "password"},
+    )
+    monkeypatch.setattr(artifact_manager.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_artifact")):
+        redacted = artifact_manager._maybe_redact_artifact_data(
+            ArtifactType.LLM_PROMPT, b"type placeholder_ab12_password, never placeholder_password"
+        )
+
+    assert redacted == f"type placeholder_ab12_password, never placeholder_{REDACTED_SECRET_PLACEHOLDER}".encode()
 
 
 def test_get_secret_values_for_run_returns_empty_when_global_flag_disabled(

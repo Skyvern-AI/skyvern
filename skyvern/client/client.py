@@ -74,6 +74,7 @@ from .types.workflow_tags_batch_response import WorkflowTagsBatchResponse
 
 if typing.TYPE_CHECKING:
     from .agents.client import AgentsClient, AsyncAgentsClient
+    from .artifacts.client import ArtifactsClient, AsyncArtifactsClient
     from .schedules.client import AsyncSchedulesClient, SchedulesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
 # this is used as the default value for optional parameters
@@ -146,6 +147,7 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
+        self._artifacts: typing.Optional[ArtifactsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
         self._schedules: typing.Optional[SchedulesClient] = None
         self._agents: typing.Optional[AgentsClient] = None
@@ -2269,6 +2271,49 @@ class Skyvern:
         _response = self._raw_client.close_browser_session(browser_session_id, request_options=request_options)
         return _response.data
 
+    def extend_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        additional_minutes: int,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserSessionResponse:
+        """
+        Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
+
+        Parameters
+        ----------
+        browser_session_id : str
+            The ID of the browser session. browser_session_id starts with `pbs_`
+
+        additional_minutes : int
+            Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserSessionResponse
+            Successfully extended browser session
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.extend_browser_session(
+            browser_session_id="pbs_123456",
+            additional_minutes=1,
+        )
+        """
+        _response = self._raw_client.extend_browser_session(
+            browser_session_id, additional_minutes=additional_minutes, request_options=request_options
+        )
+        return _response.data
+
     def get_browser_session(
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
@@ -2342,49 +2387,6 @@ class Skyvern:
         """
         _response = self._raw_client.update_browser_session(
             browser_session_id, generate_browser_profile=generate_browser_profile, request_options=request_options
-        )
-        return _response.data
-
-    def extend_browser_session(
-        self,
-        browser_session_id: str,
-        *,
-        additional_minutes: int,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> BrowserSessionResponse:
-        """
-        Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
-
-        Parameters
-        ----------
-        browser_session_id : str
-            The ID of the browser session. browser_session_id starts with `pbs_`
-
-        additional_minutes : int
-            Minutes to add to the session's timeout. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        BrowserSessionResponse
-            Successfully extended browser session
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.extend_browser_session(
-            browser_session_id="pbs_123456",
-            additional_minutes=30,
-        )
-        """
-        _response = self._raw_client.extend_browser_session(
-            browser_session_id, additional_minutes=additional_minutes, request_options=request_options
         )
         return _response.data
 
@@ -3914,6 +3916,14 @@ class Skyvern:
         return _response.data
 
     @property
+    def artifacts(self):
+        if self._artifacts is None:
+            from .artifacts.client import ArtifactsClient  # noqa: E402
+
+            self._artifacts = ArtifactsClient(client_wrapper=self._client_wrapper)
+        return self._artifacts
+
+    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -4004,6 +4014,7 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
+        self._artifacts: typing.Optional[AsyncArtifactsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
         self._schedules: typing.Optional[AsyncSchedulesClient] = None
         self._agents: typing.Optional[AsyncAgentsClient] = None
@@ -6474,6 +6485,57 @@ class AsyncSkyvern:
         _response = await self._raw_client.close_browser_session(browser_session_id, request_options=request_options)
         return _response.data
 
+    async def extend_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        additional_minutes: int,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserSessionResponse:
+        """
+        Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
+
+        Parameters
+        ----------
+        browser_session_id : str
+            The ID of the browser session. browser_session_id starts with `pbs_`
+
+        additional_minutes : int
+            Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserSessionResponse
+            Successfully extended browser session
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.extend_browser_session(
+                browser_session_id="pbs_123456",
+                additional_minutes=1,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.extend_browser_session(
+            browser_session_id, additional_minutes=additional_minutes, request_options=request_options
+        )
+        return _response.data
+
     async def get_browser_session(
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
@@ -6563,57 +6625,6 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.update_browser_session(
             browser_session_id, generate_browser_profile=generate_browser_profile, request_options=request_options
-        )
-        return _response.data
-
-    async def extend_browser_session(
-        self,
-        browser_session_id: str,
-        *,
-        additional_minutes: int,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> BrowserSessionResponse:
-        """
-        Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
-
-        Parameters
-        ----------
-        browser_session_id : str
-            The ID of the browser session. browser_session_id starts with `pbs_`
-
-        additional_minutes : int
-            Minutes to add to the session's timeout. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        BrowserSessionResponse
-            Successfully extended browser session
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.extend_browser_session(
-                browser_session_id="pbs_123456",
-                additional_minutes=30,
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.extend_browser_session(
-            browser_session_id, additional_minutes=additional_minutes, request_options=request_options
         )
         return _response.data
 
@@ -8363,6 +8374,14 @@ class AsyncSkyvern:
             workflow_permanent_id, template=template, request_options=request_options
         )
         return _response.data
+
+    @property
+    def artifacts(self):
+        if self._artifacts is None:
+            from .artifacts.client import AsyncArtifactsClient  # noqa: E402
+
+            self._artifacts = AsyncArtifactsClient(client_wrapper=self._client_wrapper)
+        return self._artifacts
 
     @property
     def scripts(self):

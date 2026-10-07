@@ -135,6 +135,7 @@ async def _run_workflow_and_build_response(
         browser_session_id=run_block_request.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         browser_seed_source=workflow_run.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
     )
 
 

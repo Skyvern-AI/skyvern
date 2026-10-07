@@ -126,6 +126,8 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
 import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
+import { PendingRecordingStartDialog } from "@/routes/workflows/editor/recording/PendingRecordingStartDialog";
+import { requestRecordingStart } from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
 import {
   runIsLogicallyFinal,
   runIsExecuting,
@@ -141,6 +143,7 @@ import {
 } from "@/store/WorkflowPanelStore";
 import {
   reflectYamlDraftDirtiness,
+  reloadConflictedWorkflow,
   useWorkflowHasChangesStore,
   usePendingWorkflowSaveRecovery,
   useWorkflowSave,
@@ -257,6 +260,7 @@ import type {
 } from "../copilot/workflowCopilotTypes";
 import {
   WorkflowYamlEditor,
+  WorkflowSaveConflictNotice,
   WorkflowSavePendingNotice,
 } from "./WorkflowYamlEditor";
 import { YamlModeToggle } from "./YamlModeToggle";
@@ -634,6 +638,12 @@ function Workspace({
   const handleOnSave = useSaveWorkflow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const yamlCommitOwnerRef = useRef<YamlCommitOwner | null>(null);
+  const mountedWorkflowRef = useRef(workflow);
+  useLayoutEffect(() => {
+    useWorkflowHasChangesStore
+      .getState()
+      .recordBaseVersion(mountedWorkflowRef.current);
+  }, []);
   useWorkspaceDeferredEditCleanup(workflow.workflow_permanent_id);
   useLayoutEffect(() => {
     const owner = createYamlCommitOwner(workflow.workflow_permanent_id);
@@ -1765,6 +1775,11 @@ function Workspace({
         recordingStore.isCommitting,
       isUploadingSOP: sopToBlocksMutation.isPending,
     });
+  // A deferred start runs after a save; the browser may have stopped being ready.
+  const canRecordTaskRef = useRef(authoringActionAvailability.canRecordTask);
+  useEffect(() => {
+    canRecordTaskRef.current = authoringActionAvailability.canRecordTask;
+  }, [authoringActionAvailability.canRecordTask]);
   const [, setRecordSearchParams] = useSearchParams();
   const autoRecordRequested = searchParams.get("record") === "1";
   const authoringBlocked = useWorkflowYamlEditorStore(
@@ -1775,33 +1790,39 @@ function Workspace({
   );
   const startRecordingAtEnd = useCallback(() => {
     if (!authoringActionAvailability.canRecordTask) return;
-    void runWorkflowAuthoringAction(() => {
-      const insertionPoint = getAppendInsertionPoint();
-      setWorkflowPanelState({
-        active: false,
-        content: "nodeLibrary",
-        data: {
-          previous: insertionPoint.previous,
-          next: insertionPoint.next,
-          parent: undefined,
-          connectingEdgeType: "default",
+    // Consume ?record=1 up front so a dismissed prompt does not re-fire auto-record.
+    if (autoRecordRequested) {
+      setRecordSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.delete("record");
+          return next;
         },
-      });
-      setIsRecording(true, {
-        workflowPermanentId: workflowPermanentId ?? null,
-        browserSessionId: debugBrowserSessionId,
-      });
-      if (autoRecordRequested) {
-        setRecordSearchParams(
-          (current) => {
-            const next = new URLSearchParams(current);
-            next.delete("record");
-            return next;
-          },
-          { replace: true },
-        );
-      }
-    });
+        { replace: true },
+      );
+    }
+    requestRecordingStart(
+      () =>
+        void runWorkflowAuthoringAction(() => {
+          const insertionPoint = getAppendInsertionPoint();
+          setWorkflowPanelState({
+            active: false,
+            content: "nodeLibrary",
+            data: {
+              previous: insertionPoint.previous,
+              next: insertionPoint.next,
+              parent: undefined,
+              connectingEdgeType: "default",
+            },
+          });
+          setIsRecording(true, {
+            workflowPermanentId: workflowPermanentId ?? null,
+            browserSessionId: debugBrowserSessionId,
+          });
+        }),
+      autoRecordRequested ? "auto_record" : "launcher",
+      { isStillValid: () => canRecordTaskRef.current },
+    );
   }, [
     getAppendInsertionPoint,
     setWorkflowPanelState,
@@ -2116,7 +2137,10 @@ function Workspace({
         parametersWorkflowPermanentId: workflowData.workflow_permanent_id,
       });
     }
-    if (options?.persisted) setAcceptedWorkflow(workflowData);
+    if (options?.persisted) {
+      setAcceptedWorkflow(workflowData);
+      useWorkflowHasChangesStore.getState().recordBaseVersion(workflowData);
+    }
 
     // Sync title so snap-back on Reject reverts the editor's title bar
     // alongside the canvas blocks. A mid-turn draft is not authoritative: it must
@@ -2588,6 +2612,9 @@ function Workspace({
       {!yamlEditorActive ? (
         <div className="absolute inset-x-0 top-0 z-50">
           <WorkflowSavePendingNotice />
+          <WorkflowSaveConflictNotice
+            onViewHistory={() => clearComparisonViewAndShowFreshIfActive(true)}
+          />
         </div>
       ) : null}
       {/* cycle browser dialog */}
@@ -2648,10 +2675,14 @@ function Workspace({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Are you sure?</DialogTitle>
+            <DialogTitle>
+              {workflowChangesStore.saveBlockedReason
+                ? "Save is paused"
+                : "Are you sure?"}
+            </DialogTitle>
             <DialogDescription>
-              Saving will delete cached code, and Skyvern will re-generate it in
-              the next run. Proceed?
+              {workflowChangesStore.saveBlockedReason ||
+                "Saving will delete cached code, and Skyvern will re-generate it in the next run. Proceed?"}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -2660,6 +2691,7 @@ function Workspace({
             </DialogClose>
             <Button
               variant="default"
+              disabled={Boolean(workflowChangesStore.saveBlockedReason)}
               onClick={async () => {
                 await confirmCodeCacheDeletion(handleOnSave);
               }}
@@ -2669,6 +2701,11 @@ function Workspace({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <PendingRecordingStartDialog
+        onSave={handleOnSave}
+        onDiscard={() => reloadConflictedWorkflow(workflow)}
+      />
 
       {/* header panel */}
       {!embedded && (
@@ -2709,6 +2746,7 @@ function Workspace({
                 onCopilotReviewClose={
                   workflowPanelState.data.onCopilotReviewClose
                 }
+                lockReason={workflowChangesStore.saveBlockedReason}
                 onExit={embedded ? exitVersionHistory : undefined}
               />
             </div>
@@ -2747,6 +2785,7 @@ function Workspace({
               onCopilotReviewClose={
                 workflowPanelState.data.onCopilotReviewClose
               }
+              lockReason={workflowChangesStore.saveBlockedReason}
               onExit={embedded ? exitVersionHistory : undefined}
             />
           </div>

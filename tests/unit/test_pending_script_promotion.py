@@ -10,13 +10,16 @@ as "missing" forever, so code/goto-only workflows regenerated the full script af
 every block instead of once.
 """
 
+import ast
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import libcst as cst
 import pytest
 
+from skyvern.core.script_generations.generate_script import _build_block_statement
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -166,6 +169,16 @@ class TestIsBlockTypeCacheable:
         assert workflow_script_service.is_block_type_cacheable(direct) is False
         assert workflow_script_service.is_block_type_cacheable(nested) is False
         assert workflow_script_service.is_block_type_cacheable(plain) is True
+
+    @pytest.mark.parametrize("child_type", sorted(set(BlockType) - {BlockType.FOR_LOOP, BlockType.WHILE_LOOP}))
+    def test_loop_is_cacheable_only_when_codegen_emits_a_call_for_its_child(self, child_type: BlockType) -> None:
+        # A child that codegen renders as a bare string or comment would be silently skipped by a cached loop.
+        child = {"label": "child", "block_type": child_type}
+        code = cst.Module(body=[_build_block_statement(child)]).code
+        emits_a_call = any(isinstance(node, ast.Await) for node in ast.walk(ast.parse(code)))
+        loop = {"label": "outer", "block_type": BlockType.FOR_LOOP, "loop_blocks": [child]}
+
+        assert workflow_script_service.is_block_type_cacheable(loop) is emits_a_call
 
 
 class TestPendingMintSkipsNonCacheableWorkflows:

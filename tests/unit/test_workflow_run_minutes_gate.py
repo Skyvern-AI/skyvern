@@ -302,6 +302,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
         SimpleNamespace(
             workflow_run_id="wr_finally",
             workflow_id="wf_finally",
+            browser_settings=None,
             workflow_permanent_id="wpid_finally",
             organization_id="org_finally",
             parent_workflow_run_id=None,

@@ -2486,7 +2486,7 @@ describe("finished-run landing", () => {
     };
   }
 
-  test("a completed run opens on its outputs and pins the block that finished last", async () => {
+  test("a completed run opens on its timeline and pins the block that finished last", async () => {
     seedCapturedCodeBlockRun(Status.Completed);
     renderRunView({}, "/?wr=wr_1");
 
@@ -2495,33 +2495,11 @@ describe("finished-run landing", () => {
         lastExecuted.workflow_run_block_id,
       );
     });
-    expect(useRunPaneViewStore.getState().view).toBe("outputs");
+    expect(useRunPaneViewStore.getState().view).toBe("timeline");
     expect(useRunViewStore.getState().pinnedFrameId).not.toBe(
       actionBearing.actions[actionBearing.actions.length - 1]!.action_id,
     );
   });
-
-  // A deep link names what to show. Switching the pane off it would restore the
-  // selection and then hide it, so the URL and the pane disagree.
-  test.each([
-    [
-      "?active=",
-      `/?wr=wr_1&active=${capturedRun.blocks[1]!.actions[0]!.action_id}`,
-    ],
-    ["?bl=", "/?wr=wr_1&bl=code_block_2"],
-    ["?view=", "/?wr=wr_1&view=timeline"],
-  ])(
-    "a completed run deep-linked with %s stays on the timeline",
-    async (_label, route) => {
-      seedCapturedCodeBlockRun(Status.Completed);
-      renderRunView({}, route);
-
-      await waitFor(() => {
-        expect(mocks.workflowRun).toBeDefined();
-      });
-      expect(useRunPaneViewStore.getState().view).toBe("timeline");
-    },
-  );
 
   test("a failed run stays on the timeline so its failure stays on screen", async () => {
     seedCapturedCodeBlockRun(Status.Failed);

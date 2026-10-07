@@ -120,9 +120,8 @@ async def _call_internal_browser_tool(
 _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
 
 
-# Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
-# as a last-resort trip wire for runaway loops — progressing runs should never
-# approach this. The OpenAI Agents SDK wraps the tool in
+# Absolute upper bound on a single ``run_blocks`` tool invocation, including a run
+# whose rows have gone silent. The OpenAI Agents SDK wraps the tool in
 # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``; the
 # inner poll loop leaves a 10 s headroom below this ceiling for orderly
 # cleanup before the SDK cancels.
@@ -289,11 +288,20 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
     )
 
 
+EDIT_BLOCK_TOOL_NAME = "edit_block"
+EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
+UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
+UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
+RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
+BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+
 BLOCK_RUNNING_TOOLS = frozenset(
-    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run", "test_workflow_from_blank_browser"}
+    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
 
-WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks", "edit_block_and_run"})
+WORKFLOW_MUTATION_TOOLS = frozenset(
+    {UPDATE_WORKFLOW_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME}
+)
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
@@ -534,9 +542,10 @@ async def _fallback_page_info(
     # page.url is a synchronous property, so it is already in hand when the title stalls, and most
     # callers here destructure the title away and want only the url.
     url = ""
+    page: Page | None = None
 
     async def _read() -> str:
-        nonlocal url
+        nonlocal url, page
         browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
             return ""
@@ -549,13 +558,16 @@ async def _fallback_page_info(
     # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
     # raising — and every caller reaches this path, since a tool result's browser_context carries
     # no url. Without the bound, one unreachable page deadlocks the whole turn.
+    title = ""
     try:
         title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
     except TimeoutError:
         LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
-        return url, ""
     except Exception:
-        return url, ""
+        pass
+    # A document committed during title() would pair one document's url with another's title.
+    if page is not None and page.url != url:
+        return page.url, ""
     return url, title
 
 

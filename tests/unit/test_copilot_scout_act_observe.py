@@ -397,7 +397,7 @@ async def test_failed_click_wrapper_carries_attempt_and_current_page_without_suc
 
     assert wrapped.isError is True
     assert projected["ok"] is False
-    assert projected["error"] == "element not interactable. Target remained covered"
+    assert projected["error"] == "element not interactable"
     assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
     assert projected[MCP_RESULT_PROVENANCE_KEY] == MCP_RESULT_PROVENANCE_VALUE
     assert projected["data"]["attempted_control"] == {
@@ -453,7 +453,7 @@ async def test_failed_click_without_page_evidence_sheds_oversized_candidates_but
 
     assert wrapped.isError is True
     assert projected["ok"] is False
-    assert projected["error"] == "element not interactable. Target remained covered"
+    assert projected["error"] == "element not interactable"
     assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
     assert projected["data"]["attempted_control"]["selector"] == "#continue"
     assert projected["data"]["attempted_control"]["effective_target"] == "button Continue"

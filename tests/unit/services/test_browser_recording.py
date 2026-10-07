@@ -38,6 +38,8 @@ from skyvern.services.browser_recording.service import (
 from skyvern.services.browser_recording.state_machines.press_key import playwright_key
 from skyvern.services.browser_recording.types import (
     ActionClick,
+    ActionDialog,
+    ActionDragDrop,
     ActionInputText,
     ActionKind,
     ActionTarget,
@@ -161,6 +163,94 @@ def test_click() -> None:
     assert actions[0].target.sky_id == "sky-123"
 
 
+def test_click_inside_child_frame_is_incomplete_capture() -> None:
+    target = dict(id="pay", skyId="sky-pay", tagName="BUTTON", selector="#pay", inChildFrame=True)
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_click_event(target=target, timestamp=1000.0)])
+
+    assert actions[0].incomplete_capture_reason == "child_frame"
+
+
+def test_confirm_accept_records_dialog_action() -> None:
+    events = [
+        make_click_event(
+            target={"id": "remove", "skyId": "sky-remove", "tagName": "BUTTON", "selector": "#remove"},
+            timestamp=1000.0,
+        ),
+        make_cdp_event(
+            "dialog:opening",
+            1.01,
+            {"type": "confirm", "message": "Continue?", "url": "https://example.com"},
+        ),
+        make_cdp_event("dialog:closed", 1.02, {"result": True, "userInput": ""}),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.DIALOG]
+    dialog = actions[1]
+    assert isinstance(dialog, ActionDialog)
+    assert dialog.dialog_type == "confirm"
+    assert dialog.response == "accept"
+    assert dialog.prompt_text is None
+
+
+def test_secret_prompt_text_is_redacted() -> None:
+    events = [
+        make_cdp_event(
+            "dialog:opening",
+            1.0,
+            {"type": "prompt", "message": "Enter API key", "url": "https://example.com"},
+        ),
+        make_cdp_event("dialog:closed", 1.1, {"result": True, "userInput": "secret-value"}),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], ActionDialog)
+    assert actions[0].prompt_text is None
+    assert actions[0].prompt_text_redacted is True
+
+
+def test_dragstart_drop_records_source_and_destination() -> None:
+    events = [
+        make_console_event(
+            params={
+                "type": "dragstart",
+                "target": {"id": "card", "tagName": "DIV", "selector": "#card", "text": ["Card"]},
+                "timestamp": 1000.0,
+                "mousePosition": {"xp": 0.2, "yp": 0.3},
+            },
+            timestamp=1000.0,
+        ),
+        make_console_event(
+            params={
+                "type": "drop",
+                "target": {"id": "column", "tagName": "DIV", "selector": "#column", "text": ["Column"]},
+                "timestamp": 1400.0,
+                "mousePosition": {"xp": 0.7, "yp": 0.4},
+            },
+            timestamp=1400.0,
+        ),
+        make_console_event(
+            params={
+                "type": "dragend",
+                "target": {"id": "card", "tagName": "DIV", "selector": "#card", "text": ["Card"]},
+                "timestamp": 1410.0,
+            },
+            timestamp=1410.0,
+        ),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], ActionDragDrop)
+    assert actions[0].source.selector == "#card"
+    assert actions[0].target.selector == "#column"
+
+
 def test_click_keeps_zero_coordinates_and_element_offset() -> None:
     event = make_console_event(
         params={
@@ -239,6 +329,17 @@ def test_durable_recording_evidence_omits_url_with_invalid_port() -> None:
     evidence = build_durable_recording_evidence([action])
 
     assert evidence[0]["url"] == ""
+
+
+def test_durable_recording_evidence_keeps_iframe_incomplete_fact() -> None:
+    action = _click_action(timestamp=1000)
+    action.target.tag_name = "iframe"
+    action = ActionClick.model_validate(action.model_dump())
+
+    evidence = build_durable_recording_evidence([action])
+
+    assert evidence[0]["target"]["tag_name"] == "iframe"
+    assert evidence[0]["incomplete_capture_reason"] == "unattached_frame"
 
 
 def test_identical_click_events_are_deduped() -> None:
@@ -354,10 +455,52 @@ def make_streaming_console_click(
     )
 
 
-def make_streaming_nav_event(url: str, timestamp: float) -> StreamingExfiltratedEvent:
+def make_streaming_nav_event(
+    url: str,
+    timestamp: float,
+    *,
+    event_name: str = "nav:frame_started_navigating",
+    frame_id: str | None = None,
+    parent_frame_id: str | None = None,
+    reason: str | None = None,
+) -> StreamingExfiltratedEvent:
+    params: dict[str, t.Any]
+    if event_name == "nav:frame_navigated":
+        frame = {"url": url}
+        if frame_id:
+            frame["id"] = frame_id
+        if parent_frame_id:
+            frame["parentId"] = parent_frame_id
+        params = {"frame": frame}
+    else:
+        params = {"url": url}
+        if frame_id:
+            params["frameId"] = frame_id
+        if reason:
+            params["reason"] = reason
+
     return StreamingExfiltratedEvent(
-        event_name="nav:frame_started_navigating",
-        params={"url": url},
+        event_name=event_name,
+        params=params,
+        source=StreamingExfiltratedEventSource.CDP,
+        timestamp=timestamp,
+    )
+
+
+def make_streaming_target_event(
+    event_name: str,
+    timestamp: float,
+    *,
+    target_id: str,
+    url: str,
+    opener_id: str | None = None,
+) -> StreamingExfiltratedEvent:
+    target_info = {"type": "page", "targetId": target_id, "url": url}
+    if opener_id:
+        target_info["openerId"] = opener_id
+    return StreamingExfiltratedEvent(
+        event_name=event_name,
+        params={"targetInfo": target_info},
         source=StreamingExfiltratedEventSource.CDP,
         timestamp=timestamp,
     )
@@ -683,6 +826,267 @@ async def test_live_interpretation_nav_then_click_emits_two_steps(monkeypatch: p
         assert steps[0].url == "https://example.com/home"
         assert steps[1].block_type == "action"
         assert steps[1].action_kind == ActionKind.CLICK
+    finally:
+        session.cancel()
+
+
+@pytest.mark.asyncio
+async def test_live_interpretation_attributes_page_navigation_without_changing_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stub_llm(*args: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:
+        return {"block_label": "act", "title": "Browser Action", "prompt": ""}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", stub_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+    base_timestamp_ms = 1_700_000_000_000.0
+    base_timestamp_s = base_timestamp_ms / 1000
+    page_url = "https://user:SECRET@next.example.com/reset/OPAQUETOKEN?code=SECRET#tok"
+    fill_url = "https://results.example.com/results?code=SECRET#tok"
+    background_url = "https://background.example.com/background"
+    new_tab_url = "https://user:SECRET@newtab.example.com/new-tab?code=SECRET#tok"
+
+    try:
+        session.ingest_events(
+            [
+                make_streaming_console_click(timestamp_ms=base_timestamp_ms),
+                make_streaming_nav_event(
+                    page_url,
+                    base_timestamp_s + 0.1,
+                    event_name="nav:frame_requested_navigation",
+                    frame_id="F",
+                    reason="anchorClick",
+                ),
+                make_streaming_console_click(
+                    timestamp_ms=base_timestamp_ms + 500,
+                    target_id="second-button",
+                    target_text="Second click",
+                ),
+                make_streaming_nav_event(page_url, base_timestamp_s + 0.55, frame_id="F"),
+                make_streaming_nav_event(
+                    page_url,
+                    base_timestamp_s + 0.6,
+                    event_name="nav:frame_navigated",
+                    frame_id="F",
+                ),
+                make_streaming_nav_event(
+                    "https://frame.example/initial",
+                    base_timestamp_s + 1.0,
+                    event_name="nav:frame_requested_navigation",
+                    frame_id="child",
+                    reason="anchorClick",
+                ),
+                make_streaming_nav_event(
+                    "https://frame.example/initial",
+                    base_timestamp_s + 1.1,
+                    frame_id="child",
+                ),
+                make_streaming_nav_event(
+                    "https://frame.example/initial",
+                    base_timestamp_s + 1.2,
+                    event_name="nav:frame_navigated",
+                    frame_id="child",
+                    parent_frame_id="F",
+                ),
+                *make_streaming_console_input(
+                    timestamp_ms=base_timestamp_ms + 2000,
+                    input_value="search",
+                    target_id="search",
+                    target_text="Search",
+                ),
+                make_streaming_nav_event(
+                    fill_url,
+                    base_timestamp_s + 2.1,
+                    event_name="nav:frame_requested_navigation",
+                    frame_id="F",
+                    reason="initialFrameNavigation",
+                ),
+                make_streaming_nav_event(fill_url, base_timestamp_s + 2.2, frame_id="F"),
+                make_streaming_nav_event(
+                    fill_url,
+                    base_timestamp_s + 2.3,
+                    event_name="nav:frame_navigated",
+                    frame_id="F",
+                ),
+                make_streaming_nav_event(
+                    background_url,
+                    base_timestamp_s + 6.0,
+                    event_name="nav:frame_requested_navigation",
+                    frame_id="F",
+                    reason="initialFrameNavigation",
+                ),
+                make_streaming_nav_event(background_url, base_timestamp_s + 6.1, frame_id="F"),
+                make_streaming_nav_event(
+                    background_url,
+                    base_timestamp_s + 6.2,
+                    event_name="nav:frame_navigated",
+                    frame_id="F",
+                ),
+                make_streaming_nav_event(
+                    "https://example.com/download",
+                    base_timestamp_s + 8.0,
+                    event_name="nav:frame_requested_navigation",
+                    frame_id="F",
+                    reason="anchorClick",
+                ),
+                make_streaming_nav_event("https://example.com/download", base_timestamp_s + 8.1, frame_id="F"),
+                make_streaming_nav_event("https://example.com/other", base_timestamp_s + 9.0, frame_id="F"),
+                make_streaming_nav_event(
+                    "https://example.com/other",
+                    base_timestamp_s + 9.1,
+                    event_name="nav:frame_navigated",
+                    frame_id="F",
+                ),
+                make_streaming_console_click(
+                    timestamp_ms=base_timestamp_ms + 10000,
+                    target_id="new-tab",
+                    target_text="Open new tab",
+                ),
+                make_streaming_target_event(
+                    "target_created",
+                    base_timestamp_s + 10.05,
+                    target_id="new-tab-target",
+                    url="",
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 10.08,
+                    target_id="new-tab-target",
+                    url="about:blank",
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 10.1,
+                    target_id="new-tab-target",
+                    url=new_tab_url,
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 10.2,
+                    target_id="new-tab-target",
+                    url="https://later.example.com/new-tab-later",
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 10.3,
+                    target_id="manual-target",
+                    url="https://manual.example.com/manually-opened",
+                ),
+                make_streaming_console_click(
+                    timestamp_ms=base_timestamp_ms + 12000,
+                    target_id="extension-popup",
+                    target_text="Open popup",
+                ),
+                make_streaming_target_event(
+                    "target_created",
+                    base_timestamp_s + 12.05,
+                    target_id="extension-popup-target",
+                    url="https://popup.example.com/popup?code=SECRET",
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 18.1,
+                    target_id="late-click-target",
+                    url="https://late.example.com/late",
+                    opener_id="source-target",
+                ),
+                make_streaming_console_click(
+                    timestamp_ms=base_timestamp_ms + 18000,
+                    target_id="late-click",
+                    target_text="Open late",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 18.2,
+                    target_id="late-click-target",
+                    url="https://landed.example.com/late/landed",
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 24.0,
+                    target_id="script-popup-target",
+                    url="https://script.example.com/script-popup",
+                    opener_id="source-target",
+                ),
+                make_streaming_console_click(
+                    timestamp_ms=base_timestamp_ms + 30000,
+                    target_id="unrelated",
+                    target_text="Unrelated",
+                ),
+                make_streaming_target_event(
+                    "target_info_changed",
+                    base_timestamp_s + 30.05,
+                    target_id="script-popup-target",
+                    url="https://script-updated.example.com/script-popup/updated",
+                    opener_id="source-target",
+                ),
+                make_streaming_target_event(
+                    "target_created",
+                    base_timestamp_s + 40.05,
+                    target_id="one-shot-target",
+                    url="https://oneshot.example.com/one-shot?code=SECRET",
+                    opener_id="source-target",
+                ),
+                make_streaming_console_click(
+                    timestamp_ms=base_timestamp_ms + 40000,
+                    target_id="one-shot",
+                    target_text="Open one-shot",
+                ),
+            ]
+        )
+
+        steps = await session.flush()
+        actions = session.recorded_actions()
+
+        assert [(action.kind, action.url) for action in actions] == [
+            (ActionKind.CLICK, "https://example.com"),
+            (ActionKind.CLICK, "https://example.com"),
+            (ActionKind.INPUT_TEXT, "https://example.com"),
+            (ActionKind.URL_CHANGE, "https://example.com/other"),
+            (ActionKind.CLICK, "https://example.com"),
+            (ActionKind.CLICK, "https://example.com"),
+            (ActionKind.CLICK, "https://example.com"),
+            (ActionKind.CLICK, "https://example.com"),
+            (ActionKind.CLICK, "https://example.com"),
+        ]
+        assert [(step.action_kind, step.block_type, step.url) for step in steps] == [
+            (ActionKind.CLICK, "action", "https://example.com"),
+            (ActionKind.CLICK, "action", "https://example.com"),
+            (ActionKind.INPUT_TEXT, "action", "https://example.com"),
+            (ActionKind.URL_CHANGE, "goto_url", "https://example.com/other"),
+            (ActionKind.CLICK, "action", "https://example.com"),
+            (ActionKind.CLICK, "action", "https://example.com"),
+            (ActionKind.CLICK, "action", "https://example.com"),
+            (ActionKind.CLICK, "action", "https://example.com"),
+            (ActionKind.CLICK, "action", "https://example.com"),
+        ]
+        assert [action.navigated_to for action in actions] == [
+            "https://next.example.com",
+            None,
+            "https://results.example.com",
+            None,
+            "https://newtab.example.com",
+            "https://popup.example.com",
+            "https://late.example.com",
+            None,
+            "https://oneshot.example.com",
+        ]
+        assert "OPAQUETOKEN" not in (actions[0].navigated_to or "")
+        assert "navigated_to" not in str(actions[0])
     finally:
         session.cancel()
 

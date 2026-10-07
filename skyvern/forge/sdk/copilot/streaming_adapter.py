@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ from skyvern.forge import app
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
+from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     USER_FACING_REASON_PARAM,
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     summarize_tool_result_detail,
     user_facing_success,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import ChatScreenshotFrame, as_png
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.turn_halt import (
@@ -57,11 +60,14 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     CopilotUnrecoverableToolError,
     _maybe_raise_unrecoverable_tool_error,
 )
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCodegenProgressUpdate,
     WorkflowCopilotDesignEndUpdate,
     WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotNarrationUpdate,
+    WorkflowCopilotScreenshotUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotTitleUpdate,
     WorkflowCopilotToolCallUpdate,
@@ -77,6 +83,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
+
+# One budget for a whole batch: the save runs inside the stream consumer, so slow storage would
+# otherwise hold back every later frame.
+_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS = 5.0
 
 _OBSERVATION_TOOLS = {
     "evaluate",
@@ -108,6 +118,66 @@ def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -
         return None
     diffs = ctx.pending_code_write_diffs.pop(call_id, None)
     return diffs or None
+
+
+async def _store_chat_screenshot(organization_id: str, chat_id: str, frame: ChatScreenshotFrame) -> str:
+    png = await asyncio.to_thread(as_png, frame.image)
+    # The chat's own key is a barrier dictation requests also wait on. A key per upload keeps this
+    # save's timeout from cancelling their uploads or surfacing as a cancellation in their wait.
+    upload_key = f"chat-screenshot:{uuid.uuid4().hex}"
+    # The manager stamps a new row with the ambient context's run ids, which a browser session
+    # created this turn sets; a chat-owned row must not inherit them.
+    with skyvern_context.scoped(SkyvernContext(organization_id=organization_id, copilot_session_id=chat_id)):
+        artifact_id = await app.ARTIFACT_MANAGER.create_log_artifact(
+            log_entity_type=LogEntityType.WORKFLOW_COPILOT_CHAT,
+            log_entity_id=chat_id,
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            organization_id=organization_id,
+            data=png,
+            upload_key=upload_key,
+        )
+    try:
+        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([upload_key])
+    except BaseException:
+        LOG.warning("copilot_chat_screenshot_upload_incomplete", artifact_id=artifact_id)
+        raise
+    return artifact_id
+
+
+async def _drain_chat_screenshots(stream: EventSourceStream, ctx: CopilotContext, *, client_gone: bool) -> None:
+    frames = list(ctx.pending_chat_screenshots)
+    ctx.pending_chat_screenshots.clear()
+    if not frames or not (chat_id := ctx.workflow_copilot_chat_id):
+        return
+    narrator_state = ctx.narrator_state or NarratorState()
+    ctx.narrator_state = narrator_state
+    try:
+        async with asyncio.timeout(_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS):
+            for frame in frames:
+                try:
+                    artifact_id = await _store_chat_screenshot(ctx.organization_id, chat_id, frame)
+                    narrator_state.screenshots.append(
+                        {
+                            "artifactId": artifact_id,
+                            "capturedAt": frame.captured_at.isoformat(),
+                            "toolCallId": frame.tool_call_id,
+                        }
+                    )
+                    if not client_gone:
+                        await stream.send(
+                            WorkflowCopilotScreenshotUpdate(
+                                artifact_id=artifact_id, captured_at=frame.captured_at, tool_call_id=frame.tool_call_id
+                            )
+                        )
+                except Exception as exc:
+                    LOG.warning(
+                        "copilot_chat_screenshot_failed",
+                        workflow_copilot_chat_id=chat_id,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+    except TimeoutError:
+        LOG.warning("copilot_chat_screenshot_save_timed_out", workflow_copilot_chat_id=chat_id, frames=len(frames))
 
 
 # Substring match over the unparsed argument buffer, covering JSON `"label": "x"` keys and YAML `label: x`
@@ -169,6 +239,9 @@ class _CodegenProgressTracker:
 
     def __init__(self) -> None:
         self._calls: dict[int, _CodegenCallState] = {}
+        # A uuid, not a counter: each enforcement pass builds a fresh tracker, and a counter would repeat
+        # the previous pass's id so the client could not tell the restarted generation apart.
+        self._generation_id = uuid.uuid4().hex
 
     async def on_raw_event(
         self,
@@ -181,6 +254,7 @@ class _CodegenProgressTracker:
 
         if event_type == "response.created":
             self._calls.clear()
+            self._generation_id = uuid.uuid4().hex
             return
 
         if event_type == "response.output_item.added":
@@ -254,6 +328,7 @@ class _CodegenProgressTracker:
                     blocks_drafted=list(state.labels),
                     chars_streamed=state.chars,
                     iteration=iteration,
+                    generation_id=self._generation_id,
                     timestamp=datetime.now(timezone.utc),
                 )
             )
@@ -331,6 +406,7 @@ async def stream_to_sse(
                     LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
 
             if event.name == "tool_called":
+                ctx.model_call_streamed_tool_call = True
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
@@ -410,6 +486,7 @@ async def stream_to_sse(
                     )
 
             elif event.name == "tool_output":
+                await _drain_chat_screenshots(stream, ctx, client_gone=client_gone)
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 presentation = ctx.stream_tool_calls.get(call_id)
@@ -594,6 +671,8 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     yields the matching ``tool_output`` event, so the frame the loop above
     would have sent never streams; the exit path calls this instead.
     """
+    client_gone = await stream.is_disconnected()
+    await _drain_chat_screenshots(stream, ctx, client_gone=client_gone)
     call_id = ctx.goal_satisfied_tool_call_id
     pending = ctx.stream_tool_calls.get(call_id) if call_id is not None else None
     parsed = ctx.goal_satisfied_tool_output
@@ -633,7 +712,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
         )
         if work_plan is not None:
             narrator_state.work_plan = {"toolCallId": pending.call_id, "items": work_plan}
-    if await stream.is_disconnected():
+    if client_gone:
         return
     await stream.send(
         WorkflowCopilotToolResultUpdate(
@@ -900,6 +979,7 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
             turn_index=ctx.turn_index,
             timestamp=now,
             prior_block_count=ctx.prior_block_count,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
         )
     )
 

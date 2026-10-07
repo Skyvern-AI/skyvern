@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import io
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +32,13 @@ from openai.types.responses import (
 )
 from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from PIL import Image
 
+from skyvern.forge import app
+from skyvern.forge.sdk.api.files import parse_uri_to_path
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_system_prompt
 from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_SCHEMA, CopilotContext, InFlightStreamToolCall
@@ -40,6 +49,7 @@ from skyvern.forge.sdk.copilot.narration import (
     MAX_DESIGN_ACTIVITY_ENTRIES,
     NarratorState,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, capturing_tool_call, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     _sanitize_input,
@@ -48,7 +58,13 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     stream_to_sse,
 )
 from skyvern.forge.sdk.copilot.tools import _with_action_reason, copilot_native_tools
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+    WorkflowCopilotStreamMessageType,
+)
 from tests.unit.copilot_test_helpers import FakeCopilotStream
 
 
@@ -1052,6 +1068,7 @@ class TestFlushGoalSatisfiedToolResult:
             goal_satisfied_tool_name="update_and_run_blocks",
             goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_1"}},
             pending_code_write_diffs={},
+            pending_chat_screenshots=[],
             narrator_state=None,
         )
         defaults.update(overrides)
@@ -1655,6 +1672,8 @@ async def test_codegen_progress_resets_on_response_created() -> None:
     events = [
         _item_added_event(0, "update_and_run_blocks"),
         _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: block_one\\n"}'),
+        _item_added_event(1, "update_workflow"),
+        _args_delta_event(1, '{"workflow_yaml": "blocks:\\n  label: block_extra\\n"}'),
         _response_created_event(),
         _item_added_event(0, "update_and_run_blocks"),
         _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: block_two\\n"}'),
@@ -1679,6 +1698,16 @@ async def test_codegen_progress_resets_on_response_created() -> None:
     codegen_payloads = _codegen_payloads(sent)
     assert any(p.blocks_drafted == ["block_two"] for p in codegen_payloads)
     assert not any("block_one" in p.blocks_drafted for p in codegen_payloads if p.blocks_drafted == ["block_two"])
+
+    # The restarted response opens exactly like a second authoring call, so only the id separates them.
+    ids = [p.generation_id for p in codegen_payloads]
+    assert len(ids) == 6 and None not in ids
+    assert len(set(ids[:4])) == 1 and len(set(ids[4:])) == 1 and ids[0] != ids[4]
+
+    # Each enforcement pass streams through a fresh tracker; its ids must not repeat the last pass's.
+    result.stream_events = lambda: _stream_events_from(_item_added_event(0, "update_and_run_blocks"))
+    await stream_to_sse(result, stream, _new_ctx())
+    assert _codegen_payloads(sent)[-1].generation_id not in ids
 
 
 @pytest.mark.asyncio
@@ -1893,7 +1922,9 @@ async def test_actor_reason_native_dispatch_preserves_ordinary_validation() -> N
     )
     tool = next(
         tool
-        for tool in copilot_native_tools(supports_question_tool=True, browser_code_available=False)
+        for tool in copilot_native_tools(
+            supports_question_tool=True, browser_code_available=False, run_tools_available=True
+        )
         if tool.name == "set_work_plan"
     )
     schema = tool.params_json_schema
@@ -2200,3 +2231,203 @@ async def test_actor_dispatch_capture_writes_only_declared_names_and_no_model_au
     assert capture["undeclared_argument_shapes"] == ["int"]
     expected_bytes = json.dumps(arguments, ensure_ascii=False).encode()
     assert capture["arguments_sha256"] == hashlib.sha256(expected_bytes).hexdigest()
+
+
+_FRAME_SIZE = (1400, 900)
+
+
+def _stage_frame(ctx: CopilotContext, image_format: str = "PNG", color: str = "white") -> bool:
+    buf = io.BytesIO()
+    Image.new("RGB", _FRAME_SIZE, color).save(buf, format=image_format)
+    return enqueue_screenshot(
+        ctx,
+        base64.b64encode(buf.getvalue()).decode(),
+        provenance=ScreenshotProvenance.unknown(source_tool="click"),
+    )
+
+
+def _click_round_trip() -> list[RunItemStreamEvent]:
+    return [_tool_called_event("c1", "click"), _tool_output_event("c1")]
+
+
+def _saved_screenshots(ctx: CopilotContext) -> list[dict[str, str]] | None:
+    """What a reloaded chat receives: the history model drops payload keys it does not declare."""
+    reloaded = WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
+        content="Finished",
+        created_at=datetime.now(UTC),
+        narrative_payload=_build_narrative_payload(
+            ctx, terminal="response", terminal_message="Finished", narrative_summary=None
+        ),
+    )
+    return reloaded.model_dump(mode="json")["narrative_payload"].get("screenshots")
+
+
+@pytest.fixture
+def chat_screenshot_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """The real artifact manager over local storage; only the row insert is faked."""
+    rows: list[dict[str, Any]] = []
+
+    async def create_artifact(
+        artifact_id: str, artifact_type: ArtifactType, uri: str, *, organization_id: str, **stamps: str | int | None
+    ) -> Artifact:
+        rows.append({"artifact_id": artifact_id, "uri": uri, "organization_id": organization_id, **stamps})
+        now = datetime.now(UTC)
+        return Artifact(
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            organization_id=organization_id,
+            created_at=now,
+            modified_at=now,
+        )
+
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
+    monkeypatch.setattr(app, "STORAGE", LocalStorage(str(tmp_path)))
+    monkeypatch.setattr(app.DATABASE.artifacts, "create_artifact", create_artifact)
+    return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_format", "client_gone"), [("PNG", False), ("JPEG", True)])
+async def test_a_frame_staged_for_the_model_is_stored_once_for_the_chat(
+    chat_screenshot_rows: list[dict[str, Any]], source_format: str, client_gone: bool
+) -> None:
+    ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
+    with capturing_tool_call("c1"):
+        assert _stage_frame(ctx, source_format)
+    assert _stage_frame(ctx, source_format)
+    sent: list[Any] = []
+    result = MagicMock(stream_events=lambda: _stream_events_from(*_click_round_trip()))
+
+    with skyvern_context.scoped(SkyvernContext(run_id="pbs_other", workflow_run_id="wr_other", task_id="tsk_other")):
+        await stream_to_sse(result, _sink_stream(sent, disconnected=client_gone), ctx)
+
+    [row] = chat_screenshot_rows
+    assert (row["organization_id"], row["workflow_run_id"], row["run_id"], row["task_id"]) == (
+        "org_test",
+        None,
+        None,
+        None,
+    )
+    assert "/logs/workflow_copilot_chat/wcc_1/" in row["uri"]
+    with Image.open(parse_uri_to_path(row["uri"])) as stored:
+        assert (stored.format, stored.size) == ("PNG", _FRAME_SIZE)
+    [saved] = _saved_screenshots(ctx) or []
+    assert (saved["artifactId"], saved["toolCallId"]) == (row["artifact_id"], "c1")
+    assert datetime.fromisoformat(saved["capturedAt"]).utcoffset() == timedelta(0)
+
+    if client_gone:
+        assert sent == []
+        return
+    frames = [p for p in sent if p.type in ("screenshot", WorkflowCopilotStreamMessageType.TOOL_RESULT)]
+    assert [p.type for p in frames] == ["screenshot", WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    wire = frames[0].model_dump(mode="json")
+    assert wire == {
+        "type": "screenshot",
+        "artifact_id": row["artifact_id"],
+        "captured_at": wire["captured_at"],
+        "tool_call_id": "c1",
+    }
+    assert saved["capturedAt"] == frames[0].captured_at.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [{"workflow_copilot_chat_id": "wcc_1", "supports_vision": False}, {"workflow_copilot_chat_id": None}],
+    ids=["model_has_no_vision", "turn_has_no_chat"],
+)
+async def test_no_frame_reaches_the_chat_without_vision_or_a_chat(
+    chat_screenshot_rows: list[dict[str, Any]], overrides: dict[str, Any]
+) -> None:
+    ctx = _test_copilot_context(**overrides)
+    _stage_frame(ctx)
+
+    sent = await _drive(_click_round_trip(), ctx)
+
+    assert chat_screenshot_rows == []
+    assert "screenshot" not in [p.type for p in sent]
+    assert _saved_screenshots(ctx) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_fault", ["refuses", "stalls"])
+async def test_a_failed_screenshot_upload_leaves_the_tool_result_as_it_was(
+    chat_screenshot_rows: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch, storage_fault: str
+) -> None:
+    dictation_upload = asyncio.create_task(asyncio.Event().wait())
+    app.ARTIFACT_MANAGER.upload_aiotasks_map["wcc_1"].append(dictation_upload)
+    dictation_waits: list[asyncio.Task[None]] = []
+
+    async def refuse(artifact: Artifact, data: bytes) -> None:
+        # A dictation request for the same chat starts waiting while this upload is in flight.
+        dictation_waits.append(asyncio.create_task(app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(["wcc_1"])))
+        if storage_fault == "stalls":
+            await asyncio.Event().wait()
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(app.STORAGE, "store_artifact", refuse)
+    monkeypatch.setattr(streaming_adapter_module, "_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS", 0.05)
+
+    def tool_results(sent: list[Any]) -> list[dict[str, Any]]:
+        return [
+            p.model_dump(exclude={"timestamp", "activity_started_at"})
+            for p in sent
+            if p.type == WorkflowCopilotStreamMessageType.TOOL_RESULT
+        ]
+
+    undisturbed = await _drive(_click_round_trip(), _test_copilot_context(workflow_copilot_chat_id="wcc_1"))
+    ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
+    assert _stage_frame(ctx)
+
+    try:
+        sent = await _drive(_click_round_trip(), ctx)
+        await asyncio.sleep(0)
+
+        assert "screenshot" not in [p.type for p in sent]
+        assert _saved_screenshots(ctx) is None
+        assert len(tool_results(sent)) == 1
+        assert tool_results(sent) == tool_results(undisturbed)
+        every_upload = [u for uploads in app.ARTIFACT_MANAGER.upload_aiotasks_map.values() for u in uploads]
+        assert [u for u in every_upload if not u.done()] == [dictation_upload]
+        assert [wait.done() for wait in dictation_waits] == [False]
+    finally:
+        for task in [*dictation_waits, dictation_upload]:
+            task.cancel()
+        app.ARTIFACT_MANAGER.upload_aiotasks_map.pop("wcc_1", None)
+
+
+@pytest.mark.asyncio
+async def test_every_distinct_frame_one_tool_staged_reaches_the_chat_in_order(
+    chat_screenshot_rows: list[dict[str, Any]],
+) -> None:
+    ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
+    for color in ("white", "black", "red"):
+        assert _stage_frame(ctx, color=color)
+
+    sent = await _drive(_click_round_trip(), ctx)
+
+    stored = [row["artifact_id"] for row in chat_screenshot_rows]
+    assert len(stored) == 3
+    assert [p.artifact_id for p in sent if p.type == "screenshot"] == stored
+    assert [shot["artifactId"] for shot in _saved_screenshots(ctx) or []] == stored
+
+
+@pytest.mark.asyncio
+async def test_goal_satisfied_flush_stores_the_frame_its_tool_staged(
+    chat_screenshot_rows: list[dict[str, Any]],
+) -> None:
+    ctx = _test_copilot_context(
+        workflow_copilot_chat_id="wcc_1",
+        in_flight_stream_tool_call=InFlightStreamToolCall(call_id="c9", tool_name="update_workflow", iteration=2),
+        goal_satisfied_tool_output={"ok": True, "data": {"block_count": 1}},
+    )
+    _fixture_pending_identity(ctx)
+    assert _stage_frame(ctx)
+    sent: list[Any] = []
+
+    await flush_goal_satisfied_tool_result(_sink_stream(sent), ctx)
+
+    assert [p.type for p in sent] == ["screenshot", WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [shot["artifactId"] for shot in _saved_screenshots(ctx) or []] == [chat_screenshot_rows[0]["artifact_id"]]

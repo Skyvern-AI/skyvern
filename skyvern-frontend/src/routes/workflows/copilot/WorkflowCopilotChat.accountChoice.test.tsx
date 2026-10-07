@@ -411,8 +411,9 @@ describe("WorkflowCopilotChat connected account choices", () => {
     });
     expect(
       Boolean(
-        screen.getByText(/choose below/).compareDocumentPosition(tray) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
+        screen
+          .getByText("Copilot needs a Google account")
+          .compareDocumentPosition(tray) & Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true);
     expect(useCopilotHeaderStore.getState().attention).toBe("account");

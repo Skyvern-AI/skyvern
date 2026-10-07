@@ -59,6 +59,7 @@ from tests.unit.copilot_test_helpers import (
     run_result_block_row,
     stub_copilot_agent_loop,
 )
+from tests.unit.helpers import unsolved_captcha_relabel_categories
 
 ORG = "o_1"
 WPID = "wpid_1"
@@ -878,6 +879,26 @@ async def test_origin_rows_are_valued_the_way_verified_recording_values_them(
     assert (source_status.has_value, source_status.value) == (True, {"row": ORIGIN_OUTPUT_SENTINEL})
     assert ORIGIN_OUTPUT_SENTINEL not in repr(snapshot)
     assert ORIGIN_OUTPUT_SENTINEL not in repr(source_status)
+
+
+@pytest.mark.asyncio
+async def test_origin_outputs_seed_the_categories_the_run_had_before_an_output_only_relabel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+    before, after = unsolved_captcha_relabel_categories()
+
+    def seeded(categories: list[dict] | None) -> object:
+        output = {"status": "failed", "failure_category": categories}
+        rows = merge_origin_rows(
+            origin_block_rows(workflow, "approval", status="failed", value=output),
+            origin_block_rows(workflow, "source_status", status="failed", row_output=output, registered=False),
+        )
+        snapshot = origin_block_outputs_from_rows(workflow.workflow_definition, *rows)
+        return {label: output.value for label, output in snapshot.outputs.items()}
+
+    assert seeded(after) == seeded(before)
 
 
 @pytest.mark.parametrize(

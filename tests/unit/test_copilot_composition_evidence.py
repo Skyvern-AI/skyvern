@@ -18,7 +18,6 @@ from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
-from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurfaceIdentity
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
@@ -55,7 +54,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _selector_for,
     _structural_path,
     _structured_modal_dismiss_controls,
-    composition_page_evidence_error,
+    composition_page_evidence_missing,
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
@@ -87,12 +86,10 @@ class _Ctx:
     flow_evidence: list[dict] = field(default_factory=list)
     # Looser than AgentContext so tests can feed malformed refs into the gate.
     block_observation_refs: dict[str, object] = field(default_factory=dict)
-    raw_block_observation_refs: object | None = None
     prior_observed_acted_pages: list[dict] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     post_run_page_observation_after_failed_test: bool = False
     last_failure_category_top: str | None = None
-    tool_surface_identity: CopilotToolSurfaceIdentity | None = None
 
 
 def _flow_entry(
@@ -1093,14 +1090,11 @@ def test_composition_gate_requires_page_evidence_before_page_dependent_blocks() 
         "navigation_goal": "Enter the person name into the name search field and click Search.",
     }
 
-    assert composition_page_evidence_error(_Ctx(), _yaml(goto_block)) is None
+    assert composition_page_evidence_missing(_Ctx(), _yaml(goto_block)) is False
 
-    error = composition_page_evidence_error(_Ctx(), _yaml(goto_block, search_block))
+    missing = composition_page_evidence_missing(_Ctx(), _yaml(goto_block, search_block))
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
-    assert "save only the initial goto_url block" in error
-    assert "search_lookup" in error
+    assert missing is True
 
 
 def test_composition_finding_does_not_depend_on_a_phase_gate() -> None:
@@ -1114,10 +1108,9 @@ def test_composition_finding_does_not_depend_on_a_phase_gate() -> None:
     )
     ctx = _Ctx()
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "search_lookup" in error
+    assert missing is True
 
 
 def test_composition_gate_requires_page_evidence_before_no_url_action_blocks() -> None:
@@ -1131,13 +1124,12 @@ def test_composition_gate_requires_page_evidence_before_no_url_action_blocks() -
             "navigation_goal": "Click the Add to cart button on the current page.",
         }
 
-        error = composition_page_evidence_error(_Ctx(), _yaml(goto_block, acting_block))
+        missing = composition_page_evidence_missing(_Ctx(), _yaml(goto_block, acting_block))
 
-        assert error is not None, f"{acting_type} should require page evidence"
-        assert f"do_{acting_type}" in error
+        assert missing is True, f"{acting_type} should require page evidence"
 
 
-def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> None:
+def test_composition_gate_flags_extraction_only_blocks_without_page_evidence() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_results", "url": "https://example.com/results"},
         {
@@ -1147,12 +1139,9 @@ def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> Non
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(), workflow_yaml)
 
-    assert error is not None
-    assert "page-dependent blocks" in error
-    assert "navigation/login" not in error
-    assert "extract_results (extraction)" in error
+    assert missing is True
 
 
 @pytest.mark.parametrize(
@@ -1177,10 +1166,9 @@ def test_composition_gate_rejects_stale_page_evidence(stale_url: str) -> None:
         "current_url": stale_url,
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is not None
-    assert "page-dependent build blocks need observed page evidence" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_untyped_browser_observation_evidence() -> None:
@@ -1199,10 +1187,9 @@ def test_composition_gate_rejects_untyped_browser_observation_evidence() -> None
         "source_tool": "get_browser_screenshot",
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_precompose_screenshot_evidence_outside_inspection_tool() -> None:
@@ -1224,10 +1211,9 @@ def test_composition_gate_rejects_precompose_screenshot_evidence_outside_inspect
         "visual_evidence_summary": "A search form is visible.",
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_accepts_screenshot_evidence_from_inspection_tool() -> None:
@@ -1246,9 +1232,9 @@ def test_composition_gate_accepts_screenshot_evidence_from_inspection_tool() -> 
         "visual_evidence_summary": "A challenge is visible below the search form.",
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_accepts_structured_evaluate_evidence_on_target_page() -> None:
@@ -1273,9 +1259,9 @@ def test_composition_gate_accepts_structured_evaluate_evidence_on_target_page() 
         ],
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_accepts_structured_evaluate_same_origin_after_initial_block() -> None:
@@ -1298,9 +1284,9 @@ def test_composition_gate_accepts_structured_evaluate_same_origin_after_initial_
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_rejects_post_run_browser_observation_outside_inspection_tool() -> None:
@@ -1335,10 +1321,9 @@ def test_composition_gate_rejects_post_run_browser_observation_outside_inspectio
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_structured_evaluate_evidence_for_same_origin_continuation() -> None:
@@ -1374,9 +1359,9 @@ def test_composition_gate_allows_structured_evaluate_evidence_for_same_origin_co
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_continuation() -> None:
@@ -1412,9 +1397,9 @@ def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_con
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_observation() -> None:
@@ -1454,9 +1439,9 @@ def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_obse
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_rejects_hollow_inspect_evidence() -> None:
@@ -1483,10 +1468,9 @@ def test_composition_gate_rejects_hollow_inspect_evidence() -> None:
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "observed page evidence" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_extraction_added_with_new_page_changing_block() -> None:
@@ -1526,9 +1510,9 @@ def test_composition_gate_allows_extraction_added_with_new_page_changing_block()
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_extraction_after_matching_current_page_evidence() -> None:
@@ -1563,9 +1547,9 @@ def test_composition_gate_allows_extraction_after_matching_current_page_evidence
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
@@ -1600,93 +1584,9 @@ def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
-
-
-def test_composition_gate_error_names_nearest_url_before_new_page_block() -> None:
-    existing_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "goto_url",
-            "label": "open_find_record",
-            "url": "https://example.com/registry/",
-        },
-    )
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "goto_url",
-            "label": "open_find_record",
-            "url": "https://example.com/registry/",
-        },
-        {
-            "block_type": "navigation",
-            "label": "search_standard_record",
-            "url": "https://example.com/registry/search",
-            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
-        },
-    )
-    ctx = _Ctx(composition_page_evidence=None)
-    ctx.workflow_yaml = existing_yaml
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "target_url='https://example.com/registry/search'" in error
-
-
-@pytest.mark.parametrize(
-    ("identity", "expected", "forbidden"),
-    [
-        (CopilotToolSurfaceIdentity.REQUIRED_CODE, "inspect_page_for_composition for", "evaluate"),
-        (None, "inspect_page_for_composition or evaluate", None),
-    ],
-    ids=["required_code", "optional"],
-)
-def test_a_string_observation_ref_is_corrected_with_tools_the_surface_offers(
-    identity: CopilotToolSurfaceIdentity | None, expected: str, forbidden: str | None
-) -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
-        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Click the Add to Cart button."},
-    )
-    ctx = _Ctx(
-        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
-        block_observation_refs={},
-        raw_block_observation_refs={"add_to_cart": "1"},
-        tool_surface_identity=identity,
-    )
-
-    error = composition_page_evidence_error(ctx, workflow_yaml, raw_block_observation_refs={"add_to_cart": "1"})
-
-    assert error is not None
-    assert "as a string" in error
-    assert expected in error
-    if forbidden is not None:
-        assert forbidden not in error
-
-
-def test_composition_gate_error_routes_the_open_through_browser_code_on_the_required_surface() -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "navigation",
-            "label": "search_standard_record",
-            "url": "https://example.com/registry/search",
-            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
-        },
-    )
-    ctx = _Ctx(composition_page_evidence=None, tool_surface_identity=CopilotToolSurfaceIdentity.REQUIRED_CODE)
-    ctx.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "Open 'https://example.com/registry/search' from browser code" in error
-    assert "target_url=" not in error
+    assert missing is False
 
 
 def test_composition_gate_rejects_same_origin_browser_observation_before_run_continuation() -> None:
@@ -1709,10 +1609,9 @@ def test_composition_gate_rejects_same_origin_browser_observation_before_run_con
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_applies_to_edit_turns_that_add_page_dependent_blocks() -> None:
@@ -1732,10 +1631,9 @@ def test_composition_gate_applies_to_edit_turns_that_add_page_dependent_blocks()
         workflow_yaml=existing_yaml,
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "search_lookup" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_page_dependent_blocks_without_target_url() -> None:
@@ -1747,10 +1645,9 @@ def test_composition_gate_rejects_page_dependent_blocks_without_target_url() -> 
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
-    assert error is not None
-    assert "target_url=None" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_navigation_after_matching_evidence() -> None:
@@ -1766,9 +1663,9 @@ def test_composition_gate_allows_navigation_after_matching_evidence() -> None:
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_observation() -> None:
@@ -1794,9 +1691,9 @@ def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_navigation_split_blocks_sharing_entrypoint_observation_ref() -> None:
@@ -1827,9 +1724,9 @@ def test_composition_gate_allows_navigation_split_blocks_sharing_entrypoint_obse
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 # ---------------- SKY-10562: block-type-agnostic, per-acted-page, multi-page gate ----------------
@@ -1844,18 +1741,17 @@ def test_composition_gate_gates_non_entrypoint_goto_url_block() -> None:
         {"block_type": "validation", "label": "confirm_item", "complete_criterion": "An item is in the cart."},
     )
 
-    error = composition_page_evidence_error(_Ctx(), workflow_yaml)
-    assert error is not None
-    assert "open_cart (goto_url)" in error
+    missing = composition_page_evidence_missing(_Ctx(), workflow_yaml)
+    assert missing is True
 
     ctx = _Ctx(flow_evidence=[_flow_entry("https://example.com/cart")])
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_entrypoint_goto_url_stays_ungated() -> None:
     # The first goto_url is the scaffold the agent scouts from — never gated.
     workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-    assert composition_page_evidence_error(_Ctx(), workflow_yaml) is None
+    assert composition_page_evidence_missing(_Ctx(), workflow_yaml) is False
 
 
 def test_composition_gate_pure_code_block_is_ungated() -> None:
@@ -1863,7 +1759,7 @@ def test_composition_gate_pure_code_block_is_ungated() -> None:
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
         {"block_type": "code", "label": "transform", "code": "result = 1 + 1"},
     )
-    assert composition_page_evidence_error(_Ctx(), workflow_yaml) is None
+    assert composition_page_evidence_missing(_Ctx(), workflow_yaml) is False
 
 
 def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> None:
@@ -1876,9 +1772,8 @@ def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> 
         {"block_type": "validation", "label": "confirm_secure", "complete_criterion": "Secure area is shown."},
     )
     only_login = _Ctx(flow_evidence=[_flow_entry("https://example.com/login")])
-    error = composition_page_evidence_error(only_login, workflow_yaml)
-    assert error is not None
-    assert "open_secure (goto_url)" in error
+    missing = composition_page_evidence_missing(only_login, workflow_yaml)
+    assert missing is True
 
     both = _Ctx(
         flow_evidence=[
@@ -1886,7 +1781,7 @@ def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> 
             _flow_entry("https://example.com/secure", reached_via="post_run"),
         ]
     )
-    assert composition_page_evidence_error(both, workflow_yaml) is None
+    assert composition_page_evidence_missing(both, workflow_yaml) is False
 
 
 def test_composition_gate_requires_block_observation_refs_for_click_reached_pages() -> None:
@@ -1901,12 +1796,9 @@ def test_composition_gate_requires_block_observation_refs_for_click_reached_page
         block_observation_refs={"search_product": 0},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "requires a block_observation_refs entry" in error
-    assert "Pass an interaction- or post_run-reached observation_step" in error
-    assert "add_first_result (action)" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_click_reached_blocks_reusing_entrypoint_observation_ref() -> None:
@@ -1925,12 +1817,9 @@ def test_composition_gate_rejects_click_reached_blocks_reusing_entrypoint_observ
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "references observation_step 0" in error
-    assert "reached via 'navigate'" in error
-    assert "add_first_result (action)" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_current_page_read_after_matching_interaction_reached_page() -> None:
@@ -1951,7 +1840,7 @@ def test_composition_gate_allows_current_page_read_after_matching_interaction_re
         },
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_accepts_scout_interaction_observation_for_click_reached_block() -> None:
@@ -1971,7 +1860,7 @@ def test_composition_gate_accepts_scout_interaction_observation_for_click_reache
         block_observation_refs={"search_product": 1, "add_to_cart": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_hollow_interaction_observation_without_schema() -> None:
@@ -1992,7 +1881,7 @@ def test_composition_gate_rejects_hollow_interaction_observation_without_schema(
         block_observation_refs={"search_product": 1, "add_to_cart": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_credits_current_page_read_after_schema_less_scout_interaction() -> None:
@@ -2010,7 +1899,7 @@ def test_composition_gate_credits_current_page_read_after_schema_less_scout_inte
         block_observation_refs={"open_results": 1, "read_results": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_finding_reuses_reached_page_evidence_independent_of_block_order() -> None:
@@ -2040,7 +1929,7 @@ def test_composition_finding_reuses_reached_page_evidence_independent_of_block_o
             *page_blocks,
         )
 
-        assert composition_page_evidence_error(ctx, workflow_yaml) is None
+        assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_current_page_read_credited_by_a_later_interaction() -> None:
@@ -2058,7 +1947,7 @@ def test_composition_gate_rejects_current_page_read_credited_by_a_later_interact
         block_observation_refs={"open_results": 2, "read_results": 1},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_finding_reuses_one_interaction_observation_for_multiple_blocks() -> None:
@@ -2077,7 +1966,7 @@ def test_composition_finding_reuses_one_interaction_observation_for_multiple_blo
         block_observation_refs={"read_results": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_current_page_read_after_the_reached_page_was_left_and_reopened() -> None:
@@ -2097,7 +1986,7 @@ def test_composition_gate_rejects_current_page_read_after_the_reached_page_was_l
         block_observation_refs={"open_results": 1, "read_results": 4},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_rejects_current_page_read_after_same_url_navigation_reopened_page() -> None:
@@ -2116,7 +2005,7 @@ def test_composition_gate_rejects_current_page_read_after_same_url_navigation_re
         block_observation_refs={"open_results": 1, "read_results": 3},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_rejects_current_page_read_without_a_same_location_interaction() -> None:
@@ -2134,7 +2023,7 @@ def test_composition_gate_rejects_current_page_read_without_a_same_location_inte
         block_observation_refs={"open_results": 1, "read_cart": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -> None:
@@ -2153,7 +2042,7 @@ def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -
         block_observation_refs={},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_click_reached_block_with_no_interaction_observation() -> None:
@@ -2167,10 +2056,9 @@ def test_composition_gate_rejects_click_reached_block_with_no_interaction_observ
         block_observation_refs={},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "add_to_cart (action)" in error
+    assert missing is True
 
 
 def test_composition_finding_auto_credit_does_not_consume_interaction_observations() -> None:
@@ -2187,7 +2075,7 @@ def test_composition_finding_auto_credit_does_not_consume_interaction_observatio
     one = _Ctx(
         flow_evidence=base + [_scout_interaction_entry("https://example.com/", step=1)], block_observation_refs={}
     )
-    assert composition_page_evidence_error(one, workflow_yaml) is None
+    assert composition_page_evidence_missing(one, workflow_yaml) is False
 
     two = _Ctx(
         flow_evidence=base
@@ -2197,10 +2085,10 @@ def test_composition_finding_auto_credit_does_not_consume_interaction_observatio
         ],
         block_observation_refs={},
     )
-    assert composition_page_evidence_error(two, workflow_yaml) is None
+    assert composition_page_evidence_missing(two, workflow_yaml) is False
 
 
-def test_composition_gate_reports_missing_referenced_observation_step() -> None:
+def test_composition_gate_flags_block_citing_an_observation_step_not_in_flow_evidence() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
         {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
@@ -2214,33 +2102,9 @@ def test_composition_gate_reports_missing_referenced_observation_step() -> None:
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "references observation_step 9" in error
-    assert "observation step was not found in flow evidence" in error
-    assert "add_first_result (action)" in error
-
-
-def test_composition_gate_reports_evicted_referenced_observation_step() -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
-        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
-    )
-    ctx = _Ctx(
-        flow_evidence=[_flow_entry("https://example.com/cart", reached_via="interaction", step=65)],
-        block_observation_refs={
-            "search_product": 65,
-            "add_first_result": 9,
-        },
-    )
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "references observation_step 9" in error
-    assert "no longer available in the flow-evidence window" in error
+    assert missing is True
 
 
 def test_normalize_block_observation_refs_rejects_string_steps() -> None:
@@ -2289,35 +2153,6 @@ def test_parse_structured_evidence_warns_on_unknown_size_compaction_category() -
     )
 
 
-def test_composition_gate_reports_string_typed_observation_step_from_raw_refs() -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
-        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
-    )
-    ctx = _Ctx(
-        # No interaction-reached observation exists, so auto-credit cannot ground the block and the
-        # string-typed-ref diagnostic fires instead.
-        flow_evidence=[
-            _flow_entry("https://example.com/", reached_via="navigate", step=0),
-        ],
-        block_observation_refs={
-            "search_product": 0,
-        },
-        raw_block_observation_refs=[
-            {"label": "search_product", "observation_step": 0},
-            {"label": "add_first_result", "observation_step": "1"},
-        ],
-    )
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "observation_step '1' as a string" in error
-    assert "Pass the integer observation_step" in error
-    assert "add_first_result (action)" in error
-
-
 def test_composition_gate_rejects_action_after_navigation_reusing_entrypoint_observation_ref() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
@@ -2332,10 +2167,9 @@ def test_composition_gate_rejects_action_after_navigation_reusing_entrypoint_obs
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "add_first_result (action)" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_click_reached_pages_with_block_observation_refs() -> None:
@@ -2358,9 +2192,9 @@ def test_composition_gate_allows_click_reached_pages_with_block_observation_refs
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_truthfully_empty_observed_confirmation_page() -> None:
@@ -2396,9 +2230,9 @@ def test_composition_gate_allows_truthfully_empty_observed_confirmation_page() -
         block_observation_refs={"submit_form": 0, "confirm_done": 1},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_regates_changed_block_url() -> None:
@@ -2412,13 +2246,12 @@ def test_composition_gate_regates_changed_block_url() -> None:
     )
     ctx = _Ctx(flow_evidence=[_flow_entry("https://example.com/old")])
     ctx.workflow_yaml = previous
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-    assert error is not None
-    assert "open_page (navigation)" in error
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
+    assert missing is True
 
     ctx_observed = _Ctx(flow_evidence=[_flow_entry("https://example.com/new")])
     ctx_observed.workflow_yaml = previous
-    assert composition_page_evidence_error(ctx_observed, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx_observed, workflow_yaml) is False
 
 
 def test_composition_gate_credits_cross_turn_observed_page_summary() -> None:
@@ -2433,7 +2266,7 @@ def test_composition_gate_credits_cross_turn_observed_page_summary() -> None:
             {"url": "https://example.com/lookup", "had_bounded_schema": True, "reached_via": "navigate"}
         ]
     )
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> None:
@@ -2451,9 +2284,8 @@ def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> N
         ]
     )
     sibling_only.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-    error = composition_page_evidence_error(sibling_only, workflow_yaml)
-    assert error is not None
-    assert "open_admin (goto_url)" in error
+    missing = composition_page_evidence_missing(sibling_only, workflow_yaml)
+    assert missing is True
 
     exact = _Ctx(
         prior_observed_acted_pages=[
@@ -2461,7 +2293,7 @@ def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> N
         ]
     )
     exact.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-    assert composition_page_evidence_error(exact, workflow_yaml) is None
+    assert composition_page_evidence_missing(exact, workflow_yaml) is False
 
 
 def test_composition_gate_credits_safe_cross_turn_location_fingerprint() -> None:
@@ -2481,7 +2313,7 @@ def test_composition_gate_credits_safe_cross_turn_location_fingerprint() -> None
         ]
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_candidate_page_context_exposes_origin_not_path_or_query() -> None:
@@ -2512,10 +2344,9 @@ def test_composition_gate_matches_url_blocks_against_target_when_observation_ref
         block_observation_refs={"open_cart": 0},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "open_cart (goto_url)" in error
+    assert missing is True
 
 
 # Bounded structured-evidence extractor
@@ -7367,7 +7198,7 @@ def test_composition_gate_falls_back_to_observed_page_for_a_stale_ref_on_an_unre
         block_observation_refs={"search_product": 99},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_merge_visual_composition_evidence_keeps_only_typed_requested_value_pairs() -> None:

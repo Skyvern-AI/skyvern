@@ -1,10 +1,14 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 
 import type {
   QuestionAnswer,
   QuestionInteraction,
   QuestionResponse,
 } from "./workflowCopilotTypes";
+
+// The tray's own last choice. Its answer is the composer text, so it is never sent as a choice.
+export const OTHER_CHOICE_ID = "other";
+const OTHER_PROMPT = "Type your answer…";
 
 type StepperState = {
   interactionId: string | null;
@@ -27,6 +31,9 @@ export type QuestionStepper = {
   isLast: boolean;
   choices: Record<string, string>;
   answeredCount: number;
+  // The placeholder for text the picked choice needs before the user can move on, or null.
+  detailPrompt: string | null;
+  advanceBlocked: boolean;
   toggleChoice: (partId: string, choiceId: string) => void;
   goTo: (index: number) => void;
   // Leaves the part on screen unanswered and moves to the next one.
@@ -59,7 +66,8 @@ export function useQuestionStepper(
   const answersFor = (omitPartId?: string): QuestionAnswer[] =>
     parts.flatMap((part) => {
       if (part.part_id === omitPartId) return [];
-      const choiceId = state.choices[part.part_id];
+      const picked = state.choices[part.part_id];
+      const choiceId = picked === OTHER_CHOICE_ID ? undefined : picked;
       const text = textFor(part.part_id);
       if (!choiceId && text === "") return [];
       return [
@@ -71,26 +79,34 @@ export function useQuestionStepper(
       ];
     });
   const answers = answersFor();
+  const pickedId = currentPartId ? state.choices[currentPartId] : undefined;
+  const detailPrompt =
+    pickedId === OTHER_CHOICE_ID
+      ? OTHER_PROMPT
+      : (parts[index]?.choices.find((choice) => choice.choice_id === pickedId)
+          ?.detail_prompt ?? null);
+  const advanceBlocked = detailPrompt !== null && draft.trim() === "";
 
-  const toggleChoice = useCallback(
-    (partId: string, choiceId: string) => {
-      setStored((previous) => {
-        const base =
-          previous.interactionId === interactionId
-            ? previous
-            : { ...EMPTY, interactionId };
-        const choices = { ...base.choices };
-        if (choices[partId] === choiceId) delete choices[partId];
-        else choices[partId] = choiceId;
-        return { ...base, choices };
-      });
-    },
-    [interactionId],
-  );
+  const toggleChoice = (partId: string, choiceId: string) => {
+    const choices = { ...state.choices };
+    const previous = choices[partId];
+    if (previous === choiceId) delete choices[partId];
+    else choices[partId] = choiceId;
+    setStored({ ...state, choices });
+    // Text the previous pick asked for answers that pick, so it must not ride along with another.
+    if (
+      partId === currentPartId &&
+      detailPrompt !== null &&
+      previous !== undefined &&
+      previous !== choiceId
+    )
+      setDraft("");
+  };
 
   const goTo = (next: number) => {
     if (!currentPartId || next < 0 || next >= parts.length || next === index)
       return;
+    if (next > index && advanceBlocked) return;
     const nextPartId = parts[next]!.part_id;
     setStored({
       ...state,
@@ -119,6 +135,8 @@ export function useQuestionStepper(
     isLast: index >= parts.length - 1,
     choices: state.choices,
     answeredCount: answers.length,
+    detailPrompt,
+    advanceBlocked,
     toggleChoice,
     goTo,
     skipCurrent,

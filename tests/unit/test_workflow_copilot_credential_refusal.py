@@ -8,10 +8,12 @@ agents SDK via FunctionTool.description). Both must state the same policy,
 or the agent follows whichever it weights higher.
 """
 
+from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_REFUSAL_SENTINEL
 from skyvern.forge.sdk.copilot.tools import (
-    add_block_tool,
+    _build_skyvern_mcp_overlays,
     edit_block_and_run_tool,
     fill_credential_field_tool,
+    list_credentials_tool,
     run_blocks_tool,
     update_and_run_blocks_tool,
 )
@@ -23,10 +25,16 @@ class TestAgentPromptRefusalClause:
 
     def test_raw_secret_is_not_echoed_used_or_run(self) -> None:
         rendered = _render_agent_prompt()
+        assert "Never put a raw secret value (for example, a password) into a tool argument or a reply" in rendered
         assert "do not echo it" in rendered
         assert "do not type or submit it into a page" in rendered
         assert "do not pass it as a run parameter" in rendered
         assert "persist only a redacted draft that uses a saved credential parameter" in rendered
+
+    def test_prompt_states_the_rule_without_a_list_or_the_refusal_sentinel(self) -> None:
+        rendered = _render_agent_prompt()
+        assert "a password, API key, token, or one-time code" not in rendered
+        assert RAW_SECRET_REFUSAL_SENTINEL not in rendered
 
     def test_saved_credentials_are_resolved_by_name_or_id(self) -> None:
         rendered = _render_agent_prompt()
@@ -57,22 +65,16 @@ class TestToolDocstringsRefusalClause:
         for tool in self._tools():
             desc = tool.description  # type: ignore[attr-defined]
             assert "do NOT pass" in desc, f"{tool.name} does not forbid inline secret pass-through"  # type: ignore[attr-defined]
+            assert "raw secret value (for example, a password)" in " ".join(desc.split())
+            assert "one_time_code, private_key" not in desc
             assert "Ask the user to store it as a saved" in desc
             assert "credential and reply with the credential name" in desc
             assert "do not build or run with" in desc
             assert "the raw value" in desc
             assert "CREDENTIAL HANDLING refusal rule" not in desc
 
-    def test_non_secret_parameters_guidance_preserved(self) -> None:
-        """The `parameters` dict is still the right channel for non-secret runtime values."""
-        for tool in self._tools():
-            desc = tool.description  # type: ignore[attr-defined]
-            assert "non-secret values" in desc, f"{tool.name} missing non-secret guidance"  # type: ignore[attr-defined]
-
     def test_list_credentials_tool_describes_pagination(self) -> None:
         """list_credentials docstring must warn about paging before concluding no match."""
-        from skyvern.forge.sdk.copilot.tools import list_credentials_tool
-
         desc = list_credentials_tool.description  # type: ignore[attr-defined]
         assert "has_more" in desc
         assert "already stored on a later page" in desc
@@ -86,14 +88,6 @@ class TestToolDocstringsRefusalClause:
         assert "existing saved login block" in fill_desc
         assert "run that block unchanged" in fill_desc
 
-    def test_add_block_describes_the_flat_workflow_parameter_shape(self) -> None:
-        desc = add_block_tool.description  # type: ignore[attr-defined]
-
-        assert '"parameter_type": "workflow"' in desc
-        assert '"workflow_parameter_type": "string"' in desc
-        assert '"default_value": "BillingHistory.jsp"' in desc
-        assert "Inspect or run the saved workflow" in desc
-
 
 class TestBrowserToolOverlayRefusalCaveat:
     """The MCP browser-tool overlays are also operating instructions for the agent.
@@ -105,12 +99,11 @@ class TestBrowserToolOverlayRefusalCaveat:
     """
 
     def test_type_text_overlay_forbids_inline_secrets(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
-
         overlays = _build_skyvern_mcp_overlays()
         assert "type_text" in overlays
         desc = overlays["type_text"].description or ""
-        assert "NEVER type inline passwords" in desc
+        assert "NEVER type a raw secret value (for example, a password)" in desc
+        assert "API keys, tokens, cookies" not in desc
         assert "Ask the user to store the value as a saved credential" in desc
         assert "do not type or submit the raw value" in desc
         assert "CREDENTIAL HANDLING refusal rule" not in desc

@@ -505,3 +505,68 @@ async def test_retry_logs_keep_both_attempts_and_update_only_current_attempt(
             await asyncio.gather(late_log_task, return_exceptions=True)
         skyvern_context.reset()
         await engine.dispose()
+
+
+def test_operation_attribution_is_excluded_from_context_logs() -> None:
+    """The internal operation-attribution envelope must be popped before context.log (the
+    downloadable S3 artifact), exactly like failure_attribution, while remaining on the
+    stdout/Datadog record."""
+    context = skyvern_context.SkyvernContext()
+    envelope = {
+        "schema_version": 1,
+        "organization_id": "o_x",
+        "workflow_permanent_id": "wpid_x",
+        "workflow_id": "w_x",
+        "workflow_run_id": "wr_probe",
+        "workflow_run_block_id": "wrb_x",
+        "block_label": "code_1",
+        "engine": "inline",
+        "code_line": 3,
+        "probe_match_count": 2,
+        "probe_status": "counted",
+        "exception_class": "PlaywrightTimeoutError",
+    }
+    event: EventDict = {
+        "event": "codeblock.locator_probe",
+        "workflow_run_id": "wr_probe",
+        "operation_attribution": dict(envelope),
+    }
+    logger = logging.getLogger(__name__)
+    with skyvern_context.scoped(context):
+        returned = skyvern_logs_processor(logger, "info", event)
+
+    # Popped from the downloadable artifact...
+    assert context.log == [{"event": "codeblock.locator_probe", "workflow_run_id": "wr_probe"}]
+    assert all("operation_attribution" not in entry for entry in context.log)
+    # ...but still present on the stdout/Datadog record.
+    assert returned["operation_attribution"] == envelope
+
+
+def test_registered_secret_collision_cannot_leak_operation_attribution_into_context_logs() -> None:
+    """A registered secret colliding with the envelope's structural keys/values must scrub the
+    value, not the protocol key, and the envelope must never reach context.log."""
+    context = skyvern_context.SkyvernContext()
+    context.register_secret_value("code_1")
+    context.register_secret_value("operation_attribution")
+    event: EventDict = {
+        "event": "codeblock.locator_probe",
+        "workflow_run_id": "wr_collision",
+        "operation_attribution": {
+            "schema_version": 1,
+            "workflow_run_block_id": "wrb_x",
+            "block_label": "code_1",
+            "probe_status": "counted",
+            "probe_match_count": 1,
+        },
+    }
+    logger = logging.getLogger(__name__)
+    with skyvern_context.scoped(context):
+        redacted = redact_registered_secrets(logger, "info", event)
+        returned = skyvern_logs_processor(logger, "info", redacted)
+
+    assert context.log == [{"event": "codeblock.locator_probe", "workflow_run_id": "wr_collision"}]
+    assert isinstance(returned["operation_attribution"], dict)
+    # The protocol key survives; the registered-secret value inside is scrubbed.
+    assert returned["operation_attribution"]["block_label"] == REDACTED_SECRET_PLACEHOLDER
+    assert returned["operation_attribution"]["probe_status"] == "counted"
+    assert returned["operation_attribution"]["probe_match_count"] == 1

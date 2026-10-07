@@ -1,5 +1,6 @@
 import { CodeWriteDiff } from "./workflowCopilotTypes";
 import {
+  ACCOUNT_GROUP_SUBMIT_TOOL,
   ActivityEntry,
   AUTHORING_TOOLS,
   BlockState,
@@ -243,7 +244,13 @@ export function rowIndexOfToolCall(
 
 // A call whose card renders after its row ends that row, so work done after the
 // user answered or the plan changed never sits above the card.
-const CARD_TOOLS = new Set(["ask_user", "set_work_plan"]);
+const CARD_TOOLS = new Set([
+  "ask_user",
+  "set_work_plan",
+  ACCOUNT_GROUP_SUBMIT_TOOL,
+  "cancel_account_group",
+  "delete_saved_credentials",
+]);
 
 export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
   // A cancelled or timed-out turn can terminate with a call still unmatched;
@@ -566,11 +573,28 @@ function kindPhrase(
       return live ? "looking up guidance" : "looked up guidance";
     case "write":
       return writePhrase(entries, live);
-    case "run":
-      if (live) return "testing the workflow";
-      return entries.length === 1
-        ? "tested the workflow"
-        : `tested the workflow ${entries.length} times`;
+    case "run": {
+      const groups = entries.filter(
+        (e) => e.toolName === ACCOUNT_GROUP_SUBMIT_TOOL,
+      ).length;
+      const tests = entries.length - groups;
+      return [
+        groups > 0
+          ? live
+            ? "reviewing account runs with you"
+            : "reviewed account runs with you"
+          : null,
+        tests === 0
+          ? null
+          : live
+            ? "testing the workflow"
+            : tests === 1
+              ? "tested the workflow"
+              : `tested the workflow ${tests} times`,
+      ]
+        .filter((part) => part !== null)
+        .join(", ");
+    }
     case "other": {
       const asks = entries.filter((e) => e.toolName === "ask_user").length;
       const rest = entries.length - asks;
@@ -616,9 +640,12 @@ export function callRollup(
 // block with neither, or seen after every dated call returned, goes to the row's
 // last run call. Empty when the row made no run call.
 export function blocksByRunCall(row: ActivityRow): Map<string, BlockState[]> {
+  // An account group's runs are separate saved-workflow runs, never blocks of this row.
   const runCalls = row.entries.filter(
     (entry) =>
-      entry.toolName !== undefined && toolCallKind(entry.toolName) === "run",
+      entry.toolName !== undefined &&
+      entry.toolName !== ACCOUNT_GROUP_SUBMIT_TOOL &&
+      toolCallKind(entry.toolName) === "run",
   );
   const byCall = new Map<string, BlockState[]>();
   const lastRun = runCalls[runCalls.length - 1];

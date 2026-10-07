@@ -62,6 +62,7 @@ from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
+    CopilotSteerMessage,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
@@ -496,9 +497,6 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
-# Matches any final reply containing these substrings, not just credential-blocking
-# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
-_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 RAW_SECRET_QUESTION = (
@@ -889,7 +887,13 @@ class QuestionResponseSiteURLSource:
     kind: Literal["question_response"] = field(default="question_response", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+@dataclass(frozen=True)
+class SteerMessageSiteURLSource:
+    steer_id: str
+    kind: Literal["steer_message"] = field(default="steer_message", init=False)
+
+
+SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource | SteerMessageSiteURLSource
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1005,14 @@ class RequestPolicy:
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
+
+    def project_steer_message(self, steer: CopilotSteerMessage) -> None:
+        # A delivered steer is more of the current user turn, so exact credential citations read it too.
+        self.canonical_user_message = f"{self.canonical_user_message}\n{steer.text}".strip()
+        if steer.raw_secret_detected:
+            self.apply_raw_secret_redacted_draft()
+            return
+        _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
 
     @property
     def raw_secret_redacted_draft(self) -> bool:
@@ -1197,18 +1209,15 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
     )
 
 
-def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
-    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
-    # allow_missing_credentials_in_draft alone also covers the generic skip_test
-    # fallthrough with no credential involvement — then a text marker.
-    if isinstance(policy, RequestPolicy):
-        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
-            return policy.clarification_reason
-        if policy.credential_draft_deferred_explicitly:
-            return "credential_deferred_draft"
-    normalized = " ".join((final_text or "").lower().split())
-    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
-        return "assistant_directed"
+def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
+    # The explicit-defer flag, not allow_missing_credentials_in_draft, because the latter
+    # also covers the generic skip_test fallthrough with no credential involvement.
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+        return policy.clarification_reason
+    if policy.credential_draft_deferred_explicitly:
+        return "credential_deferred_draft"
     return None
 
 
@@ -4176,6 +4185,19 @@ def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> l
     return [_SiteURLText(text=text, source=source) for text in texts]
 
 
+def _steer_message_url_texts(steer: CopilotSteerMessage) -> list[_SiteURLText]:
+    if steer.raw_secret_detected or steer.delivered_at is None:
+        return []
+    return [_SiteURLText(text=steer.text, source=SteerMessageSiteURLSource(steer_id=steer.steer_id))]
+
+
+def _persisted_steer_message_url_texts(raw_steer: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        return _steer_message_url_texts(CopilotSteerMessage.model_validate(raw_steer))
+    except ValidationError:
+        return []
+
+
 def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
     try:
         interaction = QuestionInteraction.model_validate(raw_interaction)
@@ -4231,10 +4253,10 @@ def _ground_user_provided_sites(
     user_message: str,
     full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
 ) -> None:
-    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+    """Rebuild the URL facts the person supplied in USER rows, accepted question responses and delivered steers.
 
     Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
-    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    in the three structured user-authored text surfaces; prompts, choices, rendered history, and
     PRODUCT or AI prose never become credential-origin authority.
     """
     url_texts: list[_SiteURLText] = []
@@ -4252,6 +4274,8 @@ def _ground_user_provided_sites(
             continue
         for raw_interaction in message.narrative_payload.get("questionInteractions", []):
             url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+        for raw_steer in message.narrative_payload.get("steerMessages", []):
+            url_texts.extend(_persisted_steer_message_url_texts(raw_steer))
     if user_message:
         url_texts.append(
             _SiteURLText(

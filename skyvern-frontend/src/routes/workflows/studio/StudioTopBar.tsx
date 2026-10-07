@@ -159,9 +159,10 @@ export function SaveButton() {
     // swallow so it isn't an unhandled rejection.
     // A hold means the baseline itself may be stale, so even a draft that matches it
     // goes through the confirmation rather than saving straight over the newer change.
+    // With no changes at all, a save would only write a new version (fresh branch ids).
     if (dirty || saveBlockedReason) {
       setConfirmOpen(true);
-    } else {
+    } else if (useWorkflowHasChangesStore.getState().hasChanges) {
       void onSave().catch((error: unknown) => {
         if (
           error instanceof SaveRefusedError ||
@@ -245,7 +246,7 @@ export function SaveButton() {
               {saveBlockedReason ? "Save is paused" : "Saving Changes"}
             </DialogTitle>
             <DialogDescription>
-              {saveBlockedReason ?? "The changes below are going to be saved:"}
+              {saveBlockedReason || "The changes below are going to be saved:"}
             </DialogDescription>
           </DialogHeader>
           <WorkflowChangesList changes={changes} />

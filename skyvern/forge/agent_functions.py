@@ -97,7 +97,7 @@ from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
-    from playwright.async_api import BrowserContext, Locator, Response
+    from playwright.async_api import BrowserContext, Locator, Request, Response
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
@@ -123,7 +123,7 @@ LOG = structlog.get_logger()
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """Ids and field names for a customer-initiated write; never secrets or request bodies. A tag's id is its text."""
+    """Resource identifiers and field names for an audited write; never secrets or request bodies."""
 
     organization_id: str
     action: str
@@ -132,6 +132,7 @@ class AuditEvent:
     changed_fields: tuple[str, ...] = ()
     related_resource_ids: tuple[str, ...] = ()
     auth_kind: str | None = None
+    oauth_client_id: str | None = None
 
 
 async def record_request_audit_event(
@@ -233,18 +234,6 @@ class TOTPVerificationResponse:
 
 
 @dataclass(frozen=True)
-class CopilotSiteOriginAssociation:
-    requested_name: str
-    entity_id: str
-    entity_label: str
-    official_site_url: str
-    origin: str
-    source: str
-    provider_relation_type: str
-    provider_relation_text: str
-
-
-@dataclass(frozen=True)
 class ScriptExecutionPolicyDecision:
     allowed: bool
     selection_reason: str
@@ -261,13 +250,6 @@ class CopilotCandidateNetworkHop(TypedDict):
     resolved_public_ips: list[str]
     connected_peer_ip: str
     enforcement_version: str
-
-
-@dataclass(frozen=True)
-class CopilotEntrypointCandidate:
-    url: str
-    source_rank: int
-    association: CopilotSiteOriginAssociation
 
 
 @dataclass(frozen=True)
@@ -317,6 +299,9 @@ class CodeBlockEngineFailure:
     nav_error_code: str | None = None
     # The owned page the failing operation ran on; final_url stays the block's own page.
     receiver_url: str | None = None
+    # Whether the page the failing operation ran on showed a sign-in form, read by the worker before it
+    # closes the runner's owned pages; None when the worker could not tie the failure to a page.
+    sign_in_form_visible: bool | None = None
     # Unredacted; associated_navigation_output masks it where it is persisted.
     document_failure: DocumentFailureReceipt | None = None
 
@@ -999,9 +984,13 @@ class DownloadRecoveryRemap:
 
 
 class DownloadRecoveryHook(Protocol):
+    def matches_target(self, request: Request) -> bool: ...
+
     def matches_failure(self, response: Response) -> bool: ...
 
     async def remap(self, page: Page) -> DownloadRecoveryRemap: ...
+
+    async def reverify(self, page: Page) -> str | None: ...
 
 
 class AgentFunction:
@@ -1043,6 +1032,10 @@ class AgentFunction:
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
     def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
+        return None
+
+    # Same contract as task_v3_age_default, for the job-application availability, experience and disclosure defaults.
+    def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
@@ -1852,7 +1845,8 @@ class AgentFunction:
         the agent keep going and fail safe at max steps rather than falsely completing.
         OSS accepts everything; a deployment may override to hold specific blocks (e.g. a
         submit block whose AI fallback would otherwise complete without a deterministic
-        confirmation check) to a stricter gate.
+        confirmation check) to a stricter gate. Raising CompletionGateTerminationError ends the
+        task as terminated with its reason, so callers must catch it before any broad except.
         """
         return True
 
@@ -2777,22 +2771,6 @@ class AgentFunction:
         if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
             raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
-    def get_copilot_security_rules(self) -> str:
-        """Return security guardrails for the workflow copilot system prompt.
-
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
-        """
-        return ""
-
-    async def acquire_copilot_entrypoint_candidates(
-        self,
-        *,
-        site_name: str,
-    ) -> list[CopilotEntrypointCandidate]:
-        del site_name
-        return []
-
     def copilot_candidate_network_guard(
         self,
         browser_context: BrowserContext,
@@ -2811,10 +2789,6 @@ class AgentFunction:
         del browser_context, expected_origin
         raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
         yield []  # pragma: no cover
-
-    async def wait_for_copilot_candidate_network_idle(self, browser_context: BrowserContext) -> None:
-        del browser_context
-        raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""

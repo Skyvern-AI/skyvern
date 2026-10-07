@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock
 import pytest
 import structlog.testing
 
-from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION,
@@ -29,15 +28,9 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
     _inspect_page_for_composition_impl,
-    _rank_discovery_entrypoint_candidates,
     _resolve_discovery_entry_url,
 )
 from skyvern.forge.sdk.copilot.tools import _shared as shared_module
-from skyvern.forge.sdk.copilot.tools.discovery import (
-    _credential_entry_url,
-    _discovery_build_result,
-    _user_provided_entry_url,
-)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender
@@ -441,7 +434,7 @@ class _TargetThenCurrentPageServer:
         ("HTTP://example.com/login", ("HTTP://example.com/login", "url")),
         ("example.com", ("https://example.com", "domain")),
         ("example.com/login?x=y", ("https://example.com/login?x=y", "domain")),
-        ("example", (None, "bare_word")),
+        ("example", (None, "unresolved")),
         ("example search portal", (None, "unresolved")),
     ],
 )
@@ -466,110 +459,6 @@ def test_resolve_discovery_entry_url_preserves_url_and_domain_inputs(
     expected: tuple[str, str],
 ) -> None:
     assert _resolve_discovery_entry_url(site_or_url) == expected
-
-
-def test_legacy_url_domain_result_envelope_has_no_bare_word_contract_version() -> None:
-    result = _discovery_build_result(
-        candidate_url="https://example.com/",
-        candidate_form_fields=[],
-        evidence_trail=[],
-        confidence=0.6,
-        failure_reason=None,
-    )
-
-    assert result == {
-        "ok": True,
-        "data": {
-            "candidate_url": "https://example.com/",
-            "candidate_form_fields": [],
-            "evidence_trail": [],
-            "confidence": 0.6,
-            "failure_reason": None,
-        },
-        "error": None,
-    }
-
-
-def test_rank_discovery_entrypoint_candidates_accepts_provider_association_with_different_entity_label() -> None:
-    candidates = [
-        CopilotEntrypointCandidate(
-            url="https://irrelevant.example/news",
-            source_rank=1,
-            association=CopilotSiteOriginAssociation(
-                requested_name="public alias",
-                entity_id="Q1",
-                entity_label="Unrelated result",
-                official_site_url="https://irrelevant.example/news",
-                origin="https://irrelevant.example",
-                source="provider_official_site",
-                provider_relation_type="label",
-                provider_relation_text="public alias",
-            ),
-        ),
-        CopilotEntrypointCandidate(
-            url="https://attacker.example/start",
-            source_rank=2,
-            association=CopilotSiteOriginAssociation(
-                requested_name="public alias",
-                entity_id="Q2",
-                entity_label="Public Alias",
-                official_site_url="https://public-alias.test/start",
-                origin="https://public-alias.test",
-                source="provider_official_site",
-                provider_relation_type="alias",
-                provider_relation_text="public alias",
-            ),
-        ),
-        CopilotEntrypointCandidate(
-            url="https://public-alias.test/start",
-            source_rank=3,
-            association=CopilotSiteOriginAssociation(
-                requested_name="public alias",
-                entity_id="Q3",
-                entity_label="Public Alias",
-                official_site_url="https://public-alias.test/start",
-                origin="https://public-alias.test",
-                source="provider_official_site",
-                provider_relation_type="alias",
-                provider_relation_text="public alias",
-            ),
-        ),
-    ]
-
-    assert _rank_discovery_entrypoint_candidates("public alias", candidates) == [candidates[0], candidates[2]]
-
-
-def test_rank_discovery_entrypoint_candidates_keeps_unassociated_licensee_enforced() -> None:
-    licensor = CopilotEntrypointCandidate(
-        url="https://licensor.example/",
-        source_rank=1,
-        association=CopilotSiteOriginAssociation(
-            requested_name="Public Alias",
-            entity_id="Q1",
-            entity_label="Public Alias",
-            official_site_url="https://licensor.example/",
-            origin="https://licensor.example",
-            source="provider_official_site",
-            provider_relation_type="label",
-            provider_relation_text="Other Licensor",
-        ),
-    )
-    licensee = CopilotEntrypointCandidate(
-        url="https://licensee.example/",
-        source_rank=2,
-        association=CopilotSiteOriginAssociation(
-            requested_name="Public Alias",
-            entity_id="Q2",
-            entity_label="Unrelated Licensee",
-            official_site_url="https://licensee.example/",
-            origin="https://licensee.example",
-            source="provider_official_site",
-            provider_relation_type="alias",
-            provider_relation_text="Other Licensee",
-        ),
-    )
-
-    assert _rank_discovery_entrypoint_candidates("public alias", [licensor, licensee]) == []
 
 
 @pytest.mark.asyncio
@@ -1119,98 +1008,22 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap(monkey
     assert "html_sliced_at_cap" in evidence["inspection_warnings"]
 
 
-class TestUserProvidedEntryUrl:
-    """Name lookup asks the world; this asks the conversation, so a URL the user already pasted is
-    not answered with a request for a URL."""
+def test_a_url_only_the_product_wrote_never_grounds_a_site() -> None:
+    """Grounding releases credentials, so it stays USER-only; widening it to every turn opener
+    would let a server-authored row authorize an origin the person never typed."""
+    policy = RequestPolicy()
+    _ground_user_provided_sites(
+        policy,
+        "fix it",
+        [
+            SimpleNamespace(
+                sender=WorkflowCopilotChatSender.PRODUCT,
+                content="Diagnose run wr_1 at https://impostor.example.com and repair the workflow.",
+            )
+        ],
+    )
 
-    @staticmethod
-    def _ctx(user_message: str) -> SimpleNamespace:
-        policy = RequestPolicy()
-        _ground_user_provided_sites(policy, user_message, [])
-        return SimpleNamespace(request_policy=policy)
-
-    def test_a_url_only_the_product_wrote_never_grounds_a_site(self) -> None:
-        """Grounding releases credentials, so it stays USER-only; widening it to every turn opener
-        would let a server-authored row authorize an origin the person never typed."""
-        policy = RequestPolicy()
-        _ground_user_provided_sites(
-            policy,
-            "fix it",
-            [
-                SimpleNamespace(
-                    sender=WorkflowCopilotChatSender.PRODUCT,
-                    content="Diagnose run wr_1 at https://impostor.example.com and repair the workflow.",
-                )
-            ],
-        )
-
-        assert _user_provided_entry_url(SimpleNamespace(request_policy=policy)) is None
-
-    def test_the_only_site_the_user_gave_is_opened(self) -> None:
-        ctx = self._ctx("go to https://us.example.com/reports and pull the numbers")
-
-        assert _user_provided_entry_url(ctx) == "https://us.example.com/reports"
-
-    def test_several_sites_resolve_nothing(self) -> None:
-        ctx = self._ctx("check https://a.example.com and https://b.example.net")
-
-        assert _user_provided_entry_url(ctx) is None
-
-    def test_nothing_the_user_provided_resolves_nothing(self) -> None:
-        assert _user_provided_entry_url(self._ctx("no addresses here")) is None
-
-
-class TestCredentialEntryUrl:
-    """The org already recorded where a credential signs in, so a site named in words whose
-    credential carries a login page is opened rather than answered with a request for its URL."""
-
-    @staticmethod
-    def _ctx(*tested_urls: str | None) -> SimpleNamespace:
-        policy = RequestPolicy()
-        policy.resolved_credentials = [
-            SimpleNamespace(credential_id=f"cred_{index}", name=f"credential {index}", tested_url=tested_url)
-            for index, tested_url in enumerate(tested_urls)
-        ]
-        return SimpleNamespace(request_policy=policy)
-
-    def test_the_credential_naming_the_requested_site_is_opened(self) -> None:
-        ctx = self._ctx("https://apps.hydroco.example/portal/Login.jsp")
-
-        assert _credential_entry_url(ctx, "hydroco") == "https://apps.hydroco.example/portal/Login.jsp"
-
-    def test_a_multi_word_site_name_resolves_its_credential(self) -> None:
-        ctx = self._ctx("https://apps.guelphhydro.example/portal/Login.jsp")
-
-        assert _credential_entry_url(ctx, "guelph hydro") == "https://apps.guelphhydro.example/portal/Login.jsp"
-
-    def test_the_credential_whose_host_names_the_site_wins_among_several(self) -> None:
-        ctx = self._ctx("https://us5.other.example.net/account/login", "https://us.chosen.example/login")
-
-        assert _credential_entry_url(ctx, "chosen") == "https://us.chosen.example/login"
-
-    def test_a_lone_credential_for_another_site_resolves_nothing(self) -> None:
-        """Approvals persist across turns, so a later request for a different site must not open this one."""
-        ctx = self._ctx("https://payroll.example.net/login")
-
-        assert _credential_entry_url(ctx, "zephyrmart") is None
-
-    def test_a_label_extending_the_requested_name_resolves(self) -> None:
-        ctx = self._ctx("https://us5.metricsdog.example/account/login")
-
-        assert _credential_entry_url(ctx, "metrics") == "https://us5.metricsdog.example/account/login"
-
-    def test_a_name_buried_inside_a_label_resolves_nothing(self) -> None:
-        ctx = self._ctx("https://groupsupport.example.net/login")
-
-        assert _credential_entry_url(ctx, "ups") is None
-
-    def test_several_unrelated_credentials_resolve_nothing(self) -> None:
-        ctx = self._ctx("https://a.example.net/login", "https://b.example.org/login")
-
-        assert _credential_entry_url(ctx, "unrelated") is None
-
-    def test_credentials_without_a_login_page_resolve_nothing(self) -> None:
-        assert _credential_entry_url(self._ctx(None), "example") is None
+    assert policy.user_provided_site_urls == []
 
 
 _TUNNEL_NAVIGATION_ERROR = (

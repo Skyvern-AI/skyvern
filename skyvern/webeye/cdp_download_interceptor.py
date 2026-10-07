@@ -49,7 +49,7 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
 )
-from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, redact_cdp_endpoint_urls
 from skyvern.forge.sdk.api import files as file_api
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
@@ -308,6 +308,21 @@ def redacted_exception_origin(error: BaseException) -> str:
     code = traceback.tb_frame.f_code
     module = traceback.tb_frame.f_globals.get("__name__")
     return f"{module if isinstance(module, str) else code.co_filename}:{code.co_name}:{traceback.tb_lineno}"
+
+
+# A CDP protocol error names the rejected method and the state that rejected it well inside this
+# bound; past it the text is a traceback tail rather than the diagnosis.
+_CDP_ERROR_DETAIL_MAX_CHARS = 300
+
+
+def _redacted_cdp_error_detail(error: BaseException) -> str:
+    """``error``'s message with every URL replaced and the length bounded.
+
+    Every playwright protocol error is class ``Error``, so the class name alone does not say which
+    CDP call was rejected or why; the message does. Messages on this path can embed the
+    credential-bearing download URL or the remote-browser endpoint, so no URL survives.
+    """
+    return redact_cdp_endpoint_urls(str(error))[:_CDP_ERROR_DETAIL_MAX_CHARS]
 
 
 def _redacted_request_origin(url: str) -> str:
@@ -665,7 +680,7 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     Determine if a response is a file download.
 
     Checks:
-    0. Skip error responses (status >= 400)
+    0. Skip anything that is not a final 2xx body (errors, redirects, 304)
     1. Skip sub-resource types (Font, Stylesheet, Script, Image, etc.)
     2. Skip API content types (application/json, etc.)
     3. For XHR/Fetch: require BOTH attachment header AND download MIME type
@@ -676,7 +691,10 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     4. Content-Disposition contains "attachment"
     5. Content-Type is a known download MIME type
     """
-    if status_code >= 400:
+    # A 3xx/304 carries no body to take, and Chromium refuses takeResponseBodyAsStream while an
+    # interception sits in its redirect stage. Claiming a redirect as a download therefore fails the
+    # request and the browser never follows it; passing it through captures the final response instead.
+    if status_code >= 300:
         return False
 
     if resource_type in NON_DOWNLOAD_RESOURCE_TYPES:
@@ -2722,10 +2740,13 @@ class CDPDownloadInterceptor:
                     # decoded body in one shot, so a lying/understated Content-Length could materialize an
                     # unbounded payload and OOM the process — the exact failure this streaming path removes.
                     # Fail the request instead so nothing is ever materialized.
+                    cause = e.__cause__ or e
                     LOG.error(
                         "takeResponseBodyAsStream failed, failing request (no whole-body fallback)",
                         filename=filename,
-                        error_type=type(e.__cause__ or e).__name__,
+                        error_type=type(cause).__name__,
+                        error_detail=_redacted_cdp_error_detail(cause),
+                        status_code=response_status,
                     )
                     self._record_download_failure(attempt, "capture_failed")
                     await self._fail_request(cdp_session, request_id, filename=filename, url=url)

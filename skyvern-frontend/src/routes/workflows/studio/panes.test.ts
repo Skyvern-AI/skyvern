@@ -78,26 +78,26 @@ describe("parsePanesParam", () => {
 });
 
 describe("panesFromDeepLink", () => {
-  test("a run deep link opens watch-and-review: Browser, Overview", () => {
+  test("a run deep link opens Timeline on the left, Browser on the right", () => {
     expect(
       panesFromDeepLink({ runId: "wr_123", active: null, blockLabel: null }),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
   test("an ?active= deep link opens the same run layout", () => {
     expect(
       panesFromDeepLink({ runId: null, active: "act_1", blockLabel: null }),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
-  test("a cold block run opens Browser and Overview", () => {
+  test("a cold block run opens Overview and Browser", () => {
     expect(
       panesFromDeepLink({
         runId: "wr_123",
         active: null,
         blockLabel: "block_1",
       }),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
   test("a block label without a run does not force the run layout", () => {
@@ -106,31 +106,31 @@ describe("panesFromDeepLink", () => {
     ).toEqual([...DEFAULT_STUDIO_PANES]);
   });
 
-  test("no deep link falls back to the default panes", () => {
+  test("no deep link (Edit) opens only Copilot and Editor", () => {
     expect(
       panesFromDeepLink({ runId: null, active: null, blockLabel: null }),
-    ).toEqual(["copilot", "browser", "editor"]);
+    ).toEqual(["copilot", "editor"]);
   });
 });
 
 describe("resolveOpenPanes", () => {
   test("no params resolves to the default panes", () => {
-    expect(resolveOpenPanes("")).toEqual(["copilot", "browser", "editor"]);
+    expect(resolveOpenPanes("")).toEqual(["copilot", "editor"]);
   });
 
-  test("?wr= resolves to Browser and Overview", () => {
-    expect(resolveOpenPanes("?wr=wr_123")).toEqual(["browser", "overview"]);
+  test("?wr= resolves to Overview and Browser", () => {
+    expect(resolveOpenPanes("?wr=wr_123")).toEqual(["overview", "browser"]);
   });
 
-  test("?wr= plus ?bl= resolves to Browser and Overview", () => {
+  test("?wr= plus ?bl= resolves to Overview and Browser", () => {
     expect(resolveOpenPanes("?wr=wr_123&bl=block_1")).toEqual([
-      "browser",
       "overview",
+      "browser",
     ]);
   });
 
   test("?active= resolves like a run deep link", () => {
-    expect(resolveOpenPanes("?active=act_1")).toEqual(["browser", "overview"]);
+    expect(resolveOpenPanes("?active=act_1")).toEqual(["overview", "browser"]);
   });
 
   test("an explicit ?panes= wins over the deep-link params", () => {
@@ -154,7 +154,6 @@ describe("resolveOpenPanes", () => {
   test("unrelated params do not affect the default", () => {
     expect(resolveOpenPanes("?cache-key-value=x")).toEqual([
       "copilot",
-      "browser",
       "editor",
     ]);
   });
@@ -170,12 +169,12 @@ describe("resolveOpenPanes with custom defaults", () => {
 
   test("deep links are unaffected by custom defaults", () => {
     expect(resolveOpenPanes("?wr=wr_123", ["copilot", "editor"])).toEqual([
-      "browser",
       "overview",
+      "browser",
     ]);
     expect(
       resolveOpenPanes("?wr=wr_123&bl=block_1", ["copilot", "editor"]),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
   test("an explicit ?panes= is never overridden by custom defaults", () => {
@@ -332,12 +331,12 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
     ).toEqual(["copilot", "browser", "editor", "overview"]);
   });
 
-  test("a block ▶ from a Browser-less layout appends Browser then Overview", () => {
+  test("a block ▶ from a Browser-less layout appends Overview then Browser", () => {
     expect(withPanesOpen(["copilot", "editor"], RUN_APPEND_PANES)).toEqual([
       "copilot",
       "editor",
-      "browser",
       "overview",
+      "browser",
     ]);
   });
 
@@ -349,8 +348,8 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
 
   test("a block ▶ from an empty stage opens just the run surfaces", () => {
     expect(withPanesOpen([], RUN_APPEND_PANES)).toEqual([
-      "browser",
       "overview",
+      "browser",
     ]);
   });
 });
@@ -394,8 +393,8 @@ describe("system run focus (?wrs=)", () => {
       resolveOpenPanes("?wr=wr_1&wrs=copilot", ["editor", "browser"]),
     ).toEqual(["editor", "browser"]);
     expect(resolveOpenPanes("?wr=wr_1", ["editor", "browser"])).toEqual([
-      "browser",
       "overview",
+      "browser",
     ]);
   });
 });

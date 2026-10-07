@@ -116,6 +116,10 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
 # may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
+# The token guards charge the prefix re-sent on every call only up to this; 99.5% of v3 tasks' prefixes are below it.
+PREFIX_REF_TOKENS = 20_000
+# Never-extended spend cap on all tokens sent: 30 of 36 token deaths at a 60K+ prefix reach 67 turns under it (6M: 15).
+MAX_RAW_TOKENS = 2 * MAX_TOKENS_CEILING
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
@@ -306,6 +310,8 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
+    # Asked before a single-action block completes on its step cap; outside the goal-check arm, never counted in it.
+    block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
     code_typed_values: tuple[CodeTypedValue, ...] = (),
 ) -> LoopOutcome:
@@ -437,28 +443,28 @@ async def run_task_v3_agent_loop(
         verification_blocker = None
     refuse_input_entry = block_type == BlockType.EXTRACTION
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
-    goal_check_on = goal_judge is not None and goal_check_eligible(
+    # A block with its own completion verifier is left to it, by every judge.
+    judge_eligible = goal_check_eligible(
         page_free=page_free,
         completion_blocker_present=completion_blocker is not None,
         extraction_requested=extraction_requested,
     )
-    # Same eligibility as the goal check: a block with its own completion verifier is left to it.
-    reask_on = unlisted_reask_criteria is not None and goal_check_eligible(
-        page_free=page_free,
-        completion_blocker_present=completion_blocker is not None,
-        extraction_requested=extraction_requested,
+    goal_check_on = goal_judge is not None and judge_eligible
+    reask_on = unlisted_reask_criteria is not None and judge_eligible
+    block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
+    tool_trail = (
+        ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on or block_check_on else None
     )
-    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on else None
     goal_verdicts: list[GoalVerdict] = []
     reasks: list[UnlistedReask] = []
 
-    async def _goal_check() -> GoalVerdict:
-        assert goal_judge is not None and tool_trail is not None
+    async def _judge_goal(judge: GoalJudge, *, secret_entered: bool, failure_log: str) -> GoalVerdict:
+        assert tool_trail is not None
         timeout = GOAL_CHECK_TIMEOUT_SECONDS
         if deadline_at is not None:
             timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
         redact = goal_check_redactor() if goal_check_redactor is not None else None
-        if tool_trail.secret_entered:
+        if secret_entered:
             verdict = GoalVerdict("achieved", "", "", "secret_entered", 0.0)
         elif timeout <= 0:
             verdict = GoalVerdict("achieved", "", "", "deadline", 0.0)
@@ -470,13 +476,31 @@ async def run_task_v3_agent_loop(
             verdict = await run_goal_check(
                 goal=model_goal,
                 trail=tool_trail,
-                judge=goal_judge,
+                judge=judge,
                 timeout_seconds=timeout,
                 instructions=goal_instructions,
                 redact=redact,
+                failure_log=failure_log,
             )
+        return verdict
+
+    async def _goal_check() -> GoalVerdict:
+        assert goal_judge is not None
+        assert tool_trail is not None
+        verdict = await _judge_goal(
+            goal_judge, secret_entered=tool_trail.secret_entered, failure_log="taskv3 goal check judge failed"
+        )
         goal_verdicts.append(verdict)
         return verdict
+
+    async def _block_completion_check() -> GoalVerdict:
+        assert block_completion_judge is not None and tool_trail is not None
+        # A secret typed before this block does not skip it: every block after a sign-in would then be refused.
+        return await _judge_goal(
+            block_completion_judge,
+            secret_entered=tool_trail.secret_entered_in_loop,
+            failure_log="taskv3 block completion judge failed",
+        )
 
     async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
         # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
@@ -567,6 +591,9 @@ async def run_task_v3_agent_loop(
         system_prompt += OPAQUE_URL_GUIDANCE
     age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
     age_default_text, age_default_reason = age_default or (None, None)
+    application_defaults = None if page_free else app.AGENT_FUNCTION.task_v3_application_defaults(parameters)
+    application_defaults_text, application_defaults_reason = application_defaults or (None, None)
+    defaults_text = "\n\n".join(text for text in (age_default_text, application_defaults_text) if text)
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal
@@ -574,7 +601,7 @@ async def run_task_v3_agent_loop(
         # The goal is message 1 of every turn and an over-limit request is refused without retry, so typed rows get
         # what the smallest dispatchable model's input limit leaves after the rest of the request, the tool schemas,
         # and the page-read characters the loop retains (at approx_count_tokens' 4 characters per token).
-        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{age_default_text or ''}"
+        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{defaults_text}"
         budget = (
             (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
             - count_tokens(system_prompt)
@@ -585,8 +612,8 @@ async def run_task_v3_agent_loop(
         prompt_goal = "\n".join([model_goal, *typed_value_rows(code_typed_values, budget)])
     user_prompt = build_user_prompt(prompt_goal, refs.masked, model_starting_url)
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
-    if age_default_text:
-        user_prompt += f"\n\n{age_default_text}"
+    if defaults_text:
+        user_prompt += f"\n\n{defaults_text}"
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
@@ -604,6 +631,8 @@ async def run_task_v3_agent_loop(
             on_action_round=on_action_round,
             on_pre_action=on_pre_action,
             max_tokens=max_tokens,
+            prefix_ref_tokens=PREFIX_REF_TOKENS,
+            max_raw_tokens=MAX_RAW_TOKENS,
             deadline_seconds=deadline_seconds,
             retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
             max_call_retries=DEFAULT_MAX_CALL_RETRIES,
@@ -627,6 +656,7 @@ async def run_task_v3_agent_loop(
             refuse_input_entry=refuse_input_entry,
             tool_trail=tool_trail,
             single_action_block=single_action_block,
+            block_completion_check=_block_completion_check if block_check_on else None,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -709,6 +739,8 @@ async def run_task_v3_agent_loop(
         has_navigation_goal=has_navigation_goal,
         age_default_rendered=bool(age_default_text),
         age_default_reason=age_default_reason,
+        application_defaults_rendered=bool(application_defaults_text),
+        application_defaults_reason=application_defaults_reason,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,

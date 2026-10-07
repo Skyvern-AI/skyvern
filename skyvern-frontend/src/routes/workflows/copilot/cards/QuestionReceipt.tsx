@@ -6,29 +6,10 @@ import {
 import { cn } from "@/util/utils";
 import { parseUtcIsoMs } from "../narrativeState";
 import type { QuestionInteraction } from "../workflowCopilotTypes";
+import { AttentionMarker } from "./AttentionTray";
 import { QuestionPartsCard } from "./QuestionPartsCard";
 import { answeredPartIds } from "./questionAnswers";
-
-type Tone = "answered" | "neutral" | "error";
-
-const TONE_CLASSES: Record<Tone, { card: string; dot: string; title: string }> =
-  {
-    answered: {
-      card: "border-emerald-500/40 bg-emerald-500/[0.06]",
-      dot: "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.18)]",
-      title: "text-emerald-700 dark:text-emerald-300",
-    },
-    neutral: {
-      card: "border-slate-400/30 bg-slate-400/[0.05]",
-      dot: "bg-slate-500",
-      title: "text-slate-600 dark:text-slate-300",
-    },
-    error: {
-      card: "border-rose-400/35 bg-rose-500/[0.05]",
-      dot: "bg-rose-500",
-      title: "text-rose-700 dark:text-rose-300",
-    },
-  };
+import { TONE_CLASSES, type Tone } from "./receiptTone";
 
 function questions(count: number): string {
   return count === 1 ? "1 question" : `${count} questions`;
@@ -83,7 +64,7 @@ function receiptHeading(interaction: QuestionInteraction): {
 }
 
 // Where a question sits in the transcript. While it is pending the answer happens in the
-// composer's tray, so this row only points there.
+// composer's tray, so this row only marks the spot.
 export function QuestionReceipt({
   interaction,
 }: {
@@ -94,17 +75,16 @@ export function QuestionReceipt({
 
   if (interaction.status === "pending") {
     return (
-      <div
-        data-interaction-id={interaction.interaction_id}
-        className="flex items-center gap-2 rounded-lg border border-dashed border-amber-500/50 px-3 py-2 text-xs text-muted-foreground"
-      >
-        <QuestionMarkCircledIcon className="size-3.5 shrink-0 text-amber-500" />
-        <span className="min-w-0">
-          <span className="font-semibold text-amber-700 dark:text-yellow-400">
-            Copilot asked {count === 1 ? "a question" : `${count} questions`}
-          </span>{" "}
-          · answer below
-        </span>
+      <div data-interaction-id={interaction.interaction_id}>
+        <AttentionMarker
+          icon={
+            <QuestionMarkCircledIcon
+              aria-hidden
+              className="size-3.5 shrink-0"
+            />
+          }
+          title={`Copilot asked ${count === 1 ? "a question" : `${count} questions`}`}
+        />
       </div>
     );
   }
