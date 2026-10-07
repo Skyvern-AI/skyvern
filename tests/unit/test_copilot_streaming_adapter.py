@@ -66,6 +66,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
 )
 from tests.unit.copilot_test_helpers import FakeCopilotStream
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 @pytest.mark.parametrize(
@@ -2359,16 +2360,26 @@ async def test_a_failed_screenshot_upload_leaves_the_tool_result_as_it_was(
     dictation_upload = asyncio.create_task(asyncio.Event().wait())
     app.ARTIFACT_MANAGER.upload_aiotasks_map["wcc_1"].append(dictation_upload)
     dictation_waits: list[asyncio.Task[None]] = []
+    save_budgets: list[asyncio.Timeout] = []
+    save_budget_delays: list[float | None] = []
+
+    def save_budget(delay: float | None) -> asyncio.Timeout:
+        save_budget_delays.append(delay)
+        save_budgets.append(asyncio.timeout(delay))
+        return save_budgets[-1]
 
     async def refuse(artifact: Artifact, data: bytes) -> None:
         # A dictation request for the same chat starts waiting while this upload is in flight.
         dictation_waits.append(asyncio.create_task(app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(["wcc_1"])))
         if storage_fault == "stalls":
+            # Expire the save budget only once the upload is in flight; a short real budget let a slow
+            # runner expire it before the upload started.
+            save_budgets[-1].reschedule(asyncio.get_running_loop().time())
             await asyncio.Event().wait()
         raise RuntimeError("storage unavailable")
 
     monkeypatch.setattr(app.STORAGE, "store_artifact", refuse)
-    monkeypatch.setattr(streaming_adapter_module, "_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(streaming_adapter_module, "asyncio", ScopedAsyncio(timeout=save_budget))
 
     def tool_results(sent: list[Any]) -> list[dict[str, Any]]:
         return [
@@ -2381,10 +2392,16 @@ async def test_a_failed_screenshot_upload_leaves_the_tool_result_as_it_was(
     ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
     assert _stage_frame(ctx)
 
+    # Count only the saves made by the drive under test, not by the undisturbed drive above.
+    save_budgets.clear()
+    save_budget_delays.clear()
     try:
         sent = await _drive(_click_round_trip(), ctx)
         await asyncio.sleep(0)
 
+        # Pins the production save budget, not just the constant's name.
+        assert save_budget_delays == [5]
+        assert [budget.expired() for budget in save_budgets] == [storage_fault == "stalls"]
         assert "screenshot" not in [p.type for p in sent]
         assert _saved_screenshots(ctx) is None
         assert len(tool_results(sent)) == 1
