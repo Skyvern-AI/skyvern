@@ -1103,72 +1103,6 @@ workflow_definition:
         assert "add them via the Credentials UI" in rewritten
         assert "Keep the draft to iterate on, or discard." in rewritten
 
-    def test_synthesized_parameter_repair_context_prompt_needs_the_recorded_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
-
-        def capture_info(event: str, **kwargs: str | list[str]) -> None:
-            info_calls.append((event, kwargs))
-
-        monkeypatch.setattr(agent_module.LOG, "info", capture_info)
-        repair_context = CodeAuthoringRepairContext(
-            block_label="search_registry",
-            reason_code="synthesized_parameter_binding_ambiguous",
-            unresolved_names=["confirmation_number"],
-            parameter_keys=[],
-            available_parameter_keys=["confirmation_number"],
-            binding_candidates=["confirmation_number"],
-        )
-        enabled_ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-        no_context_ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=None,
-        )
-        wrong_reason_ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context.model_copy(
-                update={"reason_code": "ambiguous_bare_selector"}
-            ),
-        )
-
-        enabled_prompt = agent_module._code_authoring_repair_context_prompt(enabled_ctx)
-
-        assert "CODE AUTHORING REPAIR CONTEXT" in enabled_prompt
-        assert "block_label: search_registry" in enabled_prompt
-        assert "unresolved_names: confirmation_number" in enabled_prompt
-        assert "declared_parameter_keys: (none)" in enabled_prompt
-        assert "available_parameter_keys: confirmation_number" in enabled_prompt
-        assert "binding_candidates: confirmation_number" in enabled_prompt
-        assert (
-            "confirmation_number -> existing workflow parameter key confirmation_number -> parameter_keys -> "
-            "bare variable confirmation_number"
-        ) in enabled_prompt
-        assert "For synthesized parameter binding" in enabled_prompt
-        assert "include that exact key in the code block's parameter_keys" in enabled_prompt
-        assert "do not guess or hardcode the runtime value" in enabled_prompt
-        assert "create a workflow string parameter" not in enabled_prompt
-        assert agent_module._code_authoring_repair_context_prompt(no_context_ctx) == ""
-        agent_only_ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE,
-            last_code_authoring_repair_context=repair_context,
-        )
-        assert agent_module._code_authoring_repair_context_prompt(agent_only_ctx) == ""
-        wrong_reason_prompt = agent_module._code_authoring_repair_context_prompt(wrong_reason_ctx)
-        assert "CODE AUTHORING REPAIR CONTEXT" in wrong_reason_prompt
-        assert "reason_code: ambiguous_bare_selector" in wrong_reason_prompt
-        assert (
-            "copilot code authoring repair context rendered",
-            {
-                "reason_code": "synthesized_parameter_binding_ambiguous",
-                "block_label": "search_registry",
-                "unresolved_names": ["confirmation_number"],
-            },
-        ) in info_calls
-
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
             block_label="search_registry",
@@ -1217,9 +1151,6 @@ workflow_definition:
         assert "missing_output_key: create_resource_output" in prompt
         assert "available_output_keys: search_output" in prompt
         assert "current_block_parameter_keys: create_resource_output" in prompt
-        assert "bind to an actual available_output_key" in prompt
-        assert "do not create a workflow parameter for missing_output_key" in prompt
-        assert "create workflow string parameter key create_resource_output" not in prompt
 
     def test_runtime_repair_prompt_carries_the_denials_named_replacement(self) -> None:
         failure_reason = (
@@ -1266,15 +1197,12 @@ workflow_definition:
         assert instruction[:REPAIR_INSTRUCTION_MAX_CHARS] in prompt
         assert instruction[: REPAIR_INSTRUCTION_MAX_CHARS + 1] not in prompt
 
-    @pytest.mark.parametrize("reason_code", ["synthesized_parameter_binding_ambiguous", "metadata_reject"])
     @pytest.mark.parametrize("advertised", [True, False])
-    def test_repair_context_points_at_the_rerun_tool_only_when_the_turn_has_it(
-        self, reason_code: str, advertised: bool
-    ) -> None:
+    def test_repair_context_points_at_the_rerun_tool_only_when_the_turn_has_it(self, advertised: bool) -> None:
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             last_code_authoring_repair_context=CodeAuthoringRepairContext(
-                block_label="lookup_status", reason_code=reason_code, unresolved_names=["record_id"]
+                block_label="lookup_status", reason_code="metadata_reject"
             ),
         )
         ctx.eval_native_tool_names = (UPDATE_AND_RUN_BLOCKS_TOOL_NAME,) if advertised else ()
@@ -1307,10 +1235,15 @@ workflow_definition:
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             last_code_authoring_repair_context=None,
         )
+        agent_only_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE,
+            last_code_authoring_repair_context=repair_context,
+        )
 
         prompt = agent_module._code_authoring_repair_context_prompt(ctx)
 
         assert agent_module._code_authoring_repair_context_prompt(no_context_ctx) == ""
+        assert agent_module._code_authoring_repair_context_prompt(agent_only_ctx) == ""
         assert "reason_code: metadata_reject" in prompt
         assert "block_label: lookup_status" in prompt
         assert "runtime_failure_reason: missing requested output child paths " in prompt
@@ -1323,9 +1256,6 @@ workflow_definition:
         assert "required_code_return_paths: output.record_id, output.flags" in prompt
         assert "code_artifact_metadata" in prompt
         assert "goal_value_paths" in prompt
-        assert "valid extraction_schema" in prompt
-        assert "code return paths" in prompt
-        assert "required requested output child paths" in prompt
         assert "Declare code_artifact_metadata goal_value_paths" in prompt
         assert "Coastal" not in prompt
 

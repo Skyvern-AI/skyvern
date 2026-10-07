@@ -3275,6 +3275,30 @@ async def test_finder_picks_row_over_container_and_ignores_static_text() -> None
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_finder_never_tags_a_container_whose_rows_were_skipped_as_announcements() -> None:
+    # A new container holding a status region of rows: the gate skips the rows, and the container must not then
+    # survive the containment pass as the one row (a centre click would land on an arbitrary row inside it).
+    inject = """() => {
+      const c = document.createElement('div');
+      c.id = 'dd'; c.setAttribute('style', 'position:absolute;top:132px;left:40px;width:300px');
+      const region = document.createElement('div');
+      region.setAttribute('role', 'status');
+      for (const t of ['San Francisco, California', 'San Francisco, California, USA']) {
+        const row = document.createElement('div');
+        row.textContent = t; row.setAttribute('style', 'height:28px');
+        region.appendChild(row);
+      }
+      c.appendChild(region);
+      document.body.appendChild(c);
+    }"""
+    async with _finder_page() as page:
+        found = await _snapshot_react_find(page, inject)
+        assert found is None, found
+        assert await page.eval_on_selector("#dd", "e => e.hasAttribute('data-tv3-sugg')") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_finder_excludes_navigational_anchor() -> None:
     # A matching <a href> appearing after typing is navigational (clicking would leave the form), so the
     # finder must never select it; with no non-nav candidate it returns null and tags nothing.
@@ -13770,8 +13794,8 @@ async def test_type_a_code_from_a_middle_box_says_which_boxes_it_wrote_and_that_
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_ordinary_value_typed_into_one_character_boxes_is_not_a_secret_and_keeps_the_goal_judge() -> None:
-    # A birth year in 4 boxes is not a secret, so it must neither be redacted nor mark the run as having entered
-    # one, which would skip the finish-time goal judge for the rest of the run.
+    # A birth year in 4 boxes is not a secret, so it must neither be redacted nor mark the block as having entered
+    # one, which would skip the block completion judge.
     from skyvern.forge.taskv3.goal_check import ToolTrail
     from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
 
@@ -13797,7 +13821,7 @@ async def test_an_ordinary_value_typed_into_one_character_boxes_is_not_a_secret_
         assert await page.eval_on_selector_all(".box", _BOXES_JS) == "1987"
         assert await page.evaluate("document.documentElement.hasAttribute('data-skyvern-otp-filled')") is False
     assert context.runtime_secret_values == set()
-    assert trail.secret_entered is False
+    assert trail.secret_entered_in_loop is False
 
 
 @_skip_no_browser
@@ -16894,11 +16918,17 @@ async def test_select_combobox_searchable_filter_to_zero_reads_plain_no_match() 
 
 
 def _held_value_typeahead_html(
-    *, empty_row: str = "disabled", autocomplete: bool = True, close_on_exact: bool = False
+    *,
+    empty_row: str = "disabled",
+    autocomplete: bool = True,
+    close_on_exact: bool = False,
+    disabled: tuple[str, ...] = (),
+    shadow: bool = False,
 ) -> str:
     # A typeahead holding a picked value that commits whatever text it holds on Tab or blur; a text naming no option
-    # clears the selection. Variants: how the list says it has nothing, the aria-autocomplete declaration, and a
-    # widget that commits an exact typed option and hides its list.
+    # clears the selection. Variants: how the list says it has nothing, the aria-autocomplete declaration, a widget
+    # that commits an exact typed option and hides its list, options disabled natively (never committed), and option
+    # labels drawn in a shadow root.
     empty = (
         "e.setAttribute('aria-disabled', 'true'); e.textContent = 'No options';"
         if empty_row == "disabled"
@@ -16914,6 +16944,7 @@ def _held_value_typeahead_html(
     var inp = document.getElementById('unit');
     window.__committed = 'Flat Rate';
     var close = function () {{ var o = document.getElementById('lb'); if (o) o.style.display = 'none'; }};
+    var DISABLED = {json.dumps(list(disabled))};
     var open = function () {{
       var old = document.getElementById('lb'); if (old) old.remove();
       var q = inp.value.toLowerCase();
@@ -16923,17 +16954,25 @@ def _held_value_typeahead_html(
       inp.setAttribute('aria-controls', 'lb');
       if (!m.length) {{ var e = document.createElement('li'); e.setAttribute('role', 'option'); {empty} lb.appendChild(e); }}
       OPTIONS.forEach(function (t) {{
-        var li = document.createElement('li'); li.setAttribute('role', 'option'); li.textContent = t;
-        if (m.indexOf(t) < 0) li.style.display = 'none';
-        li.addEventListener('mousedown', function (ev) {{ ev.preventDefault(); inp.value = t; commit(); close(); }});
+        var li = document.createElement({"'x-opt'" if shadow else "'li'"}); li.setAttribute('role', 'option');
+        if ({"true" if shadow else "false"}) li.attachShadow({{mode: 'open'}}).innerHTML = '<span>' + t + '</span>';
+        else li.textContent = t;
+        li.style.display = m.indexOf(t) < 0 ? 'none' : 'block';
+        if (DISABLED.indexOf(t) >= 0) li.setAttribute('disabled', '');
+        li.addEventListener('mousedown', function (ev) {{
+          ev.preventDefault(); if (DISABLED.indexOf(t) >= 0) return; inp.value = t; commit(); close();
+        }});
         lb.appendChild(li);
       }});
       document.body.appendChild(lb);
-      if ({"true" if close_on_exact else "false"} && OPTIONS.indexOf(inp.value) >= 0) {{ commit(); close(); }}
+      if ({"true" if close_on_exact else "false"} && OPTIONS.indexOf(inp.value) >= 0) {{
+        if (DISABLED.indexOf(inp.value) < 0) commit();
+        close();
+      }}
     }};
     var commit = function () {{
       var v = inp.value.trim();
-      window.__committed = OPTIONS.indexOf(v) >= 0 ? v : null;
+      window.__committed = OPTIONS.indexOf(v) >= 0 && DISABLED.indexOf(v) < 0 ? v : null;
     }};
     inp.addEventListener('focus', open);
     inp.addEventListener('input', open);
@@ -16965,8 +17004,16 @@ async def test_type_text_no_option_matches_puts_a_typeahead_held_value_back() ->
         ({"empty_row": "quoted"}, "1", "error", "Flat Rate"),
         ({"autocomplete": False}, "1", "ok", "1"),
         ({"close_on_exact": True}, "Hourly", "ok", "Hourly"),
+        ({"disabled": ("Hourly",), "close_on_exact": True}, "Hourly", "error", "Flat Rate"),
+        ({"shadow": True, "close_on_exact": True}, "Hourly", "ok", "Hourly"),
     ],
-    ids=["quoted-empty-row", "no-aria-autocomplete", "exact-option-list-hidden"],
+    ids=[
+        "quoted-empty-row",
+        "no-aria-autocomplete",
+        "exact-option-list-hidden",
+        "disabled-exact-option",
+        "shadow-label-exact-option",
+    ],
 )
 async def test_type_into_a_held_typeahead_refuses_only_text_its_list_answered_with_nothing(
     variant: dict[str, Any], text: str, status: str, held: str
@@ -27471,6 +27518,76 @@ async def test_select_combobox_walk_commits_only_a_list_it_read_whole() -> None:
     assert not wrong, f"{len(wrong)}/{len(cases)} wrong:\n" + "\n".join(wrong)
 
 
+def _remounting_list_html(*, target: int, scroll_top: int, sticky_header: bool, fade_mask: bool) -> str:
+    # Every row is rebuilt on each scroll, and the list records whether it had left `scroll_top` by the time the click
+    # landed, so a click that scrolled the matched row whole is seen even when the re-mount loses the race.
+    rows = [f"Option {i:02d}" for i in range(20)]
+    rows[target] = "Canada"
+    return (
+        "<!doctype html><html><body>"
+        '<button id="cc" type="button" aria-haspopup="listbox" aria-expanded="false"'
+        ' aria-label="Select country calling code: Option 00" style="width:220px;height:32px">Country</button>'
+        '<div id="wrap" style="position:relative;width:260px;display:none">'
+        '<div id="cc-scroll" role="listbox" style="height:200px;overflow-y:auto"></div>'
+        + (
+            '<div id="mask" style="position:absolute;left:0;right:0;bottom:0;height:12px;'
+            'background:linear-gradient(transparent,#fff)"></div>'
+            if fade_mask
+            else ""
+        )
+        + '</div><input id="phone" type="tel" style="margin-top:250px">'
+        "<script>(function () {\n"
+        f"  var ROWS = {json.dumps(rows)}, TOP = {scroll_top}, STICKY = {'true' if sticky_header else 'false'};\n"
+        "  var btn = document.getElementById('cc'), wrap = document.getElementById('wrap');\n"
+        "  var sc = document.getElementById('cc-scroll'), phone = document.getElementById('phone');\n"
+        "  window.__moved = false;\n"
+        "  function render() {\n"
+        "    var html = STICKY ? '<div style=\"position:sticky;top:0;height:12px;background:#eee;z-index:2\">Group</div>' : '';\n"
+        "    ROWS.forEach(function (t, i) {\n"
+        "      html += '<div role=\"option\" id=\"item-' + i + '\" aria-selected=\"' + (i === 0) + '\"' +\n"
+        "        ' style=\"height:30px;line-height:30px\">' + t + '</div>';\n"
+        "    });\n"
+        "    sc.innerHTML = html;\n"
+        "  }\n"
+        "  sc.addEventListener('scroll', function () { if (Math.abs(sc.scrollTop - TOP) > 0.5) window.__moved = true; render(); });\n"
+        "  btn.addEventListener('click', function () {\n"
+        "    if (btn.getAttribute('aria-expanded') === 'true') { btn.setAttribute('aria-expanded', 'false'); wrap.style.display = 'none'; return; }\n"
+        "    btn.setAttribute('aria-expanded', 'true'); wrap.style.display = 'block'; render(); sc.scrollTop = TOP;\n"
+        "  });\n"
+        "  sc.addEventListener('click', function (e) {\n"
+        "    if (Math.abs(sc.scrollTop - TOP) > 0.5) window.__moved = true;\n"
+        "    var row = e.target.closest('[role=\"option\"]'); if (!row) return;\n"
+        "    var t = row.textContent;\n"
+        "    btn.setAttribute('aria-label', 'Select country calling code: ' + t);\n"
+        "    phone.value = t === 'Canada' ? '+1' : '+0';\n"
+        "    btn.setAttribute('aria-expanded', 'false'); wrap.style.display = 'none';\n"
+        "  });\n"
+        "})();</script></body></html>"
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "scroll_top", "sticky_header", "fade_mask"),
+    [(6, 0, False, False), (6, 0, False, True), (2, 82, True, False)],
+    ids=["bottom_clip", "bottom_fade_mask", "sticky_header_over_top_clip"],
+)
+async def test_select_combobox_clicks_a_part_clipped_row_without_scrolling_a_remounting_list(
+    target: int, scroll_top: int, sticky_header: bool, fade_mask: bool
+) -> None:
+    # The matched row is part-hidden by its scroll box (and partly covered by a mask or a sticky header). Scrolling
+    # it whole first re-mounts every row, so the commit must click the row where it already shows.
+    html = _remounting_list_html(target=target, scroll_top=scroll_top, sticky_header=sticky_header, fade_mask=fade_mask)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        await page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+        assert await page.evaluate("() => window.__moved") is False, "the click scrolled the list"
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "+1", r.content
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -37717,6 +37834,124 @@ async def test_a_selection_announcement_does_not_hold_a_committed_pick_open() ->
         held = await page.eval_on_selector("#held", "el => el.textContent")
     assert held == "Riverton, Michigan, United States"
     assert r.status == "ok" and "could not be verified" not in r.content, r.content
+
+
+# A typeahead with no aria-controls whose rows render into a status region (around the rows, holding the field too,
+# or around a declared list). With `in_host`, the region is rendered inside an empty wrapper that already exists:
+# empty, it is 0x0, so the pre-snapshot never marks it, and it grows around the region once rows arrive.
+_STATUS_REGION_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div style="position:relative;top:20px;left:20px;width:320px">
+    FIELD_BEFORE
+    <div id="region" role="status">FIELD_INSIDE</div>
+    <div id="host"></div>
+  </div>
+  <script>
+    var ROWS = ["Springfield, Illinois", "Springfield, Illinois, United States"];
+    var input = document.getElementById('city');
+    input.addEventListener('input', function () {
+      var into = IN_HOST ? document.getElementById('host') : document.getElementById('region');
+      var old = document.getElementById('rows');
+      if (old) old.remove();
+      var rows = document.createElement('div');
+      rows.id = 'rows';
+      if (IN_HOST) rows.setAttribute('role', 'status');
+      if (NESTED_LIST) rows.setAttribute('role', 'listbox');
+      ROWS.filter(function (c) { return c.toLowerCase().indexOf(input.value.toLowerCase()) === 0; })
+        .forEach(function (c) {
+          var row = document.createElement('div');
+          if (NESTED_LIST) row.setAttribute('role', 'option');
+          row.style.cssText = 'height:24px;cursor:pointer';
+          row.textContent = c;
+          row.addEventListener('mousedown', function (e) { e.preventDefault(); });
+          row.addEventListener('click', function () { input.value = c; rows.remove(); });
+          rows.appendChild(row);
+        });
+      into.appendChild(rows);
+    });
+  </script>
+</body></html>
+"""
+_CITY_FIELD = '<input id="city" aria-autocomplete="list" autocomplete="off" style="width:300px;height:24px">'
+
+
+def _status_region_rows_html(*, field_inside: bool = False, in_host: bool = False, nested_list: bool = False) -> str:
+    return (
+        _STATUS_REGION_ROWS_HTML.replace("FIELD_BEFORE", "" if field_inside else _CITY_FIELD)
+        .replace("FIELD_INSIDE", _CITY_FIELD if field_inside else "")
+        .replace("IN_HOST", "true" if in_host else "false")
+        .replace("NESTED_LIST", "true" if nested_list else "false")
+    )
+
+
+# A declared list (no aria-controls on the field) whose rows each carry a role=status badge inside the row.
+_BADGED_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div style="position:relative;top:20px;left:20px;width:320px">
+    <input id="city" aria-autocomplete="list" autocomplete="off" style="width:300px;height:24px">
+    <div id="menu"></div>
+  </div>
+  <script>
+    var ROWS = [["Springfield, Illinois", "3 left"], ["Springfield, Missouri", "1 left"]];
+    var input = document.getElementById('city');
+    input.addEventListener('input', function () {
+      var menu = document.getElementById('menu');
+      menu.innerHTML = '';
+      var list = document.createElement('div');
+      list.setAttribute('role', 'listbox');
+      ROWS.filter(function (r) { return r[0].toLowerCase().indexOf(input.value.toLowerCase()) === 0; })
+        .forEach(function (r) {
+          var row = document.createElement('div');
+          row.setAttribute('role', 'option');
+          row.style.cssText = 'height:24px;cursor:pointer';
+          var badge = document.createElement('span');
+          badge.setAttribute('role', 'status');
+          badge.textContent = r[1];
+          row.appendChild(document.createTextNode(r[0] + ' '));
+          row.appendChild(badge);
+          row.addEventListener('mousedown', function (e) { e.preventDefault(); });
+          row.addEventListener('click', function () { input.value = r[0]; menu.innerHTML = ''; });
+          list.appendChild(row);
+        });
+      menu.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_declared_row_carrying_a_status_badge_is_still_committed() -> None:
+    # The badge sits inside the row and outside any list the field points at, so the gate skips it; the row it
+    # belongs to is still the row. The value is the row's whole visible text, badge included.
+    async with _content_page(_BADGED_ROWS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Illinois 3 left", "search": "Springfield"}
+        )
+        held = await page.eval_on_selector("#city", "el => el.value")
+    assert (r.status, held) == ("ok", "Springfield, Illinois"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_inside", "nested_list"),
+    [(True, False), (False, True)],
+    ids=["region-holds-the-field", "list-nested-in-the-region"],
+)
+async def test_rows_the_announcement_gate_exempts_are_still_picked(field_inside: bool, nested_list: bool) -> None:
+    # A region holding the field is the widget's own container, and a declared list inside a region owns its rows:
+    # neither is an announcement, so the requested row is committed.
+    html = _status_region_rows_html(field_inside=field_inside, nested_list=nested_list)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Illinois", "search": "Springfield"}
+        )
+        held = await page.eval_on_selector("#city", "el => el.value")
+    assert (r.status, held) == ("ok", "Springfield, Illinois"), r.content
 
 
 def test_merging_a_frames_reading_keeps_text_and_its_full_form_positionally_aligned() -> None:

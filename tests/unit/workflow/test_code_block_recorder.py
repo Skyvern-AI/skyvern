@@ -3645,6 +3645,52 @@ async def test_a_failure_overtaken_by_a_concurrent_call_still_names_its_own_tab(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_element_handle_action_names_the_page_that_produced_the_handle() -> None:
+    # An ElementHandle has no page attribute, so reading one off the failed receiver would crash the
+    # block's failure handling instead of reporting the authored timeout.
+    error = PlaywrightTimeoutError("ElementHandle.click: Timeout 500ms exceeded.")
+
+    class ElementHandle:
+        async def click(self, **kwargs: Any) -> None:
+            raise error
+
+    ElementHandle.__module__ = "playwright.async_api._generated"
+    page = DocumentEventPage()
+    page.query_selector = AsyncMock(return_value=ElementHandle())  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    handle = await recording.query_selector("#hidden")
+    with pytest.raises(PlaywrightTimeoutError):
+        await handle.click()
+
+    assert recording.failure_page(error) is page
+
+
+@pytest.mark.asyncio
+async def test_an_element_handles_owner_frame_is_the_pages_recorded_frame() -> None:
+    # A frame handed back by an element handle belongs to the page that produced the handle, so its
+    # locators are recorded and guarded exactly like page.main_frame's.
+    class Frame:
+        pass
+
+    class ElementHandle:
+        async def owner_frame(self) -> Frame:
+            return frame
+
+    for cls in (Frame, ElementHandle):
+        cls.__module__ = "playwright.async_api._generated"
+    frame = Frame()
+    page = DocumentEventPage()
+    page.main_frame = frame  # type: ignore[attr-defined]
+    page.query_selector = AsyncMock(return_value=ElementHandle())  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    handle = await recording.query_selector("#hidden")
+
+    assert await handle.owner_frame() is recording.main_frame
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("call", ["wait_for_selector", "click"])
 @pytest.mark.parametrize("failed_tab", ["own", "other"])
 async def test_an_element_handle_call_binds_the_receipt_of_the_page_that_produced_it(
