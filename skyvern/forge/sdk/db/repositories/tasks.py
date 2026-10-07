@@ -1191,9 +1191,12 @@ class TasksRepository(BaseRepository):
                 searchable_text=searchable_text or None,
             )
             session.add(task_run)
+            # The flush already holds what a post-commit refresh would reread: Python defaults are set at flush and
+            # any server default returns through the INSERT. Only a trigger could differ; add a refresh if one lands.
+            await session.flush()
+            run = Run.model_validate(task_run)
             await session.commit()
-            await session.refresh(task_run)
-            return Run.model_validate(task_run)
+            return run
 
     @db_operation("update_task_run")
     async def update_task_run(

@@ -31,7 +31,7 @@ import structlog
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import without_output_only_anti_bot
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -264,9 +264,9 @@ def origin_block_outputs_from_rows(
         registered = registered_by_parameter_id.get(output_parameter_ids[label])
         row = OriginBlockOutput(status=run_block.status, has_value=False, created_at=run_block.created_at)
         if registered is not None:
-            row = replace(row, has_value=True, value=without_output_only_anti_bot(registered.value))
+            row = replace(row, has_value=True, value=without_output_only_labels(registered.value))
         elif run_block.output is not None:
-            row = replace(row, has_value=True, value=without_output_only_anti_bot(run_block.output))
+            row = replace(row, has_value=True, value=without_output_only_labels(run_block.output))
         outputs[label] = row
     return OriginOutputSnapshot(
         definition=definition.model_copy(deep=True),

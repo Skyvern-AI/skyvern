@@ -172,7 +172,11 @@ class Settings(BaseSettings):
     # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
     # so one fetch can't consume the whole block. TOTP re-mint is instant and unaffected.
     CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS: int = 120
-    OPTION_LOADING_TIMEOUT_MS: int = 600000
+    # Backstop for the dropdown option-loading scroll loop, which now ends on its own once the menu
+    # is scrolled to the bottom and has stopped growing. Exceeding it is non-fatal — the LLM still
+    # picks from whatever loaded — so this is kept short enough that a never-settling menu costs
+    # seconds rather than the minutes a run's elapsed budget cannot absorb.
+    OPTION_LOADING_TIMEOUT_MS: int = 60000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
@@ -1008,6 +1012,8 @@ class Settings(BaseSettings):
     dispatch of already-submitted groups continue."""
     COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
     """Offer Copilot's run_workflow_for_accounts tool. Turning it off keeps group status, cancel and receipts."""
+    COPILOT_CREDENTIAL_DELETE_ENABLED: bool = True
+    """Offer Copilot's delete_saved_credentials card. Turning it off hides the tool and refuses confirmations."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

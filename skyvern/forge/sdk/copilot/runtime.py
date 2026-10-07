@@ -48,7 +48,12 @@ from skyvern.forge.sdk.copilot.config import (
     authoring_capability_from_policy,
     block_authoring_policy_from_capability,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry, ViewportFrame
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ChatScreenshotFrame,
+    PendingFrameLease,
+    ScreenshotEntry,
+    ViewportFrame,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
     origin_runs_bound_to_scrubber,
@@ -497,6 +502,8 @@ class AgentContext:
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     pending_frame_lease: PendingFrameLease | None = None
+    pending_chat_screenshots: list[ChatScreenshotFrame] = field(default_factory=list, repr=False)
+    chat_screenshot_capture_ids: set[str] = field(default_factory=set)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     unrecoverable_tool_error_streak_count: int = 0
     unrecoverable_tool_error_signature: str | None = None
@@ -651,9 +658,6 @@ class AgentContext:
     # In-turn side channel from workflow mutation calls: block label -> flow_evidence
     # observation step used to ground the newly authored page-acting block.
     block_observation_refs: dict[str, int] = field(default_factory=dict)
-    # Raw tool input for block_observation_refs, retained only for diagnostics
-    # when normalization drops malformed entries before composition validation.
-    raw_block_observation_refs: object | None = None
     # Block-label keyed metadata describing authored code artifacts. This layer
     # only normalizes and carries the metadata; sufficiency checks live elsewhere.
     code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
@@ -841,20 +845,22 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
 
     if error is not None:
         if isinstance(error, dict):
-            # MCP error: {code, message, hint, details}
-            msg = error.get("message", "Unknown error")
-            hint = error.get("hint", "")
-            result["error"] = f"{msg}. {hint}".strip() if hint else msg
+            # The server's hint is written for its own tool surface and names tools Copilot may not have.
+            result["error"] = error.get("message", "Unknown error")
             error_code = error.get("code")
             if isinstance(error_code, str) and error_code:
                 result["error_code"] = error_code
-            # The message is flattened to a string here, which loses everything a reader needs to
-            # tell a real driver verdict from a sentence describing one. The driver's own navigation
-            # code is lifted out of details so it survives as a value rather than as prose.
+            # The message is flattened to a string here, so the driver's typed verdicts are lifted out
+            # of details to survive as values rather than as prose.
             details = error.get("details")
-            nav_error_code = details.get("nav_error_code") if isinstance(details, dict) else None
-            if isinstance(nav_error_code, str) and nav_error_code:
-                result["nav_error_code"] = nav_error_code
+            if isinstance(details, dict):
+                for key in ("nav_error_code", "element_state"):
+                    value = details.get(key)
+                    if isinstance(value, str) and value:
+                        result[key] = value
+                observed_options = details.get("observed_options")
+                if isinstance(observed_options, list) and all(isinstance(option, str) for option in observed_options):
+                    result["observed_options"] = observed_options
         else:
             result["error"] = str(error)
 

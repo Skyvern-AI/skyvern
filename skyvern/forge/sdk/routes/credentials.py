@@ -2138,8 +2138,15 @@ async def delete_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> None:
+    await delete_organization_credential(current_org.organization_id, credential_id, background_tasks)
+
+
+async def delete_organization_credential(
+    organization_id: str, credential_id: str, background_tasks: BackgroundTasks
+) -> None:
+    """Delete one credential the organization owns; raises HTTPException 404, 409, 400 or 502 on refusal."""
     credential = await app.DATABASE.credentials.get_credential(
-        credential_id=credential_id, organization_id=current_org.organization_id
+        credential_id=credential_id, organization_id=organization_id
     )
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
@@ -2151,13 +2158,13 @@ async def delete_credential(
     write_guard: AbstractAsyncContextManager[None] = nullcontext()
     if requires_write_lock:
         write_guard = app.AGENT_FUNCTION.credential_write_lock(
-            organization_id=current_org.organization_id,
+            organization_id=organization_id,
             credential_id=credential_id,
         )
 
     async with write_guard:
         latest_credential = await app.DATABASE.credentials.get_credential(
-            credential_id=credential_id, organization_id=current_org.organization_id
+            credential_id=credential_id, organization_id=organization_id
         )
         if not latest_credential:
             raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
@@ -2200,7 +2207,6 @@ async def delete_credential(
     # kill-switch: flag-off orgs never lose a saved profile on credential delete (v1 has no unlink to
     # recover with), and a rollback disables it.
     profile_id = credential.browser_profile_id
-    organization_id = current_org.organization_id
     if profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id):
         try:
             # Narrow accepted race: a concurrent re-link between this check and the delete below.
@@ -2259,10 +2265,8 @@ async def delete_credential(
                 error=str(exc),
             )
 
-    _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
-    await record_request_audit_event(current_org.organization_id, "credential.delete", "credential", credential_id)
-
-    return None
+    _clear_cached_totp_code_preview(organization_id=organization_id, credential_id=credential_id)
+    await record_request_audit_event(organization_id, "credential.delete", "credential", credential_id)
 
 
 @base_router.get(

@@ -22,8 +22,9 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext, advertises
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_generation import (
     REGISTRATION_PASSWORD_MAX_LENGTH,
@@ -170,8 +171,8 @@ async def _normalize_totp_config_for_organization(totp_secret: str, organization
 
 def _runtime_otp_steering_error(credential_id: str) -> str:
     return (
-        f"Credential `{credential_id}` receives one-time codes by email/SMS, so `fill_credential_field` cannot "
-        "safely retrieve the code during scouting without a workflow run/task context to anchor polling. "
+        f"Credential `{credential_id}` receives one-time codes by email/SMS, so the code cannot be retrieved "
+        "during scouting without a workflow run/task context to anchor polling. "
         "Persist the OTP step in a code block as `await <credential_parameter>.otp()` after the action that "
         "triggers delivery; the runtime will poll for the fresh code during the workflow run without exposing it."
     )
@@ -235,7 +236,7 @@ def _credential_fill_origin_mismatch_error() -> str:
 def _credential_origin_declined_text(origin: str) -> str:
     return (
         f"No login authorized for {origin} was connected, and the saved login will not be released on that site. "
-        f"Tell the user the sign-in on {origin} needs its own saved login."
+        f"The sign-in on {origin} needs its own saved login."
     )
 
 
@@ -554,7 +555,8 @@ def _password_totp_method(credential: PasswordCredential) -> Literal["authentica
 def _rejected_credential_card_fallback(credential_name: str) -> str:
     return (
         f"Ask the user in prose to update the saved credential {defang_card_text(credential_name)} on the "
-        "Credentials page, then say when it is done. Never ask for a password, secret, or code in chat."
+        "Credentials page, then say when it is done. Never ask for a raw secret value (for example, a password) "
+        "in chat."
     )
 
 
@@ -584,15 +586,13 @@ async def _update_ask_target(
         return credential_item.name, None
     method = _password_totp_method(credential)
     if method == "authenticator":
-        return None, {
-            "ok": True,
-            "status": "has_code_method",
-            "method": "authenticator",
-            "next": (
-                f"Fill the code with `fill_credential_field` field=totp for `{credential_id}`, passing the "
+        result: dict[str, Any] = {"ok": True, "status": "has_code_method", "method": "authenticator"}
+        if advertises(copilot_ctx, CREDENTIAL_FILL_TOOL_NAME):
+            result["next"] = (
+                f"Fill the code with `{CREDENTIAL_FILL_TOOL_NAME}` field=totp for `{credential_id}`, passing the "
                 "same `target` that reached the verification step."
-            ),
-        }
+            )
+        return None, result
     if method == "out_of_band":
         return None, {
             "ok": True,
@@ -677,7 +677,7 @@ async def _request_credential(
                 "ok": False,
                 "error": (
                     "This turn has a redacted secret, so the credential card opens only for a sign-in site the "
-                    "user gave. Call `ask_user` for the site's sign-in URL, then call `request_credential` with it."
+                    "user gave. Ask the user for the site's sign-in URL, then call `request_credential` with it."
                 ),
             }
 
@@ -865,7 +865,7 @@ async def _missing_totp_ask_outcome(
     """Report the update card from the saved record, never from the answer alone: a save can leave 2FA unset."""
     not_added_next = (
         f"{defang_card_text(credential_name)} still has no authenticator. Keep it as the workflow's credential "
-        "and do not ask again this turn; say the verification step needs an authenticator on that credential "
+        "and do not ask again this turn. The verification step needs an authenticator on that credential "
         "before a run can pass it."
     )
     if credential is None:
@@ -897,8 +897,8 @@ def _rejected_credential_ask_outcome(
             "ok": True,
             "status": "unanswered" if answered is None else "skipped",
             "next": (
-                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential, do not "
-                "ask again this turn, and say the workflow keeps its saved sign-in."
+                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential and "
+                "do not ask again this turn. The workflow keeps its saved sign-in."
             ),
         }
     return {

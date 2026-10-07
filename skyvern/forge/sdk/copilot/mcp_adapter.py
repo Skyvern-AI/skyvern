@@ -16,8 +16,10 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import structlog
 from agents.agent import AgentBase
+from agents.mcp import MCPToolMetaContext
 from agents.mcp.server import MCPServer
 from agents.run_context import RunContextWrapper
+from agents.tool_context import ToolContext
 from fastmcp import Client
 from fastmcp.client.client import CallToolResult as FastMCPCallToolResult
 from mcp import Tool as MCPTool
@@ -30,6 +32,7 @@ from mcp.types import (
 from playwright.async_api import Browser, BrowserContext
 
 from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
+from skyvern.cli.core.result import ErrorCode
 from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
 from skyvern.forge import app
@@ -68,6 +71,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
+    capturing_tool_call,
     enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -528,6 +532,7 @@ class SchemaOverlay:
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 _SESSION_EXPIRED_ERROR_CODE = "SESSION_EXPIRED"
+_EFFECT_UNKNOWN_GUIDANCE = "The call timed out before its result was confirmed; read the page before retrying."
 _BROWSER_GENERATION_RETIRED_ERROR_CODE = "BROWSER_GENERATION_RETIRED"
 BROWSER_SESSION_LOSS_ERROR_CODES = frozenset({_SESSION_EXPIRED_ERROR_CODE, _BROWSER_GENERATION_RETIRED_ERROR_CODE})
 _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
@@ -1468,6 +1473,14 @@ async def service_worker_blocked_context(
                 await fallback_browser.close()
 
 
+_TOOL_CALL_ID_META_KEY = "tool_call_id"
+
+
+def _owning_tool_call_meta(context: MCPToolMetaContext) -> dict[str, Any] | None:
+    run_context = context.run_context
+    return {_TOOL_CALL_ID_META_KEY: run_context.tool_call_id} if isinstance(run_context, ToolContext) else None
+
+
 class SkyvernOverlayMCPServer(MCPServer):
     """MCP server that wraps a FastMCP transport with schema overlays and
     copilot-specific dispatch logic (loop detection, browser injection, hooks).
@@ -1485,7 +1498,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         enforce_dispatch_allowlist: bool = False,
         page_state_reader: PageStateReader | None = None,
     ) -> None:
-        super().__init__(use_structured_content=False)
+        super().__init__(use_structured_content=False, tool_meta_resolver=_owning_tool_call_meta)
         self._transport = transport
         self._overlays = overlays
         self._page_state_reader = page_state_reader
@@ -1597,6 +1610,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         call_binding = (
             resolve_browser_session_binding(copilot_ctx, arguments or {}) if overlay.requires_browser else None
         )
+        owning_call_id = (meta or {}).get(_TOOL_CALL_ID_META_KEY)
         try:
             if overlay.requires_browser:
                 async with browser_page_custody_lock(
@@ -1605,12 +1619,14 @@ class SkyvernOverlayMCPServer(MCPServer):
                     with (
                         pending_operation(f"mcp.call_tool:{tool_name}"),
                         bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                        capturing_tool_call(owning_call_id),
                     ):
                         return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
             else:
                 with (
                     pending_operation(f"mcp.call_tool:{tool_name}"),
                     bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                    capturing_tool_call(owning_call_id),
                 ):
                     return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
         except BaseException as exc:
@@ -1912,6 +1928,10 @@ class SkyvernOverlayMCPServer(MCPServer):
                 # Stamped before the post-hook, which is allowed to fail back to this base result: a
                 # browser answer whose provenance dropped is a silent cross-browser read.
                 copilot_result.update(binding.provenance())
+                error = copilot_result.get("error")
+                if copilot_result.get("error_code") == ErrorCode.TIMEOUT and isinstance(error, str):
+                    separator = " " if error.endswith((".", "?", "!")) else ". "
+                    copilot_result["error"] = f"{error}{separator}{_EFFECT_UNKNOWN_GUIDANCE}"
 
             if overlay.post_hook and not session_lost:
                 async with AsyncExitStack() as evidence_stack:
@@ -2085,10 +2105,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             within = f" within {overlay.timeout}s" if overlay.timeout is not None else ""
             err = {
                 "ok": False,
-                "error": (
-                    f"{tool_name} did not answer{within} and was cancelled. "
-                    "Whether it took effect is unknown; read the page before trying it again."
-                ),
+                "error": f"{tool_name} did not answer{within} and was cancelled. {_EFFECT_UNKNOWN_GUIDANCE}",
             }
             if uses_shared_browser_outcome:
                 outcome = _browser_call_outcome_from_mapping(

@@ -7,7 +7,7 @@ import secrets
 import time
 import weakref
 from collections import deque
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
@@ -108,6 +108,9 @@ class SessionState:
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
 _current_organization_id: ContextVar[str | None] = ContextVar("mcp_session_organization_id", default=None)
+_call_connections: ContextVar[list[SkyvernBrowser] | None] = ContextVar("mcp_call_connections", default=None)
+_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS = 5
+_CALL_CONNECTION_DISCONNECTS: set[asyncio.Task[None]] = set()
 _global_session: SessionState | None = None
 _organization_sessions: dict[str, SessionState] = {}
 _stateless_http_mode = False
@@ -189,8 +192,6 @@ def _session_ref_key(
     context = state.context
     resolved_session_id = session_id or (context.session_id if context else None)
     resolved_cdp_url = cdp_url or (context.cdp_url if context else None)
-    # Prefer the hash stored at resolve_browser time — recomputing runs a
-    # deliberately slow PBKDF2 per call, and this sits on the per-ref hot path.
     api_key_hash = state.api_key_hash or _api_key_hash(get_active_api_key())
     organization_id = _current_organization_id.get() or state.organization_id
 
@@ -496,6 +497,48 @@ async def scoped_session(state: SessionState) -> AsyncIterator[None]:
         _current_session.reset(token)
 
 
+@asynccontextmanager
+async def stateless_call_connection_scope() -> AsyncIterator[None]:
+    """Disconnect the CDP connections a stateless tool call opened when the call ends."""
+    # The call's SessionState lives only in its own ContextVar, so nothing else can close them; an open
+    # connection keeps receiving and buffering the remote browser's events until that cloud session ends.
+    if not _stateless_http_mode:
+        yield
+        return
+    connections: list[SkyvernBrowser] = []
+    token = _call_connections.set(connections)
+    try:
+        yield
+    finally:
+        _call_connections.reset(token)
+        if connections:
+            # Shielded so a cancelled call still disconnects; the timeout only stops a hung close
+            # handshake from holding the response, and the close itself finishes in the background.
+            disconnect = asyncio.create_task(_disconnect_call_connections(connections))
+            _CALL_CONNECTION_DISCONNECTS.add(disconnect)
+            disconnect.add_done_callback(_CALL_CONNECTION_DISCONNECTS.discard)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(disconnect), _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
+
+
+def _own_call_connection(browser: SkyvernBrowser) -> None:
+    connections = _call_connections.get()
+    if connections is not None:
+        connections.append(browser)
+
+
+async def _disconnect_call_connections(connections: list[SkyvernBrowser]) -> None:
+    for browser in connections:
+        try:
+            # On a connect_over_cdp browser this drops only our connection; the remote browser and its
+            # cloud session keep running. SkyvernBrowser.close() would end the cloud session.
+            playwright_browser = browser.browser
+            if playwright_browser is not None:
+                await playwright_browser.close()
+        except Exception:
+            LOG.warning("Failed to disconnect a stateless MCP browser connection", exc_info=True)
+
+
 def set_stateless_http_mode(enabled: bool) -> None:
     global _stateless_http_mode
     _stateless_http_mode = enabled
@@ -636,6 +679,7 @@ async def resolve_browser(
         and _hashes_equal(current.api_key_hash, _api_key_hash(get_active_api_key()))
     ):
         connected_browser = await skyvern.connect_to_cloud_browser_session(current.context.session_id)
+        _own_call_connection(connected_browser)
         current.browser = connected_browser
         return connected_browser, current.context
 
@@ -660,6 +704,7 @@ async def resolve_browser(
     try:
         if session_id:
             browser = await skyvern.connect_to_cloud_browser_session(session_id)
+            _own_call_connection(browser)
             ctx = BrowserContext(
                 mode="cloud_session",
                 session_id=session_id,
@@ -670,12 +715,14 @@ async def resolve_browser(
 
         if extension_runtime is not None:
             browser = await skyvern.connect_to_browser_extension(extension_runtime)
+            _own_call_connection(browser)
             ctx = BrowserContext(mode="extension", can_access_localhost=True)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if cdp_url:
             browser = await skyvern.connect_to_browser_over_cdp(cdp_url)
+            _own_call_connection(browser)
             ctx = BrowserContext(mode="cdp", cdp_url=cdp_url)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
@@ -688,6 +735,7 @@ async def resolve_browser(
 
         if create_session:
             browser = await skyvern.launch_cloud_browser(timeout=timeout)
+            _own_call_connection(browser)
             ctx = BrowserContext(
                 mode="cloud_session",
                 session_id=browser.browser_session_id,

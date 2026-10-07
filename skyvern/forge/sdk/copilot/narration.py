@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_CANCEL_TOOL_NAME,
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    CREDENTIAL_DELETE_TOOL_NAME,
 )
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import ActivityBucket, NarrativeBlockAttempt, upsert_narrative_block_attempt
@@ -25,7 +26,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry, NarrativeWorkPlan
+    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry, NarrativeScreenshot, NarrativeWorkPlan
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -99,6 +100,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME: "Reviewing the accounts with you",
     ACCOUNT_GROUP_STATUS_TOOL_NAME: "Checking the account runs",
     ACCOUNT_GROUP_CANCEL_TOOL_NAME: "Reviewing a cancel with you",
+    CREDENTIAL_DELETE_TOOL_NAME: "Reviewing a credential deletion with you",
     "set_work_plan": "Updating its plan",
 }
 
@@ -215,6 +217,7 @@ class NarratorState:
     emitted_progress_texts: set[str] = field(default_factory=set)
     last_tool_call_id: str | None = None
     work_plan: NarrativeWorkPlan | None = None
+    screenshots: list[NarrativeScreenshot] = field(default_factory=list)
 
     def activity_bucket(self) -> ActivityBucket:
         if self.running_block_id is not None:

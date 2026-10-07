@@ -16,6 +16,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_settings import BrowserSettings
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_retirement import (
     BrowserOperationRejected,
@@ -218,6 +219,8 @@ class PersistentSessionsManager(Protocol):
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
         expected_browser_session_id: str | None = None,
+        browser_settings: BrowserSettings | None = None,
+        created_for_workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...

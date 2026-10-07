@@ -35,6 +35,8 @@ from skyvern.services.browser_recording.redact import is_secret_field, redact_co
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
+    ActionDialog,
+    ActionDragDrop,
     ActionInputText,
     ActionKind,
     ActionUrlChange,
@@ -65,6 +67,7 @@ _DURABLE_TARGET_TAGS = frozenset(
         "button",
         "div",
         "input",
+        "iframe",
         "label",
         "li",
         "option",
@@ -211,15 +214,34 @@ def build_durable_recording_evidence(actions: list[Action]) -> list[dict[str, t.
             }.items()
             if value is not None
         }
-        evidence.append(
-            {
-                "kind": action.kind.value,
-                "timestamp_start": action.timestamp_start,
-                "timestamp_end": action.timestamp_end,
-                "url": _durable_recording_url(action.url),
-                "target": target,
+        item: dict[str, t.Any] = {
+            "kind": action.kind.value,
+            "timestamp_start": action.timestamp_start,
+            "timestamp_end": action.timestamp_end,
+            "url": _durable_recording_url(action.url),
+            "target": target,
+        }
+        if action.incomplete_capture_reason is not None:
+            item["incomplete_capture_reason"] = action.incomplete_capture_reason.value
+        if isinstance(action, ActionDialog):
+            item["dialog"] = {
+                "type": action.dialog_type,
+                "response": action.response,
+                "prompt_text_redacted": action.prompt_text_redacted,
+                "prompt_length": len(action.prompt_text) if action.prompt_text is not None else None,
             }
-        )
+        if isinstance(action, ActionDragDrop):
+            item["source_target"] = {
+                key: value
+                for key, value in {
+                    "tag_name": _allowlisted_target_value(action.source.tag_name, _DURABLE_TARGET_TAGS),
+                    "role": _allowlisted_target_value(action.source.role, _DURABLE_TARGET_ROLES),
+                    "input_type": _allowlisted_target_value(action.source.input_type, _DURABLE_TARGET_INPUT_TYPES),
+                    "autocomplete": _allowlisted_autocomplete(action.source.autocomplete),
+                }.items()
+                if value is not None
+            }
+        evidence.append(item)
     return evidence
 
 
@@ -326,14 +348,27 @@ DUPLICATE_ACTION_SCAN_DEPTH = 8
 
 def _action_identity(action: Action) -> tuple[str, str, str, str, str]:
     """Stable identity fields used for duplicate-action suppression."""
+    action_detail = ""
+    if isinstance(action, ActionInputText):
+        action_detail = action.input_value
+    elif isinstance(action, ActionDialog):
+        action_detail = f"{action.dialog_type}:{action.response}:{len(action.prompt_text or '')}"
+    elif isinstance(action, ActionDragDrop):
+        action_detail = ":".join(
+            (
+                action.source.sky_id or "",
+                action.source.id or "",
+                action.source.selector or "",
+                action.target.selector or "",
+            )
+        )
+
     return (
         str(action.kind),
         action.url,
         action.target.sky_id or "",
         action.target.id or "",
-        # A <select> fires change once per type-ahead keystroke. Without the value those read as
-        # one action, and suppression keeps the first — an option the user only passed through.
-        action.input_value if isinstance(action, ActionInputText) else "",
+        action_detail,
     )
 
 
@@ -563,6 +598,8 @@ class Processor:
 
         machines = machines or [
             sm.Click(),
+            sm.Dialog(),
+            sm.DragDrop(),
             sm.Hover(),
             sm.InputText(),
             sm.FileUpload(),

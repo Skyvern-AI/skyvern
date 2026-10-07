@@ -901,11 +901,18 @@ def _truncate_log_value(value: Any, max_chars: int) -> Any:
     return f"{text[:max_chars]}... [truncated]"
 
 
+# Server-authored internal envelopes: kept on the stdout/Datadog record but popped before the
+# downloadable context.log artifact, and preserved (keys not scrubbed) by the secret scrubber.
+INTERNAL_ATTRIBUTION_ENVELOPE_KEYS: tuple[str, ...] = ("failure_attribution", "operation_attribution")
+
+
 def _bounded_failure_attribution(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    attribution = event_dict.get("failure_attribution")
-    if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
-        return {"failure_attribution": attribution}
-    return {}
+    bounded: EventDict = {}
+    for key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS:
+        attribution = event_dict.get(key)
+        if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
+            bounded[key] = attribution
+    return bounded
 
 
 def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: EventDict) -> str:
@@ -1109,7 +1116,7 @@ def _registered_secret_scrubber(
                     logging_envelope
                     and depth == 0
                     and type(key) is str
-                    and key in ("event", "msg", "level", "failure_attribution")
+                    and key in ("event", "msg", "level", *INTERNAL_ATTRIBUTION_ENVELOPE_KEYS)
                 )
                 generated_field = depth == 0 and is_generated_log_field(key, item)
                 output_key = key if preserve_keys or protocol_field or generated_field else scrub(key, depth + 1)
@@ -1125,7 +1132,7 @@ def _registered_secret_scrubber(
                     result[output_key] = scrub(
                         item,
                         depth + 1,
-                        preserve_keys=preserve_keys or (protocol_field and key == "failure_attribution"),
+                        preserve_keys=preserve_keys or (protocol_field and key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS),
                     )
             return result
         if isinstance(node, list):
@@ -1299,8 +1306,9 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
     context = skyvern_context.current()
     if context:
         log_entry = dict(event_dict)
-        # Attribution is internal-only; context logs become downloadable run artifacts.
-        log_entry.pop("failure_attribution", None)
+        # Attribution envelopes are internal-only; context logs become downloadable run artifacts.
+        for _attribution_key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS:
+            log_entry.pop(_attribution_key, None)
         if workflow_run_id := log_entry.get("workflow_run_id"):
             attempt_number = skyvern_context.current_workflow_log_attempt(workflow_run_id)
             if attempt_number is not None:

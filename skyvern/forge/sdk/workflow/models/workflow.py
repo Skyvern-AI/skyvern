@@ -1,7 +1,6 @@
 import hashlib
 import json
 from datetime import datetime
-from enum import StrEnum
 from typing import Any, List
 
 from pydantic import (
@@ -18,7 +17,7 @@ from pydantic import (
 )
 from typing_extensions import Self, deprecated
 
-from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunStatus, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -37,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_run_metadata,
     normalize_run_with,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
@@ -183,6 +183,19 @@ class WorkflowDefinition(BaseModel):
         default=None,
         description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied to every browser this workflow version creates.",
+    )
+
+    # An omitted key tells a save to keep the previous version's settings, while an explicit null clears them.
+    # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
+    @model_serializer(mode="wrap")
+    def _omit_unset_browser_settings(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if "browser_settings" not in self.model_fields_set and isinstance(data, dict):
+            data.pop("browser_settings", None)
+        return data
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -320,38 +333,6 @@ class Workflow(BaseModel):
         return None
 
 
-class WorkflowRunStatus(StrEnum):
-    created = "created"
-    queued = "queued"
-    running = "running"
-    failed = "failed"
-    terminated = "terminated"
-    canceled = "canceled"
-    timed_out = "timed_out"
-    completed = "completed"
-    paused = "paused"
-
-    def is_final(self) -> bool:
-        return self in [
-            WorkflowRunStatus.failed,
-            WorkflowRunStatus.terminated,
-            WorkflowRunStatus.canceled,
-            WorkflowRunStatus.timed_out,
-            WorkflowRunStatus.completed,
-        ]
-
-    def is_final_excluding_canceled(self) -> bool:
-        """Like :meth:`is_final` but excludes ``canceled``.
-
-        For callers that can't distinguish a legitimate user/block cancel from
-        a synthetic ``canceled`` written as a last-resort fallback — e.g. the
-        copilot tool reading the row AFTER ``mark_workflow_run_as_canceled_if_not_final``
-        has run. Callers that want to trust a legitimate ``canceled`` must read
-        the row BEFORE invoking any cancel helper.
-        """
-        return self.is_final() and self is not WorkflowRunStatus.canceled
-
-
 class WorkflowRun(BaseModel):
     workflow_run_id: str
     workflow_id: str
@@ -402,6 +383,10 @@ class WorkflowRun(BaseModel):
     browser_address: str | None = None
     run_with: str | None = None
     browser_type: str | None = None
+    browser_settings: BrowserSettings | None = Field(
+        default=None, description="Browser settings copied from the workflow version when the run was created"
+    )
+    browser_settings_receipt: BrowserSettingsReceipt | None = None
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
     depends_on_workflow_run_id: str | None = None

@@ -75,9 +75,8 @@ USER_FACING_REASON_PARAM = "user_facing_reason"
 USER_FACING_REASON_SCHEMA = {
     "type": ["string", "null"],
     "description": (
-        "A short user-facing sentence explaining what this action is intended to accomplish. "
-        "This is displayed above this action while it runs; write it with the ordinary action arguments, "
-        "in product language without secrets. Null or absence is accepted when no useful explanation is available."
+        "One short sentence displayed above this action while it runs, saying what it is for. "
+        "Null or absence is accepted."
     ),
 }
 
@@ -256,6 +255,12 @@ class NarrativeWorkPlan(TypedDict):
     items: list[str]
 
 
+class NarrativeScreenshot(TypedDict):
+    artifactId: str
+    capturedAt: str
+    toolCallId: str | None
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -266,7 +271,7 @@ class TurnNarrativePayload(TypedDict):
     responseKind: NotRequired[str]
     questionInteractions: NotRequired[list[dict[str, Any]]]
     steerMessages: NotRequired[list[dict[str, Any]]]
-    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    # {"reason": <token>}, set when this turn surfaces a typed credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
@@ -290,6 +295,7 @@ class TurnNarrativePayload(TypedDict):
     # The last plan a successful set_work_plan stored this turn. Kept off designActivity, whose cap
     # can trim the call's row in a long turn.
     workPlan: NotRequired[NarrativeWorkPlan]
+    screenshots: NotRequired[list[NarrativeScreenshot]]
     startedAt: str | None
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
@@ -1511,3 +1517,8 @@ class CopilotContext(AgentContext):
             "dispatched_run_count_this_turn": len(self.dispatched_run_ids_this_turn),
             "ctx_last_workflow_present": self.last_workflow is not None,
         }
+
+
+def advertises(ctx: CopilotContext | None, tool_name: str) -> bool:
+    # A context that never resolved a tool surface advertises nothing.
+    return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)

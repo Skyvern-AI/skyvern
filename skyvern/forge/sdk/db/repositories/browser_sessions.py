@@ -32,7 +32,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
 from skyvern.forge.sdk.db.repositories.workflow_runs import lock_workflow_run_for_dispatch
-from skyvern.forge.sdk.db.utils import serialize_proxy_location
+from skyvern.forge.sdk.db.utils import browser_settings_receipt_replaceable, serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
     BrowserProfileUsage,
@@ -49,6 +49,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
@@ -994,6 +995,8 @@ class BrowserSessionsRepository(BaseRepository):
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
         expected_browser_session_id: str | None = None,
+        browser_settings: BrowserSettings | None = None,
+        created_for_workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -1052,6 +1055,9 @@ class BrowserSessionsRepository(BaseRepository):
                 bound_key=bound_key,
                 created_by=created_by,
             )
+            if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
+                browser_session.browser_settings = browser_settings.model_dump(mode="json")
+                browser_session.created_for_workflow_run_id = created_for_workflow_run_id
             session.add(browser_session)
             await session.flush()
             if (
@@ -1069,6 +1075,25 @@ class BrowserSessionsRepository(BaseRepository):
             created = PersistentBrowserSession.model_validate(browser_session)
             await session.commit()
             return created
+
+    @db_operation("record_persistent_browser_session_browser_settings_receipt")
+    async def record_persistent_browser_session_browser_settings_receipt(
+        self, session_id: str, organization_id: str, receipt: BrowserSettingsReceipt
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(PersistentBrowserSessionModel)
+                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+                .where(PersistentBrowserSessionModel.organization_id == organization_id)
+                .where(
+                    browser_settings_receipt_replaceable(
+                        PersistentBrowserSessionModel.browser_settings_receipt, receipt
+                    )
+                )
+                .values(browser_settings_receipt=receipt.model_dump(mode="json"))
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     @db_operation("update_persistent_browser_session", expected_errors=(BrowserSessionAlreadyEndedError,))
     async def update_persistent_browser_session(
@@ -1482,6 +1507,7 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str,
         *,
         workflow_run_id: str | None = None,
+        close_reason: str | None = None,
     ) -> PersistentBrowserSession:
         """Close a specific persistent browser session."""
         # Cloud consumes this out-of-band context when close emits lifecycle telemetry.
@@ -1498,6 +1524,7 @@ class BrowserSessionsRepository(BaseRepository):
                 if persistent_browser_session.completed_at:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 persistent_browser_session.completed_at = naive_utc_now()
+                persistent_browser_session.close_reason = persistent_browser_session.close_reason or close_reason
                 persistent_browser_session.status = resolve_terminal_status(
                     "completed", persistent_browser_session.close_reason
                 )

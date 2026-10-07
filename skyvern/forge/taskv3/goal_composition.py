@@ -319,6 +319,15 @@ def render_block_context(
             "report, and your reason should say what the page shows instead. Finish with "
             "status=failed only if your tools could not read the page at all."
         )
+    if task_block is not None and (
+        task.task_type == TaskType.validation or (task.navigation_goal and task.task_type != TaskType.action)
+    ):
+        pieces.append(
+            "When a criterion or the goal accepts more than one written form of a number, such as with or without a "
+            "leading zero or a dash, a form that differs from an accepted one only in that same kind of formatting "
+            "(more leading zeros, another separator) is accepted too. Otherwise compare numbers as written. This "
+            "never changes a value you type."
+        )
     framing = "\n\n".join(pieces)
 
     section = ""

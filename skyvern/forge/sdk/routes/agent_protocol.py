@@ -715,7 +715,7 @@ async def run_workflow(
     # a run that is already queued, and the client's retry would start it twice.
     async with run_submission_slot(current_org.organization_id):
         try:
-            workflow_run = await workflow_service.run_workflow(
+            workflow_run, owned_workflow = await workflow_service.run_workflow_returning_owned_workflow(
                 workflow_id=workflow_id,
                 organization=current_org,
                 workflow_request=legacy_workflow_request,
@@ -754,14 +754,12 @@ async def run_workflow(
                 if workflow_run.workflow_id:
                     span.set_attribute("workflow_id", workflow_run.workflow_id)
 
-        # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
-        # the effective browser_type, so a run that omitted browser_type reports the inherited engine
-        # instead of the request's null.
-        workflow = await app.WORKFLOW_SERVICE.get_workflow(
-            workflow_id=workflow_run.workflow_id,
-            organization_id=current_org.organization_id,
-        )
-    workflow_run_request_hydrated = _hydrate_run_request_for_response(workflow_run_request, workflow_run, workflow)
+    # Hydrate the returned request from the persisted run: the workflow title when the caller's org owns the
+    # workflow, and the effective browser_type, so a run that omitted browser_type reports the inherited
+    # engine instead of the request's null.
+    workflow_run_request_hydrated = _hydrate_run_request_for_response(
+        workflow_run_request, workflow_run, owned_workflow
+    )
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -778,6 +776,7 @@ async def run_workflow(
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         browser_seed_source=workflow_run.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -1439,6 +1438,7 @@ async def update_workflow_legacy(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    expected_version: Annotated[int | None, Query(ge=1)] = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
 
@@ -1466,6 +1466,7 @@ async def update_workflow_legacy(
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
+            expected_version=expected_version,
             return_write_result=True,
         )
     except WorkflowDefinitionValidationException as e:
@@ -4270,6 +4271,7 @@ async def retry_workflow_run(
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         browser_seed_source=workflow_run.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )

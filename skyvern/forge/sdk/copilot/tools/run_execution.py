@@ -29,7 +29,7 @@ from skyvern.exceptions import (
     CopilotInlineSequentialCredentialUnsupported,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import without_output_only_anti_bot, without_output_only_anti_bot_categories
+from skyvern.forge.failure_classifier import without_output_only_categories, without_output_only_labels
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.copilot.active_run_session import (
@@ -585,11 +585,11 @@ async def _chronological_run_block_rows(workflow_run_id: str, organization_id: s
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
-    return [_without_output_only_anti_bot_output(row) for row in reversed(rows)]
+    return [_without_output_only_label_output(row) for row in reversed(rows)]
 
 
-def _without_output_only_anti_bot_output(row: WorkflowRunBlock) -> WorkflowRunBlock:
-    output = without_output_only_anti_bot(row.output)
+def _without_output_only_label_output(row: WorkflowRunBlock) -> WorkflowRunBlock:
+    output = without_output_only_labels(row.output)
     return row if output is row.output else row.model_copy(update={"output": output})
 
 
@@ -1328,13 +1328,11 @@ async def _watchdog_error_message(
     )
     if exit_reason == "paused":
         # A pause is a healthy waiting state rather than an uncertain outcome, so it returns here
-        # instead of picking up the shared "outcome is uncertain, do not re-invoke" tail below. This
-        # is the one arm that directs the model to relay its own text, so it carries no run id.
+        # instead of picking up the shared "outcome is uncertain" tail below.
         return (
             "The run is paused at a human_interaction block, waiting for a person to approve or "
             "reject it. It stays paused until someone acts on it in Skyvern or the block's timeout "
-            "elapses; nothing was cancelled. Tell the user the run is paused and what it is waiting "
-            "for, and do not re-run these blocks."
+            "elapses; nothing was cancelled."
         )
     elif exit_reason == "ceiling":
         body = (
@@ -1351,7 +1349,7 @@ async def _watchdog_error_message(
     message = (
         f"{body} Run ID: {workflow_run_id}. Outcome is uncertain. "
         f"Do NOT re-invoke block-running tools in this session without first calling "
-        f"`get_run_results` with this workflow_run_id and reporting the result to the user."
+        f"`get_run_results` with this workflow_run_id."
     )
     current_url, _ = ("", "") if suppress_live_page else await _fallback_page_info(ctx)
     if current_url:
@@ -2278,7 +2276,7 @@ async def _attach_registered_output_parameter_values(
             block_info.update(index_by_key.get(output_parameter_key, {}))
         if block_info.get("block_label") in excluded_block_labels:
             continue
-        value = without_output_only_anti_bot(getattr(row, "value", None))
+        value = without_output_only_labels(getattr(row, "value", None))
         item = {
             "workflow_run_id": workflow_run_id,
             "output_parameter_id": output_parameter_id,
@@ -5028,7 +5026,9 @@ async def _run_blocks_and_collect_debug(
         if not run_ok and run and getattr(run, "failure_reason", None):
             result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
         if not run_ok and run and getattr(run, "failure_category", None):
-            result_data["failure_category"] = without_output_only_anti_bot_categories(run.failure_category)
+            failure_category = without_output_only_categories(run.failure_category)
+            if failure_category:
+                result_data["failure_category"] = failure_category
         _attach_loop_inputs(result_data, execution, workflow_run.workflow_run_id, run_block_rows)
         _attach_block_fact_projection(
             result_data,

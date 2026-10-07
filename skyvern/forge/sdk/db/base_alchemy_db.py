@@ -174,10 +174,16 @@ class BaseAlchemyDB:
         return False
 
 
+@dataclass
+class _Pin:
+    connection: AsyncConnection | None
+
+
 @dataclass(frozen=True)
 class _SessionEntry:
     session: AsyncSession
     task: asyncio.Task[Any] | None
+    pin: _Pin | None = None
 
 
 class _SessionFactory:
@@ -234,6 +240,57 @@ class _SessionFactory:
                     LOG.warning("Timed out closing a detached database session; abandoning it")
 
     @asynccontextmanager
+    async def pinned(self) -> AsyncIterator[AsyncSession]:
+        """Like calling the factory, but a new ambient session keeps one pooled connection across its commits
+        instead of paying a checkout and pre-ping per transaction. The connection stays checked out for the whole
+        scope except inside ``released()``, so wrap any slow non-database wait in the scope with it."""
+        existing = self.current()
+        if existing is not None:
+            yield existing
+            return
+
+        pin = _Pin(connection=await self._db.engine.connect())
+        try:
+            session = self._sessionmaker(bind=pin.connection)
+            token = self._session_ctx.set(_SessionEntry(session=session, task=asyncio.current_task(), pin=pin))
+            try:
+                yield session
+            finally:
+                self._session_ctx.reset(token)
+                await self._close(session)
+        finally:
+            if pin.connection is not None:
+                await pin.connection.close()
+
+    @asynccontextmanager
+    async def released(self) -> AsyncIterator[None]:
+        """Hand a pinned scope's connection back to the pool for the block and pin a fresh one after it; a no-op
+        outside a pinned scope or inside a transaction. A transaction the block opens keeps its own connection."""
+        entry = self._session_ctx.get()
+        if entry is None or entry.task is not asyncio.current_task() or entry.pin is None:
+            yield
+            return
+        pin, session = entry.pin, entry.session
+        if pin.connection is None or session.in_transaction():
+            yield
+            return
+
+        await pin.connection.close()
+        pin.connection = None
+        self._bind(session, self._db.engine)
+        try:
+            yield
+        finally:
+            if not session.in_transaction():
+                pin.connection = await self._db.engine.connect()
+                self._bind(session, pin.connection)
+
+    @staticmethod
+    def _bind(session: AsyncSession, bind: AsyncEngine | AsyncConnection) -> None:
+        session.bind = bind
+        session.sync_session.bind = bind.sync_engine if isinstance(bind, AsyncEngine) else bind.sync_connection
+
+    @asynccontextmanager
     async def _session(self) -> AsyncIterator[AsyncSession]:
         existing = self._session_ctx.get()
         current_task = asyncio.current_task()
@@ -247,17 +304,21 @@ class _SessionFactory:
             yield session
         finally:
             self._session_ctx.reset(token)
-            try:
-                await session.close()
-            except SQLAlchemyError as e:
-                # Handle transient errors during session cleanup gracefully.
-                # This can happen on replicas when the connection is terminated due to
-                # WAL replay conflicts. Since the actual DB operation already completed
-                # successfully (we're in finally block cleanup), we just log and continue.
-                if self._db.is_retryable_error(e):
+            await self._close(session)
+
+    async def _close(self, session: AsyncSession) -> None:
+        try:
+            await session.close()
+        except SQLAlchemyError as e:
+            # Handle transient errors during session cleanup gracefully.
+            # This can happen on replicas when the connection is terminated due to
+            # WAL replay conflicts. Since the actual DB operation already completed
+            # successfully (we're in finally block cleanup), we just log and continue.
+            if self._db.is_retryable_error(e):
+                with contained_effect("log suppressed session close error"):
                     LOG.warning(
                         "Transient error during session close (suppressed)",
                         error=str(e),
                     )
-                else:
-                    raise
+            else:
+                raise
