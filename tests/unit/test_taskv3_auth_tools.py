@@ -2064,6 +2064,30 @@ async def test_the_giveup_gate_records_both_the_hold_and_the_budget_it_let_go(
 
 
 @pytest.mark.asyncio
+async def test_a_giveup_that_never_polled_is_recorded_only_when_the_code_tool_was_offered() -> None:
+    # The "offered a code tool, never called it" give-up. Gated on the offer: a give-up on a run with no code
+    # tool is every failed v3 finish, and logging those would bury the population this read is for.
+    offered = auth_tools.VerificationState(task=_task())
+    offered.code_tool_offered = True
+    not_offered = auth_tools.VerificationState(task=_task())
+
+    with capture_logs() as logs:
+        assert await offered.block_giveup("failed") is None
+        assert await not_offered.block_giveup("failed") is None
+
+    records = [e for e in logs if e.get("event") == "task_v3 verification give-up gate"]
+    assert len(records) == 1
+    assert records[0]["code_tool_offered"] is True
+    # Together these separate "never called" from a call that failed or answered instantly.
+    assert (records[0]["polling_spent_seconds"], records[0]["values_delivered"], records[0]["source_failed"]) == (
+        0,
+        0,
+        False,
+    )
+    assert (records[0]["held"], records[0]["reason"]) == (False, "not_awaiting")
+
+
+@pytest.mark.asyncio
 async def test_a_delivered_code_disarms_the_giveup_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     # (b) in the negative controls: a run that got its code and later fails for an unrelated reason
     # must end on its first verdict. The disarm has to happen at the delivery site, not be inferred.

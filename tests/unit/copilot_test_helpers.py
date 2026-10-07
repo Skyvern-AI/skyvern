@@ -211,7 +211,7 @@ _CHAT_SESSION_ID = "pbs_chat"
 _CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
 
 
-def _fake_workflow_run(status: str) -> WorkflowRun:
+def _fake_workflow_run(status: str, failure_category: list[dict[str, Any]] | None = None) -> WorkflowRun:
     return WorkflowRun(
         workflow_run_id="wr_paused",
         workflow_id="w_source",
@@ -223,6 +223,7 @@ def _fake_workflow_run(status: str) -> WorkflowRun:
         trigger_type=None,
         browser_session_id=None,
         failure_reason=None,
+        failure_category=failure_category,
     )
 
 
@@ -495,6 +496,7 @@ async def install_run_blocks_harness(
     recent_actions: list[MagicMock] | None = None,
     run_proxy_location: ProxyLocationInput = None,
     run_session_proxy_location: ProxyLocationInput = None,
+    polled_failure_category: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
@@ -580,7 +582,7 @@ async def install_run_blocks_harness(
 
     monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", _get_session)
 
-    polled_run = _fake_workflow_run(status=polled_status)
+    polled_run = _fake_workflow_run(status=polled_status, failure_category=polled_failure_category)
 
     async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any]:
         return polled_run, now

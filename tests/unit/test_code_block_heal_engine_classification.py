@@ -56,6 +56,9 @@ def _recording_page(recorded_exception: Exception | None) -> MagicMock:
     page.last_recorded_exception.return_value = recorded_exception
     page.failure_nav_error_code.return_value = None
     page.failure_document_receipt.return_value = None
+    # Models CodeBlockActionRecording.failure_locator: None unless the exception identity owns a
+    # recorded locator; these engine-classification failures are not recorder-bound.
+    page.failure_locator.return_value = None
     return page
 
 

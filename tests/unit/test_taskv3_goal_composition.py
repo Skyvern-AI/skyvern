@@ -407,3 +407,25 @@ def test_a_field_that_cannot_be_quoted_value_by_value_is_qualified_as_a_whole(
     assert shown is not None and shown.presentation == presentation and shown.spans == 0
     assert shown.text.startswith(qualifier) and shown.text.endswith(row)
     assert OPEN not in shown.text and "⟦" not in shown.text
+
+
+def test_judging_blocks_extend_a_criterions_accepted_number_forms_to_the_same_kind_of_formatting() -> None:
+    # A criterion that accepted a number with one leading zero dropped failed on a page that dropped two, skipping the
+    # record. The rule extends only forms the criterion itself accepts, and only on blocks that judge or search.
+    now = datetime.now(UTC)
+    org = make_organization(now)
+    marker = "accepts more than one written form of a number"
+    judging = [
+        make_task(now, org, navigation_goal="Search the table for the account"),
+        make_task(now, org, navigation_goal=None, data_extraction_goal="x", task_type=TaskType.validation),
+    ]
+    for task in judging:
+        assert marker in render_block_context(task, _make_block("blk"), None)[0]
+        assert marker in render_block_context(task, _make_block("blk"), None, page_free_validation=True)[0]
+    not_judging = [
+        make_task(now, org, navigation_goal=None, data_extraction_goal="the license status"),
+        make_task(now, org, navigation_goal="Click the download button", task_type=TaskType.action),
+    ]
+    for task in not_judging:
+        assert marker not in render_block_context(task, _make_block("blk"), None)[0]
+    assert render_block_context(judging[0], None, None) == ("", "")

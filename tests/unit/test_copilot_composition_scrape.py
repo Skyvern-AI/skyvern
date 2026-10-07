@@ -17,7 +17,7 @@ import yaml
 
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.composition_evidence import (
-    composition_page_evidence_error,
+    composition_page_evidence_missing,
     has_bounded_page_schema,
     parse_composition_structured,
 )
@@ -629,12 +629,12 @@ async def test_current_page_inspect_after_schema_less_interaction_grounds_a_page
         }
     )
     assert (
-        composition_page_evidence_error(
+        composition_page_evidence_missing(
             ctx,
             workflow_yaml,
             block_observation_refs={"open_results": 1, "read_results": observation_step},
         )
-        is None
+        is False
     )
 
 

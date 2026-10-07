@@ -1594,6 +1594,77 @@ def test_evaluate_retry_policy_decisions(status, rule_status, rule_codes, errors
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "worker_container_restarted, retry_on, expected_retry",
+    [
+        # Worker loss used to end timed_out at the heartbeat deadline; recovery persists failed instead.
+        (True, ["timed_out"], True),
+        (True, ["failed"], True),
+        (False, ["timed_out"], False),
+        (True, ["failed", "timed_out"], True),
+    ],
+    ids=["restart_timed_out_rule", "restart_failed_rule", "other_failure_timed_out_rule", "restart_both_rules"],
+)
+async def test_worker_restart_failure_matches_timed_out_retry_rules(
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_container_restarted: bool,
+    retry_on: list[str],
+    expected_retry: bool,
+) -> None:
+    policy = WorkflowRetryPolicy(max_retries=2, retry_on=[{"status": status} for status in retry_on])
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    attempts = WorkflowRunAttemptsRepository(sessions)
+    async with sessions() as session:
+        session.add_all(
+            [
+                WorkflowModel(
+                    workflow_id="w_restart",
+                    workflow_permanent_id="wpid_restart",
+                    organization_id="o_test",
+                    title="Retry policy",
+                    version=1,
+                    is_saved_task=False,
+                    workflow_definition=WorkflowDefinition(parameters=[], blocks=[], retry_policy=policy).model_dump(
+                        mode="json"
+                    ),
+                ),
+                WorkflowRunModel(
+                    workflow_run_id="wr_restart",
+                    workflow_id="w_restart",
+                    workflow_permanent_id="wpid_restart",
+                    organization_id="o_test",
+                    status="running",
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_restart", organization_id="o_test", attempt_number=1, status="running"
+                ),
+            ]
+        )
+        await session.commit()
+    monkeypatch.setattr(service_module.app.DATABASE, "workflows", WorkflowsRepository(sessions))
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_runs", WorkflowRunsRepository(sessions))
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_run_attempts", attempts)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    monkeypatch.setattr(service_module.app.DATABASE.tasks, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service_module.app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=[]))
+    svc = WorkflowService()
+    monkeypatch.setattr(service_module.app, "WORKFLOW_SERVICE", svc)
+    monkeypatch.setattr(svc, "_after_workflow_run_status_write", AsyncMock())
+
+    finalized = await svc.mark_workflow_run_as_failed_if_not_final(
+        workflow_run_id="wr_restart",
+        failure_reason="Workflow run failed",
+        failure_category=[],
+        worker_container_restarted=worker_container_restarted,
+    )
+
+    assert finalized is not None and finalized.status == WorkflowRunStatus.failed
+    recorded = await attempts.get_attempts("wr_restart")
+    assert [row.retry_decision for row in recorded] == ["retry" if expected_retry else "final"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version_exists", [True, False], ids=["soft_deleted", "missing"])
 async def test_terminal_retry_resolves_deleted_pinned_workflow(
     sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, version_exists: bool

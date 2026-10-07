@@ -420,6 +420,24 @@ async def test_check_and_fix_state_recreation_defaults_run_dir_for_run_dir_state
 
 
 @pytest.mark.asyncio
+async def test_check_and_fix_state_recreation_keeps_the_launch_timezone() -> None:
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.RUN_DIR, captured)
+    state.timezone_id = "Africa/Kampala"
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            new=fake_create,
+        ),
+        patch("skyvern.webeye.real_browser_state.skyvern_context.current", return_value=None),
+    ):
+        await state.check_and_fix_state(workflow_run_id="wr-1")
+
+    assert captured.get("timezone_id") == "Africa/Kampala"
+
+
+@pytest.mark.asyncio
 async def test_check_and_fix_state_explicit_binding_overrides_prior_artifacts() -> None:
     """An explicit binding still wins over the derived one (reconnect passes prior_download_binding)."""
     captured: dict[str, object] = {}

@@ -109,7 +109,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
-    RAW_SECRET_REPLY_WITHHELD_OBSERVATION,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
@@ -140,12 +139,17 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
+from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, interim_run_start_outcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import REPAIR_INSTRUCTION_MAX_CHARS
 from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools._shared import (
+    EDIT_BLOCK_TOOL_NAME,
+    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+)
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
     _completion_verification_criteria,
@@ -1146,7 +1150,6 @@ workflow_definition:
         assert "For synthesized parameter binding" in enabled_prompt
         assert "include that exact key in the code block's parameter_keys" in enabled_prompt
         assert "do not guess or hardcode the runtime value" in enabled_prompt
-        assert "rerun via update_and_run_blocks" in enabled_prompt
         assert "create a workflow string parameter" not in enabled_prompt
         assert agent_module._code_authoring_repair_context_prompt(no_context_ctx) == ""
         agent_only_ctx = _ctx(
@@ -1263,6 +1266,23 @@ workflow_definition:
         assert instruction[:REPAIR_INSTRUCTION_MAX_CHARS] in prompt
         assert instruction[: REPAIR_INSTRUCTION_MAX_CHARS + 1] not in prompt
 
+    @pytest.mark.parametrize("reason_code", ["synthesized_parameter_binding_ambiguous", "metadata_reject"])
+    @pytest.mark.parametrize("advertised", [True, False])
+    def test_repair_context_points_at_the_rerun_tool_only_when_the_turn_has_it(
+        self, reason_code: str, advertised: bool
+    ) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="lookup_status", reason_code=reason_code, unresolved_names=["record_id"]
+            ),
+        )
+        ctx.eval_native_tool_names = (UPDATE_AND_RUN_BLOCKS_TOOL_NAME,) if advertised else ()
+
+        lines = agent_module._code_authoring_repair_context_prompt(ctx).splitlines()
+
+        assert (agent_module._RERUN_WITH_UPDATE_AND_RUN_BLOCKS in lines) is advertised
+
     def test_metadata_repair_context_prompt_includes_failure_and_contract_guidance(self) -> None:
         long_reason = "missing requested output child paths " + ("x" * 700)
         repair_context = CodeAuthoringRepairContext(
@@ -1306,7 +1326,6 @@ workflow_definition:
         assert "valid extraction_schema" in prompt
         assert "code return paths" in prompt
         assert "required requested output child paths" in prompt
-        assert "rerun update_and_run_blocks" in prompt
         assert "Declare code_artifact_metadata goal_value_paths" in prompt
         assert "Coastal" not in prompt
 
@@ -1386,6 +1405,41 @@ workflow_definition:
 
         assert "POST-RUN PAGE-PATH CONTINUATION:" not in prompt
         assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" not in prompt
+
+    @pytest.mark.parametrize(
+        ("native", "mcp", "expected"),
+        [
+            ((COMPOSITION_INSPECTION_TOOL_NAME,), (EVALUATE_TOOL_NAME,), agent_module._OBSERVE_BEFORE_ACTING),
+            ((COMPOSITION_INSPECTION_TOOL_NAME,), (), agent_module._OBSERVE_BEFORE_ACTING_FROM_BROWSER_CODE),
+            ((), (), None),
+        ],
+        ids=["optional", "required_code", "no_browser"],
+    )
+    def test_post_run_observe_contract_is_written_for_the_tools_the_turn_has(
+        self, native: tuple[str, ...], mcp: tuple[str, ...], expected: str | None
+    ) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="no_meaningful_output",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:no-output",
+            ),
+        )
+        ctx.eval_native_tool_names = native
+        ctx.eval_mcp_tool_names = mcp
+
+        lines = agent_module._recorded_build_test_outcome_prompt(ctx).splitlines()
+
+        rendered = [
+            line
+            for line in (agent_module._OBSERVE_BEFORE_ACTING, agent_module._OBSERVE_BEFORE_ACTING_FROM_BROWSER_CODE)
+            if line in lines
+        ]
+        assert rendered == ([expected] if expected else [])
 
     @pytest.mark.parametrize(
         ("policy", "directed"),
@@ -1543,6 +1597,16 @@ workflow_definition:
                 observed_after_workflow_run=True,
             ),
         )
+
+    @pytest.mark.parametrize("advertised", [True, False])
+    def test_the_anchor_rule_names_the_edit_tool_only_when_the_turn_has_it(self, advertised: bool) -> None:
+        ctx = self._repair_ctx(workflow_yaml=self._WORKFLOW)
+        ctx.eval_native_tool_names = (EDIT_BLOCK_TOOL_NAME,) if advertised else ()
+
+        lines = agent_module._code_authoring_repair_context_prompt(ctx).splitlines()
+
+        assert "stored_block_code: the source stored for block_label right now." in lines
+        assert (agent_module._STORED_CODE_ANCHOR_RULE in lines) is advertised
 
     def test_the_prompt_shows_what_the_rewrite_left_behind(self) -> None:
         rewritten = self._WORKFLOW.replace("#search", "#search-button")
@@ -4630,7 +4694,7 @@ workflow_definition:
         monkeypatch.setattr(
             agent_module,
             "evaluate_output_policy",
-            lambda **kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK]),
+            lambda **kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]),
         )
 
         _, raw_verdict, author_time_verdict = agent_module._inline_replace_workflow_credential_verdict(
@@ -4640,7 +4704,7 @@ workflow_definition:
         assert author_time_verdict.allowed is True
         assert list(author_time_verdict.reason_codes) == []
         # The raw verdict is what diagnostics report, so demotion must not consume it.
-        assert list(raw_verdict.reason_codes) == [OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK]
+        assert list(raw_verdict.reason_codes) == [OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]
 
     def test_inline_replace_verdict_still_blocks_a_credential_reason_co_firing_with_a_demoted_one(
         self, monkeypatch
@@ -4651,7 +4715,7 @@ workflow_definition:
             lambda **kwargs: OutputPolicyVerdict(
                 reason_codes=[
                     OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-                    OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK,
+                    OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
                 ]
             ),
         )
@@ -5051,7 +5115,6 @@ workflow_definition:
         assert agent_result.response_type == "REPLY"
         diagnostics = agent_result.output_policy_diagnostics or {}
         assert diagnostics["final_output_kind"] == "informational_answer"
-        assert diagnostics["soft_rewrite_reason_codes"] == []
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
         assert agent_result.workflow_was_persisted is False
@@ -5304,7 +5367,6 @@ class TestCredentialRefusalReachesAgent:
         prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
 
         assert "CREDENTIAL HANDLING - CRITICAL" in prompt
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in prompt
         assert "persist only a redacted draft" in prompt
         assert "redacted from the outbound client stream" not in prompt
 
@@ -7535,8 +7597,9 @@ class TestCopilotConfig:
         assert blocked.result is blocked_result
 
     @staticmethod
-    def _withheld_reply(*reason_codes: OutputPolicyReason) -> OutputGuardrailTripwireTriggered:
+    def _withheld_reply(*reason_codes: OutputPolicyReason, user_response: str = "") -> OutputGuardrailTripwireTriggered:
         guardrail_result = MagicMock()
+        guardrail_result.agent_output = json.dumps({"type": "REPLY", "user_response": user_response})
         guardrail_result.output.output_info = {"allowed": False, "reason_codes": [code.value for code in reason_codes]}
         return OutputGuardrailTripwireTriggered(guardrail_result)
 
@@ -7544,14 +7607,25 @@ class TestCopilotConfig:
     async def test_reply_withheld_for_a_raw_secret_shape_gets_one_tool_less_reask(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        lead_in = "The run signed in and opened the billing page for card 4111111111111111. " * 5 + "Use "
+        withheld = lead_in + "password: Hunter2Secret! next time. Trailing note after the secret."
         run = await _run_tool_bearing_empty_completion_turn(
             monkeypatch,
             _fake_run_result({"type": "REPLY", "user_response": "The page shows receipt FV-0F9080EE."}),
-            attempts=(_EnforcementAttempt(error=self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK)),),
+            attempts=(
+                _EnforcementAttempt(
+                    error=self._withheld_reply(OutputPolicyReason.RAW_SECRET_LEAK, user_response=withheld)
+                ),
+            ),
         )
 
         [call] = run.drain_calls
-        assert call.current_input == RAW_SECRET_REPLY_WITHHELD_OBSERVATION
+        assert len(lead_in) > 300
+        assert "`password`" in call.current_input
+        assert "4111111111111111" not in call.current_input
+        assert "Hunter2Secret" not in call.current_input
+        assert "Trailing note" not in call.current_input
+        assert "billing page" not in call.current_input
         assert call.model_settings.tool_choice == "none"
         assert call.max_turns == 1
         assert run.result.user_response == "The page shows receipt FV-0F9080EE."

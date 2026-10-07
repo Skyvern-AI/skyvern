@@ -3,19 +3,26 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Mapping
-from unittest.mock import AsyncMock
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, Route
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
-from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+from skyvern.forge.sdk.workflow.models.block import BlockResult, BlockStatus, CodeBlock, CodeBlockCaptchaError
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage, page_shows_sign_in_form
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
@@ -2187,3 +2194,95 @@ async def test_browser_image_arm_reaches_the_next_page_only_with_the_right_text(
             ActionType.INPUT_TEXT,
             ActionType.CLICK,
         ]
+
+
+_SIGN_IN_FORM = '<form><input name="email"><input type="password"></form>'
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("html", "failure_tab_html", "page_title", "sign_in"),
+    [
+        (_SIGN_IN_FORM, None, "Orders", True),
+        (_SIGN_IN_FORM, None, "Enter your password", True),
+        ("<p>Orders</p>", _SIGN_IN_FORM, "Orders", True),
+        (_SIGN_IN_FORM, "<p>Orders</p>", "Orders", False),
+        ('<form><input autocomplete="one-time-code"></form>', None, "Orders", False),
+        (
+            '<form><input type="password" autocomplete="new-password"><input type="password"></form>',
+            None,
+            "Orders",
+            False,
+        ),
+        ('<form><input name="email"><input type="password" style="display:none"></form>', None, "Orders", False),
+    ],
+)
+async def test_failure_on_a_sign_in_form_is_recorded_without_changing_any_other_category(
+    monkeypatch: pytest.MonkeyPatch, html: str, failure_tab_html: str | None, page_title: str, sign_in: bool
+) -> None:
+    now = datetime.now(timezone.utc)
+    block = CodeBlock(
+        label="code_1",
+        code="await page.click('#orders')",
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="code_1_output",
+            output_parameter_id="op_code",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        ),
+    )
+    monkeypatch.setattr(block, "_capture_failure_evidence", AsyncMock())
+    context = WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    reason = (
+        "Failed to execute code block. Reason: TimeoutError: Locator.click: Timeout 1500ms exceeded.\n"
+        f'Call log:\n  - waiting for locator("#orders")\n\nPage title: {page_title}'
+    )
+
+    async def build_failure() -> BlockResult:
+        return await block.build_block_result(success=False, failure_reason=reason, status=BlockStatus.failed)
+
+    async with challenge_browser_page(html, expect_challenge_frame=False) as page:
+        failure_tab = None
+        if failure_tab_html is not None:
+            failure_tab = await page.context.new_page()
+            await failure_tab.set_content(failure_tab_html)
+        result = await block._resolve_failure_with_heal(
+            authored_code=None,
+            exception=PlaywrightTimeoutError("timeout"),
+            failing_line=1,
+            build_failure_result=build_failure,
+            classification=HealClassification(healable=False, skip_reason=HealSkipReason.unclassifiable),
+            recorder=SimpleNamespace(finalize=AsyncMock()),
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+            page=page,
+            sign_in_form_visible=await page_shows_sign_in_form(failure_tab or page),
+        )
+
+    run_status, run_reason, run_category = WorkflowService._resolve_block_terminal_outcome(
+        block=block, block_result=result
+    )
+    assert result.output_parameter_value is None
+    if not sign_in:
+        assert run_category is None
+        return
+    assert run_status is not None and run_category is not None
+    assert (run_category[-1]["category"], run_category[-1]["reason_code"]) == (
+        "WRONG_PAGE_STATE",
+        "sign_in_form_visible",
+    )
+    # Decisions, attribution and run tags read these entries (ADR 0028), so they must be what the run records today.
+    assert run_category[:-1] == WorkflowService._classify_workflow_terminal_failure(run_status, run_reason)
+    assert ("AUTH_FAILURE" in {entry["category"] for entry in run_category}) is (page_title == "Enter your password")

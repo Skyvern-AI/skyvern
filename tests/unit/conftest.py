@@ -56,6 +56,7 @@ from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
+from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
@@ -340,6 +341,12 @@ def span_exporter() -> InMemorySpanExporter:
     exporter.clear()
     yield exporter
     exporter.clear()
+
+
+@pytest.fixture(scope="module")
+def gpt56_litellm_models() -> Iterator[None]:
+    with registered_gpt56_litellm_models():
+        yield
 
 
 # -- shared in-memory SQLite engine for repository/route unit tests --

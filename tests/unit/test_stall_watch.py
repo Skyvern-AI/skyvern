@@ -3,7 +3,8 @@ import asyncio
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.utils.stall_watch import log_if_stalled
+from skyvern.utils import stall_watch
+from skyvern.utils.stall_watch import log_if_stalled, wait_for_task
 
 
 async def _waits_on_the_browser(fut: asyncio.Future[str]) -> str:
@@ -47,3 +48,37 @@ async def test_a_step_that_finishes_in_time_logs_nothing_and_stops_its_watcher()
         await asyncio.sleep(0)
     assert logs == []
     assert asyncio.all_tasks() == {asyncio.current_task()}
+
+
+async def _detach_that_holds_its_cancellation() -> None:
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_holds_its_cancellation_cannot_hold_the_waiter_or_outlive_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Far longer than the test waits: only the repeat on the next loop pass can end the task in time.
+    monkeypatch.setattr(stall_watch, "ABANDONED_TASK_RECANCEL_SECONDS", 60)
+    stuck = asyncio.create_task(_detach_that_holds_its_cancellation())
+    deadline = asyncio.get_running_loop().time() + 0.05
+    try:
+        with capture_logs() as logs:
+            waiter = asyncio.create_task(wait_for_task(stuck, deadline, "Verification did not finish", step_id="stp_1"))
+            done, _ = await asyncio.wait({waiter}, timeout=5)
+
+        assert waiter in done
+        with pytest.raises(TimeoutError):
+            waiter.result()
+        [timed_out] = [log for log in logs if log["event"] == "Verification did not finish"]
+        assert timed_out["step_id"] == "stp_1"
+        assert any(frame.endswith("_detach_that_holds_its_cancellation") for frame in timed_out["await_chain"])
+        # Abandoned, it is cancelled again rather than left to carry on after swallowing the first cancellation.
+        await asyncio.wait({stuck}, timeout=5)
+        assert stuck.cancelled()
+    finally:
+        stuck.cancel()
+        await asyncio.gather(stuck, return_exceptions=True)

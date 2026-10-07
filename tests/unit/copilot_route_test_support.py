@@ -158,6 +158,7 @@ def setup_new_copilot_mocks(
         claim_pending_copilot_turn_for_finalisation=AsyncMock(return_value="claimed"),
         hold_copilot_turn_finalisation=no_finalisation_fence,
         clear_pending_copilot_turn=AsyncMock(),
+        get_workflow_copilot_claim_expires_in=AsyncMock(return_value=None),
     )
     app.DATABASE.workflow_params = workflow_params
     app.DATABASE.workflows = SimpleNamespace(

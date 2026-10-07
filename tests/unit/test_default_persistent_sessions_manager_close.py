@@ -34,6 +34,8 @@ class _LaunchBrowserSessionsRepository:
             browser_address=None,
             upstream_cdp_url=None,
             started_at=None,
+            browser_settings=None,
+            browser_settings_receipt=None,
         )
 
     async def create_persistent_browser_session(self, **kwargs: object) -> SimpleNamespace:

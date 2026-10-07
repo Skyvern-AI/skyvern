@@ -23,7 +23,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import MissingBrowserStatePage
+from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
@@ -128,6 +128,7 @@ async def _run_execute_task_v3(
     loop_raises: BaseException | None = None,
     update_task_side_effect: BaseException | None = None,
     completion_gate_vetoes: bool = False,
+    completion_gate_raises: BaseException | None = None,
     initial_active_credential_parameter_key: str | None = None,
     context_overrides: dict[str, Any] | None = None,
     own_block_row: WorkflowRunBlock | None = None,
@@ -262,7 +263,7 @@ async def _run_execute_task_v3(
 
     post_step_mock = AsyncMock(side_effect=post_step_side_effect)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", post_step_mock)
-    completion_gate = AsyncMock(return_value=not completion_gate_vetoes)
+    completion_gate = AsyncMock(return_value=not completion_gate_vetoes, side_effect=completion_gate_raises)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.gate_step_completion", completion_gate)
     loop_mock.completion_gate = completion_gate
 
@@ -2937,7 +2938,11 @@ async def test_execute_task_v3_navigation_block_token_trip_with_progress_is_exte
     script.append([("observe", {})])
     script.append([("click", {"selector": "#submit"})])
     script.append([("finish", {"status": "completed", "reason": "submitted"})])
-    caller = _ScriptedCaller(script, turn_tokens=200_000)
+    # The first call is the normal-size fixed prompt; the burn after it is the transcript growing.
+    caller = _ScriptedCaller(
+        script,
+        usage_for_call=lambda call: {"prompt_tokens": 15_000 if call == 0 else 200_000, "completion_tokens": 0},
+    )
     page = _AdvancingFormPage()
     loop_kwargs: dict[str, Any] = {}
 
@@ -3119,6 +3124,31 @@ async def test_execute_task_v3_should_cancel_fails_open_on_workflow_read_error(
     )
     should_cancel = loop_mock.await_args.kwargs["should_cancel"]
     assert await should_cancel() is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_should_cancel_true_when_task_canceled_and_workflow_read_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Failing open on the parent-run read must not hide a task row that is already canceled.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.canceled)),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(side_effect=ConnectionError("db blip")),
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_cancel_test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    should_cancel = loop_mock.await_args.kwargs["should_cancel"]
+    assert await should_cancel() is True
 
 
 @pytest.mark.asyncio
@@ -3817,6 +3847,20 @@ async def test_execute_task_v3_keeps_externally_finalized_terminal_status(
     assert loop_mock.clean_up_kwargs["need_call_webhook"] is expect_webhook
 
 
+def test_redact_tool_args_keeps_the_runs_registered_placeholder_id() -> None:
+    """The persisted row records the token the model asked to type, and script generation reads the
+    field name back out of it, so a registered id survives verbatim. A secret behind an unregistered
+    prefix does not (SKY-17864).
+    """
+    args = {"text": "placeholder_ab12_password", "selector": "#pw", "note": "not placeholder_password"}
+
+    assert agent_module._redact_tool_args(args, {"password"}, {"placeholder_ab12_password"}) == {
+        "text": "placeholder_ab12_password",
+        "selector": "#pw",
+        "note": "not placeholder_[REDACTED_SECRET]",
+    }
+
+
 def test_redact_extracted_information_disambiguates_colliding_secret_keys() -> None:
     result = agent_module._redact_extracted_information(
         {"482913": "codeA", "735264": "codeB", "other": "safe"},
@@ -3856,6 +3900,36 @@ async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: 
     assert task.status == TaskStatus.completed
     kwargs = loop_mock.completion_gate.await_args.kwargs
     assert kwargs["task_block"] is block
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gate_error, status, failure_reason",
+    [
+        (
+            CompletionGateTerminationError("the site holds an earlier entry"),
+            TaskStatus.terminated,
+            "the site holds an earlier entry",
+        ),
+        (RuntimeError("gate bug"), TaskStatus.completed, None),
+    ],
+    ids=["termination", "generic_error_accepts"],
+)
+async def test_execute_task_v3_completion_gate_raise(
+    monkeypatch: pytest.MonkeyPatch, gate_error: Exception, status: TaskStatus, failure_reason: str | None
+) -> None:
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="looks done", billable_actions=["click"]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Submit the application"),
+        completion_gate_raises=gate_error,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    loop_mock.completion_gate.assert_awaited_once()
+    assert task.status == status
+    assert task.failure_reason == failure_reason
 
 
 @pytest.mark.asyncio

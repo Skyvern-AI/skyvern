@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.failure_classifier import with_sign_in_form_visible
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -7286,6 +7287,34 @@ async def test_a_credential_bearing_run_mints_no_per_block_end_url_for_the_model
     assert ordinary["data"]["observed_block_end_urls"] == {"extract_heading": "https://fixture.test/results/widget"}
     assert "observed_block_end_urls" not in credential_bearing["data"]
     assert credential_bearing["data"]["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
+
+
+_ELEMENT_TIMEOUT_CATEGORY = {"category": "ELEMENT_STATE_TIMEOUT", "confidence_float": 0.85}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_category_before_label", "model_sees"),
+    [(None, "absent"), ([_ELEMENT_TIMEOUT_CATEGORY], [_ELEMENT_TIMEOUT_CATEGORY])],
+    ids=["label_only", "label_after_a_category"],
+)
+async def test_the_model_reads_a_run_category_as_it_was_before_the_sign_in_label(
+    monkeypatch: pytest.MonkeyPatch, run_category_before_label: list[dict[str, Any]] | None, model_sees: object
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="terminated",
+        polled_failure_category=with_sign_in_form_visible(run_category_before_label),
+        terminal_blocks=[terminal_extraction_block("failed")],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["data"].get("failure_category", "absent") == model_sees
 
 
 SEARCH_SELECT_BLOCK_TRACES: dict[str, list[dict[str, Any]]] = {

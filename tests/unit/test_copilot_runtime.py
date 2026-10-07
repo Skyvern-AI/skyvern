@@ -110,8 +110,31 @@ class _FakeBrowserContext:
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}},
-            {"ok": False, "error": "boom. retry later", "error_code": "E1"},
-            id="error_with_hint_joins_message_and_hint",
+            {"ok": False, "error": "boom", "error_code": "E1"},
+            id="error_with_hint_forwards_the_message_only",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "error": {
+                    "code": "ACTION_FAILED",
+                    "message": "No unambiguous option matched 'Blue'",
+                    "hint": "Retry with one of the observed options: Navy, Teal",
+                    "details": {
+                        "element_state": "no_unambiguous_match",
+                        "selector": "#color",
+                        "observed_options": ["Navy", "Teal"],
+                    },
+                },
+            },
+            {
+                "ok": False,
+                "error": "No unambiguous option matched 'Blue'",
+                "error_code": "ACTION_FAILED",
+                "element_state": "no_unambiguous_match",
+                "observed_options": ["Navy", "Teal"],
+            },
+            id="select_mismatch_lifts_the_observed_options_without_the_hint",
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom"}},

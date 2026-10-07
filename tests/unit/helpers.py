@@ -22,6 +22,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.actions.actions import ActionStatus, ActionType
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class FakeLLMResponse:
@@ -283,7 +284,7 @@ def setup_parallel_verification_mocks(
     monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", get_task_steps_mock)
 
     sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=sleep_mock))
 
     check_user_goal_complete_mock = AsyncMock(return_value=complete_action)
     monkeypatch.setattr(agent, "check_user_goal_complete", check_user_goal_complete_mock)

@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from skyvern.cli.mcp_tools.blocks import skyvern_block_schema, skyvern_block_validate
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build_tool_usage_guide
@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.config import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import mcp_to_copilot
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _build_skyvern_mcp_overlays
 from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     AUTHORING_FAMILY_GUIDANCE,
@@ -230,15 +229,3 @@ async def test_block_type_list_drops_the_mcp_servers_hint() -> None:
 
     assert rendered["data"]["block_types"]
     assert "hint" not in rendered["data"]
-
-
-@pytest.mark.asyncio
-async def test_a_failed_validation_reaches_the_model_without_the_mcp_servers_hint() -> None:
-    raw = await skyvern_block_validate(block_json='{"block_type": "code"}')
-    assert raw["error"]["hint"]
-
-    post_hook = _build_skyvern_mcp_overlays()["validate_block"].post_hook
-    rendered = await post_hook(mcp_to_copilot(raw), raw, _code_only_ctx())
-
-    assert rendered["ok"] is False
-    assert rendered["error"] == raw["error"]["message"]
