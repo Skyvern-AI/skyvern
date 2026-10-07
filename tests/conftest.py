@@ -3,6 +3,8 @@
 import inspect
 import io
 import logging
+import sys
+import threading
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +20,23 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.services import organization_log_scope
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _configure_logging_once_per_process() -> None:
+    """Configure logging the way the app does, once, before the first test runs.
+
+    Left unconfigured, structlog's development renderer draws every logged exception as a rich
+    traceback, which takes seconds per call, and it cannot render some values the app logs. Until
+    now a test got that only when no earlier file in its process had called setup_logger(), so its
+    time and even its outcome depended on how files were split across CI shards: the webhook
+    activity tests took 180s alone and 10s after logging was set up, the background task executor
+    tests 318s and 42s.
+    """
+    # setup_logger() also replaces the interpreter's exception hooks; pytest installs its own per test.
+    hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
+    setup_logger()
+    sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
 
 
 @pytest.fixture(autouse=True)
