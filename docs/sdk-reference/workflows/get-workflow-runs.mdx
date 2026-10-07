@@ -27,7 +27,7 @@ for (const run of runs) {
 | `page` | `int` | No | Page number (1-indexed). |
 | `page_size` | `int` | No | Results per page. |
 | `status` | `WorkflowRunStatus \| list[WorkflowRunStatus]` | No | Filter by run status. |
-| `search_key` | `str` | No | Case-insensitive substring search (min 3 chars). Matches against run ID, parameter keys, parameter values, and descriptions. |
+| `search_key` | `str` | No | Case-insensitive substring search (min 3 chars). Matches against run ID, workflow permanent ID, workflow title, parameter keys, parameter values, descriptions, extra HTTP headers, and webhook callback URL. A complete browser profile ID (`bp_...`), browser session ID (`pbs_...`), or credential ID (`cred_...`) matches the runs that used it exactly, with no substring matching. |
 | `error_code` | `str` | No | Filter by error code. |
 | `request_options` | `RequestOptions` | No | Per-request configuration (see below). |
 
