@@ -4350,14 +4350,30 @@ class LLMCaller:
         if self.llm_key and "YUTORI" in self.llm_key:
             return await self._call_yutori_navigator(messages, timeout, **active_parameters)
 
-        return await litellm.acompletion(
-            model=self.llm_config.model_name,
-            messages=messages,
-            tools=tools,
-            timeout=timeout,
-            drop_params=True,  # Drop unsupported parameters gracefully
-            **active_parameters,
+        custom_http_client = (
+            _build_custom_llm_http_client(self.original_llm_key, self.llm_config)
+            if isinstance(self.llm_config, LLMConfig)
+            else None
         )
+        try:
+            if custom_http_client is not None:
+                active_parameters["client"] = custom_http_client
+                if isinstance(custom_http_client, AsyncOpenAI):
+                    active_parameters["api_key"] = custom_http_client.api_key
+            return await litellm.acompletion(
+                model=self.llm_config.model_name,
+                messages=messages,
+                tools=tools,
+                timeout=timeout,
+                drop_params=True,  # Drop unsupported parameters gracefully
+                **active_parameters,
+            )
+        finally:
+            if custom_http_client is not None:
+                try:
+                    await custom_http_client.close()
+                except Exception:
+                    LOG.warning("Failed to close custom LLM HTTP client", llm_key=self.original_llm_key, exc_info=True)
 
     async def _call_anthropic(
         self,

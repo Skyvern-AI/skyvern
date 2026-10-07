@@ -14,6 +14,7 @@ import litellm  # type: ignore[import-not-found]
 import openai
 import pytest  # type: ignore[import-not-found]
 import structlog
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -137,11 +138,18 @@ def test_render_hashed_href_map_returns_expensive_templates_unchanged() -> None:
     ("model_name", "http_client_attribute"),
     [("openai/example-model", "_client"), ("ollama_chat/example-model", "client")],
 )
+@pytest.mark.parametrize(
+    ("entry_point", "request_error"),
+    [("handler", None), ("caller", None), ("caller", RuntimeError("provider failed")), ("caller", CancelledError())],
+    ids=["handler", "caller", "caller-failure", "caller-cancelled"],
+)
 @pytest.mark.asyncio
 async def test_custom_llm_http_clients_do_not_follow_redirects(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
     http_client_attribute: str,
+    entry_point: str,
+    request_error: BaseException | None,
 ) -> None:
     llm_config = _custom_llm_config(model_name)
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
@@ -157,11 +165,19 @@ async def test_custom_llm_http_clients_do_not_follow_redirects(
     )
     monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda **_: 0.0)
 
-    completion = AsyncMock(return_value=FakeLLMResponse(model_name))
+    completion = AsyncMock(return_value=FakeLLMResponse(model_name), side_effect=request_error)
     monkeypatch.setattr(api_handler_factory.litellm, "acompletion", completion)
 
-    handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_redirect_test")
-    await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+    if entry_point == "caller":
+        request = LLMCaller("CUSTOM_LLM_redirect_test")._dispatch_llm_call(messages=[])
+    else:
+        handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_redirect_test")
+        request = handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+    if request_error is not None:
+        with pytest.raises(type(request_error)):
+            await request
+    else:
+        await request
 
     client = completion.await_args.kwargs["client"]
     http_client = getattr(client, http_client_attribute)
@@ -174,6 +190,7 @@ async def test_custom_llm_http_clients_do_not_follow_redirects(
         await retry_client.aclose()
 
 
+@pytest.mark.parametrize("entry_point", ["handler", "caller"])
 @pytest.mark.parametrize("server_key", [None, "server-key"])
 @pytest.mark.parametrize(
     ("api_key", "extra_headers", "authorization"),
@@ -187,6 +204,7 @@ async def test_custom_llm_http_clients_do_not_follow_redirects(
 @pytest.mark.asyncio
 async def test_custom_openai_requests_use_only_configured_credentials(
     monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
     server_key: str | None,
     api_key: str | None,
     extra_headers: dict[str, str],
@@ -215,6 +233,11 @@ async def test_custom_openai_requests_use_only_configured_credentials(
     monkeypatch.setattr(
         api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
     )
+    monkeypatch.setattr(
+        api_handler_factory,
+        "llm_messages_builder_with_history",
+        AsyncMock(return_value=[{"role": "user", "content": "test"}]),
+    )
     monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.0)
     requests: list[httpx.Request] = []
     clients: list[httpx.AsyncClient] = []
@@ -242,8 +265,17 @@ async def test_custom_openai_requests_use_only_configured_credentials(
 
     monkeypatch.setattr(api_handler_factory, "ForgeAsyncHttpxClientWrapper", create_http_client)
 
-    handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_credentials_test")
-    result = await handler(prompt="test", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+    if entry_point == "caller":
+        handler = LLMCaller("CUSTOM_LLM_credentials_test").call
+    else:
+        handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_credentials_test")
+    try:
+        result = await handler(prompt="test", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+    finally:
+        # LiteLLM schedules its logging callback separately from the completion.
+        await asyncio.sleep(0)
+        await GLOBAL_LOGGING_WORKER.flush()
+        await GLOBAL_LOGGING_WORKER.stop()
 
     assert result == {"ok": True}
     assert len(requests) == 1
