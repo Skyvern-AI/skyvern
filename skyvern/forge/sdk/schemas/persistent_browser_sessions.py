@@ -4,8 +4,16 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from skyvern.exceptions import (
+    BrowserSessionClosed,
+    BrowserSessionExpired,
+    BrowserSessionStartupTimeout,
+    SkyvernHTTPException,
+)
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_timeouts import lived_full_lifetime
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
@@ -120,6 +128,10 @@ class PersistentBrowserSession(BaseModel):
     generate_browser_profile: bool = False
     bound_workflow_permanent_id: str | None = None
     bound_key: str | None = None
+    browser_settings: BrowserSettings | None = None
+    browser_settings_receipt: BrowserSettingsReceipt | None = None
+    # The workflow run whose own setup created this session; never set for a session a caller attaches.
+    created_for_workflow_run_id: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
@@ -158,6 +170,40 @@ class PersistentBrowserSession(BaseModel):
         sidecar survives; gating it off would silently log the profile out on the next reuse.
         """
         return not self.profile_read_only and bool(self.generate_browser_profile or self.browser_profile_id)
+
+
+def unusable_browser_session_error(
+    session: PersistentBrowserSession, *, refused_at_submission: bool = False
+) -> SkyvernHTTPException | None:
+    """The error a run sent to this session fails (or, at submission, is refused) with, or None while it is usable.
+
+    The single source for both run submission and the session managers' lease, so the two cannot disagree."""
+    if not (
+        is_final_status(session.status) or session.completed_at is not None or session.close_requested_at is not None
+    ):
+        return None
+    session_id = session.persistent_browser_session_id
+    timed_out = session.status == PersistentBrowserSessionStatus.timeout
+    if timed_out and session.started_at is None:
+        return BrowserSessionStartupTimeout(session_id)
+    # A session that reaches its lifetime ends with status timeout, or is closed as completed with close reason
+    # expired, a reason a retirement can also stamp before the lifetime is up.
+    if timed_out or (
+        session.close_reason == BrowserSessionCloseReason.expired
+        and lived_full_lifetime(
+            started_at=session.started_at, ended_at=session.completed_at, timeout_minutes=session.timeout_minutes
+        )
+    ):
+        return BrowserSessionExpired(
+            session_id,
+            started_at=session.started_at,
+            ended_at=session.completed_at,
+            timeout_minutes=session.timeout_minutes,
+            created_by=session.created_by,
+            bound=session.bound_key is not None or session.bound_workflow_permanent_id is not None,
+            refused_at_submission=refused_at_submission,
+        )
+    return BrowserSessionClosed(session_id, reason=f"is no longer usable (status: {session.status})")
 
 
 class FreshExitOutcome(StrEnum):

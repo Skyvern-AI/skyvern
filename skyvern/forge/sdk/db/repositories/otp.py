@@ -207,13 +207,16 @@ class OTPRepository(BaseRepository):
                 workflow_id=workflow_id or None,
                 workflow_run_id=workflow_run_id or None,
                 source=source,
-                expired_at=expired_at,
+                expired_at=to_naive_utc(expired_at),
                 otp_type=otp_type,
             )
             session.add(new_totp_code)
+            # The flush fills Python defaults and RETURNING brings back server defaults, so the row needs no
+            # re-read; validate it before commit expires it.
+            await session.flush()
+            totp_code = TOTPCode.model_validate(new_totp_code)
             await session.commit()
-            await session.refresh(new_totp_code)
-            return TOTPCode.model_validate(new_totp_code)
+            return totp_code
 
     @db_operation("create_otp_code_if_new", log_errors=False)
     async def create_otp_code_if_new(
@@ -289,12 +292,13 @@ class OTPRepository(BaseRepository):
                 workflow_id=workflow_id or None,
                 workflow_run_id=workflow_run_id or None,
                 source=source,
-                expired_at=expired_at,
+                expired_at=to_naive_utc(expired_at),
             )
             session.add(row)
+            await session.flush()
+            raw_code = RawTOTPCode.model_validate(row)
             await session.commit()
-            await session.refresh(row)
-            return RawTOTPCode.model_validate(row)
+            return raw_code
 
     @db_operation("create_raw_otp_code_if_new", log_errors=False)
     async def create_raw_otp_code_if_new(

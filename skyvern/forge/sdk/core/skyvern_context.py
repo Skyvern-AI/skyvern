@@ -720,6 +720,9 @@ class SkyvernContext:
     # scoped so bare tasks with no workflow-run context are still redacted; unioned into
     # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
     runtime_secret_values: set[str] = field(default_factory=builtins.set)
+    # Copilot credential values this request filled or scrubbed with. Its log lines and span exceptions
+    # scrub them at any length, while other sessions' values reach its log lines only above a length floor.
+    copilot_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
     # Subset of runtime_secret_values that must also never reach the model's own view of tool
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.

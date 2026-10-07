@@ -139,23 +139,19 @@ export function AttentionTray({
   );
 }
 
-// Where a docked request was raised in the transcript. While it is pending the answer happens in
-// the tray, so this row only points there.
+// Where a docked request was raised in the transcript. The tray is the one call to action, so
+// this row stays a neutral record.
 export function AttentionMarker({
   icon,
   title,
-  hint,
 }: {
   icon: ReactNode;
   title: string;
-  hint: string;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded-lg border border-dashed border-amber-500/50 px-3 py-2 text-xs text-muted-foreground">
+    <div className="flex items-center gap-2 rounded-lg border border-dashed border-border px-3 py-2 text-xs font-medium text-muted-foreground">
       {icon}
-      <span className="min-w-0">
-        <span className={TRAY_TITLE}>{title}</span> · {hint}
-      </span>
+      <span className="min-w-0">{title}</span>
     </div>
   );
 }

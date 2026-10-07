@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.build_test_outcome import ChallengeEffects, challenge_notices
 from skyvern.forge.sdk.copilot.challenge_evidence import stamp_challenge_frame_fact
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
@@ -51,6 +53,9 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import _register_code_block_secret
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
+    harness_run,
+    historical_code_version,
+    install_historical_run,
     make_completion_criterion,
     make_copilot_ctx,
 )
@@ -1068,8 +1073,12 @@ async def test_origin_registry_recovers_when_a_later_terminal_read_finds_the_han
         browser_session_id=None,
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
+        workflow_definition_sha256=None,
     )
     workflow = SimpleNamespace(
+        workflow_id="wf_origin",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
         created_by=None,
         modified_at=datetime(2026, 4, 21, 12, 0),
         workflow_definition=SimpleNamespace(parameters=[], blocks=[]),
@@ -2174,3 +2183,132 @@ def test_runtime_output_scalar_still_credits_normally() -> None:
     # untouched, so the reject does not swallow the legitimate path.
     verdict = grade_requested_output_criteria(_star_ctx(), [_exact_value_criterion("22600")], _star_snapshot())[0]
     assert verdict.state == "satisfied"
+
+
+_EXECUTED_SECRET = "Rg7vQ2mXpL9sKd4TzW8nYb3HcJ5fUa6E"
+
+
+async def _run_results_page(ctx: CopilotContext, **arguments: object) -> str:
+    return await tools_module.get_run_results_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="get_run_results"), json.dumps(arguments)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_registered_secret_in_executed_source_or_defaults_reaches_no_page_or_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Dense enough that the receipt's cut lands inside an occurrence, as it would if scrubbing ran after cutting.
+    secret_lines = [f'v{index} = "{_EXECUTED_SECRET}"' for index in range(400)]
+    code = "\n".join([f'token = "{_EXECUTED_SECRET}" + legacy_applicant_name', *secret_lines]) + "\n"
+    # The secret straddles the 120-character label cut.
+    label = "greet_" + "x" * 104 + _EXECUTED_SECRET
+    install_historical_run(
+        monkeypatch,
+        historical_code_version({label: code}, default_value=_EXECUTED_SECRET),
+        failed_label=label,
+    )
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml="")
+    ctx.secret_scrub_values = [_EXECUTED_SECRET]
+
+    first_page = await _run_results_page(ctx, workflow_run_id="wr-1")
+    detail_page = await _run_results_page(ctx, workflow_run_id="wr-1", row_keys=[f"wrb_{label}"])
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+
+    source = json.loads(first_page)["data"]["execution_source"]
+    assert source["disposition"] == "available"
+    assert source["failed_statement"].endswith("+ legacy_applicant_name")
+    assert source["failed_block_code_truncated"] is True
+    assert hydrated is not None and hydrated["run"]["execution_source"] == source
+    fragments = {_EXECUTED_SECRET[start : start + 8] for start in range(len(_EXECUTED_SECRET) - 7)}
+    for projection in (first_page, detail_page, json.dumps(hydrated)):
+        assert not [fragment for fragment in fragments if fragment in projection]
+
+
+@pytest.mark.asyncio
+async def test_a_scrubbed_multiline_secret_withholds_the_failed_statement_instead_of_naming_a_shifted_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    multiline_secret = "-----BEGIN KEY-----\nRg7vQ2mXpL9sKd4T\nzW8nYb3HcJ5fUa6E\n-----END KEY-----"
+    filler = "".join(f"unrelated_{index} = {index}\n" for index in range(5))
+    code = f'key = """{multiline_secret}"""\ngreeting = "Hello " + legacy_applicant_name\n{filler}'
+    install_historical_run(
+        monkeypatch,
+        historical_code_version({"greet_applicant": code}),
+        failed_label="greet_applicant",
+        failing_line=5,
+    )
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml="")
+    ctx.secret_scrub_values = [multiline_secret]
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    source = result["data"]["execution_source"]
+    assert source["disposition"] == "available"
+    assert "failed_statement" not in source
+    assert "legacy_applicant_name" in source["failed_block_code"]
+    assert "Rg7vQ2mX" not in json.dumps(source)
+
+
+@pytest.mark.asyncio
+async def test_a_pathological_executed_version_keeps_identity_and_statement_within_the_receipt_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statement = "greeting = " + " + ".join(["legacy_applicant_name"] * 60)
+    code = statement + "\n" + "\n".join(f"step_{index} = {index}" for index in range(2_000)) + "\n"
+    install_historical_run(
+        monkeypatch,
+        historical_code_version(
+            {"greet_applicant": code}, parameter_keys=[f"{index:03d}_{'k' * 300}" for index in range(300)]
+        ),
+        failed_label="greet_applicant",
+    )
+
+    result = await run_execution_module._get_run_results(
+        {"workflow_run_id": "wr-1"}, make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml="")
+    )
+
+    source = result["data"]["execution_source"]
+    assert len(json.dumps(source)) <= 8_000
+    assert (source["workflow_run_id"], source["workflow_id"], source["workflow_version"]) == ("wr-1", "wf-1", 3)
+    assert source["failed_statement"] == statement[:600]
+    assert source["failed_statement_truncated"] is True
+    assert source["declared_parameter_keys_omitted"] > 0
+    assert all(len(key) <= 120 for key in source["declared_parameter_keys"])
+
+
+@pytest.mark.asyncio
+async def test_escaped_text_and_labels_sharing_a_cut_stay_within_the_receipt_and_are_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # JSON escapes each supplementary-plane character to 12 characters, so code-point caps alone overflow.
+    failed_label = "\U0001f600" * 200
+    shared_prefix = "x" * 120
+    statement = "greeting = " + "\U0001f600" * 700
+    install_historical_run(
+        monkeypatch,
+        historical_code_version({failed_label: statement + "\n" + "step = 1\n" * 2_000}),
+        failed_label=failed_label,
+    )
+
+    result = await run_execution_module._get_run_results(
+        {"workflow_run_id": "wr-1"}, make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml="")
+    )
+
+    source = result["data"]["execution_source"]
+    assert len(json.dumps(source)) <= 8_000
+    assert len(json.dumps(source["failed_block_label"])) - 2 <= 120
+    assert len(json.dumps(source["failed_statement"])) - 2 <= 600
+    assert source["failed_statement_truncated"] is True
+
+    colliding = run_execution_module._run_version_source(
+        make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml=""),
+        harness_run("wr-1"),
+        historical_code_version({shared_prefix + "_first": "pass\n", shared_prefix + "_second": "pass\n"}),
+        failed_block_label=None,
+        failing_line=None,
+        requested_block_labels=[shared_prefix + "_first", shared_prefix + "_second"],
+    )
+    assert list(colliding["block_code_sha256"]) == [shared_prefix]
+    assert colliding["code_block_labels_omitted"] == 1

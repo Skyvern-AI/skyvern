@@ -148,11 +148,8 @@ export function ConnectedAccountChoiceCard({
 export function ConnectedAccountChoiceMarker() {
   return (
     <AttentionMarker
-      icon={
-        <Link2Icon aria-hidden className="size-3.5 shrink-0 text-amber-500" />
-      }
+      icon={<Link2Icon aria-hidden className="size-3.5 shrink-0" />}
       title="Copilot needs a Google account"
-      hint="choose below"
     />
   );
 }

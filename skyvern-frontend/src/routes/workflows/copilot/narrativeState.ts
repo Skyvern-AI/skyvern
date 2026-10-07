@@ -9,6 +9,7 @@ import {
   BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
+  CopilotSteerMessage,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
@@ -18,8 +19,10 @@ import {
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotSteerDeliveredUpdate,
   WorkflowCopilotToolCallUpdate,
   CodeWriteDiff,
   WorkflowCopilotToolResultUpdate,
@@ -120,6 +123,8 @@ export type NarrativeEvent =
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCodegenProgressUpdate
+  | WorkflowCopilotSteerDeliveredUpdate
+  | WorkflowCopilotScreenshotUpdate
   | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
@@ -424,7 +429,10 @@ export interface TurnNarrativeState {
   // Live-only drafting progress from codegen_progress, never persisted. Holds
   // only what the row renders: the frames' cumulative character count changes
   // on every frame and would re-render the chat for nothing.
-  codegenProgress: { blockLabels: string[] } | null;
+  codegenProgress: {
+    blockLabels: string[];
+    generationId: string | null;
+  } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -455,6 +463,17 @@ export interface TurnNarrativeState {
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
+  // Messages the user sent into this turn, in the order the model received them.
+  steerMessages: CopilotSteerMessage[];
+  // Browser frames captured for the agent this turn, in capture order.
+  screenshots: TurnScreenshot[];
+}
+
+export interface TurnScreenshot {
+  artifactId: string;
+  capturedAt: string;
+  // The call that staged the frame; null places it by time alone.
+  toolCallId: string | null;
 }
 
 export interface GoogleConnectionNotice {
@@ -495,6 +514,8 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   review: null,
   turnFacts: null,
   budgetExpiry: null,
+  steerMessages: [],
+  screenshots: [],
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -722,6 +743,8 @@ export const AUTHORING_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
 ]);
+export const ACCOUNT_GROUP_SUBMIT_TOOL = "run_workflow_for_accounts";
+
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
@@ -785,6 +808,10 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   ask_user: "Asking you",
   set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "Reviewing the accounts with you",
+  get_account_group_status: "Checking the account runs",
+  cancel_account_group: "Reviewing a cancel with you",
+  delete_saved_credentials: "Reviewing a credential deletion with you",
 };
 
 // What kind of work a call did, for the activity log's per-step rollup. Keyed
@@ -833,6 +860,10 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   disable_workflow_schedule: "other",
   cancel_workflow_schedule: "other",
   delete_workflow_schedule: "other",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "run",
+  get_account_group_status: "other",
+  cancel_account_group: "other",
+  delete_saved_credentials: "other",
 };
 
 export function toolCallKind(toolName: string): ToolCallKind {
@@ -1360,10 +1391,14 @@ export function applyNarrativeEvent(
       // producer keys its state by output_index and opens each call with an
       // empty frame. One generation can carry several authoring calls, so union
       // rather than replace — otherwise a second call's opening frame erases
-      // the blocks the first one drafted. The tool_call that ends the
-      // generation is what clears the row, so this cannot accumulate past it.
+      // the blocks the first one drafted. A restarted generation opens the same
+      // way, so a changed generation_id is what drops the abandoned labels; an
+      // older server sends none, and every frame then counts as one generation.
+      const generationId = event.generation_id ?? null;
       const drafting = prev.codegenProgress;
-      const drafted = drafting?.blockLabels ?? [];
+      const sameGeneration =
+        drafting !== null && drafting.generationId === generationId;
+      const drafted = sameGeneration ? drafting.blockLabels : [];
       const merged = drafted.concat(
         event.blocks_drafted.filter((label) => !drafted.includes(label)),
       );
@@ -1372,12 +1407,12 @@ export function applyNarrativeEvent(
       // on every one. Returning prev unchanged is what keeps a fast stream from
       // re-rendering the chat between labels. The first frame of a generation
       // still has to land: it is what opens the row, and it carries no labels.
-      if (drafting !== null && merged.length === drafted.length) {
+      if (sameGeneration && merged.length === drafted.length) {
         return prev;
       }
       return {
         ...prev,
-        codegenProgress: { blockLabels: merged },
+        codegenProgress: { blockLabels: merged, generationId },
       };
     }
 
@@ -1522,6 +1557,36 @@ export function applyNarrativeEvent(
       };
     }
 
+    case "steer_delivered": {
+      const known = new Set(prev.steerMessages.map((item) => item.steer_id));
+      return {
+        ...prev,
+        steerMessages: [
+          ...prev.steerMessages,
+          ...event.steer_messages.filter((item) => !known.has(item.steer_id)),
+        ],
+        // A delivery can abort the model call those drafting frames described.
+        codegenProgress: null,
+      };
+    }
+
+    case "screenshot":
+      return prev.screenshots.some(
+        (shot) => shot.artifactId === event.artifact_id,
+      )
+        ? prev
+        : {
+            ...prev,
+            screenshots: [
+              ...prev.screenshots,
+              {
+                artifactId: event.artifact_id,
+                capturedAt: event.captured_at,
+                toolCallId: event.tool_call_id ?? null,
+              },
+            ],
+          };
+
     case "tool_result": {
       const planItems = parseStringList(event.work_plan);
       const workPlan = planItems
@@ -1598,6 +1663,10 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
+          steerMessages:
+            hydrated.steerMessages.length > 0
+              ? hydrated.steerMessages
+              : prev.steerMessages,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1989,7 +2058,40 @@ export function hydrateNarrativeFromPayload(
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
+    steerMessages: parseSteerMessages(payload.steerMessages),
+    screenshots: parseScreenshots(payload.screenshots),
   };
+}
+
+function parseScreenshots(value: unknown): TurnScreenshot[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) =>
+    typeof item === "object" &&
+    item !== null &&
+    typeof item.artifactId === "string" &&
+    typeof item.capturedAt === "string"
+      ? [
+          {
+            artifactId: item.artifactId,
+            capturedAt: item.capturedAt,
+            toolCallId:
+              typeof item.toolCallId === "string" ? item.toolCallId : null,
+          },
+        ]
+      : [],
+  );
+}
+
+function parseSteerMessages(value: unknown): CopilotSteerMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is CopilotSteerMessage =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof item.steer_id === "string" &&
+      typeof item.text === "string" &&
+      typeof item.delivered_at === "string",
+  );
 }
 
 // History rows persisted before narrative_payload carried responseKind still

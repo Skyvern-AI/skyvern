@@ -23,7 +23,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import MissingBrowserStatePage
+from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
@@ -64,9 +64,11 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import CLOSE as PAGE_DERIVED_CLOSE
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIVED_OPEN
 from skyvern.forge.taskv3 import engine as taskv3_engine
+from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
+from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
@@ -80,6 +82,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
+    LOGIN_PACE_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
@@ -125,6 +128,7 @@ async def _run_execute_task_v3(
     loop_raises: BaseException | None = None,
     update_task_side_effect: BaseException | None = None,
     completion_gate_vetoes: bool = False,
+    completion_gate_raises: BaseException | None = None,
     initial_active_credential_parameter_key: str | None = None,
     context_overrides: dict[str, Any] | None = None,
     own_block_row: WorkflowRunBlock | None = None,
@@ -148,6 +152,7 @@ async def _run_execute_task_v3(
     goal_judge_prompt: str | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
+    llm_caller_factory: Any = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -186,6 +191,9 @@ async def _run_execute_task_v3(
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
+        pace = input_dispatch._login_pace.get()
+        loop_mock.login_pace_during_loop = pace is not None
+        loop_mock.login_pace_polls_cancel = pace is not None and pace.should_cancel is not None
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -212,7 +220,7 @@ async def _run_execute_task_v3(
     loop_mock = AsyncMock(side_effect=_loop)
     loop_mock.browser_state = browser_state
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
-    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", llm_caller_factory or MagicMock())
     monkeypatch.setattr("skyvern.forge.sdk.api.files.resolve_run_download_id", lambda *_a, **_k: "download-1")
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: "/tmp/taskv3-test")
     monkeypatch.setattr(
@@ -255,7 +263,7 @@ async def _run_execute_task_v3(
 
     post_step_mock = AsyncMock(side_effect=post_step_side_effect)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", post_step_mock)
-    completion_gate = AsyncMock(return_value=not completion_gate_vetoes)
+    completion_gate = AsyncMock(return_value=not completion_gate_vetoes, side_effect=completion_gate_raises)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.gate_step_completion", completion_gate)
     loop_mock.completion_gate = completion_gate
 
@@ -324,6 +332,40 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
         DATE_SEGMENT_AIM_FLAG,
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant, arm", [(None, "unrandomized"), ("control", "control"), ("treatment", "treatment")])
+async def test_execute_task_v3_holds_logins_only_on_the_login_pace_treatment(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None, arm: str
+) -> None:
+    # An absent or unset flag evaluates to no variant, which must leave the run unpaced. The arm is targeted at
+    # named workflows, so the resolve carries the workflow id or no release condition can match.
+    monkeypatch.setattr(settings, "TASK_V3_LOGIN_PACE", False)
+    provider = AsyncMock(side_effect=lambda flag, *_a, **_k: variant if flag == LOGIN_PACE_FLAG else None)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        workflow_run_id="wr_login_pace",
+        context_overrides={"workflow_permanent_id": "wpid_login_pace"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.context.run_arms[LOGIN_PACE_FLAG] == (task.workflow_run_id, arm)
+    assert loop_mock.login_pace_during_loop is (arm == "treatment")
+    assert loop_mock.login_pace_polls_cancel is (arm == "treatment")
+    assert input_dispatch._login_pace.get() is None
+    provider.assert_any_await(
+        LOGIN_PACE_FLAG,
+        task.workflow_run_id,
+        properties={
+            "organization_id": task.organization_id,
+            "workflow_permanent_id": task.workflow_permanent_id or "wpid_login_pace",
+        },
     )
 
 
@@ -2896,7 +2938,11 @@ async def test_execute_task_v3_navigation_block_token_trip_with_progress_is_exte
     script.append([("observe", {})])
     script.append([("click", {"selector": "#submit"})])
     script.append([("finish", {"status": "completed", "reason": "submitted"})])
-    caller = _ScriptedCaller(script, turn_tokens=200_000)
+    # The first call is the normal-size fixed prompt; the burn after it is the transcript growing.
+    caller = _ScriptedCaller(
+        script,
+        usage_for_call=lambda call: {"prompt_tokens": 15_000 if call == 0 else 200_000, "completion_tokens": 0},
+    )
     page = _AdvancingFormPage()
     loop_kwargs: dict[str, Any] = {}
 
@@ -3078,6 +3124,31 @@ async def test_execute_task_v3_should_cancel_fails_open_on_workflow_read_error(
     )
     should_cancel = loop_mock.await_args.kwargs["should_cancel"]
     assert await should_cancel() is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_should_cancel_true_when_task_canceled_and_workflow_read_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Failing open on the parent-run read must not hide a task row that is already canceled.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.canceled)),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(side_effect=ConnectionError("db blip")),
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_cancel_test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    should_cancel = loop_mock.await_args.kwargs["should_cancel"]
+    assert await should_cancel() is True
 
 
 @pytest.mark.asyncio
@@ -3776,6 +3847,20 @@ async def test_execute_task_v3_keeps_externally_finalized_terminal_status(
     assert loop_mock.clean_up_kwargs["need_call_webhook"] is expect_webhook
 
 
+def test_redact_tool_args_keeps_the_runs_registered_placeholder_id() -> None:
+    """The persisted row records the token the model asked to type, and script generation reads the
+    field name back out of it, so a registered id survives verbatim. A secret behind an unregistered
+    prefix does not (SKY-17864).
+    """
+    args = {"text": "placeholder_ab12_password", "selector": "#pw", "note": "not placeholder_password"}
+
+    assert agent_module._redact_tool_args(args, {"password"}, {"placeholder_ab12_password"}) == {
+        "text": "placeholder_ab12_password",
+        "selector": "#pw",
+        "note": "not placeholder_[REDACTED_SECRET]",
+    }
+
+
 def test_redact_extracted_information_disambiguates_colliding_secret_keys() -> None:
     result = agent_module._redact_extracted_information(
         {"482913": "codeA", "735264": "codeB", "other": "safe"},
@@ -3815,6 +3900,36 @@ async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: 
     assert task.status == TaskStatus.completed
     kwargs = loop_mock.completion_gate.await_args.kwargs
     assert kwargs["task_block"] is block
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gate_error, status, failure_reason",
+    [
+        (
+            CompletionGateTerminationError("the site holds an earlier entry"),
+            TaskStatus.terminated,
+            "the site holds an earlier entry",
+        ),
+        (RuntimeError("gate bug"), TaskStatus.completed, None),
+    ],
+    ids=["termination", "generic_error_accepts"],
+)
+async def test_execute_task_v3_completion_gate_raise(
+    monkeypatch: pytest.MonkeyPatch, gate_error: Exception, status: TaskStatus, failure_reason: str | None
+) -> None:
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="looks done", billable_actions=["click"]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Submit the application"),
+        completion_gate_raises=gate_error,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    loop_mock.completion_gate.assert_awaited_once()
+    assert task.status == status
+    assert task.failure_reason == failure_reason
 
 
 @pytest.mark.asyncio
@@ -6376,6 +6491,59 @@ def _arm_goal_judge(
         "skyvern.forge.agent.SkyvernFrame.take_scrolling_screenshot", AsyncMock(return_value=b"judge-png")
     )
     return judge_handler, get_handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller_key", "registry_key", "twin_key", "context_overrides", "judge_key"),
+    [
+        (_JUDGE_KEY, _JUDGE_KEY, None, {}, _JUDGE_KEY),
+        # An OpenRouter caller rewrites llm_key to the bare model id; the registry name is what resolves.
+        ("vendor/bare-model-id", _JUDGE_KEY, None, {}, _JUDGE_KEY),
+        ("RUN_FLEX_KEY", "RUN_FLEX_KEY", _JUDGE_KEY, {}, _JUDGE_KEY),
+        (_JUDGE_KEY, _JUDGE_KEY, None, {"enrich_tree_mode": EnrichTreeMode.ENRICHED_TREE_NO_IMAGES}, None),
+        (_BYO_JUDGE_KEY, _BYO_JUDGE_KEY, None, {}, None),
+    ],
+    ids=["run_key", "caller_rewrites_key", "standard_tier_twin", "screenshots_disabled", "byo_key"],
+)
+async def test_block_completion_judge_runs_on_the_runs_own_key_outside_the_goal_check_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    caller_key: str,
+    registry_key: str,
+    twin_key: str | None,
+    context_overrides: dict[str, Any],
+    judge_key: str | None,
+) -> None:
+    judge_handler, get_handler = _arm_goal_judge(monkeypatch, forced=False)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.get_standard_tier_twin_llm_key", MagicMock(return_value=twin_key)
+    )
+    caller = MagicMock(llm_key=caller_key, original_llm_key=registry_key)
+
+    with capture_logs() as logs:
+        step, _task, loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            task_block=_make_block(ActionBlock),
+            context_overrides=context_overrides,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            llm_caller_factory=MagicMock(return_value=caller),
+        )
+
+    assert loop_mock.call_args.kwargs["goal_judge"] is None
+    block_judge = loop_mock.call_args.kwargs["block_completion_judge"]
+    if judge_key is None:
+        assert block_judge is None
+        assert [log for log in logs if log["event"] == "taskv3 block completion judge skipped"]
+        get_handler.assert_not_called()
+        return
+    loop_mock.browser_state.must_get_working_page.return_value.is_closed = MagicMock(return_value=False)
+    await block_judge("judge prompt")
+    get_handler.assert_called_once_with(judge_key)
+    kwargs = judge_handler.await_args.kwargs
+    assert kwargs["prompt_name"] == BLOCK_COMPLETION_CHECK_PROMPT_NAME
+    assert kwargs["step"] is step
 
 
 def _resolved_goal_check_flags(logs: list[dict[str, Any]]) -> set[str]:

@@ -429,6 +429,69 @@ describe("CredentialCard sign in myself", () => {
   });
 });
 
+describe("CredentialCard registration", () => {
+  const registrationFrame =
+    CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_registration;
+
+  it("shows the exact sign-up page, username and saved name, and Generate and save answers it", () => {
+    const onGenerate = vi.fn();
+    const onSkip = vi.fn();
+    render(
+      <CredentialCard
+        frame={registrationFrame}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={onSkip}
+        onGenerate={onGenerate}
+      />,
+    );
+    expect(
+      screen.getByText("Create a login for https://portal.example.com"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("Sign-up page: https://portal.example.com/signup"),
+    ).toBeTruthy();
+    expect(screen.getByText("Username: tester@example.com")).toBeTruthy();
+    expect(screen.getByText("Saved as: Portal test account")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate and save" }));
+    expect(onGenerate).toHaveBeenCalledTimes(1);
+    expect(onSkip).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["rejected", /Nothing was saved/],
+    ["unknown", /The vault didn't confirm the save/],
+    ["created_not_connected", /Saved as Portal test account, not connected/],
+  ] as const)(
+    "after a %s attempt, hides Generate and says what happened",
+    (outcome, message) => {
+      render(
+        <CredentialCard
+          frame={{
+            ...registrationFrame,
+            registration: {
+              ...registrationFrame.registration!,
+              attempted: true,
+              outcome,
+            },
+          }}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+          onGenerate={vi.fn()}
+        />,
+      );
+      expect(
+        screen.queryByRole("button", { name: "Generate and save" }),
+      ).toBeNull();
+      expect(screen.getAllByText(message)).not.toHaveLength(0);
+      expect(
+        screen.getByRole("button", { name: "Connect credential" }),
+      ).toBeTruthy();
+    },
+  );
+});
+
 describe("CredentialCard terminal org-credential picker", () => {
   it("fetches the org credentials and renders them as a picker, in API order", async () => {
     credsData.current = [

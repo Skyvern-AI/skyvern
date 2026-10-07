@@ -39,6 +39,9 @@ class AES(BaseEncryptor):
             self._encryption_params(fallback_salt, fallback_iv)
             for fallback_salt, fallback_iv in (fallback_decrypt_keys or [])
         ]
+        # PBKDF2 blocks the event loop for tens of ms and its output depends only on secret and salt, so derive once
+        # per salt. Filled on first use rather than here so processes that never encrypt don't pay for it at boot.
+        self._derived_keys: dict[bytes, bytes] = {}
 
     def method(self) -> EncryptMethod:
         return EncryptMethod.AES
@@ -51,13 +54,18 @@ class AES(BaseEncryptor):
         )
 
     def _derive_key(self, salt: bytes | None = None) -> bytes:
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt if salt is not None else self.salt,
-            iterations=100000,
-        )
-        return kdf.derive(self.secret_key)
+        salt = salt if salt is not None else self.salt
+        key = self._derived_keys.get(salt)
+        if key is None:
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=100000,
+            )
+            key = kdf.derive(self.secret_key)
+            self._derived_keys[salt] = key
+        return key
 
     async def encrypt(self, plaintext: str) -> str:
         try:

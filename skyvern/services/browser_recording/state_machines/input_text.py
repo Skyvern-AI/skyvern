@@ -132,6 +132,7 @@ class StateMachineInputText(StateMachine):
             accessible_name=self.target.accessibleName,
             input_type=self.target.inputType,
             autocomplete=self.target.autocomplete,
+            in_child_frame=self.target.inChildFrame,
         )
 
         action = ActionInputText(

@@ -34,7 +34,8 @@ from skyvern.forge.sdk.core.skyvern_context import (
     SkyvernContext,
     action_for_multi_field_totp_persistence,
 )
-from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow import service as workflow_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPType, OTPValue
+from skyvern.utils import stall_watch
 from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions import multi_field_totp as multi_field_totp_module
@@ -4236,8 +4238,7 @@ async def test_group_fill_does_not_repeat_a_consumed_auto_submit(
     assert state.filled_at is not None
 
 
-@pytest.mark.asyncio
-async def test_retry_barrier_propagates_parent_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+def _rejected_attempt_awaiting_retry(monkeypatch: pytest.MonkeyPatch) -> tuple[Task, Step, SkyvernContext, AsyncMock]:
     now = datetime.now(UTC)
     task = make_task(now, make_organization(now))
     step = make_step(now, task, step_id="step", status=StepStatus.completed, order=0, output=None)
@@ -4253,6 +4254,49 @@ async def test_retry_barrier_propagates_parent_cancellation(monkeypatch: pytest.
     monkeypatch.setattr(
         agent_module.LLMAPIHandlerFactory, "get_override_llm_api_handler", lambda *args, **kwargs: classifier
     )
+    return task, step, context, classifier
+
+
+@pytest.mark.asyncio
+async def test_retry_barrier_skips_the_retry_when_the_speculative_plan_holds_its_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stall_watch, "ABANDONED_TASK_RECANCEL_SECONDS", 0.05)
+    task, step, context, classifier = _rejected_attempt_awaiting_retry(monkeypatch)
+
+    async def speculate():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await asyncio.Future()
+
+    speculative = asyncio.create_task(speculate())
+    await asyncio.sleep(0)
+    with skyvern_context.scoped(context), structlog.testing.capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            ForgeAgent()._maybe_retry_multi_field_totp_after_rejection(
+                task,
+                step,
+                SimpleNamespace(url="same"),
+                _box_page(6),
+                "The code was rejected.",
+                speculative_task=speculative,
+                speculative_deadline=asyncio.get_running_loop().time() + 0.05,
+            ),
+            timeout=5,
+        )
+    assert outcome == multi_field_totp_module.RetryOutcome.NO_RETRY
+    assert [log["reason"] for log in logs if log["event"] == "Multi-field TOTP retry skipped"] == [
+        "speculative_plan_still_running"
+    ]
+    assert classifier.await_args is None
+    await asyncio.wait({speculative}, timeout=5)
+    assert speculative.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_retry_barrier_propagates_parent_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    task, step, context, classifier = _rejected_attempt_awaiting_retry(monkeypatch)
     started, cleaning = asyncio.Event(), asyncio.Event()
 
     async def speculate():

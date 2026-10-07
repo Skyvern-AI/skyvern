@@ -174,6 +174,21 @@ describe("getWorkflowErrors", () => {
   });
 });
 
+describe("send email attachments", () => {
+  test.each([
+    ["an empty field", "", []],
+    ["a blank field", "   ", []],
+    ["stray commas", "a.pdf, , b.pdf,", ["a.pdf", "b.pdf"]],
+  ])("%s saves only the real entries", (_, fileAttachments, expected) => {
+    const node = createNode({ id: "n1" }, "sendEmail", "Notify");
+    const edited = { ...node, data: { ...node.data, fileAttachments } };
+
+    expect(getWorkflowBlocks([edited as AppNode], [])[0]).toMatchObject({
+      file_attachments: expected,
+    });
+  });
+});
+
 describe("withGoalUndoRecordsFrom", () => {
   const edited = {
     ...codeBlock(true),

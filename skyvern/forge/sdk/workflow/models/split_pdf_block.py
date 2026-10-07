@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
+from urllib.parse import urlparse
 
 import structlog
 from pypdf import PdfReader, PdfWriter
@@ -17,7 +18,8 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     download_file,
     get_path_for_workflow_download_directory,
-    validate_local_file_path,
+    parse_uri_to_path,
+    resolve_local_or_download_file,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -135,13 +137,15 @@ class SplitPdfBlock(Block):
     async def _resolve_source_pdf(self, workflow_run_id: str, organization_id: str | None) -> tuple[str, bool]:
         if settings.ENV == "local" and os.path.exists(self.file_url):
             return self.file_url, False
-        if self.file_url.startswith("/"):
+        parsed_url = urlparse(self.file_url)
+        if self.file_url.startswith("/") or parsed_url.scheme == "file":
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
-            resolved = validate_local_file_path(self.file_url, run_id)
-            if not os.path.isfile(resolved):
-                raise FileNotFoundError(f"Local file not found: {self.file_url}")
-            return resolved, False
+            resolved = await resolve_local_or_download_file(self.file_url, run_id, organization_id)
+            is_temp = parsed_url.scheme == "file" and os.path.realpath(resolved) != os.path.realpath(
+                parse_uri_to_path(self.file_url)
+            )
+            return resolved, is_temp
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
@@ -304,8 +308,11 @@ class SplitPdfBlock(Block):
         reader: PdfReader,
         documents: list[dict[str, Any]],
         base_dir: Path,
+        source_pdf_path: str,
     ) -> list[tuple[dict[str, Any], bytes]]:
         written: list[tuple[dict[str, Any], bytes]] = []
+        source_path = Path(source_pdf_path).resolve()
+        used_paths: set[tuple[str, str]] = set()
         for document in documents:
             start_page = cast(int, document["start_page"])
             end_page = cast(int, document["end_page"])
@@ -320,14 +327,25 @@ class SplitPdfBlock(Block):
             folder = cast(str, document.get("folder") or "")
             output_dir = base_dir.joinpath(*folder.split("/")) if folder else base_dir
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / cast(str, document["name"])
+            output_name = cast(str, document["name"])
+            output_path = output_dir / output_name
+            while (
+                (folder, output_name) in used_paths
+                or output_path.resolve() == source_path
+                or (output_path.exists() and output_path.samefile(source_path))
+            ):
+                used_paths.add((folder, output_name))
+                output_name = SplitPdfBlock._deduplicate_document_name(folder, output_name, used_paths)
+                output_path = output_dir / output_name
+            used_paths.add((folder, output_name))
             output_path.write_bytes(pdf_bytes)
 
             doc_meta = dict(document)
             doc_meta.update(
                 {
+                    "name": output_name,
                     "file_path": str(output_path),
-                    "file_name": document["name"],
+                    "file_name": output_name,
                     "file_size": len(pdf_bytes),
                     "page_range": [start_page, end_page],
                     "page_count": end_page - start_page + 1,
@@ -479,7 +497,7 @@ class SplitPdfBlock(Block):
                     )
 
                 base_dir = get_path_for_workflow_download_directory(workflow_run_id)
-                written = self._write_split_documents(reader, documents, base_dir)
+                written = self._write_split_documents(reader, documents, base_dir, source_pdf_path)
 
                 artifact_org_id = organization_id or workflow_run_context.organization_id
                 artifact_block = await self._resolve_workflow_run_block(workflow_run_block_id, artifact_org_id)

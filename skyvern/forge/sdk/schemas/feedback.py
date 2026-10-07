@@ -3,8 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-FeedbackTargetType = Literal["workflow_run", "task", "copilot_message"]
-RunFeedbackTargetType = Literal["workflow_run", "task"]
+FeedbackTargetType = Literal["workflow_run", "task", "copilot_message", "browser_recording"]
+RunFeedbackTargetType = Literal["workflow_run", "task", "browser_recording"]
 FeedbackRating = Literal["up", "down"]
 
 

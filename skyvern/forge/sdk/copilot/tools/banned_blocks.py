@@ -135,8 +135,8 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
         _WITHOUT_AGENT_BLOCKS,
         "credential-typed code synthesis with runtime credential resolution",
         (
-            "Use credential-typed code: scout saved-credential fields with fill_credential_field, bind the "
-            "credential as a credential_id workflow parameter, and read the resolved credential object in code."
+            "Use credential-typed code: bind the credential as a credential_id workflow parameter and read the "
+            "resolved credential object in code."
         ),
     ),
     "file_download": _P(
@@ -204,8 +204,8 @@ AUTHORING_FAMILY_GUIDANCE = (
     "Write a `code` block for browser work: that is the default. Write an agent block (engine `skyvern-3.0`) "
     "only when the user asks for one, when the site or page is only known at run time, or when the page has "
     "been shown to change so much between visits that fixed code is not practical. An unclear item in the "
-    "request is settled by scouting the site or by asking, not by an agent block. Among agent blocks, a "
-    "sign-in is a `login` block, not a hand-built `navigation`. Both families belong in one workflow."
+    "request is settled by scouting the site or by asking, not by an agent block. "
+    "Both families belong in one workflow."
 )
 
 # Every capability carries this: the runtime facts the deleted code-mode prompt used to state are now
@@ -332,13 +332,10 @@ def _code_only_browser_unavailable_summary() -> str:
 
 def _code_only_browser_validation_guidance(*, agent_blocks: bool = False) -> str:
     if agent_blocks:
-        return (
-            "validate_block is never for `code` blocks or dummy/probe code blocks; validate real code blocks "
-            "through update_and_run_blocks."
-        )
+        return "validate_block is never for `code` blocks; validate real code blocks by test-running them."
     return (
-        "validate_block is only for allowed non-browser helper blocks, never for `code` blocks, dummy/probe "
-        "code blocks, or browser/page native block types; validate real code blocks through update_and_run_blocks."
+        "validate_block is only for allowed non-browser helper blocks, never for `code` blocks "
+        "or browser/page native block types; validate real code blocks by test-running them."
     )
 
 
@@ -352,7 +349,7 @@ def _saved_credential_guidance() -> str:
         f"object. For a `password` credential, read {username} and {password}, use {otp} for authenticator, email, "
         f"or SMS one-time codes, and use {magic_link} when the scouted page offers an emailed sign-in link; that "
         "broker navigates the page without exposing the sign-in link to authored code. Never put literal secret "
-        "values in code; scout password-credential fields with fill_credential_field, which does not fill secrets."
+        "values in code."
     )
 
 
@@ -386,7 +383,13 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
         "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
         WRAPPER_SCOPE_RUNTIME_FACT,
-        "When a scouting tool offers a SYNTHESIZED CODE BLOCK it already encodes the interactions you scouted as deterministic Playwright: persist it verbatim and hand-author only the steps it does not cover. Direct browser evaluate is a scouting tool; a persisted code block must not use page.evaluate, page.evaluate_handle, page.request, or page.context. Use locators and locator DOM-reading methods such as inner_text, text_content, get_attribute, count, and is_visible instead.",
+        (
+            "When a scouting tool offers a SYNTHESIZED CODE BLOCK it already encodes the interactions you scouted as "
+            "deterministic Playwright: persist it verbatim and hand-author only the steps it does not cover. A "
+            "persisted code block must not use page.evaluate, page.evaluate_handle, page.request, or page.context. "
+            "Use locators and locator DOM-reading methods such as inner_text, text_content, get_attribute, count, "
+            "and is_visible instead."
+        ),
         "For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.",
         availability,
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
@@ -396,9 +399,9 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
         _saved_credential_guidance(),
         _secret_credential_guidance(),
-        "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
+        "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting.",
         *([_IMAGE_CAPTCHA_GUIDANCE] if image_ocr else []),
-        "The Code runtime provides await clear_browser_data(page) when a site needs a clean session before it will sign in: it drops every cookie in the run's browser and all stored data for every origin it has a page or frame open on, and returns nothing. Read page.url first and navigate back to it afterwards. Browser settings pages (chrome://...) cannot be navigated to; this helper is the way to clear state. A workflow parameter named clear_browser_data shadows the helper in both executors. Before calling the helper in that case, rename the parameter to an unused name, preserve its value/default, and update its block bindings, code/template references, and caller-supplied run input keys.",
+        "The Code runtime provides await clear_browser_data(page) when a site needs a clean session before it will sign in: it drops every cookie in the run's browser and all stored data for every origin it has a page or frame open on, and returns nothing. Read page.url first and navigate back to it afterwards.",
         "For file attachment: bind the file as a workflow parameter with workflow_parameter_type file_url, then call await attach_authorized_file(page, <file_parameter>, <observed_selector>). The parameter is a handle, not a path: pass it only to that helper. Attaching puts the file's contents in the page, where page scripts and page.evaluate can read them, so attach it only to the page that should receive it. It accepts only that run's materialized file, uploads at most 10 MB, and returns filename and size. To upload a file this block downloads, claim it with async with page.expect_download() as info: and pass await info.value to the same helper, never its path.",
     ]
 

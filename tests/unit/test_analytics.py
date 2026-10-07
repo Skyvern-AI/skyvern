@@ -3,7 +3,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from skyvern import analytics
+
+
+@pytest.fixture(autouse=True)
+def _telemetry_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise capture(), so turn telemetry on rather than inherit it from the environment.
+
+    CI sets SKYVERN_TELEMETRY=false so the test suite never sends events to PostHog.
+    """
+    monkeypatch.setattr(analytics.settings, "SKYVERN_TELEMETRY", True)
 
 
 class FakePosthog:

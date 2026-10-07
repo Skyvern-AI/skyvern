@@ -230,6 +230,10 @@ async def _capture_body(response: Any, request_id: int, state: Any) -> None:
 
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
     """Create console/network/dialog/pageerror handlers bound to a specific page."""
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    # Stateless HTTP mode disables every body reader, so a fetch there only blocks the hosting (API) event loop.
+    capture_bodies = not is_stateless_http_mode()
 
     def _on_console(msg: Any) -> None:
         try:
@@ -297,7 +301,7 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
                 return
             state.network_requests.append(network_event)
 
-            if _should_capture_body(content_type, content_length):
+            if capture_bodies and _should_capture_body(content_type, content_length):
                 try:
                     task = asyncio.create_task(_capture_body(response, request_id, state))
                     state._pending_tasks.add(task)

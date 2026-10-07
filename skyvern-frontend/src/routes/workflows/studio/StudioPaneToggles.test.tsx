@@ -191,7 +191,7 @@ describe("StudioPaneToggles structure", () => {
   test("reflects the built-agent default panes as expanded", () => {
     renderAt();
     expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("false");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
@@ -379,7 +379,7 @@ describe("StudioPaneToggles run selector", () => {
     fireEvent.click(tab("Past Runs"));
     fireEvent.click(await screen.findByText("wr_pick"));
 
-    expect(currentPanes()).toBe("browser,overview");
+    expect(currentPanes()).toBe("overview,browser");
     expect(urlPanes()).toBeNull();
     expect(screen.getByTestId("search").textContent).toBe("?wr=wr_pick");
     await waitFor(() => expect(screen.queryByText("wr_pick")).toBeNull());
@@ -408,7 +408,7 @@ describe("StudioPaneToggles run selector", () => {
       );
       expect(params.get("wr")).toBe("wr_pick");
       expect(params.has("panes")).toBe(false);
-      expect(currentPanes()).toBe("browser,overview");
+      expect(currentPanes()).toBe("overview,browser");
       expect(screen.getByTestId("route-state").textContent).toBe("null");
     });
     expect(window.history.state.usr).toBeNull();

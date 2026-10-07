@@ -31,6 +31,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_run_metadata,
     normalize_run_with,
 )
+from skyvern.schemas.browser_settings import BrowserSettingsReceipt
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
     ERROR_CODE_MAPPING_EXAMPLES,
@@ -830,6 +831,11 @@ class WorkflowRunResponse(BaseRunResponse):
         default=None,
         description="Which layer of the seed-precedence chain seeded this run's browser (provenance).",
         examples=["credential", "own_memory", "fresh"],
+    )
+    browser_settings_receipt: BrowserSettingsReceipt | None = Field(
+        default=None,
+        description="The timezone the run's browser reported against the one its workflow version requested. "
+        "Null when the version requests no browser settings or the browser has not been measured yet.",
     )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"

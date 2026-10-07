@@ -269,7 +269,7 @@ describe("BlockConfigSidebar mount stability (SKY-9360)", () => {
 });
 
 describe("BlockConfigSidebar footer label", () => {
-  test("footer reads 'updated N sec ago' (not 'saved') so users do not confuse it with a Cmd+S persist", () => {
+  test("footer reads 'updated N sec ago' (not 'saved') so users do not confuse it with a workflow save", () => {
     useSidebarSaveStateStore.getState().setLastUpdatedAt("block-a", Date.now());
     act(() => {
       useWorkflowPanelStore.getState().setSelectedBlockId("block-a");

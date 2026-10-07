@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Union
 
 import jwt
+from jwt.exceptions import InvalidKeyError
 
 from skyvern.config import settings
 
@@ -22,6 +23,15 @@ def _normalize_numbers(x: Any) -> Any:
 
 def _normalize_json_dumps(payload: dict) -> str:
     return json.dumps(_normalize_numbers(payload), separators=(",", ":"), ensure_ascii=False)
+
+
+def assert_signing_key_usable() -> None:
+    # PyJWT >= 2.14 refuses HMAC keys shaped like PEM, SSH or JWK material. Fail at boot
+    # rather than rejecting every API key at request time.
+    try:
+        jwt.encode({"sub": "startup-check"}, settings.SECRET_KEY, algorithm=settings.SIGNATURE_ALGORITHM)
+    except InvalidKeyError as e:
+        raise RuntimeError("SECRET_KEY looks like asymmetric key material; use a plain random string") from e
 
 
 def create_access_token(

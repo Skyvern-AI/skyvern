@@ -453,6 +453,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         reuse_browser_session=None,
         browser_profile_id="bprof_123",
         browser_seed_source=None,
+        browser_settings_receipt=None,
         run_with="code",
         ai_fallback=True,
     )
@@ -652,6 +653,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
+        browser_settings_receipt=None,
         run_with=None,
         ai_fallback=None,
     )

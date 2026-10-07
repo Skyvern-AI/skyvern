@@ -1,5 +1,6 @@
 """Tests for WorkflowRunContext initialization in context_manager."""
 
+import io
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -11,12 +12,15 @@ from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from google.api_core.exceptions import PermissionDenied, ServiceUnavailable
 from structlog.testing import capture_logs
 
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import (
     BitwardenAccessDeniedError,
     BitwardenListItemsError,
     CredentialItemNotFoundError,
+    CredentialParameterNotFoundError,
     CredentialSourceNotConfiguredError,
     HttpException,
+    InvalidWorkflowParameter,
     OnePasswordServiceUnavailableError,
     OnePasswordSessionExpiredError,
 )
@@ -44,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, Wai
 from skyvern.forge.sdk.workflow.models.parameter import (
     AzureVaultCredentialParameter,
     BitwardenLoginCredentialParameter,
+    CredentialParameter,
     WorkflowParameter,
     WorkflowParameterType,
 )
@@ -51,7 +56,9 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.workflows import BlockStatus
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
+from tests.unit.helpers import unsolved_captcha_relabel_categories
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.test_forge_log_foreign_tracebacks import _sole_record, json_stream  # noqa: F401
 
 
 def _make_workflow_parameter(
@@ -106,6 +113,35 @@ def _make_organization() -> Organization:
         created_at=now,
         modified_at=now,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parameter_type",
+    [
+        WorkflowParameterType.INTEGER,
+        WorkflowParameterType.FLOAT,
+        WorkflowParameterType.BOOLEAN,
+        WorkflowParameterType.JSON,
+    ],
+)
+async def test_a_scrubbed_typed_input_cannot_start_execution(parameter_type: WorkflowParameterType) -> None:
+    # Retention scrubbing does not wait for a run to finish, so a paused run can be resumed with scrubbed inputs.
+    parameter = _make_workflow_parameter("count", workflow_parameter_type=parameter_type)
+    with pytest.raises(InvalidWorkflowParameter):
+        await WorkflowRunContext.init(
+            aws_client=MagicMock(),
+            organization=_make_organization(),
+            workflow_run_id="wr_test",
+            workflow_title="Test",
+            workflow_id="wf_test",
+            workflow_permanent_id="wpid_test",
+            workflow_parameter_tuples=[(parameter, _make_run_parameter(parameter, SCRUBBED_VALUE))],
+            workflow_output_parameters=[],
+            context_parameters=[],
+            secret_parameters=[],
+            workflow=_make_workflow([parameter]),
+        )
 
 
 class TestAtWillCredentialBackfill:
@@ -262,9 +298,14 @@ _FETCH_LINE_FIELDS = {
     "log_level",
     "provider",
     "parameter_type",
+    "parameter_key",
+    "credential_id",
     "outcome",
     "failure_type",
     "duration_seconds",
+    "session_reused",
+    "login_seconds",
+    "lock_wait_seconds",
 }
 
 
@@ -296,6 +337,7 @@ def _install_credential_app(
             DATABASE=SimpleNamespace(
                 organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None)),
                 credentials=SimpleNamespace(get_credential=AsyncMock(return_value=db_credential)),
+                workflow_run_credential_selections=SimpleNamespace(get_selection=AsyncMock(return_value=None)),
             ),
             CREDENTIAL_VAULT_SERVICES={CredentialVaultType.AZURE_VAULT: vault_service},
             AGENT_FUNCTION=SimpleNamespace(
@@ -491,6 +533,87 @@ class TestRunCredentialFetchOutcome:
             (provider, "credential_id", outcome)
         ]
 
+    @pytest.mark.asyncio
+    async def test_each_read_names_the_credential_it_resolved_and_the_parameter_it_bound(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        json_stream: io.StringIO,  # noqa: F811
+    ) -> None:
+        db_credential = SimpleNamespace(
+            vault_type=CredentialVaultType.AZURE_VAULT,
+            totp_identifier=None,
+            run_sequentially=False,
+            tested_url=None,
+        )
+        item = CredentialItem(
+            item_id="item_1",
+            name="Portal",
+            credential_type=CredentialType.PASSWORD,
+            credential=PasswordCredential(username="user@example.com", password="synthetic-password"),
+        )
+        _install_credential_app(
+            monkeypatch,
+            db_credential=db_credential,
+            vault_service=SimpleNamespace(get_credential_item=AsyncMock(return_value=item)),
+        )
+        # The definition binds through a run input, so the logged ID must be the resolved one, not the input's name.
+        portal_input = _make_workflow_parameter("portal_cred")
+        backup_input = _make_workflow_parameter(
+            "backup_login", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID
+        )
+        now = datetime.now(UTC)
+        portal_login = CredentialParameter(
+            key="portal_login",
+            credential_parameter_id="cp_1",
+            workflow_id="wf_test",
+            credential_id="portal_cred",
+            created_at=now,
+            modified_at=now,
+        )
+
+        await _init_context(
+            workflow_parameter_tuples=[
+                (portal_input, _make_run_parameter(portal_input, "cred_live")),
+                (backup_input, _make_run_parameter(backup_input, "cred_backup")),
+            ],
+            secret_parameters=[portal_login],
+        )
+
+        bound = {
+            key: _sole_record(
+                json_stream,
+                lambda r, key=key: r.get("msg") == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE
+                and r.get("parameter_key") == key,
+            )["credential_id"]
+            for key in ("portal_login", "backup_login")
+        }
+        assert bound == {"portal_login": "cred_live", "backup_login": "cred_backup"}
+
+    @pytest.mark.asyncio
+    async def test_a_run_input_that_names_no_stored_credential_is_not_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        json_stream: io.StringIO,  # noqa: F811
+    ) -> None:
+        _install_credential_app(monkeypatch, db_credential=None)
+        backup_input = _make_workflow_parameter(
+            "backup_login", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID
+        )
+        pasted_secret = "{'username': 'ada', 'password': 'synthetic-password'}"
+
+        with pytest.raises(CredentialParameterNotFoundError):
+            await _init_context(
+                workflow_parameter_tuples=[(backup_input, _make_run_parameter(backup_input, pasted_secret))]
+            )
+
+        record = _sole_record(
+            json_stream,
+            lambda r: r.get("msg") == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE
+            and r.get("parameter_key") == "backup_login",
+        )
+        assert (record["outcome"], record["credential_id"]) == ("missing_binding", None)
+        assert "synthetic-password" not in json.dumps(record)
+
     @pytest.mark.parametrize(
         ("error", "customer_owned", "outcome"),
         [
@@ -557,6 +680,17 @@ def test_block_outcome_masks_secrets_before_bounding_the_reason() -> None:
     assert context.get_block_outcome("never_ran") is None
 
 
+def test_workflow_level_template_registers_a_secret_it_transformed() -> None:
+    context = _outcome_context()
+    context.secrets["placeholder_pw"] = "hunter2secret"
+    context.values["pw"] = "hunter2secret"
+
+    rendered = context.render_workflow_level_template("Never reveal {{ pw|upper }}.")
+
+    assert rendered == "Never reveal HUNTER2SECRET."
+    assert context.mask_secrets_in_data(rendered) == "Never reveal *****."
+
+
 @pytest.mark.asyncio
 async def test_block_outcome_is_invisible_to_templates_and_the_branch_snapshot() -> None:
     context = _outcome_context()
@@ -580,3 +714,27 @@ async def test_block_outcome_is_invisible_to_templates_and_the_branch_snapshot()
     assert context.get_block_outcome("login") == BlockOutcome(
         status=BlockStatus.failed, error_codes=["AUTH_FAILURE"], failure_reason="wrong password"
     )
+
+
+@pytest.mark.asyncio
+async def test_templates_see_the_failure_categories_from_before_an_output_only_relabel() -> None:
+    before, after = unsolved_captcha_relabel_categories()
+    # Customer data that happens to look like a category list is not a failure_category and stays as is.
+    lookalike_rows = after
+
+    async def observe(categories: list[dict] | None) -> tuple[str, str]:
+        context = _outcome_context()
+        login_output = make_block_output_parameter("login_output")
+        await context.register_output_parameter_value_post_execution(
+            login_output, {"status": "failed", "failure_category": categories, "rows": lookalike_rows}
+        )
+        block = WaitBlock(label="login", output_parameter=login_output, wait_sec=1)
+        rendered = block.format_block_parameter_template_from_workflow_run_context(
+            "{{ login }} | {{ login_output }} | {{ workflow_run_outputs }}", context
+        )
+        branch_context = BranchEvaluationContext(workflow_run_context=context, block_label="login")
+        return rendered, json.dumps(branch_context.build_llm_safe_context_snapshot(), sort_keys=True, default=str)
+
+    rendered_after = await observe(after)
+    assert rendered_after == await observe(before)
+    assert after[0]["reason_code"] in rendered_after[0]

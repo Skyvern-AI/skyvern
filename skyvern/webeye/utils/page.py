@@ -25,6 +25,7 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     ElementTreeBuildFailed,
     FailedToTakeScreenshot,
     ScreenshotTargetClosed,
@@ -36,6 +37,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.webeye.action_deadline import under_action_deadline
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
@@ -1032,6 +1034,20 @@ async def _page_screenshot_helper(
                 pass
 
 
+async def _bounded_page_screenshot(
+    page: Page,
+    file_path: str | None,
+    full_page: bool,
+    timeout: float,
+    animations: Literal["allow", "disabled"],
+) -> bytes:
+    # The driver's own screenshot timeout has been seen not to fire for hours on an unresponsive page. The
+    # action deadline also re-cancels a driver that swallows the first cancellation and rejects a late image.
+    async with under_action_deadline(budget_ms=int(timeout)):
+        screenshot = await page.screenshot(path=file_path, timeout=timeout, full_page=full_page, animations=animations)
+    return screenshot
+
+
 async def _control_screenshot(
     page: Page,
     file_path: str | None,
@@ -1041,14 +1057,11 @@ async def _control_screenshot(
 ) -> bytes:
     """Current-main behavior: Playwright-first, raw-CDP rescue on timeout for the eligible path."""
     try:
-        return await page.screenshot(
-            path=file_path,
-            timeout=timeout,
-            full_page=full_page,
-            animations="disabled",
-        )
+        return await _bounded_page_screenshot(page, file_path, full_page, timeout, animations="disabled")
     except Exception as timeout_error:
-        if not is_engine_timeout(timeout_error, engine_selection):
+        # A driver that left its own timeout unanswered would leave the rescue and the retry, which go
+        # through it too, unanswered as well.
+        if isinstance(timeout_error, ActionDeadlineExceeded) or not is_engine_timeout(timeout_error, engine_selection):
             raise
         if page.is_closed():
             raise
@@ -1078,12 +1091,7 @@ async def _control_screenshot(
         LOG.info(
             f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
         )
-        return await page.screenshot(
-            path=file_path,
-            timeout=timeout,
-            full_page=full_page,
-            animations="allow",
-        )
+        return await _bounded_page_screenshot(page, file_path, full_page, timeout, animations="allow")
 
 
 _monotonic = time.monotonic  # test seam: monkeypatch page_module._monotonic, never the time module
@@ -1113,7 +1121,9 @@ async def _cdp_first_screenshot(
     time consumes the caller budget before the fallback's remaining ms are computed; it is deliberately
     not clipped to the remaining budget because cleanup ownership must complete. Worst case the
     caller-visible tail exceeds the deadline by at most the detach bound, and if detach spends the
-    remaining budget the fallback is truthfully skipped."""
+    remaining budget the fallback is truthfully skipped. A fallback whose driver never answers its own
+    timeout ends at the action deadline, which adds ``ACTION_DEADLINE_HEADROOM_MS`` to that tail, plus one
+    re-cancel interval for each cancellation the driver swallows."""
     deadline = _monotonic() + max(timeout, 0.0) / 1000.0
     rescued = await _cdp_rescue_screenshot(
         page=page,
@@ -1152,16 +1162,11 @@ async def _cdp_first_screenshot(
         )
     started = time.time()
     try:
-        screenshot = await page.screenshot(
-            path=file_path,
-            timeout=remaining_ms,
-            full_page=False,
-            animations="disabled",
-        )
+        screenshot = await _bounded_page_screenshot(page, file_path, False, remaining_ms, animations="disabled")
     except Exception as exc:
         if page.is_closed() or _is_screenshot_target_closed(exc, engine_selection):
             outcome = ScreenshotOutcome.TARGET_CLOSED
-        elif is_engine_timeout(exc, engine_selection):
+        elif isinstance(exc, ActionDeadlineExceeded) or is_engine_timeout(exc, engine_selection):
             outcome = ScreenshotOutcome.TIMEOUT
         else:
             outcome = ScreenshotOutcome.ERROR
@@ -1265,12 +1270,12 @@ async def _current_viewpoint_screenshot_helper(
         skyvern_context.record_browser_success()
         return screenshot
     except Exception as e:
-        # ScreenshotTargetClosed / _ScreenshotDeadlineExceeded are our own canonical signals, not driver
-        # errors, so a pinned engine's is_engine_error rejects them; exempt them here so they reach the
-        # established terminal mapper (target_closed / timeout) instead of being re-raised untelemetered.
+        # ScreenshotTargetClosed / _ScreenshotDeadlineExceeded / ActionDeadlineExceeded are our own canonical
+        # signals, not driver errors, so a pinned engine's is_engine_error rejects them; exempt them here so they
+        # reach the established terminal mapper (target_closed / timeout) instead of being re-raised untelemetered.
         if (
             engine_selection is not None
-            and not isinstance(e, (_ScreenshotDeadlineExceeded, ScreenshotTargetClosed))
+            and not isinstance(e, (_ScreenshotDeadlineExceeded, ActionDeadlineExceeded, ScreenshotTargetClosed))
             and not _is_engine_error(e, engine_selection)
         ):
             raise
@@ -1292,7 +1297,9 @@ async def _current_viewpoint_screenshot_helper(
                 ),
             )
             raise ScreenshotTargetClosed(error_message=str(e)) from e
-        if isinstance(e, _ScreenshotDeadlineExceeded) or is_engine_timeout(e, engine_selection):
+        if isinstance(e, (_ScreenshotDeadlineExceeded, ActionDeadlineExceeded)) or is_engine_timeout(
+            e, engine_selection
+        ):
             skyvern_context.record_browser_timeout(BrowserOperation.SCREENSHOT)
             LOG.warning(
                 "Screenshot timeout",
@@ -2091,6 +2098,19 @@ def pop_destination_facts(nodes: object) -> dict[str, dict]:
     return facts
 
 
+@dataclasses.dataclass(frozen=True)
+class ElementScrollMetrics:
+    scroll_top: float
+    client_height: float
+    scroll_height: float
+
+    @property
+    def at_bottom(self) -> bool:
+        # Fractional device-pixel ratios leave scroll_top + client_height a sub-pixel short of
+        # scroll_height even when the container is really scrolled all the way down.
+        return self.scroll_top + self.client_height >= self.scroll_height - 1
+
+
 class SkyvernFrame:
     engine_selection: BrowserEngineSelection | None = None
 
@@ -2534,9 +2554,9 @@ class SkyvernFrame:
                 failure = exc.__cause__ if isinstance(exc, FailedToTakeScreenshot) and exc.__cause__ else exc
                 if isinstance(exc, ScreenshotTargetClosed) or _is_screenshot_target_closed(failure, engine_selection):
                     outcome = "target_closed"
-                elif isinstance(failure, (TimeoutError, _ScreenshotDeadlineExceeded)) or is_engine_timeout(
-                    failure, engine_selection
-                ):
+                elif isinstance(
+                    failure, (TimeoutError, _ScreenshotDeadlineExceeded, ActionDeadlineExceeded)
+                ) or is_engine_timeout(failure, engine_selection):
                     outcome = "timeout"
                 log_screenshot_failure(
                     LOG,
@@ -2775,6 +2795,24 @@ class SkyvernFrame:
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
         )
+
+    async def get_element_scroll_metrics(self, element: ElementHandle) -> ElementScrollMetrics:
+        js_script = "(element) => [element.scrollTop, element.clientHeight, element.scrollHeight]"
+        scroll_top, client_height, scroll_height = await self.evaluate(
+            frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
+        )
+        return ElementScrollMetrics(
+            scroll_top=scroll_top,
+            client_height=client_height,
+            scroll_height=scroll_height,
+        )
+
+    async def safe_get_element_scroll_metrics(self, element: ElementHandle) -> ElementScrollMetrics | None:
+        try:
+            return await self.get_element_scroll_metrics(element)
+        except Exception:
+            LOG.warning("Failed to read the element scroll metrics, ignore it", exc_info=True)
+            return None
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> dict:
         js_script = with_dom_utils(

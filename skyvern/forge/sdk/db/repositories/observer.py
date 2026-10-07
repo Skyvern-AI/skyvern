@@ -629,6 +629,7 @@ class ObserverRepository(BaseRepository):
         new_status: str,
         only_if_status_in: list[str],
         failure_reason: str | None = None,
+        organization_id: str | None = None,
     ) -> int:
         if not only_if_status_in:
             return 0
@@ -638,12 +639,13 @@ class ObserverRepository(BaseRepository):
             if failure_reason is not None:
                 update_values["failure_reason"] = failure_reason
 
-            stmt = (
-                update(WorkflowRunBlockModel)
-                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
-                .where(WorkflowRunBlockModel.status.in_(only_if_status_in))
-                .values(**update_values)
-            )
+            stmt = update(WorkflowRunBlockModel).where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+            # No index leads with workflow_run_id; the run lookup index is (organization_id, workflow_run_id).
+            # An unknown organization still has to match every block of the run, so None adds no predicate
+            # rather than the `IS NULL` a filter_by would generate.
+            if organization_id is not None:
+                stmt = stmt.where(WorkflowRunBlockModel.organization_id == organization_id)
+            stmt = stmt.where(WorkflowRunBlockModel.status.in_(only_if_status_in)).values(**update_values)
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount or 0

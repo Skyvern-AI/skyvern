@@ -8,18 +8,23 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from fastmcp import Client
 from fastmcp.server.middleware import MiddlewareContext
+from playwright.async_api import Page
 
 from skyvern.cli.core import client as client_mod
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager, session_ops
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
+from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.cli.mcp_tools.telemetry import MCPTelemetryMiddleware
 from skyvern.client.types.extensions import Extensions
 from skyvern.constants import SKYVERN_MCP_USER_AGENT
+from skyvern.library.skyvern_browser import SkyvernBrowser
+from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
@@ -196,7 +201,7 @@ def test_build_cloud_client_uses_self_url_in_stateless_mode(monkeypatch: pytest.
         def __init__(self, *args: object, **kwargs: object) -> None:
             captured_kwargs.append(dict(kwargs))
 
-    monkeypatch.setattr(client_mod, "Skyvern", FakeSkyvern)
+    monkeypatch.setattr(client_mod, "_LoopbackSkyvern", FakeSkyvern)
     session_manager.set_stateless_http_mode(True)
 
     client_mod._build_cloud_client("sk_test")
@@ -253,6 +258,54 @@ async def test_build_cloud_client_user_agent_header_reaches_the_wire(monkeypatch
 
     assert requests
     assert requests[0].headers.get("x-user-agent") == SKYVERN_MCP_USER_AGENT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hosted", [True, False])
+async def test_mcp_ai_action_outlives_the_shared_loopback_timeout_only_when_hosted(
+    monkeypatch: pytest.MonkeyPatch, hosted: bool
+) -> None:
+    """Hosted AI tools wait longer than the shared 60 s for run_action (p95 78 s), but less than the 120 s ALB idle."""
+    monkeypatch.setattr(client_mod.settings, "SKYVERN_BASE_URL", "http://skyvern.test")
+    session_manager.set_stateless_http_mode(hosted)
+    read_timeouts: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sdk/run_action"):
+            read_timeouts["run_action"] = request.extensions["timeout"]["read"]
+            return httpx.Response(200, json={"workflow_run_id": "wr_123", "result": {"title": "Example"}})
+        read_timeouts["other"] = request.extensions["timeout"]["read"]
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "wr_123",
+                "status": "queued",
+                "created_at": "2026-01-01T00:00:00Z",
+                "modified_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    token = client_mod.set_api_key_override("sk_test")
+    try:
+        skyvern = client_mod.get_skyvern()
+    finally:
+        client_mod.reset_api_key_override(token)
+    skyvern._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+    browser = SimpleNamespace(
+        skyvern=skyvern, browser_session_id="pbs_test", browser_address=None, workflow_run_id=None
+    )
+    page_ai = SdkSkyvernPageAi(cast(SkyvernBrowser, browser), cast(Page, SimpleNamespace(url="https://example.test")))
+    try:
+        assert await page_ai.ai_extract(prompt="Read the page title") == {"title": "Example"}
+        await skyvern.run_workflow(workflow_id="wpid_123")
+    finally:
+        await skyvern.aclose()
+
+    assert read_timeouts["other"] == 60
+    if hosted:
+        assert read_timeouts["other"] < read_timeouts["run_action"] < 120
+    else:
+        assert read_timeouts["run_action"] == read_timeouts["other"]
 
 
 def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -582,6 +635,70 @@ async def test_resolve_browser_blocks_implicit_session_in_stateless_mode() -> No
             await session_manager.resolve_browser()
     finally:
         session_manager.set_stateless_http_mode(False)
+
+
+class _FakeCdpConnection:
+    def __init__(self) -> None:
+        self.connected = True
+
+    async def close(self) -> None:
+        self.connected = False
+
+
+class _FakeCloudBrowser:
+    """A connected SkyvernBrowser: ``browser`` is its CDP connection; ``close()`` would also end the cloud session."""
+
+    def __init__(self) -> None:
+        self.browser = _FakeCdpConnection()
+        self._browser_context = SimpleNamespace(pages=[], on=lambda *_args: None)
+        self.session_closed = False
+
+    async def close(self) -> None:
+        self.session_closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [True, False])
+async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_opened(
+    monkeypatch: pytest.MonkeyPatch,
+    stateless: bool,
+) -> None:
+    opened: list[_FakeCloudBrowser] = []
+
+    async def connect(_session_id: str) -> _FakeCloudBrowser:
+        opened.append(_FakeCloudBrowser())
+        return opened[-1]
+
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(side_effect=connect)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+    copilot_browser = _FakeCloudBrowser()
+    session_manager.register_copilot_session(
+        "pbs_copilot",
+        session_manager.SessionState(
+            browser=copilot_browser,
+            context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
+        ),
+        organization_id="org_1",
+    )
+    session_manager.set_stateless_http_mode(stateless)
+
+    with session_manager.request_session_scope("org_1"):
+        async with Client(mcp) as client:
+            for session_id in ("pbs_123", "pbs_123", "pbs_copilot"):
+                result = await client.call_tool("skyvern_tab_list", {"session_id": session_id})
+                assert result.structured_content is not None
+                assert result.structured_content["ok"] is True
+
+    if stateless:
+        assert len(opened) == 2
+        assert not any(browser.browser.connected for browser in opened)
+    else:
+        # Stateful transports keep the organization's connection for the next call.
+        assert len(opened) == 1
+        assert opened[0].browser.connected
+    assert copilot_browser.browser.connected
+    assert not any(browser.session_closed for browser in [*opened, copilot_browser])
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 import inspect
 import logging
+import math
 import random
 import re
 import sys
@@ -10,6 +11,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Callable, Iterator, SupportsIndex, TypeGuard, overload
@@ -899,11 +901,18 @@ def _truncate_log_value(value: Any, max_chars: int) -> Any:
     return f"{text[:max_chars]}... [truncated]"
 
 
+# Server-authored internal envelopes: kept on the stdout/Datadog record but popped before the
+# downloadable context.log artifact, and preserved (keys not scrubbed) by the secret scrubber.
+INTERNAL_ATTRIBUTION_ENVELOPE_KEYS: tuple[str, ...] = ("failure_attribution", "operation_attribution")
+
+
 def _bounded_failure_attribution(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    attribution = event_dict.get("failure_attribution")
-    if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
-        return {"failure_attribution": attribution}
-    return {}
+    bounded: EventDict = {}
+    for key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS:
+        attribution = event_dict.get(key)
+        if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
+            bounded[key] = attribution
+    return bounded
 
 
 def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: EventDict) -> str:
@@ -969,6 +978,59 @@ def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: Ev
     )
 
 
+def _number_log_forms(node: int | float | Decimal) -> set[str]:
+    # The JSON renderer emits a Decimal as a float, and an integral float reads as its int too.
+    forms = {str(node)}
+    try:
+        as_float = float(node)
+        forms.add(str(as_float))
+        if math.isfinite(as_float) and as_float.is_integer():
+            forms.add(str(int(node)))
+    except (OverflowError, ValueError):
+        pass
+    return forms
+
+
+# Another session's short value is chance inside an id, path, date or decimal, so it matches only a whole token:
+# a letter, digit or "_" joins, as does ".", ":" or "-" beside a digit, but a %XX, \n, \r, \t or \uXXXX escape separates.
+_TOKEN_LEFT = r"(?:(?<![A-Za-z0-9_])(?<![0-9][.:-])|(?<=%[0-9A-Fa-f]{2})|(?<=\\[nrt])|(?<=\\u[0-9A-Fa-f]{4}))"
+_TOKEN_RIGHT = r"(?![A-Za-z0-9_])(?![.:-][0-9])"
+_SHORT_TOKEN = re.compile(rf"{_TOKEN_LEFT}[A-Za-z0-9]{{1,3}}{_TOKEN_RIGHT}")
+_SHORT_TOKEN_VALUE = re.compile(r"[A-Za-z0-9]{1,3}")
+
+
+def _is_token_char(char: str) -> bool:
+    return char.isascii() and char.isalnum()
+
+
+@lru_cache(maxsize=1)
+def _short_value_scrubber(values: frozenset[str], placeholder: str) -> Callable[[str], str] | None:
+    if not values:
+        return None
+    tokens = frozenset(value for value in values if _SHORT_TOKEN_VALUE.fullmatch(value))
+    others = sorted(values - tokens, key=len, reverse=True)
+    # A value with punctuation, such as "#7", gets a boundary only on an alphanumeric edge, so "x#7" still matches.
+    edged = (
+        re.compile(
+            "|".join(
+                (_TOKEN_LEFT if _is_token_char(value[0]) else "")
+                + re.escape(value)
+                + (_TOKEN_RIGHT if _is_token_char(value[-1]) else "")
+                for value in others
+            )
+        )
+        if others
+        else None
+    )
+
+    def scrub(text: str) -> str:
+        if tokens:
+            text = _SHORT_TOKEN.sub(lambda match: placeholder if match.group() in tokens else match.group(), text)
+        return text if edged is None else edged.sub(placeholder, text)
+
+    return scrub
+
+
 def _registered_secret_scrubber(
     *, logging_envelope: bool = False, protocol_level: str | None = None
 ) -> Callable[[Any, int], Any] | None:
@@ -976,11 +1038,14 @@ def _registered_secret_scrubber(
     # existing scrub helpers; never initialize the app or log from this processor.
     from skyvern.forge.sdk.copilot.secret_scrub import (
         REDACTED_SECRET_PLACEHOLDER,
-        all_registered_secret_values,
         encoded_secret_variants,
+        log_scrub_values,
     )
 
-    variants = set(all_registered_secret_values())
+    copilot_values, short_values = log_scrub_values()
+    copilot_variants = set(copilot_values)
+    # The line's own values are already replaced as text by then, so this pass needs no exclusion for them.
+    short_scrub = _short_value_scrubber(short_values, REDACTED_SECRET_PLACEHOLDER)
     registered: set[str] = set()
     context = skyvern_context.current()
     if context is not None:
@@ -1005,12 +1070,13 @@ def _registered_secret_scrubber(
                     registered.update(
                         value for value in run_context.secrets.values() if isinstance(value, str) and value
                     )
+    run_variants: set[str] = set()
     for value in registered:
         if isinstance(value, str) and value:
-            variants.update(encoded_secret_variants(value))
-    if not variants:
+            run_variants.update(encoded_secret_variants(value))
+    if not copilot_variants and not run_variants and short_scrub is None:
         return None
-    secrets = sorted(variants, key=len, reverse=True)
+    secrets = sorted(copilot_variants | run_variants, key=len, reverse=True)
     seen: set[int] = set()
     remaining = 10_000
 
@@ -1024,16 +1090,18 @@ def _registered_secret_scrubber(
         if isinstance(node, str):
             for secret in secrets:
                 node = node.replace(secret, REDACTED_SECRET_PLACEHOLDER)
-            return node
+            return node if short_scrub is None else short_scrub(node)
         if node is None or isinstance(node, bool):
             return node
         if isinstance(node, (int, float, Decimal)):
-            # Keep ordinary numbers numeric. Decimal is emitted as a float by
-            # the JSON renderer, so check that representation as well.
-            text = str(node)
-            if isinstance(node, Decimal):
-                text += " " + str(float(node))
-            return REDACTED_SECRET_PLACEHOLDER if any(secret in text for secret in secrets) else node
+            # A Copilot value replaces only a number that is the value, since a short one among a duration's
+            # digits is chance. The run's own secrets replace any number that contains them.
+            forms = _number_log_forms(node)
+            if not forms.isdisjoint(copilot_variants) or any(
+                secret in form for form in forms for secret in run_variants
+            ):
+                return REDACTED_SECRET_PLACEHOLDER
+            return node
 
         marker = id(node)
         if marker in seen:
@@ -1048,7 +1116,7 @@ def _registered_secret_scrubber(
                     logging_envelope
                     and depth == 0
                     and type(key) is str
-                    and key in ("event", "msg", "level", "failure_attribution")
+                    and key in ("event", "msg", "level", *INTERNAL_ATTRIBUTION_ENVELOPE_KEYS)
                 )
                 generated_field = depth == 0 and is_generated_log_field(key, item)
                 output_key = key if preserve_keys or protocol_field or generated_field else scrub(key, depth + 1)
@@ -1064,7 +1132,7 @@ def _registered_secret_scrubber(
                     result[output_key] = scrub(
                         item,
                         depth + 1,
-                        preserve_keys=preserve_keys or (protocol_field and key == "failure_attribution"),
+                        preserve_keys=preserve_keys or (protocol_field and key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS),
                     )
             return result
         if isinstance(node, list):
@@ -1238,8 +1306,9 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
     context = skyvern_context.current()
     if context:
         log_entry = dict(event_dict)
-        # Attribution is internal-only; context logs become downloadable run artifacts.
-        log_entry.pop("failure_attribution", None)
+        # Attribution envelopes are internal-only; context logs become downloadable run artifacts.
+        for _attribution_key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS:
+            log_entry.pop(_attribution_key, None)
         if workflow_run_id := log_entry.get("workflow_run_id"):
             attempt_number = skyvern_context.current_workflow_log_attempt(workflow_run_id)
             if attempt_number is not None:

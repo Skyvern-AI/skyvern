@@ -455,24 +455,31 @@ describe("SaveButton confirmation gating", () => {
     },
   );
 
-  test("saves directly with no confirmation when the draft matches the baseline", () => {
-    const clean = saveData([block("a", { url: "x" })]);
-    useWorkflowHasChangesStore.setState({
-      getSaveData: () => clean,
-      saveIsPending: false,
-    });
-    useWorkflowSnapshotStore.setState({
-      snapshot: snapshotOf(clean),
-      contentDirty: false,
-      userHasEdited: false,
-    });
+  test.each([
+    [true, 1],
+    [false, 0],
+  ])(
+    "a draft matching the baseline saves with no confirmation only when the editor has changes (hasChanges %s)",
+    (hasChanges, saves) => {
+      const clean = saveData([block("a", { url: "x" })]);
+      useWorkflowHasChangesStore.setState({
+        getSaveData: () => clean,
+        saveIsPending: false,
+        hasChanges,
+      });
+      useWorkflowSnapshotStore.setState({
+        snapshot: snapshotOf(clean),
+        contentDirty: false,
+        userHasEdited: false,
+      });
 
-    renderSaveButton();
-    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+      renderSaveButton();
+      fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
 
-    expect(screen.queryByText("Saving Changes")).toBeNull();
-    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
-  });
+      expect(screen.queryByText("Saving Changes")).toBeNull();
+      expect(saveWorkflowSpy).toHaveBeenCalledTimes(saves);
+    },
+  );
 
   test("confirms an uncommitted YAML-draft edit the canvas hasn't caught up to", () => {
     const canvas = saveData([block("a", { block_type: "code", code: "# a" })]);
@@ -549,9 +556,11 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
 
   beforeEach(() => {
     const data = clean();
+    // A pending Goal change is an unsaved edit.
     useWorkflowHasChangesStore.setState({
       getSaveData: () => data,
       saveIsPending: false,
+      hasChanges: true,
     });
     useWorkflowSnapshotStore.setState({
       snapshot: snapshotOf(data),

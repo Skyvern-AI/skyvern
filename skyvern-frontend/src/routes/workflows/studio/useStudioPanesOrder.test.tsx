@@ -76,7 +76,7 @@ function CopilotVisitProbe() {
       <button
         onClick={() =>
           navigate(
-            "/studio?via=blank&panes=copilot,editor,browser&wr=wr_1#proof",
+            "/studio?cache-key-value=x&panes=copilot,editor,browser&wr=wr_1#proof",
           )
         }
       >
@@ -84,7 +84,9 @@ function CopilotVisitProbe() {
       </button>
       <button
         onClick={() =>
-          navigate("/studio?via=blank&panes=copilot,editor,browser#proof")
+          navigate(
+            "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
+          )
         }
       >
         return-to-studio
@@ -133,9 +135,9 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
 
   test("reapplies shared entry panes when navigating between Studio and runs", () => {
     const studioAddress =
-      "/studio?via=blank&panes=copilot,editor,browser#proof";
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof";
     const runAddress =
-      "/studio?via=blank&panes=copilot,editor,browser&wr=wr_1#proof";
+      "/studio?cache-key-value=x&panes=copilot,editor,browser&wr=wr_1#proof";
     renderCopilotVisit(studioAddress);
 
     expect(screen.getByTestId("panes").textContent).toBe(
@@ -174,7 +176,7 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
   });
 
   test("keeps route-state handoffs while preserving pathname, search, and hash", () => {
-    const address = "/studio?via=blank&panes=editor,browser#proof";
+    const address = "/studio?cache-key-value=x&panes=editor,browser#proof";
     renderCopilotVisit(address);
 
     fireEvent.click(screen.getByText("open-copilot-with-state"));
@@ -196,14 +198,16 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
   });
 
   test("preserves the incoming URL through multiple pane toggles", () => {
-    renderCopilotVisit("/studio?via=blank&panes=copilot,editor,browser#proof");
+    renderCopilotVisit(
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
+    );
 
     fireEvent.click(screen.getByText("toggle-copilot"));
     fireEvent.click(screen.getByText("toggle-browser"));
 
     expect(screen.getByTestId("panes").textContent).toBe("editor");
     expect(screen.getByTestId("address").textContent).toBe(
-      "/studio?via=blank&panes=copilot,editor,browser#proof",
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
     );
   });
 
@@ -219,7 +223,8 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
   });
 
   test("reopens Copilot in the slot it was closed from", () => {
-    const address = "/studio?via=blank&panes=editor,copilot,browser#proof";
+    const address =
+      "/studio?cache-key-value=x&panes=editor,copilot,browser#proof";
     renderCopilotVisit(address);
 
     fireEvent.click(screen.getByText("toggle-copilot"));
@@ -336,7 +341,7 @@ function renderAtRunRoute(entry: string) {
 describe("useStudioPanes under the short run URL", () => {
   test("/runs/{wr} opens the run layout from the path, not the edit default", () => {
     renderAtRunRoute("/runs/wr_1");
-    expect(screen.getByTestId("panes").textContent).toBe("browser,overview");
+    expect(screen.getByTestId("panes").textContent).toBe("overview,browser");
   });
 
   test("an explicit ?panes= still wins under the short run URL", () => {

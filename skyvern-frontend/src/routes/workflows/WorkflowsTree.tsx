@@ -77,8 +77,10 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
 import { getUniqueSlugForFolder } from "@/util/folderSlug";
 import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 
 const FOLDERS_PAGE_SIZE = 25;
 const AGENTS_PAGE_SIZE = 20;
@@ -115,12 +117,10 @@ function WorkflowsTree() {
     () => parseTagFilter(tagFilterParam),
     [tagFilterParam],
   );
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
-  // While tagging is hidden, ignore stale `?tags=` so the backend list isn't tag-filtered.
-  const serializedTagFilter = taggingEnabled
-    ? serializeTagFilter(tagFilters)
-    : "";
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // While tagging is off, ignore stale `?tags=` so the backend list isn't tag-filtered.
+  const { tags: serializedTagFilter, hold: holdForTaggingFlag } =
+    useUrlTagFilter(serializeTagFilter(tagFilters));
 
   const setTagFilters = useCallback(
     (terms: TagFilterTerm[]) => {
@@ -334,7 +334,10 @@ function WorkflowsTree() {
     getNextPageParam: (lastPage, allPages) =>
       lastPage.length === AGENTS_PAGE_SIZE ? allPages.length + 1 : undefined,
     initialPageParam: 1,
-    placeholderData: (previousData) => previousData,
+    enabled: !holdForTaggingFlag,
+    // A held tag-filtered list must not carry over the previous unfiltered rows.
+    placeholderData: (previousData) =>
+      holdForTaggingFlag ? undefined : previousData,
   });
 
   const workflows = useMemo(
@@ -699,7 +702,9 @@ function WorkflowsTree() {
   };
 
   const showFlatInitialSkeleton =
-    isFilterActive && isWorkflowsLoading && displayWorkflows.length === 0;
+    isFilterActive &&
+    (isWorkflowsLoading || holdForTaggingFlag) &&
+    displayWorkflows.length === 0;
   const showTreeInitialSkeleton =
     !isFilterActive &&
     (isFoldersLoading || isWorkflowsLoading) &&

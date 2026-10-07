@@ -258,9 +258,94 @@ async def test_engine_forwards_single_action_block_to_the_loop(
         llm_caller=_ScriptedCaller([]),
         goal="x",
         single_action_block=single_action_block,
+        block_completion_judge=_achieving_judge([]),
     )
 
     assert captured["single_action_block"] is single_action_block
+    assert (captured["block_completion_check"] is not None) is single_action_block
+
+
+def _achieving_judge(prompts: list[str]):
+    async def judge(prompt: str) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    return judge
+
+
+@pytest.mark.asyncio
+async def test_engine_block_completion_judge_stays_out_of_the_goal_check_arm(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A secret on the page skips the arm's judge but not the block's, which runs on the loop's own model; neither
+    # judge's verdict is counted as the other's.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    arm_prompts: list[str] = []
+    block_prompts: list[str] = []
+
+    async def _capture(**kwargs: Any) -> LoopOutcome:
+        verdict = await kwargs["block_completion_check"]()
+        assert verdict.verdict == "achieved" and verdict.skipped_reason is None
+        assert (await finish_kwargs["goal_check"]()).skipped_reason == "secret_entered"
+        return LoopOutcome(status="completed", reason="ok")
+
+    finish_kwargs: dict[str, Any] = {}
+    real_make_finish_tool = engine_mod.make_finish_tool
+
+    def _capture_finish(**kwargs: Any) -> Any:
+        finish_kwargs.update(kwargs)
+        return real_make_finish_tool(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "make_finish_tool", _capture_finish)
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        single_action_block=True,
+        goal_judge=_achieving_judge(arm_prompts),
+        block_completion_judge=_achieving_judge(block_prompts),
+        secret_on_page_at_start=True,
+    )
+
+    assert len(block_prompts) == 1 and not arm_prompts
+    assert outcome.goal_check is not None and outcome.goal_check["checks"] == 1
+    assert outcome.goal_check["judged"] == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_block_completion_judge_skips_after_a_secret_typed_in_this_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The secret's field can still be on screen and pixels cannot be redacted; a secret from an earlier block
+    # (secret_on_page_at_start) does not skip it.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.goal_check import TrailEntry
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    prompts: list[str] = []
+    verdicts: list[Any] = []
+
+    async def _capture(**kwargs: Any) -> LoopOutcome:
+        kwargs["tool_trail"].record(
+            TrailEntry(
+                tool="type", status="ok", content="typed", perception=False, page_changing=True, secret_entered=True
+            )
+        )
+        verdicts.append(await kwargs["block_completion_check"]())
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        single_action_block=True,
+        block_completion_judge=_achieving_judge(prompts),
+    )
+
+    [verdict] = verdicts
+    assert verdict.skipped_reason == "secret_entered" and not prompts
 
 
 def test_runaway_backstops_scale_with_action_step_budget() -> None:
@@ -1515,11 +1600,14 @@ async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None
 
 
 @pytest.mark.asyncio
-async def test_age_default_rides_the_task_message_only_and_leaves_the_system_prompt_alone(
+async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system_prompt_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def run(hook_result: tuple[str | None, str] | None) -> tuple[str, str, dict[str, Any]]:
-        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: hook_result)
+    Hook = tuple[str | None, str] | None
+
+    async def run(age: Hook, application: Hook) -> tuple[str, str, dict[str, Any]]:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: age)
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", lambda parameters: application)
         with capture_logs() as logs:
             outcome = await run_task_v3_agent_loop(
                 page_provider=_fixed_page_provider(_FakePage()),
@@ -1531,15 +1619,25 @@ async def test_age_default_rides_the_task_message_only_and_leaves_the_system_pro
         terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
         return by_role["system"], by_role["user"], terminal
 
-    base_system, base_user, base_log = await run(None)
-    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"))
-    rendered_system, rendered_user, rendered_log = await run(("AGE DEFAULT TEXT", "rendered"))
+    base_system, base_user, base_log = await run(None, None)
+    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"), None)
+    age_system, age_user, age_log = await run(("AGE DEFAULT TEXT", "rendered"), None)
+    both_system, both_user, both_log = await run((None, "age_field_present"), ("APPLICATION DEFAULTS TEXT", "rendered"))
+    all_system, all_user, all_log = await run(
+        ("AGE DEFAULT TEXT", "rendered"), ("APPLICATION DEFAULTS TEXT", "rendered")
+    )
 
-    assert base_system.startswith(SYSTEM_PROMPT) and base_system == withheld_system == rendered_system
-    assert base_user == withheld_user and rendered_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert base_system.startswith(SYSTEM_PROMPT)
+    assert base_system == withheld_system == age_system == both_system == all_system
+    assert base_user == withheld_user and age_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert both_user == base_user + "\n\nAPPLICATION DEFAULTS TEXT"
+    assert all_user == base_user + "\n\nAGE DEFAULT TEXT\n\nAPPLICATION DEFAULTS TEXT"
     assert (base_log["age_default_rendered"], base_log["age_default_reason"]) == (False, None)
     assert (withheld_log["age_default_rendered"], withheld_log["age_default_reason"]) == (False, "age_field_present")
-    assert (rendered_log["age_default_rendered"], rendered_log["age_default_reason"]) == (True, "rendered")
+    assert (age_log["age_default_rendered"], age_log["age_default_reason"]) == (True, "rendered")
+    # Each default keeps its own field, so one entry's outcome read never counts the other's renders.
+    assert (both_log["age_default_rendered"], both_log["application_defaults_rendered"]) == (False, True)
+    assert (age_log["application_defaults_rendered"], age_log["application_defaults_reason"]) == (False, None)
 
 
 @pytest.mark.asyncio

@@ -1134,6 +1134,48 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
   });
 });
 
+describe("applyNarrativeEvent — screenshot", () => {
+  const frames = [
+    { artifactId: "a_1", capturedAt: "2026-06-10T07:23:00Z", toolCallId: "c1" },
+    { artifactId: "a_2", capturedAt: "2026-06-10T07:24:00Z", toolCallId: null },
+  ];
+
+  it("keeps the turn's frames in capture order live and after a reload, and ends on what the saved turn holds", () => {
+    let live = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    for (const frame of [frames[0]!, frames[1]!, frames[0]!]) {
+      live = applyNarrativeEvent(live, {
+        type: "screenshot",
+        artifact_id: frame.artifactId,
+        captured_at: frame.capturedAt,
+        tool_call_id: frame.toolCallId,
+      });
+    }
+    expect(live.screenshots).toEqual(frames);
+
+    const reloaded = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        screenshots: [...frames, { artifactId: "a_3" }, "a_4", null],
+      }),
+    );
+    expect(reloaded?.screenshots).toEqual(live.screenshots);
+
+    const ended = applyNarrativeEvent(
+      live,
+      response({
+        narrative_payload: reproClarifyPayload({ screenshots: [frames[0]] }),
+      }),
+    );
+    expect(ended.turnId).toBe("turn-repro");
+    expect(ended.screenshots).toEqual([frames[0]]);
+
+    const endedWithoutFrames = applyNarrativeEvent(
+      live,
+      response({ narrative_payload: reproClarifyPayload() }),
+    );
+    expect(endedWithoutFrames.screenshots).toEqual([]);
+  });
+});
+
 describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
   it("grafts clarify from the adjacent turn_outcome onto a pre-fix payload", () => {
     const turn = hydrateHistoryNarrative(reproClarifyPayload(), {

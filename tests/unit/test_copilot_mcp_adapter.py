@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import copy
+import io
 import json
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -11,23 +13,37 @@ from urllib.parse import quote, urlparse
 
 import pytest
 import yaml
+from agents import FunctionTool
 from agents.mcp.util import MCPUtil
 from agents.tool_context import ToolContext
 from fastmcp import FastMCP
+from mcp import Tool as MCPTool
 from mcp.types import CallToolResult
+from PIL import Image
 from playwright.async_api import Route
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_module
 from skyvern.cli.core.client import get_active_api_key
+from skyvern.cli.core.result import ErrorCode, make_error
 from skyvern.cli.mcp_tools import mcp
+from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_state_error
+from skyvern.cli.mcp_tools.blocks import skyvern_block_validate
+from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
-from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import (
+    AGENT_BLOCKS_ONLY,
+    ALL_BLOCK_FAMILIES,
+    CODE_BLOCKS_ONLY,
+    AuthoringCapability,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+)
 from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError
 from skyvern.forge.sdk.copilot.mcp_adapter import (
@@ -56,11 +72,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
     register_sensitive_origin_run_lease,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
     register_secret_scrub_value,
 )
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
+from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _with_action_reason, mcp_hooks
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
 from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
@@ -442,7 +459,6 @@ _PAYLOAD_KEYS_THAT_WOULD_LEAK = {"args", "merged_args", "arguments", "mcp_args",
 _BROWSER_BOOT_SECONDS = 2.0
 _MCP_CALL_SECONDS = 3.0
 _AFTER_CALL_SECONDS = 5.0
-_AFTER_CALL_MS = 5000
 _WALL_MS = 5000
 _SESSION_ONLY_MS = 2000
 _MCP_CALL_MS = 3000
@@ -1137,28 +1153,19 @@ class TestSharedBrowserCallOutcome:
         assert second["data"]["metadata"]["width"] == 1280
 
     @pytest.mark.asyncio
-    async def test_typed_internal_accessor_preserves_legacy_dict_and_drain_incomplete(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_typed_internal_accessor_preserves_legacy_dict(self) -> None:
         payload = {"ok": True, "data": {"result": {"count": 3}}}
         server = self._server(
             model_tool_name="evaluate",
             raw_tool_name="skyvern_evaluate",
             payload=payload,
         )
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _failed_drain() -> None:
-            raise RuntimeError("drain failed")
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failed_drain)
 
         typed = await server.call_internal_browser_tool("skyvern_evaluate", {"expression": "scan()"})
         legacy = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
 
         assert typed.result == legacy == mcp_to_copilot(payload)
         assert typed.outcome.dispatched is True
-        assert typed.outcome.evidence_drain_complete is False
         assert typed.outcome.source_browser_session_generation == 0
 
     @pytest.mark.asyncio
@@ -1569,16 +1576,10 @@ class TestSharedBrowserCallOutcome:
 class TestMCPToolTiming:
     @pytest.mark.asyncio
     async def test_internal_call_logs_the_server_total_without_changing_the_result(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+        self, _fake_clock: list[float]
     ) -> None:
         payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"sdk": 812, "total": 815}}
         server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
 
         with capture_logs() as captured:
             result = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
@@ -1870,6 +1871,18 @@ class TestMCPToolTiming:
         assert records[0]["wall_clock_ms"] == _WALL_MS
 
     @pytest.mark.asyncio
+    async def test_a_call_that_exceeds_its_ceiling_says_its_effect_is_unknown(self, _fake_clock: list[float]) -> None:
+        server = _server_whose_call_takes_time(TimeoutError(), SchemaOverlay(timeout=30), _fake_clock)
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert surfaced["error"] == (
+            f"evaluate did not answer within 30s and was cancelled. {mcp_adapter._EFFECT_UNKNOWN_GUIDANCE}"
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "payload",
         [
@@ -2050,7 +2063,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["call_status"] == "error"
         assert record["timing_phase"] is None
-        assert record["post_call_evidence_drain_ms"] is None
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -2180,71 +2192,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["phase_dispatch_untimed_ms"] is None
         assert record["timing_server_overrun"] is True
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("failure", "call_status"),
-        [
-            (asyncio.CancelledError(), "cancelled"),
-            (CopilotBrowserSessionUnavailable("pbs_1"), "session_error"),
-            (RuntimeError("drain exploded"), "error"),
-        ],
-        ids=["cancelled", "session_error", "error"],
-    )
-    async def test_an_evidence_drain_that_fails_still_reports_the_budget_it_spent(
-        self,
-        failure: BaseException,
-        call_status: str,
-        monkeypatch: pytest.MonkeyPatch,
-        _fake_clock: list[float],
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-        server._context_provider().browser_session_replacements = {"pbs_1": "pbs_replacement"}
-
-        async def _failing_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-            raise failure
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failing_drain)
-
-        with capture_logs() as captured:
-            if isinstance(failure, asyncio.CancelledError):
-                with pytest.raises(asyncio.CancelledError):
-                    await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-            else:
-                await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == call_status
-        assert record["wall_clock_ms"] == _WALL_MS
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["phase_residual_ms"] == 0
-        assert record["timing_phase"] == "evidence_drain"
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    async def test_an_evidence_drain_that_succeeds_reports_what_the_caller_waited_for_it(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
-
-        with capture_logs() as captured:
-            await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == "ok"
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["wall_clock_ms"] == _WALL_MS
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -3756,6 +3703,63 @@ async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> No
 
 
 @pytest.mark.asyncio
+async def test_a_frame_staged_inside_a_tool_names_the_call_that_staged_it() -> None:
+    ctx = make_copilot_ctx()
+
+    def stage(shade: int) -> None:
+        frame = io.BytesIO()
+        Image.new("RGB", (30, 20), (shade, shade, shade)).save(frame, format="PNG")
+        assert enqueue_screenshot(
+            ctx,
+            base64.b64encode(frame.getvalue()).decode(),
+            provenance=ScreenshotProvenance.unknown(source_tool="click"),
+        )
+
+    async def click_post_hook(result: dict[str, Any], raw: Any, copilot_ctx: Any) -> dict[str, Any]:
+        stage(10)
+        return result
+
+    async def native_body(tool_ctx: Any, arguments: str) -> str:
+        stage(20)
+        return "ok"
+
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={"click": SchemaOverlay(post_hook=click_post_hook)},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    server._client = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=SimpleNamespace(structured_content={"ok": True, "data": {}}, is_error=False, content=[])
+        )
+    )
+    mcp_click = MCPUtil.to_function_tool(
+        MCPTool(name="click", inputSchema={"type": "object", "properties": {}}),
+        server,
+        convert_schemas_to_strict=False,
+    )
+    native = _with_action_reason(
+        FunctionTool(
+            name="inspect",
+            description="",
+            params_json_schema={"type": "object", "properties": {}},
+            on_invoke_tool=native_body,
+        )
+    )
+
+    def call(name: str, call_id: str) -> ToolContext[Any]:
+        return ToolContext(context=ctx, tool_name=name, tool_call_id=call_id, tool_arguments="{}")
+
+    await mcp_click.on_invoke_tool(call("click", "call-mcp"), "{}")
+    await native.on_invoke_tool(call("inspect", "call-native"), "{}")
+    stage(30)
+
+    assert [frame.tool_call_id for frame in ctx.pending_chat_screenshots] == ["call-mcp", "call-native", None]
+
+
+@pytest.mark.asyncio
 async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
     ctx = make_copilot_ctx(api_key="in-process-test-key")
     aliases = get_skyvern_mcp_alias_map()
@@ -3806,3 +3810,119 @@ async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_
     submitted = copy.deepcopy(both_inputs)
     assert _block_authoring_violations(submitted, AGENT_BLOCKS_ONLY) == []
     assert submitted == both_inputs
+
+
+@pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])
+def test_every_aliased_tool_carries_a_copilot_description(capability: AuthoringCapability) -> None:
+    overlays = _build_skyvern_mcp_overlays(capability)
+
+    undescribed = [alias for alias in get_skyvern_mcp_alias_map() if not overlays[alias].description]
+
+    assert undescribed == []
+
+
+async def _real_validate_block_failure() -> dict[str, Any]:
+    return await skyvern_block_validate(block_json='{"block_type": "text_prompt"}')
+
+
+async def _real_get_workflow_failure() -> dict[str, Any]:
+    return await skyvern_workflow_get(workflow_id="not_a_wpid")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "server_failure"),
+    [
+        ("validate_block", {"block_json": '{"block_type": "text_prompt"}'}, _real_validate_block_failure),
+        ("get_org_workflow", {"workflow_id": "wpid_missing"}, _real_get_workflow_failure),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failed_server_call_reaches_the_model_without_the_servers_hint(
+    tool_name: str,
+    arguments: dict[str, Any],
+    server_failure: Callable[[], Awaitable[dict[str, Any]]],
+) -> None:
+    payload = await server_failure()
+    assert payload["error"]["hint"]
+    aliases = get_skyvern_mcp_alias_map()
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={tool_name: _build_skyvern_mcp_overlays()[tool_name]},
+        alias_map={tool_name: aliases[tool_name]},
+        allowlist=frozenset({aliases[tool_name]}),
+        context_provider=lambda: make_copilot_ctx(),
+    )
+    server._client = _FakeClient(payload)
+
+    result = await server.call_tool(tool_name, arguments)
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["ok"] is False
+    assert surfaced["error"] == payload["error"]["message"]
+    assert surfaced["error_code"] == payload["error"]["code"]
+    assert payload["error"]["hint"] not in result.content[0].text
+
+
+_CLICK_ARGS = {"selector": "#go"}
+
+
+@pytest.mark.usefixtures("_stub_browser_session")
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "server_error", "separator", "element_state"),
+    [
+        ("click", _CLICK_ARGS, action_deadline_error(TimeoutError("Timeout 5000ms exceeded.")), " ", None),
+        (
+            "click",
+            _CLICK_ARGS,
+            action_deadline_error(TimeoutError("Timeout 5000ms exceeded."), mutating=False),
+            " ",
+            None,
+        ),
+        ("click", _CLICK_ARGS, make_error(ErrorCode.TIMEOUT, "The page stopped answering!", "Retry it."), " ", None),
+        (
+            "wait_for_either_state",
+            {"selector_a": "#signed-in", "selector_b": "#sign-in", "state": "visible"},
+            make_error(
+                ErrorCode.TIMEOUT,
+                "Neither '#signed-in' nor '#sign-in' reached 'visible' within 5000ms",
+                "Neither state was confirmed before the timeout elapsed",
+            ),
+            ". ",
+            None,
+        ),
+        (
+            "click",
+            _CLICK_ARGS,
+            element_state_error("disabled", TimeoutError("Timeout 5000ms exceeded."), selector="#go", timeout_ms=5000),
+            None,
+            "disabled",
+        ),
+    ],
+    ids=["mutating_timeout", "read_timeout", "exclaimed_timeout", "wait_timeout", "element_state"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_browser_action_reports_typed_facts_instead_of_the_servers_hint(
+    tool_name: str,
+    arguments: dict[str, Any],
+    server_error: dict[str, Any],
+    separator: str | None,
+    element_state: str | None,
+) -> None:
+    server = _overlay_server(
+        make_copilot_ctx(browser_session_id="pbs_1"),
+        _FakeClient({"ok": False, "error": server_error}),
+        tool_name,
+        _build_skyvern_mcp_overlays()[tool_name],
+    )
+
+    result = await server.call_tool(tool_name, arguments)
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["ok"] is False
+    assert surfaced["error"] == (
+        server_error["message"]
+        if separator is None
+        else f"{server_error['message']}{separator}{mcp_adapter._EFFECT_UNKNOWN_GUIDANCE}"
+    )
+    assert surfaced.get("element_state") == element_state
+    assert server_error["hint"] not in result.content[0].text

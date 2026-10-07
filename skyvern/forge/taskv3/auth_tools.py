@@ -45,6 +45,7 @@ from skyvern.forge.taskv3.tools import (
     TotpCodeAuthorizer,
 )
 from skyvern.services.otp_service import (
+    MagicLinkSurfacing,
     OTPValue,
     extract_totp_from_navigation_inputs,
     has_otp_source,
@@ -529,7 +530,8 @@ class VerificationState:
         # differencing poll timestamps, so it cannot be counted directly. `finish_status` is carried
         # because failed and terminated are separate populations in that read and the record is the
         # only place they can be told apart.
-        if not held and self.polling_spent_seconds <= 0:
+        # A run offered the code tool that never polled is kept: it is the "offered, never called" give-up.
+        if not held and self.polling_spent_seconds <= 0 and not self.code_tool_offered:
             return
         try:
             LOG.info(
@@ -544,6 +546,9 @@ class VerificationState:
                 remaining_seconds=round(remaining, 1),
                 budget_seconds=self.budget_seconds,
                 giveup_deferrals=self.giveup_deferrals,
+                code_tool_offered=self.code_tool_offered,
+                values_delivered=self.values_delivered,
+                source_failed=self.source_failed,
             )
         except Exception:
             # Narration must never cost the gate its verdict, for the same reason `arm` swallows.
@@ -618,6 +623,8 @@ def build_auth_tools(
     state.budget_seconds = settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS * 60.0
     # A value one tool resolved that the other tool owns (the webhook source does not filter by type).
     cached_otp_value: OTPValue | None = None
+    # Links opened or passed over, so a code poll never hands one of them, or an older link, back.
+    spent_links: set[str] = set()
     first_poll_started_at: datetime | None = None
     # Consecutive answers that delivered nothing: an exception, a bare None, or a slice whose webhook
     # polls were failing at its timeout. One says little about the source; a second in a row is a
@@ -700,6 +707,13 @@ def build_auth_tools(
             return _budget_exhausted(expected_otp_type)
         if first_poll_started_at is None:
             first_poll_started_at = datetime.utcnow()
+        # A code poll may hand back a sign-in link stored for this run since this task began, but only when
+        # the link tool can open it; without a page the link would end the run as unsupported.
+        surface_magic_link = (
+            MagicLinkSurfacing(created_after=task.created_at, spent_values=frozenset(spent_links))
+            if expected_otp_type == OTPType.TOTP and offer_link_tool
+            else None
+        )
         started = time.monotonic()
         try:
             otp_value = await resolve_otp_value(
@@ -709,6 +723,7 @@ def build_auth_tools(
                 poll_started_at=first_poll_started_at,
                 allowed_credential_parameter_keys=allowed_credential_parameter_keys,
                 min_remaining_seconds=state.totp_min_remaining_seconds,
+                surface_magic_link=surface_magic_link,
             )
             if otp_value is None:
                 if expected_otp_type == OTPType.MAGIC_LINK:
@@ -779,15 +794,19 @@ def build_auth_tools(
         cached = cached_otp_value
         if cached is not None:
             if cached.get_otp_type() == OTPType.MAGIC_LINK:
-                if offer_link_tool:
-                    return ToolResult.error(_MAGIC_LINK_REDIRECT)
-                return _failed(
-                    _MAGIC_LINK_UNSUPPORTED,
-                    reason=VerificationFailure.MAGIC_LINK_UNSUPPORTED_CACHED,
-                    tool="get_verification_code",
-                )
-            cached_otp_value = None
-            return _deliver_code(cached.value)
+                if not offer_link_tool:
+                    return _failed(
+                        _MAGIC_LINK_UNSUPPORTED,
+                        reason=VerificationFailure.MAGIC_LINK_UNSUPPORTED_CACHED,
+                        tool="get_verification_code",
+                    )
+                # Asked for a code again instead of opening the link: the page may want a code after all, so
+                # poll for one rather than repeat the redirect, which would starve a code that arrives later.
+                spent_links.add(cached.value)
+                cached_otp_value = None
+            else:
+                cached_otp_value = None
+                return _deliver_code(cached.value)
 
         polled = await _poll(OTPType.TOTP)
         if isinstance(polled, ToolResult):
@@ -846,6 +865,7 @@ def build_auth_tools(
             )
 
         url = otp_value.value
+        spent_links.add(url)
         # Held only while nothing has been attempted: once a link is handed to the browser or refused,
         # it is treated as spent whatever the outcome, so a retry polls for a fresh one.
         cached_otp_value = otp_value

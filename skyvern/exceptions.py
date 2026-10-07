@@ -7,6 +7,8 @@ from http import HTTPStatus
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Literal, NoReturn
 
+from skyvern.schemas.browser_session_timeouts import MAX_EXTENDED_TIMEOUT
+
 if TYPE_CHECKING:
     from skyvern.errors.errors import UserDefinedError
 
@@ -158,6 +160,14 @@ class WorkflowChangedSinceReview(SkyvernHTTPException):
         )
 
 
+class GroupAccountsRanSinceReview(SkyvernHTTPException):
+    def __init__(self, item_keys: list[str]) -> None:
+        super().__init__(
+            f"{item_keys} started in another group after the review, so this group was not submitted.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
 _BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
 # Patterns that indicate a browser session connection failure (e.g. CDP WebSocket errors).
@@ -238,6 +248,15 @@ class BrowserActionPolicyNotEnforceable(SkyvernHTTPException):
         self.reasons = tuple(reasons)
         super().__init__(
             f"Workflow cannot run under a browser action policy: {', '.join(self.reasons)}",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+class BrowserSettingsUnsupported(SkyvernHTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            "browser_settings.timezone_id cannot be applied by the browser provider selected for this run. Remove "
+            "the timezone setting or run on Skyvern's own browsers.",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
@@ -640,9 +659,14 @@ class WorkflowRunNotFound(SkyvernHTTPException):
 
 
 class MissingValueForParameter(SkyvernHTTPException):
-    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str | None = None) -> None:
+        location = (
+            f"workflow run {workflow_run_id} of workflow {workflow_id}"
+            if workflow_run_id
+            else f"workflow {workflow_id}"
+        )
         super().__init__(
-            f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
+            f"Missing value for parameter {parameter_key} in {location}",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
@@ -1269,6 +1293,12 @@ class StepTerminationError(TerminationError):
         super().__init__(f"Step {step_id} cannot be executed and task is failed. Reason: {reason}")
 
 
+class CompletionGateTerminationError(TerminationError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class TaskTerminationError(TerminationError):
     def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
         super().__init__(f"Task {task_id} failed. Reason: {reason}")
@@ -1775,6 +1805,53 @@ class BrowserSessionClosed(SkyvernHTTPException):
         super().__init__(
             f"Browser session {browser_session_id} {reason or 'is closed'}. Create a new browser session and retry.",
             status_code=HTTPStatus.GONE,
+        )
+
+
+def _utc_minute(moment: datetime) -> str:
+    aware = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    return aware.strftime("%Y-%m-%d %H:%M UTC")
+
+
+class BrowserSessionExpired(BrowserSessionClosed):
+    """The session ran out its configured lifetime. Carries the session facts that decide whether a run sent to it
+    is the caller's to fix (see the browser-lease seam in the workflow service)."""
+
+    def __init__(
+        self,
+        browser_session_id: str,
+        *,
+        started_at: datetime | None,
+        ended_at: datetime | None,
+        timeout_minutes: int | None,
+        created_by: str | None,
+        bound: bool = False,
+        refused_at_submission: bool = False,
+    ) -> None:
+        self.browser_session_id = browser_session_id
+        self.started_at = started_at
+        self.ended_at = ended_at
+        self.timeout_minutes = timeout_minutes
+        self.created_by = created_by
+        self.bound = bound
+        if refused_at_submission:
+            SkyvernHTTPException.__init__(
+                self, self.expired_before_run_message(run_created=False), status_code=HTTPStatus.GONE
+            )
+        else:
+            super().__init__(browser_session_id, reason="expired after reaching its configured lifetime")
+
+    def expired_before_run_message(self, *, run_created: bool) -> str:
+        """States that the session ended before the run was submitted, so use it only once that is established."""
+        ended = f" at {_utc_minute(self.ended_at)}" if self.ended_at is not None else ""
+        limit = f"its {self.timeout_minutes}-minute limit" if self.timeout_minutes else "its configured lifetime"
+        outcome = "so the run did not start" if run_created else "so no run was created"
+        return (
+            f"Browser session {self.browser_session_id} expired{ended} after {limit}, before this run was submitted, "
+            f"{outcome}. To fix it: create a new browser session and pass its id, or leave browser_session_id empty "
+            "to start a fresh browser. To reuse one session for many runs, extend it before it ends "
+            "(POST /v1/browser_sessions/{browser_session_id}/extend, "
+            f"up to {MAX_EXTENDED_TIMEOUT // 60} hours in total)."
         )
 
 
