@@ -114,6 +114,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.browser_sessions.delete_pending_recording": "browser_session.delete",
     "skyvern.forge.sdk.routes.browser_sessions.extend_browser_session": "browser_session.execute",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_session": "browser_session.read",
+    "skyvern.forge.sdk.routes.browser_sessions.get_browser_session_metadata": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_session_action_logs": "browser_session.list",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_sessions": "browser_session.list",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_sessions_all": "browser_session.read",

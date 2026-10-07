@@ -96,14 +96,6 @@ _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
-_VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT = (
-    " For validation-only pre-submit Review pages, do not repair by returning only booleans such as "
-    "pre_submit_review_reached, submit_control_visible, submit_or_finalize_clicked, or per-field *_verified flags. "
-    "The Review block output must include an explicit validation-only marker such as `validation_only: true` or "
-    '`submit_mode: "validation_only"`, `review_values` or `review_fields` as visible Review-page label/value '
-    "strings, `evidence_text` containing the visible Review-page text that verbatim contains those values, and an "
-    "explicit false submit/finalize-click signal. Stop on the Review page; do not click Submit/Finalize."
-)
 
 
 def _completion_request_policy(copilot_ctx: Any) -> Any | None:

@@ -265,7 +265,9 @@ class _SessionFactory:
     @asynccontextmanager
     async def released(self) -> AsyncIterator[None]:
         """Hand a pinned scope's connection back to the pool for the block and pin a fresh one after it; a no-op
-        outside a pinned scope or inside a transaction. A transaction the block opens keeps its own connection."""
+        outside a pinned scope or inside a transaction. Inside the block the ambient session is hidden, so a
+        repository call opens its own short session and returns its connection, instead of joining the pinned
+        session and keeping a new connection checked out for the rest of the block."""
         entry = self._session_ctx.get()
         if entry is None or entry.task is not asyncio.current_task() or entry.pin is None:
             yield
@@ -278,9 +280,11 @@ class _SessionFactory:
         await pin.connection.close()
         pin.connection = None
         self._bind(session, self._db.engine)
+        token = self._session_ctx.set(None)
         try:
             yield
         finally:
+            self._session_ctx.reset(token)
             if not session.in_transaction():
                 pin.connection = await self._db.engine.connect()
                 self._bind(session, pin.connection)
