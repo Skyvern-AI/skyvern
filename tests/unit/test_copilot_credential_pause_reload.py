@@ -12,10 +12,19 @@ from skyvern.forge.sdk.copilot import credential_pause as pauses
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.tools.credential_fill import _request_credential
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes import workflow_copilot as routes
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
+from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
 from tests.unit.test_copilot_ask_user import setup_question_chat
-from tests.unit.test_copilot_credential_pause import _FakeCache, _make_credential, _make_stream
+from tests.unit.test_copilot_credential_pause import (
+    _REGISTRATION,
+    _FakeCache,
+    _make_credential,
+    _make_stream,
+    _RegistrationVault,
+)
 
 
 @pytest.mark.asyncio
@@ -406,3 +415,79 @@ async def test_a_done_whose_pause_ended_while_saving_discards_the_profile(sqlite
     )
     response_key = pauses.credential_response_cache_key("org", card.workflow_copilot_chat_id, card.turn_id)
     assert response_key not in cache.store
+
+
+@pytest.mark.asyncio
+async def test_registration_card_survives_a_reload_with_its_one_generate_attempt_recorded(sqlite_engine, monkeypatch):
+    _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(pauses, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(routes, "RECONCILE_ABANDON_AFTER_SECONDS", -1)
+    monkeypatch.setattr(app.DATABASE, "credentials", SimpleNamespace(get_credentials=AsyncMock(return_value=[])))
+    emitted = _sign_in_card_context(ctx, recovery=True)
+    ctx.client_supports_credential_generation = True
+    recovery_token = "a" * 64
+    vault = _RegistrationVault(_make_credential(), fail=True)
+    vault.install(monkeypatch)
+    recovered_while_saving: list[list] = []
+    fail_store = vault.store
+
+    async def store_and_reload(*args):
+        recovered_while_saving.append(
+            await pauses.pending_credential_requests("org", ctx.workflow_copilot_chat_id, ["turn"], recovery_token)
+        )
+        return await fail_store(*args)
+
+    monkeypatch.setattr(routes, "store_new_credential", store_and_reload)
+    api = client._transport.app
+    api.dependency_overrides[routes.org_auth_service.get_current_org_for_credential_routes] = api.dependency_overrides[
+        routes.org_auth_service.get_current_org
+    ]
+    api.dependency_overrides[routes.org_auth_service.get_current_user_id_or_none] = lambda: "user-1"
+    api.add_api_route("/credential-generate", routes.workflow_copilot_credential_generate, methods=["POST"])
+
+    async def history() -> list[dict]:
+        response = await client.get(
+            "/history",
+            params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id},
+            headers={"X-Copilot-Credential-Recovery-Token": recovery_token},
+        )
+        return response.json()["pending_credential_requests"]
+
+    async with client:
+        invocation = asyncio.create_task(
+            _request_credential(
+                "https://portal.example.com/signup",
+                "Create the test account",
+                ctx,
+                registration=CredentialRegistration(**_REGISTRATION),
+            )
+        )
+        try:
+            await asyncio.wait_for(emitted.wait(), 1)
+            [raised] = await history()
+            assert raised["reason"] == "credential_registration"
+            assert raised["registration"]["credential_name"] == "Portal test account"
+            assert raised["registration"]["attempted"] is False
+            body = {
+                "workflow_copilot_chat_id": raised["workflow_copilot_chat_id"],
+                "turn_id": raised["turn_id"],
+                "resume_token": raised["resume_token"],
+            }
+
+            with skyvern_context.scoped(SkyvernContext()):
+                generated = await client.post("/credential-generate", json=body)
+
+            assert generated.json()["result"] == "unknown"
+            [[saving]] = recovered_while_saving
+            assert saving.registration is not None and saving.registration.attempted is True
+            [reopened] = await history()
+            assert reopened["registration"]["attempted"] is True
+            assert reopened["registration"]["outcome"] == "unknown"
+            with skyvern_context.scoped(SkyvernContext()):
+                assert (await client.post("/credential-generate", json=body)).status_code == 409
+            assert len(vault.passwords) == 1
+            assert not invocation.done()
+        finally:
+            invocation.cancel()
+            await asyncio.gather(invocation, return_exceptions=True)

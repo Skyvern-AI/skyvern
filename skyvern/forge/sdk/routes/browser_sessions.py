@@ -28,7 +28,11 @@ from skyvern.forge.sdk.routes.code_samples import (
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import API_BROWSER_SESSION_CREATED_BY, is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    API_BROWSER_SESSION_CREATED_BY,
+    PersistentBrowserSessionStatus,
+    is_final_status,
+)
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
@@ -41,6 +45,8 @@ from skyvern.schemas.action_log import (
     ActionLogPage,
     sanitize_action_log_event,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_session_metadata import BrowserSessionMetadata, BrowserSessionWorkflowMetadata
 from skyvern.schemas.browser_session_timeouts import (
     MAX_EXTENDED_TIMEOUT,
     MAX_TIMEOUT,
@@ -152,6 +158,37 @@ async def get_browser_sessions_all(
     return responses
 
 
+@base_router.get(
+    "/browser_sessions/{session_id}/metadata", response_model=BrowserSessionMetadata, include_in_schema=False
+)
+async def get_browser_session_metadata(
+    session_id: str = Path(..., pattern=r"^pbs_[0-9]{1,20}$"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionMetadata:
+    """Read stored metadata without reconciling or contacting browser infrastructure."""
+    session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        session_id, current_org.organization_id
+    )
+    if session is None:
+        raise _browser_session_not_found()
+    session_status = session.status
+    if session_status is None:
+        raise HTTPException(status_code=503, detail={"code": "browser_session_metadata_unavailable"})
+    runs = await app.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session(
+        session_id, current_org.organization_id
+    )
+    return BrowserSessionMetadata(
+        browser_session_id=session.persistent_browser_session_id,
+        organization_id=session.organization_id,
+        status=PersistentBrowserSessionStatus(session_status),
+        created_at=session.created_at,
+        completed_at=session.completed_at,
+        runnable_id=session.runnable_id,
+        associated_workflow_runs=[BrowserSessionWorkflowMetadata.model_validate(run) for run in runs[:100]],
+        association_index_complete=len(runs) <= 100,
+    )
+
+
 @base_router.post(
     "/browser_sessions",
     response_model=BrowserSessionResponse,
@@ -241,6 +278,8 @@ async def create_browser_session(
         generate_browser_profile=browser_session_request.generate_browser_profile,
         needs_live_view=browser_session_request.needs_live_view,
         created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
+        session_kind=BrowserSessionKind.api,
+        browser_settings=browser_session_request.browser_settings,
     )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
@@ -281,7 +320,9 @@ async def close_browser_session(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    # A plain row read: close_session's own signal already handles a workflow that is gone, so the
+    # manager's reconciling read would only add a Temporal round trip to every close.
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
@@ -487,9 +528,11 @@ async def get_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     analytics.capture("skyvern-oss-agent-browser-session-get")
+    # Polled every few seconds per live session; a dead runtime shows up on a later poll.
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
         browser_session_id,
         current_org.organization_id,
+        reconcile_in_background=True,
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
@@ -593,7 +636,8 @@ async def create_browser_session_action_logs(
     events = [sanitize_action_log_event(event) for event in batch.events]
     _validate_action_log_timestamps(events)
 
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    # Ownership is all this needs (closed sessions still accept logs), so no runtime reconciliation.
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
@@ -620,7 +664,7 @@ async def get_browser_session_action_logs(
     page_size: int = Query(default=ACTION_LOG_DEFAULT_PAGE_SIZE, ge=1, le=ACTION_LOG_MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ActionLogPage:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )

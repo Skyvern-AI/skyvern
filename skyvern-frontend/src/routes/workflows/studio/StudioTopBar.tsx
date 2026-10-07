@@ -61,6 +61,8 @@ import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "../editor/PendingGoalChangesDialog";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
+import { getRunBlockingTooltipText } from "../editor/runValidation/runBlockingCopy";
+import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
 import { useDeferredTitleEdit } from "../hooks/useDeferredTitleEdit";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
@@ -159,9 +161,10 @@ export function SaveButton() {
     // swallow so it isn't an unhandled rejection.
     // A hold means the baseline itself may be stale, so even a draft that matches it
     // goes through the confirmation rather than saving straight over the newer change.
+    // With no changes at all, a save would only write a new version (fresh branch ids).
     if (dirty || saveBlockedReason) {
       setConfirmOpen(true);
-    } else {
+    } else if (useWorkflowHasChangesStore.getState().hasChanges) {
       void onSave().catch((error: unknown) => {
         if (
           error instanceof SaveRefusedError ||
@@ -191,13 +194,8 @@ export function SaveButton() {
   return (
     <>
       <ControlTooltip
-        content={
-          saveBlockedReason ? (
-            <span className="block max-w-xs">{saveBlockedReason}</span>
-          ) : (
-            "Save workflow"
-          )
-        }
+        content="Save workflow"
+        reason={saveBlockedReason}
         blocked={isRecording}
       >
         <Button
@@ -214,7 +212,7 @@ export function SaveButton() {
           }}
           aria-label={
             saveBlockedReason
-              ? `Save workflow (paused): ${saveBlockedReason}`
+              ? "Save workflow (paused)"
               : contentDirty
                 ? "Save workflow (unsaved changes)"
                 : "Save workflow"
@@ -245,7 +243,7 @@ export function SaveButton() {
               {saveBlockedReason ? "Save is paused" : "Saving Changes"}
             </DialogTitle>
             <DialogDescription>
-              {saveBlockedReason ?? "The changes below are going to be saved:"}
+              {saveBlockedReason || "The changes below are going to be saved:"}
             </DialogDescription>
           </DialogHeader>
           <WorkflowChangesList changes={changes} />
@@ -380,6 +378,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const postHog = usePostHog();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
+  const hasBlockingBlocks = blockingBlocks.length > 0;
   const {
     data: retainedRun,
     isError: statusUnavailable,
@@ -399,6 +399,12 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
+  const runBlocked = isRecording || hasNoBlocks || hasBlockingBlocks;
+  const runBlockedReason = hasBlockingBlocks
+    ? getRunBlockingTooltipText(blockingBlocks)
+    : hasNoBlocks
+      ? NO_BLOCKS_RUN_TOOLTIP
+      : "Run workflow";
   const rerunEligible = Boolean(
     workflowRun &&
     runIsLogicallyFinal(workflowRun) &&
@@ -503,15 +509,12 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
       <>
         {stopDialog}
         <Dialog>
-          <ControlTooltip
-            content={hasNoBlocks ? NO_BLOCKS_RUN_TOOLTIP : "Run workflow"}
-            blocked={isRecording || hasNoBlocks}
-          >
+          <ControlTooltip content={runBlockedReason} blocked={runBlocked}>
             <DialogTrigger asChild>
               <Button
                 size="default"
-                className="h-8 border border-transparent px-3"
-                disabled={isRecording || hasNoBlocks}
+                className="h-8 border border-transparent px-3 disabled:pointer-events-none"
+                disabled={runBlocked}
               >
                 <PlayIcon className="mr-2 size-4" /> Run
               </Button>
@@ -546,18 +549,18 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   return (
     <ControlTooltip
       content={
-        hasNoBlocks
-          ? NO_BLOCKS_RUN_TOOLTIP
+        hasBlockingBlocks || hasNoBlocks
+          ? runBlockedReason
           : rerunEligible
             ? "Re-run with this run's inputs (opens the run form pre-filled)"
             : "Run workflow"
       }
-      blocked={isRecording || hasNoBlocks}
+      blocked={runBlocked}
     >
       <Button
         size="default"
-        className="h-8 border border-transparent px-3"
-        disabled={isRecording || hasNoBlocks}
+        className="h-8 border border-transparent px-3 disabled:pointer-events-none"
+        disabled={runBlocked}
         onClick={startFullRun}
       >
         <PlayIcon className="mr-2 size-4" />

@@ -25,7 +25,12 @@ from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     authoring_capability_from_policy,
 )
-from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, USER_FACING_REASON_SCHEMA, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    USER_FACING_REASON_PARAM,
+    USER_FACING_REASON_SCHEMA,
+    CopilotContext,
+    advertises,
+)
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
@@ -53,6 +58,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     resolve_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
+from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
@@ -548,8 +554,8 @@ PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
         "run that published it. A block that fails afterwards removes the files it published."
     ),
     "usage": (
-        "Pass exactly one content argument per call. Call it inside a code block and prove it with a test run; "
-        "run_browser_code refuses it. A failed publish raises with the reason. Never write files or paths."
+        "Pass exactly one content argument per call. Call it inside a code block and prove it with a test run. "
+        "A failed publish raises with the reason. Never write files or paths."
     ),
 }
 
@@ -639,6 +645,8 @@ async def _get_block_schema_post_hook(
             _apply_for_loop_schema_guidance(data)
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
+            # The server's hint names its own tool and a block type this turn may not author.
+            data.pop("hint", None)
             for banned in _copilot_banned_block_types(ctx):
                 block_types.pop(banned, None)
             if capability.agent_blocks:
@@ -1095,6 +1103,9 @@ async def _navigate_post_hook(
         _release_scout_challenge_listeners(ctx)
 
 
+_NAVIGATE_READ_GUIDANCE = " Use {readers} when you need the page's structure or selectors before responding."
+
+
 async def _navigate_post_hook_body(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -1135,10 +1146,12 @@ async def _navigate_post_hook_body(
             captured_url=result["url"],
         )
         attached = " A screenshot is attached." if staged else ""
-        result["next_step"] = (
-            f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
-            "page's structure or selectors before responding."
+        copilot_ctx = ctx if isinstance(ctx, CopilotContext) else None
+        readers = " or ".join(
+            name for name in (EVALUATE_TOOL_NAME, COMPOSITION_INSPECTION_TOOL_NAME) if advertises(copilot_ctx, name)
         )
+        read_guidance = _NAVIGATE_READ_GUIDANCE.format(readers=readers) if readers else ""
+        result["next_step"] = f"Page loaded.{attached}{read_guidance}"
     elif not sensitive_origin_page_was_tainted:
         await _capture_post_interaction_screenshot(
             ctx,
@@ -1529,9 +1542,7 @@ def _scout_type_landing_failure(
             "ok": False,
             "error": (
                 f"{tool_name} reported success but the field is still empty. "
-                f"Re-inspect the current page and retry {tool_name} on the target field. "
-                "If an overlay (cookie/marketing popup) consumed the focus, the first "
-                "interaction usually dismisses it."
+                f"Re-inspect the current page and retry {tool_name} on the target field."
             ),
         }
     return None
@@ -2169,19 +2180,6 @@ _PENDING_PROPOSAL_SCHEDULE_ERROR = (
     "runs the saved workflow. Ask the user to accept the proposal, which saves it, or to reject it to "
     "schedule the saved version as it is; then create the schedule."
 )
-# The shared tools' hints name tools that are not on Copilot's surface.
-_SCHEDULE_HINT_REWRITES = (
-    ("Use skyvern_schedule_list to", "Use list_workflow_schedules to"),
-    (
-        "Use skyvern_workflow_list to find valid workflow IDs.",
-        "The workflow open in this chat was not found in this organization.",
-    ),
-    (
-        "Verify the workflow ID with skyvern_workflow_list",
-        "The workflow open in this chat was not found in this organization.",
-    ),
-    (", or set exact=true to do a full replace", ""),
-)
 
 
 async def _schedule_parameters_credential_pre_hook(
@@ -2275,11 +2273,6 @@ async def _workflow_schedule_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    error = result.get("error")
-    if isinstance(error, str):
-        for raw_hint, copilot_hint in _SCHEDULE_HINT_REWRITES:
-            error = error.replace(raw_hint, copilot_hint)
-        result["error"] = error
     _mask_schedule_parameter_values(result.get("data"))
     return result
 
@@ -2341,18 +2334,11 @@ _CREATE_BROWSER_PROFILE_DESCRIPTION = (
     "since closed; the profile holds that session's exact final state. workflow_run_id: a saved run of a "
     "workflow that persists its browser session; the profile copies that workflow's latest saved browser "
     "state at call time, not a snapshot of that run, so a later run of the workflow changes what is copied. "
-    "Say which source you used. "
-    "A 400 or 404 error means the source cannot be used: relay the service's reason. Closing a session is "
-    "the user's action; the user can also start a new capture with Create a Browser Profile on the Profiles "
-    "page under Browsers. A 409 means a profile with that name already exists and nothing was overwritten; "
-    "renaming or deleting it is the user's action. "
-    "After any failed create, list profiles with that name and report the error together with any profile "
-    "found (bp_ ID, created_at); say the profile was saved only when the create returned ok. "
+    "After any failed create, list profiles with that name. "
     "Creating a profile does not select it. Set the workflow's browser_profile_id only when the user asked, "
-    "and never to a profile found after a failed create unless the user confirms it. "
-    "In your reply give the bp_ ID and the name."
+    "and never to a profile found after a failed create unless the user confirms it."
 )
-_EVALUATE_BASE_DESCRIPTION = (
+_EVALUATE_DESCRIPTION = (
     "Execute JavaScript in the browser and return the result. Use it to inspect DOM state and read "
     "values. JavaScript run here can also change the page, but only click, type_text, select_option "
     "and press_key record a scouted interaction, so a change made through this tool leaves nothing to "
@@ -2367,18 +2353,6 @@ _WORKFLOW_KNOWLEDGE_DESCRIPTION = (
     "Request only the relevant sections. For exact fields of a specific block type, use "
     "get_block_schema instead."
 )
-# Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
-# target only once its page is reached. The model reaches that page with navigate/click and
-# observes it here -- evaluate records no interaction -- so the model can author the download step.
-_EVALUATE_SCOUT_ACT_DESCRIPTION = (
-    _EVALUATE_BASE_DESCRIPTION
-    + " Some affordances (a download, a row-expand, a post-login area) only expose their target "
-    "once the page holding them is reached. Use this tool to OBSERVE that page; reach it with the "
-    "navigate/click tools first. For a download, observe the page that "
-    "exposes the download control and capture a stable selector, then author the terminal download "
-    "step from the code-block schema contract."
-)
-
 
 _EVALUATE_OVERLAY_TIMEOUT_SECONDS = outer_cap_seconds(DEFAULT_ACTION_TIMEOUT_MS)
 
@@ -2389,14 +2363,6 @@ def _normalized_authoring_capability(
     if isinstance(capability, AuthoringCapability):
         return capability
     return authoring_capability_from_policy(capability)
-
-
-def _evaluate_overlay_description(
-    capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
-) -> str:
-    if _normalized_authoring_capability(capability).code_blocks:
-        return _EVALUATE_SCOUT_ACT_DESCRIPTION
-    return _EVALUATE_BASE_DESCRIPTION
 
 
 def _block_schema_banned_types_note(
@@ -2418,17 +2384,25 @@ def _build_skyvern_mcp_overlays(
             post_hook=_get_workflow_knowledge_post_hook,
         ),
         "get_block_schema": SchemaOverlay(
+            description=(
+                "Get the schema for a workflow block type, or list the available types when block_type is omitted."
+            ),
             description_suffix=_block_schema_banned_types_note(capability),
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),
-        "validate_block": SchemaOverlay(pre_hook=_validate_block_pre_hook),
+        "validate_block": SchemaOverlay(
+            description=(
+                "Check one workflow block definition, passed as a JSON string in block_json, against its block "
+                "type's schema. It does not run the block. Returns field-level errors."
+            ),
+            pre_hook=_validate_block_pre_hook,
+        ),
         "list_org_workflows": SchemaOverlay(
             description=(
                 "Search this organization's saved workflows by title, folder, or parameter name. Reach for it "
-                "when the user refers to one of their existing workflows ('like my X workflow', 'the one I "
-                "built for Y'), or before building for a site the org may already automate, so the new build "
-                "reuses the org's proven parameters, TOTP wiring and loop style. Each match carries "
+                "when the user refers to one of their existing workflows, or before building for a site the "
+                "org may already automate. Each match carries "
                 "workflow_permanent_id (wpid_...), workflow_id, title, version, status and description. Pass "
                 "the workflow_permanent_id -- not workflow_id -- to get_org_workflow for the full definition."
             ),
@@ -2438,8 +2412,7 @@ def _build_skyvern_mcp_overlays(
             description=(
                 "Read one saved workflow's full definition. workflow_id must be the wpid_... value that "
                 "list_org_workflows returns as workflow_permanent_id; pass version=<n> for an earlier saved "
-                "version. Use it to copy an existing workflow's structure into a new build, or to answer "
-                "questions about a previous saved version of the workflow open in this chat (version=<n-1>). "
+                "version. Use it to copy an existing workflow's structure into a new build. "
                 "Read-only; it does not change the current draft."
             ),
         ),
@@ -2468,7 +2441,7 @@ def _build_skyvern_mcp_overlays(
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
-            description=_evaluate_overlay_description(capability),
+            description=_EVALUATE_DESCRIPTION,
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={
                 "output_path": {
@@ -2497,10 +2470,7 @@ def _build_skyvern_mcp_overlays(
                 "deterministic. Derive the selector from page evidence. When a shared "
                 "class matches many elements (e.g. one button per result row), scope the "
                 "selector to the specific item (its container or a unique attribute). If a "
-                "selector does not resolve, inspect the page again and derive a better one. "
-                "IMPORTANT: jQuery pseudo-selectors like :contains(), :eq(), :first, "
-                ":visible are NOT valid CSS. Use standard selectors: "
-                "'button.download', 'a[href*=\"pdf\"]', '#submit-btn'."
+                "selector does not resolve, inspect the page again and derive a better one."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "button", "click_count", "intent"}),
             forced_args={"selector_mode": "direct"},
@@ -2517,12 +2487,13 @@ def _build_skyvern_mcp_overlays(
                 "if it does not resolve, "
                 "inspect the page again and derive a better one. "
                 "Optionally clear the field first. Use this for form filling. "
-                "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
-                "codes, private keys, or other raw credentials/secrets received in "
+                "NEVER type a raw secret value (for example, a password) received in "
                 "chat. Ask the user to store the value as a saved credential and "
                 "reply with its name; do not type or submit the raw value."
             ),
-            hide_params=frozenset({"session_id", "cdp_url", "delay", "intent"}),
+            # input_method is the Chrome-extension fill; its description names clear, intent and delay,
+            # none of which this surface exposes under those names.
+            hide_params=frozenset({"session_id", "cdp_url", "delay", "intent", "input_method"}),
             forced_args={"selector_mode": "direct"},
             required_overrides=["text"],
             arg_transforms={"clear_first": "clear"},
@@ -2587,6 +2558,12 @@ def _build_skyvern_mcp_overlays(
             post_hook=_press_key_post_hook,
         ),
         "wait_for_either_state": SchemaOverlay(
+            description=(
+                "Find out which of two states the page settled into, such as a sign-in form or an already "
+                "signed-in view, or a challenge or the page behind it. Returns as soon as either selector reaches "
+                "`state`, with `matched_selector` naming the one that did, so you can branch on it without "
+                "inspecting the page again."
+            ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
@@ -2595,6 +2572,7 @@ def _build_skyvern_mcp_overlays(
             post_hook=_wait_for_either_state_post_hook,
         ),
         "skyvern_frame_list": SchemaOverlay(
+            description="List all frames (including iframes) on the current page.",
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
@@ -2602,6 +2580,12 @@ def _build_skyvern_mcp_overlays(
             post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_frame_switch": SchemaOverlay(
+            description=(
+                "Switch into an iframe, chosen by CSS selector, name or index, so later browser actions target "
+                "elements inside it until you switch back to the main frame. The selection belongs to the tab it "
+                "was made in; after changing tabs, return to that tab, switch back to the main frame, then switch in "
+                "again."
+            ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
@@ -2609,6 +2593,10 @@ def _build_skyvern_mcp_overlays(
             post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_frame_main": SchemaOverlay(
+            description=(
+                "Switch back to the main page frame after working inside an iframe, so later browser actions "
+                "target the main page again."
+            ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
@@ -2689,10 +2677,10 @@ def _build_skyvern_mcp_overlays(
             "Schedule the saved workflow open in this chat. Cadence and IANA timezone must come from the user; "
             "if either is missing, ask rather than assume UTC or local time. Leave name unset unless the user "
             "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression, interval_seconds, "
-            "which runs a fixed elapsed interval counted from first_fire_at (cron cannot express an elapsed interval "
-            "such as 'every 36 hours'), or run_at to run once at the user's instant, given as ISO 8601 with the "
-            "user's UTC offset. In your reply, give the saved wfs_ ID, timezone, enabled state and next run from the "
-            "result, and for a one-time schedule its run_at and dispatch_status.",
+            "which runs a fixed elapsed interval counted from first_fire_at (cron cannot express an elapsed interval), "
+            "or run_at to run once at the user's instant, given as ISO 8601 with the "
+            "user's UTC offset. The result carries the saved schedule: its wfs_ ID, timezone, enabled state and "
+            "next run, and for a one-time schedule its run_at and dispatch_status.",
             pre_hook=_create_workflow_schedule_pre_hook,
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(

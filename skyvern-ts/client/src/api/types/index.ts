@@ -112,6 +112,7 @@ export * from "./NonEmptyCreditCardCredential.js";
 export * from "./NonEmptyPasswordCredential.js";
 export * from "./OnePasswordCredentialParameter.js";
 export * from "./OnePasswordCredentialParameterYaml.js";
+export * from "./OneTimeDispatchStatus.js";
 export * from "./OrganizationScheduleItem.js";
 export * from "./OrganizationScheduleListResponse.js";
 export * from "./OtpType.js";

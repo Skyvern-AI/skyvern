@@ -57,9 +57,11 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
+    WorkflowDefinition,
     WorkflowRun,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
@@ -209,7 +211,7 @@ _CHAT_SESSION_ID = "pbs_chat"
 _CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
 
 
-def _fake_workflow_run(status: str) -> WorkflowRun:
+def _fake_workflow_run(status: str, failure_category: list[dict[str, Any]] | None = None) -> WorkflowRun:
     return WorkflowRun(
         workflow_run_id="wr_paused",
         workflow_id="w_source",
@@ -221,6 +223,7 @@ def _fake_workflow_run(status: str) -> WorkflowRun:
         trigger_type=None,
         browser_session_id=None,
         failure_reason=None,
+        failure_category=failure_category,
     )
 
 
@@ -236,6 +239,7 @@ def harness_run(
     copilot_session_id: str | None = None,
     workflow_permanent_id: str = "wpid-1",
     organization_id: str = "org-1",
+    workflow_definition_sha256: str | None = None,
 ) -> SimpleNamespace:
     """Naive-UTC created_at, as the database returns it."""
     return SimpleNamespace(
@@ -249,6 +253,7 @@ def harness_run(
         copilot_session_id=copilot_session_id,
         failure_reason=None,
         browser_session_id="pbs-1",
+        workflow_definition_sha256=workflow_definition_sha256,
     )
 
 
@@ -266,14 +271,23 @@ def install_get_run_results_harness(
     carried_successful_run_id: str | None = None,
     carried_run_id: str | None = None,
     heal_episodes: list[HealEpisode] | None = None,
+    run_definition_sha256: str | None = None,
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
-    pool = [harness_run("wr-1", status=run_status), *(other_runs or [])]
+    pool = [
+        harness_run("wr-1", status=run_status, workflow_definition_sha256=run_definition_sha256),
+        *(other_runs or []),
+    ]
     workflow = SimpleNamespace(
+        workflow_id="wf-1",
+        workflow_permanent_id="wpid-1",
+        version=1,
         created_by=None,
         modified_at=HARNESS_RUN_CREATED_AT,
-        workflow_definition=SimpleNamespace(parameters=workflow_parameters or [], blocks=[]),
+        workflow_definition=SimpleNamespace(
+            parameters=[SimpleNamespace(**parameter) for parameter in workflow_parameters or []], blocks=[]
+        ),
     )
 
     async def get_workflow_run(workflow_run_id: str, organization_id: str | None = None) -> SimpleNamespace | None:
@@ -349,7 +363,86 @@ def install_get_run_results_harness(
         proposal_workflow_run_id=None,
         dispatched_run_ids_this_turn=set(),
         seeded_only_labels_by_run_id={},
+        workflow_yaml=None,
+        staged_workflow_yaml=None,
     )
+
+
+def historical_code_version(
+    blocks: Mapping[str, str],
+    *,
+    parameter_keys: Sequence[str] = ("applicant_name",),
+    default_value: str = "Fixture default",
+    workflow_id: str = "wf-1",
+    modified_at: datetime = HARNESS_RUN_CREATED_AT,
+) -> SimpleNamespace:
+    """A saved version of ``wpid-1`` holding one CodeBlock per ``blocks`` label, as a finished harness run read it."""
+    return SimpleNamespace(
+        workflow_id=workflow_id,
+        workflow_permanent_id="wpid-1",
+        version=3,
+        created_by=None,
+        modified_at=modified_at,
+        workflow_definition=WorkflowDefinition(
+            parameters=[
+                WorkflowParameter(
+                    workflow_parameter_id=f"wp_{key}",
+                    workflow_parameter_type=WorkflowParameterType.STRING,
+                    key=key,
+                    default_value=default_value,
+                    workflow_id=workflow_id,
+                    created_at=HARNESS_RUN_CREATED_AT,
+                    modified_at=HARNESS_RUN_CREATED_AT,
+                )
+                for key in parameter_keys
+            ],
+            blocks=[
+                CodeBlock(
+                    label=label,
+                    code=code,
+                    output_parameter=OutputParameter(
+                        output_parameter_id=f"op_{label}",
+                        key=f"{label}_output",
+                        workflow_id=workflow_id,
+                        created_at=HARNESS_RUN_CREATED_AT,
+                        modified_at=HARNESS_RUN_CREATED_AT,
+                    ),
+                )
+                for label, code in blocks.items()
+            ],
+        ),
+    )
+
+
+def install_historical_run(
+    monkeypatch: pytest.MonkeyPatch,
+    version: SimpleNamespace | None,
+    *,
+    failed_label: str,
+    failing_line: int = 1,
+    run_definition_sha256: str | None = None,
+) -> None:
+    """Harness run ``wr-1`` failed at ``failing_line`` of ``failed_label`` while executing ``version``."""
+
+    async def stamp_failing_line(
+        _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+    ) -> None:
+        results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": failing_line}]
+
+    block = run_result_block_row(
+        failed_label, "failed", failure_reason="NameError: a name is not defined", error_codes=["user_code_error"]
+    )
+    block.created_at = HARNESS_RUN_CREATED_AT
+    block.parent_workflow_run_block_id = None
+    block.current_index = None
+    block.current_value = None
+    install_get_run_results_harness(
+        monkeypatch,
+        blocks=[block],
+        attach_action_traces=stamp_failing_line,
+        run_definition_sha256=run_definition_sha256,
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run.return_value = version
 
 
 def run_result_action_row(
@@ -403,6 +496,7 @@ async def install_run_blocks_harness(
     recent_actions: list[MagicMock] | None = None,
     run_proxy_location: ProxyLocationInput = None,
     run_session_proxy_location: ProxyLocationInput = None,
+    polled_failure_category: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
@@ -488,10 +582,10 @@ async def install_run_blocks_harness(
 
     monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", _get_session)
 
-    polled_run = _fake_workflow_run(status=polled_status)
+    polled_run = _fake_workflow_run(status=polled_status, failure_category=polled_failure_category)
 
-    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any, Any]:
-        return polled_run, now, now
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any]:
+        return polled_run, now
 
     monkeypatch.setattr(run_execution_module, "_read_progress_sources", _read_progress)
     monkeypatch.setattr(run_execution_module, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)

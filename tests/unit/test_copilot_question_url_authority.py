@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _credential_fill_origin_grant,
     _request_credential,
 )
-from skyvern.forge.sdk.copilot.tools.discovery import _user_provided_entry_url
 from skyvern.forge.sdk.routes.workflow_copilot import _make_error_narrative_payload, _persist_turn_messages
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -84,7 +83,6 @@ async def test_authenticated_question_url_reaches_the_real_card_and_rebuilds_fro
             source = ctx.request_policy.user_site_url_sources[_LOGIN_URL]
             assert source == QuestionResponseSiteURLSource(interaction_id=question["interaction_id"])
             assert ctx.request_policy.user_provided_site_urls == [_LOGIN_URL]
-            assert _user_provided_entry_url(ctx) == _LOGIN_URL
 
             chat = await repo.get_workflow_copilot_chat_by_id("org", ctx.workflow_copilot_chat_id)
             await _persist_turn_messages(

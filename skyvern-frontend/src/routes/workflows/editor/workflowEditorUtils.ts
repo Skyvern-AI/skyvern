@@ -36,6 +36,7 @@ import {
   BranchCriteriaTypes,
   debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
+  type BranchCondition,
   type BranchCriteriaType,
   type OutputParameter,
   type Parameter,
@@ -1496,12 +1497,18 @@ function convertToNode(
   }
 }
 
+function isTargetlessElse(branch: BranchCondition): boolean {
+  return branch.is_default && !branch.next_block_label;
+}
+
 function serializeConditionalBlock(
   node: ConditionalNode,
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): ConditionalBlockYAML {
   const mergeLabel = findConditionalMergeLabel(node, nodes, edges) ?? null;
+  const mergeIsInferred =
+    mergeLabel !== null && mergeLabel === node.data.inferredMergeLabel;
 
   const branchConditions = node.data.branches.map((branch) => {
     const orderedNodes = getConditionalBranchNodeSequence(
@@ -1510,7 +1517,23 @@ function serializeConditionalBlock(
       nodes,
       edges,
     );
-    const nextBlockLabel = orderedNodes[0]?.data.label ?? mergeLabel ?? null;
+    // A branch that owns no blocks keeps the target it was loaded with when
+    // another branch of this same conditional owns that block (for example a
+    // shared first block), so the target can never point outside this subtree.
+    const loadedTarget =
+      branch.next_block_label &&
+      nodes.some(
+        (n) =>
+          isWorkflowBlockNode(n) &&
+          n.data.label === branch.next_block_label &&
+          n.data.conditionalNodeId === node.id,
+      )
+        ? branch.next_block_label
+        : null;
+    const nextBlockLabel =
+      orderedNodes[0]?.data.label ??
+      loadedTarget ??
+      (mergeIsInferred && isTargetlessElse(branch) ? null : mergeLabel);
 
     return {
       ...branch,
@@ -1527,7 +1550,9 @@ function serializeConditionalBlock(
     block_type: "conditional",
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
-    next_block_label: mergeLabel,
+    // An inferred merge point is not written back: the backend routes to the
+    // conditional's own next_block_label when no branch target applies.
+    next_block_label: mergeIsInferred ? null : mergeLabel,
     branch_conditions: branchConditions,
   };
 }
@@ -1910,6 +1935,60 @@ function labelsAtOrBeforeConditional(
   return result;
 }
 
+// A conditional with no next_block_label whose branches all converge on one
+// block gets that block as its editor merge point, so each branch keeps only
+// its own chain instead of the last branch walk claiming the shared tail.
+// An Else with no target (including the one the editor adds on open) neither
+// blocks convergence nor takes the merge on save.
+function inferConditionalMergeLabels(
+  blocks: Array<WorkflowBlock>,
+  blocksByLabel: Map<string, WorkflowBlock>,
+  finallyBlockLabel: string | null,
+  inferred: Map<string, string>,
+): Array<WorkflowBlock> {
+  return blocks.map((block) => {
+    if (isNestedLoopWorkflowBlock(block)) {
+      return {
+        ...block,
+        loop_blocks: inferConditionalMergeLabels(
+          block.loop_blocks,
+          blocksByLabel,
+          finallyBlockLabel,
+          inferred,
+        ),
+      } as WorkflowBlock;
+    }
+    if (block.block_type !== "conditional" || block.next_block_label) {
+      return block;
+    }
+    const excludeLabels = labelsAtOrBeforeConditional(block.label, blocks);
+    const chains = block.branch_conditions
+      .filter((branch) => !isTargetlessElse(branch))
+      .map((branch) =>
+        collectLabelsForBranch(
+          branch.next_block_label,
+          null,
+          blocksByLabel,
+          finallyBlockLabel,
+          excludeLabels,
+        ),
+      );
+    if (chains.length < 2) {
+      return block;
+    }
+    const join = chains[0]!.find((label) =>
+      chains.every((chain) => chain.includes(label)),
+    );
+    if (!join) {
+      return block;
+    }
+    inferred.set(block.label, join);
+    const withMerge = { ...block, next_block_label: join };
+    blocksByLabel.set(block.label, withMerge);
+    return withMerge;
+  });
+}
+
 /**
  * Reconstructs the proper hierarchical structure for conditional blocks from a flat blocks array.
  * This is the deserialization counterpart to the edge-based serialization logic.
@@ -2222,7 +2301,15 @@ function findConditionalMergeLabel(
     edges,
   );
   if (!mergeTargetId) {
-    return null;
+    // A conditional ending an enclosing branch keeps its loaded merge when
+    // that is where the enclosing branch continues.
+    const parentId = conditionalNode.data.conditionalNodeId;
+    const loadedMerge = conditionalNode.data.mergeLabel;
+    return loadedMerge &&
+      parentId &&
+      findNextBlockLabel(parentId, nodes, edges) === loadedMerge
+      ? loadedMerge
+      : null;
   }
   const targetNode = nodes.find(
     (node) => node.id === mergeTargetId && isWorkflowBlockNode(node),
@@ -2329,6 +2416,19 @@ function getElements(
     }
   }
 
+  const inferredMergeLabels = new Map<string, string>();
+  // An outer conditional's branches only reach the shared join once a nested
+  // conditional's own merge is inferred, so repeat until nothing new is found.
+  for (let found = -1; found !== inferredMergeLabels.size; ) {
+    found = inferredMergeLabels.size;
+    blocks = inferConditionalMergeLabels(
+      blocks,
+      buildLabelToBlockMap(blocks),
+      settings.finallyBlockLabel ?? null,
+      inferredMergeLabels,
+    );
+  }
+
   const data = generateNodeData(blocks);
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
@@ -2393,6 +2493,10 @@ function getElements(
       editable,
       effectiveDefaultEngine,
     );
+    if (isConditionalNode(node)) {
+      node.data.inferredMergeLabel =
+        inferredMergeLabels.get(node.data.label) ?? null;
+    }
     nodes.push(node);
     if (isWorkflowBlockNode(node)) {
       labelToNode.set(node.data.label, node);
@@ -3499,7 +3603,8 @@ function getWorkflowBlock(
         body_format: node.data.bodyFormat,
         file_attachments: node.data.fileAttachments
           .split(",")
-          .map((attachment) => attachment.trim()),
+          .map((attachment) => attachment.trim())
+          .filter(Boolean),
         recipients: node.data.recipients
           .split(",")
           .map((recipient) => recipient.trim()),
@@ -3792,6 +3897,24 @@ function getWorkflowBlock(
   }
 }
 
+// Branch children follow their conditional in branch order, so blocks[] does
+// not depend on node array order, which layout reshuffles on every branch tab
+// switch (hidden nodes move last).
+function conditionalBranchChildren(
+  node: AppNode,
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Array<WorkflowBlockNode> {
+  if (!isConditionalNode(node)) {
+    return [];
+  }
+  return node.data.branches.flatMap((branch) =>
+    getConditionalBranchNodeSequence(node.id, branch.id, nodes, edges).flatMap(
+      (child) => [child, ...conditionalBranchChildren(child, nodes, edges)],
+    ),
+  );
+}
+
 function getOrderedChildrenBlocks(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
@@ -3843,27 +3966,26 @@ function getOrderedChildrenBlocks(
   }
 
   const children: Array<BlockYAML> = [];
-  let currentNode: WorkflowBlockNode | undefined = firstChild;
-  while (currentNode) {
-    includedIds.add(currentNode.id);
-    if (currentNode.type === "loop") {
-      const loopChildren = getOrderedChildrenBlocks(
-        nodes,
-        edges,
-        currentNode.id,
-      );
-      // Compute next_block_label for nested loops (same as regular blocks)
-      const nextBlockLabel = findNextBlockLabel(currentNode.id, nodes, edges);
+  const pushChild = (node: WorkflowBlockNode) => {
+    includedIds.add(node.id);
+    if (node.type === "loop") {
       children.push(
         serializeLoopNodeToYAML(
-          currentNode as LoopNode,
-          loopChildren,
-          nextBlockLabel,
+          node as LoopNode,
+          getOrderedChildrenBlocks(nodes, edges, node.id),
+          findNextBlockLabel(node.id, nodes, edges),
         ),
       );
     } else {
-      children.push(getWorkflowBlock(currentNode, nodes, edges));
+      children.push(getWorkflowBlock(node, nodes, edges));
     }
+  };
+  let currentNode: WorkflowBlockNode | undefined = firstChild;
+  while (currentNode) {
+    pushChild(currentNode);
+    conditionalBranchChildren(currentNode, nodes, edges)
+      .filter((child) => !includedIds.has(child.id))
+      .forEach(pushChild);
     const nextId = edges.find(
       (edge) => edge.source === currentNode?.id,
     )?.target;
@@ -3885,19 +4007,7 @@ function getOrderedChildrenBlocks(
     if (isInsideIncludedLoop(node.id)) {
       return;
     }
-
-    if (node.type === "loop") {
-      const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
-      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
-      children.push(
-        serializeLoopNodeToYAML(node as LoopNode, loopChildren, nextBlockLabel),
-      );
-      includedIds.add(node.id);
-      return;
-    }
-
-    children.push(getWorkflowBlock(node, nodes, edges));
-    includedIds.add(node.id);
+    pushChild(node);
   });
 
   return children;
@@ -3957,10 +4067,15 @@ function getWorkflowBlocksUtil(
       if (!cursorNode || cursorNode.type === "nodeAdder") {
         break;
       }
-      const emitted = emit(cursorNode);
-      if (emitted) {
-        result.push(emitted);
-        includedIds.add(cursorNode.id);
+      for (const node of [
+        cursorNode,
+        ...conditionalBranchChildren(cursorNode, nodes, edges),
+      ]) {
+        const emitted = includedIds.has(node.id) ? null : emit(node);
+        if (emitted) {
+          result.push(emitted);
+          includedIds.add(node.id);
+        }
       }
       const currentId: string = cursorId;
       cursorId = edges.find((edge) => edge.source === currentId)?.target;
@@ -3968,11 +4083,10 @@ function getWorkflowBlocksUtil(
   }
 
   // Phase 2: append any remaining top-level-eligible blocks the chain walk
-  // did not visit. In practice these are conditional-branch children (nodes
-  // with parentId pointing at a conditional and a conditionalNodeId set).
-  // Their relative position in blocks[] is load-irrelevant; getElements
-  // discovers them via reconstructConditionalStructure keyed off
-  // conditionalNodeId rather than array order.
+  // did not visit (e.g. a branch child no branch chain reaches). Their
+  // relative position in blocks[] is load-irrelevant; getElements discovers
+  // them via reconstructConditionalStructure keyed off conditionalNodeId
+  // rather than array order.
   nodes.forEach((node) => {
     if (includedIds.has(node.id)) return;
     if (node.type === "start" || node.type === "nodeAdder") return;
@@ -4377,6 +4491,22 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
         // Update parameterKeys if present
         ...(parameterKeys !== undefined && {
           parameterKeys: updatedParameterKeys,
+        }),
+        // Save reads a conditional's loaded branch targets and merge labels,
+        // so they must follow renames.
+        ...(node.type === "conditional" && {
+          branches: (node.data.branches as Array<BranchCondition>).map(
+            (branch) =>
+              branch.next_block_label === oldLabel
+                ? { ...branch, next_block_label: newLabel }
+                : branch,
+          ),
+          mergeLabel:
+            node.data.mergeLabel === oldLabel ? newLabel : node.data.mergeLabel,
+          inferredMergeLabel:
+            node.data.inferredMergeLabel === oldLabel
+              ? newLabel
+              : node.data.inferredMergeLabel,
         }),
         // Update the label for the node being renamed
         label: node.id === id ? newLabel : node.data.label,

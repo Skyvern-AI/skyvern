@@ -34,6 +34,7 @@ type StreamBody = {
   cancel_token?: string;
   supports_credential_pause?: boolean;
   supports_credential_pause_recovery?: boolean;
+  supports_credential_generation?: boolean;
   credential_recovery_token?: string;
 };
 type StreamCall = {
@@ -596,7 +597,7 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     // The server sends no frame on timeout, so the deadline alone has to release the dock.
     await act(async () => vi.advanceTimersByTimeAsync(300_001));
     expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
-    expect(screen.queryByText(/continue below/)).toBeNull();
+    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
     expect(screen.getAllByText("Timed out").length).toBeGreaterThan(0);
     expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
@@ -614,7 +615,7 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     const precedes = (a: Node, b: Node) =>
       Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
     const tray = await screen.findByRole("group", { name: "Sign-in request" });
-    const marker = screen.getByText(/continue below/);
+    const marker = screen.getByText("Copilot needs to sign in");
     expect(
       precedes(
         document.querySelector('[data-activity-row-id="tc-1"]')!,
@@ -656,7 +657,7 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     });
     expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
     expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
-    expect(screen.queryByText(/continue below/)).toBeNull();
+    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
     expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
 
@@ -1860,6 +1861,237 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(await screen.findByText(/Sign-in skipped/)).toBeTruthy();
     expect(screen.queryByText(/Credential '.*' added/)).toBeNull();
     expect(screen.queryByText(/Credential added/)).toBeNull();
+  });
+
+  it.each([
+    ["unknown", /The vault didn't confirm the save/],
+    ["created_not_connected", /Saved as Portal test account, not connected/],
+  ] as const)(
+    "registration Generate and save POSTs only the pause ids and a %s save removes the button",
+    async (generateResult, message) => {
+      sansApiPost.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflow/copilot/credential-generate"
+            ? { data: { result: generateResult } }
+            : {},
+        ),
+      );
+      await renderChat();
+      await submit("create a test account");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      expect(streamCalls[0]!.body.supports_credential_generation).toBe(true);
+      await act(async () => {
+        streamCalls[0]!.onMessage(turnStart());
+        streamCalls[0]!.onMessage(
+          credentialFrame({
+            reason: "credential_registration",
+            login_page_urls: ["https://portal.example.com/signup"],
+            registration: {
+              username: "tester@example.com",
+              credential_name: "Portal test account",
+            },
+          }),
+        );
+      });
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Generate and save" }),
+        );
+      });
+      const generatePosts = () =>
+        sansApiPost.mock.calls.filter(
+          (call) => call[0] === "/workflow/copilot/credential-generate",
+        );
+      await waitFor(() => expect(generatePosts()).toHaveLength(1));
+      expect(generatePosts()[0]![1]).toEqual({
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        resume_token: "rt-abc",
+      });
+      expect(await screen.findAllByText(message)).not.toHaveLength(0);
+      expect(
+        screen.queryByRole("button", { name: "Generate and save" }),
+      ).toBeNull();
+      expect(credentialResponsePosts()).toHaveLength(0);
+      expect(
+        screen.queryByRole("button", { name: "Skip for now" }) === null,
+      ).toBe(generateResult === "created_not_connected");
+    },
+  );
+
+  const raiseRegistrationCard = async () => {
+    await renderChat();
+    await submit("create a test account");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          reason: "credential_registration",
+          login_page_urls: ["https://portal.example.com/signup"],
+          registration: {
+            username: "tester@example.com",
+            credential_name: "Portal test account",
+          },
+        }),
+      );
+    });
+    await waitFor(() => expect(credentialsGets().length).toBeGreaterThan(0));
+  };
+
+  it("registration unknown reloads the saved logins so a save that landed late can be picked", async () => {
+    const extendedDeadline = new Date(Date.now() + 600_000).toISOString();
+    sansApiPost.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflow/copilot/credential-generate"
+          ? {
+              data: {
+                result: "unknown",
+                expires_at: extendedDeadline,
+              },
+            }
+          : {},
+      ),
+    );
+    await raiseRegistrationCard();
+    const listsBefore = credentialsGets().length;
+    credentialsData.current = [
+      {
+        credential_id: "cred-new",
+        name: "Portal test account",
+        tested_url: null,
+      },
+    ];
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Generate and save" }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(credentialsGets().length).toBeGreaterThan(listsBefore),
+    );
+    expect(
+      (
+        await screen.findAllByText(
+          /didn't confirm the save. Check your credentials/,
+        )
+      ).length,
+    ).toBeGreaterThan(0);
+    expect((await screen.findAllByText("Saved logins")).length).toBeGreaterThan(
+      0,
+    );
+    expect(credentialResponsePosts()).toHaveLength(0);
+  });
+
+  it("registration Generate whose POST fails reads the card back instead of offering a retry", async () => {
+    sansApiPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/credential-generate"
+        ? Promise.reject(new Error("gateway timeout"))
+        : Promise.resolve({}),
+    );
+    await raiseRegistrationCard();
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [
+        credentialFrame({
+          reason: "credential_registration",
+          login_page_urls: ["https://portal.example.com/signup"],
+          registration: {
+            username: "tester@example.com",
+            credential_name: "Portal test account",
+            attempted: true,
+            outcome: "unknown",
+          },
+        }),
+      ],
+    };
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Generate and save" }),
+      );
+    });
+
+    expect(
+      (await screen.findAllByText(/The vault didn't confirm the save/)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      apiGet.mock.calls.some(
+        ([path]) => path === "/workflow/copilot/chat-history",
+      ),
+    ).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: "Generate and save" }),
+    ).toBeNull();
+    expect(toastFn).not.toHaveBeenCalled();
+  });
+
+  it("registration Generate whose POST fails keeps reading the card until the save settles", async () => {
+    sansApiPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/credential-generate"
+        ? Promise.reject(new Error("gateway timeout"))
+        : Promise.resolve({}),
+    );
+    await raiseRegistrationCard();
+    const registrationCard = (
+      registration: Partial<
+        NonNullable<WorkflowCopilotCredentialRequiredUpdate["registration"]>
+      >,
+      expiresAt?: string,
+    ) =>
+      credentialFrame({
+        reason: "credential_registration",
+        login_page_urls: ["https://portal.example.com/signup"],
+        registration: {
+          username: "tester@example.com",
+          credential_name: "Portal test account",
+          attempted: true,
+          ...registration,
+        },
+        ...(expiresAt ? { expires_at: expiresAt } : {}),
+      });
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [registrationCard({})],
+    };
+    const historyReads = () =>
+      apiGet.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/chat-history",
+      ).length;
+    vi.useFakeTimers();
+    const readsBefore = historyReads();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Generate and save" }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(historyReads()).toBeGreaterThan(readsBefore);
+    expect(screen.queryByText(/The vault didn't confirm the save/)).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Generate and save" }),
+    ).toBeNull();
+
+    const extendedDeadline = new Date(Date.now() + 600_000).toISOString();
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [
+        registrationCard({ outcome: "unknown" }, extendedDeadline),
+      ],
+    };
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+
+    expect(
+      screen.getAllByText(/The vault didn't confirm the save/).length,
+    ).toBeGreaterThan(0);
+    await act(async () => vi.advanceTimersByTimeAsync(300_001));
+    expect(
+      screen.getAllByText(/The vault didn't confirm the save/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("Timed out")).toBeNull();
+    expect(credentialResponsePosts()).toHaveLength(0);
+    expect(toastFn).not.toHaveBeenCalled();
   });
 
   it("connect with an existing matched credential POSTs the credential_id", async () => {

@@ -89,6 +89,8 @@ CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
 # Dropped hovers are tolerated: they are usually incidental to a located click.
 _RECORDING_REQUIRED_ACTION_TYPES = {
     "click": "click",
+    "drag": "drag",
+    "set_dialog_policy": "input_text",
     "type_text": "input_text",
     CREDENTIAL_FILL_TOOL_NAME: "input_text",
     "select_option": "select_option",
@@ -2459,6 +2461,22 @@ def synthesize_code_block(
         action_indent = action_indent_for(trajectory_index)
         tool_name = str(interaction.get("tool_name") or "")
 
+        incomplete_capture_reason = str(interaction.get("incomplete_capture_reason") or "").strip()
+        replay_unsupported_reason = str(interaction.get("replay_unsupported_reason") or "").strip()
+        if incomplete_capture_reason or replay_unsupported_reason:
+            diagnostics.dropped_interactions.append(
+                {
+                    "trajectory_index": trajectory_index,
+                    "tool_name": tool_name,
+                    "reason_code": (
+                        f"incomplete_capture_{incomplete_capture_reason}"
+                        if incomplete_capture_reason
+                        else replay_unsupported_reason
+                    ),
+                }
+            )
+            continue
+
         if tool_name == "press_key":
             emit_snapshot_recovery(trajectory_index, action_indent)
             key = str(interaction.get("key") or "").strip()
@@ -2562,6 +2580,35 @@ def synthesize_code_block(
             emitted += 1
             continue
 
+        if tool_name == "set_dialog_policy":
+            action = str(interaction.get("action") or "").strip()
+            if action not in {"accept", "dismiss"} or interaction.get("prompt_text_redacted"):
+                reason_code = "redacted_prompt_text" if interaction.get("prompt_text_redacted") else "invalid_action"
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": reason_code}
+                )
+                continue
+            line_start = len(lines) + 1
+            prompt_text = interaction.get("prompt_text")
+            if prompt_text is not None:
+                dialog_param_key = _unique_key("dialog_prompt", used_param_keys)
+                parameters.append({"key": dialog_param_key, "default_value": str(prompt_text)})
+                lines.append(
+                    f"{action_indent}await set_dialog_policy(page, {_py_str(action)}, str({dialog_param_key}))"
+                )
+            else:
+                lines.append(f"{action_indent}await set_dialog_policy(page, {_py_str(action)})")
+            record_emission(
+                trajectory_index,
+                tool_name,
+                "set_dialog_policy",
+                "page",
+                line_start=line_start,
+                lane="recording_dialog",
+            )
+            emitted += 1
+            continue
+
         locator = _locator_expr(
             interaction,
             notes,
@@ -2630,6 +2677,27 @@ def synthesize_code_block(
                     lines.append(f"{action_indent}await solve_captcha(page)")
                 record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
+        elif tool_name == "drag" and not strict_selectors:
+            destination = interaction.get("destination")
+            destination_locator = (
+                _locator_expr(
+                    destination,
+                    notes,
+                    diagnostics=diagnostics,
+                    trajectory_index=trajectory_index,
+                    tool_name=tool_name,
+                    strict_selectors=strict_selectors,
+                )
+                if isinstance(destination, dict)
+                else ""
+            )
+            if not destination_locator:
+                continue
+            lines.append(f"{action_indent}await {locator}.drag_to({destination_locator})")
+            record_emission(
+                trajectory_index, tool_name, "drag_to", locator, line_start=line_start, lane="recording_drag"
+            )
+            append_step(f"Drag {_step_target(interaction)}", "drag", line_start)
         elif tool_name == "type_text":
             snapshot_binding = snapshot_bindings_by_index.get(trajectory_index)
             typed_identity = _typed_value_identity(interaction)

@@ -44,6 +44,9 @@ interface CopilotActionStore extends CodeEditedGoalActions {
   queuedBuilds: Array<CopilotBlockBuildRequest>;
   // Bumped when the user stops an in-flight block generation.
   cancelNonce: number;
+  // Set while the chat refuses every stop, so a block's Stop renders disabled and requestCancel is a no-op.
+  stopBlockedReason: string | null;
+  setStopBlockedReason: (reason: string | null) => void;
   // Blocks whose Goal a person changed and that have not been updated to match it yet. Published
   // from inside the canvas so surfaces outside it (the chat, the top bar) can read it.
   pendingGoalChanges: Array<PendingGoalChange>;
@@ -75,6 +78,8 @@ export const useCopilotActionStore = create<CopilotActionStore>((set, get) => ({
   generatingBlockLabel: null,
   queuedBuilds: [],
   cancelNonce: 0,
+  stopBlockedReason: null,
+  setStopBlockedReason: (reason) => set({ stopBlockedReason: reason }),
   pendingGoalChanges: [],
   undoGoalChange: noop,
   setPendingGoalChanges: (changes) =>
@@ -160,12 +165,16 @@ export const useCopilotActionStore = create<CopilotActionStore>((set, get) => ({
         : { generatingBlockLabel: null };
     }),
   requestCancel: () =>
-    set((state) => ({
-      pendingBuild: null,
-      generatingBlockLabel: null,
-      queuedBuilds: [],
-      cancelNonce: state.cancelNonce + 1,
-    })),
+    set((state) =>
+      state.stopBlockedReason
+        ? state
+        : {
+            pendingBuild: null,
+            generatingBlockLabel: null,
+            queuedBuilds: [],
+            cancelNonce: state.cancelNonce + 1,
+          },
+    ),
 }));
 
 export function blockIsBuilding(

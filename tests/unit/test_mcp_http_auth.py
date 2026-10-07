@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -511,6 +512,39 @@ async def test_validate_mcp_api_key_retries_transient_failure_without_negative_c
 
     assert recovered_org.organization_id == "org_recovered"
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_validate_mcp_api_key_cache_keeps_keys_apart_without_key_stretching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _no_key_stretching(*_: object, **__: object) -> bytes:
+        raise AssertionError("the API-key cache fingerprint must not run a key-derivation function per request")
+
+    monkeypatch.setattr(hashlib, "pbkdf2_hmac", _no_key_stretching)
+    # Real API keys share a long JWT header prefix, so a fingerprint that truncates its input would collide here.
+    shared_prefix = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    orgs_by_key = {shared_prefix + "a": "org_a", shared_prefix + "b": "org_b"}
+    invalid_key = shared_prefix + "c"
+    resolved_keys: list[str] = []
+
+    async def _resolve(api_key: str, _db: object, **_: object) -> object:
+        resolved_keys.append(api_key)
+        if api_key not in orgs_by_key:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        return _build_resolved_validation(orgs_by_key[api_key])
+
+    monkeypatch.setattr(mcp_http_auth, "resolve_org_from_api_key", _resolve)
+    _stub_auth_db(monkeypatch, object())
+
+    for _ in range(2):
+        for api_key, organization_id in orgs_by_key.items():
+            assert (await mcp_http_auth.validate_mcp_api_key(api_key)).organization_id == organization_id
+        with pytest.raises(HTTPException) as exc_info:
+            await mcp_http_auth.validate_mcp_api_key(invalid_key)
+        assert exc_info.value.status_code == 401
+
+    assert sorted(resolved_keys) == sorted([*orgs_by_key, invalid_key])
 
 
 def test_profile_to_mcp_url_normalizes_base_variants() -> None:

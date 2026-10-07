@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,6 +24,7 @@ from sqlalchemy import (
     exists,
     false,
     func,
+    insert,
     literal,
     literal_column,
     null,
@@ -48,7 +49,7 @@ from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import DispatchFinalizationStatus, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX, PERSISTENT_BROWSER_SESSION_ID
 from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
@@ -70,6 +71,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunCredentialSelectionModel,
+    WorkflowRunGroupItemModel,
+    WorkflowRunGroupModel,
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
@@ -77,6 +80,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.protocols import WorkflowParameterReader
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import attempt_metadata_options, merge_attempt_progress
 from skyvern.forge.sdk.db.utils import (
+    browser_settings_receipt_replaceable,
     convert_to_artifact,
     convert_to_task,
     convert_to_workflow_run,
@@ -92,6 +96,7 @@ from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYT
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
+    MIXED_RUN_DEFINITION_DIGEST,
     WorkflowDefinition,
     WorkflowRun,
     WorkflowRunOutputParameter,
@@ -106,8 +111,10 @@ from skyvern.forge.sdk.workflow.status_mapping import (
     STEP_STATUS_MAP,
     TASK_STATUS_MAP,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
+from skyvern.schemas.workflows import BlockStatus
 
 LOG = structlog.get_logger()
 
@@ -392,7 +399,7 @@ class WorkflowRunsRepository(BaseRepository):
         organization_id: str,
         attempt_number: int,
         dispatch_claim_started_at: datetime | None,
-        status: Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out],
+        status: DispatchFinalizationStatus,
         failure_reason: str | None,
         failure_category: list[dict[str, Any]] | None = None,
         cascade_children: bool = True,
@@ -491,6 +498,8 @@ class WorkflowRunsRepository(BaseRepository):
                 for statement in (
                     update(WorkflowRunBlockModel)
                     .where(
+                        # No index leads with workflow_run_id; without the org the update scans the whole table.
+                        WorkflowRunBlockModel.organization_id == organization_id,
                         WorkflowRunBlockModel.workflow_run_id == workflow_run_id,
                         func.coalesce(WorkflowRunBlockModel.attempt_number, 1) == attempt_number,
                         WorkflowRunBlockModel.status.in_(NONFINAL_BLOCK_STATUSES),
@@ -863,11 +872,15 @@ class WorkflowRunsRepository(BaseRepository):
         copilot_session_id: str | None = None,
         start_fresh_browser: bool | None = None,
         created_by: str | None = None,
+        workflow_definition_sha256: str | None = None,
+        browser_settings: BrowserSettings | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
             if workflow_run_id is not None:
                 kwargs["workflow_run_id"] = workflow_run_id
+            if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
+                kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
             workflow_run = WorkflowRunModel(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_id=workflow_id,
@@ -877,6 +890,7 @@ class WorkflowRunsRepository(BaseRepository):
                 start_fresh_browser=start_fresh_browser,
                 reuse_browser_session=reuse_browser_session,
                 reuse_bound_key=reuse_bound_key,
+                workflow_definition_sha256=workflow_definition_sha256,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
                 webhook_callback_url=webhook_callback_url,
@@ -905,9 +919,30 @@ class WorkflowRunsRepository(BaseRepository):
                 **kwargs,
             )
             session.add(workflow_run)
+            # The flush already holds what a post-commit refresh would reread: Python defaults are set at flush and
+            # any server default returns through the INSERT. Only a trigger could differ; add a refresh if one lands.
+            await session.flush()
+            created = convert_to_workflow_run(workflow_run)
             await session.commit()
-            await session.refresh(workflow_run)
-            return convert_to_workflow_run(workflow_run)
+            return created
+
+    @db_operation("record_workflow_run_browser_settings_receipt")
+    async def record_workflow_run_browser_settings_receipt(
+        self, workflow_run_id: str, organization_id: str, receipt: BrowserSettingsReceipt
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(browser_settings_receipt_replaceable(WorkflowRunModel.browser_settings_receipt, receipt))
+                .values(
+                    browser_settings_receipt=receipt.model_dump(mode="json"),
+                    modified_at=WorkflowRunModel.modified_at,
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     @db_operation("get_workflow_run_retried_by")
     async def get_workflow_run_retried_by(self, workflow_run_id: str, organization_id: str) -> str | None:
@@ -1220,6 +1255,7 @@ class WorkflowRunsRepository(BaseRepository):
         only_from: Sequence[WorkflowRunStatus] | None = None,
         job_id: str | None = None,
         depends_on_workflow_run_id: str | None = None,
+        workflow_definition_sha256: str | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
@@ -1245,6 +1281,14 @@ class WorkflowRunsRepository(BaseRepository):
             values["job_id"] = job_id
         if depends_on_workflow_run_id:
             values["depends_on_workflow_run_id"] = depends_on_workflow_run_id
+        if workflow_definition_sha256 is not None:
+            # Only invalidate: a retry re-enters with the row as it is now while earlier attempts' block rows still
+            # describe the old code, and a NULL digest (a run created before digests) cannot say what those ran.
+            stored = WorkflowRunModel.workflow_definition_sha256
+            values["workflow_definition_sha256"] = case(
+                (and_(stored.is_not(None), stored != workflow_definition_sha256), MIXED_RUN_DEFINITION_DIGEST),
+                else_=stored,
+            )
         # The reopen/reset path clears attribution when it returns the row to `created`, so a
         # later terminal transition starts from SQL NULL and this COALESCE fills the freshly
         # derived document; on any row that already carries one it preserves the first writer.
@@ -1791,6 +1835,19 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter_by(organization_id=organization_id)
             return await session.scalar(query)
 
+    @db_operation("get_browser_runtime", log_errors=False)
+    async def get_browser_runtime(self, workflow_run_id: str, organization_id: str) -> str | None:
+        """Where the run's browser ran (``local``, ``pbs`` or ``vendor``), once it acquired one.
+
+        Selects the column for the same reason as ``get_secure_runner_pin``: ``WorkflowRun`` is a published schema.
+        """
+        async with self.Session() as session:
+            return await session.scalar(
+                select(WorkflowRunModel.browser_runtime).filter_by(
+                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                )
+            )
+
     @db_operation("get_workflow_run_status", log_errors=False)
     async def get_workflow_run_status(
         self,
@@ -2329,6 +2386,55 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter_by(organization_id=organization_id)
             workflow_runs = (await session.scalars(query)).all()
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
+
+    @db_operation("get_latest_group_child_run_id")
+    async def get_latest_group_child_run_id(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_id: str,
+        workflow_parameter_id: str,
+        values: Sequence[str],
+        submission_key_suffix: str,
+        completed_without_block_statuses: Collection[BlockStatus] | None,
+    ) -> str | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunGroupItemModel.workflow_run_id)
+                .select_from(WorkflowRunGroupModel)
+                .join(
+                    WorkflowRunGroupItemModel,
+                    WorkflowRunGroupItemModel.workflow_run_group_id == WorkflowRunGroupModel.workflow_run_group_id,
+                )
+                .join(
+                    WorkflowRunParameterModel,
+                    WorkflowRunParameterModel.workflow_run_id == WorkflowRunGroupItemModel.workflow_run_id,
+                )
+                .filter(
+                    WorkflowRunGroupModel.organization_id == organization_id,
+                    WorkflowRunGroupModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowRunGroupModel.workflow_id == workflow_id,
+                    WorkflowRunGroupModel.submission_key.endswith(submission_key_suffix, autoescape=True),
+                    WorkflowRunParameterModel.workflow_parameter_id == workflow_parameter_id,
+                    WorkflowRunParameterModel.value.in_(values),
+                )
+                .order_by(WorkflowRunGroupItemModel.created_at.desc())
+                .limit(1)
+            )
+            if completed_without_block_statuses is not None:
+                query = query.join(
+                    WorkflowRunModel, WorkflowRunModel.workflow_run_id == WorkflowRunGroupItemModel.workflow_run_id
+                ).filter(
+                    WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.status == WorkflowRunStatus.completed.value,
+                    ~exists().where(
+                        WorkflowRunBlockModel.organization_id == organization_id,
+                        WorkflowRunBlockModel.workflow_run_id == WorkflowRunGroupItemModel.workflow_run_id,
+                        WorkflowRunBlockModel.status.in_([status.value for status in completed_without_block_statuses]),
+                    ),
+                )
+            return await session.scalar(query)
 
     @db_operation("get_last_running_workflow_run")
     async def get_last_running_workflow_run(
@@ -3017,6 +3123,46 @@ class WorkflowRunsRepository(BaseRepository):
                 for run, title in workflow_runs_and_titles_tuples
             ]
 
+    @db_operation("get_workflow_metadata_for_browser_session")
+    async def get_workflow_metadata_for_browser_session(
+        self, browser_session_id: str, organization_id: str
+    ) -> list[dict[str, Any]]:
+        identifiers = self._indexed_identifier_run_ids(browser_session_id, standalone_tasks=False)
+        if identifiers is None:
+            raise ValueError("invalid_browser_session_identifier")
+        pinned_runs = select(WorkflowRunAttemptModel.workflow_run_id).where(
+            WorkflowRunAttemptModel.organization_id == organization_id,
+            WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
+        )
+        async with self.Session() as session:
+            query = (
+                select(
+                    WorkflowRunModel.workflow_run_id,
+                    WorkflowRunModel.organization_id,
+                    WorkflowRunModel.browser_session_id,
+                    WorkflowRunModel.workflow_permanent_id,
+                    WorkflowRunModel.copilot_session_id,
+                    WorkflowRunModel.status,
+                    WorkflowRunModel.created_at,
+                    WorkflowRunModel.finished_at,
+                    WorkflowRunModel.credits_used,
+                    WorkflowRunModel.cached_credits_used,
+                )
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(
+                    or_(
+                        WorkflowRunModel.workflow_run_id.in_(identifiers),
+                        WorkflowRunModel.workflow_run_id.in_(pinned_runs),
+                    )
+                )
+                .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+                .limit(101)
+            )
+            result = await session.execute(query)
+            return [
+                {**dict(row), "association_browser_session_id": browser_session_id} for row in result.mappings().all()
+            ]
+
     @db_operation("get_workflow_runs_by_parent_workflow_run_id")
     async def get_workflow_runs_by_parent_workflow_run_id(
         self,
@@ -3162,23 +3308,26 @@ class WorkflowRunsRepository(BaseRepository):
         if not workflow_parameter_values:
             return []
 
-        workflow_run_parameters = [
-            WorkflowRunParameterModel(
-                workflow_run_id=workflow_run_id,
-                workflow_parameter_id=workflow_parameter.workflow_parameter_id,
-                value=value,
-            )
+        created_at = naive_utc_now()
+        rows = [
+            {
+                "workflow_run_id": workflow_run_id,
+                "workflow_parameter_id": workflow_parameter.workflow_parameter_id,
+                "value": value,
+                "created_at": created_at,
+            }
             for workflow_parameter, value in workflow_parameter_values
         ]
 
         async with self.Session() as session:
-            session.add_all(workflow_run_parameters)
-            await session.flush()
+            # One multi-VALUES statement. An ORM add_all + flush has no RETURNING here, so on psycopg it
+            # becomes a pipelined executemany that waits on the event loop once per row.
+            await session.execute(insert(WorkflowRunParameterModel).values(rows))
             converted = [
-                convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
-                for workflow_run_parameter, (workflow_parameter, _) in zip(
-                    workflow_run_parameters, workflow_parameter_values, strict=True
+                convert_to_workflow_run_parameter(
+                    WorkflowRunParameterModel(**row), workflow_parameter, self.debug_enabled
                 )
+                for row, (workflow_parameter, _) in zip(rows, workflow_parameter_values, strict=True)
             ]
             await session.commit()
             return converted

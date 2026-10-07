@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING, Any
 import pydantic
 import pydantic.json
 import structlog
+from sqlalchemy import Column, ColumnElement, or_
 
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
@@ -72,6 +74,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.browser_settings import BrowserSettingsReceipt, BrowserSettingsStatus
 from skyvern.schemas.proxy_pinning import redact_proxy_location
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse, read_browser_type
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
@@ -132,6 +135,13 @@ def escape_like_term(term: str) -> str:
 
 def nullable_column_equals(column: Any, value: Any) -> Any:
     return column.is_(None) if value is None else column == value
+
+
+def browser_settings_receipt_replaceable(column: Column[Any], receipt: BrowserSettingsReceipt) -> ColumnElement[bool]:
+    """A recorded verified, mismatch or unapplied receipt is final; only a measured result may replace unknown."""
+    if receipt.status not in (BrowserSettingsStatus.verified, BrowserSettingsStatus.mismatch):
+        return column.is_(None)
+    return or_(column.is_(None), column["status"].as_string() == BrowserSettingsStatus.unknown.value)
 
 
 def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
@@ -307,6 +317,13 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     if args:
         args = (_scrub_nul_chars(args[0]),) + args[1:]
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
+
+
+def as_stored_json(value: typing.Any) -> typing.Any:
+    """Return value as a JSON column hands it back after a write: NULs stripped, non-JSON types encoded."""
+    if value is None:
+        return None
+    return _scrub_nul_chars(json.loads(_custom_json_serializer(value)))
 
 
 def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
@@ -700,6 +717,7 @@ def convert_to_workflow_run(
         start_fresh_browser=workflow_run_model.start_fresh_browser,
         reuse_browser_session=workflow_run_model.reuse_browser_session,
         reuse_bound_key=workflow_run_model.reuse_bound_key,
+        workflow_definition_sha256=workflow_run_model.workflow_definition_sha256,
         task_queue=workflow_run_model.task_queue,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
@@ -735,6 +753,8 @@ def convert_to_workflow_run(
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
+        browser_settings=workflow_run_model.browser_settings,
+        browser_settings_receipt=workflow_run_model.browser_settings_receipt,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
         copilot_session_id=workflow_run_model.copilot_session_id,
         created_by=workflow_run_model.created_by,
@@ -895,10 +915,14 @@ def convert_to_workflow_run_parameter(
             workflow_parameter_id=workflow_run_parameter_model.workflow_parameter_id,
         )
 
+    value = workflow_run_parameter_model.value
+    # Retention scrubbing overwrites the value with SCRUBBED_VALUE whatever the declared type, so it is not convertible.
+    if value != SCRUBBED_VALUE:
+        value = workflow_parameter.workflow_parameter_type.convert_value(value)
     return WorkflowRunParameter(
         workflow_run_id=workflow_run_parameter_model.workflow_run_id,
         workflow_parameter_id=workflow_run_parameter_model.workflow_parameter_id,
-        value=workflow_parameter.workflow_parameter_type.convert_value(workflow_run_parameter_model.value),
+        value=value,
         created_at=workflow_run_parameter_model.created_at,
     )
 

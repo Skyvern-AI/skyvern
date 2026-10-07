@@ -855,6 +855,7 @@ class WorkflowRunGroupItemModel(Base):
     __table_args__ = (
         UniqueConstraint("workflow_run_group_id", "item_key", name="uq_workflow_run_group_items_group_item_key"),
         UniqueConstraint("workflow_run_id", name="uq_workflow_run_group_items_workflow_run_id"),
+        Index("ix_workflow_run_group_items_item_key_created_at", "item_key", "created_at"),
     )
 
     workflow_run_group_id = Column(String, primary_key=True)
@@ -952,6 +953,7 @@ class WorkflowRunModel(Base):
     start_fresh_browser = Column(Boolean, nullable=True)
     reuse_browser_session = Column(Boolean, nullable=True)
     reuse_bound_key = Column(String, nullable=True)
+    workflow_definition_sha256 = Column(String, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -976,6 +978,8 @@ class WorkflowRunModel(Base):
     sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
@@ -1700,6 +1704,9 @@ class PersistentBrowserSessionModel(Base):
     browser_profile_id = Column(String, nullable=True, index=True)
     bound_workflow_permanent_id = Column(String, nullable=True)
     bound_key = Column(String, nullable=True)
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
+    created_for_workflow_run_id = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -1932,6 +1939,15 @@ class CredentialModel(Base):
 
 class DebugSessionModel(Base):
     __tablename__ = "debug_sessions"
+    __table_args__ = (
+        Index(
+            "ix_debug_sessions_org_wpid_user_created_at",
+            "organization_id",
+            "workflow_permanent_id",
+            "user_id",
+            "created_at",
+        ),
+    )
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import InvalidElementForTextInput
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ActionType, ClickAction, WaitAction
 from skyvern.webeye.actions.handler import ActionHandler, _resolve_action_execution_timeout
@@ -79,9 +80,12 @@ async def test_handler_raised_timeout_error_keeps_original_exception_type() -> N
 @pytest.mark.parametrize(
     ("raised", "expected_level"),
     [(timeout_type("Timeout 30000ms exceeded."), "warning") for timeout_type in DRIVER_TIMEOUT_ERROR_TYPES]
-    + [(RuntimeError("unexpected"), "error")],
+    + [
+        (InvalidElementForTextInput(element_id="el", tag_name="div"), "warning"),
+        (RuntimeError("unexpected"), "error"),
+    ],
 )
-async def test_only_driver_timeouts_are_demoted_from_error(raised: Exception, expected_level: str) -> None:
+async def test_expected_failures_are_demoted_from_error(raised: Exception, expected_level: str) -> None:
     task, step, scraped_page, page = _rig()
 
     async def raising_handler(*args: object, **kwargs: object) -> None:

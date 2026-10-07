@@ -15,7 +15,7 @@ import pytest
 from skyvern.config import Settings
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services import planner_levers, task_v2_service
 from skyvern.services.task_v2_service import _should_run_post_block_completion_check
@@ -39,7 +39,12 @@ async def _run_task_v2_wiring_case(
     task_v2.url, task_v2.workflow_run_id = "https://example.test", "wr_test"
     queued_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.queued)
     running_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.running)
-    workflow = MagicMock(workflow_id="wf_test", workflow_permanent_id="wp_test", title="Test")
+    workflow = MagicMock(
+        workflow_id="wf_test",
+        workflow_permanent_id="wp_test",
+        title="Test",
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+    )
     block_result = MagicMock(failure_reason=None, output_parameter_value={}, success=completion_case)
     block = SimpleNamespace(execute_safe=AsyncMock(return_value=block_result))
     scraped_page = SimpleNamespace(screenshots=[])
@@ -220,6 +225,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         status="published",
         extra_http_headers=None,
         cdp_connect_headers=None,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
     block_result = SimpleNamespace(
         status="failed",
@@ -352,6 +358,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
         title="Test workflow",
         description=None,
         status="published",
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
     page = MagicMock()
     scraped_page = SimpleNamespace(screenshots=[])

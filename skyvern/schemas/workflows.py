@@ -36,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
@@ -566,6 +567,8 @@ class BlockResult:
     # False when retry/continuation cannot change the outcome, such as invalid
     # CodeBlock source that fails before execution.
     can_continue_after_failure: bool = True
+    # A failed CodeBlock's failing tab showed a sign-in form. Kept off the output so templates never see it.
+    sign_in_form_visible: bool = False
 
 
 class FileType(StrEnum):
@@ -1806,6 +1809,16 @@ class WorkflowDefinitionYAML(BaseModel):
         default=None,
         description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied to every browser this workflow version creates. Omit to keep the previous "
+        "version's settings; set to null to clear them.",
+    )
+
+    @field_validator("browser_settings")
+    @classmethod
+    def validate_browser_settings(cls, value: BrowserSettings | None) -> BrowserSettings | None:
+        return require_known_timezone(value)
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":

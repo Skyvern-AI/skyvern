@@ -8,11 +8,13 @@ import {
   useRef,
   useState,
   type MutableRefObject,
+  type ReactElement,
 } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   ChevronDownIcon,
   ChevronUpIcon,
@@ -30,6 +32,7 @@ import {
   type Edge,
 } from "@xyflow/react";
 import { WorkflowVersion } from "../../hooks/useWorkflowVersionsQuery";
+import { ControlTooltip } from "../../studio/ControlTooltip";
 import { WorkflowBlock } from "../../types/workflowTypes";
 import { FlowRenderer } from "../FlowRenderer";
 import {
@@ -67,6 +70,8 @@ type Props = {
   onSelectState?: (version: WorkflowVersion) => void;
   mode?: ComparisonMode;
   onCopilotReviewClose?: (status: CopilotReviewStatus) => void | Promise<void>;
+  // Copilot mode: why Accept and Reject are held, e.g. while an Accept's outcome is unresolved.
+  lockReason?: string | null;
   // History mode: exits comparison without applying a version (the studio's
   // "Keep current version"). Copilot mode keeps its own close flow.
   onExit?: () => void;
@@ -308,12 +313,14 @@ function CopilotReview({
   diff,
   version,
   isSettling,
+  lockReason,
   canClose,
   onSettle,
 }: {
   diff: WorkflowReviewDiff;
   version: WorkflowVersion;
   isSettling: boolean;
+  lockReason: string | null;
   canClose: boolean;
   onSettle: (status: CopilotReviewStatus) => void;
 }) {
@@ -326,6 +333,17 @@ function CopilotReview({
   const [cursor, setCursor] = useState(-1);
   const anchorControlRef: AnchorControl = useRef(null);
   const showStatus = !diff.isNewWorkflow;
+  const withLockReason = (control: ReactElement) =>
+    lockReason ? (
+      <ControlTooltip
+        content={<span className="block max-w-xs">{lockReason}</span>}
+        blocked
+      >
+        {control}
+      </ControlTooltip>
+    ) : (
+      control
+    );
   const finallyLabel = version.workflow_definition?.finally_block_label ?? null;
 
   // Conditional levels never fold, so a workflow can have unchanged blocks and
@@ -488,23 +506,39 @@ function CopilotReview({
               </Label>
             </div>
           ) : null}
-          <Button
-            size="sm"
-            variant="secondary"
-            onClick={() => onSettle("reject")}
-            disabled={isSettling}
-          >
-            Reject
-          </Button>
-          {/* Matches the chat's Accept, so one decision looks the same in both places. */}
-          <Button
-            size="sm"
-            onClick={() => onSettle("approve")}
-            disabled={isSettling}
-            className="bg-success text-success-foreground hover:bg-success/90"
-          >
-            Accept changes
-          </Button>
+          {/* The panel renders outside the studio's provider in the classic editor. */}
+          <TooltipProvider delayDuration={200}>
+            {withLockReason(
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => onSettle("reject")}
+                disabled={isSettling || Boolean(lockReason)}
+                aria-label={
+                  lockReason ? `Reject unavailable: ${lockReason}` : undefined
+                }
+                className="disabled:pointer-events-none"
+              >
+                Reject
+              </Button>,
+            )}
+            {/* Matches the chat's Accept, so one decision looks the same in both places. */}
+            {withLockReason(
+              <Button
+                size="sm"
+                onClick={() => onSettle("approve")}
+                disabled={isSettling || Boolean(lockReason)}
+                aria-label={
+                  lockReason
+                    ? `Accept changes unavailable: ${lockReason}`
+                    : undefined
+                }
+                className="bg-success text-success-foreground hover:bg-success/90 disabled:pointer-events-none"
+              >
+                Accept changes
+              </Button>,
+            )}
+          </TooltipProvider>
           {canClose ? (
             <button
               type="button"
@@ -676,6 +710,7 @@ function WorkflowComparisonPanel({
   onSelectState,
   mode = "history",
   onCopilotReviewClose,
+  lockReason = null,
   onExit,
 }: Props) {
   const diff = useMemo(
@@ -737,6 +772,7 @@ function WorkflowComparisonPanel({
           diff={diff}
           version={version2}
           isSettling={isSettling}
+          lockReason={lockReason}
           canClose={Boolean(onCopilotReviewClose)}
           onSettle={(status) => void settleCopilotReview(status)}
         />

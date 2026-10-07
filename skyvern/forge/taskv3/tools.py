@@ -16,6 +16,7 @@ import asyncio
 import calendar
 import contextlib
 import dataclasses
+import decimal
 import functools
 import io
 import json
@@ -24,6 +25,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import time
 import unicodedata
 import weakref
@@ -33,7 +35,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 from urllib.parse import urlparse
 
 import structlog
@@ -81,6 +83,7 @@ from skyvern.forge.taskv3.loop import (
     record_hit_class,
     record_resolve_seconds,
     record_text_delta,
+    record_type_reach,
     set_driver_timeout_predicate,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
@@ -732,6 +735,19 @@ def _exact_tier_key(text: str) -> str:
     return normalize_option_label(_canon_label(text))
 
 
+def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str) -> None:
+    # Whether the clicked row IS the requested value, or the value plus one parenthesized decoration, so an
+    # inexact pick can be counted apart from an exact one. No form values and no selector.
+    LOG.info(
+        "taskv3 combobox pick verdict",
+        tool_call_seq=current_tool_call_seq(),
+        path=path,
+        verdict=verdict.value,
+        committed_matches_row=_exact_tier_key(row) == _exact_tier_key(value),
+        row_names_value=_label_names_value(row, value),
+    )
+
+
 def _row_identity(o: dict[str, Any]) -> str:
     """The row's identity as `_MENU_OPTION_TEXTS_JS`'s `rowIdentity` derived it. A row with no `identity` key
     is a note entry, whose `text` is already that identity; an empty one (a row nothing could read) is absent."""
@@ -1232,7 +1248,8 @@ def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any
         f"{value!r} matched no option in {selector}'s list — {seen}, so select_combobox cannot prove {label!r} is "
         f'the only match; the field is NOT filled — if the visible row [data-tv3-menu="{row.get("n")}"] '
         f"{label!r} is the option you want, click it; otherwise pass the option's complete label, or scroll the "
-        "list and look()"
+        "list and look()",
+        error_class="unproven_row",
     )
 
 
@@ -1866,11 +1883,8 @@ _PIERCED_QUERY_JS = (
   // a static list as a reaction. The WeakSet is the best carrier that costs no mutation, at one
   // disclosed price -- a component that re-creates its own content by cloning reads as all-new.
   // Absent (a navigation cleared window) means "no snapshot", never "everything is new".
-  // A run that must write nothing (weak) keeps the light DOM in the WeakSet too, at the same disclosed
-  // price: a container the page re-creates by cloning reads as all-new.
-  const preMark = (el, inShadow, weak) => {
+  const preMark = (el, inShadow) => {
     if (inShadow) window.__tv3_pre.add(el);
-    else if (weak) window.__tv3_pre.add(el);
     else el.setAttribute('data-tv3-pre', '1');
   };
   // instanceof, not truthiness: a page that pre-defines __tv3_pre as an accessor keeps its own
@@ -1936,22 +1950,16 @@ _INSTRUCTION_CLAUSE_RE = re.compile(
 )
 
 _PRESNAPSHOT_JS = (
-    r"""(weak) => {"""
+    r"""() => {"""
     + _PIERCED_QUERY_JS
     + r"""
   preReset();
   pScopeEach((el, inShadow) => {
     const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) preMark(el, inShadow, !!weak);
+    if (r.width > 0 && r.height > 0) preMark(el, inShadow);
   });
 }"""
 )
-
-
-def _pre_weak() -> bool:
-    """Whether this run's pre-snapshots use only the WeakSet carrier, writing no attribute to the page."""
-    return input_dispatch.parity()
-
 
 # Behavioral, site-agnostic suggestion finder. After the caller types a value (with a pre-snapshot taken
 # first), this looks for the suggestion list the typeahead rendered IN REACTION: a small, visible,
@@ -1979,6 +1987,15 @@ _ROW_SEMANTICS_JS = r"""
   const NAV_SEL = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="tab"]';
   const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
   const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
+  // An empty-state row is a list's own "nothing matched" line, never an answer: one the widget disables, or one that
+  // echoes the typed query back inside quotation marks ('No results for "x"'), which is how a list quotes the input.
+  const EMPTY_QUOTES = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e';
+  const emptyStateRow = (n, typedNorm) => {
+    if (composedClosest(n, '[aria-disabled="true"]')) return true;
+    const t = (n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const at = typedNorm ? t.indexOf(typedNorm) : -1;
+    return at > 0 && EMPTY_QUOTES.includes(t[at - 1]) && EMPTY_QUOTES.includes(t[at + typedNorm.length] || '');
+  };
   // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
   // component that draws its label in its own root would read as ''. A row declared inside the row is its
   // own row, so a category's text is its own label, not its children's.
@@ -2084,6 +2101,20 @@ _ROW_SEMANTICS_JS = r"""
   // root the pointer leaf lives in, so a same-root lookup reads that row as a bare button.
   const isNavRow = (el) => {
     try { return !composedClosest(el, OPT_SEL) && !!composedClosest(el, NAV_SEL); } catch (e) { return true; }
+  };
+  // A screen-reader announcement renders inside a log, status or alert region, which is never a list; bare
+  // aria-live is left alone because widgets also put it on their own list. Rows of a list nested inside the
+  // region, of a region the field points at, and of a region holding the field itself are still rows.
+  const ANNOUNCE_SEL = '[role~="log"],[role~="status"],[role~="alert"]';
+  const isAnnouncement = (el, field) => {
+    try {
+      const region = composedClosest(el, ANNOUNCE_SEL);
+      if (!region) return false;
+      const owner = composedClosest(el, DECLARED_ROW_SEL + ',' + LIST_SEL + ',ul,ol');
+      if (owner && pContains(region, owner)) return false;
+      if (field && pContains(region, field)) return false;
+      return !declaredTargets(field).some((t) => t === region || pContains(t, region) || pContains(region, t));
+    } catch (e) { return false; }
   };
   // A control the row only WRAPS reaches the click just as the row's own box does -- but only while
   // it is rendered. A display:none or visibility:hidden action never receives that click, so it says
@@ -2279,7 +2310,7 @@ _DECLARED_VALUES_JS = r"""
 """
 
 
-_FIND_SUGGESTION_JS = (
+_FIND_SUGGESTION_BODY_JS = (
     r"""(args) => {"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
@@ -2345,6 +2376,7 @@ _FIND_SUGGESTION_JS = (
     }
   } catch (e) { openNarrowed = false; }
   const cands = [];
+  const skippedEls = [];
   for (const el of pScopeAll()) {
     // Pre-existing → not a reaction, unless it is a surviving row of that narrowed list.
     if (preHas(el) && !(openNarrowed && focusHas(el))) continue;
@@ -2392,14 +2424,20 @@ _FIND_SUGGESTION_JS = (
       for (const w of want) if (have.has(w)) score++;
       if (isExact && score > 0) score += 100;
     }
-    if (score > 0) cands.push({ el, score, h: r.height, exactRow: isExact, r });
+    if (score <= 0) continue;
+    // Last, so a skipped node is one that scored (a wrapper around a region included).
+    if (isAnnouncement(el, field)) { announceSkipped++; skippedEls.push(el); continue; }
+    cands.push({ el, score, h: r.height, exactRow: isExact, r });
   }
-  if (!cands.length) return null;
+  // A skipped node still takes part in containment: a wrapper whose scoring content is an announcement is no row.
+  // A declared row keeps its own status badge, which is part of the row and not a reason to drop it.
+  const kept = cands.filter((c) => !!composedClosest(c.el, rowSel) || !skippedEls.some((s) => pContains(c.el, s)));
+  if (!kept.length) return null;
   // Drop any candidate that CONTAINS another candidate (a dropdown container over its own rows).
-  const leaves = cands.filter((c) => !cands.some((o) => o.el !== c.el && pContains(c.el, o.el)));
+  const leaves = kept.filter((c) => !kept.some((o) => o.el !== c.el && pContains(c.el, o.el)));
   // A searched row built from parts must reach the matcher whole, so nothing is dropped for containing
   // another candidate; the caller tells nested copies of one candidate from siblings.
-  const pool = searched ? cands : leaves.length ? leaves : cands;
+  const pool = searched ? kept : leaves.length ? leaves : kept;
   const declaredCands = pool.filter((c) => !!composedClosest(c.el, rowSel));
   if (declaredCands.length) {
     // The ROW the widget DECLARED is the unit, not the fragment that happens to hold the matched
@@ -2426,7 +2464,7 @@ _FIND_SUGGESTION_JS = (
     // It clears safeToTag, the same hazards the fully-undeclared branch below clears: the candidate
     // loop's isNavRow only asks whether this node IS navigational, so a plain <div> WRAPPING an
     // <a href> or a reset control reaches here unflagged, and the searched pool keeps containers on
-    // purpose (pool = cands), so a roleless box whose AGGREGATE text is the value would otherwise be
+    // purpose (pool = kept), so a roleless box whose AGGREGATE text is the value would otherwise be
     // clicked, landing on an arbitrary one of its rows.
     const bare = pool.filter(
       (c) => safeToTag(c.el) && !composedClosest(c.el, rowSel) && !rows.some((o) => pContains(o.el, c.el) || pContains(c.el, o.el))
@@ -2473,16 +2511,9 @@ _FIND_SUGGESTION_JS = (
     }
     return { count: n, options, declared: false };
   }
-  // An empty-state row is never the winner: one the widget disables, or one that echoes the typed
-  // query back inside quotation marks ('No results for "x"'), which is how a list quotes the user's input.
-  const QUOTES = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e';
+  // An empty-state row is never the winner.
   const typedNorm = String(args.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  const emptyState = (n) => {
-    if (composedClosest(n, '[aria-disabled="true"]')) return true;
-    const t = (n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const at = typedNorm ? t.indexOf(typedNorm) : -1;
-    return at > 0 && QUOTES.includes(t[at - 1]) && QUOTES.includes(t[at + typedNorm.length] || '');
-  };
+  const emptyState = (n) => emptyStateRow(n, typedNorm);
   const live = pool.filter((c) => !emptyState(c.el));
   // The exact row the widget will not take still names the answer, so no lesser row may stand in for it.
   const barred = pool.find((c) => c.exactRow && emptyState(c.el));
@@ -2507,6 +2538,13 @@ _FIND_SUGGESTION_JS = (
   best.el.setAttribute('data-tv3-sugg', '1');
   return { count: 1, options: [{ n: 1, text: (best.el.innerText || '').trim() }], declared: false };
 }"""
+)
+# Returns [found, announcements skipped], so a call the announcement gate changed can be counted even when it
+# leaves nothing found.
+_FIND_SUGGESTION_JS = (
+    "(args) => { let announceSkipped = 0; const found = ("
+    + _FIND_SUGGESTION_BODY_JS
+    + ")(args); return [found, announceSkipped]; }"
 )
 
 # Read back the row _FIND_SUGGESTION_JS tagged data-tv3-sugg="N" once the caller has picked `n` (via
@@ -2602,7 +2640,7 @@ _FOCUS_SNAPSHOT_JS = (
     if (preHas(el) && !inOpenOwn) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
-    if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow, !!arg.weak);
+    if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow);
   });
   // Record what the list offered NOW: a widget that filters by re-rendering unmounts the rows the
   // typed value does not match, so a later read would find nothing to name on an honest no-match.
@@ -2691,6 +2729,44 @@ _FIELD_DECLARES_LIST_JS = (
     if (composedClosest(el, rowSel)) return true;
   }
   return false;
+}"""
+)
+
+# Whether the list this field declares (aria-controls/aria-owns) shows an enabled row. Unlike a reaction probe it
+# also sees a list that opened on the focus click and filters its rows in place.
+# What the list this field declares (aria-controls/aria-owns) says about the typed text: "rows" when it shows an answer
+# row (it also sees a list that opened on focus and filters in place), "option" when the text is one of its options
+# even hidden (a widget that committed an exact option and closed its list), else "none". A list that cannot be resolved
+# is no evidence that nothing matched, unless the field itself says no popup is open.
+_DECLARED_LIST_ANSWER_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  let field = null;
+  try { field = pQS(arg.sel); } catch (e) { field = null; }
+  if (!field && arg.el && arg.el.isConnected) field = arg.el;
+  if (!field) return 'rows';
+  const typedNorm = String(arg.typed || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const ROW = DECLARED_ROW_SEL + ',[role="gridcell"]';
+  // A natively disabled row is not an answer; a label drawn in a shadow root still is.
+  const dead = (row) => emptyStateRow(row, typedNorm) || row.hasAttribute('disabled');
+  const label = (row) => ((row.innerText || '').trim() || composedRowText(row)).replace(/\s+/g, ' ').trim().toLowerCase();
+  const owned = fieldOwnPopup(field, false);
+  if (owned) {
+    for (const row of pScopeAll()) {
+      if (!pContains(owned, row) || !row.matches(ROW) || dead(row)) continue;
+      if (typedNorm && label(row) === typedNorm) return 'option';
+    }
+  }
+  const popup = fieldOwnPopup(field, true);
+  if (!popup) return (field.getAttribute('aria-expanded') || '').toLowerCase() === 'false' ? 'none' : 'rows';
+  for (const row of pScopeAll()) {
+    if (!pContains(popup, row) || !row.matches(ROW) || dead(row)) continue;
+    const r = row.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') return 'rows';
+  }
+  return 'none';
 }"""
 )
 
@@ -3606,8 +3682,7 @@ _WATCH_REWRITTEN_ROWS_JS = r"""() => {
       const row = t.closest(ROW);
       if (row) {
         unmark(row);
-        // Every descendant, not only stamped ones: a run that writes nothing carries its marks in the WeakSet.
-        row.querySelectorAll('*').forEach(unmark);
+        row.querySelectorAll('[data-tv3-pre]').forEach(unmark);
       } else if (rec.type === 'childList' && t.matches(LIST)) {
         t.querySelectorAll(ROW).forEach(unmark);
       }
@@ -4811,81 +4886,7 @@ _INTERACTIVE_HIT_SEL = (
     '[role~="scrollbar" i], [draggable="true" i]'
 )
 
-_TYPE_TARGET_PROBE_JS = (
-    r"""(arg) => {
-  const _q = """
-    + _ROOT_QUERY_JS
-    + r""";
-"""
-    + _NATIVE_LABEL_JS
-    + r"""
-  try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
-  try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
-  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
-
-  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
-  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
-  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
-  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
-  if (!el) return { exists: false };
-  // A LABEL's own disabled/readOnly/type attributes mean nothing; its genuinely associated control's do.
-  let ctl = el;
-  try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
-  let disabled = false;
-  try { disabled = !!(ctl.disabled || (ctl.matches && ctl.matches(':disabled'))); } catch (e) { /* best-effort */ }
-  let readOnly = false;
-  try { readOnly = !!ctl.readOnly; } catch (e) { /* best-effort */ }
-  const out = { exists: true, disabled, readOnly };
-  try {
-    if (_isToggle(ctl)) {
-      out.toggle = true;
-      out.toggleRadio = String(_attr(ctl, 'type') || '').toLowerCase() === 'radio';
-    }
-  } catch (e) { /* best-effort */ }
-  let r = el.getBoundingClientRect();
-  if (r.width === 0 || r.height === 0) return out;
-  // elementFromPoint answers about the VIEWPORT, so a field below the fold returns null and would
-  // read as unoccluded -- which is most fields on a real form. Playwright scrolls before it clicks,
-  // so scrolling here asks about the same layout the click is about to meet.
-  const inView = r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth;
-  if (!inView) {
-    // 'instant' matters: scrollIntoView inherits CSS scroll-behavior, and a page with smooth
-    // scrolling animates over hundreds of ms while the rect below is read synchronously -- the
-    // element is still off-screen, elementFromPoint returns null, and the probe reports nothing.
-    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep the rect */ }
-    r = el.getBoundingClientRect();
-  }
-  // The walk must hop ShadowRoot -> host, because Node.contains stays in the light tree and would
-  // read every component control as covered by its own host.
-  // Composed-tree containment: a slotted node renders inside the component's shadow (its
-  // assignedSlot), so a hit on a control's slotted label is a hit on the control, not a cover.
-  const related = (a, b) => {
-    for (let n = b, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) if (n === a) return true;
-    return false;
-  };
-  const domRelated = (a, b) => {
-    for (let n = b, hops = 0; n && hops < 256; hops++, n = n.parentNode || n.host || null) if (n === a) return true;
-    return false;
-  };
-  // The re-centre gate must see a pin inherited across a shadow boundary; the `pinned` skin verdict
-  // keeps its non-piercing walk (stops at a ShadowRoot).
-  const isPinned = (node, pierce) => {
-    if (!pierce) {
-      for (let n = node; n && n.nodeType === 1; n = n.parentNode || n.host || null) {
-        let pos = '';
-        try { pos = getComputedStyle(n).position; } catch (e) { break; }
-        if (pos === 'fixed' || pos === 'sticky') return true;
-      }
-      return false;
-    }
-    for (let n = node, hops = 0; n && hops < 256; hops++, n = n.parentNode || n.host || null) {
-      if (n.nodeType !== 1) continue;
-      let pos = '';
-      try { pos = getComputedStyle(n).position; } catch (e) { break; }
-      if (pos === 'fixed' || pos === 'sticky') return true;
-    }
-    return false;
-  };
+_PAINT_VISIBLE_JS = r"""
   // forPaint asks "would a person SEE this", not "could a person interact with it": a scrim with
   // pointer-events:none is still seen even though clicks pass through it, so the paint scan
   // (layerShowsPaint) passes forPaint=true to keep such a child in view. Every other caller omits it
@@ -4945,6 +4946,202 @@ _TYPE_TARGET_PROBE_JS = (
       (clipX && (box.right <= edgeL || box.left >= edgeR)) ||
       (clipY && (box.bottom <= edgeT || box.top >= edgeB))
     );
+  };
+  const visible = (n, forPaint) => {
+    const r = n.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    // pointer-events and visibility are both inherited, but either can be explicitly overridden by
+    // a descendant (a click-through overlay with a poking-through button; a hidden wrapper with one
+    // child restored via visibility:visible) -- the candidate's own computed value already resolves
+    // cascade + override in one read, so both are checked once here, not per-ancestor below.
+    // display has no such override: display:none removes the whole subtree from the render tree,
+    // so it stays an ancestor-walk check, same as opacity and overflow.
+    let ownCs;
+    try { ownCs = getComputedStyle(n); } catch (e) { return false; }
+    if ((!forPaint && ownCs.pointerEvents === 'none') || ownCs.visibility === 'hidden') return false;
+    let steps = 0;
+    for (
+      let a = n;
+      a && a !== document.body && a !== document.documentElement && steps < 40;
+      a = a.parentNode || a.host || null, steps++
+    ) {
+      // A ShadowRoot reached mid-walk (nodeType 11, not 1) carries no style of its own -- skip
+      // straight to its host via the update expression's `.host` fallback rather than stopping
+      // the walk there, or a hidden host (or anything above it) never gets checked.
+      if (a.nodeType !== 1) continue;
+      // inert makes a subtree non-focusable and non-actionable without changing any computed style
+      // property -- the .inert IDL property reflects the attribute directly, no matching needed.
+      if (a.inert) return false;
+      let cs;
+      try { cs = getComputedStyle(a); } catch (e) { return false; }
+      if (cs.display === 'none') return false;
+      if (parseFloat(cs.opacity) === 0) return false;
+      // A carousel/wizard routinely keeps an inactive slide's markup in the DOM, translated out of
+      // its own overflow:hidden container -- present, sized, but never painted.
+      if (a !== n && clipsAway(cs, a, r, false)) return false;
+    }
+    return true;
+  };
+"""
+
+_OWN_LABEL_HIT_JS = (
+    r"""
+  // A thing that announces itself as an overlay is one. This is the least ambiguous signal here --
+  // a decoration has no role, while a tooltip, dialog or toast says so in its markup.
+  const LAYER_ROLE = /^(tooltip|dialog|alertdialog|alert|status|menu|listbox|log|marquee)$/i;
+  const _roleTokens = (role) => String(role).trim().split(/\s+/);
+  const isLayerNode = (n) => {
+    const role = n.getAttribute && n.getAttribute('role');
+    return !!((role && _roleTokens(role).some((t) => LAYER_ROLE.test(t))) || n.hasAttribute('aria-modal') || n.tagName === 'DIALOG');
+  };
+  const ownLabelHitClear = (top, el, boundary) => {
+    // A label that paints nothing is the invisible-occluder shape the caller already refuses.
+    let boundaryVisible = false;
+    try { boundaryVisible = !!(boundary && visible(boundary)); } catch (e) { boundaryVisible = false; }
+    // The property being guarded is the CONTROL's own renderability, not the label's: a visible label
+    // over a visibility:hidden control is still an invisible-occluder shape, just wearing the label.
+    let ctl = el;
+    try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+    let ctlRenderable = false;
+    try { ctlRenderable = visible(ctl, true); } catch (e) { ctlRenderable = false; }
+    if (!boundaryVisible || !ctlRenderable) return false;
+    const area = (b) => Math.max(1, b.width * b.height);
+    const viewport = Math.max(1, innerWidth * innerHeight);
+    const INTERACTIVE_HIT_SEL = """
+    + json.dumps(_INTERACTIVE_HIT_SEL)
+    + r""";
+    let interactiveDescendantHit = false;
+    let layerOnTheWay = false;
+    // A view-sized node anywhere in the hit chain up to the label is a backdrop wearing a label.
+    let chainCoversTheView = false;
+    // A pseudo-element hit-tests as its originating element, so a control-sized label can paint a
+    // fixed full-viewport sheet with no view-sized node in the chain. Measured rather than parsed
+    // from CSS: a node returned for most of the view outside its own box paints across the view.
+    const paintsAcrossTheView = (n) => {
+      let rect = null, root = null;
+      try { rect = n.getBoundingClientRect(); root = n.getRootNode(); } catch (e) { return true; }
+      if (!root || typeof root.elementsFromPoint !== 'function') root = document;
+      const steps = [0.02, 0.26, 0.5, 0.74, 0.98];
+      let outside = 0;
+      for (const fx of steps) for (const fy of steps) {
+        const x = innerWidth * fx, y = innerHeight * fy;
+        if (x >= rect.left - 1 && x <= rect.right + 1 && y >= rect.top - 1 && y <= rect.bottom + 1) continue;
+        let hits = [];
+        try { hits = root.elementsFromPoint(x, y); } catch (e) { return true; }
+        if (hits.indexOf(n) !== -1) outside++;
+      }
+      return outside >= 0.6 * steps.length * steps.length;
+    };
+    // The other way a pseudo-element can be a layer: pinned to the viewport. Its computed style is
+    // the exact signal there, where the node's own position says nothing about its `::before`.
+    const pseudoPinned = (n) => {
+      for (const which of ['::before', '::after']) {
+        let cs = null;
+        try { cs = getComputedStyle(n, which); } catch (e) { return true; }
+        if (!cs || cs.content === 'none' || cs.display === 'none') continue;
+        if (cs.position === 'fixed' || cs.position === 'sticky') return true;
+      }
+      return false;
+    };
+    // The boundary itself is never its own interceptor: it IS the control in the LABEL-target case, and
+    // a label may carry role=radio/checkbox itself.
+    for (let n = top, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+      if (n.nodeType === 1 && (isLayerNode(n) || pseudoPinned(n))) { layerOnTheWay = true; break; }
+      if (n.nodeType === 1) {
+        let a = 0;
+        try { a = area(n.getBoundingClientRect()); } catch (e) { a = 0; }
+        if (a > 0.6 * viewport || paintsAcrossTheView(n)) { chainCoversTheView = true; break; }
+      }
+      if (n === boundary) break;
+      if (n !== el && n.nodeType === 1 && n.matches) {
+        try {
+          if (n.matches(INTERACTIVE_HIT_SEL)) { interactiveDescendantHit = true; break; }
+        } catch (e) { /* best-effort */ }
+      }
+    }
+    return !interactiveDescendantHit && !chainCoversTheView && !layerOnTheWay;
+  };
+"""
+)
+
+_TYPE_TARGET_PROBE_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+"""
+    + _NATIVE_LABEL_JS
+    + _PAINT_VISIBLE_JS
+    + _OWN_LABEL_HIT_JS
+    + r"""
+  try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
+  try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
+  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
+
+  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
+  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
+  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return { exists: false };
+  const RETEST_SCROLLABLE_CLIP = false;
+  // A LABEL's own disabled/readOnly/type attributes mean nothing; its genuinely associated control's do.
+  let ctl = el;
+  try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+  let disabled = false;
+  try { disabled = !!(ctl.disabled || (ctl.matches && ctl.matches(':disabled'))); } catch (e) { /* best-effort */ }
+  let readOnly = false;
+  try { readOnly = !!ctl.readOnly; } catch (e) { /* best-effort */ }
+  const out = { exists: true, disabled, readOnly };
+  try {
+    if (_isToggle(ctl)) {
+      out.toggle = true;
+      out.toggleRadio = String(_attr(ctl, 'type') || '').toLowerCase() === 'radio';
+    }
+  } catch (e) { /* best-effort */ }
+  let r = el.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return out;
+  // elementFromPoint answers about the VIEWPORT, so a field below the fold returns null and would
+  // read as unoccluded -- which is most fields on a real form. Playwright scrolls before it clicks,
+  // so scrolling here asks about the same layout the click is about to meet.
+  const inView = r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth;
+  if (!inView) {
+    // 'instant' matters: scrollIntoView inherits CSS scroll-behavior, and a page with smooth
+    // scrolling animates over hundreds of ms while the rect below is read synchronously -- the
+    // element is still off-screen, elementFromPoint returns null, and the probe reports nothing.
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep the rect */ }
+    r = el.getBoundingClientRect();
+    out.scrolled = true;
+  }
+  // The walk must hop ShadowRoot -> host, because Node.contains stays in the light tree and would
+  // read every component control as covered by its own host.
+  // Composed-tree containment: a slotted node renders inside the component's shadow (its
+  // assignedSlot), so a hit on a control's slotted label is a hit on the control, not a cover.
+  const related = (a, b) => {
+    for (let n = b, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) if (n === a) return true;
+    return false;
+  };
+  const domRelated = (a, b) => {
+    for (let n = b, hops = 0; n && hops < 256; hops++, n = n.parentNode || n.host || null) if (n === a) return true;
+    return false;
+  };
+  // The re-centre gate must see a pin inherited across a shadow boundary; the `pinned` skin verdict
+  // keeps its non-piercing walk (stops at a ShadowRoot).
+  const isPinned = (node, pierce) => {
+    if (!pierce) {
+      for (let n = node; n && n.nodeType === 1; n = n.parentNode || n.host || null) {
+        let pos = '';
+        try { pos = getComputedStyle(n).position; } catch (e) { break; }
+        if (pos === 'fixed' || pos === 'sticky') return true;
+      }
+      return false;
+    }
+    for (let n = node, hops = 0; n && hops < 256; hops++, n = n.parentNode || n.host || null) {
+      if (n.nodeType !== 1) continue;
+      let pos = '';
+      try { pos = getComputedStyle(n).position; } catch (e) { break; }
+      if (pos === 'fixed' || pos === 'sticky') return true;
+    }
+    return false;
   };
   // Which END of each physical axis a scroll container's origin sits at. Chromium runs the scroll
   // offset NEGATIVE toward content on the far side, so reading it as unsigned room sees zero at that
@@ -5063,41 +5260,6 @@ _TYPE_TARGET_PROBE_JS = (
     const usable = (v) => (v > 0 && Math.abs(v - 1) > 1e-9 ? v : null);
     return { x: usable(sx), y: usable(sy) };
   };
-  const visible = (n, forPaint) => {
-    const r = n.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return false;
-    // pointer-events and visibility are both inherited, but either can be explicitly overridden by
-    // a descendant (a click-through overlay with a poking-through button; a hidden wrapper with one
-    // child restored via visibility:visible) -- the candidate's own computed value already resolves
-    // cascade + override in one read, so both are checked once here, not per-ancestor below.
-    // display has no such override: display:none removes the whole subtree from the render tree,
-    // so it stays an ancestor-walk check, same as opacity and overflow.
-    let ownCs;
-    try { ownCs = getComputedStyle(n); } catch (e) { return false; }
-    if ((!forPaint && ownCs.pointerEvents === 'none') || ownCs.visibility === 'hidden') return false;
-    let steps = 0;
-    for (
-      let a = n;
-      a && a !== document.body && a !== document.documentElement && steps < 40;
-      a = a.parentNode || a.host || null, steps++
-    ) {
-      // A ShadowRoot reached mid-walk (nodeType 11, not 1) carries no style of its own -- skip
-      // straight to its host via the update expression's `.host` fallback rather than stopping
-      // the walk there, or a hidden host (or anything above it) never gets checked.
-      if (a.nodeType !== 1) continue;
-      // inert makes a subtree non-focusable and non-actionable without changing any computed style
-      // property -- the .inert IDL property reflects the attribute directly, no matching needed.
-      if (a.inert) return false;
-      let cs;
-      try { cs = getComputedStyle(a); } catch (e) { return false; }
-      if (cs.display === 'none') return false;
-      if (parseFloat(cs.opacity) === 0) return false;
-      // A carousel/wizard routinely keeps an inactive slide's markup in the DOM, translated out of
-      // its own overflow:hidden container -- present, sized, but never painted.
-      if (a !== n && clipsAway(cs, a, r, false)) return false;
-    }
-    return true;
-  };
   // A native control's own <label> is a sibling, not an ancestor, so related()'s composed walk never
   // reaches it on its own -- check the control's genuine labels (and the reverse, a LABEL's genuine
   // control), resolved by nativeLabelsOf/nativeControlOf rather than trusting `.labels`/`.control`.
@@ -5174,6 +5336,7 @@ _TYPE_TARGET_PROBE_JS = (
   // Not when the field's own popup is open (aria-expanded): a scroll would close what it just opened.
   if (hitResult.blocked && isPinned(hitResult.top, true) && !ownPopupOpen) {
     try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep the rect */ }
+    out.scrolled = true;
     const r2 = el.getBoundingClientRect();
     // A box that collapsed on scroll leaves nothing to re-test; the earlier blocked verdict stands.
     if (r2.width === 0 || r2.height === 0) { out.occluded = true; return out; }
@@ -5187,6 +5350,7 @@ _TYPE_TARGET_PROBE_JS = (
   let top = hitResult.top;
   const hit = hitResult.hit;
   out.occluded = true;
+  if (hit === document.body || hit === document.documentElement) out.hitRoot = true;
   // Whether to force is a question about the OCCLUDER, not about the field. Structure alone is not
   // enough: when the field sits directly under <body>, or shares a container with a portal target,
   // EVERY overlay on the page is "inside its parent". So the occluder must also be the size of a
@@ -5242,14 +5406,6 @@ _TYPE_TARGET_PROBE_JS = (
       ).some((c) => c !== el && !related(el, c));
     } catch (e) { unitOwnsOnlyThisField = false; }
   }
-  // A thing that announces itself as an overlay is one. This is the least ambiguous signal here --
-  // a decoration has no role, while a tooltip, dialog or toast says so in its markup.
-  const LAYER_ROLE = /^(tooltip|dialog|alertdialog|alert|status|menu|listbox|log|marquee)$/i;
-  const _roleTokens = (role) => String(role).trim().split(/\s+/);
-  const isLayerNode = (n) => {
-    const role = n.getAttribute && n.getAttribute('role');
-    return !!((role && _roleTokens(role).some((t) => LAYER_ROLE.test(t))) || n.hasAttribute('aria-modal') || n.tagName === 'DIALOG');
-  };
   let declaresItselfALayer = false;
   for (let n = top; n && n.nodeType === 1 && n !== unit; n = n.parentNode || n.host || null) {
     if (isLayerNode(n)) {
@@ -5260,71 +5416,7 @@ _TYPE_TARGET_PROBE_JS = (
   // A hit inside the field's own <label> counts as its own subtree unless it landed on an interactive
   // descendant (a link, another control), whose activation would replace the field's.
   const ownLabelBoundaryNode = ownLabelBoundary(top);
-  let ownLabelHit = false;
-  // A label that paints nothing is the invisible-occluder shape the caller already refuses.
-  let boundaryVisible = false;
-  try { boundaryVisible = !!(ownLabelBoundaryNode && visible(ownLabelBoundaryNode)); } catch (e) { boundaryVisible = false; }
-  // The property being guarded is the CONTROL's own renderability, not the label's: a visible label
-  // over a visibility:hidden control is still an invisible-occluder shape, just wearing the label.
-  let ownLabelCtl = el;
-  try { if (_isLabel(el)) ownLabelCtl = nativeControlOf(el) || el; } catch (e) { ownLabelCtl = el; }
-  let ctlRenderable = false;
-  try { ctlRenderable = visible(ownLabelCtl, true); } catch (e) { ctlRenderable = false; }
-  if (arg.allowOwnLabel !== false && boundaryVisible && ctlRenderable) {
-    const INTERACTIVE_HIT_SEL = """
-    + json.dumps(_INTERACTIVE_HIT_SEL)
-    + r""";
-    let interactiveDescendantHit = false;
-    let layerOnTheWay = false;
-    // A view-sized node anywhere in the hit chain up to the label is a backdrop wearing a label.
-    let chainCoversTheView = false;
-    // A pseudo-element hit-tests as its originating element, so a control-sized label can paint a
-    // fixed full-viewport sheet with no view-sized node in the chain. Measured rather than parsed
-    // from CSS: a node returned for most of the view outside its own box paints across the view.
-    const paintsAcrossTheView = (n) => {
-      let rect = null, root = null;
-      try { rect = n.getBoundingClientRect(); root = n.getRootNode(); } catch (e) { return true; }
-      if (!root || typeof root.elementsFromPoint !== 'function') root = document;
-      const steps = [0.02, 0.26, 0.5, 0.74, 0.98];
-      let outside = 0;
-      for (const fx of steps) for (const fy of steps) {
-        const x = innerWidth * fx, y = innerHeight * fy;
-        if (x >= rect.left - 1 && x <= rect.right + 1 && y >= rect.top - 1 && y <= rect.bottom + 1) continue;
-        let hits = [];
-        try { hits = root.elementsFromPoint(x, y); } catch (e) { return true; }
-        if (hits.indexOf(n) !== -1) outside++;
-      }
-      return outside >= 0.6 * steps.length * steps.length;
-    };
-    // The other way a pseudo-element can be a layer: pinned to the viewport. Its computed style is
-    // the exact signal there, where the node's own position says nothing about its `::before`.
-    const pseudoPinned = (n) => {
-      for (const which of ['::before', '::after']) {
-        let cs = null;
-        try { cs = getComputedStyle(n, which); } catch (e) { return true; }
-        if (!cs || cs.content === 'none' || cs.display === 'none') continue;
-        if (cs.position === 'fixed' || cs.position === 'sticky') return true;
-      }
-      return false;
-    };
-    // The boundary itself is never its own interceptor: it IS the control in the LABEL-target case, and
-    // a label may carry role=radio/checkbox itself.
-    for (let n = top, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-      if (n.nodeType === 1 && (isLayerNode(n) || pseudoPinned(n))) { layerOnTheWay = true; break; }
-      if (n.nodeType === 1) {
-        let a = 0;
-        try { a = area(n.getBoundingClientRect()); } catch (e) { a = 0; }
-        if (a > 0.6 * viewport || paintsAcrossTheView(n)) { chainCoversTheView = true; break; }
-      }
-      if (n === ownLabelBoundaryNode) break;
-      if (n !== el && n.nodeType === 1 && n.matches) {
-        try {
-          if (n.matches(INTERACTIVE_HIT_SEL)) { interactiveDescendantHit = true; break; }
-        } catch (e) { /* best-effort */ }
-      }
-    }
-    ownLabelHit = !interactiveDescendantHit && !chainCoversTheView && !layerOnTheWay;
-  }
+  const ownLabelHit = arg.allowOwnLabel !== false && ownLabelHitClear(top, el, ownLabelBoundaryNode);
   // An own-label hit is folded in here via ownLabelHit and surfaces below as out.ownLabel.
   const inFieldsOwnSubtree =
     related(top, el) ||
@@ -5676,6 +5768,7 @@ _TYPE_TARGET_PROBE_JS = (
           // that clips it is reached through assignedSlot and not through parentNode. The visibility
           // walk deliberately stays light-DOM (`domRelated` marks that distinction); this one cannot,
           // or the shape that enters the branch is the shape it declines to explain.
+          let reachableClip = false;
           if (!stillAtThePoint) {
             for (
               let n = el.assignedSlot || el.parentNode || el.host || null, hops = 0;
@@ -5740,12 +5833,23 @@ _TYPE_TARGET_PROBE_JS = (
                 : reachesY(edgeT2 - at.bottom, n.scrollTop - minScrollTop);
               const scrollableX = cs.overflowX === 'hidden' && n.clientWidth > 0 && canReachX;
               const scrollableY = cs.overflowY === 'hidden' && n.clientHeight > 0 && canReachY;
-              if ((!outX || scrollableX) && (!outY || scrollableY)) continue;
+              if ((!outX || scrollableX) && (!outY || scrollableY)) {
+                reachableClip = reachableClip || outX || outY;
+                continue;
+              }
               const clipperSelector = idSelector(n) || markerSelector(n);
               out.occluder = { clipped: true, selector: clipperSelector };
               out.occluder.layerKind = clipperSelector ? 'clipper' : 'unnamed';
               break;
             }
+          }
+          // The typing probe only: a field parked outside a scroller it can be scrolled into is brought in and
+          // re-tested, as the driver's own fill would, so only a cover still over it after the scroll refuses.
+          if (RETEST_SCROLLABLE_CLIP && reachableClip && !out.occluder && !ownPopupOpen) {
+            try { el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch (e) { /* keep */ }
+            out.scrolled = true;
+            const r3 = el.getBoundingClientRect();
+            if (r3.width > 0 && r3.height > 0 && !hitTestAt(r3).blocked) out.occluded = false;
           }
         }
         return out;
@@ -5859,6 +5963,10 @@ _TYPE_TARGET_PROBE_JS = (
   return out;
 }"""
 )
+# The typing path's probe: the same reading, except that a field which only needs its scroller scrolled is re-tested.
+_TYPING_REACH_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace(
+    "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
+)
 
 _ACTIVE_IS_JS = (
     r"""(arg) => {
@@ -5875,6 +5983,10 @@ _ACTIVE_IS_JS = (
   return active === el;
 }"""
 )
+
+
+class _PressNavigated(Exception):
+    """Pressing a date segment's visible part to reach it navigated the page, so nothing was typed."""
 
 
 class _FieldCovered(Exception):
@@ -5900,6 +6012,107 @@ _OTHER_CLICK_BLOCKERS = ("intercepts pointer events", "not visible", "not stable
 # A page that enables its submit once a tick or keystroke settles does so within this window, so the
 # click still lands as it did under Playwright's own wait; a control still disabled after it fails fast.
 _DISABLED_CLICK_GRACE_SECONDS = 2.0
+
+
+async def _engine_enabled(realm: input_dispatch.Realm, selector: str) -> bool:
+    # A selector only the executor can resolve gets no answer here; the click's own wait still decides it.
+    try:
+        return bool(await realm.is_enabled(selector, timeout=1000))
+    except Exception:
+        return True
+
+
+# A spinbutton group (the nearest ancestor holding another spinbutton) can keep one cursor for all its fields and send
+# keys there rather than to the focused field, so a refused focus records which field that cursor is left on.
+_SPINBUTTON_GROUP_LATCH_JS = (
+    r"""(arg) => {
+  const R = Symbol.for('tv3-spinbutton-cursor-recorded');
+  if (arg.mode === 'any') return window[R] === true;
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return null;
+  const K = Symbol.for('tv3-spinbutton-group-cursor');
+  const W = Symbol.for('tv3-spinbutton-group-cursors');
+  const spin = (n) => !!(n && n.getAttribute && n.getAttribute('role') === 'spinbutton');
+  const spins = (n) => (n.querySelectorAll ? Array.from(n.querySelectorAll('[role="spinbutton"]')) : []);
+  let group = null;
+  for (let n = el, i = 0; n && i < 8 && !group; n = n.parentElement, i++) {
+    if (spins(n).length >= 2) group = n;
+  }
+  if (!group) return null;
+  // Also kept by the fields' ids, so a group the page re-renders with the same ids keeps its record.
+  const map = (window[W] = window[W] || {});
+  const ids = spins(group).map((s) => s.id);
+  const key = ids.every(Boolean) ? ids.join('|') : null;
+  const read = () => {
+    if (K in group) return group[K];
+    if (key && key in map) return spins(group).find((s) => s.id === map[key]) || null;
+    return undefined;
+  };
+  const write = (s) => {
+    group[K] = s;
+    if (key) map[key] = s.id;
+    window[R] = true;
+  };
+  if (arg.mode === 'clear') {
+    delete group[K];
+    if (key) delete map[key];
+    return null;
+  }
+  if (arg.mode === 'clicked') {
+    if (read() === undefined) return null;
+    for (const s of spins(group)) {
+      let part = s;
+      while (part.parentElement && part.parentElement !== group && spins(part.parentElement).length === 1) {
+        part = part.parentElement;
+      }
+      if (part.contains(el)) write(s);
+    }
+    return null;
+  }
+  if (!spin(el)) return null;
+  if (arg.mode === 'check') {
+    const cursor = read();
+    return cursor !== undefined && cursor !== el;
+  }
+  write(el);
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  if (!a || a === document.body) return 'none';
+  if (a !== el && a.contains(el) && spins(a).length === 1) return 'target_wrapper';
+  if (!group.contains(a)) return 'outside';
+  return spin(a) || spins(a).length > 0 ? 'other_segment' : 'same_group';
+}"""
+)
+
+# Holds the segments by reference, since another probe may re-tag the page before the later read.
+_DATE_GROUP_LATE_READ_JS = (
+    r"""(arg) => {
+  const S = Symbol.for('tv3-date-late-read');
+  const store = (window[S] = window[S] || {});
+  const num = (e) => {
+    const m = (String(e.value ?? '') + '|' + String(e.textContent ?? '')).match(/\d+/);
+    return m ? Number(m[0]) : null;
+  };
+  if (arg.token) {
+    const els = store[arg.token];
+    delete store[arg.token];
+    return els ? els.map((e) => (e.isConnected ? num(e) : 'gone')) : null;
+  }
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const els = arg.labels.map((l) => _q.find('[data-tv3-dateseg="' + l + '"]'));
+  if (els.some((e) => !e)) return null;
+  const token = Math.random().toString(36).slice(2, 10);
+  store[token] = els;
+  return token;
+}"""
+)
+# Long enough for a widget that commits a section on a timer or a re-render; the read is off the tool's own path.
+_DATE_GROUP_LATE_READ_SECONDS = 1.5
 
 
 def _click_blocked_only_by_viewport(exc: BaseException) -> bool:
@@ -5978,6 +6191,97 @@ _DATE_SEGMENT_STATE_JS = (
 }"""
 )
 
+# Measurement only, kept apart from the restore's record. Per tagged date group, stamped with the run's salt so a reused
+# browser ignores another run's marks: a group key, and the values the last ok write confirmed (`ok`). `begin` returns
+# {key, drift} (drift null without a full record), drops the ok record and starts a value-free trace of the write's keys
+# by segment label; `stop` returns that trace; `drop` only drops the ok record.
+_DATE_WRITE_LEDGER_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const T = Symbol.for('tv3-date-write-trace');
+  const OK = Symbol.for('tv3-date-ok');
+  const KEY = Symbol.for('tv3-date-group-key');
+  const stop = () => {
+    const t = window[T];
+    if (!t) return null;
+    t.off();
+    delete window[T];
+    return t.summary;
+  };
+  if (arg.mode === 'stop') return stop();
+  const els = arg.labels.map((l) => _q.find('[data-tv3-dateseg="' + l + '"]'));
+  if (els.some((e) => !e)) {
+    if (arg.mode !== 'ok') {
+      stop();
+      els.forEach((e) => {
+        if (e) delete e[OK];
+      });
+    }
+    return null;
+  }
+  const raw = (e) => String(e.value ?? '') + '|' + String(e.textContent ?? '');
+  const held = (e) => { const m = raw(e).match(/\d+/); return m ? Number(m[0]) : null; };
+  if (arg.mode === 'ok') {
+    els.forEach((e, i) => { e[OK] = [arg.salt, arg.confirmed[i]]; });
+    return null;
+  }
+  const recs = els.map((e) => (e[OK] && e[OK][0] === arg.salt ? e[OK] : null));
+  els.forEach((e) => { delete e[OK]; });
+  if (arg.mode !== 'begin') return null;
+  stop();
+  const group = _q.find('[data-tv3-dateseg="group"]');
+  const holders = group ? [group, ...els] : els;
+  const mine = holders.map((h) => h[KEY]).find((k) => k && k[0] === arg.salt);
+  const key = mine ? mine[1] : Math.random().toString(36).slice(2, 10);
+  holders.forEach((h) => { h[KEY] = [arg.salt, key]; });
+  const labelOf = () => {
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    const i = els.findIndex((e) => e === a || e.contains(a));
+    return i < 0 ? '-' : arg.labels[i];
+  };
+  const summary = { first_key_focus: null, first_key_moved: null, moved_before_commit: [], moved_at_commit: [] };
+  let last = els.map(raw);
+  let digits = 0;
+  const onDown = (ev) => {
+    try {
+      if (/^[0-9]$/.test(ev.key) && digits++ === 0) {
+        summary.first_key_focus = labelOf();
+        // Changes made before the first digit (a press, a focus) are not the digit's.
+        last = els.map(raw);
+      }
+    } catch (e) {}
+  };
+  const onUp = (ev) => {
+    try {
+      const now = els.map(raw);
+      const moved = arg.labels.filter((l, i) => now[i] !== last[i]);
+      last = now;
+      const into = ev.key === 'Tab' ? summary.moved_at_commit : summary.moved_before_commit;
+      moved.forEach((l) => { if (!into.includes(l)) into.push(l); });
+      // The first of the first two digits that visibly changes anything: a widget may show nothing for a lone leading
+      // zero, and a later digit belongs to a retry, not to how the write entered.
+      if (summary.first_key_moved === null && /^[0-9]$/.test(ev.key) && digits <= 2 && moved.length) {
+        summary.first_key_moved = moved.join('+');
+      }
+    } catch (e) {}
+  };
+  window.addEventListener('keydown', onDown, true);
+  window.addEventListener('keyup', onUp, true);
+  window[T] = {
+    summary,
+    off: () => {
+      window.removeEventListener('keydown', onDown, true);
+      window.removeEventListener('keyup', onUp, true);
+    },
+  };
+  return { key, drift: recs.every((r) => r) ? els.some((e, i) => held(e) !== recs[i][1]) : null };
+}"""
+)
+_DATE_WRITE_TRACE_FIELDS = ("first_key_focus", "first_key_moved", "moved_before_commit", "moved_at_commit")
+
 # Every text-holding field our keystrokes could reach if the widget routes them somewhere other than
 # the element we focused, tagged so each one can be read back by the same handle afterwards. Scoped to
 # the target's own form -- or its own root when it has none, which keeps a field inside a component
@@ -6051,7 +6355,7 @@ _COLLATERAL_VALUES_JS = (
 
 
 # How type put the caret in a field: a checked click, or focus() alone.
-_Reach = Literal["click", "focus"]
+_Reach = Literal["click", "focus", "press"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
@@ -6085,7 +6389,98 @@ _FOCUS_IN_EDITABLE_JS = r"""(el) => {
 }"""
 
 _FOCUS_PROBE_FAILED = object()
+
+
+# A click-to-edit cell of an interactive grid: a focusable text cell holding no control of any kind until it is opened.
+# Tags its grid and keys the row by the text of the cells before it, so it can be found again after a re-render.
+_GRID_CELL_TARGET_JS = r"""(el, token) => {
+  // A label resolves to the control it names, which the ordinary path types into.
+  if (el.closest('label') && el.closest('label').control) return null;
+  const cell = el.closest('[role=gridcell],[role=cell]');
+  const grid = cell && cell.closest('[role=grid],[role=treegrid]');
+  const row = cell && cell.closest('[role=row]');
+  if (!grid || !row || !cell.hasAttribute('tabindex')) return null;
+  if (cell.getAttribute('aria-readonly') === 'true' || grid.getAttribute('aria-readonly') === 'true') return null;
+  if (cell.closest('[aria-disabled="true" i]')) return { disabled: true };
+  const CONTROL = 'input,textarea,select,button,a[href],[contenteditable]:not([contenteditable="false" i]),[aria-haspopup],'
+    + '[role=button],[role=link],[role=checkbox],[role=radio],[role=switch],[role=combobox],[role=listbox],[role=menu],'
+    + '[role=menuitem],[role=option],[role=slider],[role=spinbutton],[role=textbox]';
+  // A cell that is itself a popup or expander trigger is a picker or a tree row, not a text cell.
+  if (cell.isContentEditable || cell.matches('[aria-haspopup],[aria-expanded]') || cell.querySelector(CONTROL)) return null;
+  const cellsOf = (r) => Array.from(r.querySelectorAll('[role=gridcell],[role=cell],[role=rowheader]'))
+    .filter((c) => c.closest('[role=row]') === r);
+  const cells = cellsOf(row);
+  const col = cells.indexOf(cell);
+  grid.setAttribute('data-tv3-cellgrid', token);
+  // Keyed by the cells left of the edited one: the columns derived from it (an amount) sit to its right and change.
+  const key = cells.filter((c, i) => (col > 0 ? i < col : i !== col)).map((c) => (c.innerText || '').trim()).join('␟');
+  const rows = Array.from(grid.querySelectorAll('[role=row]'));
+  const keyOf = (r) => cellsOf(r).filter((c, i) => (col > 0 ? i < col : i !== col)).map((c) => (c.innerText || '').trim()).join('␟');
+  return { row: rows.indexOf(row), col, key, keyUnique: rows.filter((r) => keyOf(r) === key).length === 1 };
+}"""
+
+# The cell at (row, col) of the tagged grid -- the row whose leading cells still read `key` when exactly one does --
+# as its text, whether focus is in it, the editable focus sits in inside it, or whether focus is in an editable
+# elsewhere; plus how many dialogs are open.
+_GRID_CELL_AT_JS = r"""(grid, [rowAt, col, key, want]) => {
+  const cellsOf = (r) => Array.from(r.querySelectorAll('[role=gridcell],[role=cell],[role=rowheader]'))
+    .filter((c) => c.closest('[role=row]') === r);
+  const keyOf = (r) => cellsOf(r).filter((c, i) => (col > 0 ? i < col : i !== col)).map((c) => (c.innerText || '').trim()).join('␟');
+  const rows = Array.from(grid.querySelectorAll('[role=row]'));
+  const keyed = rows.filter((r) => keyOf(r) === key);
+  const r = keyed.length === 1 ? keyed[0] : rows[rowAt];
+  const cell = r && cellsOf(r)[col];
+  if (want === 'dialog') {
+    return Array.from(document.querySelectorAll('[role=dialog],[role=alertdialog],[aria-modal=true],dialog[open]'))
+      .filter((d) => d.checkVisibility({ visibilityProperty: true, opacityProperty: true })).length;
+  }
+  // Rows and their text and expansion, which an activated row action changes. Selection is not a change.
+  if (want === 'grid') return rows.length + '\n' + rows.map((x) => (x.getAttribute('aria-expanded') || '') + '|' + (x.innerText || '')).join('\n');
+  if (!cell) return null;
+  // A commit is read only off the row its key still names: by position, a re-sorted grid shows another row's value.
+  // An editor still mounted in the cell, focused or not, holds a pending edit, so the cell has no committed text yet.
+  if (want === 'text') return keyed.length === 1 && !cell.querySelector('input,textarea,[contenteditable]:not([contenteditable="false" i])')
+    ? (cell.innerText || '').replace(/\s+/g, ' ').trim() : null;
+  let a = cell.ownerDocument.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  if (want === 'focused') return !!a && cell.contains(a);
+  const NONTEXT = new Set(['checkbox','radio','button','submit','reset','file','image','range','color','hidden']);
+  const editable = a && (a.isContentEditable || a.tagName === 'TEXTAREA'
+    || (a.tagName === 'INPUT' && !NONTEXT.has((a.getAttribute('type') || 'text').toLowerCase())));
+  if (want === 'outside') return !!editable && !cell.contains(a);
+  if (want === 'mounted') return cell.querySelector('input,textarea,[contenteditable]:not([contenteditable="false" i])');
+  return editable && cell.contains(a) ? a : null;
+}"""
+
+_PLAIN_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?", re.ASCII)
+# The only renderings a cell may show for a typed number, around whitespace: an optional leading minus, at most one
+# currency sign (Unicode Sc) before or after, comma grouping and decimal places. An allow-list: any other affix differs.
+_RENDERED_NUMBER_RE = re.compile(r"(-?)(\D?)\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(\D?)", re.ASCII)
+# A leading plus sign or zero belongs to an identifier (a phone number, a postal code), so only the exact text matches.
+_IDENTIFIER_NUMBER_RE = re.compile(r"\+|-?0\d")
+
+
+def _same_cell_value(shown: str, typed: str) -> bool:
+    typed = typed.strip()
+    if shown == typed:
+        return True
+    rendered = _RENDERED_NUMBER_RE.fullmatch(shown.strip())
+    if rendered is None or not _PLAIN_NUMBER_RE.fullmatch(typed) or _IDENTIFIER_NUMBER_RE.match(typed):
+        return False
+    sign, before, number, after = rendered.groups()
+    if (before and after) or any(c and unicodedata.category(c) != "Sc" for c in (before, after)):
+        return False
+    # Decimal, not float: long identifiers would round to the same binary value.
+    return decimal.Decimal(sign + number.replace(",", "")) == decimal.Decimal(typed)
+
+
 _APPEND_SETTLE_S = 0.3
+# The only cell editors this path commits: a numeric <input> declaring no list. Any other editor (text, a typeahead,
+# rich text) is left to `type` on the opened editor itself, whose own typeahead and read-back checks then apply.
+_NUMERIC_CELL_EDITOR_JS = r"""el => el.tagName === 'INPUT' && !el.hasAttribute('list') && !el.getAttribute('aria-autocomplete')
+  && !el.getAttribute('aria-haspopup') && !/(^|\s)combobox(\s|$)/i.test(el.getAttribute('role') || '')
+  && (['tel', 'number'].includes((el.getAttribute('type') || '').toLowerCase())
+    || ['numeric', 'decimal'].includes((el.getAttribute('inputmode') || '').toLowerCase()))"""
 
 
 def _rich_text(read: str) -> str:
@@ -6451,6 +6846,49 @@ _DATE_SEGMENT_AIM_JS = r"""(el) => {
   };
 }"""
 
+# A widget can move its section cursor only on a press on the section's own visible part, never on focus() of a sub-pixel
+# input. The part is the input's nearest ancestor with a real box holding no other control; it is refused (a reason
+# string) when it or anything above it is a control or a label, or when its box covers another segment.
+_DATE_SEGMENT_PART_JS = (
+    r"""(arg) => {
+  const CONTROL = """
+    + json.dumps(_INTERACTIVE_HIT_SEL + ", label")
+    + r""";
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  const tag = el && el.getAttribute('data-tv3-dateseg');
+  if (!tag || tag === 'group') return null;
+  const area = (n) => {
+    const r = n.getBoundingClientRect();
+    return r.width * r.height;
+  };
+  if (area(el) > 1) return null;
+  let part = null;
+  for (let n = el.parentElement, i = 0; n && i < 8 && !part; n = n.parentElement, i++) {
+    if (Array.from(n.querySelectorAll(CONTROL)).some((c) => c !== el)) return 'no_part';
+    if (area(n) > 1) part = n;
+  }
+  if (!part) return 'no_part';
+  // The part's own roving tabindex is how the widget marks its sections, so only its ancestors are judged on it.
+  const terms = CONTROL.split(/,\s*/).filter((t) => !t.startsWith('[tabindex]'));
+  if (terms.some((t) => part.matches(t))) return 'interactive';
+  for (let n = part.assignedSlot || part.parentNode || part.host; n; n = n.assignedSlot || n.parentNode || n.host || null) {
+    if (n.nodeType === 1 && n.matches(CONTROL)) return 'interactive';
+  }
+  const r = part.getBoundingClientRect();
+  const covers = (o) => {
+    const b = o.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y = b.top + b.height / 2;
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+  const others = _q.all('[data-tv3-dateseg]').filter((o) => o !== el && o.getAttribute('data-tv3-dateseg') !== 'group');
+  return others.some(covers) ? 'other_segment' : part;
+}"""
+)
+
 # The layer carries a per-press token only while its press is checked: CDP and Playwright hold separate remote
 # objects for one node, and the page's main world is the one place both reach.
 _DATE_SEGMENT_LAYER_KEY = "Symbol.for('tv3-dateseg-layer')"
@@ -6553,6 +6991,8 @@ _SKINNED_CHECKBOX_PROBE_JS = (
 """
     + _NATIVE_LABEL_JS
     + _NATIVE_PROXY_JS
+    + _PAINT_VISIBLE_JS
+    + _OWN_LABEL_HIT_JS
     + r"""
   const _toggleOwner = """
     + _TOGGLE_OWNER_JS
@@ -6573,12 +7013,15 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     if (el.tagName !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) {
       return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
     }
-    if (!invisible) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+    const drawn = { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
     const radio = type === 'radio';
+    // :disabled covers a disabled <fieldset>, unlike el.disabled.
+    const disabled = el.matches(':disabled');
     // The click lands on coordinates this realm measured, never through a marker the page could move
     // onto something else, so the point has to be the target's own: a cover there is a cover.
     // Returns the point on a hit on the target, false under an unrelated element, null for no hit or a clipped-off point.
     // A clip that can scroll (a long list) is scrolled once to bring the target into it; only one that cannot is final.
+    let lastHit = null;
     const centreHit = (t, retried) => {
       const mid = () => { const b = t.getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; };
       let [x, y] = mid();
@@ -6597,6 +7040,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
         if (!inner || inner === hit) break;
         hit = inner;
       }
+      lastHit = hit;
       for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
         if (n === t || n === el) return { x, y };
       }
@@ -6622,6 +7066,23 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       }
       return o < 0.05;
     };
+    // A label that also wraps another control (a button, link, or a second input) is not a safe
+    // proxy: a real click on it can activate that control instead.
+    const wrapsOther = (l) => Array.from(_qsa(l, 'button,a[href],input,select,textarea')).some((c) => c !== el);
+    const ownLabel = () => nativeLabelsOf(el).find((l) => {
+      const b = l.getBoundingClientRect();
+      return b.width > 0 && b.height > 0 && !wrapsOther(l);
+    }) || null;
+    if (!invisible) {
+      // A drawn input the pointer cannot reach at its own centre (a 1px clipped box, one stacked under a
+      // sibling's label) is clicked through its own clear label; anything else keeps the plain click's diagnosis.
+      if (arg.allowOwnLabel === false || !_nativeProxy(el) || fadedAncestry() || disabled) return drawn;
+      if (centreHit(el) !== false) return drawn;
+      const label = ownLabel();
+      const at = label && nativeControlOf(label) === el ? centreHit(label) : null;
+      if (!at || !ownLabelHitClear(lastHit, el, label)) return drawn;
+      return { ...drawn, skinned: true, labelClick: at, radio, disabled: false, drawnLabel: true };
+    }
     if (!_nativeProxy(el)) {
       // Only the input's own transparency is waived: it still needs a box, no visibility:hidden, visible
       // ancestors, and to be on top at its own centre, so it is clicked directly and read back as a toggle.
@@ -6630,7 +7091,6 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       if (at === false) return { exists: true, skinned: false, labelClick: null, radio, covered: true };
       return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
     }
-    const disabled = !!el.disabled;
     const none = { exists: true, skinned: true, labelClick: null, radio, disabled };
     // `none` still gets a script click, so a proxy inside a faded panel is refused outright.
     if (fadedAncestry()) return { ...none, unproxied: true };
@@ -6638,13 +7098,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     // counts: an `el.labels` the page shadows names a decoy, not a proxy. A realm the page can patch
     // (the main-world fallback) never offers one.
     if (arg.allowOwnLabel === false) return none;
-    // A label that also wraps another control (a button, link, or a second input) is not a safe
-    // proxy: a real click on it can activate that control instead.
-    const wrapsOther = (l) => Array.from(_qsa(l, 'button,a[href],input,select,textarea')).some((c) => c !== el);
-    const label = nativeLabelsOf(el).find((l) => {
-      const b = l.getBoundingClientRect();
-      return b.width > 0 && b.height > 0 && !wrapsOther(l);
-    }) || null;
+    const label = ownLabel();
     if (!label || nativeControlOf(label) !== el) return none;
     const at = centreHit(label);
     if (!at) return { ...none, labelCovered: true };
@@ -6754,7 +7208,7 @@ _CLICK_PRECHECK_JS = (
     }
   }
   preReset();
-  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow, !!arg.weak); });
+  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
   return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState, optSel, optKids, optH, optVis };
 }"""
 )
@@ -7908,6 +8362,7 @@ async (__tv3TextArgs) => {
   // exactly as they do in the element list, or a custom checkbox's own caption reads as the question.
   const _CTRL_SEL = 'input:not([type=hidden]),textarea,select,button,[role=button],[role=checkbox],[role=radio],[role=combobox],[role=switch],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
   const _normText = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const _GRID_CELL_SEL = '[role=gridcell],[role=cell]';
   // A choice control takes its group's text only when the group is purely options: a container
   // that also holds text fields has an innerText naming every question in it.
   const _NONCHOICE_SEL = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea,select,[role=combobox],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
@@ -7941,6 +8396,7 @@ async (__tv3TextArgs) => {
   const _matches = Element.prototype.matches;
   const _qs = Element.prototype.querySelector;
   const _qsa = Element.prototype.querySelectorAll;
+  const _closest = Element.prototype.closest;
   const _bcr = Element.prototype.getBoundingClientRect;
   // A sibling the user cannot see is not the question: unrendered, transparent, aria-hidden, or a
   // box under 2px (a zero-height clip, a 1px screen-reader-only hint). A display:contents wrapper
@@ -7981,6 +8437,8 @@ async (__tv3TextArgs) => {
     try {
       let node = el;
       for (let depth = 0; depth < 6; depth++) {
+        // An interactive grid's neighbouring cells hold other columns' data, not this control's question.
+        if (_matches.call(node, _GRID_CELL_SEL) && _closest.call(node, '[role=grid],[role=treegrid]')) break;
         const parent = _parentOf.call(node);
         if (!parent) break;
         let scanned = 0;
@@ -9308,6 +9766,48 @@ async (__tv3TextArgs) => {
   let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
+  // Counts only, for the log record: how often the element budget cuts controls inside an open
+  // blocking dialog. Read lazily, after every root is known, and only from typed declarations: a plain
+  // role=dialog is also a banner or a chat launcher, which a dialog-first budget would not serve.
+  let modalTruncated = 0;
+  let _modalBoxes = null;
+  const _openModals = () => {
+    if (_modalBoxes) return _modalBoxes;
+    _modalBoxes = new Set();
+    for (const root of allRoots) {
+      try {
+        for (const box of root.querySelectorAll('dialog:modal,[aria-modal="true" i],[role~="alertdialog" i]')) {
+          // A dialog pre-rendered while hidden, or a closed drawer parked off-screen, keeps its box, and
+          // its controls would count as cut.
+          let r = _bcr.call(box);
+          if (!(r.width > 0 && r.height > 0)) {
+            // A zero-size or display:contents wrapper whose children are fixed is a common modal shape:
+            // judge it by its children's union. A closed (display:none) one stays zero.
+            let top = Infinity, left = Infinity, bottom = -Infinity, right = -Infinity;
+            for (const c of box.children) {
+              const cr = _bcr.call(c);
+              if (!(cr.width > 0 && cr.height > 0) || window.getComputedStyle(c).visibility === 'hidden') continue;
+              top = Math.min(top, cr.top); left = Math.min(left, cr.left);
+              bottom = Math.max(bottom, cr.bottom); right = Math.max(right, cr.right);
+            }
+            r = { top, left, bottom, right, width: right - left, height: bottom - top };
+          }
+          if (!(r.width > 0 && r.height > 0) || box.getAttribute('aria-hidden') === 'true') continue;
+          if (r.right <= 0 || r.bottom <= 0 || r.left >= window.innerWidth || r.top >= window.innerHeight) continue;
+          const cs = window.getComputedStyle(box);
+          if (cs.visibility === 'hidden' || cs.opacity === '0') continue;
+          _modalBoxes.add(box);
+        }
+      } catch (e) { /* an unreadable root has no dialog this count can see */ }
+    }
+    return _modalBoxes;
+  };
+  const _inOpenModal = (el) => {
+    const boxes = _openModals();
+    if (!boxes.size) return false;
+    for (let n = el, d = 0; n && d < 64; n = _composedParent(n), d++) { if (boxes.has(n)) return true; }
+    return false;
+  };
   let lastGroup = '';
   let groupTotal = 0;
   let radioGroupsMissing = 0;
@@ -9620,7 +10120,11 @@ async (__tv3TextArgs) => {
       // required") shared by every field, which would name nothing and dedupe to nothing.
       // The record carries the text at the masking width; the budget, the dedupe and the
       // name-vs-description comparison all stay at the 200-char display width.
-      const ownGroup = _groupText(el, isChoice);
+      // Nearby text names only a control that takes a value or reports an on/off state: on a control
+      // that only acts it names the wrong target, as a date heading read as the name of the arrow beside it.
+      const takesValue = isChoice || _isFieldControl(el) || rec.autocomplete === true
+        || el.hasAttribute('aria-checked') || el.hasAttribute('aria-pressed');
+      const ownGroup = takesValue ? _groupText(el, isChoice) : '';
       const gtFull = (ownGroup || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
       const gt = gtFull.slice(0, 200);
       // A slotted caption is compared at the 140 width it used to be stored at. A drawn shadow caption
@@ -9709,6 +10213,7 @@ async (__tv3TextArgs) => {
           }
           truncated++;
           if (els[k].host) truncatedInComponents++;
+          if (_inOpenModal(els[k].el)) modalTruncated++;
         } catch (e) { /* unreadable: not a control we could have listed either */ }
       }
       break;
@@ -10247,7 +10752,15 @@ async (__tv3TextArgs) => {
       protos.forEach((p, i) => { if (saved[i] && !kept[i]) Object.defineProperty(p, 'toJSON', saved[i]); });
     }
   };
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  let modalListed = 0;
+  let modalOpen = 0;
+  try {
+    modalOpen = _openModals().size;
+    if (modalOpen) { for (const r of out) { const el = elOfRec.get(r); if (el && _inOpenModal(el)) modalListed++; } }
+  } catch (e) { /* a count the page broke is not worth the reading */ }
+  let readyState = '';
+  try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -10541,14 +11054,15 @@ _TEXT_DELTA_TOOL_NAMES = frozenset(
         "wait",
     }
 )
-_TEXT_DELTA_MAX_LINES = 5
 _TEXT_DELTA_MAX_CHARS = 300
 _TEXT_DELTA_LINE_MAX_CHARS = 120
 # Held by the event loop's clock, which no page script can reach; a read past it reports nothing and
-# keeps the baseline, so its lines surface on the next call instead.
+# keeps the baseline, so its lines surface on the next call instead. The page's own text and its child
+# frames share it: frames get what the page's read left, and running out costs only the frames' lines.
 _TEXT_DELTA_READ_TIMEOUT_SECONDS = 0.25
 # Consecutive failed or timed-out reads after which a document is not read again until its tab navigates,
-# so a page whose read never succeeds costs at most this many bounded reads.
+# so a page whose read never succeeds costs at most this many bounded reads. Its child frames count apart:
+# past this many failed frame reads the frames are left out and the page's own text is still read.
 _TEXT_DELTA_MAX_FAILED_READS = 2
 # Past this many chars of rendered text a read reports nothing and keeps its baseline. Applied in the page,
 # so the text never leaves it; it also bounds each tab's baseline and seen-set.
@@ -10603,28 +11117,29 @@ def _drain_abandoned_read(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
-async def _bounded_text_read(
-    read: Awaitable[tuple[str, list[str] | None] | None],
-) -> tuple[str, list[str] | None] | None:
-    """`read`'s answer, or None once the budget passes. Not `wait_for`: that waits for the cancelled
+_T = TypeVar("_T")
+
+
+async def _bounded_text_read(read: Awaitable[_T], budget: float, stage: str) -> _T | None:
+    """`read`'s answer, or None once `budget` passes. Not `wait_for`: that waits for the cancelled
     evaluate to unwind, which a stalled page delays past the budget; the abandoned read ends on its own."""
     task = asyncio.ensure_future(read)
     try:
-        done, _ = await asyncio.wait({task}, timeout=_TEXT_DELTA_READ_TIMEOUT_SECONDS)
+        done, _ = await asyncio.wait({task}, timeout=budget)
     except BaseException:
         task.cancel()
         raise
     if task not in done:
         task.cancel()
         task.add_done_callback(_drain_abandoned_read)
-        LOG.info("taskv3 text delta read exceeded its budget")
+        LOG.info("taskv3 text delta read exceeded its budget", stage=stage)
         return None
     try:
         return task.result()
     except Exception as exc:
         # The class only: a page whose read keeps failing fails on every call, and a rendered traceback
         # per call costs more than the read it reports on.
-        LOG.info("taskv3 text delta read failed", error_type=type(exc).__name__)
+        LOG.info("taskv3 text delta read failed", stage=stage, error_type=type(exc).__name__)
         return None
 
 
@@ -10639,24 +11154,47 @@ def _text_lines(text: str) -> list[str]:
     return [stripped for stripped in (line.strip() for line in text.splitlines()) if stripped]
 
 
+class _PageText(NamedTuple):
+    nonce: str
+    lines: list[str]
+    # None when the child frames were not read this time; `frames_failed` says whether that was tried.
+    frame_lines: list[str] | None
+    frames_failed: bool
+
+
 class _TextBaseline(NamedTuple):
     nonce: str
     counts: Counter[str]
+    # Kept apart from `counts` so a child-frame read that fails leaves the page's own lines reportable.
+    # None until this document's child frames have been read once.
+    frame_counts: Counter[str] | None
+    frame_failures: int
     seq: int
+    # The call `frame_counts` was read at, which trails `seq` while the frames' reads fail.
+    frame_seq: int
     # Every line any reporting read has seen on this document, bounded by _TEXT_DELTA_TEXT_MAX_CHARS.
     seen: set[str]
     seen_chars: int
+    # Lines the last report left out and kept out of `counts`, so the next reporting read shows them.
+    deferred: Counter[str]
 
 
-def _risen_lines(before: Counter[str], after: list[str], seen: set[str]) -> list[tuple[str, bool]]:
-    """Each line of `after` past its count in `before`, verbatim and in document order, with whether
-    this document has shown it before."""
+def _risen_lines(
+    before: Counter[str], after: list[str], seen: set[str], held: Counter[str] | None = None
+) -> list[tuple[str, int]]:
+    """Each line of `after` past its count in `before`, verbatim and in document order, with its rank for the
+    cut: 0 if the last report held it back, 1 if this document never showed it, 2 if it did."""
     counted: Counter[str] = Counter()
-    risen: list[tuple[str, bool]] = []
+    first = Counter(held)
+    risen: list[tuple[str, int]] = []
     for line in after:
         counted[line] += 1
         if counted[line] > before[line]:
-            risen.append((line, line in seen))
+            if first[line] > 0:
+                first[line] -= 1
+                risen.append((line, 0))
+            else:
+                risen.append((line, 2 if line in seen else 1))
     return risen
 
 
@@ -10673,39 +11211,39 @@ def _text_delta_header(calls: int, before_this_call: bool = False, after_pending
     return f"page newly shows ({span}): "
 
 
-def _text_delta_section(
-    risen: list[tuple[str, bool]],
+def _text_delta_cut(
+    risen: list[tuple[str, int]],
     calls: int,
     render: Callable[[str], str],
     *,
     before_this_call: bool = False,
     after_pending: bool = False,
-) -> str:
-    # `render` redacts before the cut, so a cut can split a placeholder but never a hidden value. Lines
-    # this document never showed are chosen first for the cap; the chosen lines keep document order.
+) -> tuple[str, list[int]]:
+    """The section, and the indices of the risen lines it left out."""
+    # `render` redacts before the cut, so a cut can split a placeholder but never a hidden value. Lines are
+    # chosen for the cap by rank, so held lines go first; the chosen lines keep document order.
     # Each is quoted as a JSON string, so page text cannot close a quote or forge the separator.
     encoded = []
     for line, _ in risen:
         text = render(line)
         text = text if len(text) <= _TEXT_DELTA_LINE_MAX_CHARS else text[: _TEXT_DELTA_LINE_MAX_CHARS - 1] + "…"
         encoded.append(json.dumps(text, ensure_ascii=False).translate(_CURLY_QUOTE_ESCAPES))
-    # The budget counts the encoded lines, quotes and escapes included, since that is what the model reads.
+    # The budget counts what the model reads: the encoded lines, quotes, escapes and separators included.
+    separator = " | "
     chosen: set[int] = set()
     used = 0
     for index in sorted(range(len(risen)), key=lambda i: risen[i][1]):
-        if len(chosen) == _TEXT_DELTA_MAX_LINES:
-            break
-        # A line that does not fit is skipped, not a stop: a short line after it ("Saved") still fits,
-        # and the baseline moves past both, so a line left out here is never reported.
-        if used + len(encoded[index]) > _TEXT_DELTA_MAX_CHARS:
+        cost = len(encoded[index]) + (len(separator) if chosen else 0)
+        # A line that does not fit is skipped, not a stop: a short line after it ("Saved") still fits.
+        if used + cost > _TEXT_DELTA_MAX_CHARS:
             continue
         chosen.add(index)
-        used += len(encoded[index])
+        used += cost
     shown = [encoded[i] for i in sorted(chosen)]
-    section = _text_delta_header(calls, before_this_call, after_pending) + " | ".join(shown)
+    section = _text_delta_header(calls, before_this_call, after_pending) + separator.join(shown)
     if len(risen) > len(shown):
         section += f" (+{len(risen) - len(shown)} more lines)"
-    return section
+    return section, [i for i in range(len(risen)) if i not in chosen]
 
 
 async def _input_holds_file(el: Any) -> bool | None:
@@ -11163,6 +11701,66 @@ _STAMPED_ROW_GUARD_JS = (
 )
 
 
+# A row a scroller clips part-way is clicked at a point of its visible strip that hit-tests to it, where Playwright's
+# own click would first scroll it whole. A virtualized list re-mounts its rows on that scroll, detaching the row.
+_CLIPPED_ROW_MIN_VISIBLE_PX = 6
+_CLIPPED_ROW_CLICK_OFFSET_JS = (
+    r"""(el) => {
+  const MIN = """
+    + str(_CLIPPED_ROW_MIN_VISIBLE_PX)
+    + r""";
+  const r = el.getBoundingClientRect();
+  if (!(r.width > 0 && r.height > 0)) return null;
+  let top = Math.max(r.top, 0), left = Math.max(r.left, 0);
+  let bottom = Math.min(r.bottom, window.innerHeight), right = Math.min(r.right, window.innerWidth);
+  const up = (n) => n.assignedSlot || n.parentElement || (n.parentNode && n.parentNode.host) || null;
+  for (let a = up(el), i = 0; a && i < 64; a = up(a), i++) {
+    if (a.localName === 'html' || a.localName === 'body') break;
+    const cs = getComputedStyle(a);
+    if (/auto|scroll|hidden|clip/.test(cs.overflowY + ' ' + cs.overflowX)) {
+      const c = a.getBoundingClientRect();
+      top = Math.max(top, c.top + a.clientTop);
+      bottom = Math.min(bottom, c.top + a.clientTop + a.clientHeight);
+      left = Math.max(left, c.left + a.clientLeft);
+      right = Math.min(right, c.left + a.clientLeft + a.clientWidth);
+    }
+    if (cs.position === 'fixed') break;
+  }
+  if (bottom - top < MIN || right - left < MIN) return null;
+  if (top <= r.top && bottom >= r.bottom && left <= r.left && right >= r.right) return null;
+  // The topmost element at a point, through open shadow roots, and whether it is `el` or inside it.
+  const hitsEl = (x, y) => {
+    let hit = document.elementFromPoint(x, y);
+    for (let i = 0; hit && hit.shadowRoot && i < 32; i++) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    for (let n = hit, i = 0; n && i < 256; n = up(n), i++) if (n === el) return true;
+    return false;
+  };
+  const cy = (top + bottom) / 2, cx = (left + right) / 2;
+  const ys = [cy], xs = [cx, left + (right - left) / 4, left + (3 * (right - left)) / 4];
+  for (let d = 3; cy - d > top + 1 || cy + d < bottom - 1; d += 3) {
+    if (cy - d > top + 1) ys.push(cy - d);
+    if (cy + d < bottom - 1) ys.push(cy + d);
+  }
+  const s = getComputedStyle(el);
+  for (const y of ys) {
+    for (const x of xs) {
+      if (hitsEl(x, y)) {
+        return {
+          x: x - r.left - (parseInt(s.borderLeftWidth, 10) || 0),
+          y: y - r.top - (parseInt(s.borderTopWidth, 10) || 0),
+        };
+      }
+    }
+  }
+  return null;
+}"""
+)
+
+
 async def _click_stamped_row(page: Any, stamp: str, want: str, timeout: int) -> bool:
     handle = await page.query_selector(stamp)
     if handle is None:
@@ -11170,7 +11768,14 @@ async def _click_stamped_row(page: Any, stamp: str, want: str, timeout: int) -> 
     try:
         if not await handle.evaluate(_STAMPED_ROW_GUARD_JS, want):
             return False
-        await input_dispatch.click_handle(page, handle, timeout=timeout)
+        try:
+            offset = await handle.evaluate(_CLIPPED_ROW_CLICK_OFFSET_JS)
+        except Exception:
+            offset = None
+        position = None
+        if isinstance(offset, dict) and all(isinstance(offset.get(k), (int, float)) for k in ("x", "y")):
+            position = {"x": float(offset["x"]), "y": float(offset["y"])}
+        await input_dispatch.click_handle(page, handle, timeout=timeout, position=position)
     finally:
         try:
             await handle.dispose()
@@ -11518,10 +12123,14 @@ _OBSERVE_SUMMED_KEYS = (
     "phantomDropped",
     "markersMinted",
     "markersReused",
+    "modalOpen",
+    "modalListed",
+    "modalTruncated",
 )
 # `textTruncated` joins these rather than the summed set: it is a boolean the payload emits to say the
 # text digest hit its budget, so a frame that hit ITS budget has to be able to raise the page's flag.
 _OBSERVE_ANY_KEYS = ("unreadableRoot", "pageMutated", "textTruncated")
+_READY_STATE_CODES = {"loading": 1, "interactive": 2, "complete": 3}
 # Text lines the merged digest keeps. Each realm bounds its own list, so without a merged cap a page
 # of frames multiplies the text section by its frame count -- and the digest rides in the persistent
 # conversation prefix, where every line is paid for on every later turn.
@@ -12660,6 +13269,16 @@ def build_browser_tools(
             # this one is OBSERVE_MERGED_ELEMENT_MAX, applied when frames are folded in. Its share is
             # inside `elements_dropped` too, so describe-failures alone are the difference of the two.
             "elements_truncated_by_page_cap": int(data.get("mergeCapDropped") or 0),
+            # Blocking dialogs only (dialog:modal, aria-modal, role=alertdialog). Counted per realm, so a frame's
+            # modal control later cut by the merged page cap still counts as listed.
+            "modal_open": int(data.get("modalOpen") or 0),
+            "modal_listed": int(data.get("modalListed") or 0),
+            "modal_truncated": int(data.get("modalTruncated") or 0),
+            # The main document's load state when `elements_listed` is 0: 1 loading, 2 interactive, 3 complete,
+            # 4 unreadable, else 0. An int because the record keeps only ints.
+            "ready_state_when_empty": 0
+            if any(not e.get("pointerRoot") for e in elements)
+            else _READY_STATE_CODES.get(str(data.get("readyState") or ""), 4),
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
         # text or a field value the model previously typed (a token resolved back to its URL), and
@@ -12765,6 +13384,9 @@ def build_browser_tools(
     # Per tab: the line counts at the last reporting read on that tab's document. A same-document url
     # change (pushState, a hash) keeps it; a new document resets it.
     text_baselines: dict[Any, _TextBaseline] = {}
+    # Held lines that can no longer rise on their document, with the call their span starts at; the next ok
+    # result reports them, so a held line is shown exactly once either way.
+    flushed: list[tuple[Counter[str], int]] = []
     browser_calls = [0]
     # Tabs whose main frame navigated since their last read (a new document may have no baseline yet).
     # Kept in Python from the browser's own events; `watched` is every tab with a listener.
@@ -12820,21 +13442,124 @@ def build_browser_tools(
                 return True
         return False
 
-    def _remember(page: Any, nonce: str, lines: list[str], seq: int) -> list[tuple[str, bool]]:
-        """Store this read as the tab's baseline and return what rose since the previous one."""
+    def _reads_frames(page: Any, was_dirty: bool) -> bool:
         prior = text_baselines.get(page)
-        same_document = prior is not None and prior.nonce == nonce
-        risen = _risen_lines(prior.counts, lines, prior.seen) if prior is not None and same_document else []
-        seen = prior.seen if prior is not None and same_document else set()
-        seen_chars = prior.seen_chars if prior is not None and same_document else 0
+        return was_dirty or prior is None or prior.frame_failures < _TEXT_DELTA_MAX_FAILED_READS
+
+    def _risen_since(prior: _TextBaseline, read: _PageText) -> tuple[list[tuple[str, int]], int]:
+        """What rose, and the call it may have risen since."""
+        # Frames first read now have nothing to compare against: their lines become the baseline unreported.
+        # Frames left out for good are compared against nothing, as if absent.
+        if prior.frame_counts is None or (read.frame_lines is None and not read.frames_failed):
+            return _risen_lines(prior.counts, read.lines, prior.seen, prior.deferred), prior.seq
+        # Counted with the frames' last counts, so a line that moves between the page and a frame (even one
+        # whose read failed) is not newly shown. A line from the frames' unread calls can surface on either
+        # side, so the span reaches back to their last read, which is never later than the page's.
+        lines = read.lines + read.frame_lines if read.frame_lines is not None else read.lines
+        return _risen_lines(prior.counts + prior.frame_counts, lines, prior.seen, prior.deferred), prior.frame_seq
+
+    def _remember(page: Any, read: _PageText, seq: int) -> tuple[list[tuple[str, int]], int | None]:
+        """Store this read as the tab's baseline and return what rose since the previous one, with the call
+        it rose since. Frames this read did not reach keep their previous counts."""
+        prior = text_baselines.get(page)
+        same = prior if prior is not None and prior.nonce == read.nonce else None
+        if prior is not None and same is None and prior.deferred:
+            flushed.append((prior.deferred, prior.seq))
+        risen, since = _risen_since(same, read) if same is not None else ([], None)
+        counts = Counter(read.lines)
+        dated = seq
+        frame_counts: Counter[str] | None
+        if read.frame_lines is not None:
+            frame_counts, frame_failures, frame_seq = Counter(read.frame_lines), 0, seq
+        else:
+            frame_counts = same.frame_counts if same is not None else None
+            frame_failures = (same.frame_failures if same is not None else 0) + (1 if read.frames_failed else 0)
+            frame_seq = same.frame_seq if same is not None else seq
+            if same is not None and read.frames_failed:
+                # Until a read reaches both: a line that left the page may have moved into the unread frame, so it
+                # stays counted; a page line the frames' counts covered was not reported, so it is not counted yet.
+                unsettled = counts | same.counts
+                if same.frame_counts is not None:
+                    counts -= same.frame_counts
+                counts |= same.counts
+                if frame_failures >= _TEXT_DELTA_MAX_FAILED_READS and counts != unsettled:
+                    # Frames left out from now on are absent, so the next read reports those lines, dated from
+                    # the frames' last read.
+                    dated = frame_seq
+        if same is not None and same.deferred:
+            # A held line that did not rise again has left or sits in a frame this read missed, so it goes out
+            # now. In the second case it stays counted, like any line that leaves the page while frames go unread.
+            gone = same.deferred - Counter(line for line, _ in risen)
+            if gone:
+                flushed.append((gone, same.seq))
+                if read.frames_failed:
+                    counts += gone
+        lines = read.lines + (read.frame_lines or [])
+        seen = same.seen if same is not None else set()
+        seen_chars = same.seen_chars if same is not None else 0
         fresh = set(lines) - seen
         seen_chars += sum(len(line) for line in fresh)
         seen |= fresh
         if seen_chars > _TEXT_DELTA_TEXT_MAX_CHARS:
             seen = set(lines)
             seen_chars = sum(len(line) for line in seen)
-        text_baselines[page] = _TextBaseline(nonce, Counter(lines), seq, seen, seen_chars)
-        return risen
+        text_baselines[page] = _TextBaseline(
+            read.nonce, counts, frame_counts, frame_failures, dated, frame_seq, seen, seen_chars, Counter()
+        )
+        return risen, since
+
+    def _release_held(page: Any) -> None:
+        """A call that does not report gives held lines no way to rise again, so they go out with it."""
+        baseline = text_baselines.get(page)
+        if baseline is not None and baseline.deferred:
+            flushed.append((baseline.deferred, baseline.seq))
+            text_baselines[page] = baseline._replace(counts=baseline.counts + baseline.deferred, deferred=Counter())
+
+    def _take_flushed(seq: int) -> tuple[str, int]:
+        """The flushed lines' sections, oldest first, and how many lines they carried. A closed tab's held
+        lines are flushed first, so whatever the call does they go out with it."""
+        for stale in [known for known in {*text_baselines, *watched} if _page_is_closed(known)]:
+            gone = text_baselines.pop(stale, None)
+            if gone is not None and gone.deferred:
+                flushed.append((gone.deferred, gone.seq))
+            navigated.discard(stale)
+            watched.discard(stale)
+            unread.pop(stale, None)
+            read_failures.pop(stale, None)
+        sections = [
+            "\n"
+            + _text_delta_cut(
+                [(line, 1) for line in lines.elements()], seq - since, _render_delta_line, before_this_call=True
+            )[0]
+            for lines, since in flushed
+        ]
+        count = sum(sum(lines.values()) for lines, _ in flushed)
+        flushed.clear()
+        return "".join(sections), count
+
+    def _defer(page: Any, cut: list[str], prior: _TextBaseline | None, since: int) -> None:
+        """Keep the lines a report left out of the baseline, so the next reporting read shows them. Once: a
+        line the previous report already deferred is not deferred again."""
+        baseline = text_baselines[page]
+        again = prior.deferred if prior is not None and prior.nonce == baseline.nonce else Counter()
+        held = Counter(cut) - again
+        if not held:
+            return
+        counts = baseline.counts.copy()
+        frame_counts = baseline.frame_counts.copy() if baseline.frame_counts is not None else None
+        for line, n in held.items():
+            from_page = min(n, counts[line])
+            counts[line] -= from_page
+            if frame_counts is not None:
+                frame_counts[line] -= n - from_page
+        # The next report's span starts where this one's did, so it never dates a held line too recently.
+        text_baselines[page] = baseline._replace(
+            counts=+counts,
+            frame_counts=+frame_counts if frame_counts is not None else None,
+            seq=since,
+            frame_seq=min(baseline.frame_seq, since),
+            deferred=held,
+        )
 
     async def _seed_before_action(seq: int) -> bool:
         """An action on a tab with no baseline for its current document would report nothing, so the
@@ -12856,17 +13581,17 @@ def build_browser_tools(
             return False
         was_dirty = page in navigated
         navigated.discard(page)
-        read = await _bounded_text_read(_read_page_lines(page))
+        read = await _read_page_text(page, frames=_reads_frames(page, was_dirty))
         if read is None:
             _read_failed(page, was_dirty)
             return True
-        if read[1] is None:
-            unread[page] = "over_bound"
+        if isinstance(read, str):
+            unread[page] = read
             return True
         _read_succeeded(page)
         prior = text_baselines.get(page)
-        if prior is None or prior.nonce != read[0]:
-            _remember(page, read[0], read[1], seq - 1)
+        if prior is None or prior.nonce != read.nonce:
+            _remember(page, read, seq - 1)
         return True
 
     # The tool, args, tab and call ordinal of the last acting call, so a call that repeats it with nothing
@@ -12874,10 +13599,9 @@ def build_browser_tools(
     last_action: list[tuple[str, str, Any, int]] = []
 
     class _PendingRead(NamedTuple):
-        risen: list[tuple[str, bool]]
+        risen: list[tuple[str, int]]
         calls: int
-        nonce: str
-        lines: list[str]
+        read: _PageText
 
     async def _read_pending(name: str, key: str, seq: int) -> tuple[bool, _PendingRead | None]:
         """What the page newly shows since its last reporting read, read before a call that repeats the
@@ -12903,50 +13627,67 @@ def build_browser_tools(
         prior = text_baselines.get(page)
         if page is not last_action[0][2] or prior is None or page in navigated or page in unread:
             return False, None
-        read = await _bounded_text_read(_read_page_lines(page))
+        read = await _read_page_text(page, frames=_reads_frames(page, False))
         if read is None:
             _read_failed(page, False)
             return True, None
-        nonce, lines = read
-        if lines is None:
-            unread[page] = "over_bound"
+        if isinstance(read, str):
+            unread[page] = read
             return True, None
         _read_succeeded(page)
-        if nonce != prior.nonce:
+        if read.nonce != prior.nonce:
             return True, None
-        risen = _risen_lines(prior.counts, lines, prior.seen)
+        risen, since = _risen_since(prior, read)
         if not risen:
             # Lines only left: the new counts become the baseline, so a repeat that brings one back reports it.
-            _remember(page, nonce, lines, prior.seq)
+            _remember(page, read, prior.seq)
             return True, None
-        return True, _PendingRead(risen, seq - prior.seq, nonce, lines)
+        return True, _PendingRead(risen, seq - since, read)
 
-    async def _read_page_lines(
-        page: Any, inline: tuple[str, str | None] | None = None
-    ) -> tuple[str, list[str] | None] | None:
-        """None when unreadable; lines None when the rendered text is past the char bound."""
-        if inline is not None:
-            nonce, text = inline
-        else:
-            raw = await page.evaluate(_TEXT_DELTA_READ_JS, [secrets.token_hex(8), _TEXT_DELTA_TEXT_MAX_CHARS])
-            if not (isinstance(raw, list) and len(raw) == 2 and isinstance(raw[0], str)):
-                return None
-            if raw[1] is not None and not isinstance(raw[1], str):
-                return None
-            nonce, text = raw
-        if text is None:
-            return nonce, None
-        # Frame bodies only: the ordinal headers are ours, and adding a frame renumbers every one of them.
-        frames = await _child_frame_text(page, _TEXT_DELTA_TEXT_MAX_CHARS - len(text), labelled=False)
-        if frames is None:
-            return nonce, None
-        combined = text + frames
+    def _hidden_lines(text: str) -> list[str]:
         ctx = skyvern_context.current()
         # Before splitting: a hidden value spanning a line break or edge whitespace would otherwise be cut
         # into fragments no exact-value match finds.
-        if ctx is not None:
-            combined = ctx.hide_from_model(combined)
-        return nonce, _text_lines(combined)
+        return _text_lines(ctx.hide_from_model(text) if ctx is not None else text)
+
+    async def _read_page_text(
+        page: Any, inline: tuple[str, str | None] | None = None, *, frames: bool
+    ) -> _PageText | Literal["over_bound"] | None:
+        """None when the page's own text is unreadable. The child frames get what that read left of the
+        budget; when they fail or run out of it, the page's own lines are still returned."""
+        started = time.monotonic()
+
+        # Each stage runs whole inside the bounded read, so anything it raises fails the read, not the tool.
+        async def own() -> tuple[str, int, list[str] | None] | None:
+            if inline is not None:
+                nonce, text = inline
+            else:
+                raw = await page.evaluate(_TEXT_DELTA_READ_JS, [secrets.token_hex(8), _TEXT_DELTA_TEXT_MAX_CHARS])
+                if not (isinstance(raw, list) and len(raw) == 2 and isinstance(raw[0], str)):
+                    return None
+                if raw[1] is not None and not isinstance(raw[1], str):
+                    return None
+                nonce, text = raw
+            return (nonce, 0, None) if text is None else (nonce, len(text), _hidden_lines(text))
+
+        async def framed(limit: int) -> list[str] | None:
+            # Frame bodies only: the ordinal headers are ours, and adding a frame renumbers every one of them.
+            text = await _child_frame_text(page, limit, labelled=False)
+            return None if text is None else _hidden_lines(text)
+
+        read = await _bounded_text_read(own(), _TEXT_DELTA_READ_TIMEOUT_SECONDS, "page")
+        if read is None:
+            return None
+        nonce, length, lines = read
+        if lines is None:
+            return "over_bound"
+        if not frames:
+            return _PageText(nonce, lines, None, False)
+        left = _TEXT_DELTA_READ_TIMEOUT_SECONDS - (time.monotonic() - started)
+        frame_lines = (
+            await _bounded_text_read(framed(_TEXT_DELTA_TEXT_MAX_CHARS - length), left, "frames") if left > 0 else None
+        )
+        return _PageText(nonce, lines, frame_lines, frame_lines is None)
 
     def _render_delta_line(line: str) -> str:
         ctx = skyvern_context.current()
@@ -13027,64 +13768,90 @@ def build_browser_tools(
                         )
                 if _reports and _seeds:
                     last_action[:] = [(spec_name, key, page, browser_calls[0])] if page is not None else []
-                if not _reports or result.status != "ok" or page is None:
+                if result.status != "ok":
                     return result
+                if not _reports or page is None:
+                    if page is not None:
+                        _release_held(page)
+                    flush, flushed_lines = _take_flushed(seq)
+                    if flush:
+                        record_text_delta(0.0, flushed_lines, len(flush), pending=flushed_lines)
+                    return _with_delta_section(result, flush)
                 _watch_navigations(page)
                 # What a pending read found was on the page before this call ran, so it is reported even
                 # when this call's own read fails or this call left the document: it cannot come back later.
                 before = pending.risen if pending is not None else []
-                before_section = (
-                    "\n" + _text_delta_section(before, pending.calls, _render_delta_line, before_this_call=True)
-                    if pending is not None and before
-                    else ""
-                )
+                before_section = ""
+                # Lines the pending section held come back in `held` or as risen rank 0; they count once.
+                pending_held = 0
                 if pending is not None and before:
-                    _remember(page, pending.nonce, pending.lines, seq)
+                    shown_before, cut_before = _text_delta_cut(
+                        before, pending.calls, _render_delta_line, before_this_call=True
+                    )
+                    before_section = "\n" + shown_before
+                    prior_pending = text_baselines.get(page)
+                    _remember(page, pending.read, seq)
+                    if cut_before:
+                        _defer(page, [before[i][0] for i in cut_before], prior_pending, seq - pending.calls)
+                        pending_held = sum(text_baselines[page].deferred.values())
                 if page in unread and page not in navigated:
                     reason = unread[page]
+                    # This document is not read again, so lines held on it go out now.
+                    _release_held(page)
+                    flush, flushed_lines = _take_flushed(seq)
                     # A read before the action found this document unreadable in this call; later calls skip it.
                     record_text_delta(
                         seeded_seconds if read_before else 0.0,
                         None,
                         over_bound=reason == "over_bound",
                         skipped=None if read_before else reason,
-                        pending=len(before),
+                        pending=len(before) + flushed_lines - pending_held,
                     )
-                    return _with_delta_section(result, before_section)
+                    return _with_delta_section(result, flush + before_section)
                 was_dirty = page in navigated
                 navigated.discard(page)
                 started = time.monotonic() - seeded_seconds
                 # observe already read the main frame's text in its own evaluate; every other tool reads it here.
                 inline = observed_text[0][1:] if observed_text and observed_text[0][0] is page else None
-                read = await _bounded_text_read(_read_page_lines(page, inline))
-                if read is None:
-                    _read_failed(page, was_dirty)
-                    record_text_delta(time.monotonic() - started, None, pending=len(before))
-                    return _with_delta_section(result, before_section)
-                nonce, lines = read
-                if lines is None:
-                    unread[page] = "over_bound"
-                    record_text_delta(time.monotonic() - started, None, over_bound=True, pending=len(before))
-                    return _with_delta_section(result, before_section)
+                read = await _read_page_text(page, inline, frames=_reads_frames(page, was_dirty))
+                if read is None or isinstance(read, str):
+                    if read is None:
+                        _read_failed(page, was_dirty)
+                    else:
+                        unread[page] = read
+                    # No read leaves a baseline for held lines to rise against, so they go out now.
+                    _release_held(page)
+                    flush, flushed_lines = _take_flushed(seq)
+                    record_text_delta(
+                        time.monotonic() - started,
+                        None,
+                        over_bound=read is not None,
+                        pending=len(before) + flushed_lines - pending_held,
+                    )
+                    return _with_delta_section(result, flush + before_section)
                 _read_succeeded(page)
-                for stale in [known for known in {*text_baselines, *watched} if _page_is_closed(known)]:
-                    text_baselines.pop(stale, None)
-                    navigated.discard(stale)
-                    watched.discard(stale)
-                    unread.pop(stale, None)
-                    read_failures.pop(stale, None)
                 prior = text_baselines.get(page)
-                calls = seq - prior.seq if prior is not None else 0
-                # Ahead of this call's own effect, since it was on the page before this call ran.
-                section = before_section
-                risen = _remember(page, nonce, lines, seq)
+                risen, since = _remember(page, read, seq)
+                # Flushed lines and what the pending read found were on the page before this call ran, so
+                # they go ahead of this call's own effect.
+                section, held = _take_flushed(seq)
+                section += before_section
+                calls = seq - since if since is not None else 0
                 if risen:
-                    section += "\n" + _text_delta_section(risen, calls, _render_delta_line, after_pending=bool(before))
+                    # A frame line the pending read could not reach may predate this call; it keeps its span.
+                    shown, cut = _text_delta_cut(
+                        risen, calls, _render_delta_line, after_pending=bool(before) and since == seq
+                    )
+                    section += "\n" + shown
+                    if cut and since is not None:
+                        _defer(page, [risen[i][0] for i in cut], prior, since)
                 if not section:
                     record_text_delta(time.monotonic() - started, 0)
                     return result
+                returned = sum(1 for _, rank in risen if rank == 0)
+                earlier = len(before) + held + returned - pending_held
                 record_text_delta(
-                    time.monotonic() - started, len(before) + len(risen), len(section), pending=len(before)
+                    time.monotonic() - started, earlier + len(risen) - returned, len(section), pending=earlier
                 )
                 return _with_delta_section(result, section)
 
@@ -13363,9 +14130,6 @@ def build_browser_tools(
         except Exception:
             element = None
         return {"sel": selector, "el": element}
-
-    async def _snapshot_arg(page: Any, selector: str) -> dict[str, Any]:
-        return {**await _probe_arg(page, selector), "weak": _pre_weak()}
 
     def _with_target_label(handler: ToolHandler) -> ToolHandler:
         """Capture the target's page-visible name and kind BEFORE the handler runs and carry both on
@@ -13828,7 +14592,7 @@ def build_browser_tools(
             await _require_single_target(page, selector)
         pre: dict[str, Any] | None = None
         try:
-            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _snapshot_arg(page, selector))
+            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
             if isinstance(pre_raw, dict):
                 pre = pre_raw
         except Exception:
@@ -13927,10 +14691,27 @@ def build_browser_tools(
         label_over_control = isinstance(reach_pre, dict) and (
             (bool(reach_pre.get("slotted")) and not reach_pre.get("occluded")) or bool(reach_pre.get("ownLabel"))
         )
-        try:
-            skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
-        except Exception:
-            skin_probe = None
+        while True:
+            try:
+                skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
+            except Exception:
+                skin_probe = None
+            # Every toggle answer carries `radio`. The browser engine's own enabled check decides (Playwright reads
+            # aria-disabled only on roles that take it), so the label click below is never looser than a plain click.
+            if not (isinstance(skin_probe, dict) and "radio" in skin_probe) or await _engine_enabled(page, selector):
+                break
+            if time.monotonic() >= enable_deadline:
+                return ToolResult.error(
+                    f"{selector} is disabled — it cannot be clicked until the page enables it",
+                    error_class="disabled",
+                )
+            await asyncio.sleep(0.1)
+            # Enabling can re-render or move the control, so the label point is measured again after the wait.
+            pre_click_arg = await _probe_arg(page, selector)
+        if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and (label_over_control or _acted_realm):
+            # A drawn input under its own label is already force-clicked below, and a frame's label point is
+            # frame-relative, so neither takes the label route.
+            skin_probe = {**skin_probe, "skinned": False, "labelClick": None}
         if isinstance(skin_probe, dict) and skin_probe.get("file"):
             return ToolResult.error(
                 f"{selector} is a file input — clicking it opens a native picker the run cannot drive; "
@@ -14210,14 +14991,15 @@ def build_browser_tools(
                 # pre-read raced): as before the unified verdict, fall through to the ordinary post path
                 # rather than claim the control left the page.
             if verdict is CommitStatus.DID_NOT_COMMIT:
-                if skinned:
+                drawn_label = skinned and bool(skin_probe.get("drawnLabel"))
+                if skinned and not drawn_label:
                     return ToolResult.error(
                         f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
                         "the styled proxy may not sync from its hidden control; re-observe and act on the visible "
                         "proxy instead",
                         data=transition_data,
                     )
-                if verify_toggle:
+                if verify_toggle or drawn_label:
                     return ToolResult.error(
                         f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
                         "its label took the click but the control did not change (the page may refuse the toggle, "
@@ -14314,9 +15096,14 @@ def build_browser_tools(
         by both typing paths: fill() does no hit-testing, so without this a covered password or email
         field is filled silently -- no timeout to notice, and a person could not have reached it."""
         try:
-            probe = await _probe_evaluate(page, _TYPE_TARGET_PROBE_JS, selector, await _probe_arg(page, selector))
+            probe = await _probe_evaluate(page, _TYPING_REACH_PROBE_JS, selector, await _probe_arg(page, selector))
         except Exception:
             probe = None
+        record_type_reach(
+            acted_in_frame=bool(_acted_realm) and page.parent_frame is not None,
+            probe_scrolled=isinstance(probe, dict) and probe.get("scrolled") is True,
+            hit_on_document_root=isinstance(probe, dict) and probe.get("hitRoot") is True,
+        )
         if isinstance(probe, dict) and probe.get("exists"):
             # fill() waits for "enabled" and "editable" on its own, so without these the run pays a
             # second full timeout for a state the probe has already read.
@@ -14350,6 +15137,11 @@ def build_browser_tools(
             return True
         return False
 
+    # Whether a refused spinbutton group is on record (None: not yet read from the page); if not, an ok act reads nothing.
+    spinbutton_cursors: list[bool | None] = [None]
+    # Strong references, so a scheduled late read is not collected before it logs.
+    late_date_reads: set[asyncio.Future[Any]] = set()
+
     async def _focus_in_place_of_click(page: Any, selector: str, exc: Exception, *, focus_fallback: bool) -> _Reach:
         # focus() needs no hit target, so it stands in for a click refused only by the viewport check.
         # A widget that hands the caret to another segment would take the keys there, so a caret that
@@ -14359,15 +15151,70 @@ def build_browser_tools(
         # A field that commits a picked suggestion holds the raw query until blur, so a read-back could
         # not tell a fill from a query; with no click to reach its rows, keep the error.
         if await _declares_a_list(page, selector):
+            LOG.info(
+                "taskv3 focus stand-in refused",
+                reason="declares_list",
+                focus_at=None,
+                tool_call_seq=current_tool_call_seq(),
+            )
             raise exc
+        # The record lives on the page, so a group an earlier block recorded still counts here.
+        if await _spinbutton_group_latch(page, selector, "check") is True:
+            spinbutton_cursors[0] = True
+            LOG.info(
+                "taskv3 focus stand-in refused",
+                reason="group_cursor_elsewhere",
+                focus_at=None,
+                tool_call_seq=current_tool_call_seq(),
+            )
+            raise ToolRefusal(
+                f"{selector} could not be focused without a click, and its group already refused focus that way, so "
+                "keys sent now could land in another field of the group. Nothing was typed. Click the visible box of "
+                "this field first, then type into it.",
+                error_class="unreachable",
+            )
         try:
             await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
             held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
             held = None
         if held is not True:
+            await _stand_in_refused(page, selector, "focus_moved")
             raise exc
         return "focus"
+
+    async def _spinbutton_group_latch(page: Any, selector: str, mode: str) -> Any:
+        try:
+            return await page.evaluate(_SPINBUTTON_GROUP_LATCH_JS, {**await _probe_arg(page, selector), "mode": mode})
+        except Exception:
+            return None
+
+    async def _stand_in_refused(page: Any, selector: str, reason: str) -> None:
+        focus_at = await _spinbutton_group_latch(page, selector, "refuse")
+        spinbutton_cursors[0] = bool(spinbutton_cursors[0]) or focus_at is not None
+        LOG.info(
+            "taskv3 focus stand-in refused", reason=reason, focus_at=focus_at, tool_call_seq=current_tool_call_seq()
+        )
+
+    def _moves_spinbutton_cursor(mode: str, handler: ToolHandler) -> ToolHandler:
+        # Only once this run has recorded a group, and on the page already acted on: resolving it again could switch
+        # tabs or recover a lost page after the act.
+        @functools.wraps(handler)
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            result = await handler(args)
+            selector = args.get("selector")
+            if result.status != "ok" or not isinstance(selector, str) or not selector:
+                return result
+            realm = _acted_realm[0] if _acted_realm else _current_page()
+            with contextlib.suppress(Exception):
+                # Once per tool set: an earlier block's record lives on the page.
+                if spinbutton_cursors[0] is None:
+                    spinbutton_cursors[0] = await realm.evaluate(_SPINBUTTON_GROUP_LATCH_JS, {"mode": "any"}) is True
+                if spinbutton_cursors[0]:
+                    await _spinbutton_group_latch(realm, selector, mode)
+            return result
+
+        return wrapped
 
     async def _focus_for_typing(
         page: Any, selector: str, *, focus_fallback: bool = False
@@ -14379,6 +15226,14 @@ def build_browser_tools(
         reachable, occluded, occluder = await _reachable_for_typing(page, selector)
         if not reachable:
             return False, occluder, "click"
+        if focus_fallback:
+            pressed = await _press_date_segment_part(page, selector)
+            if pressed == "navigated":
+                raise _PressNavigated(selector)
+            if pressed == "press":
+                with contextlib.suppress(Exception):
+                    await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
+                    return True, None, "press"
         reach: _Reach = "click"
         if occluded:
             # Forcing skips the hit-target check but still dispatches at coordinates, so the wrapper
@@ -14717,6 +15572,9 @@ def build_browser_tools(
         _live_row_offers[selector] = _LiveRowOffer(page, element, token, [dict(row) for row in rows], list(typed))
         return token
 
+    # The finder is polled several times per call; its announcement skips are logged once per tool call.
+    announce_logged_call: list[int | None] = [None]
+
     async def _find_suggestion_rows(
         page: Any, selector: str, query: str, *, any_region: bool = False, match: str | None = None
     ) -> dict[str, Any] | None:
@@ -14734,6 +15592,24 @@ def build_browser_tools(
         except Exception as e:
             LOG.debug("taskv3 typeahead suggestion-find failed", selector=selector, error=str(e))
             return None
+        if isinstance(found, list) and len(found) == 2:
+            found, skipped = found
+            seq = current_tool_call_seq()
+            if isinstance(skipped, int) and skipped > 0 and (seq is None or seq != announce_logged_call[0]):
+                announce_logged_call[0] = seq
+                # A distinct message per outcome, so a plain message count is the census without facets.
+                if isinstance(found, dict) and found.get("count"):
+                    LOG.info(
+                        "taskv3 combobox announcement skipped", tool_call_seq=seq, skipped=skipped, list_emptied=False
+                    )
+                else:
+                    # One message is a prefix of the other, so a phrase search counts both; the field splits them.
+                    LOG.info(
+                        "taskv3 combobox announcement skipped, list emptied",
+                        tool_call_seq=seq,
+                        skipped=skipped,
+                        list_emptied=True,
+                    )
         return found if isinstance(found, dict) and found.get("count") else None
 
     async def _await_suggestion_rows(
@@ -14939,7 +15815,8 @@ def build_browser_tools(
             if isinstance(barred, str):
                 verdict = ToolResult.error(
                     f"the exact option {_model_text(barred, 60)!r} in {selector}'s list is disabled, so it cannot be selected "
-                    "— the field is NOT filled; no other option was picked in its place"
+                    "— the field is NOT filled; no other option was picked in its place",
+                    error_class="option_disabled",
                 )
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False, verdict=verdict)
             declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
@@ -15211,6 +16088,74 @@ def build_browser_tools(
         except Exception:
             LOG.debug("taskv3 pre-type value restore failed", selector=selector)
 
+    async def _rows_reacted(page: Any, selector: str) -> bool:
+        # Rows NEW since the pre-type snapshot: a menu opened on focus/click sits in that snapshot and does not count.
+        try:
+            reacted_menu = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+        except Exception:
+            return False
+        return isinstance(reacted_menu, dict) and bool(reacted_menu.get("count"))
+
+    async def _declares_search_autocomplete(page: Any, selector: str) -> bool:
+        try:
+            return bool(await page.evaluate(_DECLARES_SEARCH_AUTOCOMPLETE_JS, await _probe_arg(page, selector)))
+        except Exception:
+            return False
+
+    async def _declared_list_answers(page: Any, selector: str, text: str) -> bool:
+        # Fail toward an answer: a list that could not be read is no evidence the text matched nothing.
+        try:
+            arg = {**(await _probe_arg(page, selector)), "typed": text}
+            return await page.evaluate(_DECLARED_LIST_ANSWER_JS, arg) != "none"
+        except Exception:
+            return True
+
+    async def _answers_as_search(page: Any, selector: str) -> bool:
+        # Rows that reacted to the keystrokes, or aria-autocomplete list/both/inline, which also covers a combobox
+        # that filtered to zero rows and so left nothing new to count.
+        return await _rows_reacted(page, selector) or await _declares_search_autocomplete(page, selector)
+
+    async def _held_value_no_match(
+        page: Any, selector: str, text: str, pre_value: str | None, *, echo: bool
+    ) -> ToolResult | None:
+        # select_combobox's no-match rule for `type`: text a declared list answers with no row is not a value, and
+        # the next Tab or blur would commit it over the held value. An empty field keeps free text, so a field the
+        # caller emptied first with press_key is not protected.
+        if not pre_value or not pre_value.strip() or _exact_tier_key(pre_value) == _exact_tier_key(text):
+            return None
+        # Keys that went elsewhere are a different failure, and the field still holds its value.
+        if not _typed_text_landed(await _read_field_value(page, selector), text):
+            return None
+        if not await _field_declares_list(page, selector) or not await _declares_search_autocomplete(page, selector):
+            return None
+        # Rows still showing may be a prefix filter the caller is about to pick from with Enter.
+        for wait in (0.0, 0.5, 0.5, 1.0):
+            # Late looks over 2s before refusing: a debounced, network-backed list can answer after the commit poll.
+            await asyncio.sleep(wait)
+            if await _rows_reacted(page, selector) or await _declared_list_answers(page, selector, text):
+                return None
+        await _restore_pre_type_value(page, selector, pre_value, [text])
+        # Only the input's text is read back: a widget that keeps its selection elsewhere may still have dropped it.
+        restored = await _read_field_value(page, selector) == pre_value
+        LOG.info("taskv3 type no-match restored held value", restored=restored)
+        typed = repr(text) if echo else "the typed text"
+        try:
+            echo_held = echo and not await page.locator(selector).first.evaluate(
+                _FIELD_VALUE_IS_SECRET_JS, timeout=2000
+            )
+        except Exception:
+            echo_held = False
+        held = (
+            (f"its text {_model_text(pre_value, 60)!r} was put back" if echo_held else "its previous text was put back")
+            if restored
+            else "its previous value could not be put back, so re-observe it before moving on"
+        )
+        return ToolResult.error(
+            f"no autocomplete suggestion matched {typed} for {selector}; the field is NOT filled — {held}. "
+            "To set it to one of its options, use select_combobox",
+            error_class="no_matching_row",
+        )
+
     def _with_live_row_release(tool_name: str, handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
             if tool_name == "navigate":
@@ -15316,6 +16261,7 @@ def build_browser_tools(
                             "The requested action did not run. Closing the previous field's still-open list with "
                             "Escape also dismissed the field's own container — re-observe before continuing.",
                             data={"page_state_changed": True},
+                            error_class="close_hid_field",
                         )
                 except Exception:
                     LOG.debug("taskv3 live offer release failed", selector=field, exc_info=True)
@@ -15362,7 +16308,7 @@ def build_browser_tools(
         # of this attempt, and ownCommittedSurface reads nothing while it is open.
         pre_own = await _own_surface_text(page, selector)
         try:
-            await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
+            await page.evaluate(_PRESNAPSHOT_JS)
         except Exception:
             presnapshot_ok = False
             LOG.info("taskv3 typeahead pre-snapshot failed; skipping suggestion probe", selector=selector)
@@ -15373,11 +16319,15 @@ def build_browser_tools(
         )
         if not focused:
             raise _FieldCovered(selector, occluder)
+        if reach == "press":
+            # Rows the press itself opened were there before the keys, so they are not the keys' reaction.
+            with contextlib.suppress(Exception):
+                await page.evaluate(_PRESNAPSHOT_JS)
         if presnapshot_ok:
             # Focus may reveal help text or a validation note as well as a menu; only rows of a list
             # are a reaction the finder may pick from, so everything else focus revealed is marked too.
             try:
-                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _snapshot_arg(page, selector))
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
             except Exception:
                 pass
         # `query` is what the caller chose to search with; the row committed must still be `value` exactly.
@@ -15402,7 +16352,8 @@ def build_browser_tools(
             verdict = (
                 ToolResult.error(
                     f"typed {typed!r} into {selector} but did not press Enter: its search results could not "
-                    "be told apart from the rest of the page — the field is NOT filled; re-observe and retry"
+                    "be told apart from the rest of the page — the field is NOT filled; re-observe and retry",
+                    error_class="enter_not_pressed",
                 )
                 if press_enter
                 else None
@@ -15451,13 +16402,14 @@ def build_browser_tools(
         # The rows showing now are the widget's unfiltered list, not an answer to the query: only rows
         # the search renders (or rewrites) may count.
         try:
-            await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
+            await page.evaluate(_PRESNAPSHOT_JS)
             await page.evaluate(_WATCH_REWRITTEN_ROWS_JS)
         except Exception:
             return _settled(
                 ToolResult.error(
                     f"typed {typed!r} into {selector} but did not press Enter: the page could not be snapshotted "
-                    "to tell its search results apart — the field is NOT filled; re-observe and retry"
+                    "to tell its search results apart — the field is NOT filled; re-observe and retry",
+                    error_class="enter_not_pressed",
                 )
             )
 
@@ -15485,7 +16437,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"pressing Enter in {selector} to search for {typed!r} made the widget commit {committed!r} "
                     f"itself, not {value!r} — the field now holds {committed!r}; if that is not acceptable, remove "
-                    "it, then call select_combobox again with press_enter=true and a search that returns several rows"
+                    "it, then call select_combobox again with press_enter=true and a search that returns several rows",
+                    error_class="enter_committed_other",
                 )
             return None
 
@@ -15496,7 +16449,8 @@ def build_browser_tools(
                 return _settled(
                     ToolResult.error(
                         f"typed {typed!r} into {selector} but could not press Enter in it — the field is NOT "
-                        "filled; re-observe and retry"
+                        "filled; re-observe and retry",
+                        error_class="enter_not_pressed",
                     )
                 )
 
@@ -15513,6 +16467,7 @@ def build_browser_tools(
                         f"pressing Enter in {selector} navigated the page to {page.url} — the field is NOT "
                         "filled; re-observe before continuing",
                         data={"navigated": True, "page_state_changed": True},
+                        error_class="enter_navigated",
                     )
                 )
             held = await _read_field_value(page, selector)
@@ -15523,7 +16478,8 @@ def build_browser_tools(
                     await _auto_commit_verdict(held)
                     or ToolResult.error(
                         f"pressing Enter in {selector} to search for {typed!r} changed the field without listing any "
-                        "results — re-observe the field: the widget may have committed a value of its own"
+                        "results — re-observe the field: the widget may have committed a value of its own",
+                        error_class="enter_committed_other",
                     )
                 )
             if found is None:
@@ -15532,11 +16488,16 @@ def build_browser_tools(
                     return _settled(
                         ToolResult.error(
                             f"pressed Enter in {selector} to search for {typed!r}, but {why}, so its search results "
-                            "could not be seen — the field is NOT verified; re-observe it before retrying"
+                            "could not be seen — the field is NOT verified; re-observe it before retrying",
+                            error_class="enter_results_unseen",
                         )
                     )
                 return _settled(
-                    ToolResult.error(f"{no_rows}; the field is NOT filled", data={"release_own_list": True})
+                    ToolResult.error(
+                        f"{no_rows}; the field is NOT filled",
+                        data={"release_own_list": True},
+                        error_class="no_option_list",
+                    )
                 )
             pick = await _commit_typeahead(page, selector, value, rounds, exact_only=True, probe=typed, pre_own=pre_own)
         finally:
@@ -15557,10 +16518,15 @@ def build_browser_tools(
                     "matches that wording: call again with press_enter=true and a shorter search= (one distinctive "
                     "word)",
                     data={"release_own_list": True},
+                    error_class="no_matching_row",
                 )
             )
         if not rows and not pick.overflow:
-            return _settled(ToolResult.error(f"{no_rows}; the field is NOT filled", data={"release_own_list": True}))
+            return _settled(
+                ToolResult.error(
+                    f"{no_rows}; the field is NOT filled", data={"release_own_list": True}, error_class="no_option_list"
+                )
+            )
         searched_note = f"the site's search results for {typed!r}"
         return pick._replace(note=f"{searched_note}; {pick.note}" if pick.note else searched_note)
 
@@ -15596,7 +16562,8 @@ def build_browser_tools(
         except Exception:
             return ToolResult.error(
                 f"selected value for {selector}, but its still-open list covered the form, and closing it "
-                "with Escape dismissed the field's own container — re-observe before continuing"
+                "with Escape dismissed the field's own container — re-observe before continuing",
+                error_class="close_hid_field",
             )
         after = await _read_field_value(page, selector)
         if after is None:
@@ -15613,7 +16580,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"selected {committed!r} for {selector}, but its still-open list did not just sit there: "
                     f"closing it with Escape changed the value to {after!r} — the commit did not survive; "
-                    "re-observe and retry"
+                    "re-observe and retry",
+                    error_class="commit_reverted",
                 )
         try:
             if bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector))):
@@ -15841,6 +16809,42 @@ def build_browser_tools(
         ok = isinstance(raw, list) and len(raw) == len(labels) and all(isinstance(r, list) for r in raw)
         return dict(zip(labels, raw, strict=False)) if ok else None
 
+    date_write_salt = secrets.token_hex(4)
+
+    async def _date_write_ledger(page: Any, mode: str, labels: Sequence[str] = (), confirmed: Any = None) -> Any:
+        try:
+            arg = {"mode": mode, "labels": list(labels), "salt": date_write_salt, "confirmed": confirmed}
+            return await page.evaluate(_DATE_WRITE_LEDGER_JS, arg)
+        except Exception:
+            return None
+
+    async def _begin_date_write(write: dict[str, Any], page: Any, labels: Sequence[str]) -> None:
+        begun = await _date_write_ledger(page, "begin", labels)
+        write.update(page=page, labels=list(labels), **(begun if isinstance(begun, dict) else {}))
+
+    async def _end_date_write(write: dict[str, Any], result: ToolResult | None) -> None:
+        # The trace stops where settle took it (before any restore key), else here. An ok is recorded only for values
+        # settle confirmed on a call that reports ok, so the next write's drift is judged against what the model saw.
+        page, labels = write["page"], write["labels"]
+        stopped = await _date_write_ledger(page, "stop")
+        trace = write.get("trace") or stopped or {}
+        confirmed = write.get("confirmed")
+        if result is not None and result.status == "ok" and confirmed is not None:
+            await _date_write_ledger(page, "ok", labels, [confirmed.get(label) for label in labels])
+        with contained_effect("date write log"):
+            LOG.info(
+                "taskv3 date write",
+                date_group_key=write.get("key"),
+                drift_since_ok=write.get("drift"),
+                outcome=result.status if result is not None else "raised",
+                tool_error_class=result.error_class if result is not None else None,
+                tool_call_seq=current_tool_call_seq(),
+                # A one-segment group on the plain path is typed with no Tab and no settle read-back.
+                group_segments=len(labels),
+                plain_path=write.get("plain_path", False),
+                **{field: trace.get(field) for field in _DATE_WRITE_TRACE_FIELDS},
+            )
+
     async def _date_siblings_begin(page: Any, target: str, order: list[str]) -> dict[str, int | None] | None:
         # Each other segment's reference is the value a failed restore recorded on it, so a retried write is judged
         # against the date before the first corruption; else what it holds now. The target's record is dropped.
@@ -15900,8 +16904,11 @@ def build_browser_tools(
         # page clamps the day against the month it holds. A segment that cannot be read stops the loop.
         if group is None:
             return None, None, 0
-        label, ref = group["label"], group["ref"]
+        label, ref, write = group["label"], group["ref"], group.get("write")
+        if write is not None:
+            write["trace"] = await _date_write_ledger(page, "stop")
         stats = {"date_siblings_moved_after_tab": 0, "date_siblings_filled_after_tab": 0}
+        now: dict[str, Any] | None = None
         try:
             unverified = ToolResult.error(
                 f"typed into {selector}, but the segments of the same date could not be read back afterwards, so the "
@@ -15946,7 +16953,8 @@ def build_browser_tools(
                 other = "month" if wrong[0] == "day" and "month" in wrong else wrong[0]
                 restored[other] = (restored[other][0] if other in restored else now[other], want[other])
                 locator = page.locator(f'[data-tv3-dateseg="{other}"]').first
-                await _aim_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
+                if await _aim_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator, entry=False) == "navigated":
+                    return _pressed_into_navigation(selector), None, 0
                 # The caret goes to the end, since a clear deletes only what precedes it. Focus is checked before the
                 # clear, so a refusal never leaves the segment wiped.
                 with contextlib.suppress(Exception):
@@ -15974,6 +16982,8 @@ def build_browser_tools(
             await _date_segment_state(page, list(ref), {o: want[o] if o in wrong else "drop" for o in ref})
             # A restore's keys can also land in the segment just written, which no caller re-reads after this.
             wrong += [label] if now[label] != want[label] else []
+            if write is not None and not wrong:
+                write["confirmed"] = now
             if not wrong and restored:
                 # Named as put back only where the segment holds the wanted value; a widget default is shown as is.
                 put_back = ", ".join(
@@ -15993,7 +17003,46 @@ def build_browser_tools(
             return error, now, noted
         finally:
             with contained_effect("date siblings settled log"):
-                LOG.info("taskv3 date siblings settled", segment=label, **stats)
+                LOG.info("taskv3 date siblings settled", segment=label, tool_call_seq=current_tool_call_seq(), **stats)
+            if now is not None and sys.exc_info()[0] is None:
+                await _schedule_late_date_read(page, label, now)
+
+    async def _schedule_late_date_read(page: Any, label: str, settled: dict[str, Any]) -> None:
+        # Measurement only: whether a segment moves after the settle has read it, which no read inside the call can see.
+        # The segments are captured now and read off the tool's path, so the write returns no later.
+        labels = list(settled)
+        try:
+            token = await page.evaluate(_DATE_GROUP_LATE_READ_JS, {"labels": labels})
+        except Exception:
+            token = None
+        if not isinstance(token, str):
+            return
+
+        async def read() -> None:
+            await asyncio.sleep(_DATE_GROUP_LATE_READ_SECONDS)
+            try:
+                late = await page.evaluate(_DATE_GROUP_LATE_READ_JS, {"token": token})
+            except Exception:
+                late = None
+            read_ok = isinstance(late, list) and len(late) == len(labels)
+            pairs = list(zip(labels, late, strict=False)) if read_ok else []
+            moved = [o for o, held in pairs if held != "gone" and held != settled[o]]
+            with contained_effect("date late read log"):
+                LOG.info(
+                    "taskv3 date group late read",
+                    tool_call_seq=current_tool_call_seq(),
+                    segment=label,
+                    labels=labels,
+                    read=read_ok,
+                    moved_late=moved,
+                    target_moved_late=label in moved,
+                    gone=sum(held == "gone" for _, held in pairs),
+                )
+
+        task = asyncio.ensure_future(read())
+        late_date_reads.add(task)
+        task.add_done_callback(late_date_reads.discard)
+        task.add_done_callback(_drain_abandoned_read)
 
     def _date_segment_committed(rendered: str, expected_digits: str) -> bool:
         match = _DATE_SEGMENT_DIGITS_RE.search(rendered)
@@ -16118,7 +17167,51 @@ def build_browser_tools(
                 await result.dispose()
         return str(kind), returned, at
 
-    async def _aim_date_segment(page: Any, selector: str, locator: Any, *, press: bool = True) -> str:
+    async def _press_date_segment_part(page: Any, selector: str, *, entry: bool = True) -> str | None:
+        # "press", "navigated", or None to keep today's entry. The aim arm's own press stands while it is on.
+        if _date_segment_aim_on():
+            return None
+        try:
+            found = await page.evaluate_handle(_DATE_SEGMENT_PART_JS, await _probe_arg(page, selector))
+        except Exception:
+            return None
+        part = found.as_element()
+        if part is None:
+            with contextlib.suppress(Exception):
+                reason = await found.json_value()
+                await found.dispose()
+                if isinstance(reason, str):
+                    LOG.info(
+                        "taskv3 date segment press",
+                        outcome=reason,
+                        entry=entry,
+                        tool_call_seq=current_tool_call_seq(),
+                    )
+            return None
+        outcome = "failed"
+        try:
+            planted = await page.evaluate("() => { window.__tv3_doc = 1; return true; }") is True
+            # A checked click: a layer over the part, in this page or over its frame, refuses it rather than taking it.
+            await input_dispatch.click_handle(page, part, timeout=1500)
+            # A check that cannot run after a press that landed means the document went away with it.
+            outcome = "navigated"
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded", timeout=1000)
+            outcome = "press" if not planted or await page.evaluate("() => window.__tv3_doc === 1") else "navigated"
+        except Exception as exc:
+            outcome = "covered" if "intercepts pointer events" in str(exc) else outcome
+        finally:
+            with contextlib.suppress(Exception):
+                await part.dispose()
+        if outcome == "press":
+            # The press moved the widget's cursor to this segment, so its group's record follows before any check.
+            await _spinbutton_group_latch(page, selector, "clicked")
+        LOG.info("taskv3 date segment press", outcome=outcome, entry=entry, tool_call_seq=current_tool_call_seq())
+        return outcome if outcome in ("press", "navigated") else None
+
+    async def _aim_date_segment(
+        page: Any, selector: str, locator: Any, *, press: bool = True, entry: bool = True
+    ) -> str:
         # Some widgets move their section cursor only on a trusted pointer event and reset it when focus
         # enters the group, so focus() alone types into the wrong segment; a sub-pixel one is pressed through its layer.
         try:
@@ -16142,9 +17235,12 @@ def build_browser_tools(
             except Exception:
                 return "focus"
             return "click"
+        if not _date_segment_aim_on():
+            pressed = await _press_date_segment_part(page, selector, entry=entry) if press else None
+            return pressed if pressed in ("press", "navigated") else "focus"
         # A press in a child frame lands wherever the top page paints at that point, which the hit test
         # inside the frame cannot see, so a framed segment is only focused.
-        if not _date_segment_aim_on() or (_acted_realm and page.parent_frame is not None):
+        if _acted_realm and page.parent_frame is not None:
             return "focus"
         owner = None
         handle = None
@@ -16196,6 +17292,8 @@ def build_browser_tools(
         except Exception:
             pass
         aim = await _aim_date_segment(page, selector, locator)
+        if aim == "navigated":
+            return False, aim
         try:
             await input_dispatch.focus(page, locator, timeout=2000)
         except Exception:
@@ -16218,6 +17316,13 @@ def build_browser_tools(
         except Exception:
             return False, aim
         return await _date_segment_holds(page, selector, digits), aim
+
+    def _pressed_into_navigation(selector: str) -> ToolResult:
+        return ToolResult.error(
+            f"pressed a part of {selector}'s date to type into it, and the page navigated -- nothing was typed. "
+            "Re-observe before doing anything else.",
+            data={"navigated": True, "page_state_changed": True},
+        )
 
     def _date_group_shape(labels: list[str]) -> str:
         return "".join(label[0] for label in _DATE_SEGMENT_ORDER if label in labels)
@@ -16277,9 +17382,12 @@ def build_browser_tools(
         written: list[tuple[str, str, str]] = []
         # Every segment is rewritten, so no earlier restore's record still describes the date.
         await _date_segment_state(page, order, dict.fromkeys(order, "drop"))
+        await _date_write_ledger(page, "drop", order)
         for label in _DATE_SEGMENT_ORDER:
             segment_selector = f'[data-tv3-dateseg="{label}"]'
             committed, aim = await _type_one_date_segment(page, segment_selector, components[label])
+            if aim == "navigated":
+                return _pressed_into_navigation(selector)
             LOG.info(
                 "taskv3 date segment fill",
                 segment=label,
@@ -16294,7 +17402,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"typed a date into {selector}'s segmented date field, but the {label} segment did not "
                     "commit its value afterward -- the field is NOT filled and may hold a partial date. "
-                    "Re-observe and retry, filling the remaining segment(s) yourself if this one held."
+                    "Re-observe and retry, filling the remaining segment(s) yourself if this one held.",
+                    error_class="date_segment_not_committed",
                 )
             written.append((label, segment_selector, components[label]))
         drifted = await _drifted_date_segment(page, written)
@@ -16321,7 +17430,14 @@ def build_browser_tools(
         return None
 
     async def _fill_one_date_segment(
-        page: Any, selector: str, label: str, digits: str, labels: list[str], *, text_is_secret: bool
+        page: Any,
+        selector: str,
+        label: str,
+        digits: str,
+        labels: list[str],
+        *,
+        text_is_secret: bool,
+        write: dict[str, Any],
     ) -> ToolResult:
         # Addressed through the tag the probe just wrote, exactly as the group fill is: that is the
         # element the probe established is this segment, where re-resolving the caller's selector
@@ -16334,6 +17450,8 @@ def build_browser_tools(
         collateral = await _capture_collateral(page, segment_selector)
         outside = await _collateral_outside_date_segments(page, collateral)
         committed, aim = await _type_one_date_segment(page, segment_selector, digits)
+        if aim == "navigated":
+            return _pressed_into_navigation(selector)
         LOG.info(
             "taskv3 date segment fill",
             segment=label,
@@ -16347,7 +17465,9 @@ def build_browser_tools(
         # the widget's own state, which can keep the stray key.
         if (navigated := await _commit_with_tab(page, selector)) is not None:
             return navigated
-        date_error, now, noted = await _settle_date_group(page, selector, digits, {"label": label, "ref": ref})
+        date_error, now, noted = await _settle_date_group(
+            page, selector, digits, {"label": label, "ref": ref, "write": write}
+        )
         if date_error is not None and committed and date_error.status != "ok":
             return date_error
         # A restore the settle made leads the ok; a field outside the group that moved is still reported after it.
@@ -16366,7 +17486,8 @@ def build_browser_tools(
             return ToolResult.error(
                 f"typed into {selector}, but its {label} segment did not commit the value afterward -- "
                 f"the field is NOT filled.{reach} Re-observe and retry."
-                + (f" {still} other field(s) in the group still hold keys it sent." if still else "")
+                + (f" {still} other field(s) in the group still hold keys it sent." if still else ""),
+                error_class="date_segment_not_committed",
             )
         if now is not None and now[label] != int(digits):
             held = "" if now[label] is None else str(now[label])
@@ -16429,7 +17550,15 @@ def build_browser_tools(
         field = f"the {n}-box code field at {selector}"
 
         def outcome(name: str, typed: int) -> None:
-            LOG.info("taskv3 code box group fill", boxes=n, typed=typed, outcome=name)
+            # Read before any Enter: whether the entry alone moved the page on. `url` is cached, not a browser read.
+            LOG.info(
+                "taskv3 code box group fill",
+                boxes=n,
+                typed=typed,
+                outcome=name,
+                press_enter=press_enter,
+                moved_on_after=None if (now := _current_page()) is None else now.url != url_before_fill,
+            )
 
         def delivered_unverified(typed: int) -> ToolResult:
             if typed < n:
@@ -16557,6 +17686,17 @@ def build_browser_tools(
         )
 
     async def type_text(args: dict[str, Any]) -> ToolResult:
+        # Filled by a write into a date group, which every exit then closes.
+        write: dict[str, Any] = {}
+        result = None
+        try:
+            result = await _type_text(args, write)
+            return result
+        finally:
+            if write:
+                await _end_date_write(write, result)
+
+    async def _type_text(args: dict[str, Any], write: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
             return error
@@ -16570,6 +17710,10 @@ def build_browser_tools(
         # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
         url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
+        if clear and not press_enter:
+            cell_result = await _type_into_grid_cell(page, selector, text, echo=text == args.get("text", ""))
+            if cell_result is not None:
+                return cell_result
         date_group: dict[str, Any] | None = None
         # A segmented date input truncates a whole date typed into one segment at that segment's
         # maxlength, so a confirmed month/day/year group is filled segment by segment instead. A
@@ -16609,6 +17753,7 @@ def build_browser_tools(
                         blocked = await _segmented_write_blocked(page, selector)
                         if blocked is not None:
                             return blocked
+                        await _begin_date_write(write, page, labels)
                         return await _fill_one_date_segment(
                             page,
                             selector,
@@ -16616,6 +17761,7 @@ def build_browser_tools(
                             segment_digits,
                             labels,
                             text_is_secret=text != args.get("text", ""),
+                            write=write,
                         )
                 # The plain path types a month/year or year-only segment, so its group is tagged here only to read
                 # and restore the other segments around the write.
@@ -16624,13 +17770,16 @@ def build_browser_tools(
                 target = str(probe.get("targetLabel"))
                 if probe.get("ok") and _DATE_SEGMENT_TEXT_RE.fullmatch(text.strip()):
                     ref = await _date_siblings_begin(page, target, probe.get("order") or [])
+                    await _begin_date_write(write, page, probe.get("order") or [])
                     # None: the siblings could not be read before the write, so it can only end unverified.
-                    date_group = {"label": target, "ref": ref} if ref != {} else None
+                    date_group = {"label": target, "ref": ref, "write": write} if ref != {} else None
+                    write["plain_path"] = True
                 LOG.info("taskv3 date segment group declined", date_group_reject=group.get("reason"))
         field_type: str | None = None
         maxlength: int | None = None
         if text:
             field_type, maxlength = await _field_shape(page, selector)
+        password_anchor = input_dispatch.secret_fill_anchor(page) if field_type == "password" else None
         # One box of a field of one-character boxes cannot hold more than one character, so a longer text is
         # either written one character per box and read back from every box, or not written at all.
         box_text = maxlength == 1 and len(text) > 1
@@ -16759,6 +17908,8 @@ def build_browser_tools(
                     await field.dispose()
             if not_held is not None:
                 return not_held
+        if password_anchor is not None:
+            input_dispatch.note_secret_fill(page, password_anchor)
         if press_enter:
             await input_dispatch.press(page, selector, "Enter")
             return ToolResult.ok(f"typed into {selector}", data={"url_before": url_before})
@@ -16785,6 +17936,269 @@ def build_browser_tools(
         if not isinstance(read, dict) or not isinstance(read.get("text"), str):
             return None
         return read["text"], bool(read["rich"])
+
+    async def _type_into_grid_cell(page: Any, selector: str, text: str, *, echo: bool) -> ToolResult | None:
+        # A click-to-edit grid cell holds no control until opened: open its editor (a click, then Enter as the ARIA
+        # grid convention, then a double-click), replace the value with fill (a key chord's meaning depends on the
+        # platform), commit with Enter, and read the committed cell back. None: not such a cell.
+        token = secrets.token_hex(6)
+        try:
+            matches = await page.locator(selector).count()
+            if not matches:
+                return None
+            where = await page.locator(selector).first.evaluate(_GRID_CELL_TARGET_JS, token, timeout=2000)
+        except Exception:
+            return None
+        if isinstance(where, dict) and where.get("disabled"):
+            return ToolResult.error(
+                f"{selector} is a disabled grid cell, so nothing was typed.", error_class="disabled"
+            )
+        if not isinstance(where, dict) or min(where.get("row", -1), where.get("col", -1)) < 0:
+            return None
+        if matches > 1 or not where.get("keyUnique"):
+            # A column selector matches every row, and the first match is another row's cell.
+            with contextlib.suppress(Exception):
+                await page.locator(f'[data-tv3-cellgrid="{token}"]').first.evaluate(
+                    "g => g.removeAttribute('data-tv3-cellgrid')", timeout=500
+                )
+            return ToolResult.error(
+                f"{selector} matches {matches} grid cells, so it does not identify one, and nothing was typed. Narrow "
+                "it to the one cell, for example by its row."
+                if matches > 1
+                else f"{selector}'s row reads the same as another row before this column, so the edit could not be "
+                "verified on it and nothing was typed. Address the cell through a column that tells the rows apart.",
+                error_class="ambiguous_selector",
+            )
+        grid = page.locator(f'[data-tv3-cellgrid="{token}"]').first
+        try:
+            return await _edit_grid_cell(page, selector, text, grid, [where["row"], where["col"], where["key"]], echo)
+        finally:
+            with contextlib.suppress(Exception):
+                await grid.evaluate("g => g.removeAttribute('data-tv3-cellgrid')", timeout=500)
+
+    async def _edit_grid_cell(page: Any, selector: str, text: str, grid: Any, at: list[Any], echo: bool) -> ToolResult:
+        shown = repr(text) if echo else "the text"
+
+        async def read_cell(want: str) -> Any:
+            try:
+                if want not in ("editor", "mounted"):
+                    return await grid.evaluate(_GRID_CELL_AT_JS, [*at, want], timeout=500)
+                handle = await grid.evaluate_handle(_GRID_CELL_AT_JS, [*at, want], timeout=500)
+            except Exception:
+                return None
+            element = handle.as_element()
+            if element is None:
+                await handle.dispose()
+            return element
+
+        async def navigated() -> bool:
+            # A new document drops the marker; a client-side route keeps the window but changes the URL.
+            try:
+                return await page.evaluate("(u) => window.__tv3_doc !== 1 || location.href !== u", url_before)
+            except Exception:
+                return True
+
+        try:
+            reachable, _, occluder = await _reachable_for_typing(page, selector)
+        except _FieldNotEditable as exc:
+            return _not_editable_error(exc)
+        if not reachable:
+            return _covered_error(selector, occluder)
+
+        async def cancel(editor: Any, opened_with: tuple[str, bool] | None) -> tuple[str, bool]:
+            # Escape closes most editors, but one without an Escape handler stays open holding the text, and the next
+            # click anywhere commits it. Returns what the cell is left in, and whether it is as it was.
+            with contextlib.suppress(Exception):
+                await input_dispatch.press(page, editor, "Escape")
+            for _ in range(6):
+                await asyncio.sleep(0.05)
+                # Mounted, not focused: an Escape that only blurs the editor leaves its text pending.
+                still_open = await read_cell("mounted")
+                if still_open is None:
+                    break
+                await still_open.dispose()
+            else:
+                # The editor's opening text, or the cell's own when it opened blank (a blank put back commits an empty
+                # cell). Only the cell's own text left in it stands for "unchanged".
+                restore = opened_with[0] if opened_with and opened_with[0] else cell_before
+                if isinstance(restore, str):
+                    with contextlib.suppress(Exception):
+                        await input_dispatch.fill(page, editor, restore, timeout=2000)
+                        if (await _read_typed_text(editor) or ("", False))[0] == restore == cell_before:
+                            return "its editor ignored Escape and is still open, holding the cell's own text", True
+                return (
+                    "its editor ignored Escape and is still open with the text in it: a click elsewhere commits it",
+                    False,
+                )
+            now = await read_cell("text")
+            if now is not None and now == cell_before:
+                return "the edit was cancelled and the cell is unchanged", True
+            if echo and isinstance(now, str) and isinstance(cell_before, str):
+                was, shows = _model_text(cell_before, 60), _model_text(now, 60)
+                return f"the edit was cancelled, but the cell now shows {shows!r}, not {was!r}", False
+            return "the edit was cancelled, but the cell no longer reads as it did", False
+
+        dialog_before = await read_cell("dialog")
+        outside_before = await read_cell("outside")
+        cell_before = await read_cell("text")
+        grid_before = await read_cell("grid")
+        try:
+            url_before = await page.evaluate("() => { window.__tv3_doc = 1; return location.href; }")
+        except Exception:
+            return ToolResult.error(
+                f"grid cell {selector} could not be checked, so nothing was typed.", error_class="edit_interrupted"
+            )
+        tried: list[str] = []
+        editor: Any = None
+        landed_outside = False
+        for opener in ("click", "Enter", "double-click"):
+            try:
+                if opener == "click":
+                    await input_dispatch.click(page, selector, timeout=3000)
+                elif opener == "Enter":
+                    # Only into the cell: an Enter elsewhere could submit a form.
+                    if not await read_cell("focused"):
+                        continue
+                    await input_dispatch.press(page, selector, "Enter")
+                else:
+                    await input_dispatch.dblclick(page, selector, timeout=3000)
+            except Exception:
+                # A gesture can act and then raise (a click awaiting the navigation it started); the same checks run.
+                pass
+            tried.append(opener)
+            # Polled, not slept: most editors open within a frame, and a slow one gets about 0.3s.
+            for _ in range(6):
+                await asyncio.sleep(0.05)
+                if await navigated():
+                    return ToolResult.error(
+                        f"a {opener} on grid cell {selector}, done to open its editor, navigated the page, so nothing "
+                        "was typed. Re-observe before doing anything else.",
+                        data={"navigated": True, "page_state_changed": True},
+                        error_class="edit_interrupted",
+                    )
+                if (await read_cell("dialog") or 0) > (dialog_before or 0):
+                    return ToolResult.error(
+                        f"a {opener} on grid cell {selector}, done to open its editor, opened a dialog instead, so "
+                        "nothing was typed. Re-observe the page.",
+                        data={"page_state_changed": True},
+                        error_class="edit_interrupted",
+                    )
+                editor = await read_cell("editor")
+                landed_outside = editor is None and not outside_before and bool(await read_cell("outside"))
+                if editor is not None or landed_outside:
+                    break
+            if editor is not None or landed_outside:
+                break
+            # A focusable cell can bind Enter or a double-click to a row action; one that acted stops the probing.
+            if await read_cell("grid") != grid_before:
+                return ToolResult.error(
+                    f"a {opener} on grid cell {selector}, done to open its editor, changed the grid's rows instead, so "
+                    "nothing was typed. Re-observe: it may have acted on the row.",
+                    data={"page_state_changed": True},
+                    error_class="edit_interrupted",
+                )
+        if landed_outside:
+            return ToolResult.error(
+                f"a {tried[-1]} on grid cell {selector} put focus in a text editor outside the cell, so nothing was "
+                "typed. Re-observe: the editor is open and holds focus.",
+                error_class="not_editable",
+            )
+        if editor is None:
+            return ToolResult.error(
+                f"{selector} is a grid cell that opened no editor after a {', then '.join(tried) or 'click'}, so "
+                "nothing was typed. Re-observe it: it may be read-only, and those may have selected or opened its row.",
+                error_class="not_editable",
+            )
+        opened_with = await _read_typed_text(editor)
+        try:
+            numeric = bool(await editor.evaluate(_NUMERIC_CELL_EDITOR_JS))
+        except Exception:
+            numeric = False
+        if not numeric:
+            state, unchanged = await cancel(editor, opened_with)
+            with contextlib.suppress(Exception):
+                await editor.dispose()
+            refused = (
+                f"grid cell {selector} opened an editor that is not a plain number field (it may be a typeahead), so "
+                f"nothing was typed; {state}. Open it again ({tried[-1]}), type into its editor (select_combobox for a "
+                "list), then commit with Enter or Tab."
+            )
+            if unchanged:
+                return ToolResult.error(refused, error_class="not_editable")
+            return ToolResult.error(refused, error_class="value_changed_by_page")
+        try:
+            await input_dispatch.fill(page, editor, text, timeout=3000)
+            held = await _read_typed_text(editor)
+            if held is None or not _same_cell_value(held[0], text):
+                took = f" (it holds {_model_text(held[0], 60)!r})" if echo and held is not None else ""
+                state, unchanged = await cancel(editor, opened_with)
+                not_taken = f"grid cell {selector}'s editor did not take {shown}{took}; {state}. Re-observe the cell."
+                if unchanged:
+                    return ToolResult.error(not_taken, error_class="text_not_held")
+                return ToolResult.error(not_taken, error_class="value_changed_by_page")
+            # Enter in an input inside a form can submit that form, so there the commit is a Tab.
+            in_form = await _field_evaluate(editor, "el => !!(el.form || el.closest('form'))")
+            await input_dispatch.press(page, editor, "Tab" if in_form else "Enter")
+        except Exception:
+            state, unchanged = await cancel(editor, opened_with)
+            failed = (
+                f"typing {shown} into grid cell {selector}'s editor failed; {state}. Re-observe the cell before doing "
+                "anything else."
+            )
+            if unchanged:
+                return ToolResult.error(failed, error_class="text_not_held")
+            return ToolResult.error(failed, error_class="value_changed_by_page")
+        finally:
+            with contextlib.suppress(Exception):
+                await editor.dispose()
+        committed = None
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            if await navigated():
+                return ToolResult.error(
+                    f"committing {shown} into grid cell {selector} navigated the page, so the cell is not confirmed. "
+                    "Re-observe before doing anything else.",
+                    data={"navigated": True, "page_state_changed": True},
+                    error_class="edit_interrupted",
+                )
+            if (await read_cell("dialog") or 0) > (dialog_before or 0):
+                return ToolResult.error(
+                    f"committing {shown} into grid cell {selector} opened a dialog, so the cell is not confirmed. "
+                    "Re-observe the page.",
+                    data={"page_state_changed": True},
+                    error_class="edit_interrupted",
+                )
+            # An editor still open in the cell (an in-place contenteditable that commits on blur) is not a commit.
+            still_open = await read_cell("editor")
+            if still_open is not None:
+                await still_open.dispose()
+                continue
+            committed = await read_cell("text")
+            if isinstance(committed, str) and _same_cell_value(committed, text):
+                # The cell's own format of the same number ("1" as "$1.00") is the typed value, shown as the page has.
+                as_shown = (
+                    f"; the cell shows {_model_text(committed, 60)!r}" if echo and committed != text.strip() else ""
+                )
+                return ToolResult.ok(f"typed {shown} into grid cell {selector} and committed it{as_shown}")
+        still_open = await read_cell("mounted")
+        if still_open is not None:
+            # An editor that ignored the commit key or lost focus uncommitted holds the text; a later click commits it.
+            state, unchanged = await cancel(still_open, opened_with)
+            with contextlib.suppress(Exception):
+                await still_open.dispose()
+            not_closed = (
+                f"grid cell {selector}'s editor did not close on the commit key, so {shown} is NOT committed; {state}."
+            )
+            if unchanged:
+                return ToolResult.error(not_closed, error_class="text_not_held")
+            return ToolResult.error(not_closed, error_class="value_changed_by_page")
+        now = f"shows {_model_text(committed, 60)!r}" if isinstance(committed, str) and echo else "could not be read"
+        return ToolResult.error(
+            f"typed {shown} into grid cell {selector}'s editor and committed it, but the cell now {now}, so the "
+            "value is NOT confirmed. Re-observe the cell; the page may have rejected or reformatted it, picked another "
+            "value from a list, or re-ordered the rows.",
+            error_class="value_changed_by_page",
+        )
 
     async def _focused_editable(page: Any, selector: str) -> Any:
         # The editable element focus landed on after focusing the target, or None when it landed on none.
@@ -16913,6 +18327,8 @@ def build_browser_tools(
             pick, pre_value, pre_own, reach = await _type_and_commit(
                 page, selector, text, rounds=3, focus_fallback=True, collateral=collateral
             )
+        except _PressNavigated:
+            return _pressed_into_navigation(selector)
         except _FieldCovered as exc:
             return _covered_error(exc.selector, exc.occluder)
         except _FieldNotEditable as exc:
@@ -16996,12 +18412,14 @@ def build_browser_tools(
                     "before typing again, since typing again may add the text a second time. If it shows a suggestion "
                     "list, pick from it with select_combobox instead.",
                     data={"release_own_list": True},
+                    error_class="text_not_held",
                 )
             return ToolResult.error(
                 f"typed into {selector}, but it does not hold the typed text afterwards — the field is NOT "
                 "filled and may hold part of it. It sits outside the viewport and could only be focused, not "
                 "clicked; re-observe and fill it through the control the page shows instead",
                 data={"release_own_list": True},
+                error_class="text_not_held",
             )
         if pick.suggestion is None and pick.candidates:
             # Keep an empty field's query so the model can click a live row; protect any prior value.
@@ -17036,6 +18454,8 @@ def build_browser_tools(
         if pick.suggestion:
             suggestion = _model_text(pick.suggestion, 60)
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
+            if pick.clicked:
+                _log_committed_pick(pick.suggestion, text, verdict, "type")
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -17076,17 +18496,18 @@ def build_browser_tools(
                         f"clicked suggestion {suggestion!r} for {selector}; {why}, so the commit could not "
                         "be verified — re-observe to confirm the value before relying on it"
                     )
-                return ToolResult.error(
-                    f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is "
-                    "NOT filled; re-observe and retry, do not proceed"
-                )
             # DID_NOT_COMMIT: the field is NOT filled. The loop then skips any later click or Enter
             # in the same batch -- it may be an unvalidated submit, and no production submit guard
             # exists yet.
-            return ToolResult.error(
+            message = (
                 f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is NOT "
                 "filled; re-observe and retry, do not proceed"
             )
+            if not pick.clicked:
+                return ToolResult.error(message, error_class="click_failed")
+            if verdict is CommitStatus.UNVERIFIED:
+                return ToolResult.error(message, error_class="commit_unread")
+            return ToolResult.error(message, error_class="did_not_commit")
         if date_group:
             # A segment the click reached is not exempt: its keys can still land in an earlier segment.
             if (navigated := await _commit_with_tab(page, selector)) is not None:
@@ -17105,6 +18526,11 @@ def build_browser_tools(
                 f"typed into {selector} — {why}, so the typeahead check could not see it and no "
                 "commit was verified; re-observe to confirm the value before relying on it"
             )
+        # A date group has already been tabbed out of above, so the page may hold the text by now.
+        if not date_group and (
+            refused := await _held_value_no_match(page, selector, text, pre_value, echo=not text_is_secret)
+        ):
+            return refused
         return ToolResult.ok(f"typed into {selector}")
 
     async def _anchor_typeable(page: Any, selector: str) -> bool:
@@ -17171,11 +18597,12 @@ def build_browser_tools(
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
             try:
-                await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
+                await page.evaluate(_PRESNAPSHOT_JS)
             except Exception:
                 return None, ToolResult.error(
                     f"could not snapshot the page to open {selector}'s option list — the field is NOT "
-                    "filled; re-observe, then click the control and pick the option you want"
+                    "filled; re-observe, then click the control and pick the option you want",
+                    error_class="list_not_opened",
                 )
             try:
                 await page.evaluate(_MARK_PRE_ACTIVE_JS)
@@ -17189,7 +18616,8 @@ def build_browser_tools(
             except Exception:
                 return None, ToolResult.error(
                     f"could not click {selector} to open its option list — the field is NOT filled; "
-                    "re-observe and retry"
+                    "re-observe and retry",
+                    error_class="list_not_opened",
                 )
             # 2.4s of polling normally; while the widget shows a visible in-flight indicator (a busy
             # row, a spinner) the rows are still coming, so the poll wait extends — production pods run
@@ -17287,7 +18715,8 @@ def build_browser_tools(
             return ToolResult.error(
                 f"opened {selector} but every row is a link/button this tool will not auto-click ({shown_nav}"
                 f"{'; +' + str(len(rows) - 15) + ' more' if len(rows) > 15 else ''}) — the field is NOT filled; "
-                'if one of them is the option you want, click it by its [data-tv3-menu="N"] selector'
+                'if one of them is the option you want, click it by its [data-tv3-menu="N"] selector',
+                error_class="rows_are_navigation",
             )
 
         walk = _WalkResult()
@@ -17590,7 +19019,8 @@ def build_browser_tools(
             named = "; ".join(repr(_model_text(t, 60)) for t in contenders[:15])
             return ToolResult.error(
                 f"{value!r} is ambiguous in {selector}'s list — it names more than one option "
-                f"({named}); pass the one option's full text"
+                f"({named}); pass the one option's full text",
+                error_class="list_ambiguous",
             )
 
         if idx is not None and matched_from_scroll is None:
@@ -17624,7 +19054,8 @@ def build_browser_tools(
             if not query:
                 return ToolResult.error(
                     f"nothing to type into {selector}'s list search box — value and search are blank; the field is "
-                    "NOT filled — pass one option's text"
+                    "NOT filled — pass one option's text",
+                    error_class="blank_value",
                 )
 
             async def _committed() -> list[str | None]:
@@ -17665,11 +19096,13 @@ def build_browser_tools(
                 if _exact_tier_key(now) == want_key:
                     return ToolResult.error(
                         f"typing {query!r} into the list's search box changed {selector} to {now!r} without a "
-                        "verified pick — check that it holds the option you want"
+                        "verified pick — check that it holds the option you want",
+                        error_class="filter_changed_field",
                     )
                 return ToolResult.error(
                     f"typing {query!r} into the list's search box changed {selector} to {now!r}; that is not "
-                    f"{value!r} — correct it"
+                    f"{value!r} — correct it",
+                    error_class="filter_changed_field",
                 )
 
             async def _read_rows(mark: bool = False) -> tuple[list[dict[str, Any]], bool, int]:
@@ -17738,7 +19171,8 @@ def build_browser_tools(
                     return ToolResult.error(
                         f"{value!r} matched no option in {selector}'s list — the input beside the list did not take "
                         f"the first character of {query!r}, so it is not the list's filter and nothing more was "
-                        "typed; the field is NOT filled — pass one option's exact text, or look() and click the option"
+                        "typed; the field is NOT filled — pass one option's exact text, or look() and click the option",
+                        error_class="filter_not_found",
                     )
             try:
                 if query[1:]:
@@ -17817,7 +19251,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"{value!r} matched no option in {selector}'s list — typed {query!r} into an input beside the "
                     "list, but the list did not change, so it is not the list's filter (the text was taken back); "
-                    "the field is NOT filled — pass one option's exact text, or look() and click the option"
+                    "the field is NOT filled — pass one option's exact text, or look() and click the option",
+                    error_class="filter_not_found",
                 )
             several = _value_contenders(value, [str(o.get("text") or "") for o in filtered])
             if verdict == "ambiguous":
@@ -17848,10 +19283,15 @@ def build_browser_tools(
                 if filtered
                 else "it rendered no rows"
             )
-            return ToolResult.error(
+            message = (
                 f"{value!r} matched no option in {selector}'s list — typed {query!r} into the list's own search "
                 f"box and {rendered}; the field is NOT filled — pass one option's exact text, or a different search"
             )
+            if still_busy or (len(several) < 2 and filtered and not complete):
+                return ToolResult.error(message, error_class="list_unread")
+            if len(several) >= 2:
+                return ToolResult.error(message, error_class="list_ambiguous")
+            return ToolResult.error(message, error_class="list_no_match")
 
         # Only two visible rows that ARE the value make the filter pointless; a longer row that merely starts
         # with it says nothing about whether the exact one sits past the window.
@@ -17877,7 +19317,8 @@ def build_browser_tools(
                     return ToolResult.error(
                         f"{value!r} is ambiguous in {selector}'s list — {n_twins} options share the exact label "
                         f"{_model_text(shared, 60)!r}; the field is NOT filled — look() at the list and click the right one by "
-                        'its [data-tv3-menu="N"] selector'
+                        'its [data-tv3-menu="N"] selector',
+                        error_class="identical_rows",
                     )
                 if len(contenders) >= 2 or (contenders and walk.complete):
                     return _ambiguous_error()
@@ -17886,13 +19327,15 @@ def build_browser_tools(
                     return ToolResult.error(
                         f"{value!r} matched no option in the {len(options)} rows {selector}'s list renders — it "
                         f"declares more, and the only row naming it is {only!r}; the field is NOT "
-                        "filled — pass one option's full text, or look() and click it"
+                        "filled — pass one option's full text, or look() and click it",
+                        error_class="list_unread",
                     )
                 vocab = "; ".join(repr(_model_text(o.get("text") or "", 60)) for o in shown)
                 more = f"; +{len(options) - len(shown)} more" if len(options) > len(shown) else ""
                 return ToolResult.error(
                     f"{value!r} matched no option in {selector}'s list — scrolled through all "
-                    f"{len(options)} options ({vocab}{more}); pass one option's exact text"
+                    f"{len(options)} options ({vocab}{more}); pass one option's exact text",
+                    error_class="list_no_match",
                 )
             listing = "; ".join(
                 f'[data-tv3-menu="{o.get("n")}"] {_model_text(o.get("text") or "", 60)!r}' for o in shown
@@ -17901,7 +19344,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"{value!r} matched no option in the part of {selector}'s list we could read "
                     f"({listing}) — the list is longer than we could enumerate; scroll or look() to see "
-                    'the rest, then click the option by its [data-tv3-menu="N"] selector'
+                    'the rest, then click the option by its [data-tv3-menu="N"] selector',
+                    error_class="list_unread",
                 )
             # The list read here is complete (not overflowed), so a canon text shared by ≥2 shown rows is
             # the SAME case `_lone_duplicate_candidate` already refused: text alone cannot tell them
@@ -17930,11 +19374,13 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"opened {selector} but none of the {len(options)} options the list rendered matched "
                     f"{value!r} (the first {len(shown)}: {listing}) — pick the right one by its "
-                    '[data-tv3-menu="N"] selector, or pass one option\'s exact text'
+                    '[data-tv3-menu="N"] selector, or pass one option\'s exact text',
+                    error_class="list_no_match",
                 )
             return ToolResult.error(
                 f"opened {selector} but no option matched {value!r}; the list shows {listing} — "
-                'pick the right one by its [data-tv3-menu="N"] selector, or look() to see the full menu'
+                'pick the right one by its [data-tv3-menu="N"] selector, or look() to see the full menu',
+                error_class="list_no_match",
             )
         matched = next((str(o.get("text") or "") for o in options if o.get("n") == idx), value)
         # Read the field's committable value BEFORE the click. The verifier then rests on a CHANGE from
@@ -18019,7 +19465,8 @@ def build_browser_tools(
         except Exception:
             return ToolResult.error(
                 f"opened {selector} and matched {matched!r} but could not click it — re-observe and click "
-                f'[data-tv3-menu="{idx}"]'
+                f'[data-tv3-menu="{idx}"]',
+                error_class="click_failed",
             )
         await asyncio.sleep(0.3)
         committed, readable = await _settled_commit_read(
@@ -18042,6 +19489,7 @@ def build_browser_tools(
             pre_surface_hit,
         )
         verdict, matches = await _typeahead_commit_verdict(page, selector, committed or None, readable)
+        _log_committed_pick(matched, value, verdict, "open_pick")
         if verdict is CommitStatus.OK:
             return ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})")
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
@@ -18056,8 +19504,12 @@ def build_browser_tools(
                     f"selected {matched!r} for {selector}; {why}, so the commit could not be verified — "
                     "re-observe to confirm the value before relying on it"
                 )
-            return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
-        return ToolResult.error(f"clicked {matched!r} but {selector} did not commit a value")
+            return ToolResult.error(
+                f"clicked {matched!r} but {selector} did not commit a value", error_class="commit_unread"
+            )
+        return ToolResult.error(
+            f"clicked {matched!r} but {selector} did not commit a value", error_class="did_not_commit"
+        )
 
     def _already_held_result(selector: str, value: str) -> ToolResult:
         _log_already_selected("chip", True)
@@ -18141,9 +19593,12 @@ def build_browser_tools(
             declared: bool,
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
+            clicked: bool,
         ) -> ToolResult:
-            opt_txt = _model_text(opt_txt, 60)
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
+            if clicked:
+                _log_committed_pick(opt_txt, value, verdict, "typeahead")
+            opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
                     closed = await _close_lingering_typeahead_list(
@@ -18175,8 +19630,12 @@ def build_browser_tools(
                         f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
                         "re-observe to confirm the value before relying on it"
                     )
-                return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
-            return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
+            message = f"selected suggestion {opt_txt!r} but {selector} did not commit a value"
+            if not clicked:
+                return ToolResult.error(message, error_class="click_failed")
+            if verdict is CommitStatus.UNVERIFIED:
+                return ToolResult.error(message, error_class="commit_unread")
+            return ToolResult.error(message, error_class="did_not_commit")
 
         if await _field_already_holds(page, selector, value):
             return _already_held_result(selector, value)
@@ -18193,6 +19652,7 @@ def build_browser_tools(
                     declared=live_pick.declared,
                     surface_vouched_pre_click=live_pick.pre_surface_hit,
                     shared_surface=live_pick.shared_surface,
+                    clicked=True,
                 )
 
         def _reduced_queries() -> list[str]:
@@ -18244,7 +19704,7 @@ def build_browser_tools(
                     # reaction": the snapshot from before the first attempt would mark the rows the
                     # PREVIOUS query left on screen as pre-existing, and a widget that keeps its row
                     # nodes across a re-search would then have no reaction to show at all.
-                    await page.evaluate(_PRESNAPSHOT_JS, _pre_weak())
+                    await page.evaluate(_PRESNAPSHOT_JS)
                     await input_dispatch.type_keys(page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung))
                 except Exception:
                     return []
@@ -18262,6 +19722,7 @@ def build_browser_tools(
                         declared=rung_pick.declared,
                         surface_vouched_pre_click=rung_pick.pre_surface_hit,
                         shared_surface=rung_pick.shared_surface,
+                        clicked=rung_pick.clicked,
                     )
                 if rung_pick.candidates:
                     ladder_rung = rung
@@ -18302,7 +19763,7 @@ def build_browser_tools(
                 return
             await asyncio.sleep(0.4)
             try:
-                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _snapshot_arg(page, selector))
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
             except Exception:
                 LOG.debug("taskv3 empty-query offer snapshot failed", selector=selector)
 
@@ -18413,29 +19874,12 @@ def build_browser_tools(
                     if restore_on_refusal:
                         await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     return ToolResult.error(
-                        f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled. {cats}"
+                        f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled. {cats}",
+                        error_class="rows_under_categories",
                     )
                 # A searchable typeahead whose value is genuinely absent must report the honest no-match
-                # rather than reopen a list the value is not in. Two independent signals establish
-                # "searchable": (a) _FIND_MENU_JS finds rows NEW since the pre-type snapshot — a list that
-                # reacted to the keystrokes (a menu opened on focus/click sits in that snapshot and does not
-                # count, so a non-searchable widget still falls through); (b) the anchor declares
-                # aria-autocomplete list/both/inline — the ARIA contract that catches a combobox which
-                # filtered to ZERO rows, leaving nothing new to count.
-                searchable = False
-                try:
-                    reacted_menu = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
-                    searchable = isinstance(reacted_menu, dict) and bool(reacted_menu.get("count"))
-                except Exception:
-                    searchable = False
-                if not searchable:
-                    try:
-                        searchable = bool(
-                            await page.evaluate(_DECLARES_SEARCH_AUTOCOMPLETE_JS, await _probe_arg(page, selector))
-                        )
-                    except Exception:
-                        searchable = False
-                if searchable:
+                # rather than reopen a list the value is not in.
+                if await _answers_as_search(page, selector):
                     offered: list[str] = []
                     offered_total = 0
                     if declared_field:
@@ -18495,10 +19939,16 @@ def build_browser_tools(
                         )
                     else:
                         offered_note = ""
-                    return ToolResult.error(
+                    message = (
                         f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
-                        f"— do not assume success or move on as if it were{offered_note}",
-                        data={"release_own_list": True},
+                        f"— do not assume success or move on as if it were{offered_note}"
+                    )
+                    if offered:
+                        return ToolResult.error(
+                            message, data={"release_own_list": True}, error_class="no_suggestion_matched"
+                        )
+                    return ToolResult.error(
+                        message, data={"release_own_list": True}, error_class="no_suggestion_offered"
                     )
                 # The focus-click of the type attempt may have opened this widget's list, so close it first.
                 opened = await _open_observe_pick(
@@ -18524,6 +19974,7 @@ def build_browser_tools(
                 declared=pick.declared,
                 surface_vouched_pre_click=pick.pre_surface_hit,
                 shared_surface=pick.shared_surface,
+                clicked=pick.clicked,
             )
             # A click the widget ignored leaves the caller's search in the field, which is text the
             # widget never accepted as a value.
@@ -19090,7 +20541,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     "press_enter is only for a text field that declares Enter as its search key and is not inside "
                     f"a form; {selector} {why} — nothing was typed or pressed; call select_combobox without "
-                    "press_enter"
+                    "press_enter",
+                    error_class="unsupported_argument",
                 )
         result = await _commit_custom_combobox(
             page, selector, value, search_text, press_enter=press_enter, live_offer=live_offer
@@ -19936,7 +21388,7 @@ def build_browser_tools(
                     },
                 },
             ),
-            click,
+            _moves_spinbutton_cursor("clicked", click),
         ),
         _spec(
             "hover",
@@ -19961,7 +21413,7 @@ def build_browser_tools(
                 },
                 ["text"],
             ),
-            type_text,
+            _moves_spinbutton_cursor("clear", type_text),
         ),
         _spec(
             "select_option",

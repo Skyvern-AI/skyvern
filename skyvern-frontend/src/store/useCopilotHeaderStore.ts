@@ -22,10 +22,10 @@ export const COPILOT_ATTENTION_LABEL: Record<CopilotAttention, string> = {
   account: "needs a Google account",
 };
 
-export const COPILOT_ATTENTION_CHIP: Record<CopilotAttention, string> = {
-  question: "Needs your answer",
-  credential: "Needs sign-in",
-  account: "Choose an account",
+export const COPILOT_ATTENTION_DOT: Record<CopilotAttention, string> = {
+  question: "Copilot needs your answer",
+  credential: "Copilot needs to sign in",
+  account: "Copilot needs a Google account",
 };
 
 /**

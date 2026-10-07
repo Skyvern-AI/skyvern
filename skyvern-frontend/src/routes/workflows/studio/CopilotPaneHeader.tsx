@@ -1,7 +1,7 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 
 import {
-  COPILOT_ATTENTION_CHIP,
+  COPILOT_ATTENTION_DOT,
   useCopilotHeaderStore,
 } from "@/store/useCopilotHeaderStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -36,26 +36,15 @@ export function CopilotPaneControls() {
       {/* Disabled buttons swallow the trigger's events, so the reason a locked control gives
           has to hang off a focusable wrapper or a keyboard user never reaches it. */}
       <ControlTooltip
-        content={
-          controls.navigationLockedReason ? (
-            <span className="block max-w-xs">
-              {controls.navigationLockedReason}
-            </span>
-          ) : (
-            "New chat"
-          )
-        }
+        content="New chat"
+        reason={controls.navigationLockedReason}
         blocked={controls.newChatDisabled}
       >
         <button
           type="button"
           onClick={controls.onNewChat}
           disabled={controls.newChatDisabled}
-          aria-label={
-            controls.navigationLockedReason
-              ? `New chat unavailable: ${controls.navigationLockedReason}`
-              : "New chat"
-          }
+          aria-label="New chat"
           className={PANE_HEADER_ICON_BUTTON_CLASS}
         >
           <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />
@@ -68,21 +57,27 @@ export function CopilotPaneControls() {
 /**
  * Presence badge on the Copilot pane-header icon, replacing the old "● Active"
  * text chip (which was an always-on session indicator; the dot keeps that
- * meaning with the state voiced through the aria-label).
+ * meaning with the state voiced through the aria-label). A pending request
+ * outranks recording here because recording keeps its own header label.
  */
 export function CopilotActiveDot() {
   const recording = useRecordingStore(
     (state) => state.isRecording || state.finishRequested || state.isCommitting,
   );
+  const attention = useCopilotHeaderStore((state) => state.attention);
+  const label = attention
+    ? COPILOT_ATTENTION_DOT[attention]
+    : recording
+      ? "Copilot recording active"
+      : "Copilot session active";
   return (
     <span
       role="img"
-      aria-label={
-        recording ? "Copilot recording active" : "Copilot session active"
-      }
+      aria-label={label}
+      title={attention ? label : undefined}
       className={cn(
         "absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-2 ring-slate-elevation1",
-        recording ? "bg-red-500" : "bg-success",
+        attention ? "bg-amber-500" : recording ? "bg-red-500" : "bg-success",
       )}
     />
   );
@@ -93,16 +88,7 @@ export function CopilotPaneStatus() {
   const finishing = useRecordingStore(
     (state) => state.finishRequested || state.isCommitting,
   );
-  const attention = useCopilotHeaderStore((state) => state.attention);
-  if (!recording && !finishing) {
-    // The tray it points at can sit below the fold of a short pane, or under a collapsed line.
-    return attention ? (
-      <span className="flex items-center gap-1 text-[10px] font-medium text-amber-700 dark:text-yellow-400">
-        <span className="size-1 rounded-full bg-amber-500" aria-hidden="true" />
-        {COPILOT_ATTENTION_CHIP[attention]}
-      </span>
-    ) : null;
-  }
+  if (!recording && !finishing) return null;
   return (
     <span className="flex items-center gap-1 text-[10px] font-medium text-red-600 dark:text-red-400">
       <span

@@ -351,6 +351,11 @@ def convert_workflow_definition(
         retry_policy=workflow_definition_yaml.retry_policy,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
         completion_contract=workflow_definition_yaml.completion_contract,
+        **(
+            {"browser_settings": workflow_definition_yaml.browser_settings}
+            if "browser_settings" in workflow_definition_yaml.model_fields_set
+            else {}
+        ),
     )
 
     LOG.info(

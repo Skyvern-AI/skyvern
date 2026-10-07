@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+from itertools import chain, count, repeat
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -16,6 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import ActionType, InputOrSelectContext, SelectOption, SelectOptionAction
 from skyvern.webeye.actions.handler import (
@@ -25,6 +28,7 @@ from skyvern.webeye.actions.handler import (
     _select_deterministic_custom_option,
     _verify_custom_select_option,
 )
+from skyvern.webeye.utils.page import ElementScrollMetrics
 from tests.unit.helpers import make_organization, make_task
 
 
@@ -306,6 +310,77 @@ class TestCollectOptionTexts:
             {"tagName": "input", "attributes": {"type": "checkbox", "aria-label": "I agree"}},
         ]
         assert _collect_option_texts(tree) == ["Yes", "I agree"]
+
+    def test_extracts_menuitem_and_treeitem_options(self) -> None:
+        tree = [
+            {
+                "tagName": "div",
+                "attributes": {"role": "menu"},
+                "children": [
+                    {"tagName": "div", "attributes": {"role": "menuitem"}, "text": "Alpha"},
+                    {"tagName": "div", "attributes": {"role": "treeitem"}, "text": "Bravo"},
+                ],
+            }
+        ]
+        assert _collect_option_texts(tree) == ["Alpha", "Bravo"]
+
+    def test_menuitem_label_wrapping_an_unlabeled_radio_uses_its_aria_label(self) -> None:
+        # The label has no text of its own, so a text-only read of the menuitem role
+        # reports zero options and turns OPTION_NOT_AVAILABLE into a transient miss.
+        tree = [
+            {
+                "tagName": "label",
+                "attributes": {"role": "menuitem", "aria-label": "Alpha"},
+                "children": [{"id": "r1", "tagName": "input", "attributes": {"type": "radio"}}],
+            }
+        ]
+        assert _collect_option_texts(tree) == ["Alpha"]
+
+    def test_extracts_interactable_rows_inside_a_choice_surface(self) -> None:
+        # SKY-17693: a listbox whose rows carry no role at all is the common div-based
+        # dropdown; reporting zero options here reroutes a real OPTION_NOT_AVAILABLE
+        # into the transient "try again later" miss.
+        tree = [
+            {
+                "id": "listbox",
+                "tagName": "div",
+                "attributes": {"role": "listbox"},
+                "children": [
+                    {"id": "row-1", "tagName": "div", "text": "Bachelor's Degree", "interactable": True},
+                    {"id": "row-2", "tagName": "div", "text": "Doctorate", "interactable": True},
+                ],
+            }
+        ]
+        assert _collect_option_texts(tree) == ["Bachelor's Degree", "Doctorate"]
+
+    def test_ignores_interactable_nodes_outside_a_choice_surface(self) -> None:
+        tree = [
+            {"id": "btn", "tagName": "button", "text": "Submit", "interactable": True},
+            {"id": "link", "tagName": "a", "attributes": {"href": "/x"}, "text": "Help", "interactable": True},
+            {"id": "plain", "tagName": "div", "text": "header copy", "interactable": True},
+        ]
+        assert _collect_option_texts(tree) == []
+
+    def test_agrees_with_candidate_walker_on_a_div_based_dropdown(self) -> None:
+        # The transient/permanent split is driven by this walker while the deterministic
+        # matcher and the LLM both work from the candidate walker, so an option the
+        # candidate walker sees must never be counted as zero observed options.
+        tree = [
+            {
+                "id": "listbox",
+                "tagName": "div",
+                "attributes": {"role": "listbox"},
+                "children": [
+                    {"id": "row-1", "tagName": "div", "text": "Alpha", "interactable": True},
+                    {"id": "row-2", "tagName": "span", "attributes": {"role": "menuitem"}, "text": "Bravo"},
+                ],
+            }
+        ]
+        assert [candidate["label"] for candidate in _custom_select_candidates_from_elements(tree)] == [
+            "Alpha",
+            "Bravo",
+        ]
+        assert _collect_option_texts(tree) == ["Alpha", "Bravo"]
 
 
 class TestCustomSelectCandidates:
@@ -1703,6 +1778,29 @@ class TestNoMatchExceptionForDropdown:
         assert isinstance(exc, NoAvailableOptionFoundForCustomSelection)
         assert exc.observed_options_count == 2
 
+    def test_div_based_dropdown_routes_to_permanent_not_transient(self) -> None:
+        # SKY-17693: a populated div-based listbox was walked as zero options, so a real
+        # "this option does not exist" miss surfaced as the transient retry exception.
+        tree = [
+            {
+                "id": "listbox",
+                "tagName": "div",
+                "attributes": {"role": "listbox"},
+                "children": [
+                    {"id": "row-1", "tagName": "div", "text": "Alpha", "interactable": True},
+                    {"id": "row-2", "tagName": "div", "text": "Bravo", "interactable": True},
+                ],
+            }
+        ]
+        exc = _no_match_exception_for_dropdown(
+            reasoning="target not in list",
+            target_value="Charlie",
+            observed_options=_collect_option_texts(tree),
+            transient_fallback_element_id="listbox",
+        )
+        assert isinstance(exc, NoAvailableOptionFoundForCustomSelection)
+        assert exc.observed_options_excerpt == ["Alpha", "Bravo"]
+
 
 class TestSelectFromDropdownByValueNoMatch:
     @pytest.mark.asyncio
@@ -1753,7 +1851,7 @@ class TestSelectFromDropdownByValueNoMatch:
         dropdown_menu = _FakeDropdownMenuElement()
         skyvern_frame = MagicMock()
         skyvern_frame.get_element_scrollable = AsyncMock(return_value=True)
-        scroll_down_to_load_all_options = AsyncMock()
+        scroll_down_to_load_all_options = AsyncMock(return_value=None)
 
         monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=dropdown_menu))
         monkeypatch.setattr(handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=dropdown_menu))
@@ -1811,6 +1909,205 @@ class TestScrollDownToLoadAllOptionsDetachedHandle:
         skyvern_frame.scroll_to_element_bottom.assert_not_awaited()
         skyvern_frame.scroll_to_element_top.assert_not_awaited()
         assert page.mouse.wheel.await_count >= 1
+
+
+class TestScrollDownToLoadAllOptionsStopCondition:
+    CLIENT_HEIGHT = 300.0
+
+    @classmethod
+    def _bottomed_metrics(cls, scroll_height: float) -> ElementScrollMetrics:
+        return ElementScrollMetrics(
+            scroll_top=max(scroll_height - cls.CLIENT_HEIGHT, 0.0),
+            client_height=cls.CLIENT_HEIGHT,
+            scroll_height=scroll_height,
+        )
+
+    @classmethod
+    def _build_menu(cls, scroll_heights: list[float]) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+        """A scrollable menu reporting scroll_heights in order, whose mutation counter never settles."""
+        handle = MagicMock()
+        handle.scroll_into_view_if_needed = AsyncMock()
+        locator = MagicMock()
+        locator.element_handle = AsyncMock(return_value=handle)
+        locator.focus = AsyncMock()
+        scrollable_element = MagicMock()
+        scrollable_element.get_locator = MagicMock(return_value=locator)
+        scrollable_element.move_mouse_to_safe = AsyncMock()
+        scrollable_element.get_id = MagicMock(return_value="menu-element-id")
+
+        page = MagicMock()
+        page.mouse.wheel = AsyncMock()
+
+        skyvern_frame = MagicMock()
+        skyvern_frame.engine_selection = None
+        skyvern_frame.scroll_to_element_bottom = AsyncMock()
+        skyvern_frame.scroll_to_element_top = AsyncMock()
+        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+        skyvern_frame.safe_get_element_scroll_metrics = AsyncMock(
+            side_effect=chain(
+                (cls._bottomed_metrics(height) for height in scroll_heights),
+                repeat(cls._bottomed_metrics(scroll_heights[-1])),
+            )
+        )
+
+        incremental_scraped = MagicMock()
+        incremental_scraped.get_incremental_elements_num = AsyncMock(side_effect=count(4, 4))
+
+        return scrollable_element, page, skyvern_frame, incremental_scraped
+
+    @pytest.mark.asyncio
+    async def test_stops_once_menu_is_bottomed_out_despite_rising_mutation_count(self) -> None:
+        scrollable_element, page, skyvern_frame, incremental_scraped = self._build_menu([1200.0])
+
+        await handler.scroll_down_to_load_all_options(
+            scrollable_element=scrollable_element,
+            page=page,
+            skyvern_frame=skyvern_frame,
+            incremental_scraped=incremental_scraped,
+        )
+
+        assert skyvern_frame.scroll_to_element_bottom.await_count == 2
+        skyvern_frame.scroll_to_element_top.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_keeps_scrolling_while_the_menu_loads_more_options(self) -> None:
+        # The first pass ends flat at the bottom behind a loading row; the next page lands a pass later.
+        scrollable_element, page, skyvern_frame, incremental_scraped = self._build_menu(
+            [1200.0, 1200.0, 2400.0, 3600.0, 3600.0]
+        )
+
+        await handler.scroll_down_to_load_all_options(
+            scrollable_element=scrollable_element,
+            page=page,
+            skyvern_frame=skyvern_frame,
+            incremental_scraped=incremental_scraped,
+        )
+
+        assert skyvern_frame.scroll_to_element_bottom.await_count == 5
+
+    @staticmethod
+    def _read_task_row(monkeypatch: pytest.MonkeyPatch, *, canceled: Callable[[], bool], read_fails: bool) -> None:
+        task = _task()
+
+        async def _get_task(*_args: object, **_kwargs: object) -> object:
+            if read_fails:
+                raise ConnectionError("db blip")
+            return task.model_copy(update={"status": TaskStatus.canceled if canceled() else TaskStatus.running})
+
+        monkeypatch.setattr(
+            "skyvern.services.run_cancellation.app.DATABASE.tasks.get_task", AsyncMock(side_effect=_get_task)
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("run_state", "selects"),
+        [
+            pytest.param("running", True, id="running"),
+            pytest.param("lookup_error", True, id="lookup-error-fails-open"),
+            pytest.param("canceled_mid_loop", False, id="canceled-mid-loop"),
+            pytest.param("canceled_during_option_lookup", False, id="canceled-during-option-lookup"),
+        ],
+    )
+    async def test_value_match_loaded_after_a_cancel_is_not_clicked(
+        self, monkeypatch: pytest.MonkeyPatch, run_state: str, selects: bool
+    ) -> None:
+        scrollable_element, page, skyvern_frame, incremental_scraped = self._build_menu([1200.0, 2400.0, 3600.0])
+        scrollable_element.get_element_handler = AsyncMock(return_value=MagicMock())
+        skyvern_frame.get_element_scrollable = AsyncMock(return_value=True)
+        option = MagicMock()
+        option.click = AsyncMock()
+        incremental_scraped.get_incremental_element_tree = AsyncMock(return_value=[])
+        # Absent before the scroll and after its first pass; the second pass loads it.
+        lookup = AsyncMock(side_effect=[None, None, option])
+        incremental_scraped.select_one_element_by_value = lookup
+        monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=MagicMock()))
+        monkeypatch.setattr(
+            handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=scrollable_element)
+        )
+        canceled = {
+            "running": lambda: False,
+            "lookup_error": lambda: False,
+            "canceled_mid_loop": lambda: skyvern_frame.scroll_to_element_bottom.await_count >= 2,
+            # Lands while the lookup that finds the option is awaited, after that pass's poll.
+            "canceled_during_option_lookup": lambda: lookup.await_count >= 3,
+        }[run_state]
+        self._read_task_row(monkeypatch, canceled=canceled, read_fails=run_state == "lookup_error")
+
+        result = await handler.select_from_dropdown_by_value(
+            value="Choice",
+            page=page,
+            skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+            skyvern_frame=skyvern_frame,
+            dom=MagicMock(),
+            incremental_scraped=incremental_scraped,
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert result.success is selects
+        assert handler._is_terminal_custom_select_failure(result) is (not selects)
+        assert option.click.await_count == (1 if selects else 0)
+        assert skyvern_frame.scroll_to_element_bottom.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("run_state", "deterministic_attempts", "clicks"),
+        [
+            pytest.param("running", 1, 1, id="running"),
+            pytest.param("canceled_mid_loop", 0, 0, id="canceled-mid-loop"),
+            pytest.param("canceled_during_scroll_back", 0, 0, id="canceled-during-scroll-back"),
+            pytest.param("canceled_during_option_tree", 0, 0, id="canceled-during-option-tree"),
+            pytest.param("canceled_during_llm_call", 1, 0, id="canceled-during-llm-call"),
+        ],
+    )
+    async def test_dropdown_canceled_before_selecting_selects_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, run_state: str, deterministic_attempts: int, clicks: int
+    ) -> None:
+        scrollable_element, page, skyvern_frame, incremental_scraped = self._build_menu([1200.0, 2400.0, 3600.0])
+        scrollable_element.get_element_handler = AsyncMock(return_value=MagicMock())
+        skyvern_frame.get_element_scrollable = AsyncMock(return_value=True)
+        incremental_scraped.get_incremental_element_tree = AsyncMock(return_value=[])
+        # No deterministic match, so the selection falls through to the option the LLM picks.
+        deterministic_select = AsyncMock(return_value=None)
+        llm = AsyncMock(
+            return_value={"id": "choice-option", "action_type": "click", "value": "Choice", "relevant": True}
+        )
+        option = _FakeCustomElement()
+        monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
+        monkeypatch.setattr(handler.prompt_engine, "load_prompt", MagicMock(return_value="prompt"))
+        monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm)
+        monkeypatch.setattr(handler.SkyvernElement, "create_from_incremental", AsyncMock(return_value=option))
+        monkeypatch.setattr(
+            handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=scrollable_element)
+        )
+        canceled = {
+            "running": lambda: False,
+            "canceled_mid_loop": lambda: skyvern_frame.scroll_to_element_bottom.await_count >= 2,
+            "canceled_during_scroll_back": lambda: skyvern_frame.scroll_to_element_top.await_count >= 1,
+            "canceled_during_option_tree": lambda: incremental_scraped.get_incremental_element_tree.await_count >= 1,
+            "canceled_during_llm_call": lambda: llm.await_count >= 1,
+        }[run_state]
+        self._read_task_row(monkeypatch, canceled=canceled, read_fails=False)
+
+        with skyvern_context.scoped(SkyvernContext(tz_info=UTC)):
+            result = await handler.select_from_dropdown(
+                context=InputOrSelectContext(field="Field", is_required=True),
+                page=page,
+                skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+                skyvern_frame=skyvern_frame,
+                incremental_scraped=incremental_scraped,
+                check_filter_funcs=[],
+                step=MagicMock(),
+                task=_task(),  # type: ignore[arg-type]
+                dropdown_menu_element=MagicMock(),
+                force_select=True,
+                target_value="Choice",
+            )
+
+        assert deterministic_select.await_count == deterministic_attempts
+        assert option.click.await_count == clicks
+        # A terminal failure keeps every caller from falling back to another way of selecting.
+        assert handler._is_terminal_custom_select_failure(result.action_result) is (clicks == 0)
 
 
 class TestCustomSelectMissRespectsOptionality:

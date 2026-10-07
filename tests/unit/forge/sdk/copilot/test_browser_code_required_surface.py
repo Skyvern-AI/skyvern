@@ -65,7 +65,9 @@ _REMOVED_MODEL_FACING_NAMES = {
 def _surface(*, browser_code_available: bool) -> CopilotToolSurface:
     return resolve_copilot_tool_surface(
         mode=None,
-        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=browser_code_available),
+        native_tools=copilot_native_tools(
+            supports_question_tool=True, browser_code_available=browser_code_available, run_tools_available=True
+        ),
         alias_map=get_skyvern_mcp_alias_map(),
         overlays=_build_skyvern_mcp_overlays(),
         browser_code_mode=CopilotBrowserCodeMode.REPLACE if browser_code_available else CopilotBrowserCodeMode.OFF,
@@ -115,7 +117,9 @@ def test_a_deployment_without_the_code_tool_keeps_the_browser_tools() -> None:
 def test_the_locator_probe_arms_follow_the_production_identity() -> None:
     surface = resolve_copilot_tool_surface(
         mode=CopilotEvalMode.REPAIR_PROBE_OFF,
-        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=True),
+        native_tools=copilot_native_tools(
+            supports_question_tool=True, browser_code_available=True, run_tools_available=True
+        ),
         alias_map=get_skyvern_mcp_alias_map(),
         overlays=_build_skyvern_mcp_overlays(),
         browser_code_mode=CopilotBrowserCodeMode.REPLACE,

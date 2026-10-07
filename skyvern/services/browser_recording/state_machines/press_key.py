@@ -95,6 +95,7 @@ class StateMachinePressKey(StateMachine):
                 accessible_name=target.accessibleName,
                 input_type=target.inputType,
                 autocomplete=target.autocomplete,
+                in_child_frame=target.inChildFrame,
             ),
             timestamp_start=event.params.timestamp,
             timestamp_end=event.params.timestamp,

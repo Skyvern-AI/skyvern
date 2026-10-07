@@ -48,6 +48,7 @@ from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CredentialPauseResolvedOutcome,
     WorkflowCopilotCredentialPauseResolvedUpdate,
+    WorkflowCopilotCredentialRegistration,
     WorkflowCopilotCredentialRequiredUpdate,
     WorkflowCopilotStreamMessageType,
 )
@@ -85,7 +86,7 @@ def _credential_pause_lock_key(organization_id: str, chat_id: str, turn_id: str)
 
 
 # A Done claim reserves the pause while the profile is saved outside the lock; the save itself is bounded
-# tighter so the claim always outlives it.
+# tighter so the claim always outlives it. A Generate and save claim reuses the same window.
 MANUAL_SIGN_IN_CLAIM_SECONDS = 120
 MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS = 90
 
@@ -144,6 +145,8 @@ class _ActivePauseRecord:
     manual_sign_in: ManualSignIn | None = None
     claim_id: str | None = None
     claim_deadline: datetime | None = None
+    registration: WorkflowCopilotCredentialRegistration | None = None
+    generated_credential_id: str | None = None
 
     def live_until(self) -> datetime | None:
         if self.status == "pending":
@@ -174,6 +177,8 @@ def _encode_record(record: _ActivePauseRecord) -> str:
             ),
             "claim_id": record.claim_id,
             "claim_deadline": record.claim_deadline.isoformat() if record.claim_deadline else None,
+            "registration": record.registration.model_dump(mode="json") if record.registration else None,
+            "generated_credential_id": record.generated_credential_id,
         }
     )
 
@@ -186,6 +191,7 @@ def _encode_active_pause(
     card: WorkflowCopilotCredentialRequiredUpdate | None = None,
     recovery_token_digest: str | None = None,
     manual_sign_in: ManualSignIn | None = None,
+    registration: WorkflowCopilotCredentialRegistration | None = None,
 ) -> str:
     return _encode_record(
         _ActivePauseRecord(
@@ -195,6 +201,7 @@ def _encode_active_pause(
             card=card,
             recovery_token_digest=recovery_token_digest,
             manual_sign_in=manual_sign_in,
+            registration=registration,
         )
     )
 
@@ -245,8 +252,17 @@ def _decode_active_pause(raw: Any) -> _ActivePauseRecord | None:
         card = WorkflowCopilotCredentialRequiredUpdate.model_validate(data["card"]) if data.get("card") else None
     except ValidationError:
         card = None
+    try:
+        registration = (
+            WorkflowCopilotCredentialRegistration.model_validate(data["registration"])
+            if data.get("registration")
+            else None
+        )
+    except ValidationError:
+        registration = None
     digest = data.get("recovery_token_digest")
     claim_id = data.get("claim_id")
+    generated_credential_id = data.get("generated_credential_id")
     return _ActivePauseRecord(
         resume_token=token,
         status=record_status,
@@ -256,6 +272,8 @@ def _decode_active_pause(raw: Any) -> _ActivePauseRecord | None:
         manual_sign_in=_decode_manual_sign_in(data.get("manual_sign_in")),
         claim_id=claim_id if isinstance(claim_id, str) else None,
         claim_deadline=_decode_datetime(data.get("claim_deadline")),
+        registration=registration,
+        generated_credential_id=generated_credential_id if isinstance(generated_credential_id, str) else None,
     )
 
 
@@ -355,7 +373,8 @@ async def pending_credential_requests(
             and card.resume_token == record.resume_token
             and card.expires_at == record.expires_at
         ):
-            cards.append(card)
+            registration = record.registration
+            cards.append(card.model_copy(update={"registration": registration}) if registration else card)
     return cards
 
 
@@ -431,7 +450,13 @@ async def resolve_credential_pause(
     async with cache.get_lock(lock_key):
         record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
         ttl = _credential_pause_record_ttl(settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
-        await cache.set(active_key, _encode_active_pause(record.resume_token, record.expires_at, consumed=True), ex=ttl)
+        await cache.set(
+            active_key,
+            _encode_active_pause(
+                record.resume_token, record.expires_at, consumed=True, registration=record.registration
+            ),
+            ex=ttl,
+        )
         await cache.set(
             credential_response_cache_key(organization_id, workflow_copilot_chat_id, turn_id),
             encode_credential_response(action, credential_id, record.resume_token),
@@ -452,6 +477,7 @@ class CredentialPauseResolution:
     action: Literal["connected", "skip", "signed_in"]
     credential: Credential | None = None
     signed_in: SignedInProfile | None = None
+    generated: bool = False
 
 
 def encode_credential_response(
@@ -531,15 +557,20 @@ async def start_manual_sign_in(
             )
         if sign_in.started:
             return record.expires_at
-        expires_at = max(
-            record.expires_at,
-            datetime.now(timezone.utc) + timedelta(seconds=settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS),
+        record = _extend_pause(
+            replace(record, manual_sign_in=replace(sign_in, started=True)),
+            settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS,
+            signing_in=True,
         )
-        # The recovered card must carry the record's deadline, or pending_credential_requests drops it.
-        card = record.card.model_copy(update={"expires_at": expires_at, "signing_in": True}) if record.card else None
-        record = replace(record, expires_at=expires_at, card=card, manual_sign_in=replace(sign_in, started=True))
         await cache.set(active_key, _encode_record(record), ex=_longest_credential_pause_record_ttl())
-        return expires_at
+        return record.expires_at
+
+
+def _extend_pause(record: _ActivePauseRecord, seconds: int, **card_update: bool) -> _ActivePauseRecord:
+    expires_at = max(record.expires_at, datetime.now(timezone.utc) + timedelta(seconds=seconds))
+    # The recovered card must carry the record's deadline, or pending_credential_requests drops it.
+    card = record.card.model_copy(update={"expires_at": expires_at, **card_update}) if record.card else None
+    return replace(record, expires_at=expires_at, card=card)
 
 
 @dataclass(frozen=True)
@@ -608,13 +639,89 @@ async def finish_manual_sign_in(
         return True
 
 
-def credential_pause_reason(ctx: Any) -> str | None:
-    """Typed-signal-only detector for a mid-build credential ask.
+@dataclass(frozen=True)
+class CredentialGenerationClaim:
+    claim_id: str
+    registration: WorkflowCopilotCredentialRegistration
+    deadline: datetime
 
-    Deliberately narrower than ``credential_prompt_reason`` (request_policy.py):
-    no text-marker tier, so a REPLY that merely mentions credentials in prose
-    can't trigger a pause -- see the SKY-11988 false-positive lesson.
-    """
+
+async def claim_credential_generation(
+    cache: BaseCache,
+    *,
+    organization_id: str,
+    workflow_copilot_chat_id: str,
+    turn_id: str,
+    resume_token: str,
+) -> CredentialGenerationClaim:
+    """Reserve a registration card's one Generate and save while the credential is created outside the lock."""
+    active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
+    async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
+        record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
+        registration = record.registration
+        if registration is None:
+            raise CredentialPauseRejection(
+                status_code=HTTPStatus.CONFLICT,
+                detail="This credential card does not offer generating a credential",
+            )
+        if registration.attempted:
+            raise CredentialPauseRejection(
+                status_code=HTTPStatus.CONFLICT,
+                detail="This credential card already tried to generate a credential",
+            )
+        claim_id = secrets.token_hex(16)
+        registration = registration.model_copy(update={"attempted": True})
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS)
+        claimed = replace(
+            record, status="resolving", claim_id=claim_id, claim_deadline=deadline, registration=registration
+        )
+        await cache.set(active_key, _encode_record(claimed), ex=_longest_credential_pause_record_ttl())
+        return CredentialGenerationClaim(claim_id=claim_id, registration=registration, deadline=deadline)
+
+
+async def finish_credential_generation(
+    cache: BaseCache,
+    *,
+    organization_id: str,
+    workflow_copilot_chat_id: str,
+    turn_id: str,
+    claim: CredentialGenerationClaim,
+    credential_id: str | None,
+    outcome: Literal["rejected", "unknown"] | None = None,
+) -> datetime | None:
+    """Connect the created credential, or reopen the card without Generate and with a fresh deadline.
+
+    Returns the pause's deadline, or None when the claim was lost."""
+    active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
+    if credential_id is not None:
+        await _record_turn_resumed(organization_id, workflow_copilot_chat_id, turn_id)
+    async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
+        record = _decode_active_pause(await cache.get(active_key))
+        if record is None or record.status != "resolving" or record.claim_id != claim.claim_id:
+            return None
+        ttl = _longest_credential_pause_record_ttl()
+        if credential_id is None:
+            registration = claim.registration.model_copy(update={"outcome": outcome})
+            reopened = _extend_pause(
+                replace(record, status="pending", claim_id=None, claim_deadline=None, registration=registration),
+                settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS,
+            )
+            await cache.set(active_key, _encode_record(reopened), ex=ttl)
+            return reopened.expires_at
+        consumed = _ActivePauseRecord(
+            record.resume_token, "consumed", record.expires_at, generated_credential_id=credential_id
+        )
+        await cache.set(active_key, _encode_record(consumed), ex=ttl)
+        await cache.set(
+            credential_response_cache_key(organization_id, workflow_copilot_chat_id, turn_id),
+            encode_credential_response("connected", credential_id, record.resume_token),
+            ex=ttl,
+        )
+        return record.expires_at
+
+
+def credential_pause_reason(ctx: Any) -> str | None:
+    """Typed-signal-only detector for a run-derived credential ask; reply prose never counts."""
     policy = getattr(ctx, "request_policy", None)
     raw_secret_redacted_draft = (
         isinstance(policy, RequestPolicy)
@@ -880,6 +987,7 @@ async def _run_credential_pause(
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     allow_second_ask: bool = False,
     anchor_tool_call_id: str | None = None,
+    registration: WorkflowCopilotCredentialRegistration | None = None,
 ) -> CredentialPauseResolution | None:
     """Send the credential card and wait for the user's decision.
 
@@ -889,6 +997,7 @@ async def _run_credential_pause(
     Recovery-capable clients restore the same active card through chat history.
     """
     update_ask = update_credential_id is not None
+    ctx.credential_registration_outcome = None
     if not credential_pause_transport_ready(ctx, copilot_config, allow_second_ask=update_ask or allow_second_ask):
         return None
     # Latch before async checks so a declined transport cannot trigger another pause. Only the pick ask
@@ -931,9 +1040,9 @@ async def _run_credential_pause(
     turn_id = ctx.turn_id or ""
     resume_token = _new_resume_token()
     expires_at = now + timedelta(seconds=timeout_seconds)
-    manual_sign_in = None if update_ask else _manual_sign_in_offer(ctx, login_page_urls)
-    if manual_sign_in is not None:
-        # Signing in takes minutes in the same tab, so the card must survive a reload.
+    manual_sign_in = None if update_ask or registration else _manual_sign_in_offer(ctx, login_page_urls)
+    if manual_sign_in is not None or registration is not None:
+        # Signing in or saving a generated credential can outlast the tab, so the card must survive a reload.
         ctx.credential_recovery_armed = True
         recovery_enabled = _credential_recovery_enabled(ctx)
     # Establish the active-pause record before the frame carries the token: the
@@ -953,6 +1062,7 @@ async def _run_credential_pause(
         expires_at=expires_at,
         anchor_tool_call_id=anchor_tool_call_id,
         sign_in_browser_session_id=manual_sign_in.browser_session_id if manual_sign_in else None,
+        registration=registration,
         timestamp=now,
     )
     await cache.set(
@@ -963,8 +1073,11 @@ async def _run_credential_pause(
             card=card if recovery_enabled else None,
             recovery_token_digest=ctx.credential_recovery_token_digest if recovery_enabled else None,
             manual_sign_in=manual_sign_in,
+            registration=registration,
         ),
-        ex=_longest_credential_pause_record_ttl() if manual_sign_in else _credential_pause_record_ttl(timeout_seconds),
+        ex=_longest_credential_pause_record_ttl()
+        if manual_sign_in or registration
+        else _credential_pause_record_ttl(timeout_seconds),
     )
     await stream.send(card)
 
@@ -991,9 +1104,16 @@ async def _run_credential_pause(
                 return "live"
             await cache.set(
                 active_key,
-                _encode_active_pause(resume_token, expires_at, consumed=True),
+                _encode_active_pause(
+                    resume_token,
+                    expires_at,
+                    consumed=True,
+                    registration=record.registration
+                    if record is not None and record.resume_token == resume_token
+                    else None,
+                ),
                 ex=_longest_credential_pause_record_ttl()
-                if manual_sign_in
+                if manual_sign_in or registration
                 else _credential_pause_record_ttl(timeout_seconds),
             )
             return None
@@ -1060,6 +1180,23 @@ async def _run_credential_pause(
     if resolution is None and not invalidated:
         invalidated_resolution = await _invalidate_active_pause_record()
         resolution = invalidated_resolution if isinstance(invalidated_resolution, CredentialPauseResolution) else None
+    generated_credential_id: str | None = None
+    if registration is not None:
+        settled_record = _decode_active_pause(
+            await cache.get(credential_pause_active_key(organization_id, chat_id, turn_id))
+        )
+        if settled_record is None or settled_record.resume_token != resume_token:
+            settled_record = None
+        settled_registration = settled_record.registration if settled_record is not None else None
+        generated_credential_id = settled_record.generated_credential_id if settled_record is not None else None
+        if settled_registration is not None:
+            ctx.credential_registration_outcome = settled_registration.outcome
+            # A create claimed but never finished (the pause ran out mid-create) may still have saved a credential.
+            connected = resolution is not None and resolution.action == "connected"
+            if settled_registration.attempted and settled_registration.outcome is None and not connected:
+                ctx.credential_registration_outcome = "unknown"
+        if generated_credential_id is not None or ctx.credential_registration_outcome == "unknown":
+            ctx.credential_generation_spent = True
     if resolution is None:
         settle("timeout")
         return None
@@ -1095,7 +1232,9 @@ async def _run_credential_pause(
             return None
         await answered("connected", credential)
         return resolution
-    if admit_connected is not None and not await admit_connected(credential):
+    # A credential this card just generated has no saved site yet; the card's own origin is its only placement.
+    is_generated = credential.credential_id == generated_credential_id
+    if admit_connected is not None and not is_generated and not await admit_connected(credential):
         ctx.credential_pause_outcome = "not_admitted"
         await answered("not_admitted")
         return resolution
@@ -1103,7 +1242,7 @@ async def _run_credential_pause(
         _apply_connected_credential_to_policy(ctx, policy, credential)
     ctx.credential_pause_outcome = "connected"
     await answered("connected", credential)
-    return resolution
+    return replace(resolution, generated=True) if is_generated else resolution
 
 
 def arm_credential_pause_gate(ctx: Any) -> None:
@@ -1135,6 +1274,7 @@ async def request_credential_pause(
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     allow_second_ask: bool = False,
     anchor_tool_call_id: str | None = None,
+    registration: WorkflowCopilotCredentialRegistration | None = None,
 ) -> CredentialPauseResolution | None:
     """Raise the card from the model's own ``request_credential`` call and wait, inline, for the
     answer, so tool calls the model issued alongside it can await ``credential_pause_settled``."""
@@ -1149,12 +1289,17 @@ async def request_credential_pause(
             message,
             stream,
             copilot_config,
-            reason=update_reason if update_ask else "login_credentials_unresolved",
+            reason=update_reason
+            if update_ask
+            else "credential_registration"
+            if registration
+            else "login_credentials_unresolved",
             login_page_urls=[login_page_url],
             update_credential_id=update_credential_id,
             admit_connected=admit_connected,
             allow_second_ask=allow_second_ask,
             anchor_tool_call_id=anchor_tool_call_id,
+            registration=None if update_ask else registration,
         )
         if not update_ask:
             ctx.credential_pause_reaskable_by_run = resolution is None or resolution.action == "skip"

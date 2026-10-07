@@ -542,9 +542,7 @@ async def _persisted_engine_from_execute_workflow_blocks(
 
     block = block or _make_block(TaskBlock, label="e2e_block")
     workflow = MagicMock()
-    workflow.workflow_definition.blocks = [block]
-    workflow.workflow_definition.version = 1
-    workflow.workflow_definition.finally_block_label = None
+    workflow.workflow_definition = WorkflowDefinition(parameters=[], blocks=[block])
     workflow.status = workflow_status
 
     workflow_run = MagicMock()
@@ -910,7 +908,7 @@ async def test_branch_eval_synthetic_block_gets_no_extraction_report_framing(sco
     (block,) = captured
     now = datetime.now(UTC)
     task = make_task(now, make_organization(now), navigation_goal=None, data_extraction_goal=block.data_extraction_goal)
-    assert "This block only reads the page" not in render_block_context(task, block, None)[0]
+    assert "This block only reads the page" not in render_block_context(task, block)
 
 
 @pytest.mark.asyncio

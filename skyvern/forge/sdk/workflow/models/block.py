@@ -119,7 +119,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import OUTPUT_ONLY_ANTI_BOT_REASON_CODES, classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -175,7 +175,7 @@ from skyvern.forge.sdk.credential_site_policy import describe_release_scope, ori
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.db.id import generate_action_id
+from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -208,6 +208,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     inline_authorized_file_path,
+    pin_file_chooser,
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
@@ -218,6 +219,7 @@ from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
     BlockMetadata,
     WorkflowRunContext,
+    register_secret_derived_output,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     CodeBlockTemplateSyntaxError,
@@ -257,7 +259,9 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     DocumentFailureReceipt,
     RecordingPage,
+    is_element_handle,
     json_safe_recorder_output,
+    page_shows_sign_in_form,
     user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
@@ -291,6 +295,8 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_settings import requested_timezone_id
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
@@ -1439,6 +1445,9 @@ class Block(BaseModel, abc.ABC):
                 str(exc),
                 available_keys=get_available_keys(potential_template, template_data),
             ) from exc
+        register_secret_derived_output(
+            workflow_run_context.secrets, template, potential_template, template_data, rendered
+        )
         if page_derived_capture is not None:
             page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
         return rendered
@@ -1924,14 +1933,21 @@ class Block(BaseModel, abc.ABC):
         pass
 
 
+def _is_retry_blocking_anti_bot_entry(category: dict) -> bool:
+    return (
+        category.get("category") == "ANTI_BOT_DETECTION"
+        and category.get("reason_code") not in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+    )
+
+
 def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     categories = task.failure_category
     if categories:
-        return any(c.get("category") == "ANTI_BOT_DETECTION" for c in categories)
+        return any(_is_retry_blocking_anti_bot_entry(c) for c in categories)
 
     if task.failure_reason:
         result = classify_from_failure_reason(task.failure_reason)
-        if result and any(c.get("category") == "ANTI_BOT_DETECTION" for c in result):
+        if result and any(_is_retry_blocking_anti_bot_entry(c) for c in result):
             return True
 
     return False
@@ -3005,6 +3021,9 @@ class LoopBlockExecutedResult(BaseModel):
 
     def can_continue_after_failure(self) -> bool:
         return not self.block_outputs or self.block_outputs[-1].can_continue_after_failure
+
+    def last_block_failed_on_sign_in_form(self) -> bool:
+        return bool(self.block_outputs) and self.block_outputs[-1].sign_in_form_visible
 
     def is_completed(self) -> bool:
         if len(self.block_outputs) == 0:
@@ -4237,7 +4256,7 @@ class ForLoopBlock(Block):
 
         block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
-        return await self.build_block_result(
+        loop_result = await self.build_block_result(
             success=success,
             failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
@@ -4246,6 +4265,9 @@ class ForLoopBlock(Block):
             organization_id=organization_id,
             can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
+        if not success and loop_executed_result.last_block_failed_on_sign_in_form():
+            return replace(loop_result, sign_in_form_visible=True)
+        return loop_result
 
 
 class WhileLoopBlock(Block):
@@ -4925,7 +4947,7 @@ class WhileLoopBlock(Block):
 
         block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
-        return await self.build_block_result(
+        loop_result = await self.build_block_result(
             success=success,
             failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
@@ -4934,6 +4956,9 @@ class WhileLoopBlock(Block):
             organization_id=organization_id,
             can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
+        if not success and loop_executed_result.last_block_failed_on_sign_in_form():
+            return replace(loop_result, sign_in_form_visible=True)
+        return loop_result
 
 
 class Credential(SimpleNamespace):
@@ -5013,6 +5038,39 @@ CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 # An exception can carry a whole page's text. Bound the persisted reason below the parameter
 # scrubber's disclosure budget, past which it fails closed and returns nothing at all.
 CODE_BLOCK_FAILURE_REASON_MAX_CHARS = 2000
+
+# Diagnostic operation-attribution probe. Bounded and fail-open: it runs on the code-block
+# locator-failure path only (when the failure is bound to a recorded locator), never replaces the
+# original exception/result, and adds no wait to the success path.
+CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS = 0.2
+_OPERATION_ATTRIBUTION_SCHEMA_VERSION = 1
+# Frozen privacy allowlist for the internal operation_attribution envelope; enforced by test.
+_OPERATION_ATTRIBUTION_ALLOWLIST = (
+    "schema_version",
+    "organization_id",
+    "workflow_permanent_id",
+    "workflow_id",
+    "workflow_run_id",
+    "workflow_run_block_id",
+    "block_label",
+    "engine",
+    "code_line",
+    "matched_step_index",
+    "probe_match_count",
+    "probe_status",
+    "exception_class",
+)
+# The secure runner reports probe_status as a free string over gRPC; only these reach the envelope.
+_LOCATOR_PROBE_STATUSES = frozenset({"counted", "timeout", "error"})
+_NATIVE_EXCEPTION_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _consume_probe_result(task: asyncio.Future[Any]) -> None:
+    # Retrieve a late locator-count result/exception so a driver reply that lands after the bounded
+    # wait (e.g. a navigation that destroys the execution context) is consumed rather than surfacing
+    # as an unretrieved-future error -- the very signal this telemetry exists to measure.
+    if not task.cancelled():
+        task.exception()
 
 
 MACHINERY_STACK_MAX_FRAMES = 40
@@ -6779,6 +6837,13 @@ class CodeBlock(Block):
             download_log=download_log,
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
+            file_chooser=pin_file_chooser(_raw_code_block_page(page)),
+            # Taken before execute_user_function_with_timeout starts its clock, so it errs early.
+            deadline=(
+                monotonic() + settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+                if settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS > 0
+                else None
+            ),
         )
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
@@ -7586,6 +7651,73 @@ async def wrapper({default_args}):
             if step is matched_step:
                 return idx
         return None
+
+    async def _probe_failed_locator_count(self, locator: Any) -> tuple[int | None, str]:
+        """Probe-time (not attempt-time) non-strict match count of the exact failed locator.
+
+        Fail-open and separately bounded: a timeout or error yields ``(None, status)`` and never
+        alters the original exception, result, or evidence. The count runs as a detached task bounded
+        by a wait (mirroring the secure arm) so a late driver reply after a navigation is consumed,
+        not left as an unretrieved future; cancellation of the caller still propagates.
+        """
+        task = asyncio.ensure_future(locator.count())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS)
+            if not done:
+                return None, "timeout"
+            count = task.result()
+        except Exception:
+            return None, "error"
+        finally:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_probe_result)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None, "error"
+        # Exact, uncapped: query-time aggregation may bucket later, but emission must not lose the value.
+        return count, "counted"
+
+    def _emit_operation_attribution_failure(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        failing_line: int | None,
+        exception_class: str | None,
+        probe_match_count: int | None,
+        probe_status: str,
+        engine: str = "inline",
+    ) -> None:
+        """Emit the internal, privacy-safe operation-attribution failure event.
+
+        Every field is inside the ``operation_attribution`` envelope, which the log processor pops
+        before the downloadable ``context.log`` artifact. Only bounded IDs/enums/ints/bools and the
+        exception's type name are recorded -- never selector text, code, DOM, URLs, or messages.
+
+        Operation ambiguity is intentionally not emitted: on the secure arm the recorder rows carry no
+        authored ``code_line`` (always-false, misleading), and it is derivable at query time by
+        grouping the persisted recorded-action rows on ``code_line``.
+        """
+        LOG.info(
+            "codeblock.locator_probe",
+            operation_attribution={
+                "schema_version": _OPERATION_ATTRIBUTION_SCHEMA_VERSION,
+                "organization_id": organization_id,
+                "workflow_permanent_id": workflow_run_context.workflow_permanent_id,
+                "workflow_id": workflow_run_context.workflow_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "block_label": self.label,
+                "engine": engine,
+                "code_line": failing_line,
+                "matched_step_index": self._matched_step_index_for_failing_line(failing_line),
+                "probe_match_count": probe_match_count,
+                "probe_status": probe_status,
+                "exception_class": exception_class,
+            },
+        )
 
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
         return workflow_run_context.mask_secrets_in_data(self.prompt or "")
@@ -8592,10 +8724,14 @@ async def wrapper({default_args}):
             return "".join(char for char in redacted if unicodedata.category(char)[0] != "C").strip()[:1000] or None
 
         state: dict[str, str] = {}
+        first_url: str | None = None
+        later_url: str | None = None
+        page_title: str | None = None
         try:
             async with asyncio.timeout(0.5):
                 try:
-                    final_url = mask_fact(page.url)
+                    first_url = page.url
+                    final_url = mask_fact(first_url)
                     if final_url:
                         state["final_url"] = final_url
                 except asyncio.CancelledError:
@@ -8604,12 +8740,15 @@ async def wrapper({default_args}):
                     pass
                 try:
                     page_title = mask_fact(await page.title())
-                    if page_title:
-                        state["page_title"] = page_title
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - failure evidence is best effort.
                     pass
+                finally:
+                    with contextlib.suppress(Exception):
+                        later_url = page.url
+                        if later_url != first_url and (later_final_url := mask_fact(later_url)):
+                            state["final_url"] = later_final_url
                 try:
                     receiver_url = mask_fact(receiver.url) if receiver is not None else None
                     if receiver_url:
@@ -8631,6 +8770,9 @@ async def wrapper({default_args}):
             raise
         except TimeoutError:
             pass
+        # A document committed after the first url read would pair one document's URL with another's title.
+        if page_title and first_url is not None and later_url == first_url:
+            state["page_title"] = page_title
         return state
 
     async def _persist_captured_failure_final_url(
@@ -8735,6 +8877,8 @@ async def wrapper({default_args}):
         redaction_parameters: dict[str, Any] | None = None,
         download_claim_outcome: DownloadClaimOutcome | None = None,
         failed_nav_error_code: str | None = None,
+        # Read by the caller before this runs, since AI fallback can navigate away from the failing tab.
+        sign_in_form_visible: bool = False,
         authored_code: str | None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
@@ -8743,6 +8887,9 @@ async def wrapper({default_args}):
 
         def scrub_failure_value(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
             return _redact_codeblock_failure_text(value, resolved_redaction_parameters, fallback)
+
+        def with_sign_in_fact(result: BlockResult) -> BlockResult:
+            return replace(result, sign_in_form_visible=True) if sign_in_form_visible else result
 
         if (
             organization_id
@@ -8874,7 +9021,7 @@ async def wrapper({default_args}):
                     return result
 
                 async def return_committed_final_failure() -> BlockResult:
-                    return result
+                    return with_sign_in_fact(result)
 
                 return await self._publish_failure_result_with_evidence(
                     build_failure_result=return_committed_final_failure,
@@ -8891,7 +9038,7 @@ async def wrapper({default_args}):
 
             async def persist_unhealed_failure() -> BlockResult:
                 result = await build_failure_result()
-                return _redact_codeblock_result(result, resolved_redaction_parameters)
+                return with_sign_in_fact(_redact_codeblock_result(result, resolved_redaction_parameters))
 
             return await self._publish_failure_result_with_evidence(
                 build_failure_result=persist_unhealed_failure,
@@ -9437,6 +9584,37 @@ async def wrapper({default_args}):
                         )
                     await recorder.persist(recorded)
                     if secure_failure is not None:
+                        # The worker measured the failed locator's match count; emitting it here must never
+                        # alter the classified secure failure below.
+                        if secure_failure.locator_probe_status in _LOCATOR_PROBE_STATUSES:
+                            try:
+                                self._emit_operation_attribution_failure(
+                                    organization_id=organization_id,
+                                    workflow_run_context=workflow_run_context,
+                                    workflow_run_id=workflow_run_id,
+                                    workflow_run_block_id=workflow_run_block_id,
+                                    failing_line=secure_failure.failing_line,
+                                    # Never the broker wrapper class: it would not group with inline events.
+                                    exception_class=(
+                                        secure_failure.native_exception_class
+                                        if secure_failure.native_exception_class is not None
+                                        and _NATIVE_EXCEPTION_CLASS.fullmatch(secure_failure.native_exception_class)
+                                        else None
+                                    ),
+                                    probe_match_count=(
+                                        secure_failure.locator_match_count
+                                        if secure_failure.locator_match_count is not None
+                                        and secure_failure.locator_match_count >= 0
+                                        else None
+                                    ),
+                                    probe_status=secure_failure.locator_probe_status,
+                                    engine="secure",
+                                )
+                            except Exception:
+                                LOG.debug(
+                                    "codeblock.locator_probe failed open; original failure preserved",
+                                    exc_info=True,
+                                )
                         # The runner's code is uncorroborated; the worker recorder resolved the host, so a dead
                         # site behind the proxy (reported there as the sentinel) keeps healing.
                         secure_nav_code = (
@@ -9539,6 +9717,15 @@ async def wrapper({default_args}):
                                 or None,
                             )
 
+                        # The worker checks the failing tab before it closes the runner's opened tabs. Without its answer
+                        # the block's own page is checked, except after a failure on an opened tab or a timeout, whose
+                        # tab is unknown.
+                        if secure_failure.sign_in_form_visible is not None:
+                            secure_sign_in_form_visible = secure_failure.sign_in_form_visible
+                        elif secure_failure.receiver_url is not None or secure_failure.error_code == "timeout":
+                            secure_sign_in_form_visible = False
+                        else:
+                            secure_sign_in_form_visible = await page_shows_sign_in_form(page)
                         return await self._resolve_failure_with_heal(
                             authored_code=authored_code,
                             exception=None,
@@ -9546,6 +9733,7 @@ async def wrapper({default_args}):
                             build_failure_result=build_secure_failure_result,
                             classification=secure_classification,
                             failed_nav_error_code=recovery_nav_code,
+                            sign_in_form_visible=secure_sign_in_form_visible,
                             recorder=recorder,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
@@ -9839,7 +10027,10 @@ async def wrapper({default_args}):
             timeout_navigation = _context_navigation_output(
                 recording_page.failure_document_receipt(e), workflow_run_context, serialized_parameter_values
             )
-            return await self._failed_result_with_evidence(
+            # wait_for raises the timeout from the cancellation of the call in flight, which names the tab it ran on.
+            timeout_failure_page = recording_page.failing_tab(e.__cause__) if e.__cause__ is not None else None
+            timeout_on_sign_in_form = await page_shows_sign_in_form(timeout_failure_page or page)
+            timeout_result = await self._failed_result_with_evidence(
                 failure_reason=timeout_failure_reason,
                 output_parameter_value=(
                     {**build_block_failure_output(timeout_failure_reason, []), **timeout_navigation}
@@ -9858,6 +10049,7 @@ async def wrapper({default_args}):
                 download_dir_before=download_dir_before,
                 attempt_started_at=attempt_started_at,
             )
+            return replace(timeout_result, sign_in_form_visible=True) if timeout_on_sign_in_form else timeout_result
         except Exception as e:
             # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
             # complete-verifier rejected the block, which is a failure to heal, not an intentional stop.
@@ -9879,6 +10071,7 @@ async def wrapper({default_args}):
                     attempt_started_at=attempt_started_at,
                 )
             failing_line = user_code_line_from_exception(e)
+            failing_tab = recording_page.failing_tab(e)
             declared_error = self._extract_declared_error(e, workflow_run_context)
             if declared_error is not None:
                 await recorder.persist(recorder.recorded_actions())
@@ -9940,6 +10133,7 @@ async def wrapper({default_args}):
                     attempt_started_at=attempt_started_at,
                     redaction_parameters=serialized_parameter_values,
                     download_claim_outcome=inline_download_claim_outcome.outcome,
+                    sign_in_form_visible=await page_shows_sign_in_form(failing_tab or page),
                 )
             if (
                 type(e) is ErrorCode
@@ -9988,12 +10182,40 @@ async def wrapper({default_args}):
                     failure_page=failed_page,
                     workflow_run_context=workflow_run_context,
                     redaction_parameters=serialized_parameter_values,
-                    opened_pages=opened_pages,
+                    opened_pages=[*opened_pages, *recording_page._claimed_popups()],
                 )
             if inline_failure_page_state:
                 from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state
 
                 failure_reason = append_failure_page_state(failure_reason, **inline_failure_page_state)
+            # Diagnostic operation-attribution probe: after the existing higher-priority failure
+            # evidence and before outcome construction. The structural gate is the only gate --
+            # it fires whenever the failure is bound to a recorded locator (incl. strict-mode),
+            # separate from the customer-visible PlaywrightTimeoutError capture gate above.
+            # Fully fail-open: any failure in locator identification, probe, attribute assembly, or
+            # emission must leave the original classified failure/result unchanged, so the whole
+            # block is guarded (cancellation still propagates). Touches no failure_reason/output/
+            # action row/error code.
+            try:
+                probe_locator = recording_page.failure_locator(e)
+                # An ElementHandle was already resolved, so there is no selector left to count; the
+                # secure arm skips element handles too.
+                if probe_locator is not None and not is_element_handle(probe_locator):
+                    probe_match_count, probe_status = await self._probe_failed_locator_count(probe_locator)
+                    self._emit_operation_attribution_failure(
+                        organization_id=organization_id,
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        failing_line=failing_line,
+                        exception_class=type(e).__name__,
+                        probe_match_count=probe_match_count,
+                        probe_status=probe_status,
+                    )
+            except Exception:
+                # CancelledError is a BaseException on the supported Python (>=3.11) and is not caught
+                # here, so cancellation still propagates while every other failure stays fail-open.
+                LOG.debug("codeblock.locator_probe failed open; original failure preserved", exc_info=True)
             recorded = recorder.recorded_actions()
             if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
@@ -10094,6 +10316,7 @@ async def wrapper({default_args}):
                 build_failure_result=build_legacy_failure_result,
                 classification=legacy_classification,
                 failed_nav_error_code=inline_nav_code,
+                sign_in_form_visible=await page_shows_sign_in_form(failing_tab or page),
                 recorder=recorder,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
@@ -12649,6 +12872,10 @@ class SendEmailBlock(Block):
         context = skyvern_context.current()
         run_id = context.run_id if context and context.run_id else workflow_run_id
         for path in self.file_attachments:
+            # Only an entry blank as written is skipped; one that resolves or renders to empty still fails,
+            # since that usually means an upstream file is missing.
+            if not path.strip():
+                continue
             # if the file path is a parameter, get the value from the workflow run context first
             if workflow_run_context.has_parameter(path):
                 file_path_parameter_value = workflow_run_context.get_value(path)
@@ -18840,6 +19067,7 @@ class WorkflowTriggerBlock(Block):
         # setup_workflow_run so the child run persists that engine despite carrying a browser_session_id;
         # stays None for caller-supplied sessions and parent-shared browsers.
         child_effective_browser_type: str | None = None
+        child_workflow_run_id: str | None = None
         if self.browser_session_id:
             resolved_browser_session_id = self.browser_session_id
         elif self.use_parent_browser_session and browser_session_id:
@@ -18882,6 +19110,11 @@ class WorkflowTriggerBlock(Block):
                     if child_mapped_browser_type is not None:
                         child_session_kwargs["browser_type"] = child_mapped_browser_type
                         child_session_kwargs["workflow_run_id"] = workflow_run_id
+                    target_browser_settings = target_workflow.workflow_definition.browser_settings
+                    if requested_timezone_id(target_browser_settings) is not None:
+                        child_workflow_run_id = generate_workflow_run_id()
+                        child_session_kwargs["browser_settings"] = target_browser_settings
+                        child_session_kwargs["created_for_workflow_run_id"] = child_workflow_run_id
             except (WorkflowNotFound, SQLAlchemyError) as e:
                 return await _fail(f"Failed to resolve triggered workflow: {get_user_facing_exception_message(e)}")
             try:
@@ -18889,6 +19122,7 @@ class WorkflowTriggerBlock(Block):
                     organization_id=organization_id,
                     proxy_location=proxy_location,
                     timeout_minutes=30,
+                    session_kind=BrowserSessionKind.workflow_run,
                     **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id
@@ -18951,6 +19185,7 @@ class WorkflowTriggerBlock(Block):
                             # though it carries a browser_session_id. None for caller-supplied/parent-shared.
                             server_owned_browser_type=child_effective_browser_type if created_fresh_session else None,
                             reject_empty_workflow=True,
+                            workflow_run_id=child_workflow_run_id,
                         )
                     except Exception as e:
                         error_msg = get_user_facing_exception_message(e)

@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
@@ -109,8 +110,31 @@ class _FakeBrowserContext:
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}},
-            {"ok": False, "error": "boom. retry later", "error_code": "E1"},
-            id="error_with_hint_joins_message_and_hint",
+            {"ok": False, "error": "boom", "error_code": "E1"},
+            id="error_with_hint_forwards_the_message_only",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "error": {
+                    "code": "ACTION_FAILED",
+                    "message": "No unambiguous option matched 'Blue'",
+                    "hint": "Retry with one of the observed options: Navy, Teal",
+                    "details": {
+                        "element_state": "no_unambiguous_match",
+                        "selector": "#color",
+                        "observed_options": ["Navy", "Teal"],
+                    },
+                },
+            },
+            {
+                "ok": False,
+                "error": "No unambiguous option matched 'Blue'",
+                "error_code": "ACTION_FAILED",
+                "element_state": "no_unambiguous_match",
+                "observed_options": ["Navy", "Teal"],
+            },
+            id="select_mismatch_lifts_the_observed_options_without_the_hint",
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom"}},
@@ -391,7 +415,13 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
     assert ctx.attached_browser_drivers == {"bs_1": runtime.AttachedBrowserDriver("bs_1", ready_state)}
-    assert mock_manager.create_session.call_args.kwargs.keys() == {"organization_id", "timeout_minutes", "created_by"}
+    assert mock_manager.create_session.call_args.kwargs.keys() == {
+        "organization_id",
+        "timeout_minutes",
+        "created_by",
+        "session_kind",
+    }
+    assert mock_manager.create_session.call_args.kwargs["session_kind"] == BrowserSessionKind.copilot
 
 
 @pytest.mark.asyncio
@@ -968,6 +998,7 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
         "organization_id": ctx.organization_id,
         "timeout_minutes": 30,
         "created_by": "copilot",
+        "session_kind": BrowserSessionKind.copilot,
         "browser_profile_id": "bp_saved",
         "profile_read_only": True,
         "generate_browser_profile": True,

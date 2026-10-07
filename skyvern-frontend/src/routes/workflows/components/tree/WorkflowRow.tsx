@@ -23,8 +23,7 @@ import {
   workflowCreatedAt,
 } from "../../types/workflowTypes";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
@@ -83,8 +82,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
   const showCreator = useCreatorColumnEnabled();
   const studioEnabled = useWorkflowStudioEnabled();
   const navigate = useNavigate();
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  const taggingEnabled = useWorkflowTaggingEnabled();
 
   const parameterItems = (workflow.workflow_definition?.parameters ?? [])
     .filter((p) => p.parameter_type !== "output")

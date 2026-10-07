@@ -73,7 +73,6 @@ import {
   CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
-  WorkflowBlock,
   WorkflowParameter,
   WorkflowParameterTypes,
 } from "./types/workflowTypes";
@@ -103,28 +102,7 @@ import {
   isAtWillCredentialParameter,
 } from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
-import { visitWorkflowBlocks } from "./workflowBlockUtils";
-
-/**
- * Recursively finds all login blocks that don't have any credential parameters selected.
- * Checks nested blocks inside for_loop blocks as well.
- */
-function getLoginBlocksWithoutCredentials(
-  blocks: Array<WorkflowBlock>,
-): Array<{ label: string }> {
-  const result: Array<{ label: string }> = [];
-
-  visitWorkflowBlocks(blocks, (block) => {
-    if (block.block_type === "login") {
-      // Login block requires at least one parameter (credential) to be selected
-      if (!block.parameters || block.parameters.length === 0) {
-        result.push({ label: block.label });
-      }
-    }
-  });
-
-  return result;
-}
+import { getLoginBlocksWithoutCredentials } from "./runValidation";
 
 /**
  * Validates the workflow for issues that would prevent it from running.

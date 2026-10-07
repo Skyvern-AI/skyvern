@@ -600,8 +600,8 @@ def test_response_error_filter_keeps_case_variant_under_the_mapping_key(agent):
 
 
 @pytest.mark.asyncio
-async def test_error_detection_performance_doesnt_block_failure(agent, mock_browser_state):
-    """Test that slow error detection doesn't significantly delay task failure."""
+async def test_slow_error_detection_runs_once_after_the_failure_is_saved(agent, mock_browser_state):
+    """The failure is saved before slow error detection starts, and detection is awaited exactly once."""
     now = datetime.now()
     organization = make_organization(now)
     task = make_task(
@@ -620,8 +620,14 @@ async def test_error_detection_performance_doesnt_block_failure(agent, mock_brow
             # Simulate slow error detection
             import asyncio
 
+            detection_finished = asyncio.Event()
+            saves_before_detection: list[int] = []
+
             async def slow_detection(*args, **kwargs):
+                # fail_task swallows detection errors, so the save count is checked after it returns.
+                saves_before_detection.append(mock_update_task.await_count)
                 await asyncio.sleep(0.1)  # Simulate some delay
+                detection_finished.set()
                 return [UserDefinedError(error_code="timeout", reasoning="Timeout detected", confidence_float=0.80)]
 
             with patch(
@@ -633,15 +639,16 @@ async def test_error_detection_performance_doesnt_block_failure(agent, mock_brow
                 with patch("skyvern.forge.agent.app") as mock_app:
                     mock_app.DATABASE.tasks.update_task = AsyncMock()
 
-                    import time
+                    # The wait_for only turns a hang into a failure; counts, not wall time, show there is no retry loop.
+                    result = await asyncio.wait_for(
+                        agent.fail_task(task, step, "Task timeout", mock_browser_state), timeout=30
+                    )
 
-                    start_time = time.time()
-                    result = await agent.fail_task(task, step, "Task timeout", mock_browser_state)
-                    elapsed = time.time() - start_time
-
-                    # Should complete (error detection runs but doesn't block indefinitely)
                     assert result is True
-                    # Should take at least 0.1s (the sleep time)
-                    assert elapsed >= 0.1
-                    # But not much more (no retry loops or hangs)
-                    assert elapsed < 1.0
+                    assert detection_finished.is_set()
+                    assert saves_before_detection == [1]
+                    assert mock_detect.await_count == 1
+                    mock_app.DATABASE.tasks.update_task.assert_awaited_once()
+                    assert [
+                        e["error_code"] for e in mock_app.DATABASE.tasks.update_task.call_args.kwargs["errors"]
+                    ] == ["timeout"]

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import os
 import socket
 import time
 import uuid
+import weakref
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import StrEnum
 from mimetypes import add_type, guess_type
 from typing import IO, TYPE_CHECKING, Any, cast
@@ -296,6 +298,70 @@ class _ParkedFallback:
             LOG.warning("Failed to close parked fallback reader", exc_info=True)
 
 
+class _SharedS3Client:
+    """One S3 client used by every operation on one event loop until it is retired. A task owns it so asyncio.run's
+    shutdown cancellation closes it; an aiohttp session still open at exit is logged as an error.
+    """
+
+    def __init__(
+        self,
+        session: aioboto3.Session,
+        context: contextlib.AbstractAsyncContextManager[S3Client],
+        registry: dict[asyncio.AbstractEventLoop, _SharedS3Client],
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._registry = registry
+        self.session = session
+        self.leases = 0
+        self._retired = False
+        self._wake = asyncio.Event()
+        self.ready: asyncio.Future[S3Client] = self._loop.create_future()
+        self._owner = asyncio.ensure_future(self._own(context))
+
+    def release(self) -> None:
+        self.leases -= 1
+        if self.leases == 0:
+            self._wake.set()
+
+    def retire(self) -> None:
+        self._retired = True
+        self._wake.set()
+
+    def _evict(self) -> None:
+        if self._registry.get(self._loop) is self:
+            del self._registry[self._loop]
+
+    async def _own(self, context: contextlib.AbstractAsyncContextManager[S3Client]) -> None:
+        try:
+            client = await context.__aenter__()
+        except asyncio.CancelledError:
+            self._evict()
+            self.ready.cancel()
+            raise
+        except Exception as exc:
+            self._evict()
+            self.ready.set_exception(exc)
+            # Marked retrieved: every waiter may already have been cancelled.
+            self.ready.exception()
+            return
+        self.ready.set_result(client)
+        try:
+            while self.leases or not self._retired:
+                self._wake.clear()
+                await self._wake.wait()
+        finally:
+            self._evict()
+            # A loop closed without cancelling its tasks leaves nothing to close on; awaiting would raise.
+            if not self._loop.is_closed():
+                await context.__aexit__(None, None, None)
+
+
+def _retire_shared_s3_clients(registry: dict[asyncio.AbstractEventLoop, _SharedS3Client]) -> None:
+    for loop, shared in list(registry.items()):
+        with contextlib.suppress(RuntimeError):  # the loop is already closed
+            loop.call_soon_threadsafe(shared.retire)
+
+
 class AsyncAWSClient:
     def __init__(
         self,
@@ -315,11 +381,20 @@ class AsyncAWSClient:
         self._aws_secret_access_key = aws_secret_access_key
         self._profile_name = profile_name
         pinned_host = urlparse(self._endpoint_url).hostname if self._endpoint_url else None
-        self._config = (
-            AioConfig(connector_args={"resolver": _PinnedIPResolver(pinned_host, endpoint_resolved_ips)})
+        connector_args = (
+            {"resolver": _PinnedIPResolver(pinned_host, endpoint_resolved_ips)}
             if endpoint_resolved_ips and pinned_host
             else None
         )
+        self._config = AioConfig(connector_args=connector_args) if connector_args else None
+        # 0 lifts aiohttp's connection cap. A client per operation never shared a cap, and a fan-out on the shared
+        # client (listing heads, multipart parts) must not queue behind botocore's default of 10.
+        self._s3_config = AioConfig(connector_args=connector_args, max_pool_connections=0)
+        # Building an S3 client creates an aiohttp connector (SSL context + CA bundle load) synchronously on the
+        # event loop, so operations share one per loop. Keyed by loop because a client cannot outlive its loop.
+        self._shared_s3_clients: dict[asyncio.AbstractEventLoop, _SharedS3Client] = {}
+        # Each instance owns a ~10 MB botocore session, so a per-call instance retires its clients when dropped.
+        weakref.finalize(self, _retire_shared_s3_clients, self._shared_s3_clients)
         self._session: aioboto3.Session | None = None
         self._session_created_at: float = 0.0
         # Per-object-key write chain: serializes writes to one key in issue order so a later terminal
@@ -529,10 +604,27 @@ class AsyncAWSClient:
             config=self._config,
         )
 
-    def _s3_client(self) -> S3Client:
-        return self._get_session(AWSClientType.S3).client(
-            AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url, config=self._config
-        )
+    @contextlib.asynccontextmanager
+    async def _s3_client(self) -> AsyncIterator[S3Client]:
+        loop = asyncio.get_running_loop()
+        session = self._get_session(AWSClientType.S3)
+        shared = self._shared_s3_clients.get(loop)
+        if shared is None or shared.session is not session:
+            # A replaced session (TTL or credential refresh) retires its client once in-flight operations finish.
+            if shared is not None:
+                shared.retire()
+            for stale_loop in [other for other in list(self._shared_s3_clients) if other.is_closed()]:
+                del self._shared_s3_clients[stale_loop]
+            context = session.client(
+                AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url, config=self._s3_config
+            )
+            shared = self._shared_s3_clients[loop] = _SharedS3Client(session, context, self._shared_s3_clients)
+        shared.leases += 1
+        try:
+            # Shielded so one caller's cancellation cannot cancel the client creation other callers wait on.
+            yield await asyncio.shield(shared.ready)
+        finally:
+            shared.release()
 
     def _ec2_client(self) -> EC2Client:
         return self._get_session(AWSClientType.EC2).client(

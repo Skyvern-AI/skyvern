@@ -85,9 +85,11 @@ import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { useAnalyticsDashboardFlag } from "@/hooks/useAnalyticsDashboardFlag";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { usePageSlots } from "@/store/PageSlots";
@@ -150,21 +152,25 @@ function WorkflowPage() {
     setSearchParams,
   );
 
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // A stale ?tags= URL param would 403 the request when tagging is off.
+  const { tags: urlTags, hold: holdForTaggingFlag } =
+    useUrlTagFilter(tagsParam);
 
-  const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    statusFilters,
-    page,
-    pageSize,
-    search: debouncedSearch,
-    createdAtStart: runWindow.createdAtStart,
-    createdAtEnd: runWindow.createdAtEnd,
-    // A stale ?tags= URL param would 403 the request when tagging is disabled.
-    tags: taggingEnabled ? tagsParam : undefined,
-    refetchOnMount: "always",
-  });
+  const { data: workflowRuns, isLoading: isRunsQueryLoading } =
+    useWorkflowRunsQuery({
+      workflowPermanentId,
+      statusFilters,
+      page,
+      pageSize,
+      search: debouncedSearch,
+      createdAtStart: runWindow.createdAtStart,
+      createdAtEnd: runWindow.createdAtEnd,
+      tags: urlTags || undefined,
+      enabled: !holdForTaggingFlag,
+      refetchOnMount: "always",
+    });
+  const isLoading = isRunsQueryLoading || holdForTaggingFlag;
 
   useEffect(() => {
     if (!isLoading && workflowRuns && workflowRuns.length === 0 && page > 1) {

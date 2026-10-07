@@ -2486,7 +2486,7 @@ describe("finished-run landing", () => {
     };
   }
 
-  test("a completed run opens on its outputs and pins the block that finished last", async () => {
+  test("a completed run opens on its timeline and pins the block that finished last", async () => {
     seedCapturedCodeBlockRun(Status.Completed);
     renderRunView({}, "/?wr=wr_1");
 
@@ -2495,33 +2495,11 @@ describe("finished-run landing", () => {
         lastExecuted.workflow_run_block_id,
       );
     });
-    expect(useRunPaneViewStore.getState().view).toBe("outputs");
+    expect(useRunPaneViewStore.getState().view).toBe("timeline");
     expect(useRunViewStore.getState().pinnedFrameId).not.toBe(
       actionBearing.actions[actionBearing.actions.length - 1]!.action_id,
     );
   });
-
-  // A deep link names what to show. Switching the pane off it would restore the
-  // selection and then hide it, so the URL and the pane disagree.
-  test.each([
-    [
-      "?active=",
-      `/?wr=wr_1&active=${capturedRun.blocks[1]!.actions[0]!.action_id}`,
-    ],
-    ["?bl=", "/?wr=wr_1&bl=code_block_2"],
-    ["?view=", "/?wr=wr_1&view=timeline"],
-  ])(
-    "a completed run deep-linked with %s stays on the timeline",
-    async (_label, route) => {
-      seedCapturedCodeBlockRun(Status.Completed);
-      renderRunView({}, route);
-
-      await waitFor(() => {
-        expect(mocks.workflowRun).toBeDefined();
-      });
-      expect(useRunPaneViewStore.getState().view).toBe("timeline");
-    },
-  );
 
   test("a failed run stays on the timeline so its failure stays on screen", async () => {
     seedCapturedCodeBlockRun(Status.Failed);
@@ -2557,5 +2535,96 @@ describe("finished-run landing", () => {
     expect(container.textContent).not.toContain(
       "No output captured for this run",
     );
+  });
+});
+
+describe("RunView human-interaction banner", () => {
+  function seedPausedOnHumanInteraction(
+    humanInteractionStatus: Status = Status.Running,
+  ) {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_nav",
+          workflow_run_id: "wr_1",
+          block_type: "navigation",
+          label: "open_login",
+          status: Status.Completed,
+          created_at: "2026-06-10T00:00:00Z",
+        }),
+      ),
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_hi",
+          workflow_run_id: "wr_1",
+          block_type: "human_interaction",
+          label: "manual_login",
+          status: humanInteractionStatus,
+          instructions: "Sign in to the portal manually.",
+          positive_descriptor: "Login complete",
+          negative_descriptor: "Cancel",
+          created_at: "2026-06-10T00:00:20Z",
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Paused,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  test("a run paused on a human-interaction block shows its actions once, in the pane banner, whichever block is selected", () => {
+    seedPausedOnHumanInteraction();
+    useRunViewStore.getState().pinFrame("wrb_nav");
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    const banner = scope.getByRole("region", { name: "Action needed" });
+    expect(
+      within(banner).getByRole("button", { name: "Login complete" }),
+    ).toBeTruthy();
+    expect(within(banner).getByRole("button", { name: "Cancel" })).toBeTruthy();
+    // The block detail panel no longer carries its own copy.
+    expect(
+      scope.getAllByRole("button", { name: "Login complete" }),
+    ).toHaveLength(1);
+  });
+
+  test("the banner stays up outside the Timeline view", () => {
+    seedPausedOnHumanInteraction();
+    useRunPaneViewStore.getState().setView("inputs");
+    const { container } = renderRunView();
+
+    expect(
+      within(container).getByRole("region", { name: "Action needed" }),
+    ).toBeTruthy();
+  });
+
+  test("a resolved human-interaction block shows no banner while the run is paused elsewhere", () => {
+    seedPausedOnHumanInteraction(Status.Completed);
+    const { container } = renderRunView();
+
+    expect(
+      within(container).queryByRole("region", { name: "Action needed" }),
+    ).toBeNull();
+  });
+
+  test("a running run shows no banner", () => {
+    seedPausedOnHumanInteraction();
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    const { container } = renderRunView();
+
+    expect(
+      within(container).queryByRole("region", { name: "Action needed" }),
+    ).toBeNull();
   });
 });
