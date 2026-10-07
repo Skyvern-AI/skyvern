@@ -36,6 +36,7 @@ import {
   BranchCriteriaTypes,
   debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
+  type BranchCondition,
   type BranchCriteriaType,
   type OutputParameter,
   type Parameter,
@@ -1510,7 +1511,21 @@ function serializeConditionalBlock(
       nodes,
       edges,
     );
-    const nextBlockLabel = orderedNodes[0]?.data.label ?? mergeLabel ?? null;
+    // A branch that owns no blocks keeps the target it was loaded with when
+    // another branch of this same conditional owns that block (for example a
+    // shared first block), so the target can never point outside this subtree.
+    const loadedTarget =
+      branch.next_block_label &&
+      nodes.some(
+        (n) =>
+          isWorkflowBlockNode(n) &&
+          n.data.label === branch.next_block_label &&
+          n.data.conditionalNodeId === node.id,
+      )
+        ? branch.next_block_label
+        : null;
+    const nextBlockLabel =
+      orderedNodes[0]?.data.label ?? loadedTarget ?? mergeLabel ?? null;
 
     return {
       ...branch,
@@ -1527,7 +1542,10 @@ function serializeConditionalBlock(
     block_type: "conditional",
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
-    next_block_label: mergeLabel,
+    // An inferred merge point is not written back: the backend routes to the
+    // conditional's own next_block_label when no branch target applies.
+    next_block_label:
+      mergeLabel === node.data.inferredMergeLabel ? null : mergeLabel,
     branch_conditions: branchConditions,
   };
 }
@@ -1910,6 +1928,62 @@ function labelsAtOrBeforeConditional(
   return result;
 }
 
+// A conditional with no next_block_label whose branches all converge on one
+// block gets that block as its editor merge point, so each branch keeps only
+// its own chain instead of the last branch walk claiming the shared tail.
+// Skipped without a default branch: the editor adds an empty Else on open,
+// which would then save as the merge point instead of null.
+function inferConditionalMergeLabels(
+  blocks: Array<WorkflowBlock>,
+  blocksByLabel: Map<string, WorkflowBlock>,
+  finallyBlockLabel: string | null,
+  inferred: Map<string, string>,
+): Array<WorkflowBlock> {
+  return blocks.map((block) => {
+    if (isNestedLoopWorkflowBlock(block)) {
+      return {
+        ...block,
+        loop_blocks: inferConditionalMergeLabels(
+          block.loop_blocks,
+          blocksByLabel,
+          finallyBlockLabel,
+          inferred,
+        ),
+      } as WorkflowBlock;
+    }
+    if (
+      block.block_type !== "conditional" ||
+      block.next_block_label ||
+      !block.branch_conditions.some((branch) => branch.is_default)
+    ) {
+      return block;
+    }
+    const excludeLabels = labelsAtOrBeforeConditional(block.label, blocks);
+    const chains = block.branch_conditions.map((branch) =>
+      collectLabelsForBranch(
+        branch.next_block_label,
+        null,
+        blocksByLabel,
+        finallyBlockLabel,
+        excludeLabels,
+      ),
+    );
+    if (chains.length < 2) {
+      return block;
+    }
+    const join = chains[0]!.find((label) =>
+      chains.every((chain) => chain.includes(label)),
+    );
+    if (!join) {
+      return block;
+    }
+    inferred.set(block.label, join);
+    const withMerge = { ...block, next_block_label: join };
+    blocksByLabel.set(block.label, withMerge);
+    return withMerge;
+  });
+}
+
 /**
  * Reconstructs the proper hierarchical structure for conditional blocks from a flat blocks array.
  * This is the deserialization counterpart to the edge-based serialization logic.
@@ -2222,7 +2296,15 @@ function findConditionalMergeLabel(
     edges,
   );
   if (!mergeTargetId) {
-    return null;
+    // A conditional ending an enclosing branch keeps its loaded merge when
+    // that is where the enclosing branch continues.
+    const parentId = conditionalNode.data.conditionalNodeId;
+    const loadedMerge = conditionalNode.data.mergeLabel;
+    return loadedMerge &&
+      parentId &&
+      findNextBlockLabel(parentId, nodes, edges) === loadedMerge
+      ? loadedMerge
+      : null;
   }
   const targetNode = nodes.find(
     (node) => node.id === mergeTargetId && isWorkflowBlockNode(node),
@@ -2329,6 +2411,19 @@ function getElements(
     }
   }
 
+  const inferredMergeLabels = new Map<string, string>();
+  // An outer conditional's branches only reach the shared join once a nested
+  // conditional's own merge is inferred, so repeat until nothing new is found.
+  for (let found = -1; found !== inferredMergeLabels.size; ) {
+    found = inferredMergeLabels.size;
+    blocks = inferConditionalMergeLabels(
+      blocks,
+      buildLabelToBlockMap(blocks),
+      settings.finallyBlockLabel ?? null,
+      inferredMergeLabels,
+    );
+  }
+
   const data = generateNodeData(blocks);
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
@@ -2393,6 +2488,10 @@ function getElements(
       editable,
       effectiveDefaultEngine,
     );
+    if (isConditionalNode(node)) {
+      node.data.inferredMergeLabel =
+        inferredMergeLabels.get(node.data.label) ?? null;
+    }
     nodes.push(node);
     if (isWorkflowBlockNode(node)) {
       labelToNode.set(node.data.label, node);
@@ -4377,6 +4476,22 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
         // Update parameterKeys if present
         ...(parameterKeys !== undefined && {
           parameterKeys: updatedParameterKeys,
+        }),
+        // Save reads a conditional's loaded branch targets and merge labels,
+        // so they must follow renames.
+        ...(node.type === "conditional" && {
+          branches: (node.data.branches as Array<BranchCondition>).map(
+            (branch) =>
+              branch.next_block_label === oldLabel
+                ? { ...branch, next_block_label: newLabel }
+                : branch,
+          ),
+          mergeLabel:
+            node.data.mergeLabel === oldLabel ? newLabel : node.data.mergeLabel,
+          inferredMergeLabel:
+            node.data.inferredMergeLabel === oldLabel
+              ? newLabel
+              : node.data.inferredMergeLabel,
         }),
         // Update the label for the node being renamed
         label: node.id === id ? newLabel : node.data.label,

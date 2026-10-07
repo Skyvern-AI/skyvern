@@ -28,12 +28,14 @@ type DuplicateBlockBelowResult = {
 
 type BranchConditionLike = {
   id: string;
+  next_block_label?: string | null;
 };
 
 type ConditionalDataLike = NodeBaseData & {
   activeBranchId: string | null;
   branches: Array<BranchConditionLike>;
   mergeLabel?: string | null;
+  inferredMergeLabel?: string | null;
 };
 
 const SKIP_KEYS_FOR_REFERENCE_REWRITE = new Set([
@@ -370,6 +372,9 @@ export function duplicateBlockBelow({
       clonedData.branches = clonedData.branches.map((branch) => ({
         ...branch,
         id: branchIdMap.get(branchKey(node.id, branch.id)) ?? branch.id,
+        next_block_label: branch.next_block_label
+          ? (labelMap.get(branch.next_block_label) ?? branch.next_block_label)
+          : branch.next_block_label,
       }));
       clonedData.activeBranchId = oldActiveBranchId
         ? (branchIdMap.get(branchKey(node.id, oldActiveBranchId)) ??
@@ -377,6 +382,14 @@ export function duplicateBlockBelow({
         : oldActiveBranchId;
       if (clonedData.mergeLabel && labelMap.has(clonedData.mergeLabel)) {
         clonedData.mergeLabel = labelMap.get(clonedData.mergeLabel)!;
+      }
+      if (
+        clonedData.inferredMergeLabel &&
+        labelMap.has(clonedData.inferredMergeLabel)
+      ) {
+        clonedData.inferredMergeLabel = labelMap.get(
+          clonedData.inferredMergeLabel,
+        )!;
       }
     }
 
