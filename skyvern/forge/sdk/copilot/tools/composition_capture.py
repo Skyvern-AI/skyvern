@@ -107,6 +107,7 @@ from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
+    _evidence_list_len,
     _mark_post_run_page_observed,
 )
 
@@ -1097,6 +1098,7 @@ def store_post_run_page_evidence(
         run_browser_session_id=run_browser_session_id,
         matched=source_browser_session_id == run_browser_session_id,
         granted=stamped.get("observed_after_workflow_run") is True,
+        key_value_relation_count=_evidence_list_len(stamped, "key_value_relations"),
     )
     if current_url and not stamped.get("current_url"):
         stamped["current_url"] = current_url
@@ -1530,7 +1532,6 @@ def _attach_author_time_levers(copilot_ctx: Any, evidence: dict[str, Any]) -> No
     ]
 
 
-COMPOSITION_INSPECTION_TOOL_NAME = "inspect_page_for_composition"
 CURRENT_PAGE_INSPECTION_TARGET = "current_page"
 _CURRENT_PAGE_INSPECTION_DESCRIPTION = """Inspect the page the browser is currently on before composing workflow blocks.
 
@@ -1540,9 +1541,7 @@ selectors, visible state or layout, before authoring blocks that fill fields, su
 filter results or expand result rows, and after a run to read the page that run stopped on.
 `target="debug"` (the default) reads the browser this chat drives; `target="last_run"` reads the
 browser used by the most recent test run. The packet describes the page only as it is at that
-moment: a control that appears solely after an interaction -- a Delete control after an Add click,
-a cart after add-to-cart, the secure area after login -- is absent from it until that interaction
-has happened.
+moment.
 
 Returns observed page evidence: current URL, title, navigation targets, form fields with labels and
 selectors, submit/search controls, result containers, compact visible text excerpts, anti-bot
@@ -1553,7 +1552,7 @@ ground concise block prompts. If a select reports `options_omitted=true`, `optio
 observed total and its selector remains available. If those options are needed, read that one select
 from browser code; do not repeat the full-page inspection. If a block run changes pages, inspect the
 reached page before authoring downstream form/search/result blocks. If the evidence shows required
-fields or controls that the user did not supply enough information for, ASK_QUESTION with that
+fields or controls that the user did not supply enough information for, ask the user for that
 observed missing input. If evidence is sufficient, compose and run workflow blocks from the observed
 fields. `challenge_state` reports what the page looks like, which is not what a run will do: it does
 not establish that a submit/search path is closed, and a run settles that.

@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import copy
+import io
 import json
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -9,21 +12,39 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote, urlparse
 
 import pytest
+import yaml
+from agents import FunctionTool
+from agents.mcp.util import MCPUtil
+from agents.tool_context import ToolContext
 from fastmcp import FastMCP
+from mcp import Tool as MCPTool
 from mcp.types import CallToolResult
+from PIL import Image
 from playwright.async_api import Route
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_module
 from skyvern.cli.core.client import get_active_api_key
+from skyvern.cli.core.result import ErrorCode, make_error
 from skyvern.cli.mcp_tools import mcp
+from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_state_error
+from skyvern.cli.mcp_tools.blocks import skyvern_block_validate
+from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import (
+    AGENT_BLOCKS_ONLY,
+    ALL_BLOCK_FAMILIES,
+    CODE_BLOCKS_ONLY,
+    AuthoringCapability,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+)
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM_NAME,
@@ -37,6 +58,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _transform_args,
     resolve_browser_session_binding,
 )
+from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
@@ -50,13 +72,22 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
     register_sensitive_origin_run_lease,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
     register_secret_scrub_value,
 )
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
+from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _with_action_reason, mcp_hooks
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
+from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _FOR_LOOP_EXAMPLE,
+    _FOR_LOOP_GUIDANCE,
+    _FOR_LOOP_PROPERTY_DESCRIPTIONS,
+    _build_skyvern_mcp_overlays,
+    get_skyvern_mcp_alias_map,
+)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -99,7 +130,7 @@ def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: p
     encoded = quote(secret, safe="")
     seen_parameters: list[dict[str, Any]] = []
 
-    def redact(value: Any, parameters: dict[str, Any]) -> Any:
+    def redact(value: Any, parameters: dict[str, Any], **_budget: object) -> Any:
         seen_parameters.append(parameters)
 
         def walk(node: Any) -> Any:
@@ -160,12 +191,63 @@ def test_a_driver_navigation_code_survives_a_scrubbed_value_that_spells_part_of_
     rescrubbed = mcp_adapter.scrub_model_facing_tool_result(ctx, flattened, tool_name="skyvern_navigate")
     assert rescrubbed["nav_error_code"] == flattened["nav_error_code"]
 
-    # A scrub that fails closed stays empty: a code written into it would turn a failed call into a success.
     register_secret_scrub_value(ctx, "target")
     fail_closed = mcp_adapter.scrub_model_facing_tool_result(
         ctx, {**flattened, "target": {"page": 0}}, tool_name="skyvern_navigate"
     )
-    assert fail_closed == {}
+    assert mcp_adapter.is_redaction_withheld(fail_closed) and fail_closed["ok"] is False
+    assert "nav_error_code" not in fail_closed and "ERR_TUNNEL" not in str(fail_closed)
+
+
+@pytest.mark.parametrize("size_is_registered", [False, True])
+def test_a_withheld_result_keeps_its_disposition_across_rescrubs_and_logs_once(size_is_registered: bool) -> None:
+    ctx = make_copilot_ctx()
+    register_secret_scrub_value(ctx, "data")
+    raw = {"ok": True, "data": {"result": "signed-in page text"}}
+    size = len(json.dumps(raw, ensure_ascii=False))
+    if size_is_registered:
+        register_secret_scrub_value(ctx, str(size))
+    outcome = mcp_adapter._browser_call_outcome_from_mapping(
+        raw_tool_name="skyvern_evaluate", source_browser_session_id=None, raw_result=raw
+    )
+
+    with capture_logs() as logs:
+        first = mcp_adapter.scrub_model_facing_tool_result(ctx, raw, tool_name="skyvern_evaluate")
+        withheld_outcome = outcome.with_raw_result(first)
+        projected = mcp_adapter._project_browser_call_outcome(withheld_outcome, display_tool_name="evaluate")
+        second = mcp_adapter.scrub_model_facing_tool_result(ctx, projected, tool_name="skyvern_evaluate")
+
+    assert first == second and mcp_adapter.is_redaction_withheld(second)
+    assert (withheld_outcome.ok, withheld_outcome.payload_omitted, withheld_outcome.error_kind) == (False, True, "tool")
+    assert "signed-in page text" not in json.dumps([first, projected, second])
+    assert (str(size) in json.dumps(second)) is not size_is_registered
+    assert [log["event"] for log in logs if log["event"] == "copilot_model_facing_result_withheld"] == [
+        "copilot_model_facing_result_withheld"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_stub_browser_session")
+async def test_structured_evidence_reports_a_withheld_read_by_its_reason() -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_withheld_evidence")
+    register_secret_scrub_value(ctx, "data")
+    ctx.discovery_mcp_server = _make_server(
+        ctx,
+        {"ok": True, "data": {"result": json.dumps({"text": "signed-in page text"})}},
+        SchemaOverlay(requires_browser=True),
+        alias_map={"evaluate": "skyvern_evaluate"},
+    )
+    try:
+        evidence, error = await _composition_get_structured_evidence_result(
+            ctx, inspected_url="https://example.test/", current_url="https://example.test/"
+        )
+    finally:
+        clear_session_scrub_values(ctx.browser_session_id)
+
+    assert evidence is None
+    assert error is not None and error.startswith("structured page evidence was withheld: Result withheld")
+    assert "could not be redacted safely" in error and "too large" not in error
+    assert "returned an error" not in error and "signed-in" not in error
 
 
 @pytest.mark.parametrize(
@@ -213,7 +295,7 @@ def test_the_model_facing_scrub_reads_the_run_parameters_before_restoring_a_code
     """A redaction parameter never registered with the exact-value scrubber is still redacted, so the
     restore has to consult it too or it hands back what the parameter pass was hiding."""
 
-    def redact(value: object, parameters: dict[str, object]) -> object:
+    def redact(value: object, parameters: dict[str, object], **_budget: object) -> object:
         secret = str(next(iter(parameters.values())))
 
         def walk(node: object) -> object:
@@ -377,7 +459,6 @@ _PAYLOAD_KEYS_THAT_WOULD_LEAK = {"args", "merged_args", "arguments", "mcp_args",
 _BROWSER_BOOT_SECONDS = 2.0
 _MCP_CALL_SECONDS = 3.0
 _AFTER_CALL_SECONDS = 5.0
-_AFTER_CALL_MS = 5000
 _WALL_MS = 5000
 _SESSION_ONLY_MS = 2000
 _MCP_CALL_MS = 3000
@@ -1072,28 +1153,19 @@ class TestSharedBrowserCallOutcome:
         assert second["data"]["metadata"]["width"] == 1280
 
     @pytest.mark.asyncio
-    async def test_typed_internal_accessor_preserves_legacy_dict_and_drain_incomplete(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_typed_internal_accessor_preserves_legacy_dict(self) -> None:
         payload = {"ok": True, "data": {"result": {"count": 3}}}
         server = self._server(
             model_tool_name="evaluate",
             raw_tool_name="skyvern_evaluate",
             payload=payload,
         )
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _failed_drain() -> None:
-            raise RuntimeError("drain failed")
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failed_drain)
 
         typed = await server.call_internal_browser_tool("skyvern_evaluate", {"expression": "scan()"})
         legacy = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
 
         assert typed.result == legacy == mcp_to_copilot(payload)
         assert typed.outcome.dispatched is True
-        assert typed.outcome.evidence_drain_complete is False
         assert typed.outcome.source_browser_session_generation == 0
 
     @pytest.mark.asyncio
@@ -1504,16 +1576,10 @@ class TestSharedBrowserCallOutcome:
 class TestMCPToolTiming:
     @pytest.mark.asyncio
     async def test_internal_call_logs_the_server_total_without_changing_the_result(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+        self, _fake_clock: list[float]
     ) -> None:
         payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"sdk": 812, "total": 815}}
         server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
 
         with capture_logs() as captured:
             result = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
@@ -1805,6 +1871,18 @@ class TestMCPToolTiming:
         assert records[0]["wall_clock_ms"] == _WALL_MS
 
     @pytest.mark.asyncio
+    async def test_a_call_that_exceeds_its_ceiling_says_its_effect_is_unknown(self, _fake_clock: list[float]) -> None:
+        server = _server_whose_call_takes_time(TimeoutError(), SchemaOverlay(timeout=30), _fake_clock)
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert surfaced["error"] == (
+            f"evaluate did not answer within 30s and was cancelled. {mcp_adapter._EFFECT_UNKNOWN_GUIDANCE}"
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "payload",
         [
@@ -1985,7 +2063,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["call_status"] == "error"
         assert record["timing_phase"] is None
-        assert record["post_call_evidence_drain_ms"] is None
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -2115,71 +2192,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["phase_dispatch_untimed_ms"] is None
         assert record["timing_server_overrun"] is True
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("failure", "call_status"),
-        [
-            (asyncio.CancelledError(), "cancelled"),
-            (CopilotBrowserSessionUnavailable("pbs_1"), "session_error"),
-            (RuntimeError("drain exploded"), "error"),
-        ],
-        ids=["cancelled", "session_error", "error"],
-    )
-    async def test_an_evidence_drain_that_fails_still_reports_the_budget_it_spent(
-        self,
-        failure: BaseException,
-        call_status: str,
-        monkeypatch: pytest.MonkeyPatch,
-        _fake_clock: list[float],
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-        server._context_provider().browser_session_replacements = {"pbs_1": "pbs_replacement"}
-
-        async def _failing_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-            raise failure
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failing_drain)
-
-        with capture_logs() as captured:
-            if isinstance(failure, asyncio.CancelledError):
-                with pytest.raises(asyncio.CancelledError):
-                    await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-            else:
-                await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == call_status
-        assert record["wall_clock_ms"] == _WALL_MS
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["phase_residual_ms"] == 0
-        assert record["timing_phase"] == "evidence_drain"
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    async def test_an_evidence_drain_that_succeeds_reports_what_the_caller_waited_for_it(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
-
-        with capture_logs() as captured:
-            await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == "ok"
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["wall_clock_ms"] == _WALL_MS
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -3060,6 +3072,31 @@ async def test_browserless_surface_can_read_but_not_change_schedules() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("browser_tools_available", "expected"),
+    [
+        (True, ["create_browser_profile", "get_browser_profile", "list_browser_profiles"]),
+        (False, ["get_browser_profile", "list_browser_profiles"]),
+    ],
+)
+async def test_profile_create_needs_run_authority_and_takes_exactly_the_shared_sources(
+    browser_tools_available: bool, expected: list[str]
+) -> None:
+    tools, _ = await _listed_tools(browser_tools_available=browser_tools_available)
+
+    assert sorted(name for name in tools if "profile" in name) == expected
+    if browser_tools_available:
+        schema = tools["create_browser_profile"].inputSchema
+        assert set(schema["properties"]) - {USER_FACING_REASON_PARAM} == {
+            "name",
+            "description",
+            "browser_session_id",
+            "workflow_run_id",
+        }
+        assert schema["required"] == ["name"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", _SCHEDULE_TOOLS)
 async def test_schedule_tools_always_target_the_chat_workflow(tool_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
@@ -3073,6 +3110,90 @@ async def test_schedule_tools_always_target_the_chat_workflow(tool_name: str, mo
             {"workflow_schedule_id": "wfs_1", "workflow_permanent_id": "wpid_chat"},
         )
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_tools_available", [True, False])
+async def test_run_list_is_offered_without_a_workflow_id_and_with_a_status_filter(
+    browser_tools_available: bool,
+) -> None:
+    tools, _ = await _listed_tools(browser_tools_available=browser_tools_available)
+
+    properties = tools["list_workflow_runs"].inputSchema["properties"]
+    assert "workflow_id" not in properties
+    assert "search_key" not in properties
+    assert "error_code" not in properties
+    assert "status" in properties
+    assert "workflow_id" not in tools["list_workflow_runs"].inputSchema.get("required", [])
+
+
+@pytest.mark.asyncio
+async def test_run_list_always_targets_the_chat_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"runs": []}})
+
+    await server.call_tool("list_workflow_runs", {"workflow_id": "wpid_foreign", "status": ["terminated"]})
+
+    assert server._client.calls == [
+        ("skyvern_workflow_run_list", {"workflow_id": "wpid_chat", "status": ["terminated"]}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_list_shows_the_model_only_the_fields_that_pick_a_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    run = {
+        "run_id": "wr_1",
+        "status": "terminated",
+        "created_at": "2026-09-24T19:30:00Z",
+        "trigger_type": "scheduled",
+        "copilot_session_id": None,
+        "run_type": "workflow_run",
+        "failure_reason": "Login rejected for password hunter2-unseen",
+        "output_summary": {"present": True, "scalar_preview": {"api_token": "hunter2-unseen"}},
+        "artifact_summary": {"downloaded_file_names": ["hunter2-unseen.pdf"]},
+        "run_with": "agent",
+    }
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"runs": [run], "count": 1, "has_more": False}})
+
+    result = await server.call_tool("list_workflow_runs", {"status": ["terminated"]})
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["data"]["runs"] == [
+        {"run_id": "wr_1", "status": "terminated", "created_at": "2026-09-24T19:30:00Z", "trigger_type": "scheduled"}
+    ]
+    assert "hunter2-unseen" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args", "data"),
+    [
+        (
+            "list_workflow_runs",
+            {"status": ["terminated"]},
+            {"runs": [{"run_id": "wr_1", "failure_reason": "password hunter2-unseen"}]},
+        ),
+        (
+            "get_workflow_schedule",
+            {"workflow_schedule_id": "wfs_1"},
+            {"workflow_schedule_id": "wfs_1", "parameters": {"password": "hunter2-unseen"}},
+        ),
+    ],
+)
+async def test_a_crashed_stored_value_filter_withholds_the_result(
+    tool_name: str, args: dict[str, Any], data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": data})
+    server._overlays[tool_name] = replace(server._overlays[tool_name], post_hook=_crash)
+
+    result = await server.call_tool(tool_name, args)
+
+    assert result.isError is True
+    text = " ".join(content.text for content in result.content)
+    assert "withheld" in text
+    assert "hunter2-unseen" not in text
 
 
 @pytest.mark.asyncio
@@ -3532,7 +3653,7 @@ class TestPageStateOnBrowserResults:
 
     @skip_no_browser
     @pytest.mark.asyncio
-    async def test_a_result_the_scrub_empties_stays_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_result_the_scrub_withholds_stays_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_scrub_emptied")
         register_secret_scrub_value(ctx, "error")
         try:
@@ -3544,4 +3665,264 @@ class TestPageStateOnBrowserResults:
             clear_session_scrub_values(ctx.browser_session_id)
 
         assert result.isError is True
-        assert result.content == []
+        assert "redaction_withheld" in result.content[0].text and "timed out" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    name = "get_block_schema"
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name]},
+        allowlist=frozenset({aliases[name]}),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        advertised = await server.list_tools()
+        assert [tool.name for tool in advertised] == [name]
+        schema = advertised[0].inputSchema
+        assert "user_facing_reason" in schema["properties"]
+        assert "user_facing_reason" not in schema.get("required", [])
+        tool = MCPUtil.to_function_tool(advertised[0], server, convert_schemas_to_strict=False)
+        assert serialize_tool_surface([tool]).payload["tools"][0]["params_json_schema"] == schema
+        tc = ToolContext(context=ctx, tool_name=name, tool_call_id="schema-call", tool_arguments="{}")
+        for reason in (None, "", "   ", 17, {"bad": True}, "I will inspect the code block options."):
+            result = await tool.on_invoke_tool(tc, json.dumps({"block_type": "code", "user_facing_reason": reason}))
+            assert "input validation error" not in str(result).lower()
+            assert "code" in str(result)
+        original = _transform_args(
+            {"block_type": "code", "user_facing_reason": "Explain"}, _build_skyvern_mcp_overlays()[name]
+        )
+        assert original == {"block_type": "code"}
+    finally:
+        await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_frame_staged_inside_a_tool_names_the_call_that_staged_it() -> None:
+    ctx = make_copilot_ctx()
+
+    def stage(shade: int) -> None:
+        frame = io.BytesIO()
+        Image.new("RGB", (30, 20), (shade, shade, shade)).save(frame, format="PNG")
+        assert enqueue_screenshot(
+            ctx,
+            base64.b64encode(frame.getvalue()).decode(),
+            provenance=ScreenshotProvenance.unknown(source_tool="click"),
+        )
+
+    async def click_post_hook(result: dict[str, Any], raw: Any, copilot_ctx: Any) -> dict[str, Any]:
+        stage(10)
+        return result
+
+    async def native_body(tool_ctx: Any, arguments: str) -> str:
+        stage(20)
+        return "ok"
+
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={"click": SchemaOverlay(post_hook=click_post_hook)},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    server._client = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=SimpleNamespace(structured_content={"ok": True, "data": {}}, is_error=False, content=[])
+        )
+    )
+    mcp_click = MCPUtil.to_function_tool(
+        MCPTool(name="click", inputSchema={"type": "object", "properties": {}}),
+        server,
+        convert_schemas_to_strict=False,
+    )
+    native = _with_action_reason(
+        FunctionTool(
+            name="inspect",
+            description="",
+            params_json_schema={"type": "object", "properties": {}},
+            on_invoke_tool=native_body,
+        )
+    )
+
+    def call(name: str, call_id: str) -> ToolContext[Any]:
+        return ToolContext(context=ctx, tool_name=name, tool_call_id=call_id, tool_arguments="{}")
+
+    await mcp_click.on_invoke_tool(call("click", "call-mcp"), "{}")
+    await native.on_invoke_tool(call("inspect", "call-native"), "{}")
+    stage(30)
+
+    assert [frame.tool_call_id for frame in ctx.pending_chat_screenshots] == ["call-mcp", "call-native", None]
+
+
+@pytest.mark.asyncio
+async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    names = ("get_block_schema", "get_workflow_knowledge")
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name] for name in names},
+        allowlist=frozenset(aliases[name] for name in names),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        tools = {tool.name: tool for tool in await server.list_tools()}
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            tool = MCPUtil.to_function_tool(tools[name], server, convert_schemas_to_strict=False)
+            tc = ToolContext(context=ctx, tool_name=name, tool_call_id=f"{name}-call", tool_arguments="{}")
+            output = await tool.on_invoke_tool(tc, json.dumps(arguments))
+            return json.loads(output["text"])["data"]
+
+        schema_data = await call("get_block_schema", {"block_type": "for_loop"})
+        knowledge = (await call("get_workflow_knowledge", {"topics": ["for_loop_block"]}))["sections"]["for_loop_block"]
+    finally:
+        await server.cleanup()
+
+    schema = schema_data["schema"]
+    properties = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]["properties"]
+    assert {name: properties[name]["description"] for name in _FOR_LOOP_PROPERTY_DESCRIPTIONS} == (
+        _FOR_LOOP_PROPERTY_DESCRIPTIONS
+    )
+    assert schema_data["example"] == _FOR_LOOP_EXAMPLE
+    producer, loop = schema_data["example"]["blocks"]
+    assert loop["loop_over_parameter_key"] == f"{producer['label']}_output"
+    assert "loop_variable_reference" not in loop
+    assert knowledge["content"] == _FOR_LOOP_GUIDANCE
+    assert all(description in _FOR_LOOP_GUIDANCE for description in _FOR_LOOP_PROPERTY_DESCRIPTIONS.values())
+    assert yaml.safe_load(_FOR_LOOP_GUIDANCE.partition("the list):\n")[2]) == _FOR_LOOP_EXAMPLE
+    assert {"loop_over_parameter_key", "loop_variable_reference"} <= set(properties)
+
+    both_inputs = {
+        "block_type": "for_loop",
+        "label": "visit_each_row",
+        "loop_over_parameter_key": "parse_rows_output",
+        "loop_variable_reference": "current_value",
+        "loop_blocks": [{"block_type": "goto_url", "label": "open_row_url", "url": "{{ current_value.url }}"}],
+    }
+    submitted = copy.deepcopy(both_inputs)
+    assert _block_authoring_violations(submitted, AGENT_BLOCKS_ONLY) == []
+    assert submitted == both_inputs
+
+
+@pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])
+def test_every_aliased_tool_carries_a_copilot_description(capability: AuthoringCapability) -> None:
+    overlays = _build_skyvern_mcp_overlays(capability)
+
+    undescribed = [alias for alias in get_skyvern_mcp_alias_map() if not overlays[alias].description]
+
+    assert undescribed == []
+
+
+async def _real_validate_block_failure() -> dict[str, Any]:
+    return await skyvern_block_validate(block_json='{"block_type": "text_prompt"}')
+
+
+async def _real_get_workflow_failure() -> dict[str, Any]:
+    return await skyvern_workflow_get(workflow_id="not_a_wpid")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "server_failure"),
+    [
+        ("validate_block", {"block_json": '{"block_type": "text_prompt"}'}, _real_validate_block_failure),
+        ("get_org_workflow", {"workflow_id": "wpid_missing"}, _real_get_workflow_failure),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failed_server_call_reaches_the_model_without_the_servers_hint(
+    tool_name: str,
+    arguments: dict[str, Any],
+    server_failure: Callable[[], Awaitable[dict[str, Any]]],
+) -> None:
+    payload = await server_failure()
+    assert payload["error"]["hint"]
+    aliases = get_skyvern_mcp_alias_map()
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={tool_name: _build_skyvern_mcp_overlays()[tool_name]},
+        alias_map={tool_name: aliases[tool_name]},
+        allowlist=frozenset({aliases[tool_name]}),
+        context_provider=lambda: make_copilot_ctx(),
+    )
+    server._client = _FakeClient(payload)
+
+    result = await server.call_tool(tool_name, arguments)
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["ok"] is False
+    assert surfaced["error"] == payload["error"]["message"]
+    assert surfaced["error_code"] == payload["error"]["code"]
+    assert payload["error"]["hint"] not in result.content[0].text
+
+
+_CLICK_ARGS = {"selector": "#go"}
+
+
+@pytest.mark.usefixtures("_stub_browser_session")
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "server_error", "separator", "element_state"),
+    [
+        ("click", _CLICK_ARGS, action_deadline_error(TimeoutError("Timeout 5000ms exceeded.")), " ", None),
+        (
+            "click",
+            _CLICK_ARGS,
+            action_deadline_error(TimeoutError("Timeout 5000ms exceeded."), mutating=False),
+            " ",
+            None,
+        ),
+        ("click", _CLICK_ARGS, make_error(ErrorCode.TIMEOUT, "The page stopped answering!", "Retry it."), " ", None),
+        (
+            "wait_for_either_state",
+            {"selector_a": "#signed-in", "selector_b": "#sign-in", "state": "visible"},
+            make_error(
+                ErrorCode.TIMEOUT,
+                "Neither '#signed-in' nor '#sign-in' reached 'visible' within 5000ms",
+                "Neither state was confirmed before the timeout elapsed",
+            ),
+            ". ",
+            None,
+        ),
+        (
+            "click",
+            _CLICK_ARGS,
+            element_state_error("disabled", TimeoutError("Timeout 5000ms exceeded."), selector="#go", timeout_ms=5000),
+            None,
+            "disabled",
+        ),
+    ],
+    ids=["mutating_timeout", "read_timeout", "exclaimed_timeout", "wait_timeout", "element_state"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_browser_action_reports_typed_facts_instead_of_the_servers_hint(
+    tool_name: str,
+    arguments: dict[str, Any],
+    server_error: dict[str, Any],
+    separator: str | None,
+    element_state: str | None,
+) -> None:
+    server = _overlay_server(
+        make_copilot_ctx(browser_session_id="pbs_1"),
+        _FakeClient({"ok": False, "error": server_error}),
+        tool_name,
+        _build_skyvern_mcp_overlays()[tool_name],
+    )
+
+    result = await server.call_tool(tool_name, arguments)
+
+    surfaced = json.loads(result.content[0].text)
+    assert surfaced["ok"] is False
+    assert surfaced["error"] == (
+        server_error["message"]
+        if separator is None
+        else f"{server_error['message']}{separator}{mcp_adapter._EFFECT_UNKNOWN_GUIDANCE}"
+    )
+    assert surfaced.get("element_state") == element_state
+    assert server_error["hint"] not in result.content[0].text

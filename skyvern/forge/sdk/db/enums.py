@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Literal, TypeAlias
 
 
 class OrganizationAuthTokenType(StrEnum):
@@ -83,3 +84,40 @@ JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
 
 def is_job_recipe_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
     return trigger_type in JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES
+
+
+class WorkflowRunStatus(StrEnum):
+    created = "created"
+    queued = "queued"
+    running = "running"
+    failed = "failed"
+    terminated = "terminated"
+    canceled = "canceled"
+    timed_out = "timed_out"
+    completed = "completed"
+    paused = "paused"
+
+    def is_final(self) -> bool:
+        return self in [
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.timed_out,
+            WorkflowRunStatus.completed,
+        ]
+
+    def is_final_excluding_canceled(self) -> bool:
+        """Like :meth:`is_final` but excludes ``canceled``.
+
+        For callers that can't distinguish a legitimate user/block cancel from
+        a synthetic ``canceled`` written as a last-resort fallback — e.g. the
+        copilot tool reading the row AFTER ``mark_workflow_run_as_canceled_if_not_final``
+        has run. Callers that want to trust a legitimate ``canceled`` must read
+        the row BEFORE invoking any cancel helper.
+        """
+        return self.is_final() and self is not WorkflowRunStatus.canceled
+
+
+# An alias, not an inline Literal at each use: the per-file pre-commit mypy run (follow_imports = skip) sees an
+# imported WorkflowRunStatus as Any, and Literal[Any] is a valid-type error there.
+DispatchFinalizationStatus: TypeAlias = Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out]

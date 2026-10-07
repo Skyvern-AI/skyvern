@@ -26,6 +26,8 @@ from skyvern.webeye import display_recorder as dr
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
+from skyvern.webeye.profile_cookie_merge import write_signin_cookies
+from tests.unit._chrome_profile_fixtures import history_row_counts, write_profile_with_prior_download
 
 
 @pytest.mark.asyncio
@@ -167,6 +169,27 @@ async def test_create_browser_context_gates_playwright_video_on_acquired_recorde
     await BrowserContextFactory.create_browser_context(playwright=object())
 
     assert listener.called is expect_listener
+
+
+@pytest.mark.asyncio
+async def test_factory_restores_sign_in_seed_with_banked_cookies_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    write_signin_cookies(str(tmp_path), [{"name": "sid", "value": "1", "domain": "portal.example.com", "path": "/"}])
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+
+    async def _creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        return context, BrowserArtifacts(browser_session_dir=str(tmp_path)), None
+
+    _factory_harness(monkeypatch)
+    BrowserContextFactory.register_type("test-signin-seed", _creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-signin-seed")
+
+    await BrowserContextFactory.create_browser_context(playwright=object())
+
+    assert [c["name"] for c in context.add_cookies.await_args.args[0]] == ["sid"]
+    factory_module.restore_banked_cookies.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -483,3 +506,75 @@ async def test_factory_closes_context_before_releasing_recorder_on_post_return_f
         assert (":99", "wr_t1") not in dr._REGISTRY and rec.is_stopped  # released + deregistered
     finally:
         dr._REGISTRY.pop((":99", "wr_t1"), None)
+
+
+def _stub_local_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> MagicMock:
+    monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
+    monkeypatch.setattr(
+        BrowserContextFactory,
+        "build_browser_args",
+        MagicMock(return_value={"record_har_path": str(tmp_path / "h.har")}),
+    )
+    monkeypatch.setattr(factory_module, "initialize_download_dir", lambda: str(tmp_path / "downloads"))
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock())
+    return playwright
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("creator_name", ["_create_headless_chromium", "_create_headful_chromium"])
+async def test_saved_profile_launch_drops_prior_downloads_and_keeps_login_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, creator_name: str
+) -> None:
+    from skyvern.forge import app
+
+    profile = tmp_path / "profile"
+    write_profile_with_prior_download(profile)
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(profile)))
+    playwright = _stub_local_launch(monkeypatch, tmp_path)
+
+    await getattr(factory_module, creator_name)(playwright, browser_profile_id="bp_test", organization_id="o_test")
+
+    assert history_row_counts(profile) == {"urls": 1, "downloads": 0, "downloads_url_chains": 0, "downloads_slices": 0}
+    assert not (profile / "Default" / "shared_proto_db").exists()
+    assert (profile / "Default" / "Cookies").read_bytes() == b"synthetic-cookie-jar"
+
+
+@pytest.mark.asyncio
+async def test_fresh_profile_launch_leaves_the_temp_profile_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from skyvern.forge import app
+
+    fresh = tmp_path / "fresh"
+    write_profile_with_prior_download(fresh)
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(fresh))
+    playwright = _stub_local_launch(monkeypatch, tmp_path)
+
+    await factory_module._create_headless_chromium(playwright, browser_profile_id="bp_test", organization_id="o_test")
+
+    assert history_row_counts(fresh)["downloads"] == 1
+    assert (fresh / "Default" / "shared_proto_db").exists()
+
+
+@pytest.mark.asyncio
+async def test_saved_profile_with_unreadable_history_still_launches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from skyvern.forge import app
+
+    profile = tmp_path / "profile"
+    write_profile_with_prior_download(profile)
+    (profile / "Default" / "History").write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(profile)))
+    playwright = _stub_local_launch(monkeypatch, tmp_path)
+
+    _, artifacts, _ = await factory_module._create_headless_chromium(
+        playwright, browser_profile_id="bp_test", organization_id="o_test"
+    )
+
+    assert artifacts.applied_browser_profile_id == "bp_test"
+    playwright.chromium.launch_persistent_context.assert_awaited_once()
+    assert (profile / "Default" / "History").read_bytes() == b"not a sqlite database"
+    assert not (profile / "Default" / "shared_proto_db").exists()

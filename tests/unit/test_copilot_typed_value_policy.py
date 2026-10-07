@@ -287,13 +287,3 @@ async def test_publish_file_contract_is_advertised_only_when_test_runs_reach_the
     assert (contract is None) is inline_opt_in
     if contract is not None:
         assert contract["call"].startswith("await publish_file(")
-
-
-def test_code_only_evaluate_guidance_supports_grounded_download_authoring() -> None:
-    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_overlay_description
-
-    description = _evaluate_overlay_description(BlockAuthoringPolicy.CODE_ONLY_BROWSER)
-
-    assert "rather than authoring the download yourself" not in description
-    assert "capture a stable selector" in description
-    assert "author the terminal download step from the code-block schema contract" in description

@@ -24,16 +24,15 @@ export const CREATE_STUDIO_PANES: readonly StudioPaneId[] = [
 ];
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
   "copilot",
-  "browser",
   "editor",
 ];
 
 // The run surfaces: cold-entry run-class views open exactly these, and in-app
 // run starts (full run or block ▶) append them to whatever is already open —
-// appends never rearrange or close panes.
+// appends never rearrange or close panes. Order is text left, screen right.
 export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
-  "browser",
   "overview",
+  "browser",
 ];
 
 // Panes that mutate the workflow (Copilot builds, Editor saves), as opposed to

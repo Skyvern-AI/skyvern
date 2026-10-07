@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +13,9 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
+from skyvern.forge.taskv3 import loop as taskv3_loop
 from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
-    GoalVerdict,
     NonCompletedStatus,
     ToolTrail,
     TrailEntry,
@@ -34,6 +36,7 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER, redact_secrets_from_text
+from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
 PAGE_TEXT = "Order summary\nShipping address: 12 Example Road\nStatus: Draft"
@@ -56,14 +59,10 @@ async def _judged_prompt(*, typed: str, reason: str, output: str, prose: str) ->
         return {"verdict": "achieved", "quote": "", "missing": ""}
 
     trail = ToolTrail()
-
-    async def goal_check() -> GoalVerdict:
-        return await run_goal_check(goal="Save the shipping address.", trail=trail, judge=judge, timeout_seconds=5)
-
     tools = [
         _tool("observe", PAGE_TEXT, compactable=True),
         _tool("type", "typed into #address", billable=True),
-        make_finish_tool(goal_check=goal_check, goal_check_enforce=True),
+        make_finish_tool(),
     ]
     script = [
         [("observe", {})],
@@ -80,6 +79,7 @@ async def _judged_prompt(*, typed: str, reason: str, output: str, prose: str) ->
         tool_trail=trail,
     )
     assert outcome.status == "completed"
+    await run_goal_check(goal="Save the shipping address.", trail=trail, judge=judge, timeout_seconds=5)
     assert len(prompts) == 1
     return prompts[0]
 
@@ -276,14 +276,6 @@ def test_a_secret_cut_by_truncation_never_leaks_in_part() -> None:
 
     for text in (prompt, evidence):
         assert not any(_SECRET[i : i + 4] in text for i in range(len(_SECRET) - 3))
-
-
-@pytest.mark.parametrize(
-    ("quote", "source"),
-    [("SCREENSHOT: an empty form", "screenshot"), ("Status: Draft", "text"), ("", "none")],
-)
-def test_the_logged_quote_source_names_where_a_quote_came_from(quote: str, source: str) -> None:
-    assert GoalVerdict("not_achieved", quote, "", None, 0.0).quote_source == source
 
 
 @pytest.mark.asyncio
@@ -740,7 +732,7 @@ class _ReaskSpy:
         )
 
 
-def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool, goal: str | None) -> dict[str, Any]:
+def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool) -> dict[str, Any]:
     fingerprints = iter(f"fp-{i}" for i in range(1000))
 
     async def fingerprint() -> str | None:
@@ -752,11 +744,7 @@ def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool, goal: str | N
     async def verification_blocker(status: str) -> str | None:
         return "the verification code step failed" if blocked and status in ("completed", "converted") else None
 
-    async def goal_check() -> GoalVerdict:
-        assert goal is not None
-        return GoalVerdict(goal, "Status: Draft" if goal != "achieved" else "", "x", None, 0.0)  # type: ignore[arg-type]
-
-    kwargs: dict[str, Any] = {
+    return {
         "page_fingerprint": fingerprint,
         "settle_wait_seconds": 0.0,
         "pending_marker": pending_marker,
@@ -764,24 +752,15 @@ def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool, goal: str | N
         "verification_blocker": verification_blocker,
         "activity": ActivityRecency(),
     }
-    if goal is not None:
-        kwargs["goal_check"] = goal_check
-        kwargs["goal_check_enforce"] = True
-    return kwargs
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("blocked", [False, True])
 @pytest.mark.parametrize("unsettled", [False, True])
-@pytest.mark.parametrize("goal", [None, "achieved", "not_achieved", "impossible"])
-async def test_a_completed_finish_never_reaches_the_reask(
-    pending: bool, blocked: bool, unsettled: bool, goal: str | None
-) -> None:
+async def test_a_completed_finish_never_reaches_the_reask(pending: bool, blocked: bool, unsettled: bool) -> None:
     spy = _ReaskSpy()
-    finish = make_finish_tool(
-        **_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled, goal=goal), unlisted_reask=spy
-    )
+    finish = make_finish_tool(**_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled), unlisted_reask=spy)
 
     # Every hold and deferral the gates grant, then the verdict that stands.
     for _ in range(6):
@@ -793,7 +772,7 @@ async def test_a_completed_finish_never_reaches_the_reask(
     # The same gates let a terminated finish through to it, so the probe above can fire.
     control_spy = _ReaskSpy()
     control = make_finish_tool(
-        **_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled, goal=goal), unlisted_reask=control_spy
+        **_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled), unlisted_reask=control_spy
     )
     await control.handler({"status": "terminated", "reason": "no PIN screen"})
     assert control_spy.calls == [("terminated", "no PIN screen")]
@@ -805,9 +784,7 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
     status: NonCompletedStatus,
 ) -> None:
     spy = _ReaskSpy()
-    finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None), unlisted_reask=spy
-    )
+    finish = make_finish_tool(**_gate_kwargs(pending=False, blocked=False, unsettled=False), unlisted_reask=spy)
     result = await finish.handler({"status": status, "reason": "no PIN screen", "extracted_output": None})
     assert result.data == {
         "status": "completed",
@@ -817,16 +794,10 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
         "converted_from_reason": "no PIN screen",
     }
 
-    # The goal check in enforce mode vetoes a conversion it contradicts, as it would a claimed completion.
-    for veto in ("pending", "blocked", "unsettled", "goal_check"):
+    for veto in ("pending", "blocked", "unsettled"):
         spy = _ReaskSpy()
         finish = make_finish_tool(
-            **_gate_kwargs(
-                pending=veto == "pending",
-                blocked=veto == "blocked",
-                unsettled=veto == "unsettled",
-                goal="not_achieved" if veto == "goal_check" else None,
-            ),
+            **_gate_kwargs(pending=veto == "pending", blocked=veto == "blocked", unsettled=veto == "unsettled"),
             unlisted_reask=spy,
         )
         with capture_logs() as logs:
@@ -842,12 +813,212 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
                 "pending": "pending_marker",
                 "blocked": "verification_blocker",
                 "unsettled": "unsettled",
-                "goal_check": "goal_check",
             }[veto]
         )
         # Once per run: a second give-up is not re-asked.
         await finish.handler({"status": status, "reason": "again"})
         assert len(spy.calls) == 1
+
+
+class _SettleWindowPage:
+    """Fingerprint pairs settle on the samples `settles` marks; the document identity moves once `moves_after`
+    settle samples have been taken (None: never)."""
+
+    def __init__(self, settles: tuple[bool, ...], moves_after: int | None) -> None:
+        self.settles = settles
+        self.moves_after = moves_after
+        self.fingerprint_calls = 0
+
+    async def fingerprint(self) -> str | None:
+        sample = self.fingerprint_calls // 2
+        self.fingerprint_calls += 1
+        if sample < len(self.settles) and self.settles[sample]:
+            return f"settled-{sample}"
+        return f"fp-{self.fingerprint_calls}"
+
+    async def identity(self) -> str | None:
+        moved = self.moves_after is not None and self.fingerprint_calls // 2 >= self.moves_after
+        return "https://example.com/next|nonce-b" if moved else "https://example.com/form|nonce-a"
+
+
+async def _conversion_veto_for(**overrides: Any) -> tuple[str | None, bool]:
+    kwargs = _gate_kwargs(pending=False, blocked=False, unsettled=False)
+    kwargs.update(overrides)
+    finish = make_finish_tool(**kwargs, unlisted_reask=_ReaskSpy())
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    completed = result.data is not None and result.data["status"] == "completed"
+    assert completed == line["converted"]
+    return line["veto"], line["converted"]
+
+
+@pytest.mark.asyncio
+async def test_a_conversion_is_vetoed_by_the_settle_gate_only_when_the_document_changes_identity() -> None:
+    """With a readable identity, a conversion is refused by the settle gate only when the document changed
+    across the window, settled or not. An unchanged document is never refused."""
+    mismatches = []
+    for max_settle_deferrals in range(4):
+        window = max_settle_deferrals + 1
+        for settles in itertools.product([False, True], repeat=window):
+            for moves_after in [None, *range(1, window + 1)]:
+                page = _SettleWindowPage(settles, moves_after)
+                veto, converted = await _conversion_veto_for(
+                    page_fingerprint=page.fingerprint,
+                    document_identity=page.identity,
+                    max_settle_deferrals=max_settle_deferrals,
+                )
+                samples_taken = settles.index(True) + 1 if any(settles) else window
+                moved = moves_after is not None and samples_taken >= moves_after
+                expected = "navigating" if moved else None
+                if veto != expected or converted != (expected is None):
+                    mismatches.append((max_settle_deferrals, settles, moves_after, veto, converted))
+    assert mismatches == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["no_identity", "cancel", "cancel_raises"])
+async def test_a_conversion_on_a_page_that_never_settles_fails_closed_without_an_identity_or_on_cancel(
+    case: str,
+) -> None:
+    page = _SettleWindowPage(settles=(), moves_after=None)
+
+    async def should_cancel() -> bool:
+        # The veto's own first gate runs before any sample; only a cancel inside the window is under test.
+        if not case.startswith("cancel") or page.fingerprint_calls < 2:
+            return False
+        if case == "cancel_raises":
+            raise RuntimeError("cancel store unreachable")
+        return True
+
+    veto, converted = await _conversion_veto_for(
+        page_fingerprint=page.fingerprint,
+        document_identity=None if case == "no_identity" else page.identity,
+        should_cancel=should_cancel,
+    )
+
+    assert (veto, converted) == ("canceled" if case.startswith("cancel") else "unsettled", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settles", [(), (True,)])
+@pytest.mark.parametrize("read", ["before", "after"])
+@pytest.mark.parametrize("failure", ["none", "raises"])
+async def test_an_unreadable_document_identity_vetoes_a_conversion_even_on_a_settled_page(
+    settles: tuple[bool, ...], read: str, failure: str
+) -> None:
+    page = _SettleWindowPage(settles=settles, moves_after=None)
+    reads = 0
+
+    async def identity() -> str | None:
+        nonlocal reads
+        reads += 1
+        if (reads == 1) != (read == "before"):
+            return await page.identity()
+        if failure == "raises":
+            raise RuntimeError("execution context destroyed")
+        return None
+
+    veto, converted = await _conversion_veto_for(page_fingerprint=page.fingerprint, document_identity=identity)
+
+    assert (veto, converted) == ("identity_unreadable", False)
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_during_the_judge_vetoes_a_conversion_even_once_the_new_page_settles() -> None:
+    page = _SettleWindowPage(settles=(True,), moves_after=None)
+
+    class _NavigatingJudge(_ReaskSpy):
+        async def __call__(self, status: NonCompletedStatus, reason: str) -> UnlistedReask:
+            page.moves_after = 0
+            return await super().__call__(status, reason)
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False)
+        | {"page_fingerprint": page.fingerprint, "document_identity": page.identity},
+        unlisted_reask=_NavigatingJudge(),
+    )
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    assert result.data is not None and result.data["status"] == "terminated"
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert (line["veto"], line["settled"], line["settle_rounds"]) == ("navigating", True, 1)
+
+
+class _ScopedClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_inside_the_conversion_settle_window_vetoes_without_sleeping_past_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _ScopedClock()
+
+    async def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    monkeypatch.setattr(taskv3_loop, "time", clock)
+    monkeypatch.setattr(taskv3_loop, "asyncio", ScopedAsyncio(sleep=sleep))
+    page = _SettleWindowPage(settles=(), moves_after=None)
+
+    veto, converted = await _conversion_veto_for(
+        page_fingerprint=page.fingerprint,
+        document_identity=page.identity,
+        max_settle_deferrals=3,
+        settle_wait_seconds=4.0,
+        deadline_at=10.0,
+    )
+
+    assert (veto, converted) == ("deadline", False)
+    assert clock.now == 10.0
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_that_elapses_during_the_judge_still_vetoes_as_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_settled reads a missing sample as settled (its own docstring), so a deadline that elapses
+    between the pre-judge identity read and the settle loop's first round must still surface as
+    "deadline" -- not "identity_unreadable" from the closing read finding nothing left to sample."""
+    clock = _ScopedClock()
+
+    async def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    monkeypatch.setattr(taskv3_loop, "time", clock)
+    monkeypatch.setattr(taskv3_loop, "asyncio", ScopedAsyncio(sleep=sleep))
+    page = _SettleWindowPage(settles=(), moves_after=None)
+
+    class _SlowJudge(_ReaskSpy):
+        async def __call__(self, status: NonCompletedStatus, reason: str) -> UnlistedReask:
+            clock.now = 10.0  # the deadline elapses while the judge call is in flight
+            return await super().__call__(status, reason)
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False)
+        | {
+            "page_fingerprint": page.fingerprint,
+            "document_identity": page.identity,
+            "pending_marker": None,
+            "deadline_at": 10.0,
+        },
+        unlisted_reask=_SlowJudge(),
+    )
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    assert result.data is not None and result.data["status"] == "terminated"
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert line["veto"] == "deadline"
 
 
 @pytest.mark.asyncio
@@ -867,7 +1038,7 @@ async def test_a_run_canceled_during_the_reask_is_left_to_the_loops_cancellation
         return canceled
 
     finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None),
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
         should_cancel=should_cancel,
         unlisted_reask=_CancelingSpy(converts=converts),
     )

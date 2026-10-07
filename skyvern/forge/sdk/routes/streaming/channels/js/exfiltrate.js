@@ -16,6 +16,9 @@
       "change",
       "keydown",
       "mouseenter",
+      "dragstart",
+      "drop",
+      "dragend",
     ]);
 
     const cssEscape =
@@ -285,6 +288,9 @@
       "scroll",
       "contextmenu",
       "dblclick",
+      "dragstart",
+      "drop",
+      "dragend",
     ].forEach((eventType) => {
       document.addEventListener(
         eventType,
@@ -512,6 +518,7 @@
                   ? e.target?.type || null
                   : null,
               autocomplete,
+              inChildFrame: window !== window.top,
             },
             inputValue: secretField
               ? null

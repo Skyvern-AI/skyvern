@@ -37,6 +37,7 @@ import {
   type WorkflowSaveData,
 } from "./WorkflowHasChangesStore";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { useRecordingFeedbackStore } from "./RecordingFeedbackStore";
 import { useRecordingStore } from "./useRecordingStore";
 import {
   confirmCodeCacheDeletion,
@@ -58,7 +59,10 @@ import {
   withCopilotAcceptance,
 } from "./WorkflowYamlEditorStore";
 
-import { WorkflowSavePendingNotice } from "@/routes/workflows/editor/WorkflowYamlEditor";
+import {
+  WorkflowSaveConflictNotice,
+  WorkflowSavePendingNotice,
+} from "@/routes/workflows/editor/WorkflowYamlEditor";
 
 const mocks = vi.hoisted(() => ({
   workflowId: "wpid-1",
@@ -86,6 +90,7 @@ vi.mock("@/routes/workflows/studio/useStudioPanes", () => ({
 }));
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: vi.fn(),
+  getRecordBrowserContext: () => ({}),
   markRecordBrowserProcessed: vi.fn(),
   setRecordBrowserContext: vi.fn(),
 }));
@@ -402,6 +407,157 @@ describe("workflow recording attachment", () => {
     expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
   });
 
+  it.each([
+    ["after", false],
+    ["before", true],
+  ])(
+    "keeps the second save latest when a PUT held across reload reaches the server %s Discard",
+    async (_, heldLandsFirst) => {
+      const server = [{ ...saveData.workflow, title: "Loaded" }];
+      const serve = (body: string, params: { expected_version?: number }) => {
+        const latest = server[server.length - 1]!;
+        if (
+          params.expected_version !== undefined &&
+          params.expected_version !== latest.version
+        )
+          return { status: 409 } as const;
+        const saved = {
+          ...latest,
+          version: latest.version + 1,
+          title: parseYaml(body).title,
+        };
+        server.push(saved);
+        return { status: 200, data: saved } as const;
+      };
+      let held!: [string, { expected_version?: number }];
+      mocks.put
+        .mockImplementationOnce((_url, body, config) => {
+          held = [body, config.params];
+          return new Promise(() => {});
+        })
+        .mockImplementation(async (_url, body, config) => {
+          const response = serve(body, config.params);
+          if (response.status === 409)
+            throw new AxiosError("conflict", undefined, undefined, undefined, {
+              status: 409,
+              data: { detail: "conflict" },
+            } as NonNullable<AxiosError["response"]>);
+          return response;
+        });
+      mocks.get.mockImplementation(async () => ({
+        data: server[server.length - 1],
+      }));
+      useWorkflowHasChangesStore.setState({
+        hasChanges: true,
+        hydrateSavedSettings: vi.fn(),
+        getSaveData: () => ({ ...saveData, title: "First save" }),
+      });
+      const firstTab = renderHook(() => useWorkflowSave(), { wrapper });
+      act(() => {
+        void firstTab.result.current.mutateAsync(undefined);
+      });
+      await waitFor(() => expect(mocks.put).toHaveBeenCalledOnce());
+      firstTab.unmount();
+
+      useWorkflowHasChangesStore.setState(
+        useWorkflowHasChangesStore.getInitialState(),
+      );
+      useWorkflowYamlEditorStore.setState(
+        useWorkflowYamlEditorStore.getInitialState(),
+      );
+      registerEditorOwner(createYamlCommitOwner("wpid-1"));
+      useWorkflowHasChangesStore.setState({
+        hydrateSavedSettings: vi.fn(),
+        getSaveData: () => ({ ...saveData, title: "Second save" }),
+      });
+      if (heldLandsFirst) serve(...held);
+      const reloaded = renderHook(
+        () => {
+          usePendingWorkflowSaveRecovery(saveData.workflow);
+          return useWorkflowSave();
+        },
+        { wrapper },
+      );
+      render(<WorkflowSavePendingNotice />);
+      await act(async () =>
+        fireEvent.click(
+          screen.getByRole("button", { name: "Discard pending save" }),
+        ),
+      );
+      act(() => useWorkflowHasChangesStore.getState().setHasChanges(true));
+      await act(async () => {
+        await reloaded.result.current.mutateAsync(undefined);
+      });
+      if (!heldLandsFirst) expect(serve(...held).status).toBe(409);
+
+      expect(server[server.length - 1]!.title).toBe("Second save");
+      expect(
+        mocks.put.mock.calls.map(
+          ([, , config]) => config.params.expected_version,
+        ),
+      ).toEqual(heldLandsFirst ? [1, 2] : [1, 1]);
+    },
+  );
+
+  it("keeps a rejected stale save on the canvas and reloads the latest version only on request", async () => {
+    const latest = {
+      ...saveData.workflow,
+      version: 3,
+      title: "Saved elsewhere",
+    };
+    mocks.put.mockRejectedValueOnce(
+      new AxiosError("conflict", undefined, undefined, undefined, {
+        status: 409,
+        data: { detail: "conflict" },
+      } as NonNullable<AxiosError["response"]>),
+    );
+    mocks.get.mockResolvedValueOnce({ data: latest });
+    const hydrate = vi.fn();
+    useWorkflowHasChangesStore.setState({
+      hasChanges: true,
+      hydrateSavedSettings: hydrate,
+    });
+    const hook = renderHook(() => useWorkflowSave(), { wrapper });
+    const viewHistory = vi.fn();
+    render(<WorkflowSaveConflictNotice onViewHistory={viewHistory} />);
+    act(() =>
+      useWorkflowYamlEditorStore.getState().open("title: Rejected draft\n"),
+    );
+
+    await act(async () => {
+      await hook.result.current.mutateAsync(undefined).catch(() => undefined);
+    });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "your changes were not saved",
+    );
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    expect(hydrate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "View history" }));
+    expect(viewHistory).toHaveBeenCalledOnce();
+
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reload latest" })),
+    );
+    expect(hydrate).toHaveBeenCalledExactlyOnceWith(latest, {
+      hydrateGraph: true,
+    });
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+      active: false,
+      draft: "",
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    await act(async () => {
+      await hook.result.current.mutateAsync(undefined);
+    });
+    expect(
+      mocks.put.mock.calls.map(
+        ([, , config]) => config.params.expected_version,
+      ),
+    ).toEqual([1, 3]);
+  });
+
   it("offers only Reload for a live PUT, including after an editor remount", async () => {
     let resolvePut!: (value: unknown) => void;
     mocks.put.mockImplementationOnce(
@@ -602,6 +758,9 @@ describe("workflow recording attachment", () => {
   );
 
   it("writes the pending-save marker without a degraded-mode notice when storage works", async () => {
+    useRecordingFeedbackStore
+      .getState()
+      .show({ workflow_permanent_id: "wpid-1" });
     let resolvePut!: (value: unknown) => void;
     mocks.put.mockReset().mockImplementationOnce(
       () =>
@@ -638,6 +797,7 @@ describe("workflow recording attachment", () => {
       await saving;
     });
     expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
+    expect(useRecordingFeedbackStore.getState().target).toBeNull();
   });
 
   it.each([false, true])(
@@ -713,6 +873,68 @@ describe("workflow recording attachment", () => {
       expect(useWorkflowTitleStore.getState().title).toBe(
         returnToOriginal ? "Original saved" : "Next title",
       );
+    },
+  );
+
+  it.each(["skyvern-3.0", null])(
+    "A46 keeps the cached effective_default_engine %s when a disposed-owner PUT without it hydrates the active editor",
+    async (cachedEngine) => {
+      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { staleTime: 5 * 60 * 1000, retry: false } },
+      });
+      const queryKey = ["workflow", "wpid-1"];
+      queryClient.setQueryData(queryKey, {
+        ...saveData.workflow,
+        effective_default_engine: cachedEngine,
+      });
+      function cacheWrapper({ children }: { children: ReactNode }) {
+        return (
+          <QueryClientProvider client={queryClient}>
+            {children}
+          </QueryClientProvider>
+        );
+      }
+      let resolvePut!: (value: unknown) => void;
+      mocks.put.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePut = resolve;
+          }),
+      );
+      const hook = renderHook(() => useWorkflowSave(), {
+        wrapper: cacheWrapper,
+      });
+      beginYamlCommit(owner);
+      let saving!: Promise<unknown>;
+      act(() => {
+        saving = hook.result.current.mutateAsync({
+          yamlCommit: {
+            owner,
+            revision: useWorkflowYamlEditorStore.getState().revision,
+          },
+        });
+      });
+      await waitFor(() => expect(mocks.put).toHaveBeenCalledOnce());
+      hook.unmount();
+      unregisterEditorOwner(owner);
+      registerEditorOwner(createYamlCommitOwner("wpid-1"));
+      const hydrate = vi.fn();
+      useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
+      await act(async () => {
+        resolvePut({
+          data: {
+            ...saveData.workflow,
+            title: "Original saved",
+          },
+        });
+        await saving;
+      });
+      expect(hydrate).toHaveBeenCalledOnce();
+      expect(queryClient.getQueryData(queryKey)).toMatchObject({
+        title: "Original saved",
+        effective_default_engine: cachedEngine,
+      });
     },
   );
 
@@ -1596,6 +1818,53 @@ describe("workflow recording attachment", () => {
       act(async () => result.current.mutateAsync(undefined)),
     ).rejects.toThrow("save failed");
 
+    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
+      "br-1",
+    );
+  });
+
+  it.each([
+    ["deletes the recording on a definite failure", true],
+    ["keeps it on a transport failure with an unknown outcome", false],
+  ])("after its marker was dropped mid-PUT, it %s", async (_, definite) => {
+    mocks.put.mockImplementation(async () => {
+      // Another editor's Record dropped the marker after this save captured it.
+      useWorkflowHasChangesStore.getState().clearPendingRecording("br-1");
+      throw new AxiosError(
+        "save failed",
+        undefined,
+        undefined,
+        undefined,
+        definite ? ({ status: 409, data: {} } as never) : undefined,
+      );
+    });
+    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+    await expect(
+      act(async () => result.current.mutateAsync(undefined)),
+    ).rejects.toThrow("save failed");
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (definite)
+      expect(mocks.delete).toHaveBeenCalledWith("/browser_recordings/br-1");
+    else expect(mocks.delete).not.toHaveBeenCalled();
+  });
+
+  it("does not delete a recording whose marker survives a failed save", async () => {
+    mocks.put.mockRejectedValue(
+      new AxiosError("save failed", undefined, undefined, undefined, {
+        status: 500,
+        data: {},
+      } as never),
+    );
+    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+    await expect(
+      act(async () => result.current.mutateAsync(undefined)),
+    ).rejects.toThrow("save failed");
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.delete).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
       "br-1",
     );

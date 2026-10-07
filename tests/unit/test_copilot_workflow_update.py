@@ -17,6 +17,7 @@ from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot import workflow_yaml as workflow_yaml_module
+from skyvern.forge.sdk.copilot.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
@@ -34,6 +35,29 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_round_trip_leaves_an_unset_block_engine_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Past the chosen-engine cutoff a written skyvern-1.0 is a pin, not the default an omitted engine runs.
+    blocks = [
+        {"block_type": "navigation", "label": "nav", "url": "https://example.com", "navigation_goal": "Go"},
+        {"block_type": "extraction", "label": "ex", "data_extraction_goal": "Read"},
+        {"block_type": "file_download", "label": "dl", "navigation_goal": "Download"},
+        {"block_type": "login", "label": "lg"},
+    ]
+    monkeypatch.setattr(
+        app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(side_effect=WorkflowNotFound("wp"))
+    )
+    document = {"title": "t", "workflow_definition": {"version": 2, "parameters": [], "blocks": blocks}}
+    stored = await _process_workflow_yaml("w", "wp", "o", yaml.safe_dump(document))
+
+    copilot_yaml = workflow_yaml_module.workflow_to_copilot_yaml(stored)
+    applied = await _process_workflow_yaml("w", "wp", "o", copilot_yaml, settings_fallback_workflow=stored)
+
+    assert all("engine" not in block for block in yaml.safe_load(copilot_yaml)["workflow_definition"]["blocks"])
+    assert all("engine" not in block for block in applied.model_dump(mode="json")["workflow_definition"]["blocks"])
+
 
 _SETTING_VALUES: dict[str, tuple[Any, Any]] = {
     "is_saved_task": (True, False),
@@ -357,6 +381,25 @@ def test_combined_tool_result_carries_sheet_tab_resolution() -> None:
     carried = carry_author_time_findings(update_result, {"ok": True, "data": {"message": "Ran 1 block."}})
 
     assert carried["data"]["google_sheet_tab_resolution"] == [fact]
+
+
+def test_combined_tool_result_carries_every_submission_rewrite_disclosure() -> None:
+    goal_disclosure = user_owned_goal_carry_disclosure(UserOwnedGoalCarry("", ["get_invoice"], ["old_label"]))
+    assert set(goal_disclosure) >= {"stored_goal_kept", "stored_goal_dropped"}
+    update_result: dict[str, Any] = {
+        "ok": True,
+        "data": {
+            "stored_code_rewritten": ["login"],
+            **goal_disclosure,
+            "google_connection_resolution": [{"label": "write_row", "resolved_to": "cred_1"}],
+        },
+    }
+    run_result: dict[str, Any] = {"ok": True, "data": {"message": "Ran 1 block."}}
+
+    carried = carry_author_time_findings(update_result, run_result)["data"]
+
+    for key, value in update_result["data"].items():
+        assert carried[key] == value
 
 
 _SAVE_CLAIM_PHRASES = ("updated successfully", "has been saved", "saved the workflow", "workflow was saved")

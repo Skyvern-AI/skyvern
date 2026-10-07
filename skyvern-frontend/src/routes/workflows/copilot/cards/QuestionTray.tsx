@@ -1,18 +1,19 @@
 import { useEffect, useId, useRef, type KeyboardEvent } from "react";
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  ChevronUpIcon,
-} from "@radix-ui/react-icons";
+import { CheckIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
-import type { QuestionStepper } from "../useQuestionStepper";
-import type { QuestionInteraction } from "../workflowCopilotTypes";
-
-const MAX_KEYED_CHOICES = 9;
+import { OTHER_CHOICE_ID, type QuestionStepper } from "../useQuestionStepper";
+import type {
+  QuestionChoice,
+  QuestionInteraction,
+} from "../workflowCopilotTypes";
+import { AttentionTray } from "./AttentionTray";
+import { keyedChoiceFor, MAX_KEYED_CHOICES } from "./keyedChoice";
 
 // One tray renders at a time, so the composer can name the prompt it is answering.
 export const QUESTION_PROMPT_ID = "copilot-question-prompt";
+// What the picked choice still needs typed, since a placeholder is not reliably announced.
+export const QUESTION_DETAIL_ID = "copilot-question-detail";
 
 export function QuestionTray({
   interaction,
@@ -23,9 +24,11 @@ export function QuestionTray({
   onCollapsedChange,
   onSend,
   onSkip,
+  onAnswerInComposer,
   onCancel,
   cancelDisabled,
   cancelTitle,
+  upNext,
 }: {
   interaction: QuestionInteraction;
   stepper: QuestionStepper;
@@ -37,9 +40,11 @@ export function QuestionTray({
   onCollapsedChange: (collapsed: boolean) => void;
   onSend: () => void;
   onSkip: () => void;
+  onAnswerInComposer: () => void;
   onCancel?: () => void;
   cancelDisabled?: boolean;
   cancelTitle?: string;
+  upNext?: string | null;
 }) {
   const titleId = useId();
   const advanceRef = useRef<HTMLButtonElement>(null);
@@ -54,78 +59,56 @@ export function QuestionTray({
   const total = interaction.parts.length;
   const part = interaction.parts[stepper.index];
   const noun = total === 1 ? "question" : "questions";
+  const choices: QuestionChoice[] = part?.choices.length
+    ? [...part.choices, { choice_id: OTHER_CHOICE_ID, text: "Other" }]
+    : [];
+  // Other never costs the generated choices their keys; it is unnumbered when it would be tenth.
+  const keyed = (part?.choices.length ?? 0) <= MAX_KEYED_CHOICES;
+  const advanceHint = stepper.advanceBlocked
+    ? "Type your answer in the message box to continue"
+    : undefined;
 
-  if (collapsed) {
-    return (
-      <div className="flex items-center gap-2 rounded-t-lg border border-b-0 border-amber-500/50 bg-amber-500/[0.06] px-3 py-1.5 text-xs">
-        <span
-          aria-hidden
-          className="size-2 shrink-0 rounded-full bg-amber-500"
-        />
-        <span className="min-w-0 flex-1 truncate font-semibold text-amber-700 dark:text-yellow-400">
-          Copilot is waiting on {total} {noun}
-        </span>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-6 px-2 text-xs"
-          aria-expanded={false}
-          onClick={() => onCollapsedChange(false)}
-        >
-          Show
-          <ChevronUpIcon className="ml-1 size-3.5" />
-        </Button>
-      </div>
-    );
-  }
+  const pick = (choiceId: string) => {
+    if (!part) return;
+    const picking = stepper.choices[part.part_id] !== choiceId;
+    stepper.toggleChoice(part.part_id, choiceId);
+    const needsText =
+      choiceId === OTHER_CHOICE_ID ||
+      part.choices.some(
+        (choice) => choice.choice_id === choiceId && choice.detail_prompt,
+      );
+    if (picking && needsText) onAnswerInComposer();
+  };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (disabled || !part || part.choices.length > MAX_KEYED_CHOICES) return;
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    const choice = part.choices[Number(event.key) - 1];
-    if (!/^[1-9]$/.test(event.key) || !choice) return;
+    if (disabled || !keyed) return;
+    const choice = keyedChoiceFor(event, choices);
+    if (!choice) return;
     event.preventDefault();
-    stepper.toggleChoice(part.part_id, choice.choice_id);
+    pick(choice.choice_id);
   };
 
   return (
-    <div
-      role="group"
+    <AttentionTray
       aria-label="Question parts"
       aria-describedby={titleId}
       data-interaction-id={interaction.interaction_id}
       onKeyDown={onKeyDown}
-      className="flex max-h-[50vh] min-w-0 flex-col overflow-hidden rounded-t-lg border border-b-0 border-amber-500/50 bg-amber-500/[0.06]"
+      title="Copilot needs your answer"
+      titleId={titleId}
+      meta={
+        total > 1 ? (
+          <span className="tabular-nums text-muted-foreground">
+            {stepper.index + 1} of {total}
+          </span>
+        ) : null
+      }
+      collapsedTitle={`Copilot is waiting on ${total} ${noun}`}
+      collapsed={collapsed}
+      onCollapsedChange={onCollapsedChange}
+      minimizeLabel="Minimize question"
+      upNext={upNext}
     >
-      <div className="flex items-center gap-2 px-3 pb-1 pt-2 text-xs">
-        <span
-          aria-hidden
-          className="size-2 shrink-0 rounded-full bg-amber-500 shadow-[0_0_0_3px_rgba(245,158,11,0.18)]"
-        />
-        <span
-          id={titleId}
-          className="min-w-0 truncate font-semibold text-amber-700 dark:text-yellow-400"
-        >
-          Copilot needs your answer
-        </span>
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          {total > 1 ? (
-            <span className="tabular-nums text-muted-foreground">
-              {stepper.index + 1} of {total}
-            </span>
-          ) : null}
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-6 text-muted-foreground"
-            aria-label="Minimize question"
-            aria-expanded
-            onClick={() => onCollapsedChange(true)}
-          >
-            <ChevronDownIcon className="size-3.5" />
-          </Button>
-        </div>
-      </div>
       {/* Stays mounted across steps so Back and Next read the new question to a screen reader
           whose focus is still in the composer. */}
       <span className="sr-only" aria-live="polite">
@@ -145,21 +128,18 @@ export function QuestionTray({
           >
             {part.prompt}
           </p>
-          {part.choices.length > 0 ? (
+          {choices.length > 0 ? (
             <div className="flex flex-wrap gap-1.5">
-              {part.choices.map((choice, choiceIndex) => {
+              {choices.map((choice, choiceIndex) => {
                 const selected =
                   stepper.choices[part.part_id] === choice.choice_id;
-                const keyed = part.choices.length <= MAX_KEYED_CHOICES;
                 return (
                   <button
                     key={choice.choice_id}
                     type="button"
                     disabled={disabled}
                     aria-pressed={selected}
-                    onClick={() =>
-                      stepper.toggleChoice(part.part_id, choice.choice_id)
-                    }
+                    onClick={() => pick(choice.choice_id)}
                     className={cn(
                       "flex max-w-full items-start gap-1.5 rounded-md border border-border bg-slate-elevation3 py-1 pl-1.5 pr-2.5 text-left text-xs transition-colors hover:border-muted-foreground",
                       "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-default disabled:opacity-60 disabled:hover:border-border",
@@ -171,7 +151,7 @@ export function QuestionTray({
                         aria-hidden
                         className="size-4 shrink-0 text-success"
                       />
-                    ) : keyed ? (
+                    ) : keyed && choiceIndex < MAX_KEYED_CHOICES ? (
                       <kbd
                         aria-hidden
                         className="h-4 min-w-4 shrink-0 rounded border border-border px-1 text-center font-mono text-[10px] leading-[14px] text-muted-foreground"
@@ -182,15 +162,28 @@ export function QuestionTray({
                     <span className="min-w-0 whitespace-pre-wrap break-words">
                       {choice.text}
                     </span>
+                    {choice.recommended ? (
+                      // The space keeps the tag a separate word in the button's accessible name.
+                      <span className="shrink-0 self-center rounded bg-badge-neutral px-1.5 text-[10px] font-medium leading-4 text-foreground">
+                        {" "}
+                        Recommended
+                      </span>
+                    ) : null}
                   </button>
                 );
               })}
             </div>
-          ) : (
+          ) : null}
+          {part.choices.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               Type your answer in the message box below.
             </p>
-          )}
+          ) : null}
+          {stepper.detailPrompt ? (
+            <span id={QUESTION_DETAIL_ID} className="sr-only">
+              {stepper.detailPrompt}
+            </span>
+          ) : null}
         </div>
       ) : null}
       <div
@@ -245,8 +238,12 @@ export function QuestionTray({
               ref={advanceRef}
               size="sm"
               className="h-7"
-              disabled={disabled || stepper.answeredCount === 0}
-              title={lockReason ?? undefined}
+              disabled={
+                disabled ||
+                stepper.answeredCount === 0 ||
+                stepper.advanceBlocked
+              }
+              title={lockReason ?? advanceHint}
               onClick={onSend}
             >
               Send
@@ -256,7 +253,8 @@ export function QuestionTray({
               ref={advanceRef}
               size="sm"
               className="h-7"
-              disabled={disabled}
+              disabled={disabled || stepper.advanceBlocked}
+              title={advanceHint}
               onClick={() => stepper.goTo(stepper.index + 1)}
             >
               Next
@@ -264,6 +262,6 @@ export function QuestionTray({
           )}
         </div>
       </div>
-    </div>
+    </AttentionTray>
   );
 }

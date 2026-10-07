@@ -37,6 +37,7 @@ import { summarizeWorkflowChanges, snapshotOf } from "./workflowChangesSummary";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TitleSection } from "../studio/StudioTopBar";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import type { WorkflowCopilotChatHistoryResponse } from "../copilot/workflowCopilotTypes";
 import { Status } from "@/api/types";
@@ -60,6 +61,7 @@ import {
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { applySopResultAtCurrentAppend } from "./workspaceAuthoringActions";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -1698,6 +1700,16 @@ describe("save failures stop navigation and block runs", () => {
         await chat!.onReviewWorkflow!(proposal, settle, null);
       });
       expect(screen.getByTestId("comparison")).toBeTruthy();
+      // The chat's hold reaches the open comparison as it changes, not as it stood at Review.
+      const hold = "Copilot is saving your accepted changes.";
+      act(() =>
+        useWorkflowHasChangesStore.getState().setSaveBlockedReason(hold),
+      );
+      expect(panelSpy.mock.lastCall?.[0]).toMatchObject({ lockReason: hold });
+      act(() =>
+        useWorkflowHasChangesStore.getState().setSaveBlockedReason(null),
+      );
+      expect(panelSpy.mock.lastCall?.[0]).toMatchObject({ lockReason: null });
       const review = useWorkflowPanelStore.getState().workflowPanelState.data!;
       const revision = useWorkflowYamlEditorStore.getState().revision;
       await act(async () => {
@@ -2017,7 +2029,77 @@ describe("save failures stop navigation and block runs", () => {
     cleanup();
     client.clear();
   });
-  test("saves a corrected required prompt through the navigation blocker before its debounce fires", async () => {
+  test("lays out a block measured during another owner's lock once the lock clears", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    const setNodes = vi.fn();
+    const canvasNodes: AppNode[] = [
+      { id: "node_1", type: "nodeAdder", position: { x: 0, y: 0 }, data: {} },
+    ];
+    let flowStore!: ReturnType<typeof useStoreApi<AppNode>>;
+    function Canvas() {
+      flowStore = useStoreApi<AppNode>();
+      return (
+        <FlowRenderer
+          nodes={canvasNodes}
+          edges={[]}
+          setNodes={setNodes}
+          setEdges={vi.fn()}
+          onNodesChange={vi.fn()}
+          onEdgesChange={vi.fn()}
+          initialTitle="Live agent"
+          workflow={liveWorkflow}
+        />
+      );
+    }
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/agents/wpid_live/edit"]}>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <Canvas />
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const owner = createYamlCommitOwner("wpid_live");
+    act(() => {
+      registerEditorOwner(owner);
+      expect(beginSaveTransaction(owner)).toBe(true);
+    });
+    setNodes.mockClear();
+    act(() =>
+      flowStore.getState().triggerNodeChanges([
+        {
+          type: "dimensions",
+          id: "node_1",
+          dimensions: { width: 40, height: 40 },
+        },
+      ]),
+    );
+    expect(setNodes).not.toHaveBeenCalled();
+    act(() => finishSaveTransaction(owner));
+    expect(setNodes).toHaveBeenCalledOnce();
+    cleanup();
+    client.clear();
+  });
+  function renderEmptyPromptNavigationWorkspace() {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -2110,6 +2192,38 @@ describe("save failures stop navigation and block runs", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    return { view, client };
+  }
+
+  test("a first text edit after load lights the unsaved-changes dot", () => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
+    try {
+      const prompt = view.container.querySelector<HTMLTextAreaElement>(
+        'textarea[name="navigationGoal"]',
+      );
+      vi.useFakeTimers();
+      fireEvent.keyDown(prompt!, { key: "O" });
+      fireEvent.change(prompt!, {
+        target: { value: "Open the dashboard" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
+    } finally {
+      view.unmount();
+      client.clear();
+      vi.useRealTimers();
+      clearDeferredEdits();
+    }
+  });
+
+  test("saves a corrected required prompt through the navigation blocker before its debounce fires", async () => {
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
     try {
       const prompt = view.container.querySelector<HTMLTextAreaElement>(
         'textarea[name="navigationGoal"]',
@@ -2211,6 +2325,91 @@ describe("save failures stop navigation and block runs", () => {
       client.clear();
     },
   );
+  test("Run asks about a saved Goal that is not applied yet; leaving the editor does not", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [
+        { label: "read_account", goal: "New", previousGoal: null },
+      ],
+    });
+    integration.realNavigation = true;
+    const workflow = {
+      ...(liveWorkflow as WorkflowApiResponse),
+      workflow_permanent_id: "wpid_live",
+    };
+    workflowQueryMock.mockReturnValue({ data: workflow, isLoading: false });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/agents/wpid_live/edit",
+          element: (
+            <ReactFlowProvider>
+              <DebugStoreContext.Provider
+                value={{ isDebugMode: false, blockRunsEnabled: false }}
+              >
+                <Link to="/agents/wpid_live/run">Run</Link>
+                <Link to="/away">Leave editor</Link>
+                <FlowRenderer
+                  nodes={[]}
+                  edges={[]}
+                  setNodes={vi.fn()}
+                  setEdges={vi.fn()}
+                  onNodesChange={vi.fn()}
+                  onEdgesChange={vi.fn()}
+                  initialTitle="Live agent"
+                  workflow={workflow}
+                />
+              </DebugStoreContext.Provider>
+            </ReactFlowProvider>
+          ),
+        },
+        { path: "/agents/wpid_live/run", element: <p>Run page</p> },
+        { path: "/away", element: <p>Away</p> },
+      ],
+      { initialEntries: ["/agents/wpid_live/edit"] },
+    );
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("link", { name: "Run" }));
+      expect(await screen.findByText("New Goal not applied")).toBeTruthy();
+      expect(router.state.location.pathname).toBe("/agents/wpid_live/edit");
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue without saving" }),
+      );
+      expect(await screen.findByText("Run page")).toBeTruthy();
+
+      await act(() => router.navigate("/agents/wpid_live/edit"));
+      fireEvent.click(screen.getByRole("link", { name: "Leave editor" }));
+      expect(await screen.findByText("Away")).toBeTruthy();
+    } finally {
+      cleanup();
+      client.clear();
+      integration.realNavigation = false;
+      useCopilotActionStore.setState({ pendingGoalChanges: [] });
+    }
+  });
   test.each([new SaveRefusedError(), new SaveStaleError()])(
     "does not start a block run after %s",
     async (error) => {
@@ -2278,6 +2477,240 @@ describe("save failures stop navigation and block runs", () => {
       client.clear();
     },
   );
+
+  const SAVE_HOLD = "Copilot is saving your accepted changes.";
+  const setSaveHold = (reason: string | null) =>
+    act(() =>
+      useWorkflowHasChangesStore.getState().setSaveBlockedReason(reason),
+    );
+
+  test("a save hold disables the navigation blocker's Save and keeps leaving live", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    navBlocker.state = "blocked";
+    const workflow = {
+      ...(liveWorkflow as WorkflowApiResponse),
+      workflow_permanent_id: "wpid_live",
+    };
+    workflowQueryMock.mockReturnValue({ data: workflow, isLoading: false });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/agents/wpid_live/edit"]}>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <FlowRenderer
+                nodes={[]}
+                edges={[]}
+                setNodes={vi.fn()}
+                setEdges={vi.fn()}
+                onNodesChange={vi.fn()}
+                onEdgesChange={vi.fn()}
+                initialTitle="Live agent"
+                workflow={workflow}
+              />
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      act(() => useWorkflowHasChangesStore.getState().setHasChanges(true));
+      setSaveHold(SAVE_HOLD);
+      const dialog = screen.getByRole("dialog", { description: SAVE_HOLD });
+      const save = () =>
+        within(dialog).getByRole("button", { name: "Save changes" });
+      expect(save().matches(":disabled")).toBe(true);
+      expect(
+        within(dialog)
+          .getByRole("button", { name: "Continue without saving" })
+          .matches(":disabled"),
+      ).toBe(false);
+
+      setSaveHold(null);
+      expect(save().matches(":disabled")).toBe(false);
+    } finally {
+      cleanup();
+      client.clear();
+    }
+  });
+
+  test("a save hold disables the cached-code confirmation's Yes and keeps Cancel live", () => {
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
+    try {
+      act(() =>
+        useWorkflowHasChangesStore
+          .getState()
+          .setShowConfirmCodeCacheDeletion(true),
+      );
+      setSaveHold(SAVE_HOLD);
+      const dialog = screen.getByRole("dialog", { description: SAVE_HOLD });
+      const yes = () => within(dialog).getByRole("button", { name: "Yes" });
+      expect(yes().matches(":disabled")).toBe(true);
+      expect(
+        within(dialog)
+          .getByRole("button", { name: "Cancel" })
+          .matches(":disabled"),
+      ).toBe(false);
+
+      setSaveHold(null);
+      expect(yes().matches(":disabled")).toBe(false);
+    } finally {
+      view.unmount();
+      client.clear();
+      clearDeferredEdits();
+    }
+  });
+
+  test("a save hold disables a block run and keeps its reason reachable", async () => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    integration.mockSave = true;
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    useWorkflowHasChangesStore.getState().setSaveBlockedReason(SAVE_HOLD);
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/agents/wpid_live/edit"]}>
+          <Routes>
+            <Route
+              path="/agents/:workflowPermanentId/*"
+              element={
+                <ReactFlowProvider>
+                  <DebugStoreContext.Provider
+                    value={{ isDebugMode: true, blockRunsEnabled: true }}
+                  >
+                    <BlockActionContext.Provider
+                      value={{
+                        requestDeleteNodeCallback: vi.fn(),
+                        duplicateNodeCallback: vi.fn(),
+                        transmuteNodeCallback: vi.fn(),
+                        toggleScriptForNodeCallback: vi.fn(),
+                      }}
+                    >
+                      <NodeHeader
+                        blockLabel="block_1"
+                        editable
+                        nodeId="node_1"
+                        totpIdentifier={null}
+                        totpUrl={null}
+                        type="code"
+                      />
+                    </BlockActionContext.Provider>
+                  </DebugStoreContext.Provider>
+                </ReactFlowProvider>
+              }
+            />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      // The name stays the action; why it is unavailable is the description.
+      const run = screen.getByRole("button", {
+        name: "Run this block",
+        description: `Save is paused: ${SAVE_HOLD}`,
+      });
+      expect(run.matches(":disabled")).toBe(true);
+      // A disabled button swallows its own tooltip trigger's events.
+      const wrapper = run.closest<HTMLElement>("[tabindex='0']");
+      expect(wrapper?.getAttribute("aria-describedby")).toBe(
+        run.getAttribute("aria-describedby"),
+      );
+      fireEvent.click(run);
+      expect(saveSpy).not.toHaveBeenCalled();
+
+      setSaveHold(null);
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Run this block" })),
+      );
+      await waitFor(() => expect(saveSpy).toHaveBeenCalledOnce());
+    } finally {
+      cleanup();
+      client.clear();
+    }
+  });
+
+  test("a save hold disables Save as Template and names the reason in the menu", async () => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    const save = vi.fn<() => Promise<void>>().mockResolvedValue();
+    const saveHook = vi
+      .spyOn(saveWorkflowModule, "useSaveWorkflow")
+      .mockReturnValue(save);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    useWorkflowHasChangesStore.getState().setSaveBlockedReason(SAVE_HOLD);
+    const control = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <EditorOverflowMenu />
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      fireEvent.keyDown(control.getByRole("button", { name: "More actions" }), {
+        key: "Enter",
+      });
+      // The name stays the action; the visible reason line is its description.
+      const held = await screen.findByRole("menuitem", {
+        name: "Save as Template",
+        description: SAVE_HOLD,
+      });
+      expect(held.getAttribute("aria-disabled")).toBe("true");
+      expect(held.textContent).toContain(SAVE_HOLD);
+      fireEvent.click(held);
+      expect(save).not.toHaveBeenCalled();
+
+      setSaveHold(null);
+      const released = screen.getByRole("menuitem", {
+        name: "Save as Template",
+      });
+      expect(released.getAttribute("aria-disabled")).toBeNull();
+      expect(released.getAttribute("aria-describedby")).toBeNull();
+    } finally {
+      control.unmount();
+      client.clear();
+      saveHook.mockRestore();
+    }
+  });
 });
 
 test("the editor browser stops indicating execution during a retry wait and resumes for the next attempt", () => {
@@ -2475,6 +2908,208 @@ describe("Discover recording handoff", () => {
       client.clear();
     },
   );
+});
+
+describe("Record Browser pending-change prompt", () => {
+  const del = vi.fn();
+
+  beforeEach(() => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useRecordingStore.getState().reset();
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useWorkflowPanelStore.setState(useWorkflowPanelStore.getInitialState());
+    activeRunQueryMock.mockReturnValue({
+      data: { active_run_session_id: null },
+    });
+    debugQueryMock.mockReturnValue({
+      data: { browser_session_id: "pbs_debug", status: "created" },
+    });
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow });
+    historyGet.mockResolvedValue({ data: {} });
+    del.mockReset().mockResolvedValue({ data: {} });
+    vi.mocked(axiosClientModule.getClient).mockResolvedValue({
+      put,
+      post,
+      get: historyGet,
+      delete: del,
+    } as never);
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRecordingStore.getState().reset();
+  });
+
+  function renderPendingWorkspace() {
+    const { nodes, edges } = getElements(
+      [],
+      apiWorkflowToSettings(liveWorkflow),
+      true,
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/agents/:workflowPermanentId/edit",
+          element: (
+            <WorkflowPermanentIdContext.Provider value="wpid_live">
+              <ReactFlowProvider>
+                <DebugStoreContext.Provider
+                  value={{ isDebugMode: false, blockRunsEnabled: false }}
+                >
+                  <Workspace
+                    initialNodes={nodes}
+                    initialEdges={edges}
+                    initialTitle="Live agent"
+                    workflow={liveWorkflow}
+                    embedded
+                  />
+                </DebugStoreContext.Provider>
+              </ReactFlowProvider>
+            </WorkflowPermanentIdContext.Provider>
+          ),
+        },
+      ],
+      { initialEntries: ["/agents/wpid_live/edit"] },
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    act(() => {
+      const changes = useWorkflowHasChangesStore.getState();
+      changes.setHasChanges(true);
+      changes.setPendingRecording("br_prev", "wpid_live");
+    });
+    return router;
+  }
+
+  async function clickBrowserPaneRecord() {
+    await waitFor(() =>
+      expect(
+        useRecordingLauncherStore.getState().startRecordingAtEnd,
+      ).not.toBeNull(),
+    );
+    act(() => useRecordingLauncherStore.getState().startRecordingAtEnd!());
+  }
+
+  test("the Browser pane Record button asks first, and Save and record saves before recording", async () => {
+    renderPendingWorkspace();
+    await clickBrowserPaneRecord();
+    expect(
+      screen.getByText("Save or discard changes before recording"),
+    ).toBeTruthy();
+    expect(useRecordingStore.getState().isRecording).toBe(false);
+
+    put.mockResolvedValue({
+      data: { ...(liveWorkflow as object), version: 2 },
+    });
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+    );
+    await waitFor(() =>
+      expect(useRecordingStore.getState().isRecording).toBe(true),
+    );
+    expect(put).toHaveBeenCalledOnce();
+    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(null);
+  });
+
+  test("Save and record does not record if the browser stopped being ready during the save", async () => {
+    renderPendingWorkspace();
+    await clickBrowserPaneRecord();
+    put.mockImplementation(async () => {
+      debugQueryMock.mockReturnValue({ data: undefined });
+      return { data: { ...(liveWorkflow as object), version: 2 } };
+    });
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+    );
+    await waitFor(() =>
+      expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
+        null,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useRecordingStore.getState().isRecording).toBe(false);
+  });
+
+  test("Discard and record reloads the saved workflow, deletes the old recording, then records", async () => {
+    renderPendingWorkspace();
+    await clickBrowserPaneRecord();
+    await act(async () =>
+      fireEvent.click(
+        screen.getByRole("button", { name: "Discard and record" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(useRecordingStore.getState().isRecording).toBe(true),
+    );
+    expect(put).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    await waitFor(() =>
+      expect(del).toHaveBeenCalledWith("/browser_recordings/br_prev"),
+    );
+  });
+
+  test("while a Copilot turn holds the editor, Discard stays disabled and nothing is deleted", async () => {
+    renderPendingWorkspace();
+    act(() =>
+      useWorkflowYamlEditorStore.setState({
+        copilotAcceptance: Symbol("copilot"),
+      }),
+    );
+    await clickBrowserPaneRecord();
+    const discard = screen.getByRole("button", { name: "Discard and record" });
+    expect((discard as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(discard);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(del).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
+      hasChanges: true,
+      pendingRecordingId: "br_prev",
+    });
+    act(() => useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }));
+  });
+
+  test("?record=1 arriving with pending changes asks once, and Cancel neither records nor asks again", async () => {
+    const router = renderPendingWorkspace();
+    await act(async () => {
+      await router.navigate("/agents/wpid_live/edit?record=1");
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByText("Save or discard changes before recording"),
+      ).toBeTruthy(),
+    );
+    expect(
+      new URLSearchParams(router.state.location.search).has("record"),
+    ).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Save or discard changes before recording"),
+      ).toBeNull(),
+    );
+    expect(useRecordingStore.getState().isRecording).toBe(false);
+    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
+      "br_prev",
+    );
+  });
 });
 
 describe("save callback content revisions", () => {
@@ -3373,6 +4008,9 @@ describe("A49 metadata authorship through editor actions", () => {
           const discard = screen.getByRole("button", {
             name: "Discard pending save",
           });
+          // The editor reads a change as user-driven only within a wall-clock window after the
+          // gesture, so hold the clock until hydration's effects have classified it.
+          vi.useFakeTimers({ toFake: ["Date"] });
           fireEvent.pointerDown(discard);
           fireEvent.click(discard);
           fireEvent.pointerUp(document);
@@ -3402,6 +4040,8 @@ describe("A49 metadata authorship through editor actions", () => {
         });
         expectHydrated(canonical);
         expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+        await act(async () => {});
+        vi.useRealTimers();
         if (release === "discard")
           await waitFor(() => expect(dirtyRefresh).toHaveBeenCalledWith(true));
         expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(false);

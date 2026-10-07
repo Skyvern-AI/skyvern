@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sys
 import time
 import typing
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 import structlog
@@ -30,6 +31,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from starlette.requests import Request
     from starlette.types import Message, Receive, Scope, Send
 
+    from skyvern.forge.sdk.services.request_principal import RequestPrincipal
+
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
@@ -52,8 +55,11 @@ _SENSITIVE_ENDPOINTS = {
     # body stays opaque; the route persists only its canonical redacted form.
     "POST /v1/workflow/copilot/chat-post",
     "POST /v1/workflow/copilot/question-response",
+    "POST /v1/workflow/copilot/steer",
     "POST /v1/workflow/copilot/credential-response",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
+    # Payment-provider events carry customer billing details (name, email, address, card metadata).
+    "POST /api/v1/stripe_webhook",
 }
 _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
@@ -61,6 +67,10 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
     # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
     re.compile(r"^[^ ]+ /mcp(?:/.*)?$", re.DOTALL),
+    # OAuth grants carry form-encoded client secrets and codes, and their responses carry tokens.
+    re.compile(r"^POST /oauth/(?:token|consent|callback)$"),
+    # Marketplace service routes return freshly minted client secrets.
+    re.compile(r"^POST /(?:api/)?v1/marketplace(?:/.*)?$"),
 )
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -85,9 +95,19 @@ class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
     org_age: int | None = None
+    principal: RequestPrincipal | None = None
+    principal_resolution_key: tuple[str, bytes | None] | None = None
+    principal_resolution_conflict: bool = False
+    bearer_identity_status: str | None = None
+    principal_resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    load_shed: bool = False
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
+
+
+def get_request_principal_state() -> _RequestIdentity | None:
+    return _request_identity.get()
 
 
 def set_request_organization(
@@ -105,6 +125,9 @@ def set_request_organization(
     if identity is None:
         return
     if organization_id:
+        if identity.principal is not None and organization_id != identity.principal.organization_id:
+            identity.principal_resolution_conflict = True
+            return
         identity.organization_id = organization_id
     if organization_name:
         identity.organization_name = organization_name
@@ -112,17 +135,49 @@ def set_request_organization(
         identity.org_age = org_age
 
 
-def _organization_log_fields() -> dict[str, str | int]:
+def mark_request_load_shed() -> None:
+    """Log this request's 503 at warning level: the server shed it on purpose under load, before doing any work."""
+    identity = _request_identity.get()
+    if identity is not None:
+        identity.load_shed = True
+
+
+def set_request_principal(
+    principal: RequestPrincipal,
+    resolution_key: tuple[str, bytes | None],
+    bearer_identity_status: str,
+) -> None:
+    identity = _request_identity.get()
+    if identity is None:
+        return
+    if identity.principal is None:
+        identity.principal = principal
+        identity.principal_resolution_key = resolution_key
+        identity.bearer_identity_status = bearer_identity_status
+    elif identity.principal_resolution_key != resolution_key:
+        identity.principal_resolution_conflict = True
+
+
+def _identity_log_fields() -> dict[str, str | int | bool | None]:
     identity = _request_identity.get()
     if identity is None:
         return {}
-    fields: dict[str, str | int] = {}
+    fields: dict[str, str | int | bool | None] = {}
     if identity.organization_id:
         fields["organization_id"] = identity.organization_id
     if identity.organization_name:
         fields["organization_name"] = identity.organization_name
     if identity.org_age is not None:
         fields["org_age"] = identity.org_age
+    if identity.principal is not None:
+        # Explicit nulls: "resolved, no user" must stay distinguishable from an unauthenticated request.
+        fields["auth_kind"] = identity.principal.auth_kind.value
+        fields["user_id"] = identity.principal.user_id
+        fields["org_role"] = identity.principal.org_role
+        fields["org_role_claim"] = identity.principal.org_role_claim
+        fields["token_has_organization_claim"] = identity.principal.token_has_organization_claim
+        fields["bearer_identity_status"] = identity.bearer_identity_status
+        fields["principal_resolution_conflict"] = identity.principal_resolution_conflict
     return fields
 
 
@@ -144,10 +199,17 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
     return first_hop or None
 
 
+def _is_fixture_endpoint(request: Request) -> bool:
+    return request.url.path.rstrip("/") == "/api/v1/eval-fixtures" or request.url.path.startswith(
+        "/api/v1/eval-fixtures/"
+    )
+
+
 def _is_sensitive_endpoint(request: Request) -> bool:
     endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
     return (
-        endpoint in _SENSITIVE_ENDPOINTS
+        _is_fixture_endpoint(request)
+        or endpoint in _SENSITIVE_ENDPOINTS
         or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
         or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
@@ -246,7 +308,7 @@ def _log_unhandled_request(
             headers=headers,
             duration_seconds=time.monotonic() - start_time,
             **(exception_log_fields(exc) if exc is not None else {}),
-            **_organization_log_fields(),
+            **_identity_log_fields(),
         )
     except Exception:
         pass
@@ -263,7 +325,10 @@ def _log_request(
     headers: dict[str, str],
     start_time: float,
 ) -> None:
-    if status_code >= 500:
+    identity = _request_identity.get()
+    if status_code == 503 and identity is not None and identity.load_shed:
+        log_method = LOG.warning
+    elif status_code >= 500:
         log_method = LOG.error
     elif status_code >= 400 and status_code not in _ROUTINE_CLIENT_ERROR_STATUSES:
         log_method = LOG.warning
@@ -283,7 +348,7 @@ def _log_request(
             # backwards-compat: keep error_body for existing Datadog queries
             error_body=response_body if status_code >= 400 else None,
             duration_seconds=time.monotonic() - start_time,
-            **_organization_log_fields(),
+            **_identity_log_fields(),
         )
     except Exception:
         pass
@@ -298,13 +363,24 @@ def log_raw_request_exception(status_code: int) -> None:
 
 
 async def log_raw_request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    _request_identity.set(_RequestIdentity())
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 
     start_time = time.monotonic()
-    _request_identity.set(_RequestIdentity())
     try:
-        body_bytes = await request.body()
+        if _is_fixture_endpoint(request):
+            bounded = bytearray()
+            async with asyncio.timeout(2):
+                async for chunk in request.stream():
+                    if len(bounded) + len(chunk) > 4096:
+                        return Response(status_code=413)
+                    bounded.extend(chunk)
+            body_bytes = bytes(bounded)
+        else:
+            body_bytes = await request.body()
+    except TimeoutError:
+        return Response(status_code=408)
     except ClientDisconnect:
         # The client closed the connection before the body finished streaming, so no
         # response will reach it. Short-circuit with a benign 499 instead of letting

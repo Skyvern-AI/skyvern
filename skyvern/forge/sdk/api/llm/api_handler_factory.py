@@ -7,7 +7,9 @@ import re
 import time
 import warnings
 from asyncio import CancelledError
+from collections.abc import Collection
 from json import JSONDecodeError
+from types import MappingProxyType
 from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
 
 import litellm
@@ -35,7 +37,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_h
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_direct_copilot_model_usage,
+    _emit_direct_copilot_model_usage,
 )
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
@@ -69,6 +71,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
+from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value, is_generated_log_field
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -332,6 +335,7 @@ _VERTEX_FLEX_COST_MULTIPLIER = 0.5
 # threshold, so get_model_info() drops our *_above_272k_tokens_flex keys and prices a
 # flex-tagged, long-context OpenAI-direct GPT-5.6 call at the untiered standard rate.
 _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
+_OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
 
@@ -413,36 +417,58 @@ def _current_secret_values_for_redaction() -> set[str]:
     return secret_values
 
 
-def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
+def _current_placeholder_ids_for_redaction() -> frozenset[str]:
+    """The run's registered placeholder ids, exempted from the scrub below.
+
+    Both directions of the model boundary carry these tokens: the prompt offers them in place of
+    credential values, and the model types them back for the run to resolve. Redacting one would
+    break that round trip, so they are named here rather than matched by shape.
+    """
+    try:
+        context = skyvern_context.current()
+        return app.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run(
+            context.workflow_run_id if context else None
+        )
+    except Exception:
+        return frozenset()
+
+
+def _redact_prompt_text(text: str | None, secret_values: set[str], placeholder_ids: Collection[str] = ()) -> str | None:
     if text is None:
         return None
 
     if not secret_values:
         return text
 
-    return redact_secrets_from_text(text, secret_values)
+    return redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
 
 
-def _redact_content_blocks(blocks: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_content_blocks(
+    blocks: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_blocks: list[Any] = []
     changed = False
     for block in blocks:
-        redacted_block, block_changed = _redact_content_block(block, secret_values)
+        redacted_block, block_changed = _redact_content_block(block, secret_values, placeholder_ids)
         redacted_blocks.append(redacted_block)
         changed = changed or block_changed
     return (redacted_blocks, True) if changed else (blocks, False)
 
 
-def _redact_content_value(content: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_value(
+    content: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if isinstance(content, str):
-        redacted_content = redact_secrets_from_text(content, secret_values)
+        redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
         return redacted_content, redacted_content != content
     if isinstance(content, list):
-        return _redact_content_blocks(content, secret_values)
+        return _redact_content_blocks(content, secret_values, placeholder_ids)
     return content, False
 
 
-def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_block(
+    block: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if not isinstance(block, dict):
         return block, False
 
@@ -451,14 +477,14 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
         text = block.get("text")
         if not isinstance(text, str):
             return block, False
-        redacted_text = redact_secrets_from_text(text, secret_values)
+        redacted_text = redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
         if redacted_text == text:
             return block, False
         return {**block, "text": redacted_text}, True
 
     if block_type == "tool_result":
         content = block.get("content")
-        redacted_content, content_changed = _redact_content_value(content, secret_values)
+        redacted_content, content_changed = _redact_content_value(content, secret_values, placeholder_ids)
         if not content_changed:
             return block, False
         return {**block, "content": redacted_content}, True
@@ -466,7 +492,9 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
     return block, False
 
 
-def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_tool_calls(
+    tool_calls: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_tool_calls: list[Any] = []
     changed = False
     for tool_call in tool_calls:
@@ -481,7 +509,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
         if not isinstance(arguments, str):
             redacted_tool_calls.append(tool_call)
             continue
-        redacted_arguments = redact_secrets_from_text(arguments, secret_values)
+        redacted_arguments = redact_secrets_from_text(arguments, secret_values, placeholder_ids=placeholder_ids)
         if redacted_arguments == arguments:
             redacted_tool_calls.append(tool_call)
             continue
@@ -494,6 +522,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
 def _redact_message_text_content(
     messages: list[dict[str, Any]] | None,
     secret_values: set[str],
+    placeholder_ids: Collection[str] = (),
 ) -> list[dict[str, Any]] | None:
     if messages is None or not secret_values:
         return messages
@@ -504,18 +533,18 @@ def _redact_message_text_content(
         redacted_message = message
         content = message.get("content")
         if isinstance(content, str):
-            redacted_content = redact_secrets_from_text(content, secret_values)
+            redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
             if redacted_content != content:
                 redacted_message = {**redacted_message, "content": redacted_content}
                 changed = True
         elif isinstance(content, list):
-            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values)
+            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values, placeholder_ids)
             if content_changed:
                 redacted_message = {**redacted_message, "content": redacted_content_blocks}
                 changed = True
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
-            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values)
+            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values, placeholder_ids)
             if tool_calls_changed:
                 redacted_message = {**redacted_message, "tool_calls": redacted_tool_calls}
                 changed = True
@@ -844,7 +873,7 @@ def _emit_copilot_model_usage_for_response(
 ) -> None:
     try:
         provider_name = _response_provider(response)
-        emit_direct_copilot_model_usage(
+        _emit_direct_copilot_model_usage(
             _copilot_model_usage_event(
                 response,
                 request_model=request_model,
@@ -1064,7 +1093,7 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
     chain = [llm_config.main_model_group, *fallback_groups]
     fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
 
-    return litellm.Router(
+    router = litellm.Router(
         model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
         redis_host=llm_config.redis_host,
         redis_port=llm_config.redis_port,
@@ -1086,6 +1115,16 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
         set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
         enable_pre_call_checks=True,
     )
+    # LiteLLM's Deployment validation removes str subclasses. Keep source identities
+    # on the router that owns these deployments, including across cached-config changes.
+    router._skyvern_model_group_provenance = MappingProxyType(
+        {
+            str(model.model_name): model.model_name
+            for model in llm_config.model_list
+            if is_generated_log_field("model_name", model.model_name)
+        }
+    )
+    return router
 
 
 # Cache routers by llm_key so concurrent LLMCaller instances (v3 builds one per run) share a single
@@ -1198,7 +1237,11 @@ class LLMAPIHandlerFactory:
     def _served_model_group(router: Any, response: Any) -> str | None:
         """Resolve the litellm deployment group that served a router response, or None
         when unavailable (direct litellm.acompletion paths, test doubles)."""
-        return getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+        group = getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+        provenance = getattr(router, "_skyvern_model_group_provenance", None)
+        if isinstance(group, str) and isinstance(provenance, MappingProxyType):
+            return provenance.get(group, group)
+        return group
 
     @staticmethod
     def _deployment_service_tier(deployment: Any) -> str | None:
@@ -1398,7 +1441,7 @@ class LLMAPIHandlerFactory:
         if not isinstance(requested_model, str):
             return False
         direct_model = requested_model.removeprefix("openai/").removeprefix("responses/")
-        if not direct_model.startswith((_OPENAI_GPT5_6_MODEL_PREFIX, "gpt-6-")):
+        if not direct_model.startswith((_OPENAI_GPT5_6_MODEL_PREFIX, *_OPENAI_GPT6_MODEL_PREFIXES)):
             return False
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
@@ -1506,11 +1549,14 @@ class LLMAPIHandlerFactory:
             "anthropic/claude-opus-5",
             "anthropic/claude-opus-5-5",
             "bedrock/us.anthropic.claude-opus-5-5",
+            "anthropic/claude-sonnet-5-5",
+            "bedrock/global.anthropic.claude-sonnet-5-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
             "anthropic-claude-fable-5-1",
             "anthropic-claude-opus-5",
             "anthropic-claude-opus-5-5",
+            "anthropic-claude-sonnet-5-5",
         }
 
     @staticmethod
@@ -1934,10 +1980,11 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -2531,28 +2578,32 @@ class LLMAPIHandlerFactory:
                     LLM_CALL_DURATION_MESSAGE,
                     reasoning_effort=_effective_reasoning_effort(parameters),
                     llm_key=llm_key,
-                    model=model_used,
+                    model=_model_log_value("model", model_used),
                     # `model_used` is the router group, identical for the flex and fallback legs;
                     # without the served deployment the split between them is invisible.
-                    served_model_group=served_model_group,
+                    served_model_group=_model_log_value("served_model_group", served_model_group),
                     **llm_fallback_log_fields(llm_config, llm_served_fallback_outcome(llm_config, served_model_group)),
                     service_tier_source=service_tier_source,
                     prompt_name=prompt_name,
-                    duration_seconds=duration_seconds,
-                    llm_duration_seconds=llm_duration_seconds,
+                    duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                    llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
                     workflow_run_id=context.workflow_run_id if context else None,
                     task_id=context.task_id if context else None,
-                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    llm_cost=llm_cost if llm_cost > 0 else None,
-                    image_count=image_count if image_count > 0 else None,
-                    image_tokens=image_tokens if image_tokens > 0 else None,
-                    image_cost=image_cost if image_cost > 0 else None,
+                    input_tokens=_generated_log_value("input_tokens", prompt_tokens if prompt_tokens > 0 else None),
+                    output_tokens=_generated_log_value(
+                        "output_tokens", completion_tokens if completion_tokens > 0 else None
+                    ),
+                    reasoning_tokens=_generated_log_value(
+                        "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
+                    ),
+                    cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
+                    image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                    image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                    image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
@@ -2784,10 +2835,11 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -3179,22 +3231,26 @@ class LLMAPIHandlerFactory:
                     reasoning_effort=_effective_reasoning_effort(active_parameters),
                     llm_key=llm_key,
                     prompt_name=prompt_name,
-                    model=llm_config.model_name,
-                    duration_seconds=duration_seconds,
-                    llm_duration_seconds=llm_duration_seconds,
+                    model=_model_log_value("model", llm_config.model_name),
+                    duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                    llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
                     workflow_run_id=context.workflow_run_id if context else None,
                     task_id=context.task_id if context else None,
-                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    llm_cost=llm_cost if llm_cost > 0 else None,
-                    image_count=image_count if image_count > 0 else None,
-                    image_tokens=image_tokens if image_tokens > 0 else None,
-                    image_cost=image_cost if image_cost > 0 else None,
+                    input_tokens=_generated_log_value("input_tokens", prompt_tokens if prompt_tokens > 0 else None),
+                    output_tokens=_generated_log_value(
+                        "output_tokens", completion_tokens if completion_tokens > 0 else None
+                    ),
+                    reasoning_tokens=_generated_log_value(
+                        "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
+                    ),
+                    cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
+                    image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                    image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                    image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
@@ -3692,8 +3748,9 @@ class LLMCaller:
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()
+        placeholder_ids = _current_placeholder_ids_for_redaction()
         original_prompt = prompt
-        prompt = _redact_prompt_text(prompt, secret_values)
+        prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -3784,7 +3841,9 @@ class LLMCaller:
                 message_pattern = "anthropic"
 
             if use_message_history:
-                redacted_message_history = _redact_message_text_content(self.message_history, secret_values)
+                redacted_message_history = _redact_message_text_content(
+                    self.message_history, secret_values, placeholder_ids
+                )
                 messages = await llm_messages_builder_with_history(
                     prompt,
                     screenshots,
@@ -3997,30 +4056,30 @@ class LLMCaller:
                 reasoning_effort=_effective_reasoning_effort(active_parameters),
                 llm_key=self.llm_key,
                 prompt_name=prompt_name,
-                model=self.llm_config.model_name,
-                duration_seconds=duration_seconds,
-                llm_duration_seconds=llm_duration_seconds,
+                model=_model_log_value("model", self.llm_config.model_name),
+                duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
-                reasoning_tokens=call_stats.reasoning_tokens
-                if call_stats and call_stats.reasoning_tokens is not None
-                else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
-                image_count=image_count if image_count > 0 else None,
-                image_tokens=image_tokens if image_tokens > 0 else None,
-                image_cost=image_cost if image_cost > 0 else None,
+                input_tokens=_generated_log_value("input_tokens", call_stats.input_tokens if call_stats else None),
+                output_tokens=_generated_log_value("output_tokens", call_stats.output_tokens if call_stats else None),
+                reasoning_tokens=_generated_log_value(
+                    "reasoning_tokens", call_stats.reasoning_tokens if call_stats else None
+                ),
+                cached_tokens=_generated_log_value("cached_tokens", call_stats.cached_tokens if call_stats else None),
+                llm_cost=_generated_log_value("llm_cost", call_stats.llm_cost if call_stats else None),
+                image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
                 # `model` above is the router group, identical for the flex and standard legs;
                 # without the served deployment the split between them is invisible.
-                served_model_group=served_model_group,
+                served_model_group=_model_log_value("served_model_group", served_model_group),
                 **llm_fallback_log_fields(
                     self.llm_config, llm_served_fallback_outcome(self.llm_config, served_model_group)
                 ),

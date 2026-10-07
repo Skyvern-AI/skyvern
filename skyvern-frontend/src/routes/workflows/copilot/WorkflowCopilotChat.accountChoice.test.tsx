@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 
 type StreamBody = {
   message: string;
@@ -202,6 +203,9 @@ function chatElement(props: ComponentProps<typeof WorkflowCopilotChat> = {}) {
 
 async function renderChat() {
   const view = render(chatElement());
+  // The composer renders before the history load lands; the mocked load resolves in microtasks,
+  // so one act() turn applies it without racing React's scheduler.
+  await act(async () => {});
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
@@ -346,7 +350,9 @@ describe("WorkflowCopilotChat connected account choices", () => {
         }).disabled,
       ).toBe(true);
       if (accountQuestion) {
-        expect(screen.getByText("Choose a Google account")).toBeTruthy();
+        expect(
+          screen.getByRole("group", { name: "Connected Google accounts" }),
+        ).toBeTruthy();
         expect(
           screen.getByRole<HTMLButtonElement>("button", {
             name: /Connection …goac_1/,
@@ -399,6 +405,29 @@ describe("WorkflowCopilotChat connected account choices", () => {
         );
     },
   );
+
+  it("docks an actionable choice above the composer and picks an active row by number", async () => {
+    await renderChat();
+    await finishChoiceAsk();
+    const tray = screen.getByRole("group", {
+      name: "Connected Google accounts",
+    });
+    expect(
+      Boolean(
+        screen
+          .getByText("Copilot needs a Google account")
+          .compareDocumentPosition(tray) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+    expect(useCopilotHeaderStore.getState().attention).toBe("account");
+
+    // The first number is the first active row; the reconnect-only row above it has no key.
+    await act(async () => {
+      fireEvent.keyDown(tray, { key: "1" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.selected_connected_account_id).toBe("goac_1");
+  });
 
   it("renders canonical rows and sends one exact active id despite a same-tick double click", async () => {
     await renderChat();

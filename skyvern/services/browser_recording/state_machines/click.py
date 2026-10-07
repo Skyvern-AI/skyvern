@@ -76,6 +76,7 @@ class StateMachineClick(StateMachine):
             role=self.target.role,
             accessible_name=self.target.accessibleName,
             input_type=self.target.inputType,
+            in_child_frame=self.target.inChildFrame,
         )
 
         action = ActionClick(

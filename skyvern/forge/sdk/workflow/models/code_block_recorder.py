@@ -4,26 +4,39 @@ import asyncio
 import inspect
 import sys
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager, suppress
+from dataclasses import dataclass, replace
+from functools import partial
 from os import PathLike, fspath
 from types import FrameType
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 import pydantic
 import structlog
-from playwright.async_api import BrowserContext, Locator, Page
+from playwright.async_api import BrowserContext, Locator, Page, Request, Response
 
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
+from skyvern.utils.url_validators import redacted_url_origin
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
-from skyvern.webeye.navigation import reported_nav_error_code
+from skyvern.webeye.navigation import driver_nav_error_code, reported_nav_error_code
 from skyvern.webeye.playwright_input import PlaywrightInputDefaults
 
 LOG = structlog.get_logger()
+
+
+@runtime_checkable
+class _FrameIdentified(Protocol):
+    """Raw-CDP requests and frames expose their CDP frame id; Playwright's do not."""
+
+    @property
+    def frame_id(self) -> str | None: ...
+
 
 _LOCATOR_STRATEGY_INPUT_OPTIONS = frozenset({"delay", "force", "no_wait_after", "text", "timeout", "value"})
 _PAGE_STRATEGY_INPUT_OPTIONS = frozenset(
@@ -74,6 +87,31 @@ COVERING_ELEMENT_SCRIPT = """el => {
   return '<' + hit.tagName.toLowerCase() + (hit.id ? ' id=' + JSON.stringify(hit.id) : '') + (hit.getAttribute('class') ? ' class=' + JSON.stringify(hit.getAttribute('class')) : '') + '>';
 }"""
 
+# A sign-in form is exactly one visible password field not marked new-password; sign-up and change-password forms
+# show two or mark one new-password, and a one-time-code field alone also appears on payment confirmations.
+# ponytail: main frame only, and an email-first sign-in page (password on the next page) is not detected.
+SIGN_IN_FORM_SCRIPT = """() => {
+  const visible = el => {
+    if (el.disabled) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return typeof el.checkVisibility === 'function' ? el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}) : true;
+  };
+  const tokens = el => (el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/);
+  const passwords = [...document.querySelectorAll('input[type="password" i]')].filter(visible);
+  return passwords.length === 1 && !tokens(passwords[0]).includes('new-password');
+}"""
+
+
+async def page_shows_sign_in_form(page: Page | None) -> bool:
+    if page is None:
+        return False
+    try:
+        async with asyncio.timeout(0.5):
+            return await page.evaluate(SIGN_IN_FORM_SCRIPT) is True
+    except Exception:  # noqa: BLE001 - failure evidence is best effort.
+        return False
+
 
 def append_failure_page_state(
     reason: str,
@@ -117,6 +155,7 @@ _LOCATOR_ACTION_MAP: dict[str, ActionType] = {
     "check": ActionType.CHECKBOX,
     "uncheck": ActionType.CHECKBOX,
     "hover": ActionType.HOVER,
+    "drag_to": ActionType.DRAG,
     "set_input_files": ActionType.UPLOAD_FILE,
 }
 # Sync locator factories on both Page and Locator; their results must stay wrapped.
@@ -133,6 +172,7 @@ _LOCATOR_FACTORY_METHODS = frozenset(
     }
 )
 _RECORDABLE_HANDLE_TYPE_NAMES = frozenset({"ElementHandle", "FrameLocator", "Locator"})
+_HANDLE_RETURNING_METHODS = frozenset({"query_selector", "query_selector_all", "wait_for_selector"})
 # SkyvernPage high-level API (page.extract / page.complete / ...). These are not raw
 # Playwright calls, so they fall through the maps above and used to execute unrecorded —
 # a navigate+extract block then rendered as only repeated "Goto URL" on the timeline.
@@ -182,6 +222,68 @@ class PendingAction:
 
 OnPendingAction = Callable[[PendingAction], None]
 
+# Spelled out again where this module cannot be imported; both spellings must stay equal.
+DOCUMENT_FAILURE_ATTRIBUTE = "_skyvern_document_failure"
+FAILURE_PAGE_ATTRIBUTE = "_skyvern_failure_page"
+DocumentFailureRelation = Literal["associated", "context"]
+_ABORTED_NAVIGATION_CODE = "net::ERR_ABORTED"
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentFailureReceipt:
+    """``associated``: the failed document opened after the failing call began, or during the call before it when
+    the failing call is the latest one. ``context``: an older failure nothing superseded, never claimed as the cause."""
+
+    attempt_id: int
+    origin: str | None
+    driver_code: str | None
+    response_status: int | None
+    relation: DocumentFailureRelation
+
+
+@dataclass(slots=True)
+class _DocumentAttempt:
+    attempt_id: int
+    opened_generation: int
+    request: Request
+    origin: str | None
+    response_status: int | None = None
+    failed: bool = False
+    driver_code: str | None = None
+
+
+def _stamp_document_failure(exc: BaseException, receipt: DocumentFailureReceipt | None) -> None:
+    """A None stamp still marks ``exc`` as a recorded failure, so it never borrows a sibling's receipt."""
+    with suppress(Exception):
+        stamps = BaseException.__getattribute__(exc, "__dict__")
+        if receipt is not None:
+            stamps[DOCUMENT_FAILURE_ATTRIBUTE] = receipt
+        else:
+            stamps.setdefault(DOCUMENT_FAILURE_ATTRIBUTE, None)
+
+
+def _stamp_failure_page(exc: BaseException, locator: Locator | None, page: Page | None) -> None:
+    """The latest recorded call to raise ``exc`` names its page, whatever ran concurrently since."""
+    with suppress(Exception):
+        if locator is not None:
+            # An element handle has no page; its call keeps the page it was given.
+            with suppress(AttributeError):
+                page = locator.page
+        if page is not None:
+            BaseException.__getattribute__(exc, "__dict__")[FAILURE_PAGE_ATTRIBUTE] = page
+
+
+def _stamped_failure_page(exc: BaseException) -> Page | None:
+    try:
+        return BaseException.__getattribute__(exc, "__dict__").get(FAILURE_PAGE_ATTRIBUTE)
+    except Exception:
+        return None
+
+
+def _document_origin(url: str) -> str | None:
+    origin = redacted_url_origin(url)
+    return None if origin == "<redacted>" else origin
+
 
 def _frame_user_line() -> int | None:
     # Walk f_back instead of inspect.stack(), which reads source for every frame; this runs on
@@ -220,6 +322,10 @@ def _describe(name: str, target: str | None, args: tuple[Any, ...]) -> str:
 def _factory_selector(name: str, args: tuple[Any, ...]) -> str:
     arg = next((str(a) for a in args if isinstance(a, (str, int, float))), None)
     return f"{name}({arg})" if arg is not None else name
+
+
+def is_element_handle(value: Any) -> bool:
+    return type(value).__name__ == "ElementHandle"
 
 
 def _string_value(value: Any) -> str | None:
@@ -325,9 +431,10 @@ def _recorded_action_fields(
         fields["x"] = kwargs.get("x", _arg(args, 0))
         fields["y"] = kwargs.get("y", _arg(args, 1))
     elif action_type == ActionType.DRAG:
-        fields["start_x"] = kwargs.get("start_x", _arg(args, 0))
-        fields["start_y"] = kwargs.get("start_y", _arg(args, 1))
-        fields["path"] = kwargs.get("path", _arg(args, 2))
+        if not name.endswith(".drag_to"):
+            fields["start_x"] = kwargs.get("start_x", _arg(args, 0))
+            fields["start_y"] = kwargs.get("start_y", _arg(args, 1))
+            fields["path"] = kwargs.get("path", _arg(args, 2))
     elif action_type == ActionType.LEFT_MOUSE:
         fields["x"] = kwargs.get("x", _arg(args, 0))
         fields["y"] = kwargs.get("y", _arg(args, 1))
@@ -395,10 +502,17 @@ class _Recorder:
         self.failed_page: Page | None = None
         self.failed_nav_error_code: str | None = None
         self.failed_nav_error_code_exception: BaseException | None = None
+        self.document_attempts: dict[int, _DocumentAttempt] = {}
+        self.document_failure: tuple[BaseException, DocumentFailureReceipt] | None = None
+        self.document_failure_generation = 0
+        self._document_attempt_count = 0
+        self._document_listeners: list[tuple[Page, str, Callable[..., None]]] = []
+        self._pending_document_binding: deque[tuple[BaseException, int, int, _DocumentAttempt]] = deque(maxlen=8)
         # One proxy per page of the run, shared by every wrapper: a page reached from a second tab
         # has to be the same object, or identity comparisons fail and the worker hands out a
         # second handle for the page it already registered.
         self.page_proxies: dict[int, tuple[Any, Any]] = {}
+        self.claimed_popups: dict[int, Page] = {}
         self.failure_operation_generation = 0
         self._next_action_order = 0
         self._on_action = on_action
@@ -459,13 +573,118 @@ class _Recorder:
             await self.credential_release_guard.enforce(target, name, args, kwargs)
 
     def begin_failure_operation(self) -> int:
-        self.failure_operation_generation += 1
         self.failed_locator_exception = None
         self.failed_locator = None
         self.failed_page = None
         # The nav code survives later calls: block code may click or screenshot before re-raising, and
         # failure_nav_error_code only hands it back for the exception that navigated.
+        return self.begin_document_operation()
+
+    def begin_document_operation(self) -> int:
+        """Opens a call's document-association window, leaving the last failed call in place."""
+        self.failure_operation_generation += 1
         return self.failure_operation_generation
+
+    def observe_documents(self, page: Page) -> None:
+        """Watch ``page``'s main-frame document requests; read-only, removed by detach_document_observers."""
+        handlers: dict[str, Callable[..., None]] = {
+            "request": lambda request: self._on_document_request(page, request),
+            "response": lambda response: self._on_document_response(page, response),
+            "requestfailed": lambda request: self._on_document_request_failed(page, request),
+        }
+        for event, handler in handlers.items():
+            with suppress(Exception):
+                page.on(event, handler)  # type: ignore[call-overload]
+                self._document_listeners.append((page, event, handler))
+
+    def detach_document_observers(self) -> None:
+        listeners, self._document_listeners = self._document_listeners, []
+        for page, event, handler in listeners:
+            with suppress(Exception):
+                page.remove_listener(event, handler)
+
+    def _on_document_request(self, page: Page, request: Request) -> None:
+        with suppress(Exception):
+            frame = request.frame
+            if not request.is_navigation_request() or frame is not page.main_frame:
+                return
+            # The raw-CDP engine's request.frame falls back to the main frame for a frame id it does not know.
+            if (
+                isinstance(request, _FrameIdentified)
+                and isinstance(frame, _FrameIdentified)
+                and frame.frame_id != request.frame_id
+            ):
+                return
+            attempt = self.document_attempts.get(id(page))
+            redirected_from = request.redirected_from
+            if attempt is not None and redirected_from is not None and redirected_from is attempt.request:
+                attempt.request = request
+                attempt.origin = _document_origin(request.url)
+                attempt.response_status = None
+                return
+            self._document_attempt_count += 1
+            self.document_attempts[id(page)] = _DocumentAttempt(
+                attempt_id=self._document_attempt_count,
+                opened_generation=self.failure_operation_generation,
+                request=request,
+                origin=_document_origin(request.url),
+            )
+            self._pending_document_binding = deque(
+                (pending for pending in self._pending_document_binding if pending[3] is not attempt), maxlen=8
+            )
+
+    def _on_document_response(self, page: Page, response: Response) -> None:
+        with suppress(Exception):
+            attempt = self.document_attempts.get(id(page))
+            if attempt is not None and response.request is attempt.request:
+                attempt.response_status = response.status
+
+    def _on_document_request_failed(self, page: Page, request: Request) -> None:
+        with suppress(Exception):
+            attempt = self.document_attempts.get(id(page))
+            if attempt is None or request is not attempt.request:
+                return
+            failure = request.failure
+            driver_code = driver_nav_error_code(failure) if isinstance(failure, str) else None
+            # Chromium reports a navigation that became a download, and a cancelled one, as ERR_ABORTED.
+            if driver_code == _ABORTED_NAVIGATION_CODE:
+                return
+            attempt.failed = True
+            attempt.driver_code = driver_code
+            pending_to_resolve = [p for p in self._pending_document_binding if p[3] is attempt]
+            for pending in pending_to_resolve:
+                self._resolve_document_failure(*pending)
+
+    def bind_document_failure(self, exc: BaseException, generation: int, page: Page | None) -> None:
+        attempt = self.document_attempts.get(id(page)) if page is not None else None
+        if attempt is None or generation < self.document_failure_generation:
+            _stamp_document_failure(exc, None)
+            return
+        # The latest call's trigger is the call before it. A call still in flight when later calls began
+        # can only be waiting on a document opened after it started.
+        floor = generation - 1 if generation == self.failure_operation_generation else generation
+        if not attempt.failed:
+            _stamp_document_failure(exc, None)
+            # The driver can report the document's failure after the wait raised; readers see the stamp later.
+            self._pending_document_binding.append((exc, generation, floor, attempt))
+            return
+        self._resolve_document_failure(exc, generation, floor, attempt)
+
+    def _resolve_document_failure(
+        self, exc: BaseException, generation: int, floor: int, attempt: _DocumentAttempt
+    ) -> None:
+        if generation < self.document_failure_generation:
+            return
+        receipt = DocumentFailureReceipt(
+            attempt_id=attempt.attempt_id,
+            origin=attempt.origin,
+            driver_code=attempt.driver_code,
+            response_status=attempt.response_status,
+            relation="associated" if attempt.opened_generation >= floor else "context",
+        )
+        self.document_failure = (exc, receipt)
+        self.document_failure_generation = generation
+        _stamp_document_failure(exc, receipt)
 
     def _reserve_action_order(self) -> int:
         action_order = self._next_action_order
@@ -487,6 +706,7 @@ class _Recorder:
         workflow_run_id: str | None = None,
         record_failure_type_only: bool = False,
         extra_output: dict[str, Any] | None = None,
+        document_page: Page | None = None,
     ) -> Any:
         """``extra_output`` is read after ``call`` settles, so the call can fill it on its failure path too."""
         generation = self.begin_failure_operation()
@@ -545,6 +765,14 @@ class _Recorder:
                     captured = ""
                 action.response = captured or type(exc).__name__
             self.last_exception = exc
+            _stamp_failure_page(exc, failure_locator, failure_page if failure_page is not None else document_page)
+            # A navigation's own failure is reported by its nav code, never as an associated document.
+            if action_type in _NAVIGATION_ACTION_TYPES:
+                _stamp_document_failure(exc, None)
+            else:
+                self.bind_document_failure(
+                    exc, generation, document_page if document_page is not None else failure_page
+                )
             if generation == self.failure_operation_generation:
                 self.failed_locator_exception = exc
                 self.failed_locator = failure_locator
@@ -575,15 +803,24 @@ class _Recorder:
 
 
 def _wrap_recording_result(
-    value: Any, recorder: _Recorder, selector: str | None, owner: RecordingPage | None = None
+    value: Any,
+    recorder: _Recorder,
+    selector: str | None,
+    owner: RecordingPage | None = None,
+    page: Page | None = None,
 ) -> Any:
     if isinstance(value, list):
-        return [_wrap_recording_result(item, recorder, selector, owner) for item in value]
+        return [_wrap_recording_result(item, recorder, selector, owner, page) for item in value]
     if not type(value).__module__.startswith("playwright."):
         return value
     type_name = type(value).__name__
     if type_name in _RECORDABLE_HANDLE_TYPE_NAMES:
-        return RecordingLocator(value, recorder, selector)
+        return RecordingLocator(value, recorder, selector, page)
+    if owner is None and page is not None:
+        # A locator or element handle call (el.owner_frame()) knows only its raw page; the proxy recording
+        # that page owns the frames it hands back, as it does for the page's own calls.
+        cached = recorder.page_proxies.get(id(page))
+        owner = cached[1] if cached is not None and cached[0] is page else None
     # A call can hand back a page or a frame too -- page.frame(name=...), page.opener(), a popup --
     # and navigating through one of those has to be recorded like any other. ``owner`` is the page
     # the call was made on, so a frame from a second tab is bound to that tab rather than the first.
@@ -595,17 +832,64 @@ def _wrap_recording_result(
 
 
 def _wrap_call_result(
-    value: Any, recorder: _Recorder, selector: str | None, call_name: str, owner: RecordingPage | None = None
+    value: Any,
+    recorder: _Recorder,
+    selector: str | None,
+    call_name: str,
+    owner: RecordingPage | None = None,
+    page: Page | None = None,
 ) -> Any:
     if inspect.isawaitable(value):
 
         async def resolve() -> Any:
             return _wrap_recording_result(
-                await recorder.await_pending_aware(value, call_name), recorder, selector, owner
+                await recorder.await_pending_aware(value, call_name), recorder, selector, owner, page
             )
 
         return resolve()
-    return _wrap_recording_result(value, recorder, selector, owner)
+    return _wrap_recording_result(value, recorder, selector, owner, page)
+
+
+def _unchanged(value: Any) -> Any:
+    return value
+
+
+def _wrap_if_page(wrap: Callable[[Any], Any], value: Any) -> Any:
+    # expect_event also yields downloads, requests and the like, so only a page is wrapped.
+    return wrap(value) if type(value).__name__ == "Page" else value
+
+
+def _bind_document_failure_on_raise(
+    value: Any,
+    recorder: _Recorder,
+    generation: int,
+    page: Page | None,
+    *,
+    failed_locator: Locator | None = None,
+    event_value: Callable[[Any], Any] = _unchanged,
+) -> Any:
+    def fail(exc: BaseException) -> None:
+        recorder.bind_document_failure(exc, generation, page)
+        _stamp_failure_page(exc, failed_locator, page)
+        if failed_locator is not None and generation == recorder.failure_operation_generation:
+            recorder.failed_locator_exception = exc
+            recorder.failed_locator = failed_locator
+            recorder.failed_page = page
+
+    # An expect_* wait raises from __aexit__ or from its info's value, after the body's trigger began.
+    if isinstance(value, AbstractAsyncContextManager):
+        return _RecordingExpectContext(value, event_value, fail)
+    if not inspect.isawaitable(value):
+        return value
+
+    async def resolve() -> Any:
+        try:
+            return await value
+        except BaseException as exc:
+            fail(exc)
+            raise
+
+    return resolve()
 
 
 class RecordingLocator:
@@ -613,10 +897,12 @@ class RecordingLocator:
     # receives opaque markers, never this proxy instance.
     _skyvern_brokerable_handle = True
 
-    def __init__(self, locator: Any, recorder: _Recorder, selector: str | None) -> None:
+    def __init__(self, locator: Any, recorder: _Recorder, selector: str | None, page: Page | None = None) -> None:
         self.__locator = locator
         self.__recorder = recorder
         self.__selector = selector
+        # An ElementHandle has no page of its own, so the page that produced it is carried along.
+        self.__page = page
 
     def _skyvern_page_operation_argument(self) -> Any:
         return self.__locator
@@ -632,48 +918,46 @@ class RecordingLocator:
             self.__locator.locator(native_argument, **kwargs),
             self.__recorder,
             recording_selector,
+            self.__page,
         )
 
     @property
     def first(self) -> RecordingLocator:
-        return RecordingLocator(self.__locator.first, self.__recorder, self.__selector)
+        return RecordingLocator(self.__locator.first, self.__recorder, self.__selector, self.__page)
 
     @property
     def last(self) -> RecordingLocator:
-        return RecordingLocator(self.__locator.last, self.__recorder, self.__selector)
+        return RecordingLocator(self.__locator.last, self.__recorder, self.__selector, self.__page)
 
     def nth(self, index: int) -> RecordingLocator:
-        return RecordingLocator(self.__locator.nth(index), self.__recorder, self.__selector)
+        return RecordingLocator(self.__locator.nth(index), self.__recorder, self.__selector, self.__page)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__locator, name)
         if name in _LOCATOR_FACTORY_METHODS and callable(attr):
 
             def factory(*args: Any, **kwargs: Any) -> RecordingLocator:
-                return RecordingLocator(attr(*args, **kwargs), self.__recorder, _factory_selector(name, args))
+                return RecordingLocator(
+                    attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), self.__page
+                )
 
             return factory
         action_type = _LOCATOR_ACTION_MAP.get(name)
         if not callable(attr):
+            # Locator.content_frame and FrameLocator.owner are properties that continue the chain.
+            if type(attr).__name__ in _RECORDABLE_HANDLE_TYPE_NAMES:
+                return RecordingLocator(attr, self.__recorder, self.__selector, self.__page)
             return attr
         if action_type is None:
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
                 generation = self.__recorder.begin_failure_operation()
-                value = _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector, f"locator.{name}")
-                if not inspect.isawaitable(value):
-                    return value
-
-                async def resolve() -> Any:
-                    try:
-                        return await value
-                    except Exception as exc:
-                        if generation == self.__recorder.failure_operation_generation:
-                            self.__recorder.failed_locator_exception = exc
-                            self.__recorder.failed_locator = self.__locator
-                        raise
-
-                return resolve()
+                value = _wrap_call_result(
+                    attr(*args, **kwargs), self.__recorder, self.__selector, f"locator.{name}", page=self.__page
+                )
+                return _bind_document_failure_on_raise(
+                    value, self.__recorder, generation, self.__page, failed_locator=self.__locator
+                )
 
             return forwarded
 
@@ -715,10 +999,26 @@ class RecordingLocator:
                                 delay=delay,
                                 no_wait_after=no_wait_after,
                             )
-                return await attr(*args, **kwargs)
+                native_args = (
+                    tuple(
+                        arg._skyvern_page_operation_argument() if isinstance(arg, RecordingLocator) else arg
+                        for arg in args
+                    )
+                    if name == "drag_to"
+                    else args
+                )
+                return await attr(*native_args, **kwargs)
 
             return await self.__recorder.record(
-                action_type, f"locator.{name}", self.__selector, call, args, kwargs, failure_locator=self.__locator
+                action_type,
+                f"locator.{name}",
+                self.__selector,
+                call,
+                args,
+                kwargs,
+                failure_locator=self.__locator,
+                failure_page=self.__page,
+                document_page=self.__page,
             )
 
         return recorded
@@ -737,26 +1037,38 @@ class RecordingKeyboard:
         if name in ("type", "insert_text"):
 
             async def guarded(*args: Any, **kwargs: Any) -> Any:
-                self.__recorder.begin_failure_operation()
+                generation = self.__recorder.begin_failure_operation()
 
                 async def call() -> Any:
                     await self.__recorder.enforce_credential_release(self.__page, f"keyboard.{name}", args, kwargs)
                     return await attr(*args, **kwargs)
 
-                return await self.__recorder.await_pending_aware(call(), f"keyboard.{name}")
+                return await _bind_document_failure_on_raise(
+                    self.__recorder.await_pending_aware(call(), f"keyboard.{name}"),
+                    self.__recorder,
+                    generation,
+                    self.__page,
+                )
 
             return guarded
         if name != "press":
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
-                self.__recorder.begin_failure_operation()
-                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, None, f"keyboard.{name}")
+                generation = self.__recorder.begin_failure_operation()
+                value = _wrap_call_result(attr(*args, **kwargs), self.__recorder, None, f"keyboard.{name}")
+                return _bind_document_failure_on_raise(value, self.__recorder, generation, self.__page)
 
             return forwarded
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
             return await self.__recorder.record(
-                ActionType.KEYPRESS, "keyboard.press", None, lambda: attr(*args, **kwargs), args, kwargs
+                ActionType.KEYPRESS,
+                "keyboard.press",
+                None,
+                lambda: attr(*args, **kwargs),
+                args,
+                kwargs,
+                document_page=self.__page,
             )
 
         return recorded
@@ -773,14 +1085,20 @@ class _RecordingEventInfo:
     Only ``value`` is answered here; everything else is the real object's.
     """
 
-    def __init__(self, info: Any, wrap: Callable[[Any], Any]) -> None:
+    def __init__(self, info: Any, wrap: Callable[[Any], Any], fail: Callable[[BaseException], None]) -> None:
         self.__info = info
         self.__wrap = wrap
+        self.__fail = fail
 
     @property
     def value(self) -> Any:
         async def resolve() -> Any:
-            return self.__wrap(await self.__info.value)
+            try:
+                value = await self.__info.value
+            except BaseException as exc:
+                self.__fail(exc)
+                raise
+            return self.__wrap(value)
 
         return resolve()
 
@@ -789,17 +1107,27 @@ class _RecordingEventInfo:
 
 
 class _RecordingExpectContext:
-    """The async context manager ``expect_page()`` returns, yielding a recorded ``EventInfo``."""
+    """The async context manager an ``expect_*`` call returns, yielding a recorded ``EventInfo``."""
 
-    def __init__(self, manager: Any, wrap: Callable[[Any], Any]) -> None:
+    def __init__(
+        self,
+        manager: AbstractAsyncContextManager[Any],
+        wrap: Callable[[Any], Any],
+        fail: Callable[[BaseException], None],
+    ) -> None:
         self.__manager = manager
         self.__wrap = wrap
+        self.__fail = fail
 
     async def __aenter__(self) -> Any:
-        return _RecordingEventInfo(await self.__manager.__aenter__(), self.__wrap)
+        return _RecordingEventInfo(await self.__manager.__aenter__(), self.__wrap, self.__fail)
 
     async def __aexit__(self, *exc_info: Any) -> Any:
-        return await self.__manager.__aexit__(*exc_info)
+        try:
+            return await self.__manager.__aexit__(*exc_info)
+        except BaseException as exc:
+            self.__fail(exc)
+            raise
 
 
 class RecordingBrowserContext:
@@ -809,11 +1137,14 @@ class RecordingBrowserContext:
         recorder: _Recorder,
         wrap_page: Callable[[Any], Any],
         intercept_timeout: bool,
+        page: Page,
     ) -> None:
         self.__context = context
         self.__recorder = recorder
         self.__wrap_page = wrap_page
         self.__intercept_timeout = intercept_timeout
+        # A failed context wait is bound to the page whose context this is.
+        self.__page = page
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__context, name)
@@ -832,21 +1163,26 @@ class RecordingBrowserContext:
         if name in ("expect_page", "expect_event") and callable(attr):
 
             def expect_page(*args: Any, **kwargs: Any) -> Any:
-                # expect_event also yields downloads, requests and the like, so only a page is
-                # wrapped; expect_page always yields one.
-                wrap = (
-                    self.__wrap_page
-                    if name == "expect_page"
-                    else lambda value: self.__wrap_page(value) if type(value).__name__ == "Page" else value
+                generation = self.__recorder.begin_document_operation()
+                return _bind_document_failure_on_raise(
+                    attr(*args, **kwargs),
+                    self.__recorder,
+                    generation,
+                    self.__page,
+                    event_value=(
+                        self.__wrap_page if name == "expect_page" else partial(_wrap_if_page, self.__wrap_page)
+                    ),
                 )
-                return _RecordingExpectContext(attr(*args, **kwargs), wrap)
 
             return expect_page
         if name == "wait_for_event" and callable(attr):
 
             async def wait_for_event(*args: Any, **kwargs: Any) -> Any:
-                awaited = await attr(*args, **kwargs)
-                return self.__wrap_page(awaited) if type(awaited).__name__ == "Page" else awaited
+                generation = self.__recorder.begin_document_operation()
+                awaited = await _bind_document_failure_on_raise(
+                    attr(*args, **kwargs), self.__recorder, generation, self.__page
+                )
+                return _wrap_if_page(self.__wrap_page, awaited)
 
             return wait_for_event
         if name != "set_default_timeout" or not callable(attr) or not self.__intercept_timeout:
@@ -860,7 +1196,7 @@ class RecordingBrowserContext:
 
 
 class RecordingFrame:
-    """Passes Frame calls through, recording only navigation.
+    """Passes Frame calls through, recording navigation and the main frame's locators and handles.
 
     Inline code can navigate through ``page.main_frame`` or ``page.frames[n]``. Those calls never
     reach the page proxy, so without this a frame navigation records no destination and its failure
@@ -892,10 +1228,40 @@ class RecordingFrame:
             return [self.__wrap(frame) for frame in attr]
         if name == "parent_frame":
             return self.__wrap(attr) if attr is not None else None
-        # A frame hands back the page that owns it, and navigating through that page has to be
-        # recorded like any other: returning the raw one reopens the hole this proxy closes.
-        if name != "goto" or not callable(attr):
+        if not callable(attr):
             return attr
+        page = self.__page._underlying_page
+        # Only the main frame's locators and handles are the page's own; a child frame's stay unrecorded.
+        locator_factory = name in ("locator", "frame_locator") or name in _LOCATOR_FACTORY_METHODS
+        wrap_for_page = (locator_factory or name in _HANDLE_RETURNING_METHODS) and self.__frame is page.main_frame
+        # A locator factory starts no browser call, so like the page's it opens no new failure window.
+        if locator_factory:
+            if not wrap_for_page:
+                return attr
+
+            def factory(*args: Any, **kwargs: Any) -> RecordingLocator:
+                selector = args[0] if name == "locator" and args and isinstance(args[0], str) else None
+                return RecordingLocator(
+                    attr(*args, **kwargs), self.__recorder, selector or _factory_selector(name, args), page
+                )
+
+            return factory
+        # A sync query such as is_detached() starts no browser work, and the secure broker calls it around
+        # every page operation; opening a window for it would demote the next wait's receipt to context.
+        if not (inspect.iscoroutinefunction(attr) or name.startswith("expect_")):
+            return attr
+        if name != "goto":
+
+            def forwarded(*args: Any, **kwargs: Any) -> Any:
+                generation = self.__recorder.begin_document_operation()
+                value = attr(*args, **kwargs)
+                if wrap_for_page:
+                    value = _wrap_call_result(
+                        value, self.__recorder, _factory_selector(name, args), f"frame.{name}", page=page
+                    )
+                return _bind_document_failure_on_raise(value, self.__recorder, generation, page)
+
+            return forwarded
 
         async def goto(*args: Any, **kwargs: Any) -> Any:
             async def call() -> Any:
@@ -939,12 +1305,20 @@ class RecordingPage:
         proxy.__frame_proxies = {}
         proxy.__recorder = recorder
         recorder.page_proxies[id(page)] = (page, proxy)
+        recorder.observe_documents(page)
         return proxy
 
     def _wrap_frame(self, frame: Any) -> Any:
         return self.__recording_frame(frame)
 
     def _wrap_page(self, page: Any) -> Any:
+        return self.__recording_page(page)
+
+    def __claim_popup(self, page: Page) -> RecordingPage:
+        # Playwright still yields a popup that closed before the block read it; it is wrapped but not
+        # claimed, so failure evidence never names a tab that is already gone.
+        if not page.is_closed():
+            self.__recorder.claimed_popups[id(page)] = page
         return self.__recording_page(page)
 
     def __recording_page(self, page: Any) -> Any:
@@ -984,6 +1358,7 @@ class RecordingPage:
             playwright_input_defaults=playwright_input_defaults,
         )
         self.__recorder.page_proxies[id(page)] = (page, self)
+        self.__recorder.observe_documents(page)
 
     @property
     def _underlying_page(self) -> Page:
@@ -1002,7 +1377,7 @@ class RecordingPage:
         if locate is None:
             return None
         page, recorder = self.__page, self.__recorder
-        return lambda selector: RecordingLocator(locate(page, selector), recorder, selector)
+        return lambda selector: RecordingLocator(locate(page, selector), recorder, selector, page)
 
     @property
     def _credential_release_guard(self) -> CredentialReleaseGuard | None:
@@ -1019,15 +1394,24 @@ class RecordingPage:
     def failure_locator(self, exception: BaseException) -> Locator | None:
         return self.__recorder.failed_locator if self.__recorder.failed_locator_exception is exception else None
 
+    def _claimed_popups(self) -> list[Page]:
+        return list(self.__recorder.claimed_popups.values())
+
     def failure_page(self, exception: BaseException) -> Page | None:
         """The raw page the call that raised ``exception`` ran on, whether through the page, one of
         its frames or a locator; None when the exception did not come from a recorded call."""
         recorder = self.__recorder
         if recorder.failed_locator_exception is not exception:
             return None
-        if recorder.failed_locator is not None:
+        # An ElementHandle has no page attribute; its RecordingLocator carried the page that produced it.
+        if recorder.failed_locator is not None and not is_element_handle(recorder.failed_locator):
             return recorder.failed_locator.page
         return recorder.failed_page
+
+    def failing_tab(self, exception: BaseException) -> Page | None:
+        """The raw page the call that raised ``exception`` ran on, whatever ran concurrently since; a wrapped
+        failure gives None."""
+        return _stamped_failure_page(exception)
 
     def failure_nav_error_code(self, exception: BaseException) -> str | None:
         """The driver code of the navigation that raised ``exception``, or None.
@@ -1040,6 +1424,29 @@ class RecordingPage:
 
     def last_failed_nav_error_code(self) -> str | None:
         return self.__recorder.failed_nav_error_code
+
+    def failure_document_receipt(self, exception: BaseException) -> DocumentFailureReceipt | None:
+        """The failed document bound to ``exception``; an exception raised over the last failed call
+        (an authored wrapper) only gets that call's receipt as context."""
+        recorder = self.__recorder
+        if recorder.document_failure is None:
+            return None
+        bound_exception, receipt = recorder.document_failure
+        if bound_exception is exception:
+            return receipt
+        try:
+            stamps = BaseException.__getattribute__(exception, "__dict__")
+        except Exception:
+            stamps = {}
+        if DOCUMENT_FAILURE_ATTRIBUTE in stamps:
+            stamped = stamps[DOCUMENT_FAILURE_ATTRIBUTE]
+            return stamped if isinstance(stamped, DocumentFailureReceipt) else None
+        if recorder.document_failure_generation == recorder.failure_operation_generation:
+            return replace(receipt, relation="context")
+        return None
+
+    def _detach_document_observers(self) -> None:
+        self.__recorder.detach_document_observers()
 
     async def _record_solve_captcha(
         self,
@@ -1120,7 +1527,7 @@ class RecordingPage:
         return True
 
     def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
-        return RecordingLocator(self.__page.locator(selector, **kwargs), self.__recorder, selector)
+        return RecordingLocator(self.__page.locator(selector, **kwargs), self.__recorder, selector, self.__page)
 
     @property
     def keyboard(self) -> RecordingKeyboard:
@@ -1129,22 +1536,7 @@ class RecordingPage:
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__page, name)
         if name == "context" and self.__recorder.strategy_aware_typing:
-            return RecordingBrowserContext(attr, self.__recorder, self.__recording_page, True)
-        # The canonical popup flow is `async with page.expect_popup() as info`, whose value is a
-        # page. Left unwrapped, navigating that popup skips the recorder like any other raw page.
-        if name in _PAGE_EVENT_CONTEXT_METHODS and callable(attr):
-
-            def expect_event_context(*args: Any, **kwargs: Any) -> Any:
-                # expect_event also yields downloads, requests and the like, so only a page is
-                # wrapped; expect_popup always yields one.
-                wrap = (
-                    self.__recording_page
-                    if name == "expect_popup"
-                    else lambda value: self.__recording_page(value) if type(value).__name__ == "Page" else value
-                )
-                return _RecordingExpectContext(attr(*args, **kwargs), wrap)
-
-            return expect_event_context
+            return RecordingBrowserContext(attr, self.__recorder, self.__recording_page, True, self.__page)
         if name == "main_frame":
             return self.__recording_frame(attr)
         if name == "frames":
@@ -1159,7 +1551,9 @@ class RecordingPage:
         if name in _LOCATOR_FACTORY_METHODS and callable(attr):
 
             def factory(*args: Any, **kwargs: Any) -> RecordingLocator:
-                return RecordingLocator(attr(*args, **kwargs), self.__recorder, _factory_selector(name, args))
+                return RecordingLocator(
+                    attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), self.__page
+                )
 
             return factory
         # Record direct page-level interactions (page.click/fill/press/...) and the high-level
@@ -1170,9 +1564,29 @@ class RecordingPage:
         if action_type is None:
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
-                self.__recorder.begin_failure_operation()
-                return _wrap_call_result(
-                    attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), f"page.{name}", self
+                generation = (
+                    self.__recorder.begin_document_operation()
+                    if name in _PAGE_EVENT_CONTEXT_METHODS
+                    else self.__recorder.begin_failure_operation()
+                )
+                value = _wrap_call_result(
+                    attr(*args, **kwargs),
+                    self.__recorder,
+                    _factory_selector(name, args),
+                    f"page.{name}",
+                    self,
+                    self.__page,
+                )
+                # The canonical popup flow is `async with page.expect_popup() as info`, whose value is a
+                # page. Left unwrapped, navigating that popup skips the recorder like any other raw page.
+                return _bind_document_failure_on_raise(
+                    value,
+                    self.__recorder,
+                    generation,
+                    self.__page,
+                    event_value=(
+                        self.__claim_popup if name == "expect_popup" else partial(_wrap_if_page, self.__recording_page)
+                    ),
                 )
 
             return forwarded

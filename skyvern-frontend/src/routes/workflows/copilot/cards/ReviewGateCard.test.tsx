@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   EMPTY_NARRATIVE,
@@ -31,6 +37,7 @@ const completedBlock = {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 // Radix menus open on pointerdown, not click.
@@ -374,6 +381,50 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Test end-to-end/ }));
     fireEvent.click(screen.getByRole("button", { name: "Run test" }));
     expect(testRuns).toBe(1);
+  });
+
+  it("moves Reject into More actions when the row is too narrow to hold both", () => {
+    let reportWidth: (width: number) => void = () => {};
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          reportWidth = (width) =>
+            callback(
+              [{ contentRect: { width } } as ResizeObserverEntry],
+              this as unknown as ResizeObserver,
+            );
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    let rejects = 0;
+    render(
+      <ReviewGateCard
+        turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={() => {
+          rejects += 1;
+        }}
+        onReview={noop}
+        onTestEndToEnd={noop}
+      />,
+    );
+
+    act(() => reportWidth(279));
+    expect(screen.queryByRole("button", { name: "Reject" })).not.toBeNull();
+
+    act(() => reportWidth(190));
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    openMenu("More actions");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reject" }));
+    expect(rejects).toBe(1);
   });
 
   it("drops an open confirmation and locks More actions when the gate locks", () => {

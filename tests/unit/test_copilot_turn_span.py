@@ -43,8 +43,8 @@ def _user_message(content: str) -> WorkflowCopilotChatHistoryMessage:
 
 
 async def _stub_build_request_policy_with_child_span(*_args: Any, **_kwargs: Any) -> RequestPolicy:
-    """Open an OTel child span so the test can assert parentage, then short-circuit
-    run_copilot_agent via the ask_clarification early-return path."""
+    """Open an OTel child span so the test can assert parentage. The request policy no longer ends the
+    turn early, so patched_request_policy_trust_floor also stubs the agent loop."""
     tracer = otel_trace.get_tracer("test.copilot.turn")
     with tracer.start_as_current_span("test.req_policy_child"):
         pass
@@ -53,6 +53,11 @@ async def _stub_build_request_policy_with_child_span(*_args: Any, **_kwargs: Any
         clarification_question="What URL should I target?",
         clarification_reason="missing_target_url",
     )
+
+
+async def _stub_agent_loop_without_model_call(*_args: Any, **_kwargs: Any) -> None:
+    """Stand in for the Agents SDK loop so the turn ends without sending a request to OpenAI."""
+    raise RuntimeError("model call stubbed out in tests")
 
 
 async def _raise_unhandled_turn_error(*_args: Any, **_kwargs: Any) -> None:
@@ -66,6 +71,7 @@ def patched_request_policy_trust_floor(monkeypatch: pytest.MonkeyPatch) -> None:
         "build_request_policy_trust_floor",
         _stub_build_request_policy_with_child_span,
     )
+    monkeypatch.setattr(copilot_agent, "_run_agent_loop_with_surface", _stub_agent_loop_without_model_call)
 
 
 def _find_span(spans: list[Any], name: str) -> Any:
@@ -84,7 +90,7 @@ async def test_copilot_turn_span_parents_inner_spans(
     chat_history = [_user_message("prior question")]
 
     result = await copilot_agent.run_copilot_agent(
-        stream=object(),  # never used on the ask_clarification path
+        stream=object(),  # never used: the stubbed agent loop raises before streaming
         organization_id="o_test",
         chat_request=chat_request,
         chat_history=chat_history,

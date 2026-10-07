@@ -15,6 +15,7 @@ import {
   canonicalRecoveriesByWorkflow,
 } from "./WorkflowCopilotChat";
 
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import {
   beginYamlCommit,
@@ -33,6 +34,7 @@ type StreamBody = {
   cancel_token?: string;
   supports_credential_pause?: boolean;
   supports_credential_pause_recovery?: boolean;
+  supports_credential_generation?: boolean;
   credential_recovery_token?: string;
 };
 type StreamCall = {
@@ -574,12 +576,91 @@ const streamScoutTurn = async () => {
 describe("WorkflowCopilotChat — activity log", () => {
   it("renders the flat log, not the retired phase rail", async () => {
     await streamScoutTurn();
-    expect(screen.getByText("Opened the sign-in page")).toBeTruthy();
+    expect(screen.getByText("1 browser action")).toBeTruthy();
     expect(screen.queryByText("Explore site")).toBeNull();
   });
 });
 
 describe("WorkflowCopilotChat — credential receipt placement", () => {
+  it("releases the dock and header flag when a docked sign-in request times out", async () => {
+    await streamScoutTurn();
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByRole("group", { name: "Sign-in request" })).toBeTruthy();
+    expect(useCopilotHeaderStore.getState().attention).toBe("credential");
+
+    // The server sends no frame on timeout, so the deadline alone has to release the dock.
+    await act(async () => vi.advanceTimersByTimeAsync(300_001));
+    expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
+    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
+    expect(screen.getAllByText("Timed out").length).toBeGreaterThan(0);
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
+  });
+
+  it("docks a live sign-in request above the composer and hands the receipt back to the transcript", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+    });
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const tray = await screen.findByRole("group", { name: "Sign-in request" });
+    const marker = screen.getByText("Copilot needs to sign in");
+    expect(
+      precedes(
+        document.querySelector('[data-activity-row-id="tc-1"]')!,
+        marker,
+      ),
+    ).toBe(true);
+    expect(precedes(marker, tray)).toBe(true);
+    expect(
+      precedes(
+        tray,
+        screen.getByRole("group", { name: "Copilot message composer" }),
+      ),
+    ).toBe(true);
+    expect(screen.getAllByRole("button", { name: "Skip for now" })).toEqual([
+      within(tray).getByRole("button", { name: "Skip for now" }),
+    ]);
+    expect(useCopilotHeaderStore.getState().attention).toBe("credential");
+
+    // Minimized, the tray keeps its name on the control that restores it.
+    fireEvent.click(
+      within(tray).getByRole("button", { name: "Minimize sign-in request" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show Sign-in request" }),
+    );
+    expect(screen.getByRole("group", { name: "Sign-in request" })).toBeTruthy();
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "credential_pause_resolved",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        resume_token: "rt-abc",
+        outcome: "connected",
+        credential_id: "cred-hn",
+        name: "HN Login",
+        timestamp: new Date().toISOString(),
+      });
+    });
+    expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
+    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
+  });
+
   it("keeps a mid-turn credential card after the row it was raised on, live and once the turn ends", async () => {
     credentialsData.current = [
       { credential_id: "cred-hn", name: "HN Login", tested_url: null },
@@ -680,11 +761,408 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     });
     const receipt = await screen.findByText("Credential 'HN Login' added");
     expect(screen.getAllByText("Credential 'HN Login' added")).toHaveLength(1);
-    expect(precedes(row("tc-1"), receipt)).toBe(true);
-    expect(precedes(receipt, row("tc-2"))).toBe(true);
     expect(
       precedes(receipt, screen.getByText("Signed in and saved the draft.")),
     ).toBe(true);
+
+    // The finished turn folds its steps; the card stays visible, and opening
+    // the fold puts it back after the row it was raised on.
+    fireEvent.click(
+      document.querySelector<HTMLButtonElement>("[data-activity-fold]")!,
+    );
+    const unfolded = screen.getByText("Credential 'HN Login' added");
+    expect(screen.getAllByText("Credential 'HN Login' added")).toHaveLength(1);
+    expect(precedes(row("tc-1"), unfolded)).toBe(true);
+    expect(precedes(unfolded, row("tc-2"))).toBe(true);
+  });
+});
+
+describe("WorkflowCopilotChat — question receipt placement", () => {
+  it("keeps an answered question after the step that asked it while later steps run", async () => {
+    await streamScoutTurn();
+    const ask = {
+      tool_name: "ask_user",
+      display_label: "Asking you",
+      iteration: 1,
+      tool_call_id: "tc-ask",
+    };
+    const said = (iteration: number, narration: string, second: number) => ({
+      type: "narration",
+      narration,
+      iteration,
+      timestamp: `2026-07-13T00:00:0${second}Z`,
+    });
+    const question = {
+      interaction_id: "qi-1",
+      turn_id: "turn-1",
+      tool_call_id: "tc-ask",
+      parts: [
+        {
+          part_id: "p1",
+          prompt: "Which structure?",
+          choices: [{ choice_id: "c-llc", text: "LLC" }],
+        },
+      ],
+      status: "pending" as const,
+      response: null,
+      created_at: "2026-07-13T00:00:02Z",
+      resolved_at: null,
+    };
+    const later = {
+      tool_name: "get_block_schema",
+      display_label: "Checking workflow block options",
+      iteration: 2,
+      tool_call_id: "tc-later",
+    };
+    await act(async () => {
+      streamCalls[0]!.onMessage(said(1, "Checking what the form needs.", 1));
+      streamCalls[0]!.onMessage({
+        type: "tool_call",
+        tool_input: {},
+        timestamp: "2026-07-13T00:00:02Z",
+        ...ask,
+      });
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        cancel_token: null,
+        interactions: [question],
+      });
+      streamCalls[0]!.onMessage({
+        type: "question_resolved",
+        continued: true,
+        interaction: {
+          ...question,
+          status: "resolved",
+          response: {
+            answers: [{ part_id: "p1", choice_id: "c-llc", text: null }],
+            text: null,
+            skipped: false,
+          },
+          resolved_at: "2026-07-13T00:00:03Z",
+        },
+      });
+      streamCalls[0]!.onMessage({
+        type: "tool_result",
+        success: true,
+        summary: "Answered",
+        timestamp: "2026-07-13T00:00:04Z",
+        ...ask,
+      });
+      streamCalls[0]!.onMessage(said(2, "Choosing the blocks.", 5));
+      streamCalls[0]!.onMessage({
+        type: "tool_call",
+        tool_input: {},
+        timestamp: "2026-07-13T00:00:06Z",
+        ...later,
+      });
+    });
+    // The full suite runs this file under load; the default 1s wait flakes.
+    const receipt = await screen.findByText(
+      "You answered 1 question",
+      undefined,
+      {
+        timeout: 5000,
+      },
+    );
+    const step = (reason: string) =>
+      [...document.querySelectorAll("[data-activity-row-id]")].find((row) =>
+        row.textContent?.includes(reason),
+      );
+    const precedes = (a: Node | undefined, b: Node | undefined) =>
+      Boolean(
+        a &&
+        b &&
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    // The receipt renders before later steps finish revealing, so wait for the steps too.
+    await waitFor(
+      () => {
+        expect(precedes(step("Checking what the form needs."), receipt)).toBe(
+          true,
+        );
+        expect(precedes(receipt, step("Choosing the blocks."))).toBe(true);
+      },
+      { timeout: 5000 },
+    );
+  });
+});
+
+describe("WorkflowCopilotChat — saved turn placement", () => {
+  it("places a plan and a question whose rows the saved turn no longer keeps by their call and time", async () => {
+    const at = (s: number) => `2026-07-13T00:00:${String(s).padStart(2, "0")}Z`;
+    const call = (id: string, toolName: string, s: number) => [
+      {
+        kind: "tool_call",
+        id: `tc-${id}`,
+        text: "…",
+        toolName,
+        iteration: s,
+        timestamp: at(s),
+      },
+      {
+        kind: "tool_result",
+        id: `tr-${id}`,
+        text: "OK",
+        toolName,
+        iteration: s,
+        success: true,
+        timestamp: at(s),
+      },
+    ];
+    const said = (text: string, s: number) => ({
+      kind: "narration",
+      id: `n-${s}`,
+      text,
+      iteration: s,
+      timestamp: at(s),
+    });
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "Apply for it",
+        turn_id: "turn-1",
+        created_at: at(0),
+      },
+      {
+        sender: "ai",
+        content: "Stopped.",
+        turn_id: "turn-1",
+        created_at: at(30),
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          terminal: "response",
+          terminalMessage: "Stopped.",
+          narrativeSummary: "Stopped.",
+          startedAt: at(0),
+          endedAt: at(30),
+          draft: { blockCount: 1, blockLabels: ["fill_form"] },
+          blocks: [],
+          // The ask_user call at 0:02 aged out of the saved activity.
+          designActivity: [
+            said("Opening the form.", 10),
+            ...call("nav", "navigate_browser", 11),
+            said("Writing the plan.", 12),
+            ...call("plan", "set_work_plan", 13),
+            said("Checking the next page.", 14),
+            ...call("look", "evaluate", 15),
+          ],
+        },
+      },
+    ];
+    (historyResponse.data as Record<string, unknown>).work_plan = [
+      "Fill in the form",
+    ];
+    historyResponse.data.question_interactions = [
+      {
+        interaction_id: "qi-early",
+        turn_id: "turn-1",
+        tool_call_id: "tc-aged-out",
+        parts: [
+          {
+            part_id: "p1",
+            prompt: "Which structure?",
+            choices: [{ choice_id: "c-llc", text: "LLC" }],
+          },
+        ],
+        status: "resolved",
+        response: {
+          answers: [{ part_id: "p1", choice_id: "c-llc", text: null }],
+          text: null,
+          skipped: false,
+        },
+        created_at: at(2),
+        resolved_at: at(3),
+      },
+    ];
+    await renderChat();
+    await screen.findByText("You answered 1 question");
+    const fold = document.querySelector<HTMLButtonElement>(
+      "[data-activity-fold]",
+    )!;
+    // Folded, the question asked before every kept step still reads first,
+    // while the plan made mid-turn stays below the fold line.
+    expect(
+      Boolean(
+        screen
+          .getByText("You answered 1 question")
+          .compareDocumentPosition(fold) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+    expect(
+      Boolean(
+        fold.compareDocumentPosition(screen.getByText("Fill in the form")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+    fireEvent.click(fold);
+    const step = (reason: string) =>
+      [...document.querySelectorAll("[data-activity-row-id]")].find((row) =>
+        row.textContent?.includes(reason),
+      )!;
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const question = screen.getByText("You answered 1 question");
+    const plan = screen.getByText("Fill in the form");
+    expect(screen.getAllByText("Fill in the form")).toHaveLength(1);
+    expect(precedes(question, step("Opening the form."))).toBe(true);
+    expect(precedes(step("Writing the plan."), plan)).toBe(true);
+    expect(precedes(plan, step("Checking the next page."))).toBe(true);
+  });
+});
+
+describe("WorkflowCopilotChat — saved plan attribution", () => {
+  it("does not credit an older turn with the plan when a newer turn's steps were trimmed", async () => {
+    const at = (s: number) =>
+      `2026-07-13T00:${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}Z`;
+    const pair = (id: string, toolName: string, s: number) => [
+      {
+        kind: "tool_call",
+        id: `tc-${id}`,
+        text: "…",
+        toolName,
+        iteration: s,
+        timestamp: at(s),
+      },
+      {
+        kind: "tool_result",
+        id: `tr-${id}`,
+        text: "OK",
+        toolName,
+        iteration: s,
+        success: true,
+        timestamp: at(s),
+      },
+    ];
+    const turn = (
+      id: string,
+      start: number,
+      reply: string,
+      designActivity: unknown[],
+    ) => [
+      {
+        sender: "user",
+        content: `Ask ${id}`,
+        turn_id: id,
+        created_at: at(start),
+      },
+      {
+        sender: "ai",
+        content: reply,
+        turn_id: id,
+        created_at: at(start + 50),
+        turn_outcome: { copilot_turn_id: id, terminal_reason: "completed" },
+        narrative_payload: {
+          turnId: id,
+          terminal: "response",
+          terminalMessage: reply,
+          narrativeSummary: reply,
+          startedAt: at(start),
+          endedAt: at(start + 50),
+          blocks: [],
+          designActivity,
+        },
+      },
+    ];
+    historyResponse.data.chat_history = [
+      ...turn(
+        "turn-1",
+        0,
+        "First turn done.",
+        pair("plan", "set_work_plan", 5),
+      ),
+      // At the 50-entry cap: this turn's own set_work_plan call may have aged out.
+      ...turn(
+        "turn-2",
+        100,
+        "Second turn done.",
+        Array.from({ length: 25 }, (_, n) =>
+          pair(`look-${n}`, "evaluate", 101 + n),
+        ).flat(),
+      ),
+    ];
+    (historyResponse.data as Record<string, unknown>).work_plan = [
+      "Fill in the form",
+    ];
+    await renderChat();
+    const plan = await screen.findByText("Fill in the form");
+    const secondReply = screen.getByText("Second turn done.");
+    expect(
+      Boolean(
+        secondReply.compareDocumentPosition(plan) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("WorkflowCopilotChat — saved plan clear", () => {
+  it("shows a plan cleared by a turn saved without its plan", async () => {
+    const at = (s: number) => `2026-07-13T00:00:${String(s).padStart(2, "0")}Z`;
+    const planResult = (id: string, s: number) => ({
+      kind: "tool_result",
+      id: `tr-${id}`,
+      text: "OK",
+      toolName: "set_work_plan",
+      iteration: s,
+      success: true,
+      timestamp: at(s),
+    });
+    const aiTurn = (
+      id: string,
+      start: number,
+      reply: string,
+      extra: Record<string, unknown>,
+    ) => ({
+      sender: "ai",
+      content: reply,
+      turn_id: id,
+      created_at: at(start + 5),
+      turn_outcome: { copilot_turn_id: id, terminal_reason: "completed" },
+      narrative_payload: {
+        turnId: id,
+        terminal: "response",
+        terminalMessage: reply,
+        narrativeSummary: reply,
+        startedAt: at(start),
+        endedAt: at(start + 5),
+        blocks: [],
+        ...extra,
+      },
+    });
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "Plan it",
+        turn_id: "turn-1",
+        created_at: at(0),
+      },
+      aiTurn("turn-1", 0, "Planned.", {
+        designActivity: [planResult("plan", 1)],
+        workPlan: { toolCallId: "tc-plan", items: ["Fill in the form"] },
+      }),
+      {
+        sender: "user",
+        content: "Drop it",
+        turn_id: "turn-2",
+        created_at: at(10),
+      },
+      // Saved without its plan; its newest successful call cleared it.
+      aiTurn("turn-2", 10, "Cleared.", {
+        designActivity: [planResult("clear", 11)],
+      }),
+    ];
+    (historyResponse.data as Record<string, unknown>).work_plan = [];
+    await renderChat();
+    expect(await screen.findByText("Plan cleared")).toBeTruthy();
   });
 });
 
@@ -1385,6 +1863,237 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(screen.queryByText(/Credential added/)).toBeNull();
   });
 
+  it.each([
+    ["unknown", /The vault didn't confirm the save/],
+    ["created_not_connected", /Saved as Portal test account, not connected/],
+  ] as const)(
+    "registration Generate and save POSTs only the pause ids and a %s save removes the button",
+    async (generateResult, message) => {
+      sansApiPost.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflow/copilot/credential-generate"
+            ? { data: { result: generateResult } }
+            : {},
+        ),
+      );
+      await renderChat();
+      await submit("create a test account");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      expect(streamCalls[0]!.body.supports_credential_generation).toBe(true);
+      await act(async () => {
+        streamCalls[0]!.onMessage(turnStart());
+        streamCalls[0]!.onMessage(
+          credentialFrame({
+            reason: "credential_registration",
+            login_page_urls: ["https://portal.example.com/signup"],
+            registration: {
+              username: "tester@example.com",
+              credential_name: "Portal test account",
+            },
+          }),
+        );
+      });
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Generate and save" }),
+        );
+      });
+      const generatePosts = () =>
+        sansApiPost.mock.calls.filter(
+          (call) => call[0] === "/workflow/copilot/credential-generate",
+        );
+      await waitFor(() => expect(generatePosts()).toHaveLength(1));
+      expect(generatePosts()[0]![1]).toEqual({
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        resume_token: "rt-abc",
+      });
+      expect(await screen.findAllByText(message)).not.toHaveLength(0);
+      expect(
+        screen.queryByRole("button", { name: "Generate and save" }),
+      ).toBeNull();
+      expect(credentialResponsePosts()).toHaveLength(0);
+      expect(
+        screen.queryByRole("button", { name: "Skip for now" }) === null,
+      ).toBe(generateResult === "created_not_connected");
+    },
+  );
+
+  const raiseRegistrationCard = async () => {
+    await renderChat();
+    await submit("create a test account");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          reason: "credential_registration",
+          login_page_urls: ["https://portal.example.com/signup"],
+          registration: {
+            username: "tester@example.com",
+            credential_name: "Portal test account",
+          },
+        }),
+      );
+    });
+    await waitFor(() => expect(credentialsGets().length).toBeGreaterThan(0));
+  };
+
+  it("registration unknown reloads the saved logins so a save that landed late can be picked", async () => {
+    const extendedDeadline = new Date(Date.now() + 600_000).toISOString();
+    sansApiPost.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflow/copilot/credential-generate"
+          ? {
+              data: {
+                result: "unknown",
+                expires_at: extendedDeadline,
+              },
+            }
+          : {},
+      ),
+    );
+    await raiseRegistrationCard();
+    const listsBefore = credentialsGets().length;
+    credentialsData.current = [
+      {
+        credential_id: "cred-new",
+        name: "Portal test account",
+        tested_url: null,
+      },
+    ];
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Generate and save" }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(credentialsGets().length).toBeGreaterThan(listsBefore),
+    );
+    expect(
+      (
+        await screen.findAllByText(
+          /didn't confirm the save. Check your credentials/,
+        )
+      ).length,
+    ).toBeGreaterThan(0);
+    expect((await screen.findAllByText("Saved logins")).length).toBeGreaterThan(
+      0,
+    );
+    expect(credentialResponsePosts()).toHaveLength(0);
+  });
+
+  it("registration Generate whose POST fails reads the card back instead of offering a retry", async () => {
+    sansApiPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/credential-generate"
+        ? Promise.reject(new Error("gateway timeout"))
+        : Promise.resolve({}),
+    );
+    await raiseRegistrationCard();
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [
+        credentialFrame({
+          reason: "credential_registration",
+          login_page_urls: ["https://portal.example.com/signup"],
+          registration: {
+            username: "tester@example.com",
+            credential_name: "Portal test account",
+            attempted: true,
+            outcome: "unknown",
+          },
+        }),
+      ],
+    };
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Generate and save" }),
+      );
+    });
+
+    expect(
+      (await screen.findAllByText(/The vault didn't confirm the save/)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      apiGet.mock.calls.some(
+        ([path]) => path === "/workflow/copilot/chat-history",
+      ),
+    ).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: "Generate and save" }),
+    ).toBeNull();
+    expect(toastFn).not.toHaveBeenCalled();
+  });
+
+  it("registration Generate whose POST fails keeps reading the card until the save settles", async () => {
+    sansApiPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/credential-generate"
+        ? Promise.reject(new Error("gateway timeout"))
+        : Promise.resolve({}),
+    );
+    await raiseRegistrationCard();
+    const registrationCard = (
+      registration: Partial<
+        NonNullable<WorkflowCopilotCredentialRequiredUpdate["registration"]>
+      >,
+      expiresAt?: string,
+    ) =>
+      credentialFrame({
+        reason: "credential_registration",
+        login_page_urls: ["https://portal.example.com/signup"],
+        registration: {
+          username: "tester@example.com",
+          credential_name: "Portal test account",
+          attempted: true,
+          ...registration,
+        },
+        ...(expiresAt ? { expires_at: expiresAt } : {}),
+      });
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [registrationCard({})],
+    };
+    const historyReads = () =>
+      apiGet.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/chat-history",
+      ).length;
+    vi.useFakeTimers();
+    const readsBefore = historyReads();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Generate and save" }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(historyReads()).toBeGreaterThan(readsBefore);
+    expect(screen.queryByText(/The vault didn't confirm the save/)).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Generate and save" }),
+    ).toBeNull();
+
+    const extendedDeadline = new Date(Date.now() + 600_000).toISOString();
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [
+        registrationCard({ outcome: "unknown" }, extendedDeadline),
+      ],
+    };
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+
+    expect(
+      screen.getAllByText(/The vault didn't confirm the save/).length,
+    ).toBeGreaterThan(0);
+    await act(async () => vi.advanceTimersByTimeAsync(300_001));
+    expect(
+      screen.getAllByText(/The vault didn't confirm the save/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("Timed out")).toBeNull();
+    expect(credentialResponsePosts()).toHaveLength(0);
+    expect(toastFn).not.toHaveBeenCalled();
+  });
+
   it("connect with an existing matched credential POSTs the credential_id", async () => {
     credentialsData.current = [
       {
@@ -1693,9 +2402,14 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await waitFor(() =>
       expect(credentialsGets().length).toBeGreaterThanOrEqual(1),
     );
+    // The notice sits in the tray, and a second copy of the ask in the transcript would add a button.
+    const tray = await screen.findByRole("group", { name: "Sign-in request" });
     expect(
-      await screen.findByText(/Couldn't load your saved logins/),
-    ).toBeTruthy();
+      within(tray).getAllByText(/Couldn't load your saved logins/),
+    ).toHaveLength(1);
+    expect(
+      screen.getAllByRole("button", { name: "Connect credential" }),
+    ).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Connect credential" }),
@@ -1925,6 +2639,9 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     });
     expect(await screen.findByRole("combobox")).toBeTruthy();
     expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+    // A stranded ask is no longer the tail turn, so it stays inline instead of holding the dock.
+    expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
 
   it("hides a stale terminal ask once it is no longer the last message", async () => {

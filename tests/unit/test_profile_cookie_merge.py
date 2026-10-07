@@ -10,13 +10,16 @@ from playwright.async_api import BrowserContext
 
 from skyvern.webeye.profile_cookie_merge import (
     BANKED_COOKIES_FILENAME,
+    SIGNIN_COOKIES_FILENAME,
     _cookie_key,
     clear_banked_cookies,
     cookie_delta,
+    cookies_for_login_urls,
     seed_cookie_values,
     union_cookies_into_profile_dir,
+    write_signin_cookies,
 )
-from skyvern.webeye.session_cookies import restore_banked_cookies
+from skyvern.webeye.session_cookies import restore_banked_cookies, restore_signin_cookies
 
 _SESSION = {"name": "sess", "value": "a", "domain": "x.com", "path": "/", "expires": -1}
 _SESSION_ZERO = {"name": "sess0", "value": "c", "domain": "x.com", "path": "/", "expires": 0}
@@ -213,3 +216,35 @@ def test_three_way_applies_when_current_still_equals_seed(tmp_path: Path) -> Non
     ours = [{"name": "sid", "value": "OURS", "domain": "x.com", "path": "/"}]
     union_cookies_into_profile_dir(ours, str(tmp_path), base_values=seed_cookie_values(seed))
     assert _sidecar_values(tmp_path)[("x.com", "sid", "/")] == "OURS"  # base==theirs -> ours applied
+
+
+def test_cookies_for_login_urls_keeps_login_hosts_and_parent_domains() -> None:
+    cookies = [
+        {"name": "a", "domain": ".example.com"},
+        {"name": "b", "domain": "app.example.com"},
+        {"name": "c", "domain": "other.example.org"},
+        {"name": "d", "domain": "sibling.example.com"},
+    ]
+    kept = cookies_for_login_urls(cookies, ["https://app.example.com/login", "not a url"])
+    assert [c["name"] for c in kept] == ["a", "b"]
+    assert cookies_for_login_urls(cookies, []) == []
+
+
+@pytest.mark.asyncio
+async def test_signin_seed_restores_once_then_is_deleted(tmp_path: Path) -> None:
+    assert write_signin_cookies(str(tmp_path), [_SESSION_ZERO, _PERSISTENT, {"name": "", "domain": "x.com"}]) == 2
+    seed = tmp_path / SIGNIN_COOKIES_FILENAME
+    assert stat.S_IMODE(seed.stat().st_mode) == 0o600
+
+    fake = FakeContext()
+    await restore_signin_cookies(_ctx(fake), str(tmp_path))
+
+    assert {c["name"] for c in fake.added[0]} == {"sess0", "persist"}
+    assert not seed.exists()
+
+
+@pytest.mark.asyncio
+async def test_signin_seed_is_kept_when_restore_fails(tmp_path: Path) -> None:
+    write_signin_cookies(str(tmp_path), [_PERSISTENT])
+    await restore_signin_cookies(_ctx(RaisingContext()), str(tmp_path))
+    assert (tmp_path / SIGNIN_COOKIES_FILENAME).exists()

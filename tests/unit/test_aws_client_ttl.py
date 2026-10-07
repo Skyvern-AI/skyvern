@@ -1,15 +1,18 @@
 import asyncio
 import contextlib
 import datetime
+import gc
 import ssl
 import time
 import types
+import weakref
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 from aiohttp import web
+from aiohttp.test_utils import unused_port
 from botocore.exceptions import ClientError, ProfileNotFound
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -405,6 +408,7 @@ async def test_resolved_ips_pin_the_connection_and_preserve_the_host_header() ->
     seen: list[str | None] = []
 
     async def handler(request: web.Request) -> web.Response:
+        await request.read()
         seen.append(request.headers.get("Host"))
         return web.Response(status=200)
 
@@ -562,3 +566,123 @@ async def test_upload_file_from_path_cancelled_mid_multipart_aborts_upload_and_s
 
     assert aborted_upload_ids == ["upload-1"]
     assert not [t for t in asyncio.all_tasks() if "upload_fileobj.<locals>.uploader" in repr(t)]
+
+
+@contextlib.asynccontextmanager
+async def _local_s3(barrier: asyncio.Barrier | None = None, port: int = 0):  # type: ignore[no-untyped-def]
+    """A plain-HTTP stand-in for S3 that records which connection and credential served each request."""
+    seen: list[tuple[int, str, asyncio.BaseTransport]] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        await request.read()
+        transport = request.transport
+        assert transport is not None
+        seen.append((transport.get_extra_info("peername")[1], request.headers.get("Authorization", ""), transport))
+        if barrier is not None:
+            await barrier.wait()
+        return web.Response(body=b"payload" if request.method == "GET" else b"")
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    try:
+        yield f"http://127.0.0.1:{runner.addresses[0][1]}", seen
+    finally:
+        if barrier is not None:
+            await barrier.abort()
+        await runner.cleanup()
+
+
+def _local_client(endpoint_url: str) -> aws.AsyncAWSClient:
+    return aws.AsyncAWSClient(
+        aws_access_key_id="AKIAORIGINAL",
+        aws_secret_access_key="secret-test",
+        region_name="us-east-1",
+        endpoint_url=endpoint_url,
+    )
+
+
+@pytest.mark.asyncio
+async def test_s3_operations_reuse_one_client_connection() -> None:
+    """Building a client per operation creates a connector (SSL context + CA bundle load) and a new
+    connection on the event loop every time; production stall dumps caught the API loop there."""
+    async with _local_s3() as (endpoint_url, seen):
+        client = _local_client(endpoint_url)
+        for i in range(3):
+            assert await client.upload_file(f"s3://bucket/k{i}.txt", b"x")
+            assert await client.download_file(f"s3://bucket/k{i}.txt") == b"payload"
+
+    assert len(seen) == 6
+    assert len({port for port, _, _ in seen}) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_s3_operations_are_not_capped_at_the_default_pool_size() -> None:
+    """A shared client must not queue a fan-out behind botocore's default 10-connection pool; every
+    request here is held until all 20 arrive."""
+    async with _local_s3(barrier=asyncio.Barrier(20)) as (endpoint_url, _):
+        client = _local_client(endpoint_url)
+        async with asyncio.timeout(10):
+            results = await asyncio.gather(*(client.download_file(f"s3://bucket/k{i}") for i in range(20)))
+
+    assert results == [b"payload"] * 20
+
+
+@pytest.mark.asyncio
+async def test_replaced_session_credentials_reach_the_next_s3_request_and_the_old_client_closes() -> None:
+    async with _local_s3() as (endpoint_url, seen):
+        client = _local_client(endpoint_url)
+        assert await client.download_file("s3://bucket/k") == b"payload"
+
+        client.session = aws.aioboto3.Session(aws_access_key_id="AKIAROTATED", aws_secret_access_key="rotated")
+        assert await client.download_file("s3://bucket/k") == b"payload"
+
+        old_transport = seen[0][2]
+        async with asyncio.timeout(5):
+            while not old_transport.is_closing():
+                await asyncio.sleep(0.01)
+
+    assert "Credential=AKIAORIGINAL/" in seen[0][1]
+    assert "Credential=AKIAROTATED/" in seen[1][1]
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_client_releases_its_session_promptly() -> None:
+    """Per-call instances (customer-destination uploads, profile jobs) each own a ~10 MB botocore session, so a shared
+    client must not keep one alive after its caller drops the instance."""
+    loop = asyncio.get_running_loop()
+    loop_errors: list[str] = []
+    loop.set_exception_handler(lambda _, context: loop_errors.append(context["message"]))
+    try:
+        async with _local_s3() as (endpoint_url, _):
+            client = _local_client(endpoint_url)
+            assert await client.download_file("s3://bucket/k") == b"payload"
+            session = weakref.ref(client.session)
+            del client
+
+            async with asyncio.timeout(5):
+                while session() is not None:
+                    gc.collect()
+                    await asyncio.sleep(0.01)
+    finally:
+        loop.set_exception_handler(None)
+
+    # Freed by closing, not by garbage-collecting a pending owner task with its aiohttp session still open.
+    assert loop_errors == []
+
+
+def test_s3_client_keeps_working_across_event_loops() -> None:
+    """The storage singleton outlives any one loop (CLI commands, tests); a client bound to a closed
+    loop must not be handed out again."""
+    port = unused_port()
+    client = _local_client(f"http://127.0.0.1:{port}")
+
+    async def download_once() -> bytes | None:
+        async with _local_s3(port=port):
+            return await client.download_file("s3://bucket/k")
+
+    assert asyncio.run(download_once()) == b"payload"
+    assert asyncio.run(download_once()) == b"payload"

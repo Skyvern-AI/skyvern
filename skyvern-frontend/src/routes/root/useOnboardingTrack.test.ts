@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 import {
   countedTrackItems,
   parseOnboardingTrack,
+  REWARD_TRACK_KEYS,
   TRACK_KEYS,
 } from "./useOnboardingTrack";
 
@@ -25,6 +26,30 @@ const validTrack = () => ({
 
 it("accepts a well-formed track", () => {
   expect(parseOnboardingTrack(validTrack())?.completed_count).toBe(1);
+});
+
+it("accepts the activation-rewards layout with its credit totals", () => {
+  const parsed = parseOnboardingTrack({
+    ...validTrack(),
+    items: REWARD_TRACK_KEYS.map((key, index) => ({
+      key,
+      completed_at: index === 0 ? "2026-09-01T00:00:00Z" : null,
+      verification:
+        key === "github_starred" || key === "discord_joined"
+          ? "self"
+          : "server",
+      reward_credits: 100,
+      reward_state: index === 0 ? "granted" : "unearned",
+    })),
+    reward_credits_earned: 100,
+    reward_credits_cap: 1000,
+  });
+  expect(parsed?.items[0]).toMatchObject({
+    key: "questionnaire_completed",
+    reward_state: "granted",
+  });
+  expect(parsed?.reward_credits_earned).toBe(100);
+  expect(parsed?.reward_credits_cap).toBe(1000);
 });
 
 it("accepts only the server-verified second-agent ninth row", () => {

@@ -218,6 +218,7 @@ async def test_task_v2_webhook_exception_log_exposes_canonical_fields(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 @pytest.mark.parametrize("task_version", ["v1", "v2"])
 async def test_task_http_failure_logs_do_not_copy_response_body(
     task_version: str,

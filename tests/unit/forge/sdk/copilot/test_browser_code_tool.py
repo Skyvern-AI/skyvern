@@ -80,7 +80,9 @@ async def test_the_code_tool_mode_decides_whether_it_joins_or_replaces_the_direc
         return resolve_copilot_tool_surface(
             mode=None,
             native_tools=copilot_native_tools(
-                supports_question_tool=True, browser_code_available=mode != CopilotBrowserCodeMode.OFF
+                supports_question_tool=True,
+                browser_code_available=mode != CopilotBrowserCodeMode.OFF,
+                run_tools_available=True,
             ),
             alias_map=aliases,
             overlays=overlays,
@@ -106,6 +108,21 @@ async def test_the_code_tool_mode_decides_whether_it_joins_or_replaces_the_direc
         replaced.ordered_native_names
     )
     assert len({oss.sha256, added.sha256, replaced.sha256}) == 3
+
+
+def test_executed_source_parameters_are_advertised_only_with_the_tool_that_produces_them() -> None:
+    def advertised(browser_code_available: bool) -> dict[str, dict[str, Any]]:
+        tools = copilot_native_tools(
+            supports_question_tool=True, browser_code_available=browser_code_available, run_tools_available=True
+        )
+        return {tool.name: tool.params_json_schema["properties"] for tool in tools}
+
+    with_code_tool, without_code_tool = advertised(True), advertised(False)
+
+    assert with_code_tool["edit_block_and_run"]["executed_source_reference"]["description"]
+    assert with_code_tool["update_and_run_blocks"]["executed_source_references"]["description"]
+    assert "executed_source_reference" not in without_code_tool["edit_block_and_run"]
+    assert "executed_source_references" not in without_code_tool["update_and_run_blocks"]
 
 
 class _LeaseProbeSession:
@@ -905,7 +922,9 @@ async def test_a_recovery_navigation_with_another_tab_open_keeps_the_browser_wit
     # tabs are gone the next code navigation lifts the hold.
     required = resolve_copilot_tool_surface(
         mode=None,
-        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=True),
+        native_tools=copilot_native_tools(
+            supports_question_tool=True, browser_code_available=True, run_tools_available=True
+        ),
         alias_map=get_skyvern_mcp_alias_map(),
         overlays=_build_skyvern_mcp_overlays(),
         browser_code_mode=CopilotBrowserCodeMode.REPLACE,
@@ -1918,7 +1937,9 @@ async def _invoke_advertised_tool(
 ) -> dict[str, Any]:
     tool = next(
         tool
-        for tool in copilot_native_tools(supports_question_tool=True, browser_code_available=True)
+        for tool in copilot_native_tools(
+            supports_question_tool=True, browser_code_available=True, run_tools_available=True
+        )
         if tool.name == tool_name
     )
     raw = await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool.name), json.dumps(arguments))  # type: ignore[arg-type]
@@ -2118,7 +2139,9 @@ async def test_a_tainted_page_withholds_its_location_from_browser_code_page_stat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code", [pytest.param(" ", id="refused"), pytest.param("1", id="ran-with-source-reference")])
-async def test_a_browser_code_result_the_scrub_empties_stays_empty(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+async def test_a_browser_code_result_the_scrub_cannot_redact_is_withheld(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
     _patch_cell_runtime(monkeypatch)
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_scrub_emptied"
@@ -2129,4 +2152,6 @@ async def test_a_browser_code_result_the_scrub_empties_stays_empty(monkeypatch: 
     finally:
         clear_session_scrub_values(ctx.browser_session_id)
 
-    assert result == {}
+    assert mcp_adapter.is_redaction_withheld(result) and result["ok"] is False
+    assert result["data"]["redaction_withheld"]["reason"] == "redaction_unavailable"
+    assert set(result) == {"page_state", "ok", "error", "data"}

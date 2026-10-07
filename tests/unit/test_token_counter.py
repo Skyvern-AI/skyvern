@@ -85,6 +85,10 @@ def hello():
         result = count_tokens("https://www.example.com/path?query=value")
         assert result > 0
 
+    def test_special_token_text_is_counted_not_raised(self):
+        """Customer text can contain a tokenizer's special-token spelling; counting it must not raise."""
+        assert count_tokens("before <|endoftext|> after") > count_tokens("before  after")
+
     def test_consistency(self):
         """Same input should always produce same output."""
         text = "This is a test sentence."

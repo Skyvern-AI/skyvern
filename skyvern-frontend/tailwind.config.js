@@ -108,6 +108,9 @@ export default {
         sidebar: "cubic-bezier(0.32, 0.72, 0, 1)",
       },
       keyframes: {
+        marquee: {
+          to: { transform: "translateX(-50%)" },
+        },
         "accordion-down": {
           from: { height: "0" },
           to: { height: "var(--radix-accordion-content-height)" },
@@ -160,6 +163,7 @@ export default {
         },
       },
       animation: {
+        marquee: "marquee 30s linear infinite",
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
         "collapsible-down":
@@ -172,6 +176,7 @@ export default {
         "copilot-sparkle-breathe":
           "copilot-sparkle-breathe 2.8s ease-in-out infinite",
         glow: "glow 2.5s ease-in-out infinite",
+        "run-blocking-locate": "glow 0.85s ease-in-out 3",
         "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
         "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",
         "copilot-row-flash-error": "copilot-row-flash-error 0.6s ease-out",

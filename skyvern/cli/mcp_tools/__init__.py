@@ -226,9 +226,17 @@ def _add_argument_validation_middleware() -> None:
     from .argument_validation import MCPArgumentValidationMiddleware  # noqa: PLC0415
 
     # Registered after telemetry so telemetry stays the outermost wrapper and
-    # still records the call; this one is innermost and rejects malformed
-    # arguments before dispatch runs (and logs a raw pydantic error).
+    # still records the call; this one rejects malformed arguments before
+    # dispatch runs (and logs a raw pydantic error).
     mcp.add_middleware(MCPArgumentValidationMiddleware())
+
+
+def _add_stateless_connection_middleware() -> None:
+    if _FASTMCP_IMPORT_ERROR is not None:
+        return
+    from .connection_scope import MCPStatelessConnectionMiddleware  # noqa: PLC0415
+
+    mcp.add_middleware(MCPStatelessConnectionMiddleware())
 
 
 # -- Tool annotation factories --
@@ -267,6 +275,7 @@ mcp = _FastMCP(
 )
 _add_telemetry_middleware()
 _add_argument_validation_middleware()
+_add_stateless_connection_middleware()
 
 # -- Browser session management --
 mcp.tool(tags={"session", "lean"}, annotations=_mut("Create Browser Session"))(skyvern_browser_session_create)

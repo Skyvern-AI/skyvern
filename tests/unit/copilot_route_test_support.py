@@ -6,6 +6,8 @@ DB / LLM / agent mocks; these helpers keep that wiring in one place.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -49,6 +51,11 @@ def narrative_payload_with_run(run_id: str | None) -> dict[str, Any]:
             "ranCleanOnCurrentSource": False,
         },
     }
+
+
+@asynccontextmanager
+async def no_finalisation_fence(*_: object) -> AsyncIterator[None]:
+    yield
 
 
 def install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -148,7 +155,10 @@ def setup_new_copilot_mocks(
         ),
         replace_workflow_copilot_chat_message=AsyncMock(),
         claim_pending_copilot_turn=AsyncMock(return_value=True),
+        claim_pending_copilot_turn_for_finalisation=AsyncMock(return_value="claimed"),
+        hold_copilot_turn_finalisation=no_finalisation_fence,
         clear_pending_copilot_turn=AsyncMock(),
+        get_workflow_copilot_claim_expires_in=AsyncMock(return_value=None),
     )
     app.DATABASE.workflow_params = workflow_params
     app.DATABASE.workflows = SimpleNamespace(
@@ -157,7 +167,6 @@ def setup_new_copilot_mocks(
     app.DATABASE.observer = SimpleNamespace(
         get_workflow_run_blocks=AsyncMock(return_value=[]),
     )
-    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
     app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(
         return_value=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)

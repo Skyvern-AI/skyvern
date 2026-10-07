@@ -1,4 +1,6 @@
+import inspect
 import logging
+import math
 import random
 import re
 import sys
@@ -9,12 +11,14 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Iterator, SupportsIndex, TypeGuard
+from typing import Any, Callable, Iterator, SupportsIndex, TypeGuard, overload
 from weakref import WeakSet
 
 import structlog
+from structlog._frames import _find_first_app_frame_and_name
 from structlog.typing import EventDict, Processor
 
 from skyvern._version import __version__
@@ -136,6 +140,10 @@ def _render_opaque_log_values(value: Any) -> Any:
     if type(value) is _GeneratedLogValue:
         # The code-block redactor retains its own policy for these strings.
         return str(value)
+    if type(value) is _GeneratedLogInt:
+        return int(value)
+    if type(value) is _GeneratedLogFloat:
+        return float(value)
     if type(value) in (str, int, float, bool, type(None)):
         return value
     if type(value) is dict:
@@ -165,11 +173,12 @@ def _is_platform_codeblock_log_value(
 ) -> bool:
     if not isinstance(key, str):
         return False
+    if type(value) is _GeneratedLogValue and value.field == key:
+        return all(generated for _text, generated in value.parts)
+    if is_generated_log_field(key, value):
+        return True
     if key == "org_age":
-        # An int has no provenance wrapper; the age is platform-authored only when it is the context's own.
         return type(value) is int and context is not None and value == context.org_age
-    if type(value) is _GeneratedLogValue:
-        return key in _CODEBLOCK_GENERATED_LOG_KEYS and _is_fully_generated(key, value)
     if key == "logger":
         return _is_module_logger_name(value)
     if key not in _CODEBLOCK_FAIL_CLOSED_ID_KEYS or type(value) is not str or not _PLATFORM_ID_SHAPE.fullmatch(value):
@@ -558,6 +567,8 @@ def _is_fully_generated(key: str, value: "_GeneratedLogValue") -> bool:
 
 
 def _is_kept_codeblock_log_field(key: str, value: object) -> bool:
+    if isinstance(value, (_GeneratedLogInt, _GeneratedLogFloat)):
+        value = _plain_generated_log_value(value)
     if type(value) is _GeneratedLogValue:
         if key in _CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS:
             return _is_fully_generated(key, value)
@@ -596,7 +607,12 @@ def _blank_codeblock_log_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _untrusted_log_keys(*groups: Mapping[Any, Any]) -> list[Any]:
-    return [key for group in groups for key in group if key not in _CODEBLOCK_TRUSTED_LOG_KEYS]
+    return [
+        key
+        for group in groups
+        for key, value in group.items()
+        if key not in _CODEBLOCK_TRUSTED_LOG_KEYS and not is_generated_log_field(key, value)
+    ]
 
 
 def _renamed_log_keys(keys: list[Any], redacted_keys: list[Any]) -> dict[Any, str]:
@@ -607,7 +623,17 @@ def _renamed_log_keys(keys: list[Any], redacted_keys: list[Any]) -> dict[Any, st
     }
 
 
-class _GeneratedLogValue(str):
+class _ImmutableLogProvenance:
+    __slots__ = ()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Log provenance is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("Log provenance is immutable")
+
+
+class _GeneratedLogValue(str, _ImmutableLogProvenance):
     """Per-event provenance that survives shallow formatter copies and JSON encoding."""
 
     field: str
@@ -615,8 +641,8 @@ class _GeneratedLogValue(str):
 
     def __new__(cls, field: str, parts: tuple[tuple[str, bool], ...]) -> "_GeneratedLogValue":
         value = super().__new__(cls, "".join(text for text, _generated in parts))
-        value.field = field
-        value.parts = parts
+        object.__setattr__(value, "field", field)
+        object.__setattr__(value, "parts", parts)
         return value
 
     def scrub_caller_text(self, scrub: Callable[[str], str]) -> "_GeneratedLogValue":
@@ -641,6 +667,90 @@ class _GeneratedLogValue(str):
         return _GeneratedLogValue(self.field, tuple(parts))
 
 
+class _GeneratedLogInt(int, _ImmutableLogProvenance):
+    # Stdlib JSON preserves numeric types; other serializers must unwrap provenance first.
+    field: str
+
+    def __new__(cls, field: str, value: int) -> "_GeneratedLogInt":
+        instance = super().__new__(cls, value)
+        object.__setattr__(instance, "field", field)
+        return instance
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return type(self), (self.field, int(self))
+
+
+class _GeneratedLogFloat(float, _ImmutableLogProvenance):
+    field: str
+
+    def __new__(cls, field: str, value: float) -> "_GeneratedLogFloat":
+        instance = super().__new__(cls, value)
+        object.__setattr__(instance, "field", field)
+        return instance
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return type(self), (self.field, float(self))
+
+
+@overload
+def _generated_log_value(field: str, value: str) -> str: ...
+
+
+@overload
+def _generated_log_value(field: str, value: int) -> int: ...
+
+
+@overload
+def _generated_log_value(field: str, value: float) -> float: ...
+
+
+@overload
+def _generated_log_value(field: str, value: None) -> None: ...
+
+
+def _generated_log_value(field: str, value: str | int | float | None) -> str | int | float | None:
+    """Only mark independently generated values; their contents deliberately bypass matching."""
+    if isinstance(value, str):
+        return _GeneratedLogValue(field, ((value, True),))
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _GeneratedLogInt(field, value)
+    if isinstance(value, float):
+        return _GeneratedLogFloat(field, value)
+    return value
+
+
+@overload
+def _model_log_value(field: str, value: str) -> str: ...
+
+
+@overload
+def _model_log_value(field: str, value: None) -> None: ...
+
+
+def _model_log_value(field: str, value: str | None) -> str | None:
+    if type(value) is _GeneratedLogValue and _is_fully_generated("model_name", value):
+        return _generated_log_value(field, value)
+    return str(value) if value is not None else None
+
+
+def is_generated_log_field(key: object, value: object) -> bool:
+    return (
+        isinstance(value, (_GeneratedLogValue, _GeneratedLogInt, _GeneratedLogFloat))
+        and type(value) in (_GeneratedLogValue, _GeneratedLogInt, _GeneratedLogFloat)
+        and value.field == key
+    )
+
+
+def _plain_generated_log_value(value: Any) -> Any:
+    if type(value) is _GeneratedLogValue:
+        return str(value)
+    if type(value) is _GeneratedLogInt:
+        return int(value)
+    if type(value) is _GeneratedLogFloat:
+        return float(value)
+    return value
+
+
 class _LogTimeStamper(structlog.processors.TimeStamper):
     def __call__(self, logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
         event_dict = super().__call__(logger, method_name, event_dict)
@@ -655,10 +765,16 @@ class _LogCallsiteParameterAdder(structlog.processors.CallsiteParameterAdder):
         self._keys = tuple(parameter.value for parameter in parameters)
 
     def __call__(self, logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-        event_dict = super().__call__(logger, method_name, event_dict)
+        # structlog's getframeinfo(frame) reads the caller's source for context lines no field uses, and its first
+        # call maps every loaded module to its file (~0.2 s of worker boot); context=0 skips the read. The private
+        # structlog names below hold only under the structlog<24 pin, and this adder never sees stdlib records.
+        frame, module = _find_first_app_frame_and_name(additional_ignores=self._additional_ignores)
+        frame_info = inspect.getframeinfo(frame, context=0)
+        for parameter, handler in self._active_handlers:
+            event_dict[parameter.value] = handler(module, frame_info)
         for key in self._keys:
-            if type(event_dict.get(key)) is str:
-                event_dict[key] = _GeneratedLogValue(key, ((event_dict[key], True),))
+            if type(event_dict.get(key)) in (str, int):
+                event_dict[key] = _generated_log_value(key, event_dict[key])
         return event_dict
 
 
@@ -711,13 +827,6 @@ _CODEBLOCK_TRUSTED_LOG_KEYS = (
     _CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS | _CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS | {"", "event", "msg"}
 )
 _GENERATED_CONTEXT_LOG_KEYS = _GENERATED_CONTEXT_ID_KEYS | {"codeblock_execution_path"}
-# Keys whose fully generated values code-block redaction passes through untouched when the redactor succeeds.
-_CODEBLOCK_GENERATED_LOG_KEYS = (
-    _CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS
-    | _CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS
-    | _GENERATED_CONTEXT_LOG_KEYS
-    | {"entrypoint"}
-)
 
 
 def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -739,7 +848,7 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
                 )
         # An org created today is 0 days old, so presence is tested against None, not truthiness.
         if context.org_age is not None:
-            context_fields["org_age"] = context.org_age
+            context_fields["org_age"] = _generated_log_value("org_age", context.org_age)
     elif (log_organization := _log_organization.get()) is not None:
         context_fields["organization_id"] = _GeneratedLogValue(
             "organization_id", ((log_organization.organization_id, True),)
@@ -747,13 +856,13 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
         if log_organization.organization_name:
             context_fields["organization_name"] = log_organization.organization_name
         if log_organization.org_age is not None:
-            context_fields["org_age"] = log_organization.org_age
+            context_fields["org_age"] = _generated_log_value("org_age", log_organization.org_age)
     # Lines that only name an organization take its age from the process cache; a miss adds no field.
     organization_id = context_fields.get("organization_id")
     if "org_age" not in context_fields and isinstance(organization_id, str):
         org_age = cached_org_age(organization_id)
         if org_age is not None:
-            context_fields["org_age"] = org_age
+            context_fields["org_age"] = _generated_log_value("org_age", org_age)
     # Scrub complete caller values before slicing the searchable suffix. Replace
     # their original keys too: masking can change a key's spelling.
     event_dict = {key: value for key, value in event_dict.items() if key not in context_fields}
@@ -792,11 +901,18 @@ def _truncate_log_value(value: Any, max_chars: int) -> Any:
     return f"{text[:max_chars]}... [truncated]"
 
 
+# Server-authored internal envelopes: kept on the stdout/Datadog record but popped before the
+# downloadable context.log artifact, and preserved (keys not scrubbed) by the secret scrubber.
+INTERNAL_ATTRIBUTION_ENVELOPE_KEYS: tuple[str, ...] = ("failure_attribution", "operation_attribution")
+
+
 def _bounded_failure_attribution(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    attribution = event_dict.get("failure_attribution")
-    if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
-        return {"failure_attribution": attribution}
-    return {}
+    bounded: EventDict = {}
+    for key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS:
+        attribution = event_dict.get(key)
+        if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
+            bounded[key] = attribution
+    return bounded
 
 
 def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: EventDict) -> str:
@@ -862,6 +978,59 @@ def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: Ev
     )
 
 
+def _number_log_forms(node: int | float | Decimal) -> set[str]:
+    # The JSON renderer emits a Decimal as a float, and an integral float reads as its int too.
+    forms = {str(node)}
+    try:
+        as_float = float(node)
+        forms.add(str(as_float))
+        if math.isfinite(as_float) and as_float.is_integer():
+            forms.add(str(int(node)))
+    except (OverflowError, ValueError):
+        pass
+    return forms
+
+
+# Another session's short value is chance inside an id, path, date or decimal, so it matches only a whole token:
+# a letter, digit or "_" joins, as does ".", ":" or "-" beside a digit, but a %XX, \n, \r, \t or \uXXXX escape separates.
+_TOKEN_LEFT = r"(?:(?<![A-Za-z0-9_])(?<![0-9][.:-])|(?<=%[0-9A-Fa-f]{2})|(?<=\\[nrt])|(?<=\\u[0-9A-Fa-f]{4}))"
+_TOKEN_RIGHT = r"(?![A-Za-z0-9_])(?![.:-][0-9])"
+_SHORT_TOKEN = re.compile(rf"{_TOKEN_LEFT}[A-Za-z0-9]{{1,3}}{_TOKEN_RIGHT}")
+_SHORT_TOKEN_VALUE = re.compile(r"[A-Za-z0-9]{1,3}")
+
+
+def _is_token_char(char: str) -> bool:
+    return char.isascii() and char.isalnum()
+
+
+@lru_cache(maxsize=1)
+def _short_value_scrubber(values: frozenset[str], placeholder: str) -> Callable[[str], str] | None:
+    if not values:
+        return None
+    tokens = frozenset(value for value in values if _SHORT_TOKEN_VALUE.fullmatch(value))
+    others = sorted(values - tokens, key=len, reverse=True)
+    # A value with punctuation, such as "#7", gets a boundary only on an alphanumeric edge, so "x#7" still matches.
+    edged = (
+        re.compile(
+            "|".join(
+                (_TOKEN_LEFT if _is_token_char(value[0]) else "")
+                + re.escape(value)
+                + (_TOKEN_RIGHT if _is_token_char(value[-1]) else "")
+                for value in others
+            )
+        )
+        if others
+        else None
+    )
+
+    def scrub(text: str) -> str:
+        if tokens:
+            text = _SHORT_TOKEN.sub(lambda match: placeholder if match.group() in tokens else match.group(), text)
+        return text if edged is None else edged.sub(placeholder, text)
+
+    return scrub
+
+
 def _registered_secret_scrubber(
     *, logging_envelope: bool = False, protocol_level: str | None = None
 ) -> Callable[[Any, int], Any] | None:
@@ -869,11 +1038,14 @@ def _registered_secret_scrubber(
     # existing scrub helpers; never initialize the app or log from this processor.
     from skyvern.forge.sdk.copilot.secret_scrub import (
         REDACTED_SECRET_PLACEHOLDER,
-        all_registered_secret_values,
         encoded_secret_variants,
+        log_scrub_values,
     )
 
-    variants = set(all_registered_secret_values())
+    copilot_values, short_values = log_scrub_values()
+    copilot_variants = set(copilot_values)
+    # The line's own values are already replaced as text by then, so this pass needs no exclusion for them.
+    short_scrub = _short_value_scrubber(short_values, REDACTED_SECRET_PLACEHOLDER)
     registered: set[str] = set()
     context = skyvern_context.current()
     if context is not None:
@@ -898,12 +1070,13 @@ def _registered_secret_scrubber(
                     registered.update(
                         value for value in run_context.secrets.values() if isinstance(value, str) and value
                     )
+    run_variants: set[str] = set()
     for value in registered:
         if isinstance(value, str) and value:
-            variants.update(encoded_secret_variants(value))
-    if not variants:
+            run_variants.update(encoded_secret_variants(value))
+    if not copilot_variants and not run_variants and short_scrub is None:
         return None
-    secrets = sorted(variants, key=len, reverse=True)
+    secrets = sorted(copilot_variants | run_variants, key=len, reverse=True)
     seen: set[int] = set()
     remaining = 10_000
 
@@ -917,16 +1090,18 @@ def _registered_secret_scrubber(
         if isinstance(node, str):
             for secret in secrets:
                 node = node.replace(secret, REDACTED_SECRET_PLACEHOLDER)
-            return node
+            return node if short_scrub is None else short_scrub(node)
         if node is None or isinstance(node, bool):
             return node
         if isinstance(node, (int, float, Decimal)):
-            # Keep ordinary numbers numeric. Decimal is emitted as a float by
-            # the JSON renderer, so check that representation as well.
-            text = str(node)
-            if isinstance(node, Decimal):
-                text += " " + str(float(node))
-            return REDACTED_SECRET_PLACEHOLDER if any(secret in text for secret in secrets) else node
+            # A Copilot value replaces only a number that is the value, since a short one among a duration's
+            # digits is chance. The run's own secrets replace any number that contains them.
+            forms = _number_log_forms(node)
+            if not forms.isdisjoint(copilot_variants) or any(
+                secret in form for form in forms for secret in run_variants
+            ):
+                return REDACTED_SECRET_PLACEHOLDER
+            return node
 
         marker = id(node)
         if marker in seen:
@@ -941,19 +1116,23 @@ def _registered_secret_scrubber(
                     logging_envelope
                     and depth == 0
                     and type(key) is str
-                    and key in ("event", "msg", "level", "failure_attribution")
+                    and key in ("event", "msg", "level", *INTERNAL_ATTRIBUTION_ENVELOPE_KEYS)
                 )
-                generated_field = depth == 0 and type(item) is _GeneratedLogValue and item.field == key
+                generated_field = depth == 0 and is_generated_log_field(key, item)
                 output_key = key if preserve_keys or protocol_field or generated_field else scrub(key, depth + 1)
                 if generated_field:
-                    result[output_key] = item.scrub_caller_text(lambda text: scrub(text, depth + 1))
+                    result[output_key] = (
+                        item.scrub_caller_text(lambda text: scrub(text, depth + 1))
+                        if type(item) is _GeneratedLogValue
+                        else item
+                    )
                 elif protocol_field and key == "level" and type(item) is str and item == protocol_level:
                     result[output_key] = protocol_level
                 else:
                     result[output_key] = scrub(
                         item,
                         depth + 1,
-                        preserve_keys=preserve_keys or (protocol_field and key == "failure_attribution"),
+                        preserve_keys=preserve_keys or (protocol_field and key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS),
                     )
             return result
         if isinstance(node, list):
@@ -983,7 +1162,7 @@ def redact_registered_log_payload(body: Any, attributes: Mapping[str, Any]) -> t
         safe_attributes = scrub(attributes, 0)
     return (
         str(safe_body) if isinstance(safe_body, str) else safe_body,
-        {key: str(value) if type(value) is _GeneratedLogValue else value for key, value in safe_attributes.items()},
+        {key: _plain_generated_log_value(value) for key, value in safe_attributes.items()},
     )
 
 
@@ -1127,8 +1306,9 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
     context = skyvern_context.current()
     if context:
         log_entry = dict(event_dict)
-        # Attribution is internal-only; context logs become downloadable run artifacts.
-        log_entry.pop("failure_attribution", None)
+        # Attribution envelopes are internal-only; context logs become downloadable run artifacts.
+        for _attribution_key in INTERNAL_ATTRIBUTION_ENVELOPE_KEYS:
+            log_entry.pop(_attribution_key, None)
         if workflow_run_id := log_entry.get("workflow_run_id"):
             attempt_number = skyvern_context.current_workflow_log_attempt(workflow_run_id)
             if attempt_number is not None:

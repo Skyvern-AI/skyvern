@@ -21,7 +21,6 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { compactLocalDateTime } from "@/util/timeFormat";
 
 import type {
   WorkflowRunBlock,
@@ -386,9 +385,11 @@ describe("BrowserTab view machine", () => {
         .getQueryCache()
         .getAll()
         .filter(
-          (query) => query.queryKey[query.queryKey.length - 1] === "artifacts",
+          (query) =>
+            query.queryKey[query.queryKey.length - 1] === "artifacts" &&
+            query.queryKey[1] != null,
         );
-      expect(queries).toHaveLength(3);
+      expect(queries).toHaveLength(1);
       for (const query of queries) {
         expect(query.observers[0]?.options.refetchInterval).toBe(interval);
       }
@@ -426,8 +427,13 @@ describe("BrowserTab view machine", () => {
     expectArtifactPolling(5000);
   });
 
-  it("keeps historical screenshots and recordings accessible during a retry wait", () => {
+  it("keeps historical screenshots and recordings accessible during a retry wait", async () => {
     seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    mocks.artifactsByUrl = {
+      "workflow_run_block/wrb_historical/": [
+        { artifact_id: "art_h", artifact_type: "screenshot_llm" },
+      ],
+    };
     mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
       retry_pending: true,
       attempt: 2,
@@ -459,7 +465,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("hero-recording")).toBeTruthy();
     expect(screen.queryByText(retryMessage)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Screenshots" }));
     expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
     expect(screen.queryByText(retryMessage)).toBeNull();
 
@@ -490,15 +496,30 @@ describe("BrowserTab view machine", () => {
     );
   });
 
-  it("labels the replay pills with the run they replay", () => {
+  it("identifies the inspected run without repeating its timestamp in the Browser header", () => {
     seedRun({ status: Status.Completed });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
-    // Same formatter as the Runs list, so the label is locale/TZ-stable here.
-    expect(screen.getByTestId("browser-pane-run-label").textContent).toBe(
-      `Run · ${compactLocalDateTime("2026-09-24T12:00:00")}`,
+    expect(screen.getByTestId("browser-pane-run-cue").textContent).toBe(
+      "Run wr_1",
     );
     expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
+  });
+
+  it("keeps the inspected run cue in place across every view so the pills never shift", () => {
+    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    const cue = screen.getByTestId("browser-pane-run-cue");
+    for (const name of ["Debug browser", "Recording", "Debug browser"]) {
+      const pill = screen.getByRole("button", { name });
+      fireEvent.click(pill);
+      expect(pill.getAttribute("aria-pressed")).toBe("true");
+      // Same node, same text: the row before the pills does not re-lay out.
+      expect(screen.getByTestId("browser-pane-run-cue")).toBe(cue);
+      expect(cue.textContent).toBe("Run wr_1");
+    }
   });
 
   it("registers the shell stream slot while live", () => {
@@ -632,7 +653,9 @@ describe("BrowserTab view machine", () => {
 
     const status = screen.getByTestId("browser-pane-live-status");
     expect(status.textContent).toBe("Starting browser…");
-    expect(screen.getByTestId("browser-pane-run-label")).toBeTruthy();
+    expect(screen.getByTestId("browser-pane-run-cue").textContent).toBe(
+      "Run browser",
+    );
     expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "emit run live" }));
@@ -695,7 +718,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
       "Live",
     );
-    expect(screen.queryByTestId("browser-pane-run-label")).toBeNull();
+    expect(screen.queryByTestId("browser-pane-run-cue")).toBeNull();
     expect(screen.queryByRole("group", { name: "Browser view" })).toBeNull();
   });
 
@@ -773,16 +796,16 @@ describe("BrowserTab view machine", () => {
     expect(startRecording).toHaveBeenCalledOnce();
   });
 
-  it("hides replay pills a finished run has nothing for, and restores them as artifacts arrive", () => {
+  it("hides replay pills a run has nothing for, and restores them as artifacts arrive", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_test" });
     mocks.timeline = [];
     mocks.debugSession = { browser_session_id: "pbs_test" };
     const { rerenderPane } = renderBrowserPane(
       `${STUDIO_PATH}&wr=wr_1&view=recording`,
     );
-    // Artifacts are written at finalize, so a running run keeps both pills.
-    expect(screen.getByRole("button", { name: "Recording" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
+    // Nothing captured yet: a running run offers no replay pills either.
+    expect(screen.queryByRole("button", { name: "Recording" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
 
     mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
       status: Status.Completed,
@@ -803,20 +826,6 @@ describe("BrowserTab view machine", () => {
   });
 
   it.each([
-    {
-      name: "an earlier block's LLM screenshot, none on the last block",
-      timeline: () => [
-        buildBlockItem(
-          buildBlock({
-            workflow_run_block_id: "wrb_B",
-            block_type: "text_prompt",
-            created_at: "2026-01-01T00:01:00Z",
-          }),
-        ),
-        buildBlockItem(buildBlock({ workflow_run_block_id: "wrb_A" })),
-      ],
-      artifacts: { "workflow_run_block/wrb_A/": "screenshot_llm" },
-    },
     {
       name: "an earlier step's screenshot, none on the last step",
       timeline: () => [
@@ -861,6 +870,39 @@ describe("BrowserTab view machine", () => {
       expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
     },
   );
+
+  it("offers Screenshots for a block only once that block has one", async () => {
+    // wrb_B, the last block, captured nothing; the earlier wrb_A has an LLM screenshot.
+    const timeline = () => [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_B",
+          block_type: "text_prompt",
+          created_at: "2026-01-01T00:01:00Z",
+        }),
+      ),
+      buildBlockItem(buildBlock({ workflow_run_block_id: "wrb_A" })),
+    ];
+    seedRun({ status: Status.Completed });
+    mocks.timeline = timeline();
+    mocks.artifactsByUrl = {
+      "workflow_run_block/wrb_A/": [
+        { artifact_id: "art_a", artifact_type: "screenshot_llm" },
+      ],
+    };
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
+    expect(screen.queryByText("Screenshot unavailable.")).toBeNull();
+
+    cleanup();
+    mocks.timeline = timeline();
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=wrb_A`);
+    expect(
+      await screen.findByRole("button", { name: "Screenshots" }),
+    ).toBeTruthy();
+  });
 
   it("never strands a finished run with nothing to replay and no debug browser on an endless warm-up", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_run" });

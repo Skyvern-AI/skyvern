@@ -21,7 +21,7 @@ describe("NarrativeView — transcript working line", () => {
   it("replaces the active-turn working header with the acknowledgement", () => {
     render(<NarrativeView turn={exploringTurn()} />);
 
-    expect(screen.queryByText("Working…")).toBeNull();
+    expect(screen.getAllByText("Working…")).toHaveLength(1);
     expect(screen.queryByText("· building your workflow")).toBeNull();
     expect(screen.getByRole("status").textContent).toContain(
       "Copilot is working on your request…",

@@ -3,6 +3,7 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 import { useEffect, useRef, useState } from "react";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import { getCredentialParam } from "@/util/env";
 import { useQueryClient } from "@tanstack/react-query";
@@ -106,14 +107,20 @@ function WorkflowRunStream({
   const showStream =
     alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
+  const browserSessionId = workflowRun?.browser_session_id ?? null;
+  const browserSessionIdRef = useRef(browserSessionId);
+  browserSessionIdRef.current = browserSessionId;
   const queryClient = useQueryClient();
 
   const socketRef = useRef<WebSocket | null>(null);
   const hasFrameRef = useRef(false);
   const reconnectAttemptsRef = useRef(0);
   const streamFinishedRef = useRef(false);
+  const parseFailureLoggedRef = useRef(false);
+  const parseFailureRunIdRef = useRef<string | undefined>(undefined);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Why the stream stopped, when the server told us before closing. Survives into
   // the close handler so a reconnect notice augments that reason instead of
@@ -147,6 +154,10 @@ function WorkflowRunStream({
     hasFrameRef.current = false;
     reconnectAttemptsRef.current = 0;
     streamFinishedRef.current = false;
+    if (parseFailureRunIdRef.current !== workflowRunId) {
+      parseFailureRunIdRef.current = workflowRunId;
+      parseFailureLoggedRef.current = false;
+    }
     streamEndedDiagnosticRef.current = null;
     let cancelled = false;
 
@@ -264,6 +275,14 @@ function WorkflowRunStream({
           }
         } catch (e) {
           console.error("Failed to parse message", e);
+          if (!parseFailureLoggedRef.current) {
+            parseFailureLoggedRef.current = true;
+            logging.warn("Stream message parse failed", {
+              stream: "run",
+              browser_session_id: browserSessionIdRef.current,
+              workflow_run_id: workflowRunId,
+            });
+          }
           // The backend only sends non-JSON text to reject credentials, and
           // retrying that would just burn the reconnect budget in silence.
           streamFinishedRef.current = true;
@@ -337,6 +356,13 @@ function WorkflowRunStream({
           setDiagnostic(
             diagnosticForReconnectExhausted(WORKFLOW_RUN_STREAM_SUBJECT),
           );
+          logging.warn("Stream gave up", {
+            stream: "run",
+            browser_session_id: browserSessionIdRef.current,
+            workflow_run_id: workflowRunId,
+            reason: "reconnect_exhausted",
+            reconnect_attempts: reconnectAttemptsRef.current,
+          });
         }
       });
     }
@@ -357,6 +383,7 @@ function WorkflowRunStream({
     showStream,
     queryClient,
     workflowPermanentId,
+    logging,
   ]);
 
   const isRunningOrPaused =

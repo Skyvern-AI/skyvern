@@ -99,11 +99,8 @@ def empty_read_decision(
 
 class S3Storage(BaseStorage):
     _PATH_VERSION = "v1"
-    # Cap concurrent head_object fan-out in the legacy listing fallback.
-    # /browser_sessions/history gathers across up to page_size=100 sessions
-    # in parallel, so a per-call semaphore would still allow sessions x cap
-    # in-flight requests. The semaphore is held on the instance so every
-    # legacy listing call sharing this S3Storage shares the same cap.
+    # Caps concurrent head_object calls from S3 listing reads. /browser_sessions/history fans out over up to 100
+    # sessions at once, so the semaphore lives on the instance and every listing call on it shares one cap.
     _LEGACY_LISTING_HEAD_CONCURRENCY = 32
 
     def __init__(self, bucket: str | None = None, endpoint_url: str | None = None) -> None:
@@ -494,14 +491,13 @@ class S3Storage(BaseStorage):
     ) -> list[str]:
         """Return S3 URIs of completed downloads in the session.
 
-        DB-backed (artifact rows are the source of truth) — see
-        ``cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md``. Used by the agent
-        for baseline-before / baseline-after diffs to detect newly-downloaded
-        files. Excludes ``*.crdownload`` partials; those go through
-        ``list_downloading_files_in_browser_session`` instead.
+        DB-backed: artifact rows are the source of truth when the keyring is set.
+        Used by the agent for baseline-before / baseline-after diffs to detect
+        newly-downloaded files. Excludes ``*.crdownload`` partials; those go
+        through ``list_downloading_files_in_browser_session`` instead.
 
-        Falls back to S3 LIST when the keyring is unset (OSS default — no
-        artifact rows exist) or when the DB lookup itself raises.
+        Lists S3 instead when the keyring is unset (OSS default, where the rows
+        are not consulted) or when the DB lookup itself raises.
         """
         return await self._list_downloads_for_session(
             organization_id=organization_id,
@@ -549,13 +545,9 @@ class S3Storage(BaseStorage):
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        # Artifact-first when keyring is configured: query rows scoped to the
-        # session, build short signed /v1/artifacts URLs from them. See
-        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md.
-        #
-        # OSS-default deployments without HMAC signing fall straight to the
-        # legacy listing path so webhook consumers (no API key) can still
-        # fetch the files via presigned URLs.
+        # With the keyring set, artifact rows are the source of truth: a lookup that succeeds and finds nothing
+        # means no downloads, so S3 is not listed. Without a keyring (OSS default) this lists S3 and presigns, so
+        # webhook consumers with no API key can still fetch the files.
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             try:
                 artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
@@ -570,12 +562,11 @@ class S3Storage(BaseStorage):
                     browser_session_id=browser_session_id,
                     exc_info=True,
                 )
-                artifacts = []
-            # Filter out in-progress partials — the user-facing listing must
-            # only show completed downloads. Partials still live as artifact
-            # rows so the agent can detect "still downloading" via DB query.
-            artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
-            if artifacts:
+            else:
+                # Filter out in-progress partials — the user-facing listing must
+                # only show completed downloads. Partials still live as artifact
+                # rows so the agent can detect "still downloading" via DB query.
+                artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
                 return await _file_infos_from_download_artifacts(artifacts)
 
         return await self._get_shared_downloaded_files_in_browser_session_via_listing(
@@ -633,10 +624,9 @@ class S3Storage(BaseStorage):
     async def _get_shared_downloaded_files_in_browser_session_via_listing(
         self, *, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        # Direct S3 LIST: legacy fallback for sessions pre-cutover (no artifact
-        # rows) and OSS deployments without a keyring. We can't go through
-        # ``list_downloaded_files_in_browser_session`` here — that now sources
-        # from artifact rows and would short-circuit to [] on legacy sessions.
+        # Direct S3 LIST, only for OSS deployments without a keyring and for a
+        # failed row lookup. ``list_downloaded_files_in_browser_session`` returns
+        # S3 URIs, not presigned FileInfos, so it is not reused here.
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
         listing_uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
         object_keys = [
@@ -697,11 +687,11 @@ class S3Storage(BaseStorage):
     ) -> list[FileInfo]:
         """Get recording files for a browser session.
 
-        Artifact-first when the keyring is configured: query RECORDING rows
-        scoped to the session and build short signed ``/v1/artifacts/{id}/content``
-        URLs from them — no S3 round-trip per file. Falls back to direct S3
-        LIST + presigned URLs for legacy sessions and OSS-default deployments
-        without HMAC signing.
+        When the keyring is configured, RECORDING rows scoped to the session are
+        the source of truth: build short signed ``/v1/artifacts/{id}/content``
+        URLs from them, and return nothing when there are none. The S3 LIST +
+        presigned URLs path runs only when the row lookup raises or the keyring
+        is unset (OSS default, no HMAC signing).
         """
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             try:
@@ -717,22 +707,19 @@ class S3Storage(BaseStorage):
                     browser_session_id=browser_session_id,
                     exc_info=True,
                 )
-                artifacts = []
-            # Defensive extension filter — same as the legacy listing path —
-            # in case a non-recording row sneaks under the same browser_session_id.
-            artifacts = [
-                a for a in artifacts if a.uri and (a.uri.lower().endswith(".webm") or a.uri.lower().endswith(".mp4"))
-            ]
-            if artifacts:
+            else:
+                # Defensive extension filter — same as the listing path —
+                # in case a non-recording row sneaks under the same browser_session_id.
+                artifacts = [
+                    a
+                    for a in artifacts
+                    if a.uri and (a.uri.lower().endswith(".webm") or a.uri.lower().endswith(".mp4"))
+                ]
                 file_infos = await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.RECORDING)
-                # Newest first — match the legacy listing path's ordering.
+                # Newest first — match the listing path's ordering.
                 file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
                 return file_infos
 
-        # Legacy fallback: keyring unset, DB raised, or session pre-cutover
-        # with no rows at all. SKY-9286: drop entirely after the bake-in
-        # window (target 2026-05-03) — every call here is a billable
-        # ListObjects request.
         return await self._get_shared_recordings_in_browser_session_via_listing(
             organization_id=organization_id, browser_session_id=browser_session_id
         )
@@ -740,10 +727,8 @@ class S3Storage(BaseStorage):
     async def _get_shared_recordings_in_browser_session_via_listing(
         self, *, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        # Direct S3 LIST: legacy fallback for sessions pre-cutover (no
-        # RECORDING artifact rows) and OSS deployments without a keyring.
-        # SKY-9286: scheduled for removal once production sessions all have
-        # rows — every call here is a billable ListObjects request.
+        # Direct S3 LIST, only for OSS deployments without a keyring and for a
+        # failed row lookup. Every call is a billable ListObjects request.
         bucket = settings.AWS_S3_BUCKET_ARTIFACTS
         listing_uri = f"s3://{bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
         all_keys = [f"s3://{bucket}/{file}" for file in await self.async_client.list_files(uri=listing_uri)]
@@ -918,7 +903,7 @@ class S3Storage(BaseStorage):
                     )
                 except Exception:
                     LOG.warning(
-                        "Failed to register downloaded file as artifact; falling back to S3 listing for retrieval",
+                        "Failed to register downloaded file as artifact",
                         file=file,
                         organization_id=organization_id,
                         run_id=run_id,
@@ -939,14 +924,10 @@ class S3Storage(BaseStorage):
     async def get_downloaded_files(
         self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
     ) -> list[FileInfo]:
-        # Artifact-first: when a run has DOWNLOAD artifact rows, return them as
-        # the source of truth — the row carries enough to build a short signed
-        # /v1/artifacts/{id}/content URL plus the SHA-256 we persisted at save
-        # time, so we skip the S3 LIST and per-file HEAD entirely (SKY-8861).
-        #
-        # If HMAC signing isn't configured (self-hosted OSS default), the signed
-        # endpoint requires an API key webhook consumers don't have, so we stay
-        # on the legacy S3-list+presign path even when rows exist.
+        # With the keyring set, the run's DOWNLOAD rows are the source of truth: each row carries the SHA-256 and
+        # what a signed /v1/artifacts/{id}/content URL needs, so there is no S3 LIST or per-file HEAD, and a run with
+        # no rows has no downloads. Without a keyring (OSS default) the signed endpoint needs an API key that webhook
+        # consumers lack, so this lists and presigns even when rows exist, as it also does when the row lookup fails.
 
         # ``download_row_count`` stays None when the rows were never queried (no keyring, no run id,
         # or the lookup failed), so an unqueried read is never reported as a read that found nothing.
@@ -959,38 +940,22 @@ class S3Storage(BaseStorage):
             )
             if not rows_lookup_failed:
                 download_row_count = len(download_artifacts)
-            download_artifacts = dedupe_run_scoped_download_artifacts(
-                download_artifacts, attempt_started_at=attempt_started_at
-            )
-            if download_artifacts:
+                download_artifacts = dedupe_run_scoped_download_artifacts(
+                    download_artifacts, attempt_started_at=attempt_started_at
+                )
                 file_infos = await _file_infos_from_download_artifacts(download_artifacts)
                 if not file_infos:
                     self._log_empty_downloads_read(
                         organization_id=organization_id,
                         run_id=run_id,
                         download_row_count=download_row_count,
-                        rows_lookup_failed=rows_lookup_failed,
-                        skip_fired=False,
-                        rows_present_but_unresolvable=True,
+                        rows_lookup_failed=False,
+                        skip_fired=not download_artifacts,
+                        rows_present_but_unresolvable=bool(download_artifacts),
                         listed=False,
                     )
                 return file_infos
-            if not rows_lookup_failed and await self._skip_empty_downloads_listing(
-                organization_id=organization_id, run_id=run_id
-            ):
-                self._log_empty_downloads_read(
-                    organization_id=organization_id,
-                    run_id=run_id,
-                    download_row_count=download_row_count,
-                    rows_lookup_failed=rows_lookup_failed,
-                    skip_fired=True,
-                    rows_present_but_unresolvable=False,
-                    listed=False,
-                )
-                return []
 
-        # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
-        # OSS-default deployments without HMAC signing both arrive here.
         file_infos = await self._get_downloaded_files_via_s3_listing(
             organization_id=organization_id,
             run_id=run_id,
@@ -1033,36 +998,6 @@ class S3Storage(BaseStorage):
             run_id=run_id,
             **decision,
         )
-
-    async def _skip_empty_downloads_listing(self, *, organization_id: str, run_id: str) -> bool:
-        """True when a run with zero DOWNLOAD rows may skip the legacy S3 LIST.
-
-        Only runs created at/after DOWNLOADS_EMPTY_S3_LISTING_CUTOVER qualify: they
-        register every download as an artifact row at save time, so an empty row set
-        means an empty S3 prefix. Anything unresolvable (cutover unset or unparseable,
-        run row missing, DB error) keeps the LIST fallback.
-        """
-        cutover_raw = settings.DOWNLOADS_EMPTY_S3_LISTING_CUTOVER
-        if not cutover_raw:
-            return False
-        try:
-            cutover = datetime.fromisoformat(cutover_raw)
-            run = await app.DATABASE.tasks.get_run(run_id=run_id, organization_id=organization_id)
-        except Exception:
-            LOG.warning(
-                "Failed to resolve run for empty-downloads listing skip; using S3 LIST",
-                run_id=run_id,
-                exc_info=True,
-            )
-            return False
-        if run is None:
-            return False
-        created_at = run.created_at
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        if cutover.tzinfo is None:
-            cutover = cutover.replace(tzinfo=timezone.utc)
-        return created_at >= cutover
 
     async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> tuple[list[Artifact], bool]:
         """The run's DOWNLOAD rows, plus whether the lookup itself failed.
@@ -1318,8 +1253,8 @@ class S3Storage(BaseStorage):
         For ``downloads``, also drop the matching DOWNLOAD artifact row so a
         subsequent ``GET /v1/browser_sessions/{id}`` doesn't hand out a signed
         URL that 404s. The DB delete runs before the S3 delete: if S3 fails
-        we'd rather have an artifact row missing (the listing fallback covers
-        it) than a row pointing at a deleted object.
+        we'd rather have an artifact row missing (the file simply stops being
+        listed) than a row pointing at a deleted object.
         """
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         if artifact_type == "downloads":

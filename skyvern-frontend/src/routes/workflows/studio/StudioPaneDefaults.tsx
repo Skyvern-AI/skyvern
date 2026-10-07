@@ -6,11 +6,13 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { toast } from "@/components/ui/use-toast";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
+import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { sanitizePaneWidth, type PaneWidths } from "@/store/paneWidths";
 
 import {
@@ -23,10 +25,20 @@ import {
   rememberPaneSlots,
   resolveOpenPanes,
   searchWithRunReference,
+  toReadableSearch,
+  withPaneOpen,
   type StudioPaneId,
 } from "./panes";
-import { StudioPaneDefaultsContext } from "./StudioPaneDefaultsContext";
+import { liveLocationState, liveSearch } from "./liveSearch";
+import {
+  StudioPaneDefaultsContext,
+  type PanesCutFrom,
+} from "./StudioPaneDefaultsContext";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+
+// Create markers nothing reads after mount; discover, template and record are
+// stripped later by the flows that consume them.
+const CREATE_ONLY_VIA = ["blank", "sidebar", "onboarding_template"];
 
 type PaneState = {
   key: string;
@@ -36,8 +48,15 @@ type PaneState = {
   entryId: number;
 };
 
-function withPanes(state: PaneState, panes: StudioPaneId[]): PaneState {
-  return { ...state, panes, slots: rememberPaneSlots(state.slots, panes) };
+function withPanes(
+  state: PaneState,
+  panes: StudioPaneId[],
+  arrangement?: readonly StudioPaneId[],
+): PaneState {
+  const slots = arrangement
+    ? rememberPaneSlots(state.slots, arrangement)
+    : state.slots;
+  return { ...state, panes, slots: rememberPaneSlots(slots, panes) };
 }
 
 export function StudioPaneDefaultsProvider({
@@ -48,7 +67,12 @@ export function StudioPaneDefaultsProvider({
   children: ReactNode;
 }) {
   const location = useLocation();
+  const navigate = useNavigate();
   const pathRunId = useFirstParam("workflowRunId", "runId");
+  // A Copilot manual sign-in happens in the Browser pane, which Edit does not
+  // open; a re-resolve during the sign-in (it can drop ?wr=) keeps it too. The
+  // store is global, so only a sign-in that starts after this studio mounts counts.
+  const signingInRef = useRef(false);
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   const stageElRef = useRef<HTMLElement | null>(null);
   const transitionRef = useRef<{
@@ -76,19 +100,49 @@ export function StudioPaneDefaultsProvider({
   const key = keyForSearch(location.search);
 
   const initialPanes = () => {
+    // Create flows mark their entry with ?via= or ?record=, and some strip it only
+    // after this first resolve. An agent opened without one is being edited.
+    const params = new URLSearchParams(location.search);
+    const creating = params.has("via") || params.get("record") === "1";
+    const defaults = !creating
+      ? DEFAULT_STUDIO_PANES
+      : hasBlocks
+        ? withPaneOpen(CREATE_STUDIO_PANES, "editor")
+        : CREATE_STUDIO_PANES;
     const resolved = resolveOpenPanes(
       searchWithRunReference(location.search, pathRunId),
-      hasBlocks ? DEFAULT_STUDIO_PANES : CREATE_STUDIO_PANES,
+      defaults,
     );
-    const panes = workflowDeleted
-      ? panesWithoutDeletedBlocked(resolved)
+    // Before Editor, so the narrow-stage clamp (it keeps a leading prefix)
+    // drops Editor rather than the Browser the user is signing in through.
+    const shown = signingInRef.current
+      ? withPaneOpen(resolved, "browser", ["browser", "editor"])
       : resolved;
+    const panes = workflowDeleted ? panesWithoutDeletedBlocked(shown) : shown;
     const width = stageElRef.current?.clientWidth ?? 0;
     return width > 0 ? fitPanesToWidth(panes, width) : panes;
   };
   const [state, setState] = useState<PaneState>(() => {
     const panes = initialPanes();
     return { key, panes, slots: [...panes], paneWidths: {}, entryId: 0 };
+  });
+  // Same-commit readers (pane resolve, studio telemetry) already captured it;
+  // dropping it lets a reload or shared link open the Edit panes.
+  useMountEffect(() => {
+    const params = new URLSearchParams(liveSearch(location.search));
+    if (!CREATE_ONLY_VIA.includes(params.get("via") ?? "")) return;
+    params.delete("via");
+    navigate(
+      {
+        pathname: location.pathname,
+        search: toReadableSearch(params),
+        hash: location.hash,
+      },
+      {
+        replace: true,
+        state: liveLocationState(location.search, location.state),
+      },
+    );
   });
   const latestRef = useRef(state);
   let current = state;
@@ -126,20 +180,28 @@ export function StudioPaneDefaultsProvider({
       compute: (
         panes: StudioPaneId[],
         slots: readonly StudioPaneId[],
-      ) => StudioPaneId[],
+        stageWidth: number,
+      ) => StudioPaneId[] | PanesCutFrom,
     ) => {
       const previous = latestRef.current;
-      const computed = compute([...previous.panes], previous.slots);
+      const result = compute(
+        [...previous.panes],
+        previous.slots,
+        stageElRef.current?.clientWidth ?? 0,
+      );
+      const computed = Array.isArray(result) ? result : result.panes;
+      const arrangement = Array.isArray(result)
+        ? undefined
+        : result.arrangement;
       const panes = workflowDeleted
         ? panesWithoutDeletedBlocked(computed)
         : computed;
       wroteEntryRef.current = previous.entryId;
       if (!panesListEqual(previous.panes, panes)) {
-        latestRef.current = withPanes(previous, panes);
+        latestRef.current = withPanes(previous, panes, arrangement);
         setState(latestRef.current);
       }
       const firstRun = useStudioFirstRunStore.getState();
-      if (!firstRun.coachMarkSeen) firstRun.markCoachMarkSeen();
       const width = stageElRef.current?.clientWidth ?? 0;
       if (
         width > 0 &&
@@ -156,6 +218,19 @@ export function StudioPaneDefaultsProvider({
       }
     },
     [workflowDeleted],
+  );
+  // A layout effect subscribes before the Copilot chat's passive effects write
+  // the store, and before a previous agent's chat clears it on unmount.
+  useLayoutEffect(
+    () =>
+      useManualSignInStore.subscribe((state, previous) => {
+        if (state.browserSessionId === previous.browserSessionId) return;
+        signingInRef.current = state.browserSessionId !== null;
+        if (signingInRef.current) {
+          updatePanes((panes, slots) => withPaneOpen(panes, "browser", slots));
+        }
+      }),
+    [updatePanes],
   );
 
   const registerStageElement = useCallback((el: HTMLElement | null) => {

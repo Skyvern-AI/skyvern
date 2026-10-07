@@ -48,8 +48,14 @@ from skyvern.forge.sdk.copilot.config import (
     authoring_capability_from_policy,
     block_authoring_policy_from_capability,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry, ViewportFrame
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ChatScreenshotFrame,
+    PendingFrameLease,
+    ScreenshotEntry,
+    ViewportFrame,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    clear_session_scrub_values,
     origin_runs_bound_to_scrubber,
     register_matching_origin_run_redaction_values,
 )
@@ -65,6 +71,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -88,12 +95,18 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, SignedOutPageObservation
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+    from skyvern.forge.sdk.copilot.repair_origin_run import (
+        OriginOutputRefusalDetail,
+        OutputCarrier,
+        SelectedOutputSource,
+    )
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import FreshExitReceipt
     from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
@@ -155,6 +168,9 @@ _ABANDONED_DRIVER_RELEASES: set[asyncio.Task[bool] | asyncio.Task[None]] = set()
 # Per session: attached turns in this process, and the newest generation any of them attached.
 # Only the last one out releases, and it retires that newest generation rather than its own.
 _ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
+# Closed sessions whose scrub values wait for the last attached turn's release: that turn may still be
+# scrubbing a readback it took before the close.
+_SCRUB_VALUES_CLEARED_ON_RELEASE: set[str] = set()
 # Set while a last-out release has popped its ledger entry but the evict has not finished; an attach
 # in that window would record the generation the evict is about to retire.
 _DRIVER_RELEASES_IN_FLIGHT: dict[str, asyncio.Event] = {}
@@ -452,6 +468,12 @@ class AgentContext:
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
+    # True from on_llm_start to on_llm_end: no tool of that response has started, so aborting the
+    # stream then discards only the call itself.
+    model_call_in_flight: bool = False
+    # The SDK streams each tool call to the chat before its response completes, so aborting after one
+    # would leave a call on screen that never runs.
+    model_call_streamed_tool_call: bool = False
     # Build-test dispatch calls in the model response now executing, armed before any of them runs.
     # The SDK schedules them concurrently, so more than one means a sibling may hold this session.
     build_test_tool_calls_in_model_response: int = 0
@@ -480,6 +502,8 @@ class AgentContext:
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     pending_frame_lease: PendingFrameLease | None = None
+    pending_chat_screenshots: list[ChatScreenshotFrame] = field(default_factory=list, repr=False)
+    chat_screenshot_capture_ids: set[str] = field(default_factory=set)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     unrecoverable_tool_error_streak_count: int = 0
     unrecoverable_tool_error_signature: str | None = None
@@ -634,9 +658,6 @@ class AgentContext:
     # In-turn side channel from workflow mutation calls: block label -> flow_evidence
     # observation step used to ground the newly authored page-acting block.
     block_observation_refs: dict[str, int] = field(default_factory=dict)
-    # Raw tool input for block_observation_refs, retained only for diagnostics
-    # when normalization drops malformed entries before composition validation.
-    raw_block_observation_refs: object | None = None
     # Block-label keyed metadata describing authored code artifacts. This layer
     # only normalizes and carries the metadata; sufficiency checks live elsewhere.
     code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
@@ -697,6 +718,13 @@ class AgentContext:
         default=(), repr=False
     )
     repair_origin_is_copilot_run: bool = False
+    # Block outputs the same run recorded, or why they cannot be used; loaded only when a run was named.
+    repair_origin_outputs: OutputCarrier = field(default=None, repr=False)
+    repair_origin_outputs_run_id: str | None = None
+    # Set by the planner, consumed and cleared by the run it planned, like frontier_resume_session_id.
+    frontier_selected_output_sources: dict[str, SelectedOutputSource] = field(default_factory=dict, repr=False)
+    frontier_origin_reused_labels: list[str] = field(default_factory=list)
+    frontier_origin_output_refusal: OriginOutputRefusalDetail | None = None
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the
@@ -817,20 +845,22 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
 
     if error is not None:
         if isinstance(error, dict):
-            # MCP error: {code, message, hint, details}
-            msg = error.get("message", "Unknown error")
-            hint = error.get("hint", "")
-            result["error"] = f"{msg}. {hint}".strip() if hint else msg
+            # The server's hint is written for its own tool surface and names tools Copilot may not have.
+            result["error"] = error.get("message", "Unknown error")
             error_code = error.get("code")
             if isinstance(error_code, str) and error_code:
                 result["error_code"] = error_code
-            # The message is flattened to a string here, which loses everything a reader needs to
-            # tell a real driver verdict from a sentence describing one. The driver's own navigation
-            # code is lifted out of details so it survives as a value rather than as prose.
+            # The message is flattened to a string here, so the driver's typed verdicts are lifted out
+            # of details to survive as values rather than as prose.
             details = error.get("details")
-            nav_error_code = details.get("nav_error_code") if isinstance(details, dict) else None
-            if isinstance(nav_error_code, str) and nav_error_code:
-                result["nav_error_code"] = nav_error_code
+            if isinstance(details, dict):
+                for key in ("nav_error_code", "element_state"):
+                    value = details.get(key)
+                    if isinstance(value, str) and value:
+                        result[key] = value
+                observed_options = details.get("observed_options")
+                if isinstance(observed_options, list) and all(isinstance(option, str) for option in observed_options):
+                    result["observed_options"] = observed_options
         else:
             result["error"] = str(error)
 
@@ -1459,7 +1489,16 @@ async def close_browser_session_quietly(
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
         return False
+    _clear_closed_session_scrub_values(session_id)
     return True
+
+
+def _clear_closed_session_scrub_values(session_id: str) -> None:
+    """Only a landed close, never a retired id: a retired session can still be alive and reattached."""
+    if session_id in _ATTACHED_TURNS_PER_SESSION:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.add(session_id)
+    else:
+        clear_session_scrub_values(session_id)
 
 
 def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:
@@ -1506,6 +1545,9 @@ async def release_browser_driver_quietly(
         )
         return
     _ATTACHED_TURNS_PER_SESSION.pop(attached.session_id, None)
+    if attached.session_id in _SCRUB_VALUES_CLEARED_ON_RELEASE:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.discard(attached.session_id)
+        clear_session_scrub_values(attached.session_id)
     manager = app.PERSISTENT_SESSIONS_MANAGER
     if not manager.supports_evict_and_reconnect():
         # This process drives the browser itself; detaching its driver would strand the browser
@@ -1903,6 +1945,52 @@ def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict
     }
 
 
+def _browser_session_denial(ctx: AgentContext) -> BuildTestConnectFailure | None:
+    # Belt and braces: the tool surface already withholds every browser tool on such a turn.
+    if ctx.copilot_config is not None and not ctx.copilot_config.browser_tools_available:
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
+        )
+    if raw_secret_browser_denied(ctx):
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=RAW_SECRET_BROWSER_ERROR,
+        )
+    return None
+
+
+async def acquire_fresh_exit_browser_session(
+    ctx: AgentContext,
+    *,
+    prior_browser_session_id: str,
+    proxy_location: ProxyLocationInput,
+    browser_profile_id: str | None,
+) -> FreshExitReceipt | dict[str, Any]:
+    """The platform's verified-new-exit browser for a build test, or the same typed failure envelope as any
+    other build-test browser acquisition."""
+    denial = _browser_session_denial(ctx)
+    if denial is not None:
+        return _browser_session_acquisition_failure_result(denial)
+    try:
+        return await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
+            organization_id=ctx.organization_id,
+            prior_browser_session_id=prior_browser_session_id,
+            proxy_location=proxy_location,
+            browser_profile_id=browser_profile_id,
+            session_kind=BrowserSessionKind.copilot,
+        )
+    except BrowserSessionCreditAdmissionRefusal:
+        return _browser_session_acquisition_failure_result(
+            BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None)
+        )
+    except Exception:
+        LOG.warning("Failed to create a fresh-exit browser session for a build test", exc_info=True)
+        return _browser_session_acquisition_failure_result(BuildTestConnectFailure(state="provisioning_unavailable"))
+
+
 def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
     if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
@@ -1932,7 +2020,7 @@ class _SeededCreateSessionKwargs(TypedDict, total=False):
     profile_read_only: bool
     generate_browser_profile: bool
     proxy_session_id: str
-    proxy_location: ProxyLocation
+    proxy_location: ProxyLocationInput
     inherit_profile_proxy: bool
 
 
@@ -1954,7 +2042,7 @@ def _seeded_create_session_kwargs(seed: BuildTestBrowserSeed | None) -> _SeededC
 
 
 async def _provision_browser_session(
-    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None
+    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None, proxy_location: ProxyLocationInput = None
 ) -> BuildTestConnectFailure | None:
     """Create a browser session if the context holds none.
 
@@ -1969,19 +2057,9 @@ async def _provision_browser_session(
     failure fact, so a failed adoption aborts the turn rather than degrading to a normal
     tool-level error. Callers must let it propagate.
     """
-    # Belt and braces: the tool surface already withholds every browser tool on such a turn.
-    if ctx.copilot_config is not None and not ctx.copilot_config.browser_tools_available:
-        return BuildTestConnectFailure(
-            state="provisioning_unavailable",
-            browser_session_id=ctx.browser_session_id,
-            diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
-        )
-    if raw_secret_browser_denied(ctx):
-        return BuildTestConnectFailure(
-            state="provisioning_unavailable",
-            browser_session_id=ctx.browser_session_id,
-            diagnostic=RAW_SECRET_BROWSER_ERROR,
-        )
+    denial = _browser_session_denial(ctx)
+    if denial is not None:
+        return denial
 
     if ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
         browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
@@ -2004,11 +2082,15 @@ async def _provision_browser_session(
     installed_session_id: str | None = None
     try:
         with copilot_span("browser_session_create", data={"organization_id": ctx.organization_id}):
+            creation_kwargs = _seeded_create_session_kwargs(seed)
+            if proxy_location is not None:
+                creation_kwargs.setdefault("proxy_location", proxy_location)
             session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=30,
                 created_by="copilot",
-                **_seeded_create_session_kwargs(seed),
+                session_kind=BrowserSessionKind.copilot,
+                **creation_kwargs,
             )
         if ctx.browser_session_id:
             # A sibling call installed a session while this create was in flight. Adopt theirs and
@@ -2093,10 +2175,10 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
 
 
 async def ensure_build_test_browser_session(
-    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None
+    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None, proxy_location: ProxyLocationInput = None
 ) -> dict[str, Any] | None:
     async with browser_session_recovery(ctx):
-        failure = await _provision_browser_session(ctx, seed=seed)
+        failure = await _provision_browser_session(ctx, seed=seed, proxy_location=proxy_location)
         return None if failure is None else _build_test_connect_failure_result(failure)
 
 

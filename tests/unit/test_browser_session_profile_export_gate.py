@@ -10,6 +10,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     export_profile_storage_id,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest, UpdateBrowserSessionRequest
 
 
@@ -60,6 +61,7 @@ async def test_create_browser_session_passes_start_url_to_session_manager() -> N
     created_session = SimpleNamespace(persistent_browser_session_id="pbs_1")
     response = SimpleNamespace(browser_session_id="pbs_1")
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
     from_browser_session = AsyncMock(return_value=response)
 
@@ -90,6 +92,9 @@ async def test_create_browser_session_passes_start_url_to_session_manager() -> N
         generate_browser_profile=True,
         needs_live_view=False,
         created_by="user_1",
+        # A signed-in user on the API route is still an API session, which created_by cannot tell.
+        session_kind=BrowserSessionKind.api,
+        browser_settings=None,
     )
     from_browser_session.assert_awaited_once_with(created_session)
 

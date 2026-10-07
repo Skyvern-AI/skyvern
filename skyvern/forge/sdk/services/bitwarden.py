@@ -12,7 +12,8 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from functools import cached_property
@@ -75,7 +76,12 @@ _EXPIRED_SESSION_MARKERS = (
     "session key is invalid",
     "invalid session",
     "mac failed",
+    # The interactive unlock prompt a locked read prints if `BW_NOINTERACTION` ever stops reaching it.
+    "master password:",
 )
+# How `bw sync` reports the server rejecting the login behind a cached session. The CLI logs itself
+# out when it sees one, so that session's vault copy can never be refreshed again.
+_REJECTED_LOGIN_PATTERN = re.compile(r'invalid_grant|"statuscode"\s*:\s*401\b|cannot refresh access token')
 # A vault copy that predates the item looks exactly like an item that does not exist, so both are
 # worth one forced sync before believing the miss.
 _STALE_VAULT_MARKERS = ("not found", "no items found", "no item found")
@@ -87,6 +93,15 @@ _DECRYPTION_FAILURE_VALUE = "[error: cannot decrypt]"
 # The only stderr line advisory enough to accept alongside a valid item: the CLI's generic
 # audit-event upload failure. Everything else stays fatal.
 _EVENT_POST_FAILED_ADVISORY = "Event post failed."
+
+# CLI 2026.x prints this on `bw login --apikey` (vault still locked) when the server has no recorded user key id;
+# the `bw unlock` that follows records it. Only this exact line is tolerated, never other backfill failures.
+_USER_KEY_ID_BACKFILL_ADVISORY = re.compile(
+    r"^\[UserKeyIdBackfillMigration\] Could not determine whether user "
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} "
+    r"needs migration: KeyIdBackfillError: User key is not available in key store$",
+    re.IGNORECASE,
+)
 
 
 def _contains_decryption_failure(value: Any) -> bool:
@@ -105,6 +120,8 @@ def _contains_decryption_failure(value: Any) -> bool:
 _IDENTITY_FINGERPRINT_SALT = secrets.token_bytes(32)
 _IDENTITY_FINGERPRINT_ITERATIONS = 120_000
 
+_SESSION_LIFETIME_JITTER = 0.15
+
 
 class _SessionRepair(StrEnum):
     """What to do to a cached session that just failed a read."""
@@ -114,9 +131,11 @@ class _SessionRepair(StrEnum):
     RELOGIN = "relogin"
 
 
-def _repair_for_failure(message: str) -> _SessionRepair:
-    lowered = message.lower()
-    if any(marker in lowered for marker in _EXPIRED_SESSION_MARKERS):
+def _repair_for_failure(error: BaseException) -> _SessionRepair:
+    lowered = str(error).lower()
+    if any(marker in lowered for marker in _EXPIRED_SESSION_MARKERS) or (
+        isinstance(error, BitwardenSyncError) and _REJECTED_LOGIN_PATTERN.search(lowered)
+    ):
         return _SessionRepair.RELOGIN
     if any(marker in lowered for marker in _STALE_VAULT_MARKERS):
         return _SessionRepair.RESYNC
@@ -183,7 +202,14 @@ class _CliSession:
         self.synced_at: float = 0.0
         self.in_flight = 0
         self.retired = False
-        self.last_used_at = time.monotonic()
+        self.created_at = time.monotonic()
+        self.last_used_at = self.created_at
+        # Sessions one burst logged in would otherwise all expire, and all log in again, together.
+        self.lifetime_scale = random.uniform(1 - _SESSION_LIFETIME_JITTER, 1 + _SESSION_LIFETIME_JITTER)
+
+    def outlived(self, now: float) -> bool:
+        max_lifetime = settings.BITWARDEN_SESSION_MAX_LIFETIME_SECONDS * self.lifetime_scale
+        return max_lifetime > 0 and now - self.created_at >= max_lifetime
 
     @property
     def env(self) -> dict[str, str]:
@@ -200,21 +226,17 @@ class _CliSession:
             self.in_flight -= 1
             self.last_used_at = time.monotonic()
             if self.retired and self.in_flight == 0:
-                self._remove_data_dir()
+                self._log_out()
 
     def retire(self) -> None:
-        """Log this identity out for good.
-
-        Removing the directory is what logs it out: the directory holds the tokens and the vault
-        copy. A retired session is never handed out again, so it is safe to wait for the readers
-        still inside `in_use` rather than deleting the directory out from under them.
-        """
+        """Never hand this session out again, and log it out once its last reader has finished."""
         self.retired = True
-        self.session_key = None
         if self.in_flight == 0:
-            self._remove_data_dir()
+            self._log_out()
 
-    def _remove_data_dir(self) -> None:
+    def _log_out(self) -> None:
+        # Removing the directory is what logs the identity out: it holds the tokens and the vault copy.
+        self.session_key = None
         shutil.rmtree(self.appdata_dir, ignore_errors=True)
 
 
@@ -236,6 +258,13 @@ class _CliSessionCache:
     async def checkout(self, identity: _VaultIdentity) -> _CliSession:
         async with self._lock:
             session = self._sessions.get(identity.fingerprint)
+            outlived: list[tuple[_CliSession, str]] = []
+            if session is not None and session.outlived(time.monotonic()):
+                # A session in constant use never goes idle, so only its age can retire it. Readers
+                # already inside finish on it; this checkout gets a fresh login.
+                del self._sessions[identity.fingerprint]
+                outlived.append((session, "lifetime"))
+                session = None
             if session is None:
                 # A directory per session object, not per identity: a session retired while another
                 # request still held it must never be able to delete its own replacement's data.
@@ -245,9 +274,9 @@ class _CliSessionCache:
                 self._sessions[identity.fingerprint] = session
             os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
             self._sessions.move_to_end(identity.fingerprint)
-            reclaimed = self._reclaim(keep=identity.fingerprint)
+            reclaimed = outlived + self._reclaim(keep=identity.fingerprint)
 
-        await self._retire_all(reclaimed)
+        self._retire_all(reclaimed)
         return session
 
     async def release(self) -> None:
@@ -260,20 +289,22 @@ class _CliSessionCache:
         """
         async with self._lock:
             reclaimed = self._reclaim(keep=None)
-        await self._retire_all(reclaimed)
+        self._retire_all(reclaimed)
 
-    async def _retire_all(self, reclaimed: list[tuple[_CliSession, str]]) -> None:
+    @staticmethod
+    def _retire_all(reclaimed: list[tuple[_CliSession, str]]) -> None:
+        # Never waits on a session's lock: the reader that noticed a busy session expire would
+        # otherwise queue behind every reader of the old session before starting its own login.
         for stale, reason in reclaimed:
             LOG.info(
                 "Retiring a cached Bitwarden CLI session",
                 reason=reason,
                 fingerprint=stale.identity.fingerprint[:12],
             )
-            async with stale.lock:
-                stale.retire()
+            stale.retire()
 
     def _reclaim(self, keep: str | None) -> list[tuple[_CliSession, str]]:
-        """Retire sessions that have gone idle or pushed the cache past capacity.
+        """Retire sessions that have gone idle, outlived their lifetime, or pushed the cache past capacity.
 
         The caller holds the cache lock. `keep` names the session this checkout is about to hand
         out: it has no reader yet, so it looks idle, and retiring it would send the caller to a
@@ -290,6 +321,8 @@ class _CliSessionCache:
                 continue
             if max_idle > 0 and now - session.last_used_at >= max_idle:
                 reason = "idle"
+            elif session.outlived(now):
+                reason = "lifetime"
             elif len(self._sessions) > capacity:
                 reason = "capacity"
             else:
@@ -302,19 +335,44 @@ class _CliSessionCache:
         async with self._lock:
             if self._sessions.get(session.identity.fingerprint) is session:
                 del self._sessions[session.identity.fingerprint]
-        async with session.lock:
-            session.retire()
+        session.retire()
 
     async def clear(self) -> None:
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
         for session in sessions:
-            async with session.lock:
-                session.retire()
+            session.retire()
 
 
 _cli_sessions = _CliSessionCache()
+
+
+@dataclass
+class BitwardenSessionUsage:
+    """How one credential read got its CLI session: a cached one, or a login of its own."""
+
+    # Whether the first session the read checked out was already logged in when the read arrived,
+    # so a read that waited out another read's login counts as cold. None when no read reached one.
+    session_reused: bool | None = None
+    # Wall time spent in `bw login`, summed across any repair logins. None when nothing logged in.
+    login_seconds: float | None = None
+    # Wall time spent queued for a session's lock, behind another read's login or sync.
+    lock_wait_seconds: float | None = None
+
+
+_session_usage: ContextVar[BitwardenSessionUsage | None] = ContextVar("bitwarden_session_usage", default=None)
+
+
+@contextlib.contextmanager
+def track_bitwarden_session_usage() -> Iterator[BitwardenSessionUsage]:
+    usage = BitwardenSessionUsage()
+    token = _session_usage.set(usage)
+    try:
+        yield usage
+    finally:
+        _session_usage.reset(token)
+
 
 T = TypeVar("T")
 
@@ -420,12 +478,12 @@ def _credit_card_credential_from_bitwarden_item(item: dict) -> CreditCardCredent
         key.removeprefix("metadata_"): value for key, value in extra_values.items() if key.startswith("metadata_")
     }
     return CreditCardCredential(
-        card_holder_name=card["cardholderName"],
-        card_number=card["number"],
-        card_exp_month=card["expMonth"],
-        card_exp_year=card["expYear"],
-        card_cvv=card["code"],
-        card_brand=card["brand"],
+        card_holder_name=card.get("cardholderName"),
+        card_number=card.get("number"),
+        card_exp_month=card.get("expMonth"),
+        card_exp_year=card.get("expYear"),
+        card_cvv=card.get("code"),
+        card_brand=card.get("brand"),
         billing_address=CreditCardBillingAddress(**address_values) if address_values else None,
         billing_email=extra_values.get("billing_email"),
         billing_phone=extra_values.get("billing_phone"),
@@ -451,8 +509,8 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
-                username=login["username"] or "",
-                password=login["password"] or "",
+                username=login.get("username") or "",
+                password=login.get("password") or "",
                 totp=totp,
                 metadata=_password_metadata_from_bitwarden_item(item),
             ),
@@ -614,6 +672,7 @@ class BitwardenService:
         ]
         ignorable_regexes = [
             re.compile(r'^Could not find data file, ".+?/data\.json"; creating it instead\.$'),
+            _USER_KEY_ID_BACKFILL_ADVISORY,
         ]
         for line in lines:
             if any(s in line for s in ignorable_substrings):
@@ -644,10 +703,15 @@ class BitwardenService:
         # CLEANEXIT/RESPONSE/QUIET/PRETTY/RAW/NOINTERACTION output modes). An inherited output-mode var
         # can suppress a failure, wrap the item payload, or — with BW_RAW — make `bw unlock` print the
         # raw vault session key on stdout. Scrub the whole BW_* prefix fail-closed and re-supply only
-        # what additional_env sets below; do not narrow this back to a fixed allowlist that can drift.
+        # what is set below; do not narrow this back to a fixed allowlist that can drift.
         for key in [name for name in env if name.startswith("BW_")]:
             del env[key]
         env["NODE_NO_WARNINGS"] = "1"
+        # Without it, a read of a locked vault prompts for the master password and exits 0 with no output
+        # instead of failing with "Vault is locked.". Login stays interactive so a new-device challenge
+        # still says "New device verification", which the global-credentials fallback keys on.
+        if command[1:2] != ["login"]:
+            env["BW_NOINTERACTION"] = "true"
         if additional_env:
             env.update(additional_env)  # Update with any additional environment variables
 
@@ -662,6 +726,8 @@ class BitwardenService:
                 async with asyncio.timeout(timeout):
                     shell_subprocess = await asyncio.create_subprocess_exec(
                         *command,
+                        # An inherited open stdin turns any prompt into a hang until the timeout.
+                        stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         env=env,
@@ -702,38 +768,46 @@ class BitwardenService:
                     pass
 
     @staticmethod
-    def _extract_session_key(unlock_cmd_output: str) -> str | None:
-        # Split the text by lines
-        lines = unlock_cmd_output.split("\n")
-
-        # Look for the line containing the BW_SESSION
-        for line in lines:
-            if 'BW_SESSION="' in line:
-                # Find the start and end positions of the session key
-                start = line.find('BW_SESSION="') + len('BW_SESSION="')
-                end = line.rfind('"', start)
-                return line[start:end]
-
-        return None
+    def _extract_session_key(cli_output: str) -> str | None:
+        """The session key from `bw unlock` or an email `bw login` output, or None if it has none."""
+        match = re.search(r'BW_SESSION="([^"\s]+)"', cli_output)
+        return match.group(1) if match else None
 
     @staticmethod
-    async def _establish_cli_session(session: _CliSession, timeout: int) -> None:
-        """Log this identity in and unlock it. The caller holds `session.lock`."""
+    async def _establish_cli_session(
+        session: _CliSession,
+        timeout: int,
+        verify_sync: bool = False,
+        trust_login_key: bool = True,
+    ) -> None:
+        """Log in (which already runs a full sync), then unlock unless an email login printed a key to trust.
+        The caller holds `session.lock`."""
         identity = session.identity
-        await BitwardenService.login(
-            identity.client_id,
-            identity.client_secret,
-            email=identity.email,
-            master_password=identity.master_password,
-            timeout=timeout,
-            appdata_dir=session.appdata_dir,
-        )
-        session.session_key = await BitwardenService.unlock(
-            identity.master_password, timeout=timeout, appdata_dir=session.appdata_dir
-        )
-        # Sync after unlocking rather than before, so the one call works for both auth modes: an
-        # API-key login leaves the vault locked, and `bw sync` needs it open.
-        await BitwardenService.sync(timeout=timeout, session_key=session.session_key, appdata_dir=session.appdata_dir)
+        usage = _session_usage.get()
+        started = time.monotonic()
+        try:
+            login_key = await BitwardenService.login(
+                identity.client_id,
+                identity.client_secret,
+                email=identity.email,
+                master_password=identity.master_password,
+                timeout=timeout,
+                appdata_dir=session.appdata_dir,
+            )
+        finally:
+            if usage is not None:
+                usage.login_seconds = (usage.login_seconds or 0.0) + time.monotonic() - started
+        if identity.uses_email_auth and trust_login_key and login_key:
+            session.session_key = login_key
+        else:
+            session.session_key = await BitwardenService.unlock(
+                identity.master_password, timeout=timeout, appdata_dir=session.appdata_dir
+            )
+        if verify_sync:
+            # The sync inside `bw login` swallows its own failure; `bw sync` reports one.
+            await BitwardenService.sync(
+                timeout=timeout, session_key=session.session_key, appdata_dir=session.appdata_dir
+            )
         session.synced_at = time.monotonic()
 
     @staticmethod
@@ -741,11 +815,21 @@ class BitwardenService:
         session: _CliSession,
         timeout: int,
         force_sync: bool = False,
+        verify_sync: bool = False,
+        trust_login_key: bool = True,
     ) -> None:
         """Make `session` usable, logging in only if this process does not already hold a session."""
+        usage = _session_usage.get()
+        if usage is not None and usage.session_reused is None:
+            usage.session_reused = session.session_key is not None
+        queued_at = time.monotonic()
         async with session.lock:
+            if usage is not None:
+                usage.lock_wait_seconds = (usage.lock_wait_seconds or 0.0) + time.monotonic() - queued_at
             if session.session_key is None:
-                await BitwardenService._establish_cli_session(session, timeout=timeout)
+                await BitwardenService._establish_cli_session(
+                    session, timeout=timeout, verify_sync=verify_sync, trust_login_key=trust_login_key
+                )
                 return
 
             if (
@@ -758,11 +842,15 @@ class BitwardenService:
                     timeout=timeout, session_key=session.session_key, appdata_dir=session.appdata_dir
                 )
                 session.synced_at = time.monotonic()
-            except Exception:
+            except Exception as error:
                 if force_sync:
                     # A caller that asked for a guaranteed-fresh vault has no way to tell a stale
                     # answer from a correct one — a listing that is missing an item someone just
                     # added looks exactly like a listing that is right. Say the refresh failed.
+                    raise
+                if _repair_for_failure(error) is _SessionRepair.RELOGIN:
+                    # The login behind this session is gone, so the cached copy can only get staler.
+                    # The caller drops the session and logs in again rather than read from it.
                     raise
                 # An opportunistic refresh is different: the read that follows can still detect a
                 # miss and force another sync, so a failure here is not worth failing the run over.
@@ -775,19 +863,29 @@ class BitwardenService:
         run: Callable[[_CliSession], Awaitable[T]],
         force_sync: bool = False,
     ) -> T:
-        """Run `run` against a live CLI session, repairing a stale session once before giving up."""
+        """Run `run` against a live CLI session, repairing a stale session once before giving up.
+        `force_sync` demands a `bw sync` that reports failure even after a fresh login; a repair only resyncs."""
+        resync = force_sync
         for attempt in range(2):
             session = await _cli_sessions.checkout(identity)
             try:
                 # Claim the session before the first await after checkout, so eviction cannot pull
                 # the data directory out from under a command that is about to run against it.
                 async with session.in_use():
-                    await BitwardenService._prepare_cli_session(session, timeout=timeout, force_sync=force_sync)
+                    await BitwardenService._prepare_cli_session(
+                        session,
+                        timeout=timeout,
+                        force_sync=resync,
+                        verify_sync=force_sync,
+                        # A login key that unlocks nothing makes the read fail with "Vault is locked.";
+                        # the repair login then unlocks explicitly, so that costs one retry, not every read.
+                        trust_login_key=attempt == 0,
+                    )
                     return await run(session)
             except BitwardenAccessDeniedError:
                 raise
             except BaseException as error:
-                repair = _repair_for_failure(str(error)) if attempt == 0 else _SessionRepair.NONE
+                repair = _repair_for_failure(error) if attempt == 0 else _SessionRepair.NONE
                 # A session that never finished logging in is not a session; drop it rather than
                 # hand the next run a half-built data directory.
                 if session.session_key is None or repair is _SessionRepair.RELOGIN:
@@ -800,7 +898,7 @@ class BitwardenService:
                     fingerprint=identity.fingerprint[:12],
                     error=str(error),
                 )
-                force_sync = True
+                resync = True
             finally:
                 # This request is done holding its session, which may be what makes another one
                 # reclaimable. Runs on the way out of a return, a raise and a retry alike.
@@ -835,14 +933,14 @@ class BitwardenService:
         if items_result.returncode != 0:
             raise BitwardenListItemsError(f"Failed to list Bitwarden items. Error: {items_result.stderr}")
 
+        # Never quote stdout in an error: it is the decrypted vault, passwords included. `from None` keeps
+        # the parse error, whose `doc` is that stdout, out of the chain.
         try:
             items = json.loads(items_result.stdout)
         except json.JSONDecodeError:
-            raise BitwardenListItemsError(
-                f"Failed to parse items JSON. Error: {items_result.stderr} Output: {items_result.stdout}"
-            )
+            raise BitwardenListItemsError(f"Failed to parse items JSON. Error: {items_result.stderr}") from None
         if not isinstance(items, list):
-            raise BitwardenListItemsError(f"Failed to parse items JSON. Output: {items_result.stdout}")
+            raise BitwardenListItemsError(f"Items output is a JSON {type(items).__name__}, not a list")
         return items
 
     @staticmethod
@@ -865,7 +963,7 @@ class BitwardenService:
         try:
             item = json.loads(item_result.stdout)
         except json.JSONDecodeError:
-            raise BitwardenGetItemError(f"Failed to parse Bitwarden item JSON. Error: {item_result.stderr}")
+            raise BitwardenGetItemError(f"Failed to parse Bitwarden item JSON. Error: {item_result.stderr}") from None
         if not isinstance(item, dict) or item.get("object") != "item":
             raise BitwardenGetItemError("Invalid Bitwarden item envelope")
         returned_id = item.get("id")
@@ -894,9 +992,9 @@ class BitwardenService:
         else:
             card = item.get("card")
             card_fields = ("cardholderName", "number", "expMonth", "expYear", "code", "brand")
-            if not isinstance(card, dict) or any(field not in card for field in card_fields):
+            if not isinstance(card, dict) or not any(field in card for field in card_fields):
                 raise BitwardenGetItemError("Invalid Bitwarden card payload")
-            if any(card[field] is not None and not isinstance(card[field], str) for field in card_fields):
+            if any(card.get(field) is not None and not isinstance(card[field], str) for field in card_fields):
                 raise BitwardenGetItemError("Invalid Bitwarden card field")
             fields = item.get("fields")
             if fields is not None and (
@@ -1352,13 +1450,13 @@ class BitwardenService:
         master_password: str | None = None,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
         appdata_dir: str | None = None,
-    ) -> None:
+    ) -> str | None:
         """
-        Log in to the Bitwarden CLI.
+        Log in to the Bitwarden CLI, returning the session key the login printed, if any.
 
         Supports two auth modes:
-        1. Email + master_password (preferred when available)
-        2. API key (client_id + client_secret) via --apikey flag
+        1. Email + master_password (preferred when available), which also unlocks the vault
+        2. API key (client_id + client_secret) via --apikey flag, which leaves it locked
         """
         bw_email = email or settings.BITWARDEN_EMAIL
         bw_master_password = master_password or settings.BITWARDEN_MASTER_PASSWORD
@@ -1375,14 +1473,16 @@ class BitwardenService:
             login_command = ["bw", "login", "--apikey"]
         login_result = await BitwardenService.run_command(login_command, env, timeout=timeout)
 
-        # Validate the login result
+        # Never quote stdout in an error: a successful email login prints the vault session key there,
+        # even when stderr carries something unexpected.
         if login_result.stdout and "You are logged in!" not in login_result.stdout:
-            raise BitwardenLoginError(f"Failed to log in. stdout: {login_result.stdout} stderr: {login_result.stderr}")
+            raise BitwardenLoginError(f"Failed to log in. stderr: {login_result.stderr}")
 
         if login_result.stderr and not BitwardenService._is_ignorable_login_stderr(login_result.stderr):
-            raise BitwardenLoginError(f"Failed to log in. stdout: {login_result.stdout} stderr: {login_result.stderr}")
+            raise BitwardenLoginError(f"Failed to log in. stderr: {login_result.stderr}")
 
         LOG.info("Bitwarden login successful")
+        return BitwardenService._extract_session_key(login_result.stdout)
 
     @staticmethod
     async def unlock(
@@ -1502,12 +1602,12 @@ class BitwardenService:
             credit_card_data = item["card"]
 
             mapped_credit_card_data: dict[str, str] = {
-                BitwardenConstants.CREDIT_CARD_HOLDER_NAME: credit_card_data["cardholderName"],
-                BitwardenConstants.CREDIT_CARD_NUMBER: credit_card_data["number"],
-                BitwardenConstants.CREDIT_CARD_EXPIRATION_MONTH: credit_card_data["expMonth"],
-                BitwardenConstants.CREDIT_CARD_EXPIRATION_YEAR: credit_card_data["expYear"],
-                BitwardenConstants.CREDIT_CARD_CVV: credit_card_data["code"],
-                BitwardenConstants.CREDIT_CARD_BRAND: credit_card_data["brand"],
+                BitwardenConstants.CREDIT_CARD_HOLDER_NAME: credit_card_data.get("cardholderName"),
+                BitwardenConstants.CREDIT_CARD_NUMBER: credit_card_data.get("number"),
+                BitwardenConstants.CREDIT_CARD_EXPIRATION_MONTH: credit_card_data.get("expMonth"),
+                BitwardenConstants.CREDIT_CARD_EXPIRATION_YEAR: credit_card_data.get("expYear"),
+                BitwardenConstants.CREDIT_CARD_CVV: credit_card_data.get("code"),
+                BitwardenConstants.CREDIT_CARD_BRAND: credit_card_data.get("brand"),
             }
             mapped_credit_card_data.update(_extract_credit_card_extra_custom_field_values(item))
 
@@ -1598,8 +1698,8 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 
         return PasswordCredential(
-            username=login["username"] or "",
-            password=login["password"] or "",
+            username=login.get("username") or "",
+            password=login.get("password") or "",
             totp=totp,
         )
 
@@ -1904,8 +2004,8 @@ class BitwardenService:
                 credential_type=CredentialType.PASSWORD,
                 name=name,
                 credential=PasswordCredential(
-                    username=login_item["username"] or "",
-                    password=login_item["password"] or "",
+                    username=login_item.get("username") or "",
+                    password=login_item.get("password") or "",
                     totp=BitwardenService.normalize_totp_config(login_item.get("totp") or ""),
                     metadata=_password_metadata_from_bitwarden_item(response["data"]),
                 ),

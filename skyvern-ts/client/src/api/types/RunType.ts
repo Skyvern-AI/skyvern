@@ -3,6 +3,7 @@
 export const RunType = {
     TaskV1: "task_v1",
     TaskV2: "task_v2",
+    TaskV3: "task_v3",
     WorkflowRun: "workflow_run",
     OpenaiCua: "openai_cua",
     AnthropicCua: "anthropic_cua",

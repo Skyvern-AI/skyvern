@@ -105,7 +105,7 @@ function NavigationEditorBody({
     data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
   );
 
-  const handleEngineChange = (value: RunEngine) => {
+  const handleEngineChange = (value: RunEngine | null) => {
     if (!editable) return;
     const updates: Partial<NavigationNodeData> = {
       engine: value,

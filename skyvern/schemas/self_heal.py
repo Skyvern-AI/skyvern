@@ -29,6 +29,7 @@ class HealSkipReason(StrEnum):
     user_defined_error = "user_defined_error"
     no_goal = "no_goal"
     proxy_transport = "proxy_transport"
+    authoring_run = "authoring_run"
 
 
 class OutputObligation(StrEnum):

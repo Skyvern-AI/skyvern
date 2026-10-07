@@ -13,6 +13,7 @@ import httpx
 import litellm  # type: ignore[import-not-found]
 import openai
 import pytest  # type: ignore[import-not-found]
+import structlog
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -23,15 +24,20 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMCaller,
     get_org_aware_secondary_llm_api_handler,
 )
+from skyvern.forge.sdk.api.llm.custom_llm_registry import _build_llm_config
 from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseFormat,
     LLMOutputTruncatedError,
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
+from skyvern.forge.sdk.copilot import secret_scrub
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.helpers import DummyLogger, FakeLLMResponse, fallback_receipts, router_test_context
 
 
@@ -637,6 +643,61 @@ def _stub_successful_llm_caller(
     logger = DummyLogger()
     monkeypatch.setattr(api_handler_factory, "LOG", logger)
     return caller, logger
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_preserves_generated_cost_and_tokens_during_real_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller, _ = _stub_successful_llm_caller(monkeypatch)
+    logger = structlog.get_logger("skyvern.test.accounting")
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+    credential = "fake-registered-credential"
+    monkeypatch.setattr(secret_scrub, "_SESSION_SCRUB_VALUES", {"pbs_unrelated": ["25", "7", credential]})
+    with capture_runtime_logs() as events:
+        await caller.call(prompt="test", prompt_name=f"workflow-copilot-{credential}")
+        logger.info("Caller diagnostics", llm_cost=0.25, input_tokens=7)
+    records = json.loads(json.dumps(events))
+    accounting = next(record for record in records if "llm_cost" in record and "model" in record)
+    assert accounting["llm_cost"] == 0.25 and type(accounting["llm_cost"]) is float
+    assert accounting["input_tokens"] == 7 and type(accounting["input_tokens"]) is int
+    assert credential not in json.dumps(records)
+    assert REDACTED_SECRET_PLACEHOLDER in accounting["prompt_name"]
+    usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
+    assert REDACTED_SECRET_PLACEHOLDER in usage["copilot.prompt_name"]
+    # Another session's short values never match inside a caller's numbers.
+    assert records[-1]["llm_cost"] == 0.25 and records[-1]["input_tokens"] == 7
+
+
+@pytest.mark.asyncio
+async def test_custom_model_response_key_and_provider_cannot_gain_log_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller, _ = _stub_successful_llm_caller(monkeypatch)
+    credential = "fake-registered-credential"
+    caller.llm_config = _build_llm_config(
+        CustomLLMConfig(
+            display_name="Test",
+            provider=CustomLLMProvider.OPENAI_COMPATIBLE,
+            model_name=f"model-{credential}",
+            api_base="https://llm.example.test/v1",
+            api_key="synthetic-test-key",
+        )
+    )
+    caller.llm_key = f"custom-{credential}"
+    response = FakeLLMResponse(f"response-{credential}")
+    response.provider = credential
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
+    monkeypatch.setattr(api_handler_factory, "LOG", structlog.get_logger("skyvern.test.custom_accounting"))
+    monkeypatch.setattr(secret_scrub, "_SESSION_SCRUB_VALUES", {"pbs_unrelated": [credential, "25", "7"]})
+    with capture_runtime_logs() as events:
+        await caller.call(prompt="test", prompt_name="workflow-copilot")
+    records = json.loads(json.dumps(events))
+    assert credential not in json.dumps(records)
+    accounting = next(record for record in records if "llm_cost" in record and "model" in record)
+    assert accounting["llm_cost"] == 0.25 and type(accounting["llm_cost"]) is float
+    for key in ("model", "llm_key", "resolved_provider"):
+        assert REDACTED_SECRET_PLACEHOLDER in accounting[key]
 
 
 @pytest.mark.asyncio
@@ -2088,8 +2149,14 @@ def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypat
         usage=SimpleNamespace(prompt_tokens=300_000),
         _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
     )
+    gpt6_1_long_context_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "openai/responses/gpt-6.1-sol"},
+    )
 
     assert LLMAPIHandlerFactory.completion_cost_or_none(long_context_flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(gpt6_1_long_context_flex) == pytest.approx(0.05)
     assert LLMAPIHandlerFactory.completion_cost_or_none(short_prompt_flex) == pytest.approx(0.10)
     assert LLMAPIHandlerFactory.completion_cost_or_none(azure_long_context_flex) == pytest.approx(0.10)
     assert LLMAPIHandlerFactory.completion_cost_or_none(standard_tier_long_context) == pytest.approx(0.10)

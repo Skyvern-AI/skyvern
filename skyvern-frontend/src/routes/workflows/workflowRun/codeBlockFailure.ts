@@ -311,7 +311,7 @@ const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block held too many browser objects",
     guidance:
-      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object for the rest of the run. Read rows through page.locator(...), .nth() and .all() chains instead, which hold none, or split the work across several runs.",
+      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object until it is released with dispose() or the run ends. Read rows through page.locator(...), .nth() and .all() chains instead, which hold none, release each temporary object with dispose() in a finally block, or split the work across several runs.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.BlockedEgressError": {

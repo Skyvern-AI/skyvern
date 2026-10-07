@@ -15,7 +15,10 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useOnChange } from "@/hooks/useOnChange";
-import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
+import {
+  flushBufferedEditorEdits,
+  subscribeToBufferedEdits,
+} from "@/hooks/useDeferredLockedEdit";
 import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
@@ -117,6 +120,7 @@ import {
   START_ANCHOR_MIN_ZOOM,
 } from "./paneFit";
 import { useBlockerExit } from "./useBlockerExit";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { FlowJumpControls } from "./controls/FlowJumpControls";
@@ -127,6 +131,7 @@ import { ZoomInControl } from "./controls/ZoomInControl";
 import { ZoomOutControl } from "./controls/ZoomOutControl";
 import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import { OPEN_WORKFLOW_SETTINGS_EVENT } from "./nodes/StartNode/types";
+import { useLocateBlockStore } from "./runValidation/useLocateBlockStore";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -198,9 +203,12 @@ import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
 import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
 import {
+  beginFocusGeneration,
   blockJumpDuration,
   collectBlockSearchTargets,
   focusBlockTarget,
+  invalidateFocusGeneration,
+  type FocusFraming,
   waitForNodeSettle,
 } from "../studio/blockSearch";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
@@ -771,14 +779,47 @@ function FlowRenderer({
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
   useShouldNotifyWhenClosingTab(!readOnly && workflowChangesStore.hasChanges);
+  const pendingGoalChanges = useCopilotActionStore(
+    (state) => state.pendingGoalChanges,
+  );
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
+    if (readOnly || nextLocation.pathname === currentLocation.pathname) {
+      return false;
+    }
+    // A Goal change can be saved without being applied (API writes, or a proposal accepted for
+    // another block), so Run has to ask even when nothing is unsaved.
     return (
-      !readOnly &&
-      workflowChangesStore.hasChanges &&
-      nextLocation.pathname !== currentLocation.pathname
+      workflowChangesStore.hasChanges ||
+      (pendingGoalChanges.length > 0 &&
+        nextLocation.pathname ===
+          `/agents/${workflow.workflow_permanent_id}/run`)
     );
   });
   const blockerExit = useBlockerExit(blocker);
+  const unsavedResolutionCapturedRef = useRef(false);
+
+  useEffect(() => {
+    if (blocker.state === "blocked") {
+      unsavedResolutionCapturedRef.current = false;
+    }
+  }, [blocker.state]);
+
+  const captureUnsavedResolution = (
+    choice: "stay" | "discard" | "save" | "apply_goal",
+  ) => {
+    if (unsavedResolutionCapturedRef.current) {
+      return;
+    }
+    unsavedResolutionCapturedRef.current = true;
+    postHog.capture("builder.unsaved_changes.resolved", {
+      org_id: workflow.organization_id,
+      workflow_permanent_id: workflow.workflow_permanent_id,
+      choice,
+    });
+  };
+  const applyPendingGoalChanges = useCopilotActionStore(
+    (state) => state.applyPendingGoalChanges,
+  );
 
   // Studio-only: list what changed inside the leave/run unsaved-changes modal.
   // Memoized on the blocked state so it runs once when the modal opens (the
@@ -819,7 +860,10 @@ function FlowRenderer({
   // when copy-pasting triggers rapid successive dimension changes
   const debouncedLayoutForDimensions = useDebouncedCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
-      if (isLockedByOther()) return;
+      if (isLockedByOther()) {
+        pendingLayoutRef.current = true;
+        return;
+      }
       if (isLayoutingRef.current) {
         return;
       }
@@ -875,7 +919,12 @@ function FlowRenderer({
 
   const queueDimensionLayout = useCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
-      if (isLockedByOther()) return;
+      // The measured size is already stored on the node, so a dropped layout
+      // never re-triggers; replay it once the lock clears.
+      if (isLockedByOther()) {
+        pendingLayoutRef.current = true;
+        return;
+      }
       debouncedLayoutForDimensions(tempNodes, currentEdges);
     },
     [debouncedLayoutForDimensions],
@@ -1143,11 +1192,13 @@ function FlowRenderer({
     document.addEventListener("pointerup", onPointerUp, true);
     document.addEventListener("pointercancel", onPointerUp, true);
     document.addEventListener("keydown", onKeyDown, true);
+    const unsubscribeBufferedEdits = subscribeToBufferedEdits(markGesture);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("pointerup", onPointerUp, true);
       document.removeEventListener("pointercancel", onPointerUp, true);
       document.removeEventListener("keydown", onKeyDown, true);
+      unsubscribeBufferedEdits();
     };
   }, [embedded, readOnly]);
 
@@ -1385,6 +1436,7 @@ function FlowRenderer({
       workflowChangesStore.setHasChanges(true);
       postHog.capture("builder.block.duplicated", {
         org_id: workflow.organization_id,
+        workflow_permanent_id: workflow.workflow_permanent_id,
         position: result.position,
         source_block_id: id,
       });
@@ -1400,6 +1452,7 @@ function FlowRenderer({
       workflowChangesStore,
       postHog,
       workflow.organization_id,
+      workflow.workflow_permanent_id,
     ],
   );
 
@@ -1966,26 +2019,52 @@ function FlowRenderer({
     };
   }, []);
 
+  // Each focus/locate bumps this; a run superseded by a later one turns its
+  // pan + selection into no-ops (and resolves false) so a rapid second Locate
+  // wins the viewport instead of racing the first, slower nested reveal.
+  const focusGenerationRef = useRef(0);
   const focusBlockForSearch = useCallback(
-    (nodeId: string, entryIsCurrent?: () => boolean) => {
+    (
+      nodeId: string,
+      entryIsCurrent?: () => boolean,
+      framing: FocusFraming = "top-anchored",
+    ) => {
+      const isCurrent = beginFocusGeneration(focusGenerationRef);
+      const canFocus = () =>
+        isCurrent() && (!entryIsCurrent || entryIsCurrent());
       const duration = blockJumpDuration();
       if (!entryIsCurrent) {
         lastCanvasInteractionAtRef.current = Date.now();
       }
       const getNodes = () =>
-        entryIsCurrent && !entryIsCurrent()
-          ? []
-          : (reactFlowInstance.getNodes() as Array<AppNode>);
+        !canFocus() ? [] : (reactFlowInstance.getNodes() as Array<AppNode>);
       return focusBlockTarget(nodeId, {
         getNodes,
         getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
         getPaneWidth: () =>
           editorElementRef.current?.getBoundingClientRect().width ?? 0,
+        getPaneHeight: () =>
+          editorElementRef.current?.getBoundingClientRect().height ?? 0,
+        // Read at landing time, not at click time: the header may be mid
+        // collapse/expand transition, and it slides fully off the pane.
+        // Queried from the document because Workspace renders the header as a
+        // sibling of this canvas, not a descendant of it.
+        getPaneTopInset: () => {
+          const pane = editorElementRef.current?.getBoundingClientRect();
+          const header = document
+            .querySelector("[data-workflow-editor-header]")
+            ?.getBoundingClientRect();
+          if (!pane || !header) {
+            return 0;
+          }
+          return Math.max(0, header.bottom - pane.top);
+        },
+        framing,
         viewportZoom: reactFlowInstance.getViewport().zoom,
         duration,
         setViewport: (viewport, options) => {
           // Entry reuses reveal/settle, then centers once at fixed zoom.
-          if (entryIsCurrent) return;
+          if (entryIsCurrent || !canFocus()) return;
           // An explicit jump outranks any pending pane-layout recenter and,
           // like runFitView, must not be clamped by constrainPan mid-flight.
           lastCanvasInteractionAtRef.current = Date.now();
@@ -2000,10 +2079,15 @@ function FlowRenderer({
           }, options.duration + 50);
         },
         selectBlock: (id) => {
-          if (!entryIsCurrent) setSelectedBlockId(id);
+          if (!entryIsCurrent && canFocus()) {
+            setSelectedBlockId(id);
+          }
         },
+        // Guarded like expandBlock: a superseded run must not arm the relayout
+        // gate, since its expandBlock no-op never fires the header-resize that
+        // disarms it, and waitForNodeSettle would time out on every later jump.
         beforeExpand: (label) => {
-          if (entryIsCurrent && !entryIsCurrent()) return;
+          if (!canFocus()) return;
           const workflowId = workflow.workflow_permanent_id ?? "__global__";
           if (
             isBlockCollapsedAt(
@@ -2016,13 +2100,13 @@ function FlowRenderer({
           }
         },
         expandBlock: (label) => {
-          if (entryIsCurrent && !entryIsCurrent()) return;
+          if (!canFocus()) return;
           useNodeCollapseStore
             .getState()
             .expandBlock(workflow.workflow_permanent_id ?? "__global__", label);
         },
         switchBranch: (conditionalId, branchId) => {
-          if (entryIsCurrent && !entryIsCurrent()) return;
+          if (!canFocus()) return;
           // Same write and dirty-state guard as the branch tab click
           // (BranchesEditor.handleSelectBranch): switching branches is UI
           // state, so the `replace` change must not mark the workflow dirty.
@@ -2049,7 +2133,7 @@ function FlowRenderer({
               isLayoutingRef.current ||
               debouncedLayoutForDimensions.isPending(),
           }),
-      });
+      }).then((revealed) => revealed && canFocus());
     },
     [
       reactFlowInstance,
@@ -2079,6 +2163,76 @@ function FlowRenderer({
     };
   }, [embedded, readOnly, reactFlowInstance, focusBlockForSearch]);
 
+  // Locate (from the run-blocking panel) reuses the block-search focus engine:
+  // a target inside a collapsed loop or an inactive conditional branch is first
+  // revealed level by level, then panned into view — a plain fitView would land
+  // on empty space. Gated on readOnly only; the engine works on any live canvas
+  // (unlike the search-store registration above, which is studio-only).
+  // glow(0.85s) x 3 iterations; hold the pulse just past the last cycle.
+  const RUN_BLOCKING_LOCATE_PULSE_MS = 2600;
+  const locateRequest = useLocateBlockStore((s) => s.request);
+  const clearLocate = useLocateBlockStore((s) => s.clearLocate);
+  const startLocatePulse = useLocateBlockStore((s) => s.startPulse);
+  const clearLocatePulse = useLocateBlockStore((s) => s.clearPulse);
+  const locatePulseTimerRef = useRef<number | null>(null);
+  const locateMountedRef = useRef(true);
+
+  useEffect(() => {
+    if (readOnly || locateRequest === null) {
+      return;
+    }
+    const { nodeId } = locateRequest;
+    if (!reactFlowInstance.getNode(nodeId)) {
+      clearLocate();
+      return;
+    }
+    void focusBlockForSearch(nodeId, undefined, "centered").then((revealed) => {
+      // focusBlockForSearch folds in the supersession guard, so a newer Locate
+      // resolves this to false: skip the glow and leave the newer request
+      // untouched. Clearing here — not in a cleanup that the clear itself would
+      // re-fire — is what lets a collapsed/nested reveal finish and still glow.
+      // A reveal that resolves after unmount would set the shared pulse and a
+      // timer past the cleanup that could have cleared them, glowing a same-id
+      // node on the next canvas. Leave the request for that canvas to handle.
+      if (revealed === false || !locateMountedRef.current) {
+        return;
+      }
+      startLocatePulse(nodeId);
+      if (locatePulseTimerRef.current !== null) {
+        window.clearTimeout(locatePulseTimerRef.current);
+      }
+      locatePulseTimerRef.current = window.setTimeout(() => {
+        clearLocatePulse();
+        locatePulseTimerRef.current = null;
+      }, RUN_BLOCKING_LOCATE_PULSE_MS);
+      clearLocate();
+    });
+  }, [
+    locateRequest,
+    readOnly,
+    reactFlowInstance,
+    focusBlockForSearch,
+    clearLocate,
+    startLocatePulse,
+    clearLocatePulse,
+  ]);
+
+  useEffect(() => {
+    locateMountedRef.current = true;
+    return () => {
+      locateMountedRef.current = false;
+      invalidateFocusGeneration(focusGenerationRef);
+      if (locatePulseTimerRef.current !== null) {
+        window.clearTimeout(locatePulseTimerRef.current);
+      }
+      clearLocatePulse();
+    };
+  }, [clearLocatePulse]);
+
+  // "initial-load" lands one frame after Dagre positions commit (mid fade-in),
+  // so fitting here can't read pre-layout node positions. layoutPhase only
+  // advances once nodesInitialized flips, but guard explicitly so a future
+  // layout-phase refactor can't reintroduce a zero-size fit.
   useEffect(() => {
     if (!embedded) return;
     hasInitialPaneFitRef.current = false;
@@ -2401,16 +2555,31 @@ function FlowRenderer({
           open={blocker.state === "blocked"}
           onOpenChange={(open) => {
             if (!open) {
+              captureUnsavedResolution("stay");
               blockerExit.reset();
             }
           }}
         >
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Unsaved Changes</DialogTitle>
+              <DialogTitle>
+                {pendingGoalChanges.length === 0
+                  ? "Unsaved Changes"
+                  : pendingGoalChanges.length === 1
+                    ? "New Goal not applied"
+                    : "New Goals not applied"}
+              </DialogTitle>
               <DialogDescription>
-                Your workflow has unsaved changes. Do you want to save them
-                before leaving?
+                {pendingGoalChanges.length > 0
+                  ? `${pendingGoalChanges
+                      .map((change) => `“${change.label}”`)
+                      .join(", ")} ${
+                      pendingGoalChanges.length === 1
+                        ? "has a new Goal it doesn't follow yet. Apply it"
+                        : "have new Goals they don't follow yet. Apply them"
+                    } first, or continue with the last saved version.`
+                  : workflowChangesStore.saveBlockedReason ||
+                    "Your workflow has unsaved changes. Do you want to save them before leaving?"}
               </DialogDescription>
             </DialogHeader>
             <WorkflowChangesList changes={unsavedChangeSummary} />
@@ -2418,6 +2587,7 @@ function FlowRenderer({
               <Button
                 variant="secondary"
                 onClick={() => {
+                  captureUnsavedResolution("discard");
                   useWorkflowTitleStore
                     .getState()
                     .clearCopilotMetadata(workflow.workflow_permanent_id);
@@ -2426,21 +2596,39 @@ function FlowRenderer({
               >
                 Continue without saving
               </Button>
-              <Button
-                onClick={() => {
-                  handleSave().then((ok) => {
-                    if (ok) {
-                      blockerExit.proceed();
-                    }
-                  });
-                }}
-                disabled={workflowChangesStore.saveIsPending}
-              >
-                {workflowChangesStore.saveIsPending && (
-                  <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                )}
-                Save changes
-              </Button>
+              {pendingGoalChanges.length > 0 ? (
+                <Button
+                  onClick={() => {
+                    captureUnsavedResolution("apply_goal");
+                    blockerExit.reset();
+                    applyPendingGoalChanges();
+                  }}
+                >
+                  {pendingGoalChanges.length === 1
+                    ? "Apply new Goal"
+                    : "Apply new Goals"}
+                </Button>
+              ) : (
+                <Button
+                  onClick={() => {
+                    handleSave().then((ok) => {
+                      if (ok) {
+                        captureUnsavedResolution("save");
+                        blockerExit.proceed();
+                      }
+                    });
+                  }}
+                  disabled={
+                    workflowChangesStore.saveIsPending ||
+                    Boolean(workflowChangesStore.saveBlockedReason)
+                  }
+                >
+                  {workflowChangesStore.saveIsPending && (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Save changes
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>

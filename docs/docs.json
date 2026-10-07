@@ -2,6 +2,12 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "palm",
   "name": "Skyvern",
+  "integrations": {
+    "cookies": {
+      "key": "skyvern_docs_telemetry",
+      "value": "granted"
+    }
+  },
   "colors": {
     "primary": "#4A6CF7",
     "light": "#7B93FA",

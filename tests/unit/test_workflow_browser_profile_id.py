@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -8,8 +10,10 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
-from skyvern.exceptions import SkyvernHTTPException
+from skyvern.exceptions import SkyvernHTTPException, WorkflowHasNoBlocks
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService, _workflow_save_fingerprint
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
@@ -39,6 +43,14 @@ def test_workflow_pydantic_defaults_to_none() -> None:
 def test_workflow_pydantic_accepts_browser_profile_id() -> None:
     workflow = _make_workflow(browser_profile_id="bp_abc123")
     assert workflow.browser_profile_id == "bp_abc123"
+
+
+def test_default_workflow_deep_copies_and_pickles() -> None:
+    # Copilot block runs deep-copy the stored workflow, so every field default must be copyable.
+    workflow = _make_workflow()
+    assert copy.deepcopy(workflow) == workflow
+    assert workflow.model_copy(deep=True) == workflow
+    assert pickle.loads(pickle.dumps(workflow)) == workflow
 
 
 def test_workflow_create_yaml_request_defaults_to_none() -> None:
@@ -345,9 +357,10 @@ async def test_recording_save_retry_returns_the_original_workflow_without_side_e
             organization=cast(Any, SimpleNamespace(organization_id="org_1")),
             request=request,
             workflow_permanent_id="wpid_test",
+            return_write_result=True,
         )
 
-    assert result is original_workflow
+    assert result == (original_workflow, ())
     create_workflow = service.create_workflow
     maybe_delete_cached_code = service.maybe_delete_cached_code
     refresh_schedules = service._refresh_workflow_schedule_runtime_limits
@@ -426,9 +439,10 @@ async def test_concurrent_recording_save_retry_removes_the_redundant_version() -
             organization=cast(Any, SimpleNamespace(organization_id="org_1")),
             request=request,
             workflow_permanent_id="wpid_test",
+            return_write_result=True,
         )
 
-    assert result is original_workflow
+    assert result == (original_workflow, ())
     delete_workflow = service.delete_workflow_by_id
     maybe_delete_cached_code = service.maybe_delete_cached_code
     refresh_schedules = service._refresh_workflow_schedule_runtime_limits
@@ -930,3 +944,49 @@ async def test_setup_workflow_run_without_credentials_writes_no_sequential_crede
 
         update_mock = mock_app.DATABASE.workflow_runs.update_workflow_run
         assert all("sequential_credential_id" not in call.kwargs for call in update_mock.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_rejects_empty_workflow_before_creating_run() -> None:
+    service, organization, _ = _make_setup_service(_make_workflow_stub(browser_profile_id=None))
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+        with pytest.raises(WorkflowHasNoBlocks) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=WorkflowRequestBody(data={}),
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+                reject_empty_workflow=True,
+            )
+
+    assert exc_info.value.status_code == 400
+    cast(AsyncMock, service.create_workflow_run).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_allows_empty_loop_block_when_rejecting_empty_workflows() -> None:
+    workflow_stub = _make_workflow_stub(browser_profile_id=None)
+    output_parameter = OutputParameter(
+        key="loop_output",
+        output_parameter_id="op_test",
+        workflow_id="wf_test",
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    empty_loop = ForLoopBlock(label="loop", output_parameter=output_parameter, loop_blocks=[])
+    workflow_stub.workflow_definition = SimpleNamespace(parameters=[], blocks=[empty_loop])
+    service, organization, _ = _make_setup_service(workflow_stub)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            reject_empty_workflow=True,
+        )
+
+    cast(AsyncMock, service.create_workflow_run).assert_awaited_once()

@@ -1,4 +1,5 @@
 import typing as t
+from collections.abc import Awaitable, Callable
 from http import HTTPStatus
 
 import structlog
@@ -13,7 +14,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
 from skyvern.forge.sdk.workflow.models.tags import TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import drop_reserved_tag_values
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY,
@@ -23,6 +24,7 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
     read_browser_type,
 )
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.real_browser_manager import (
     SelectedBrowserTypeUnsupportedError,
     ensure_runtime_supports_browser_type,
@@ -106,6 +108,7 @@ async def prepare_workflow(
     tag_write_context: TagWriteContext | None = None,
     block_scoped: bool = False,
     created_by: str | None = None,
+    refuse_unusable_parameters_before_create: bool = False,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -113,24 +116,20 @@ async def prepare_workflow(
     ``resolved_workflow_id`` pins the exact workflow version row; when None, resolve by
     permanent id + version.
     """
-    if template:
-        if workflow_id not in await app.STORAGE.retrieve_global_workflows():
-            raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
-
-    workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-        request_id=request_id,
-        workflow_request=workflow_request,
-        workflow_permanent_id=workflow_id,
+    workflow_run, _ = await _prepare_workflow(
+        workflow_id=workflow_id,
         organization=organization,
+        workflow_request=workflow_request,
+        template=template,
         version=version,
-        max_steps_override=max_steps,
-        is_template_workflow=template,
+        max_steps=max_steps,
+        request_id=request_id,
         debug_session_id=debug_session_id,
         code_gen=code_gen,
-        workflow_run_id=workflow_run_id,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
         workflow_schedule_id=workflow_schedule_id,
+        workflow_run_id=workflow_run_id,
         retried_from_workflow_run_id=retried_from_workflow_run_id,
         fallback_attempt=fallback_attempt,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
@@ -139,35 +138,92 @@ async def prepare_workflow(
         tag_write_context=tag_write_context,
         block_scoped=block_scoped,
         created_by=created_by,
+        refuse_unusable_parameters_before_create=refuse_unusable_parameters_before_create,
     )
+    return workflow_run
 
-    if resolved_workflow_id is not None:
-        workflow = await app.WORKFLOW_SERVICE.get_workflow(
-            workflow_id=resolved_workflow_id,
-            organization_id=None if template else organization.organization_id,
-        )
-    else:
-        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+
+async def _prepare_workflow(
+    workflow_id: str,
+    organization: Organization,
+    workflow_request: WorkflowRequestBody,
+    template: bool = False,
+    version: int | None = None,
+    max_steps: int | None = None,
+    request_id: str | None = None,
+    debug_session_id: str | None = None,
+    code_gen: bool | None = None,
+    parent_workflow_run_id: str | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
+    workflow_schedule_id: str | None = None,
+    workflow_run_id: str | None = None,
+    retried_from_workflow_run_id: str | None = None,
+    fallback_attempt: int | None = None,
+    ignore_inherited_workflow_system_prompt: bool = False,
+    copilot_session_id: str | None = None,
+    resolved_workflow_id: str | None = None,
+    tag_write_context: TagWriteContext | None = None,
+    block_scoped: bool = False,
+    created_by: str | None = None,
+    refuse_unusable_parameters_before_create: bool = False,
+    post_dispatch_effects: list[Callable[[], Awaitable[None]]] | None = None,
+) -> tuple[WorkflowRun, Workflow]:
+    if template:
+        if workflow_id not in await app.STORAGE.retrieve_global_workflows():
+            raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
+
+    # One ambient session keeps the version lookup in the same transaction as the run insert, as it
+    # was when setup_workflow_run resolved the version itself, and one connection across setup's commits.
+    async with app.DATABASE.workflow_runs.Session.pinned():
+        workflow = await app.WORKFLOW_SERVICE.resolve_workflow_for_run(
             workflow_permanent_id=workflow_id,
-            organization_id=None if template else organization.organization_id,
+            organization=organization,
+            is_template_workflow=template,
             version=version,
+            resolved_workflow_id=resolved_workflow_id,
         )
-
-    await app.DATABASE.tasks.create_task_run(
-        task_run_type=RunType.workflow_run,
-        organization_id=organization.organization_id,
-        run_id=workflow_run.workflow_run_id,
-        title=workflow.title,
-        status=RunStatus.queued,
-        workflow_permanent_id=workflow_id,
-        parent_workflow_run_id=parent_workflow_run_id,
-        debug_session_id=debug_session_id,
-    )
+        workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+            request_id=request_id,
+            workflow_request=workflow_request,
+            workflow_permanent_id=workflow_id,
+            organization=organization,
+            version=version,
+            max_steps_override=max_steps,
+            reject_empty_workflow=True,
+            is_template_workflow=template,
+            debug_session_id=debug_session_id,
+            code_gen=code_gen,
+            workflow_run_id=workflow_run_id,
+            parent_workflow_run_id=parent_workflow_run_id,
+            trigger_type=trigger_type,
+            workflow_schedule_id=workflow_schedule_id,
+            retried_from_workflow_run_id=retried_from_workflow_run_id,
+            fallback_attempt=fallback_attempt,
+            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+            copilot_session_id=copilot_session_id,
+            resolved_workflow_id=resolved_workflow_id,
+            tag_write_context=tag_write_context,
+            block_scoped=block_scoped,
+            created_by=created_by,
+            refuse_unusable_parameters_before_create=refuse_unusable_parameters_before_create,
+            workflow=workflow,
+            post_dispatch_effects=post_dispatch_effects,
+        )
+        await app.DATABASE.tasks.create_task_run(
+            task_run_type=RunType.workflow_run,
+            organization_id=organization.organization_id,
+            run_id=workflow_run.workflow_run_id,
+            title=workflow.title,
+            status=RunStatus.queued,
+            workflow_permanent_id=workflow_id,
+            parent_workflow_run_id=parent_workflow_run_id,
+            debug_session_id=debug_session_id,
+        )
 
     if max_steps:
         LOG.info("Overriding max steps per run", max_steps_override=max_steps)
 
-    return workflow_run
+    return workflow_run, workflow
 
 
 async def run_workflow(
@@ -191,22 +247,21 @@ async def run_workflow(
     ignore_inherited_workflow_system_prompt: bool = False,
     tag_write_context: TagWriteContext | None = None,
     created_by: str | None = None,
+    refuse_unusable_parameters_before_create: bool = False,
 ) -> WorkflowRun:
-    # Fail fast before the run is prepared/persisted: reject a run-level browser_type this runtime
-    # cannot honor with a 4xx, rather than accepting it and failing at launch. No-op when unset or on
-    # a runtime that supports an explicit selection (cloud).
-    try:
-        ensure_runtime_supports_browser_type(read_browser_type(workflow_request))
-    except SelectedBrowserTypeUnsupportedError as e:
-        raise SkyvernHTTPException(str(e), HTTPStatus.BAD_REQUEST) from e
-    workflow_run = await prepare_workflow(
+    workflow_run, _ = await run_workflow_returning_owned_workflow(
         workflow_id=workflow_id,
         organization=organization,
         workflow_request=workflow_request,
         template=template,
         version=version,
         max_steps=max_steps,
+        api_key=api_key,
         request_id=request_id,
+        request=request,
+        background_tasks=background_tasks,
+        block_labels=block_labels,
+        block_outputs=block_outputs,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
         workflow_schedule_id=workflow_schedule_id,
@@ -215,23 +270,88 @@ async def run_workflow(
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         tag_write_context=tag_write_context,
         created_by=created_by,
+        refuse_unusable_parameters_before_create=refuse_unusable_parameters_before_create,
     )
-
-    await AsyncExecutorFactory.get_executor().execute_workflow(
-        request=request,
-        background_tasks=background_tasks,
-        organization=organization,
-        workflow_id=workflow_run.workflow_id,
-        workflow_run_id=workflow_run.workflow_run_id,
-        workflow_permanent_id=workflow_run.workflow_permanent_id,
-        max_steps_override=max_steps,
-        browser_session_id=workflow_run.browser_session_id,
-        api_key=api_key,
-        block_labels=block_labels,
-        block_outputs=block_outputs,
-    )
-
     return workflow_run
+
+
+async def run_workflow_returning_owned_workflow(
+    workflow_id: str,
+    organization: Organization,
+    workflow_request: WorkflowRequestBody,
+    template: bool = False,
+    version: int | None = None,
+    max_steps: int | None = None,
+    api_key: str | None = None,
+    request_id: str | None = None,
+    request: Request | None = None,
+    background_tasks: BackgroundTasks | None = None,
+    block_labels: list[str] | None = None,
+    block_outputs: dict[str, t.Any] | None = None,
+    parent_workflow_run_id: str | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
+    workflow_schedule_id: str | None = None,
+    retried_from_workflow_run_id: str | None = None,
+    fallback_attempt: int | None = None,
+    ignore_inherited_workflow_system_prompt: bool = False,
+    tag_write_context: TagWriteContext | None = None,
+    created_by: str | None = None,
+    refuse_unusable_parameters_before_create: bool = False,
+) -> tuple[WorkflowRun, Workflow | None]:
+    # Fail fast before the run is prepared/persisted: reject a run-level browser_type this runtime
+    # cannot honor with a 4xx, rather than accepting it and failing at launch. No-op when unset or on
+    # a runtime that supports an explicit selection (cloud).
+    try:
+        ensure_runtime_supports_browser_type(read_browser_type(workflow_request))
+    except SelectedBrowserTypeUnsupportedError as e:
+        raise SkyvernHTTPException(str(e), HTTPStatus.BAD_REQUEST) from e
+    # Best-effort bookkeeping that no dispatch gate reads is written after the Temporal submit, off the
+    # created-to-queued path; it still runs if the submit fails, as it did when it ran before the submit.
+    post_dispatch_effects: list[Callable[[], Awaitable[None]]] = []
+    try:
+        workflow_run, workflow = await _prepare_workflow(
+            workflow_id=workflow_id,
+            organization=organization,
+            workflow_request=workflow_request,
+            template=template,
+            version=version,
+            max_steps=max_steps,
+            request_id=request_id,
+            parent_workflow_run_id=parent_workflow_run_id,
+            trigger_type=trigger_type,
+            workflow_schedule_id=workflow_schedule_id,
+            retried_from_workflow_run_id=retried_from_workflow_run_id,
+            fallback_attempt=fallback_attempt,
+            ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+            tag_write_context=tag_write_context,
+            created_by=created_by,
+            refuse_unusable_parameters_before_create=refuse_unusable_parameters_before_create,
+            post_dispatch_effects=post_dispatch_effects,
+        )
+        # A template run resolves its workflow without an org filter, so it can be another org's row, which must
+        # reach neither the executor nor a caller that echoes it back.
+        owned_workflow = workflow if workflow.organization_id == organization.organization_id else None
+
+        await AsyncExecutorFactory.get_executor().execute_workflow(
+            request=request,
+            background_tasks=background_tasks,
+            organization=organization,
+            workflow_id=workflow_run.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
+            max_steps_override=max_steps,
+            browser_session_id=workflow_run.browser_session_id,
+            api_key=api_key,
+            block_labels=block_labels,
+            block_outputs=block_outputs,
+            resolved_workflow=owned_workflow,
+        )
+    finally:
+        for effect in post_dispatch_effects:
+            with contained_effect("post-dispatch bookkeeping"):
+                await effect()
+
+    return workflow_run, owned_workflow
 
 
 async def get_workflow_run_response(
@@ -276,6 +396,7 @@ async def get_workflow_run_response(
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         browser_seed_source=workflow_run.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         script_run=workflow_run.script_run,
         script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,

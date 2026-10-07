@@ -7,6 +7,8 @@ existing durable-credit boundary. No external site or production run is involved
 from __future__ import annotations
 
 import asyncio
+import json
+import socket
 import threading
 import time
 from datetime import UTC, datetime
@@ -17,14 +19,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+import websockets
 
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_get_json
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.actions import ClickAction, InputTextAction, SwitchTabAction
 from skyvern.webeye.actions.handler import ActionHandler, _browser_dispatch_committed
 from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
+from skyvern.webeye.browser_factory import (
+    _rename_unreported_downloads,
+    set_download_file_listener,
+    start_unreported_download_renamer,
+)
 from skyvern.webeye.real_browser_state import RealBrowserState
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -644,3 +653,108 @@ async def test_claimed_real_dead_blank_no_credit_releases_and_recovers(popup_sit
     assert owning_ctx.download_popup_recovery_grace_started_at == {}, "the released page's anchor must be dropped"
     assert dead.context is context, "release/recovery must not perturb the real BrowserContext identity"
     assert not opener.is_closed(), "the http survivor must remain open"
+
+
+class _CsvAttachmentHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a: Any) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        if self.path == "/":
+            body = b"<!doctype html><html><body><a href='/export'>export</a></body></html>"
+            content_type = "text/html; charset=utf-8"
+        else:
+            body = b"a,b\n1,2\n"
+            content_type = "text/csv"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if self.path != "/":
+            self.send_header("Content-Disposition", 'attachment; filename="report.csv"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.mark.asyncio
+async def test_download_on_outside_client_new_tab_keeps_its_extension(tmp_path: Path) -> None:
+    """Playwright never reports a download that is a tab's first navigation when the tab has no opener, as when an
+    outside CDP client opens it, so only the browser-level listener can name that file."""
+    from playwright.async_api import async_playwright
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CsvAttachmentHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        cdp_port = sock.getsockname()[1]
+    downloads_dir = tmp_path / "downloads"
+
+    try:
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                str(tmp_path / "profile"),
+                headless=True,
+                downloads_path=str(downloads_dir),
+                args=[f"--remote-debugging-port={cdp_port}", "--no-proxy-server"],
+            )
+            try:
+                set_download_file_listener(context)
+                renamer = await start_unreported_download_renamer(cdp_port, str(downloads_dir))
+                assert renamer is not None
+
+                version = await aiohttp_get_json(f"http://127.0.0.1:{cdp_port}/json/version")
+                async with websockets.connect(version["webSocketDebuggerUrl"]) as outside_client:
+                    await outside_client.send(
+                        json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": f"{origin}/export"}})
+                    )
+                    await outside_client.recv()
+
+                page = await context.new_page()
+                await page.goto(origin)
+                async with page.expect_download():
+                    await page.click("a")
+
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    files = sorted(downloads_dir.iterdir())
+                    if len(files) == 2 and all(f.suffix == ".csv" for f in files):
+                        break
+                    await asyncio.sleep(0.1)
+                assert [f.suffix for f in files] == [".csv", ".csv"], [f.name for f in files]
+                assert all(f.read_bytes() == b"a,b\n1,2\n" for f in files)
+            finally:
+                await context.close()
+    finally:
+        server.shutdown()
+
+
+class _ScriptedCdp:
+    def __init__(self, messages: list[str]) -> None:
+        self._messages = messages
+
+    async def __aenter__(self) -> _ScriptedCdp:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def __aiter__(self) -> Any:
+        for message in self._messages:
+            yield message
+
+
+@pytest.mark.asyncio
+async def test_unreported_download_renamer_keeps_renaming_after_a_bad_event(tmp_path: Path) -> None:
+    (tmp_path / "guid-1").write_bytes(b"a,b\n1,2\n")
+    messages = [
+        "not json",
+        json.dumps({"method": "Browser.downloadProgress", "params": {"guid": "guid-0"}}),
+        json.dumps(
+            {"method": "Browser.downloadWillBegin", "params": {"guid": "guid-1", "suggestedFilename": "report.csv"}}
+        ),
+        json.dumps({"method": "Browser.downloadProgress", "params": {"guid": "guid-1", "state": "completed"}}),
+    ]
+
+    await _rename_unreported_downloads(_ScriptedCdp(messages), tmp_path)  # type: ignore[arg-type]
+
+    assert [f.name for f in tmp_path.iterdir()] == ["guid-1.csv"]

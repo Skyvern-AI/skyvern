@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import {
@@ -8,6 +9,7 @@ import {
 } from "@/routes/streaming/useRecordingMessageChannel";
 import { toast } from "@/components/ui/use-toast";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import { useManualSignInControl } from "@/store/useManualSignInStore";
 import {
   toastClipboardReadFailed,
   toastNothingToPaste,
@@ -141,6 +143,7 @@ function BrowserSessionStream({
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const [isStopped, setIsStopped] = useState(false);
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -164,6 +167,7 @@ function BrowserSessionStream({
   const lastCommittedTokenRef = useRef<number>(0);
   const reconnectAttemptsRef = useRef(0);
   const streamFinishedRef = useRef(false);
+  const parseFailureLoggedRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordingReconnectTimerRef = useRef<ReturnType<
     typeof setTimeout
@@ -298,6 +302,10 @@ function BrowserSessionStream({
     // Recording keeps copy local so the keystroke never lands in the capture.
     forwardCopyShortcut: !exfiltrate,
   });
+  useManualSignInControl(
+    controllable ? browserSessionId : undefined,
+    setUserIsControlling,
+  );
   const keepMessageChannelAlive = !!exfiltrate || userIsControlling;
   keepMessageChannelAliveRef.current = keepMessageChannelAlive;
 
@@ -448,6 +456,7 @@ function BrowserSessionStream({
     hasFrameRef.current = false;
     reconnectAttemptsRef.current = 0;
     streamFinishedRef.current = false;
+    parseFailureLoggedRef.current = false;
     streamEndedDiagnosticRef.current = null;
 
     const clearReconnectTimer = () => {
@@ -594,6 +603,14 @@ function BrowserSessionStream({
           }
         } catch (e) {
           console.error("Failed to parse message", e);
+          if (!parseFailureLoggedRef.current) {
+            parseFailureLoggedRef.current = true;
+            logging.warn("Stream message parse failed", {
+              stream: "cdp",
+              browser_session_id: browserSessionId,
+              workflow_run_id: null,
+            });
+          }
           // The backend only sends non-JSON text to reject credentials, and
           // retrying that would just burn the reconnect budget in silence.
           streamFinishedRef.current = true;
@@ -676,6 +693,13 @@ function BrowserSessionStream({
           setDiagnostic(
             diagnosticForReconnectExhausted(BROWSER_SESSION_STREAM_SUBJECT),
           );
+          logging.warn("Stream gave up", {
+            stream: "cdp",
+            browser_session_id: browserSessionId,
+            workflow_run_id: null,
+            reason: "reconnect_exhausted",
+            reconnect_attempts: reconnectAttemptsRef.current,
+          });
         }
       });
     }
@@ -691,7 +715,7 @@ function BrowserSessionStream({
         socket.close();
       }
     };
-  }, [credentialGetter, browserSessionId, forceCdp]);
+  }, [credentialGetter, browserSessionId, forceCdp, logging]);
 
   const isReady = streamImgSrc.length > 0;
   const streamState: StreamState = isReady

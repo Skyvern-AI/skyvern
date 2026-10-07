@@ -564,6 +564,107 @@ async def test_update_workflow_converts_the_engine_pinned_draft_when_the_engine_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submitted_engine, stored",
+    [
+        ("skyvern-1.0", {"engine": "skyvern-1.0", "engine_pinned": True}),
+        (None, {"engine": "skyvern-1.0", "engine_pinned": True}),
+    ],
+    ids=["re-emitted-without-marker", "engine-omitted"],
+)
+async def test_update_workflow_keeps_a_pinned_v1_through_a_whole_document_write(
+    submitted_engine: str | None, stored: dict
+) -> None:
+    goal = {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"}
+    prior = _yaml({**goal, "engine": "skyvern-1.0", "engine_pinned": True})
+    resubmitted = {**goal, "engine": submitted_engine} if submitted_engine else goal
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            side_effect=RuntimeError("stop here"),
+        ) as process,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app"),
+        pytest.raises(RuntimeError),
+    ):
+        await _update_workflow({"workflow_yaml": _yaml(resubmitted)}, _ctx(prior_yaml=prior))
+
+    block = yaml.safe_load(process.call_args.kwargs["workflow_yaml"])["workflow_definition"]["blocks"][0]
+    assert {key: block[key] for key in ("engine", "engine_pinned") if block.get(key)} == stored
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_cannot_add_a_pin_to_an_unmarked_v1_block() -> None:
+    goal = {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"}
+    ctx = _ctx(prior_yaml=_yaml({**goal, "engine": "skyvern-1.0"}))
+
+    # Engine omitted with a marker: the refill restores the prior engine and drops the model's marker.
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            side_effect=RuntimeError("stop here"),
+        ) as process,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app"),
+        pytest.raises(RuntimeError),
+    ):
+        await _update_workflow({"workflow_yaml": _yaml({**goal, "engine_pinned": True})}, ctx)
+    block = yaml.safe_load(process.call_args.kwargs["workflow_yaml"])["workflow_definition"]["blocks"][0]
+    assert block["engine"] == "skyvern-1.0" and not block.get("engine_pinned")
+
+    # Engine kept with a new marker: the block counts as changed and the non-v3 engine is refused.
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml") as process:
+        result = await _update_workflow(
+            {"workflow_yaml": _yaml({**goal, "engine": "skyvern-1.0", "engine_pinned": True})}, ctx
+        )
+    assert result["ok"] is False
+    assert result["data"]["violations"][0]["code"] == "engine_not_skyvern_v3"
+    process.assert_not_called()
+
+
+_GOAL = {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"}
+
+
+@pytest.mark.parametrize("route", ["whole_document", "block_scoped"])
+@pytest.mark.parametrize(
+    "prior, submitted, expected",
+    [
+        ({"engine": "skyvern-1.0"}, {"engine_pinned": True}, {"engine": "skyvern-1.0"}),
+        ({}, {"engine_pinned": True}, {}),
+        ({"engine": "skyvern-3.0"}, {"engine_pinned": True}, {"engine": "skyvern-3.0"}),
+        ({"engine": "skyvern-3.0", "engine_pinned": True}, {"engine_pinned": True}, {"engine": "skyvern-3.0"}),
+        ({"engine": "skyvern-1.0"}, {"engine": "skyvern-3.0", "engine_pinned": True}, {"engine": "skyvern-3.0"}),
+        (
+            {"engine": "skyvern-1.0", "engine_pinned": True},
+            {"engine": "skyvern-1.0"},
+            {"engine": "skyvern-1.0", "engine_pinned": True},
+        ),
+    ],
+    ids=[
+        "omitted-engine-on-unmarked-v1",
+        "no-prior-engine",
+        "v3-prior",
+        "marker-on-v3-prior",
+        "v3-with-marker",
+        "kept-pin",
+    ],
+)
+def test_a_submitted_marker_survives_only_as_the_prior_blocks_pin(
+    route: str, prior: dict, submitted: dict, expected: dict
+) -> None:
+    prior_yaml = _yaml({**_GOAL, **prior})
+    if route == "whole_document":
+        admission = reject_authoring_violations(_ctx(prior_yaml=prior_yaml), _yaml({**_GOAL, **submitted}), "test")
+    else:
+        admission = reject_authoring_violations(
+            _ctx(), _yaml({**_GOAL, **submitted}), "test", prior_workflow_yaml=prior_yaml
+        )
+
+    assert admission.reject is None
+    block = yaml.safe_load(admission.workflow_yaml)["workflow_definition"]["blocks"][0]
+    assert {key: block[key] for key in ("engine", "engine_pinned") if block.get(key)} == expected
+
+
+@pytest.mark.asyncio
 async def test_task_v3_pure_update_preserves_submitted_v3_engine_bytes() -> None:
     submitted = _yaml(
         {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go", "engine": "skyvern-3.0"}
@@ -658,7 +759,6 @@ def test_code_schema_guidance_advertises_clear_browser_data_instead_of_browser_s
     guidance = " ".join(_code_only_browser_schema_guidance())
 
     assert "await clear_browser_data(page)" in guidance
-    assert "chrome://" in guidance
     assert "clear_cookies" not in guidance
 
 
@@ -685,7 +785,6 @@ def test_code_only_schema_guidance_exposes_secret_credential_runtime_accessor() 
     assert "magic_link" not in secret_line
     assert "fill_credential_field" not in secret_line
     assert "<key>.secret_value" not in password_line
-    assert "fill_credential_field" in password_line
     for accessors in CREDENTIAL_CODE_ACCESSORS.values():
         for accessor in (*accessors.fields, accessors.otp, accessors.magic_link):
             assert accessor is None or accessor in "\n".join(lines)
@@ -1395,6 +1494,7 @@ def test_authoring_guidance_reaches_the_three_write_tools_only_under_both_famili
             supports_question_tool=True,
             browser_code_available=True,
             authoring_capability=capability,
+            run_tools_available=True,
         )
     }
 
@@ -1414,6 +1514,7 @@ def test_read_the_schema_first_reaches_the_write_tools_under_every_capability(ca
             supports_question_tool=True,
             browser_code_available=True,
             authoring_capability=capability,
+            run_tools_available=True,
         )
     }
 
@@ -1428,6 +1529,7 @@ def test_agent_blocks_only_keeps_direct_browser_scouting_without_the_code_tool()
             supports_question_tool=True,
             browser_code_available=False,
             authoring_capability=AGENT_BLOCKS_ONLY,
+            run_tools_available=True,
         )
     }
 

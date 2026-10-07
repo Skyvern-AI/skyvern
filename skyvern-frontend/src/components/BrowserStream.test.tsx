@@ -1,12 +1,14 @@
 import { StrictMode, type ComponentProps } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
 } from "@testing-library/react";
+import { AxiosError, type AxiosResponse } from "axios";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -218,10 +220,53 @@ vi.mock("@/store/useRecordingStore", () => {
   };
 });
 
+const respondWithRunningSession = mocks.apiGet.getMockImplementation()!;
+
+type SessionFields = {
+  status: string;
+  browser_address: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+};
+
+async function sessionWith(fields: Partial<SessionFields>) {
+  return { ...(await respondWithRunningSession()).data, ...fields };
+}
+
+function respondWith(respond: () => Promise<{ data: unknown }>) {
+  mocks.apiGet.mockImplementation(respond as typeof respondWithRunningSession);
+}
+
+function failWith(status: number) {
+  respondWith(async () => {
+    throw new AxiosError("request failed", undefined, undefined, undefined, {
+      status,
+    } as AxiosResponse);
+  });
+}
+
+// Through act, so React settles the renders and effects each tick schedules.
+function advance(ms: number) {
+  return act(() => vi.advanceTimersByTimeAsync(ms));
+}
+
+// Retries until React commits the expected state, polling on the real event
+// loop (React's scheduler runs there, and fake time does not drive it).
+// Interval 0 keeps vi.waitFor from also advancing fake time on every check.
+function settled(assertion: () => void) {
+  return vi.waitFor(assertion, { interval: 0 });
+}
+
+function sessionRequestCount() {
+  return (mocks.apiGet.mock.calls as unknown[][]).filter(
+    ([url]) => url === "/browser_sessions/pbs_test",
+  ).length;
+}
+
 function renderBrowserStream(
   props: Pick<
     ComponentProps<typeof BrowserStream>,
-    "onActivity" | "onStreamStateChange"
+    "browserSession" | "onActivity" | "onStreamStateChange"
   > = {},
 ) {
   const queryClient = new QueryClient({
@@ -236,6 +281,7 @@ function renderBrowserStream(
     <QueryClientProvider client={queryClient}>
       <BrowserStream
         browserSessionId="pbs_test"
+        browserSession={props.browserSession}
         interactive={false}
         showControlButtons={true}
         onActivity={props.onActivity}
@@ -307,6 +353,7 @@ describe("BrowserStream", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.clearAllMocks();
+    mocks.apiGet.mockImplementation(respondWithRunningSession);
     mocks.rfbInstances.length = 0;
     mocks.wsInstances.length = 0;
   });
@@ -814,9 +861,13 @@ describe("BrowserStream", () => {
     try {
       const onStreamStateChange = vi.fn();
       renderBrowserStream({ onStreamStateChange });
-      await vi.advanceTimersByTimeAsync(1000);
+      await settled(() =>
+        expect(onStreamStateChange).toHaveBeenLastCalledWith(
+          "live",
+          "pbs_test",
+        ),
+      );
       expect(mocks.rfbInstances).toHaveLength(1);
-      expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_test");
       mocks.autoConnect.value = false;
 
       // Each disconnect schedules exactly one delayed redial, up to the cap.
@@ -827,13 +878,19 @@ describe("BrowserStream", () => {
         ] as unknown as {
           emit: (type: string, detail?: unknown) => void;
         };
-        rfb.emit("disconnect", { clean: false });
+        act(() => rfb.emit("disconnect", { clean: false }));
         // No immediate redial: the retry waits out its backoff delay.
-        await vi.advanceTimersByTimeAsync(0);
+        // This absence check settles on act's trailing macrotask, which drains
+        // only microtask-only chains (the mocked async getClient and
+        // useCredentialGetter); if the dial path ever awaits real macrotasks,
+        // it false-passes silently.
+        await advance(0);
         expect(mocks.rfbInstances).toHaveLength(instanceCount);
         // Max delay 15s plus up to 50% jitter.
-        await vi.advanceTimersByTimeAsync(30000);
-        expect(mocks.rfbInstances).toHaveLength(instanceCount + 1);
+        await advance(30000);
+        await settled(() =>
+          expect(mocks.rfbInstances).toHaveLength(instanceCount + 1),
+        );
       }
       expect(onStreamStateChange).toHaveBeenLastCalledWith(
         "connecting",
@@ -846,12 +903,14 @@ describe("BrowserStream", () => {
       ] as unknown as {
         emit: (type: string, detail?: unknown) => void;
       };
-      rfb.emit("disconnect", { clean: false });
-      await vi.advanceTimersByTimeAsync(120000);
+      act(() => rfb.emit("disconnect", { clean: false }));
+      await advance(120000);
       expect(mocks.rfbInstances).toHaveLength(instanceCount);
-      expect(onStreamStateChange).toHaveBeenLastCalledWith(
-        "stopped",
-        "pbs_test",
+      await settled(() =>
+        expect(onStreamStateChange).toHaveBeenLastCalledWith(
+          "stopped",
+          "pbs_test",
+        ),
       );
     } finally {
       vi.useRealTimers();
@@ -913,6 +972,194 @@ describe("BrowserStream", () => {
           "The browser stream dropped before everything wrapped up.",
         ),
       ).toBeNull();
+    });
+  });
+
+  describe("session polling", () => {
+    const WINDOW_MS = 30_000;
+    const STARTED = {};
+    const NOT_STARTED = {
+      status: "created",
+      browser_address: null,
+      started_at: null,
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it.each([
+      {
+        mount: "the session page",
+        render: renderBrowserSession,
+        phase: "a started",
+        fields: STARTED,
+        intervalMs: 5000,
+      },
+      {
+        mount: "the session page",
+        render: renderBrowserSession,
+        phase: "a not-yet-started",
+        fields: NOT_STARTED,
+        intervalMs: 1000,
+      },
+      {
+        mount: "a mount with no parent session",
+        render: () => renderBrowserStream(),
+        phase: "a started",
+        fields: STARTED,
+        intervalMs: 5000,
+      },
+      {
+        mount: "a mount with no parent session",
+        render: () => renderBrowserStream(),
+        phase: "a not-yet-started",
+        fields: NOT_STARTED,
+        intervalMs: 1000,
+      },
+    ])(
+      "requests $phase session once per interval from $mount",
+      async ({ render: renderMount, fields, intervalMs }) => {
+        const session = await sessionWith(fields);
+        respondWith(async () => ({ data: session }));
+        renderMount();
+        await advance(500);
+        mocks.apiGet.mockClear();
+
+        await advance(WINDOW_MS);
+
+        expect(sessionRequestCount()).toBe(WINDOW_MS / intervalMs);
+      },
+    );
+
+    it("dials VNC from the session page once the page's poll reports the session started", async () => {
+      const notStarted = await sessionWith(NOT_STARTED);
+      respondWith(async () => ({ data: notStarted }));
+      renderBrowserSession();
+      await advance(3000);
+      expect(screen.getByText(/warming up your browser/i)).toBeTruthy();
+      expect(mocks.rfbInstances).toHaveLength(0);
+
+      mocks.apiGet.mockImplementation(respondWithRunningSession);
+      await advance(1500);
+
+      expect(mocks.rfbInstances).toHaveLength(1);
+    });
+
+    describe.each(["its own poll", "the parent's session"] as const)(
+      "reading the session from %s",
+      (source) => {
+        it.each([
+          {
+            state: "completed",
+            fields: { completed_at: "2026-01-01T01:00:00Z" },
+            panel: /wandered off/i,
+            vncDials: 0,
+            streamState: "stopped",
+          },
+          {
+            state: "started, by started_at alone",
+            fields: { browser_address: null },
+            panel: null,
+            vncDials: 1,
+            streamState: "live",
+          },
+          {
+            state: "started, by browser_address alone",
+            fields: { started_at: null },
+            panel: null,
+            vncDials: 1,
+            streamState: "live",
+          },
+          {
+            state: "not yet started",
+            fields: NOT_STARTED,
+            panel: /warming up your browser/i,
+            vncDials: 0,
+            streamState: "connecting",
+          },
+        ])(
+          "a $state session",
+          async ({ fields, panel, vncDials, streamState }) => {
+            const session = await sessionWith(fields);
+            const onStreamStateChange = vi.fn();
+            if (source === "its own poll") {
+              respondWith(async () => ({ data: session }));
+              renderBrowserStream({ onStreamStateChange });
+            } else {
+              renderBrowserStream({
+                onStreamStateChange,
+                browserSession: session,
+              });
+            }
+
+            await advance(1000);
+
+            expect(mocks.rfbInstances).toHaveLength(vncDials);
+            expect(onStreamStateChange).toHaveBeenLastCalledWith(
+              streamState,
+              "pbs_test",
+            );
+            if (panel) {
+              expect(screen.getByText(panel)).toBeTruthy();
+            }
+            expect(sessionRequestCount() > 0).toBe(source === "its own poll");
+          },
+        );
+      },
+    );
+
+    it("treats a missing session as ended", async () => {
+      respondWith(async () => ({ data: null }));
+      const onStreamStateChange = vi.fn();
+      renderBrowserStream({ onStreamStateChange });
+
+      await advance(1000);
+
+      expect(screen.getByText(/wandered off/i)).toBeTruthy();
+      expect(mocks.rfbInstances).toHaveLength(0);
+      expect(onStreamStateChange).toHaveBeenLastCalledWith(
+        "stopped",
+        "pbs_test",
+      );
+    });
+
+    it("keeps polling through a failed request without calling the session ended", async () => {
+      failWith(500);
+      const onStreamStateChange = vi.fn();
+      renderBrowserStream({ onStreamStateChange });
+      await advance(500);
+      mocks.apiGet.mockClear();
+
+      await advance(WINDOW_MS);
+
+      expect(sessionRequestCount()).toBe(WINDOW_MS / 1000);
+      expect(screen.getByText(/wandered off/i)).toBeTruthy();
+      expect(mocks.rfbInstances).toHaveLength(0);
+      expect(onStreamStateChange).toHaveBeenLastCalledWith(
+        "connecting",
+        "pbs_test",
+      );
+    });
+
+    it("stops polling a forbidden session and reports it ended", async () => {
+      failWith(403);
+      const onStreamStateChange = vi.fn();
+      renderBrowserStream({ onStreamStateChange });
+
+      await advance(WINDOW_MS);
+
+      expect(sessionRequestCount()).toBe(1);
+      expect(screen.getByText(/wandered off/i)).toBeTruthy();
+      expect(mocks.rfbInstances).toHaveLength(0);
+      expect(onStreamStateChange).toHaveBeenLastCalledWith(
+        "stopped",
+        "pbs_test",
+      );
     });
   });
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Callable
 from functools import lru_cache
@@ -8,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build_tool_usage_guide
@@ -214,3 +216,16 @@ def test_ask_carve_out_gates_money_and_destruction_and_never_a_site_sent_message
     # A page click that makes the site email its own account holder is not the workflow
     # sending anything, and no permission clause may read it as one.
     assert "message or email" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_block_type_list_drops_the_mcp_servers_hint() -> None:
+    listed = await skyvern_block_schema()
+    assert "hint" in listed["data"]
+
+    # The server returns its module-level catalog and the hook edits what it is given in place.
+    payload = copy.deepcopy(listed["data"])
+    rendered = await _get_block_schema_post_hook({"ok": True, "data": payload}, {}, _code_only_ctx())
+
+    assert rendered["data"]["block_types"]
+    assert "hint" not in rendered["data"]

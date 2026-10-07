@@ -5,13 +5,12 @@ import copy
 import hashlib
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol, TypedDict
 
-import aiohttp
 import httpx
 import structlog
 from cachetools import TTLCache
@@ -74,13 +73,19 @@ from skyvern.forge.sdk.services import (
     sftp_service,
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
+from skyvern.forge.sdk.services.request_principal import (
+    BearerIdentityResolution,
+    BearerIdentityStatus,
+    RequestPrincipal,
+    get_request_principal,
+)
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
-from skyvern.forge.sdk.workflow.web_search import WebSearchProvider
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
@@ -92,7 +97,7 @@ from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
-    from playwright.async_api import BrowserContext, Locator, Response
+    from playwright.async_api import BrowserContext, Locator, Request, Response
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
@@ -103,7 +108,7 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
-    from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import DocumentFailureReceipt, RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.forge.taskv3.loop import ToolSpec
@@ -115,9 +120,40 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """Resource identifiers and field names for an audited write; never secrets or request bodies."""
+
+    organization_id: str
+    action: str
+    resource_type: str
+    resource_id: str | None
+    changed_fields: tuple[str, ...] = ()
+    related_resource_ids: tuple[str, ...] = ()
+    auth_kind: str | None = None
+    oauth_client_id: str | None = None
+
+
+async def record_request_audit_event(
+    organization_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    *,
+    changed_fields: tuple[str, ...] = (),
+    related_resource_ids: tuple[str, ...] = (),
+) -> None:
+    await app.AGENT_FUNCTION.record_audit_event(
+        get_request_principal(),
+        AuditEvent(organization_id, action, resource_type, resource_id, changed_fields, related_resource_ids),
+    )
+
+
 EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
 EMAIL_OTP_MAX_RESULTS = 5
 EMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
+STANDALONE_BROWSER_SESSION_FEATURE_NAME = "standalone_browser_sessions"
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 
@@ -188,25 +224,13 @@ class TOTPVerificationResponse:
     """Normalized response shape for the TOTP verification seam.
 
     Decouples the seam contract from any specific HTTP client so the OSS
-    direct path (aiohttp) and the cloud proxy path (NATEgressProxyClient)
+    direct path (pinned httpx) and the cloud proxy path (NATEgressProxyClient)
     can both produce a response the helper consumes the same way.
     """
 
     status_code: int
     body: str
     headers: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class CopilotSiteOriginAssociation:
-    requested_name: str
-    entity_id: str
-    entity_label: str
-    official_site_url: str
-    origin: str
-    source: str
-    provider_relation_type: str
-    provider_relation_text: str
 
 
 @dataclass(frozen=True)
@@ -226,13 +250,6 @@ class CopilotCandidateNetworkHop(TypedDict):
     resolved_public_ips: list[str]
     connected_peer_ip: str
     enforcement_version: str
-
-
-@dataclass(frozen=True)
-class CopilotEntrypointCandidate:
-    url: str
-    source_rank: int
-    association: CopilotSiteOriginAssociation
 
 
 @dataclass(frozen=True)
@@ -282,6 +299,18 @@ class CodeBlockEngineFailure:
     nav_error_code: str | None = None
     # The owned page the failing operation ran on; final_url stays the block's own page.
     receiver_url: str | None = None
+    # Whether the page the failing operation ran on showed a sign-in form, read by the worker before it
+    # closes the runner's owned pages; None when the worker could not tie the failure to a page.
+    sign_in_form_visible: bool | None = None
+    # Unredacted; associated_navigation_output masks it where it is persisted.
+    document_failure: DocumentFailureReceipt | None = None
+    # Worker-measured non-strict match count of the failed locator and how the probe resolved
+    # ("counted"/"timeout"/"error"); internal operation-attribution evidence, never user-facing.
+    locator_match_count: int | None = None
+    locator_probe_status: str | None = None
+    # Bare native worker exception class for operation attribution, so secure events are comparable
+    # to inline ones; distinct from the healing-facing exception_class above.
+    native_exception_class: str | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -945,13 +974,45 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+@dataclass(frozen=True)
+class DownloadRecoveryRemap:
+    """Bounded outcome of a download-recovery ``remap``.
+
+    ``locator`` is the retry target on the pinned page, or ``None`` when recovery must not click.
+    ``resolution`` names how the locator was found (``cached_css`` or ``fresh_scrape``) and is set only
+    when ``locator`` is present. ``reason`` is a bounded, non-sensitive rejection code when ``locator``
+    is ``None`` so the single structured log line can distinguish sub-outcomes without leaking URLs,
+    query parameters, or customer data.
+    """
+
+    locator: Locator | None
+    resolution: str | None = None
+    reason: str | None = None
+
+
 class DownloadRecoveryHook(Protocol):
+    def matches_target(self, request: Request) -> bool: ...
+
     def matches_failure(self, response: Response) -> bool: ...
 
-    async def remap(self, page: Page) -> Locator | None: ...
+    async def remap(self, page: Page) -> DownloadRecoveryRemap: ...
+
+    async def reverify(self, page: Page) -> str | None: ...
 
 
 class AgentFunction:
+    async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
+        """OSS has no customer audit store; cloud overrides this best-effort hook."""
+        return None
+
+    async def authorize_request(
+        self,
+        principal: RequestPrincipal | None,
+        action: str,
+        resource: Mapping[str, object],
+    ) -> str | None:
+        return None
+
     def build_download_recovery(
         self, *, action: Action, scraped_page: ScrapedPage, page: Page
     ) -> DownloadRecoveryHook | None:
@@ -975,9 +1036,13 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
-    # (fill text, self-screen bullet) for the v3 required-field-answers arm's treatment prompt. OSS
-    # supplies none, so a run in that arm's treatment renders the control prompt.
-    def task_v3_required_field_answers_text(self) -> tuple[str, str] | None:
+    # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
+    # the run's payload. OSS supplies no default.
+    def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
+        return None
+
+    # Same contract as task_v3_age_default, for the job-application availability, experience and disclosure defaults.
+    def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
@@ -1126,6 +1191,10 @@ class AgentFunction:
         """
         return None
 
+    def get_standard_tier_twin_llm_key(self, llm_key: str | None) -> str | None:
+        """Like get_non_flex_llm_key, but also covers flex routers the manual-run handler swap must leave alone."""
+        return None
+
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
         """Return a provider-fallback router twin for the given LLM key, or None if none exists.
 
@@ -1259,12 +1328,14 @@ class AgentFunction:
         under them; OSS has no runner, so its budget is unknown rather than unlimited."""
         return None
 
-    def web_search_provider(self) -> WebSearchProvider | None:
-        """No search engine is configured in OSS; reading a provider's result markup is
-        deployment configuration. Cloud overrides this with its configured provider."""
-        return None
-
-    def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
+    def redact_codeblock_parameter_values(
+        self,
+        value: Any,
+        parameters: dict[str, Any],
+        *,
+        max_disclosure_chars: int | None = None,
+        max_disclosure_nodes: int | None = None,
+    ) -> Any:
         """Cloud overrides this with the runner's canonical parameter scrubber."""
         return value
 
@@ -1781,7 +1852,8 @@ class AgentFunction:
         the agent keep going and fail safe at max steps rather than falsely completing.
         OSS accepts everything; a deployment may override to hold specific blocks (e.g. a
         submit block whose AI fallback would otherwise complete without a deterministic
-        confirmation check) to a stricter gate.
+        confirmation check) to a stricter gate. Raising CompletionGateTerminationError ends the
+        task as terminated with its reason, so callers must catch it before any broad except.
         """
         return True
 
@@ -2593,15 +2665,28 @@ class AgentFunction:
         headers: dict[str, str],
         timeout_seconds: float = 30.0,
         organization_id: str | None = None,
+        resolved_ips: tuple[str, ...] | None = None,
+        method: str = "POST",
     ) -> TOTPVerificationResponse:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
-            async with session.post(url, data=payload, headers=headers) as response:
-                body = await response.text()
-                return TOTPVerificationResponse(
-                    status_code=response.status,
-                    body=body,
-                    headers=dict(response.headers),
+        # Redirects are left to the caller, which validates and pins each hop. httpx timeouts are per
+        # operation, so a slow-drip endpoint needs the outer cap to stay within the budget.
+        try:
+            async with asyncio.timeout(timeout_seconds), pinned_ip_client(resolved_ips) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    content=payload or None,
+                    headers=headers,
+                    timeout=httpx.Timeout(timeout_seconds),
                 )
+        except TimeoutError as e:
+            raise httpx.ReadTimeout(f"TOTP verification request exceeded {timeout_seconds}s") from e
+        return TOTPVerificationResponse(
+            status_code=response.status_code,
+            body=response.text,
+            # Original casing, as the earlier aiohttp path returned; otp_service's Content-Type gate is case-sensitive.
+            headers={key.decode("latin-1"): value.decode("latin-1") for key, value in response.headers.raw},
+        )
 
     async def upload_file_to_customer_storage(
         self,
@@ -2693,22 +2778,6 @@ class AgentFunction:
         if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
             raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
-    def get_copilot_security_rules(self) -> str:
-        """Return security guardrails for the workflow copilot system prompt.
-
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
-        """
-        return ""
-
-    async def acquire_copilot_entrypoint_candidates(
-        self,
-        *,
-        site_name: str,
-    ) -> list[CopilotEntrypointCandidate]:
-        del site_name
-        return []
-
     def copilot_candidate_network_guard(
         self,
         browser_context: BrowserContext,
@@ -2727,10 +2796,6 @@ class AgentFunction:
         del browser_context, expected_origin
         raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
         yield []  # pragma: no cover
-
-    async def wait_for_copilot_candidate_network_idle(self, browser_context: BrowserContext) -> None:
-        del browser_context
-        raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
@@ -2950,6 +3015,18 @@ class AgentFunction:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
         return None
 
+    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+        """Return a verified bearer identity or why it could not be resolved."""
+        return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
+
+    async def mirror_organization_member(
+        self,
+        principal: RequestPrincipal,
+        *,
+        role_observed_at: datetime | None = None,
+    ) -> None:
+        pass
+
     async def on_workflow_saved(
         self,
         organization_id: str,
@@ -2965,6 +3042,15 @@ class AgentFunction:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
         return
 
+    async def on_workflow_updated_by_user(
+        self,
+        organization_id: str,
+        user_id: str | None,
+        workflow: Workflow,
+    ) -> None:
+        """Fired after the update-agent routes save a new version. Overrides must be best-effort and never raise."""
+        return
+
     async def on_workflow_run_completed(
         self,
         organization_id: str,
@@ -2975,6 +3061,9 @@ class AgentFunction:
     ) -> None:
         """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
         return
+
+    def schedule_workflow_run_group_advance(self, workflow_run: WorkflowRun) -> None:
+        schedule_advance_after_terminal(workflow_run)
 
     async def on_task_completed(
         self,

@@ -29,7 +29,13 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", async (importOriginal) => {
   };
 });
 
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -151,5 +157,80 @@ describe("WorkflowRunHumanInteraction", () => {
       buildBlock({ status: Status.Completed }),
     );
     expect(container.textContent).toBe("");
+  });
+});
+
+describe("WorkflowRunHumanInteraction decisions", () => {
+  beforeEach(() => {
+    runQueryStub.mockReturnValue({
+      data: { workflow_run_id: "wr_1", status: Status.Paused },
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    getClientMock.mockReset();
+  });
+
+  it.each([
+    ["Approve", "/workflows/runs/wr_1/continue"],
+    ["Reject", "/workflows/runs/wr_1/cancel"],
+  ])("%s asks for confirmation, then posts to %s", async (label, path) => {
+    const post = vi.fn().mockResolvedValue({});
+    getClientMock.mockResolvedValue({ post });
+    renderInteraction(buildBlock());
+
+    fireEvent.click(screen.getByRole("button", { name: label }));
+    expect(post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Proceed" }));
+
+    await waitFor(() => expect(post).toHaveBeenCalledWith(path));
+  });
+});
+
+describe("WorkflowRunHumanInteraction instructions", () => {
+  const instructions = "Sign in to the portal, then leave the browser as-is.";
+  let scrollHeight: ReturnType<typeof vi.spyOn>;
+  let clientHeight: ReturnType<typeof vi.spyOn>;
+
+  function setLayout(scroll: number, client: number) {
+    scrollHeight.mockReturnValue(scroll);
+    clientHeight.mockReturnValue(client);
+  }
+
+  beforeEach(() => {
+    runQueryStub.mockReturnValue({
+      data: { workflow_run_id: "wr_1", status: Status.Paused },
+    });
+    // jsdom has no layout; model a 3-line clamp whose text is taller or not.
+    scrollHeight = vi.spyOn(Element.prototype, "scrollHeight", "get");
+    clientHeight = vi.spyOn(Element.prototype, "clientHeight", "get");
+  });
+  afterEach(() => {
+    cleanup();
+    scrollHeight.mockRestore();
+    clientHeight.mockRestore();
+  });
+
+  it("offers Show more when the instructions are cut off, and expands them in place", () => {
+    setLayout(120, 60);
+    renderInteraction(buildBlock({ instructions }));
+
+    const more = screen.getByRole("button", { name: "Show more" });
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(more);
+
+    const less = screen.getByRole("button", { name: "Show less" });
+    expect(less.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText(instructions)).toBeTruthy();
+  });
+
+  it("offers no toggle when the instructions fit", () => {
+    setLayout(60, 60);
+    renderInteraction(buildBlock({ instructions }));
+
+    expect(screen.getByText(instructions)).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /show (more|less)/i }),
+    ).toBeNull();
   });
 });

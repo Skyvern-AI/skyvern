@@ -168,6 +168,7 @@ export type FailureCategory = {
   category: string;
   confidence_float: number;
   reasoning: string;
+  reason_code?: string | null;
 };
 
 export type TaskApiResponse = {
@@ -1254,7 +1255,10 @@ export type PylonEmailHash = {
   hash: string;
 };
 
-export type RunFeedbackTargetType = "workflow_run" | "task";
+export type RunFeedbackTargetType =
+  | "workflow_run"
+  | "task"
+  | "browser_recording";
 export type FeedbackRating = "up" | "down";
 
 export type RunFeedbackApiResponse = {

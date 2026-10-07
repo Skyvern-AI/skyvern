@@ -1,5 +1,7 @@
 import asyncio
+from collections.abc import Callable, Coroutine, Hashable
 from datetime import datetime, timedelta
+from typing import Any, TypeVar, TypeVarTuple
 
 import structlog
 from fastapi import HTTPException, status
@@ -34,20 +36,23 @@ from skyvern.services import (
 
 LOG = structlog.get_logger()
 
-_IN_FLIGHT: dict[tuple[str, str, bool], asyncio.Task[RunResponse | None]] = {}
+T = TypeVar("T")
+Ts = TypeVarTuple("Ts")
+
+_IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
 
 
-async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:
-    """A caller that joins an in-flight build can get a status older than its own request."""
-    key = (organization_id, run_id, cap_output_values)
+async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:
+    """Overlapping calls of one build with equal arguments await a single run of it, and a finished result is never
+    reused. A caller that joins an in-flight build can get a result older than its own request."""
+    # The key is the whole call, so the build must take everything that changes its result as an argument.
+    key = (build, *args)
     task = _IN_FLIGHT.get(key)
     if task is None or task.done():
-        task = asyncio.create_task(
-            get_run_response(run_id, organization_id=organization_id, cap_output_values=cap_output_values)
-        )
+        task = asyncio.create_task(build(*args))
         _IN_FLIGHT[key] = task
 
-        def _forget(done: asyncio.Task[RunResponse | None]) -> None:
+        def _forget(done: asyncio.Task[T]) -> None:
             if _IN_FLIGHT.get(key) is done:
                 del _IN_FLIGHT[key]
             if not done.cancelled():
@@ -57,6 +62,10 @@ async def get_run_response_coalesced(run_id: str, organization_id: str, cap_outp
         task.add_done_callback(_forget)
     # Shielded so one poller disconnecting does not cancel the build the other pollers are waiting on.
     return await asyncio.shield(task)
+
+
+async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:
+    return await coalesce_in_flight(get_run_response, run_id, organization_id, cap_output_values)
 
 
 async def get_run_response(

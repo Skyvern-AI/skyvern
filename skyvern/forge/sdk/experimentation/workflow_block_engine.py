@@ -24,7 +24,6 @@ LOG = structlog.get_logger()
 
 WORKFLOW_TASK_V3_AB_FLAG = "WORKFLOW_TASK_V3_AB"
 DISABLE_TASK_V3_FLAG = "DISABLE_TASK_V3"
-TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG = "TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT"
 
 # Trigger kinds whose run executes a workflow the platform minted for that one request rather than
 # one a customer built. The job-recipe endpoints are the whole set today: each call creates a fresh
@@ -47,40 +46,18 @@ class WorkflowBlockEngineRouteReason(StrEnum):
     flag_bucket_treatment = "flag_bucket_treatment"
     flag_bucket_control = "flag_bucket_control"
     new_self_serve_workflow_default = "new_self_serve_workflow_default"
+    # A workflow born at or after TASK_V3_CHOSEN_ENGINE_CUTOFF, never randomized: at least one block
+    # left its engine unset and runs on v3 (``new_workflow_v3_default``), or every block's engine was
+    # chosen and is honored as written (``chosen_engine``).
+    new_workflow_v3_default = "new_workflow_v3_default"
+    chosen_engine = "chosen_engine"
+    # Before that cutoff, a block a person pinned to skyvern-1.0 keeps the run out of the A/B; labelled
+    # apart from ``ineligible`` so reads can count and drop these runs by this value alone.
+    pinned_v1_engine = "pinned_v1_engine"
     ineligible = "ineligible"
     disabled = "disabled"
     flag_undefined = "flag_undefined"
     flag_error = "flag_error"
-
-
-class NewWorkflowDefaultRollout(StrEnum):
-    """How ``TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT`` answered for a run the v3 default would enrol.
-
-    Only ``enrolled`` -- a conclusive True -- lets the rule fire. ``not_enrolled`` is a conclusive
-    False: the flag is inactive, the run fell outside the percentage, or a condition excluded it.
-    ``undefined`` means the key never resolved at all: nobody created it, or local evaluation has no
-    snapshot row for it yet. ``error`` means the evaluation raised. The last three are logged apart
-    from each other because only ``not_enrolled`` is a randomized cell -- a read that wants this
-    rule's control must pin that value, not the boolean.
-    """
-
-    enrolled = "enrolled"
-    not_enrolled = "not_enrolled"
-    undefined = "undefined"
-    error = "error"
-
-
-# Every resolution but a conclusive True leaves the run on the A/B path, so every off-state of the
-# flag -- inactive, deleted, 0%, a condition that excluded the run, an evaluation that raised -- turns
-# the rule off. An inactive flag is the one that has to be safe: posthog's local evaluator answers a
-# conclusive False for it (``_compute_flag_locally``, "if not active: return False"), which is the
-# gesture an operator reaches for mid-incident. Derived from the enum so a resolution added later
-# leaves the run on the A/B instead of enrolling it.
-_NOT_ENROLLED_RESOLUTIONS = frozenset(NewWorkflowDefaultRollout) - {NewWorkflowDefaultRollout.enrolled}
-
-
-def _rollout_enrols(rollout: NewWorkflowDefaultRollout | None) -> bool:
-    return rollout is not None and rollout not in _NOT_ENROLLED_RESOLUTIONS
 
 
 def _arm_label(override: RunEngine | None) -> str:
@@ -111,7 +88,8 @@ class WorkflowBlockEngineArmDecision:
 
     route_reason: WorkflowBlockEngineRouteReason | None = None
     billing_tier: BillingTier | None = None
-    new_workflow_default_rollout_resolution: NewWorkflowDefaultRollout | None = None
+    # An explicit skyvern_v1 on a block is a pin, not a routable default (see Block.resolve_engine).
+    honors_chosen_engine: bool = False
 
 
 NO_ARM_DECISION = WorkflowBlockEngineArmDecision()
@@ -176,15 +154,14 @@ def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-async def _workflow_is_new_for_v3_default(workflow_permanent_id: str | None, organization_id: str | None) -> bool:
-    """Whether this permanent id was born at or after the v3-default cutoff.
+async def _workflow_birth(workflow_permanent_id: str | None, organization_id: str | None) -> datetime | None:
+    """When this permanent id was born, in UTC, or None when that could not be read.
 
-    Never raises and never answers True on a read it could not complete: the rule can only add
-    treatment, so any doubt has to leave the run on the arm the A/B would have given it.
+    Never raises, and None satisfies no cutoff: both cutoff rules take a run out of the A/B, so any
+    doubt has to leave the run on the arm the A/B would have given it.
     """
-    cutoff = settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF
-    if cutoff is None or not workflow_permanent_id or not organization_id:
-        return False
+    if not workflow_permanent_id or not organization_id:
+        return None
     try:
         # The earliest version's timestamp, deleted versions included, is when the permanent id was
         # born. Reading the version this run executes would instead enrol every long-lived workflow
@@ -192,18 +169,30 @@ async def _workflow_is_new_for_v3_default(workflow_permanent_id: str | None, org
         born_at = await app.DATABASE.workflows.get_workflow_permanent_id_created_at(
             workflow_permanent_id, organization_id
         )
-        if born_at is None:
-            return False
-        # Inside the try with the read: a rule that raised here would reach the resolver's catch-all
-        # and send the run to control, which is a different arm than the A/B would have given it.
-        return _as_utc(born_at) >= _as_utc(cutoff)
+        # Inside the try with the read: a conversion that raised here would reach the resolver's
+        # catch-all and send the run to control, a different arm than the A/B would have given it.
+        return None if born_at is None else _as_utc(born_at)
     except Exception:
         LOG.warning(
-            "Failed to read the workflow's birth timestamp for the Task V3 default rule",
+            "Failed to read the workflow's birth timestamp for a Task V3 cutoff rule",
             workflow_permanent_id=workflow_permanent_id,
             exc_info=True,
         )
-        return False
+        return None
+
+
+def _born_at_or_after(born_at: datetime | None, cutoff: datetime | None) -> bool:
+    return born_at is not None and cutoff is not None and born_at >= _as_utc(cutoff)
+
+
+def _is_kept_workflow_run(workflow_status: WorkflowStatus, trigger_type: WorkflowRunTriggerType | None) -> bool:
+    # An auto_generated running version is a per-call workflow the login, download_files, credential
+    # test-login and SDK endpoints mint and run in one request, and enrolling those would move standing
+    # API traffic rather than the workflows a customer keeps; the birth version's status would be the
+    # wrong test, because the prompt box writes version 1 as auto_generated and the editor save that
+    # keeps it writes the next as published. The job-recipe endpoints are per-call too but build a
+    # published definition, so only their trigger kind excludes them.
+    return workflow_status != WorkflowStatus.auto_generated and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
 
 
 async def _ab_flag_puts_run_in_treatment(
@@ -236,56 +225,6 @@ async def _ab_flag_puts_run_in_treatment(
     )
 
 
-async def _resolve_new_workflow_default_rollout(
-    provider: BaseExperimentationProvider,
-    *,
-    workflow_run_id: str,
-    organization_id: str | None,
-    workflow_permanent_id: str | None,
-    billing_tier: BillingTier,
-) -> NewWorkflowDefaultRollout:
-    """How the rollout flag answered for a run the new-workflow v3 default would otherwise enrol.
-
-    This flag is what enrols: the share it does not enrol continues down ``WORKFLOW_TASK_V3_AB``
-    exactly as if the rule did not exist, which is where this population's concurrent control comes
-    from. It is also the only lever that stops the rule for less than everybody -- the cutoff is a
-    setting and needs a restart, and a condition on ``WORKFLOW_TASK_V3_AB`` cannot reach a run that
-    never evaluates it. Turning it off de-enrols rather than forcing v1: an unenrolled run can still
-    be treated by the A/B, so ``DISABLE_TASK_V3`` is the lever for getting an organization off v3.
-
-    ``resolve_feature_flag_strict`` rather than the boolean resolver, so an evaluation that raised is
-    labelled rather than collapsed: both PostHog providers swallow one into ``None`` and ``bool()`` it
-    to ``False``, which would report an error as a real "outside the percentage".
-
-    Only a conclusive ``True`` enrols. ``False``, ``None`` and a raised evaluation all leave the run on
-    the A/B, so every off-gesture on this flag -- disable, delete, 0%, an excluding condition -- turns
-    the rule off, and the cutoff does nothing until the flag resolves ``True`` for someone. A
-    condition on it must be written on person properties: the arm-resolving processes evaluate
-    PostHog locally, and a cohort, group or flag-dependency condition resolves to ``None``, which
-    enrols nobody.
-    """
-    try:
-        resolved = await provider.resolve_feature_flag_strict(
-            TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
-            workflow_run_id,
-            properties={
-                "organization_id": organization_id,
-                "workflow_permanent_id": workflow_permanent_id,
-                BILLING_TIER_PROPERTY: billing_tier.value,
-            },
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to evaluate the new-workflow v3 default rollout; leaving this run on the A/B",
-            workflow_run_id=workflow_run_id,
-            exc_info=True,
-        )
-        return NewWorkflowDefaultRollout.error
-    if resolved is None:
-        return NewWorkflowDefaultRollout.undefined
-    return NewWorkflowDefaultRollout.enrolled if resolved else NewWorkflowDefaultRollout.not_enrolled
-
-
 async def resolve_workflow_block_engine_arm(
     context: skyvern_context.SkyvernContext,
     *,
@@ -295,6 +234,8 @@ async def resolve_workflow_block_engine_arm(
     workflow_status: WorkflowStatus,
     trigger_type: WorkflowRunTriggerType | None,
     ineligibility_reason: V3AbIneligibleReason | None,
+    takes_default_engine: bool | None,
+    pinned_v1_blocks: int = 0,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -308,17 +249,23 @@ async def resolve_workflow_block_engine_arm(
     A self-serve organization's workflow born at or after
     ``settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF`` takes v3 without the percentage being
     consulted, so those runs are marked ``new_self_serve_workflow_default`` for every per-arm read to
-    exclude. ``TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT``, read only for the runs that rule would enrol,
-    is what enrols them; the share it leaves alone continues down the A/B, which is where this
-    population's concurrent control and its scoped kill come from. The rule fires only on a
-    conclusive True, so the cutoff is inert until the flag resolves True for someone, and disabling,
-    deleting or zeroing the flag turns the rule off.
+    exclude. No flag gates the rule: ``DISABLE_TASK_V3`` or unsetting the cutoff turns it off.
+
+    A workflow of any tier born at or after ``settings.TASK_V3_CHOSEN_ENGINE_CUTOFF`` skips the A/B
+    and the rule above: every block's chosen engine is honored and an unset one runs on v3.
+    ``takes_default_engine`` (see ``block.takes_default_engine``) says whether any block left its
+    engine unset, or is None when the run has no engine to choose. The rule does not require A/B
+    eligibility, since a pinned block no longer keeps the run's unset blocks on v1, and so covers a
+    script run's uncached blocks and AI fallback.
 
     ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
     the run was launched. Together they are what separates a workflow a customer keeps from the
     per-call throwaways several endpoints mint and run in one request: most of those run while still
     auto_generated, and the job-recipe endpoints build a published definition, so neither test alone
     covers them.
+
+    ``pinned_v1_blocks`` counts blocks a person pinned to skyvern-1.0 (see ``pinned_v1_block_count``);
+    eligibility already keeps such a run out of the A/B, and this labels it ``pinned_v1_engine``.
     """
     if context.workflow_block_engine_resolved_run_id == workflow_run_id:
         return
@@ -333,12 +280,31 @@ async def resolve_workflow_block_engine_arm(
         if context.workflow_block_engine_resolved_run_id == workflow_run_id:
             return
         override: RunEngine | None = None
+        honors_chosen_engine = False
         run_is_eligible = ineligibility_reason is None
         billing_tier: BillingTier | None = None
-        route_reason = WorkflowBlockEngineRouteReason.ineligible
-        rollout: NewWorkflowDefaultRollout | None = None
+        route_reason = (
+            WorkflowBlockEngineRouteReason.pinned_v1_engine
+            if pinned_v1_blocks
+            else WorkflowBlockEngineRouteReason.ineligible
+        )
+        chosen_engine_candidate = (
+            settings.TASK_V3_CHOSEN_ENGINE_CUTOFF is not None
+            and takes_default_engine is not None
+            and _is_kept_workflow_run(workflow_status, trigger_type)
+        )
+        # Both cutoff rules compare the same birth timestamp, so it is read at most once per run.
+        birth_reads: list[datetime | None] = []
+
+        async def born_at_or_after(cutoff: datetime | None) -> bool:
+            if cutoff is None:
+                return False
+            if not birth_reads:
+                birth_reads.append(await _workflow_birth(workflow_permanent_id, organization_id))
+            return _born_at_or_after(birth_reads[0], cutoff)
+
         try:
-            if run_is_eligible:
+            if run_is_eligible or chosen_engine_candidate:
                 # The kill switch, shared with the dispatch gate via task_v3_disabled so both
                 # evaluations use the same cache key, wins over the experiment and over the
                 # new-workflow default below. A kill flipped mid-run still takes effect at dispatch
@@ -347,42 +313,31 @@ async def resolve_workflow_block_engine_arm(
                 # when someone flips this, and this lock is held throughout, so the kill switch must
                 # not queue behind that call.
                 if await task_v3_disabled(workflow_run_id, organization_id):
-                    route_reason = WorkflowBlockEngineRouteReason.disabled
-                else:
+                    if run_is_eligible:
+                        route_reason = WorkflowBlockEngineRouteReason.disabled
+                elif chosen_engine_candidate and await born_at_or_after(settings.TASK_V3_CHOSEN_ENGINE_CUTOFF):
+                    honors_chosen_engine = True
+                    if takes_default_engine:
+                        override = RunEngine.skyvern_v3
+                        route_reason = WorkflowBlockEngineRouteReason.new_workflow_v3_default
+                    else:
+                        route_reason = WorkflowBlockEngineRouteReason.chosen_engine
+                elif run_is_eligible:
                     # billing_tier rides along so a release condition can hold enterprise and
                     # self-serve at different percentages. Deliberately not passed to
                     # task_v3_disabled: that flag's two callers must build identical provider cache
                     # keys, see its docstring.
                     billing_tier = await _billing_tier_for_arm(organization_id)
                     # The tier, the status and the trigger are checked first, so anything that
-                    # cannot use the rule pays for no workflow read. An auto_generated running
-                    # version is a per-call workflow the login, download_files, credential
-                    # test-login and SDK endpoints mint and run in one request, and enrolling those
-                    # would move standing API traffic rather than the workflows a customer keeps;
-                    # the birth version's status would be the wrong test, because the prompt box
-                    # writes version 1 as auto_generated and the editor save that keeps it writes
-                    # the next as published. The job-recipe endpoints are per-call too but build a
-                    # published definition, so only their trigger kind excludes them.
+                    # cannot use the rule pays for no workflow read.
                     takes_new_workflow_default = (
                         billing_tier == BillingTier.SELF_SERVE
-                        and workflow_status != WorkflowStatus.auto_generated
-                        and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
-                        and await _workflow_is_new_for_v3_default(workflow_permanent_id, organization_id)
+                        and _is_kept_workflow_run(workflow_status, trigger_type)
+                        and await born_at_or_after(settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF)
                     )
                     if takes_new_workflow_default:
-                        # Read only for the runs the rule would enrol, so the A/B population is never
-                        # exposed to this flag and its bucketing is unchanged.
-                        rollout = await _resolve_new_workflow_default_rollout(
-                            provider,
-                            workflow_run_id=workflow_run_id,
-                            organization_id=organization_id,
-                            workflow_permanent_id=workflow_permanent_id,
-                            billing_tier=billing_tier,
-                        )
-                    if takes_new_workflow_default and _rollout_enrols(rollout):
                         # A workflow born at or after the cutoff runs its task blocks on v3 by
-                        # default, so the percentage knob is never consulted: the unenrolled share the
-                        # A/B then routes to control is the only concurrent control these runs have.
+                        # default, so the percentage knob is never consulted.
                         override = RunEngine.skyvern_v3
                         route_reason = WorkflowBlockEngineRouteReason.new_self_serve_workflow_default
                     else:
@@ -410,11 +365,12 @@ async def resolve_workflow_block_engine_arm(
                 exc_info=True,
             )
             override = None
+            honors_chosen_engine = False
             route_reason = WorkflowBlockEngineRouteReason.flag_error
         decision = WorkflowBlockEngineArmDecision(
             route_reason=route_reason,
             billing_tier=billing_tier,
-            new_workflow_default_rollout_resolution=rollout,
+            honors_chosen_engine=honors_chosen_engine,
         )
         context.workflow_block_engine_override = override
         context.workflow_block_engine_arm_decision = decision
@@ -427,23 +383,13 @@ async def resolve_workflow_block_engine_arm(
             workflow_permanent_id=workflow_permanent_id,
             arm=_arm_label(override),
             route_reason=engine_arm_log_value(route_reason),
-            # True only for a run this rule enrolled, which is every run it treated: the rule's
-            # control cell is the unenrolled share the A/B then routed to control, so a read of the
-            # rule compares route_reason=new_self_serve_workflow_default against
-            # new_workflow_default_rollout_resolution=not_enrolled intersected with
-            # flag_bucket_control -- an unenrolled run re-enters the A/B and can be treated there.
-            new_workflow_default_rollout=_rollout_enrols(rollout),
-            # None whenever the rollout flag was not consulted. The three non-enrolling resolutions
-            # are indistinguishable in the boolean above, and only not_enrolled is a randomized cell,
-            # so both a check of whether the flag is answering at all and the rule's control cell read
-            # this field instead.
-            new_workflow_default_rollout_resolution=engine_arm_log_value(rollout),
             run_is_eligible=run_is_eligible,
             ineligibility_reason=ineligibility_reason,
             # None whenever the A/B was never consulted -- an ineligible run, or one the kill switch
             # already stopped -- so the field means "the tier this run was bucketed on" and never
             # doubles as "nobody looked".
             billing_tier=engine_arm_log_value(billing_tier),
+            pinned_v1_blocks=pinned_v1_blocks,
         )
 
 
@@ -459,6 +405,43 @@ def workflow_block_engine_override(workflow_run_id: str | None) -> RunEngine | N
     if context is None or context.workflow_block_engine_resolved_run_id != workflow_run_id:
         return None
     return context.workflow_block_engine_override
+
+
+def run_honors_chosen_engine(workflow_run_id: str | None) -> bool:
+    if not workflow_run_id:
+        return False
+    context = skyvern_context.current()
+    if context is None or context.workflow_block_engine_resolved_run_id != workflow_run_id:
+        return False
+    decision = context.workflow_block_engine_arm_decision
+    return decision is not None and decision.honors_chosen_engine
+
+
+async def effective_default_engine(workflow_permanent_id: str, organization_id: str) -> RunEngine | None:
+    """The engine a block with no chosen engine runs on in this workflow, or None when routing decides it.
+
+    Mirrors the resolver's chosen-engine rule for the editor; the per-call exclusions do not apply to
+    a workflow someone opens there.
+    """
+    cutoff = settings.TASK_V3_CHOSEN_ENGINE_CUTOFF
+    if cutoff is None or isinstance(app.EXPERIMENTATION_PROVIDER, NoOpExperimentationProvider):
+        return None
+    if _born_at_or_after(await _workflow_birth(workflow_permanent_id, organization_id), cutoff):
+        return RunEngine.skyvern_v3
+    return None
+
+
+async def unset_engine_routes_as_v1(workflow_permanent_id: str, organization_id: str) -> bool:
+    """Whether an unset block engine and skyvern-1.0 route alike in this workflow.
+
+    False when the workflow's birth cannot be read, although routing then still treats them alike: this errs
+    toward a caller comparing definitions seeing a change, so a cached script is regenerated, not reused stale.
+    """
+    cutoff = settings.TASK_V3_CHOSEN_ENGINE_CUTOFF
+    if cutoff is None or isinstance(app.EXPERIMENTATION_PROVIDER, NoOpExperimentationProvider):
+        return True
+    born_at = await _workflow_birth(workflow_permanent_id, organization_id)
+    return born_at is not None and not _born_at_or_after(born_at, cutoff)
 
 
 def resolved_workflow_block_engine_arm_attribution(workflow_run_id: str | None) -> WorkflowBlockEngineArmAttribution:

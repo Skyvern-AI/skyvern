@@ -18,9 +18,27 @@ describe("composerPlaceholder", () => {
       composerPlaceholder({
         ...base,
         latestTurnIsAsk: true,
-        askPartHasChoices: true,
+        askPartChoices: "unpicked",
       }),
-    ).toBe("Add details (optional)…");
+    ).toBe("Or type your own…");
+    expect(
+      composerPlaceholder({
+        ...base,
+        latestTurnIsAsk: true,
+        askPartChoices: "picked",
+      }),
+    ).toBe("Add details…");
+  });
+
+  it("asks for the text a picked choice needs", () => {
+    expect(
+      composerPlaceholder({
+        ...base,
+        latestTurnIsAsk: true,
+        askPartChoices: "picked",
+        detailPrompt: "Which restaurant?",
+      }),
+    ).toBe("Which restaurant?");
   });
 
   it("returns to the standing invitation once the ask is answered", () => {

@@ -195,11 +195,20 @@ DESTINATION_ADAPTERS: dict[str, DestinationAdapter] = {
 }
 
 
+_CODE_BLOCK_NON_IDENTITY_KEYS = frozenset(
+    {"steps", "user_owned_goal", "goal_needs_regeneration", "code_edited_by_hand"}
+)
+
+
 def _without_code_steps(value: Any) -> Any:
-    """Drop code-derived `steps` at every nesting depth; they are a projection of `code`, not execution identity."""
+    """Drop code-derived `steps` and the Goal-ownership facts at every nesting depth; neither is execution identity."""
     if isinstance(value, dict):
         is_code = _block_type(value) == BlockType.CODE.value
-        return {key: _without_code_steps(item) for key, item in value.items() if not (is_code and key == "steps")}
+        return {
+            key: _without_code_steps(item)
+            for key, item in value.items()
+            if not (is_code and key in _CODE_BLOCK_NON_IDENTITY_KEYS)
+        }
     if isinstance(value, list):
         return [_without_code_steps(item) for item in value]
     return value

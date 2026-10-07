@@ -1,9 +1,10 @@
 import {
   ChevronDownIcon,
+  Cross2Icon,
   DotsHorizontalIcon,
   MagicWandIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { Badge, type BadgeProps } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -87,6 +88,10 @@ const END_TO_END_REAL_ACTIONS =
 
 const PENDING_CHANGE_LIMIT = 4;
 
+// Even with the compact tier, Reject beside the more menu needs ~215px; narrower rows move Reject
+// into that menu. Both dropdowns render in a portal, so this cannot be a container query.
+const FOLD_REJECT_BELOW_PX = 220;
+
 // Cause-coded per the 2026-07-13 ruling on terminal states: red only for a write that
 // failed, amber for one whose outcome we cannot read yet. Most Accept "failures" are a
 // second click on a first click that had already saved, so amber is the honest colour.
@@ -103,7 +108,7 @@ const GATE_STATUS: Record<
 > = {
   accepting: {
     label: "Accepting…",
-    variant: "secondary",
+    variant: "progress",
     line: "Saving your accepted changes.",
   },
   accept: {
@@ -140,6 +145,9 @@ interface ReviewGateCardProps {
   pending: boolean;
   verdict: ReviewGateVerdict;
   settled?: ReviewGateSettled;
+  // Whether the footer renders at all, and whether Accept, Reject and Test may act; Review only
+  // reads, so it stays live whenever the footer shows.
+  actionsShown?: boolean;
   actionsEnabled: boolean;
   // Every action in the row acts on a staged proposal, so with none the row is locked: the gates
   // that outlive their proposal render for their message, not their buttons.
@@ -477,6 +485,7 @@ export function ReviewGateCard({
   verdict,
   settled = null,
   actionsEnabled,
+  actionsShown = actionsEnabled,
   hasProposal,
   acceptsEnabled = true,
   onAccept,
@@ -498,6 +507,22 @@ export function ReviewGateCard({
   // The confirmation replaces the row that opened it, so focus is placed by hand both ways.
   const restoreFocusRef = useRef(false);
   const selectingTestRef = useRef(false);
+  const [actionsRow, setActionsRow] = useState<HTMLDivElement | null>(null);
+  const [actionsRowNarrow, setActionsRowNarrow] = useState(false);
+  // Measured once before paint so a card mounting in an already-narrow pane never shows Reject unfolded.
+  useLayoutEffect(() => {
+    if (!actionsRow || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const measure = (width: number) =>
+      setActionsRowNarrow(width > 0 && width < FOLD_REJECT_BELOW_PX);
+    measure(actionsRow.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => {
+      measure(entry?.contentRect.width ?? 0);
+    });
+    observer.observe(actionsRow);
+    return () => observer.disconnect();
+  }, [actionsRow]);
   useEffect(() => {
     if (confirmingTest) {
       runTestRef.current?.focus();
@@ -522,7 +547,9 @@ export function ReviewGateCard({
   const accepted = settled === "accepted";
   const title = turn
     ? getDiffCardTitle(turn, { pendingProposal: pending, rejected, accepted })
-    : "Proposed changes";
+    : accepted
+      ? "Applied changes"
+      : "Proposed changes";
 
   if (!pending) {
     return (
@@ -546,7 +573,7 @@ export function ReviewGateCard({
   const billingCreditRefusal =
     turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
   const testFailed = Boolean(turn && hasFailedTestBlock(turn));
-  const showActions = actionsEnabled && hasProposal;
+  const showActions = actionsShown && hasProposal;
   const connectFailure = isBuildTestConnectFailureState(
     turn?.turnFacts?.terminalCause,
   );
@@ -563,7 +590,10 @@ export function ReviewGateCard({
         turn !== undefined &&
         everyTestBlockExecuted(turn) &&
         !testFailed));
+  // The caller already withholds actionsEnabled in these states; this keeps the row locked if it
+  // ever does not.
   const actionsLocked =
+    !actionsEnabled ||
     accepting ||
     failure === "reload" ||
     failure === "recover" ||
@@ -585,7 +615,7 @@ export function ReviewGateCard({
         type="button"
         size="sm"
         onClick={onAccept}
-        className={`${ACCEPT_BUTTON_CLASS} rounded-r-none`}
+        className={`${ACCEPT_BUTTON_CLASS} rounded-r-none [@container_gate-actions_(max-width:249px)]:px-2`}
       >
         Accept
       </Button>
@@ -597,7 +627,7 @@ export function ReviewGateCard({
             type="button"
             size="sm"
             aria-label="More accept options"
-            className={`${ACCEPT_BUTTON_CLASS} w-8 rounded-l-none border-l border-black/15 px-0`}
+            className={`${ACCEPT_BUTTON_CLASS} w-8 rounded-l-none border-l border-black/15 px-0 [@container_gate-actions_(max-width:249px)]:w-6`}
           >
             <ChevronDownIcon className="h-4 w-4" />
           </Button>
@@ -617,46 +647,58 @@ export function ReviewGateCard({
     </div>
   ) : null;
 
-  const moreMenu =
-    canTest && !offerTestInBody ? (
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild disabled={actionsLocked}>
-          <Button
-            ref={moreTriggerRef}
-            type="button"
-            size="sm"
-            variant="outline"
-            aria-label="More actions"
-            className="w-8 px-0"
-          >
-            <DotsHorizontalIcon />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="end"
-          className="w-60"
-          onCloseAutoFocus={(event) => {
-            if (selectingTestRef.current) {
-              selectingTestRef.current = false;
-              event.preventDefault();
-            }
-          }}
+  const hasMoreMenu = canTest && !offerTestInBody;
+  const foldRejectIntoMenu = hasMoreMenu && actionsRowNarrow;
+  const moreMenu = hasMoreMenu ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild disabled={actionsLocked}>
+        <Button
+          ref={moreTriggerRef}
+          type="button"
+          size="sm"
+          variant="outline"
+          aria-label="More actions"
+          className="w-8 px-0 [@container_gate-actions_(max-width:249px)]:w-7"
         >
+          <DotsHorizontalIcon />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="w-60"
+        onCloseAutoFocus={(event) => {
+          if (selectingTestRef.current) {
+            selectingTestRef.current = false;
+            event.preventDefault();
+          }
+        }}
+      >
+        {/* The menu renders outside the disabled fieldset, and a lock can land while it is open. */}
+        <DropdownMenuItem
+          disabled={actionsLocked}
+          onSelect={() => {
+            selectingTestRef.current = true;
+            setConfirmingTest(true);
+          }}
+          className="flex-col items-start gap-0.5 text-xs"
+        >
+          {testLabel}
+          <span className="text-[11px] leading-snug text-muted-foreground">
+            Runs every block together on the real site.
+          </span>
+        </DropdownMenuItem>
+        {foldRejectIntoMenu ? (
           <DropdownMenuItem
-            onSelect={() => {
-              selectingTestRef.current = true;
-              setConfirmingTest(true);
-            }}
-            className="flex-col items-start gap-0.5 text-xs"
+            disabled={actionsLocked}
+            onSelect={onReject}
+            className="text-xs text-red-700 focus:text-red-700 dark:text-red-400 dark:focus:text-red-400"
           >
-            {testLabel}
-            <span className="text-[11px] leading-snug text-muted-foreground">
-              Runs every block together on the real site.
-            </span>
+            Reject
           </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    ) : null;
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null;
 
   return (
     <CopilotCard
@@ -708,7 +750,7 @@ export function ReviewGateCard({
           ) : null}
         </CardBody>
       ) : null}
-      {actionsEnabled ? (
+      {actionsShown ? (
         <CardFooter>
           {gateStatus ? (
             <div
@@ -743,12 +785,11 @@ export function ReviewGateCard({
             </div>
           ) : null}
           {/* A second Accept while one is in flight loses the race server-side, and a
-              proposal that could not be re-read may be stale, so the row stays locked. */}
+              proposal that could not be re-read may be stale, so the decisions stay locked.
+              Review only opens the comparison, which carries the same lock, so it sits
+              outside the disabled groups. */}
           {hasProposal ? (
-            <fieldset
-              disabled={actionsLocked}
-              className="min-w-0 disabled:opacity-60"
-            >
+            <div className="min-w-0">
               {billingCreditRefusal ? (
                 <p className="pb-2 text-[11px] leading-snug text-muted-foreground">
                   No browser or run started because credits are exhausted.{" "}
@@ -789,31 +830,56 @@ export function ReviewGateCard({
                   </div>
                 </>
               ) : (
-                <div className="flex flex-wrap items-center gap-2">
-                  {acceptSplit}
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={onReview}
-                  >
-                    Review
-                  </Button>
-                  <div className="ml-auto flex items-center gap-2">
+                // Reject collapses to an icon below 300px and the controls tighten below 250px, so the
+                // row fits on one line down to ~190px; with the more menu, Reject folds into it.
+                <div
+                  ref={setActionsRow}
+                  className="[container-name:gate-actions] [container-type:inline-size]"
+                >
+                  <div className="flex flex-wrap items-center gap-2 [@container_gate-actions_(max-width:249px)]:gap-1.5">
+                    {acceptSplit ? (
+                      <fieldset
+                        disabled={actionsLocked}
+                        className="min-w-0 disabled:opacity-60"
+                      >
+                        {acceptSplit}
+                      </fieldset>
+                    ) : null}
                     <Button
                       type="button"
                       size="sm"
                       variant="outline"
-                      onClick={onReject}
-                      className={REJECT_BUTTON_CLASS}
+                      onClick={onReview}
+                      className="[@container_gate-actions_(max-width:249px)]:px-2"
                     >
-                      Reject
+                      Review
                     </Button>
-                    {moreMenu}
+                    <fieldset
+                      disabled={actionsLocked}
+                      className="ml-auto flex min-w-0 items-center gap-2 disabled:opacity-60 [@container_gate-actions_(max-width:249px)]:gap-1.5"
+                    >
+                      {foldRejectIntoMenu ? null : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={onReject}
+                          aria-label="Reject"
+                          title="Reject"
+                          className={`${REJECT_BUTTON_CLASS} w-8 px-0 [@container_gate-actions_(max-width:249px)]:w-7 [@container_gate-actions_(min-width:300px)]:w-auto [@container_gate-actions_(min-width:300px)]:px-3`}
+                        >
+                          <Cross2Icon className="[@container_gate-actions_(min-width:300px)]:hidden" />
+                          <span className="hidden [@container_gate-actions_(min-width:300px)]:inline">
+                            Reject
+                          </span>
+                        </Button>
+                      )}
+                      {moreMenu}
+                    </fieldset>
                   </div>
                 </div>
               )}
-            </fieldset>
+            </div>
           ) : null}
         </CardFooter>
       ) : null}

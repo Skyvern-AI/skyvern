@@ -8,12 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
+from skyvern.forge.sdk.workflow import web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
-from skyvern.forge.sdk.workflow.models import web_search_block as search_module
 from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock, WebSearchError
+from skyvern.forge.sdk.workflow.web_search_client import SearchResponse
 from skyvern.schemas.workflows import BlockStatus, WebSearchBlockYAML
 
 SCHEMA_ECHO = {
@@ -93,8 +94,8 @@ def search_setup(monkeypatch: pytest.MonkeyPatch) -> tuple[WebSearchBlock, Workf
     )
     handler = AsyncMock()
     monkeypatch.setattr(WebSearchBlock, "get_workflow_run_context", staticmethod(lambda _: context))
-    monkeypatch.setattr(WebSearchBlock, "_request", AsyncMock(return_value=PROVIDER_PAGE))
-    monkeypatch.setattr(search_module.settings, "EXA_API_KEY", "test-provider-key")
+    monkeypatch.setattr(web_search_client, "request", AsyncMock(return_value=PROVIDER_PAGE))
+    monkeypatch.setattr(web_search_client.settings, "EXA_API_KEY", "test-provider-key")
     monkeypatch.setattr(TextPromptBlock, "_resolve_default_llm_handler", AsyncMock(return_value=handler))
     monkeypatch.setattr(
         block_module.LLMAPIHandlerFactory, "get_override_llm_api_handler", lambda llm_key, *, default: default
@@ -116,7 +117,7 @@ async def test_exa_search_keeps_pages_without_cached_content(
     payloads: dict[str, dict[str, Any]] = {}
 
     async def request(
-        self: WebSearchBlock, provider: str, url: str, payload: dict[str, Any] | None = None
+        _response: SearchResponse, provider: str, url: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         assert payload is not None
         payloads[url] = payload
@@ -132,7 +133,7 @@ async def test_exa_search_keeps_pages_without_cached_content(
             ]
         }
 
-    monkeypatch.setattr(WebSearchBlock, "_request", request)
+    monkeypatch.setattr(web_search_client, "request", request)
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
 
     assert "contents" not in payloads["https://api.exa.ai/search"]
@@ -280,8 +281,8 @@ async def test_search_completes_with_validated_partial_results(
         ],
         "serpapi_pagination": {"next": "https://serpapi.com/search.json?start=10"},
     }
-    monkeypatch.setattr(search_module.settings, "SERPAPI_API_KEY", "test-google-key")
-    monkeypatch.setattr(WebSearchBlock, "_request", AsyncMock(side_effect=[page, second_page]))
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", "test-google-key")
+    monkeypatch.setattr(web_search_client, "request", AsyncMock(side_effect=[page, second_page]))
     handler.return_value = {"llm_response": "Partial results processed."}
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
@@ -312,8 +313,8 @@ async def test_google_site_filter_refetches_off_site_page_at_most_twice(
         "serpapi_pagination": {"next": "https://serpapi.com/search.json?start=10"},
     }
     request = AsyncMock(side_effect=[off_site_page] * 3)
-    monkeypatch.setattr(search_module.settings, "SERPAPI_API_KEY", "test-google-key")
-    monkeypatch.setattr(WebSearchBlock, "_request", request)
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", "test-google-key")
+    monkeypatch.setattr(web_search_client, "request", request)
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
 
@@ -322,8 +323,8 @@ async def test_google_site_filter_refetches_off_site_page_at_most_twice(
     output = result.output_parameter_value
     assert output["results"] == []
     assert request.await_count == 3
-    assert all(call.args[0] == "google" for call in request.await_args_list)
-    parameters = [parse_qs(urlsplit(call.args[1]).query) for call in request.await_args_list]
+    assert all(call.args[1] == "google" for call in request.await_args_list)
+    parameters = [parse_qs(urlsplit(call.args[2]).query) for call in request.await_args_list]
     assert "no_cache" not in parameters[0]
     assert parameters[1] == parameters[2] == {**parameters[0], "no_cache": ["true"]}
     assert all(params["start"] == ["0"] for params in parameters)
@@ -341,8 +342,8 @@ async def test_search_first_page_timeout_preserves_fallback(
     request = AsyncMock(
         side_effect=[TimeoutError("Google search timed out after 30 seconds."), PROVIDER_PAGE, PROVIDER_PAGE]
     )
-    monkeypatch.setattr(search_module.settings, "SERPAPI_API_KEY", "test-google-key")
-    monkeypatch.setattr(WebSearchBlock, "_request", request)
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", "test-google-key")
+    monkeypatch.setattr(web_search_client, "request", request)
     handler.return_value = {"llm_response": "Results processed."}
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
@@ -353,7 +354,40 @@ async def test_search_first_page_timeout_preserves_fallback(
     else:
         assert result.status == BlockStatus.completed
         assert result.output_parameter_value["provider"] == "exa"
-        assert request.await_args_list[1].args[0] == "exa"
+        assert request.await_args_list[1].args[1] == "exa"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exa_key", "failure_reason"),
+    [
+        ("test-provider-key", "Exa search failed (HTTP 500). Exa ran because Google search failed (HTTP 500)."),
+        (None, "Google search failed (HTTP 500)."),
+    ],
+    ids=["exa-fallback-fails", "no-exa-key"],
+)
+async def test_a_google_failure_under_auto_falls_back_only_to_a_configured_exa(
+    search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    exa_key: str | None,
+    failure_reason: str,
+) -> None:
+    original, _, _ = search_setup
+    block = original.model_copy(update={"provider": "auto"})
+    request = AsyncMock(
+        side_effect=[
+            WebSearchError("Google search failed (HTTP 500)."),
+            WebSearchError("Exa search failed (HTTP 500)."),
+        ]
+    )
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", "test-google-key")
+    monkeypatch.setattr(web_search_client.settings, "EXA_API_KEY", exa_key)
+    monkeypatch.setattr(web_search_client, "request", request)
+
+    result = await block.execute("workflow-run-test", "block-run-test", "org-test")
+
+    assert result.status == BlockStatus.failed
+    assert result.failure_reason == failure_reason
 
 
 @pytest.mark.asyncio
@@ -371,7 +405,7 @@ async def test_search_no_results_detects_legacy_code_after_prompt(
             "errors": [{"error_code": "NO_SEARCH_RESULTS", "reasoning": "No results.", "confidence_float": 0.9}],
         },
     ]
-    monkeypatch.setattr(WebSearchBlock, "_request", AsyncMock(return_value={"results": []}))
+    monkeypatch.setattr(web_search_client, "request", AsyncMock(return_value={"results": []}))
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
 
@@ -413,7 +447,7 @@ async def test_search_prompt_match_outcome(
     block, context, handler = search_setup
     block.no_match_error_code = "NO_MATCHING_RESULT"
     block.json_schema = {"type": "array", "items": {"type": "string"}}
-    monkeypatch.setattr(WebSearchBlock, "_request", AsyncMock(return_value=page))
+    monkeypatch.setattr(web_search_client, "request", AsyncMock(return_value=page))
     handler.side_effect = [answer[0], {"reasoning": "Checked results.", "errors": answer[1]}]
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")

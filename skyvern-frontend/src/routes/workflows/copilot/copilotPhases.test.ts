@@ -68,6 +68,12 @@ describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
     );
   });
 
+  it("labels the credential-deletion card as a review with the user", () => {
+    expect(toolActivityDisplayLabel("delete_saved_credentials")).toBe(
+      "Reviewing a credential deletion with you",
+    );
+  });
+
   it("still falls back to Working for unmapped tools", () => {
     expect(toolActivityDisplayLabel("some_unmapped_tool")).toBe("Working");
   });

@@ -149,6 +149,7 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
                 [
                     "ANTHROPIC_CLAUDE5_OPUS",
                     "ANTHROPIC_CLAUDE5.5_OPUS",
+                    "ANTHROPIC_CLAUDE5.5_SONNET",
                     "ANTHROPIC_CLAUDE5.1_FABLE",
                     "ANTHROPIC_CLAUDE5_FABLE",
                     "ANTHROPIC_CLAUDE4.7_OPUS",

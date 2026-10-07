@@ -162,7 +162,6 @@ vi.mock("./WorkflowCopilotHistory", () => ({
   ),
 }));
 
-import { COPILOT_ACK_LINES } from "./NarrativeView";
 const BOOLEAN_FLAGS: Record<string, boolean> = {
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
@@ -188,18 +187,14 @@ async function submit(value: string) {
   await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 }
 
+const ACK = "Copilot is working on your request…";
+
 function expectNoAckLines() {
-  for (const line of COPILOT_ACK_LINES) {
-    expect(screen.queryByText(line)).toBeNull();
-  }
+  expect(screen.queryByText(ACK)).toBeNull();
 }
 
-// The placeholder opens on a random line, so assert *some* ack line shows.
 function expectSomeAckLine() {
-  const present = COPILOT_ACK_LINES.some(
-    (line) => screen.queryByText(line) !== null,
-  );
-  expect(present).toBe(true);
+  expect(screen.getByText(ACK)).toBeTruthy();
 }
 
 async function completeStream(index: number, message: string) {

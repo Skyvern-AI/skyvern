@@ -342,6 +342,7 @@ class CodeBlockActionRecording:
 
     async def finalize(self, success: bool) -> None:
         # Finalize both task and step on every exit path (incl. CancelledError via a finally); idempotent.
+        self.recording_page._detach_document_observers()
         if self._task is None or self._finalized:
             return
         self._finalized = True

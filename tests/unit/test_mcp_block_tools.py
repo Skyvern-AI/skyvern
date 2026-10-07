@@ -149,6 +149,17 @@ async def test_block_schema_google_sheets_write_carries_its_knowledge_section() 
 
 
 @pytest.mark.asyncio
+async def test_block_schema_terminate_lists_the_optional_error_code_and_its_example_validates() -> None:
+    result = await skyvern_block_schema(block_type="terminate")
+
+    assert result["ok"] is True
+    assert "error_code" in result["data"]["schema"]["properties"]
+    assert "error_code" in result["data"]["example"]
+    validated = await skyvern_block_validate(block_json=json.dumps(result["data"]["example"]))
+    assert validated["ok"] is True, validated
+
+
+@pytest.mark.asyncio
 async def test_block_schema_unknown_type_returns_error() -> None:
     """Requesting schema for a nonexistent type should return an error with available types."""
     result = await skyvern_block_schema(block_type="invalid_xyz")
