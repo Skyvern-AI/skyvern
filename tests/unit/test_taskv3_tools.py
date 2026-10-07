@@ -8834,8 +8834,13 @@ class _ClickFakePage:
         click_raises: Exception | None = None,
         match_counts: list[int] | None = None,
         doc_same: bool | None = True,
+        click_seen: bool | None = False,
+        plant_raises: bool = False,
     ) -> None:
         self.url = "https://example.test/results"
+        # whether the document received the press; None => the page cannot be asked
+        self._click_seen = click_seen
+        self._plant_raises = plant_raises
         # the post-click "is this still the same document" answer; None => the page cannot be asked
         self._doc_same = doc_same
         self.calls: list[tuple[str, Any]] = []
@@ -8868,6 +8873,12 @@ class _ClickFakePage:
             return self._doc_same
         if "__tv3_click_doc = 1" in js:
             return None
+        if "__tv3_click_hook" in js and self._plant_raises:
+            raise RuntimeError("plant refused")
+        if "__tv3_click_seen === 1" in js:
+            if self._click_seen is None:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return self._click_seen
         if self._probe_raises:
             raise RuntimeError("probe boom")
         if "menuOpen" in js:
@@ -9011,6 +9022,8 @@ async def test_click_option_no_commit_errors_loud(monkeypatch: pytest.MonkeyPatc
     assert "did not commit" in r.content
     assert "Most popular" in r.content
     assert "Do not repeat" in r.content
+    # The click fired before the verification failed: an action block must not be granted a second one.
+    assert (r.data or {}).get(taskv3_loop.CLICK_DISPATCHED_DATA_KEY) is True
 
 
 @pytest.mark.asyncio
@@ -11230,6 +11243,42 @@ async def test_click_timeout_on_live_element_reraises_original() -> None:
     tools = build_browser_tools(_fixed_page_provider(page))
     with pytest.raises(_Boom):
         await _tool(tools, "click").handler({"selector": "#covered"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seen", "plant_raises", "dispatched"),
+    [(True, False, True), (False, False, False), (None, False, True), (False, True, True)],
+    ids=["received", "never", "unreadable", "marker_never_armed"],
+)
+@pytest.mark.parametrize("covered", [False, True], ids=["reraised", "covered_after_raise"])
+async def test_a_raised_click_reports_whether_the_page_received_it(
+    seen: bool | None, plant_raises: bool, dispatched: bool, covered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A slow submit raises after the page took the press; the loop must not grant a single-action block a second
+    # click then. An overlay the submit raised is the covered branch, which returns instead of re-raising.
+    if covered:
+        monkeypatch.setattr(
+            taskv3_tools,
+            "_probe_evaluate",
+            AsyncMock(return_value={"exists": True, "occluded": True, "occluder": {"tag": "div"}}),
+        )
+    page = _ClickFakePage(
+        exists=True,
+        click_raises=TimeoutError("Page.click: Timeout 15000ms exceeded"),
+        click_seen=seen,
+        plant_raises=plant_raises,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    token = taskv3_loop._CLICK_DISPATCHED.set(False)
+    try:
+        try:
+            await _tool(tools, "click").handler({"selector": "#submit"})
+        except TimeoutError:
+            assert not covered
+        assert taskv3_loop._CLICK_DISPATCHED.get() is dispatched
+    finally:
+        taskv3_loop._CLICK_DISPATCHED.reset(token)
 
 
 # --- DOM-level tests: the REAL precheck/finder/after JS against live Chromium, on a faithful mimic
