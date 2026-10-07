@@ -15,6 +15,8 @@ export type NodeBaseData = {
   nextLoopOnFailure?: boolean;
   editable: boolean;
   model: WorkflowModel | null;
+  // A person picked the block's engine; only task-like blocks read it.
+  enginePinned?: boolean;
   showCode?: boolean;
   review?: BlockReviewAnnotation | FoldReviewAnnotation;
   ignoreWorkflowSystemPrompt?: boolean;

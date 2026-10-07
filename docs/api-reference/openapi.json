@@ -193,6 +193,17 @@
           "400": {
             "description": "Invalid agent run request"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -3123,14 +3134,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search (min 3 chars for trigram index).",
+              "description": "Case-insensitive substring search (min 3 chars for trigram index) across the run's title, URL, run ID, agent (workflow) ID and inputs, plus a workflow run's webhook callback URL. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. Browser profile and credential IDs apply to workflow runs; a browser session ID also matches a standalone task that used it.",
               "examples": [
                 "login_url",
-                "wr_abc123"
+                "wr_abc123",
+                "bp_123456789",
+                "cred_123456789"
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search (min 3 chars for trigram index)."
+            "description": "Case-insensitive substring search (min 3 chars for trigram index) across the run's title, URL, run ID, agent (workflow) ID and inputs, plus a workflow run's webhook callback URL. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. Browser profile and credential IDs apply to workflow runs; a browser session ID also matches a standalone task that used it."
           },
           {
             "name": "run_type",
@@ -6626,6 +6639,17 @@
           "404": {
             "description": "Workflow run not found"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -6646,7 +6670,7 @@
           "Runs"
         ],
         "summary": "Get all runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n\nA complete browser profile or browser session id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
         "operationId": "get_workflow_runs_v1_workflows_runs_get",
         "parameters": [
           {
@@ -6710,15 +6734,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
               "examples": [
                 "login_url",
-                "credential_value",
-                "wr_abc123"
+                "wr_abc123",
+                "bp_123456789",
+                "cred_123456789"
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
           },
           {
             "name": "error_code",
@@ -6798,7 +6823,7 @@
           "Runs"
         ],
         "summary": "Get all runs by agent",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
         "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -6871,15 +6896,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
               "examples": [
                 "login_url",
-                "credential_value",
-                "wr_abc123"
+                "wr_abc123",
+                "bp_123456789",
+                "cred_123456789"
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
           },
           {
             "name": "error_code",
@@ -8220,6 +8246,149 @@
         },
         "x-fern-sdk-method-name": "list_job_recipe_runs"
       }
+    },
+    "/v1/audit-events/export": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Export organization audit events",
+        "description": "Export audit events for the authenticated organization as JSON or CSV. Only organization admins and full API keys may export. The default window is the last 90 days, with timezone-aware since/until bounds, newest-first keyset pagination, and a maximum page size of 500. CSV output uses fixed columns and is protected from spreadsheet formula execution.",
+        "operationId": "export_audit_events_v1_audit_events_export_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of audit events as JSON, or a CSV download when format=csv.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditEventExportResponse"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller must be an organization admin or use a full API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDenialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "export_audit_events"
+      }
     }
   },
   "components": {
@@ -8951,6 +9120,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -9271,6 +9445,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -9674,6 +9854,192 @@
           "unknown"
         ],
         "title": "ArtifactType"
+      },
+      "AuditEventExportResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventExportRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "next": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "next"
+        ],
+        "title": "AuditEventExportResponse"
+      },
+      "AuditEventExportRow": {
+        "properties": {
+          "audit_event_id": {
+            "type": "string",
+            "title": "Audit Event Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "actor_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor User Id"
+          },
+          "auth_kind": {
+            "type": "string",
+            "title": "Auth Kind"
+          },
+          "org_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Org Role"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action"
+          },
+          "resource_type": {
+            "type": "string",
+            "title": "Resource Type"
+          },
+          "resource_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource Id"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Details"
+          }
+        },
+        "type": "object",
+        "required": [
+          "audit_event_id",
+          "created_at",
+          "organization_id",
+          "actor_user_id",
+          "auth_kind",
+          "org_role",
+          "action",
+          "resource_type",
+          "resource_id",
+          "request_id",
+          "details"
+        ],
+        "title": "AuditEventExportRow"
+      },
+      "AuditExportDenialDetail": {
+        "properties": {
+          "error_code": {
+            "type": "string",
+            "const": "organization_admin_required",
+            "title": "Error Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "reason_kind": {
+            "type": "string",
+            "const": "role",
+            "title": "Reason Kind"
+          },
+          "required": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Required"
+          },
+          "caller_has": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Caller Has"
+          },
+          "next_action": {
+            "type": "string",
+            "title": "Next Action"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error_code",
+          "message",
+          "reason_kind",
+          "required",
+          "caller_has",
+          "next_action"
+        ],
+        "title": "AuditExportDenialDetail"
+      },
+      "AuditExportDenialResponse": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/AuditExportDenialDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "AuditExportDenialResponse"
       },
       "AzureSecretParameter": {
         "properties": {
@@ -10996,6 +11362,28 @@
             "description": "Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
             "default": false
           },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Browser settings requested when the session was created."
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the browser reported after launch for the requested settings. Null until it is measured, and always null when no settings were requested."
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -11145,6 +11533,93 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "BrowserSettings": {
+        "properties": {
+          "timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone Id",
+            "description": "IANA timezone the browser reports to pages, for example `America/New_York`. Applied when a browser is created and takes precedence over any timezone implied by the proxy location. Offsets such as `+03:00` are rejected. Omit or set to null to keep the default behavior.",
+            "examples": [
+              "America/New_York"
+            ]
+          }
+        },
+        "type": "object",
+        "title": "BrowserSettings"
+      },
+      "BrowserSettingsReceipt": {
+        "properties": {
+          "requested_timezone_id": {
+            "type": "string",
+            "title": "Requested Timezone Id",
+            "description": "The timezone that was requested."
+          },
+          "actual_timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Timezone Id",
+            "description": "The timezone the browser reported when measured, or null when it could not be measured."
+          },
+          "source": {
+            "$ref": "#/components/schemas/BrowserSettingsSource",
+            "description": "Where the requested setting came from."
+          },
+          "status": {
+            "$ref": "#/components/schemas/BrowserSettingsStatus",
+            "description": "`verified` when the browser reported the requested timezone or an IANA alias of it (Chromium reports `Asia/Calcutta` for `Asia/Kolkata`), `mismatch` when it reported another zone, `unapplied` when the browser already existed and was left unchanged, `unknown` when it could not be measured."
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          }
+        },
+        "type": "object",
+        "required": [
+          "requested_timezone_id",
+          "source",
+          "status"
+        ],
+        "title": "BrowserSettingsReceipt"
+      },
+      "BrowserSettingsSource": {
+        "type": "string",
+        "enum": [
+          "workflow_version",
+          "session_request",
+          "existing_session"
+        ],
+        "title": "BrowserSettingsSource"
+      },
+      "BrowserSettingsStatus": {
+        "type": "string",
+        "enum": [
+          "verified",
+          "mismatch",
+          "unapplied",
+          "unknown"
+        ],
+        "title": "BrowserSettingsStatus"
       },
       "BrowserTypeOption": {
         "properties": {
@@ -11517,6 +11992,17 @@
               }
             ],
             "title": "Goal Needs Regeneration"
+          },
+          "code_edited_by_hand": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Edited By Hand"
           }
         },
         "type": "object",
@@ -11768,6 +12254,18 @@
             ],
             "title": "Goal Needs Regeneration",
             "description": "True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one"
+          },
+          "code_edited_by_hand": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Edited By Hand",
+            "description": "True when a person edited this block's code in the editor's code field since the Goal was last confirmed, so the Goal may no longer describe the code. Set by the editor; a value the copilot submits is ignored in favour of the stored one"
           }
         },
         "type": "object",
@@ -12238,6 +12736,17 @@
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
             "default": false
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied when the session's browser is created. A timezone_id here takes precedence over the timezone implied by proxy_location."
           },
           "needs_live_view": {
             "type": "boolean",
@@ -14476,6 +14985,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -14818,6 +15332,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "data_schema": {
             "anyOf": [
@@ -15237,6 +15757,11 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -15780,6 +16305,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "error_code_mapping": {
             "anyOf": [
@@ -18676,6 +19207,11 @@
             ],
             "default": "skyvern-1.0"
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -19274,6 +19810,22 @@
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
       },
+      "JobRecipeOutcome": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "canceled",
+          "job_unavailable",
+          "login_required",
+          "application_refused",
+          "blocked_by_site",
+          "invalid_input",
+          "insufficient_credits",
+          "incomplete",
+          "failed"
+        ],
+        "title": "JobRecipeOutcome"
+      },
       "JobRecipeRunListResponse": {
         "properties": {
           "runs": {
@@ -19370,6 +19922,29 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobRecipeOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Typed result of a finished run; null while it is still running. Apply failures name their cause (job_unavailable, login_required, application_refused, blocked_by_site, invalid_input, insufficient_credits, incomplete); a cause Skyvern cannot classify is failed, and so is every Extract failure except one Skyvern itself reports, such as running out of credits."
+          },
+          "next_step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Step",
+            "description": "What to do about an unsuccessful outcome; null for completed, canceled, and running runs."
           }
         },
         "additionalProperties": false,
@@ -19381,7 +19956,9 @@
           "status",
           "created_at",
           "job_url",
-          "failure_reason"
+          "failure_reason",
+          "outcome",
+          "next_step"
         ],
         "title": "JobRecipeRunSummary"
       },
@@ -19494,6 +20071,11 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -19805,6 +20387,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -20321,6 +20909,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -20624,6 +21217,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "error_code_mapping": {
             "anyOf": [
@@ -24518,6 +25117,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -24823,6 +25427,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -27508,6 +28118,11 @@
             ],
             "default": "skyvern-1.0"
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -27957,6 +28572,11 @@
               }
             ]
           },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -28251,6 +28871,12 @@
                 "type": "null"
               }
             ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -30344,6 +30970,17 @@
             ],
             "title": "Completion Contract",
             "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied to every browser this workflow version creates."
           }
         },
         "type": "object",
@@ -30623,6 +31260,17 @@
             ],
             "title": "Completion Contract",
             "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied to every browser this workflow version creates. Omit to keep the previous version's settings; set to null to clear them."
           }
         },
         "type": "object",
@@ -31257,6 +31905,27 @@
               }
             ],
             "title": "Browser Type"
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Browser settings copied from the workflow version when the run was created"
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "script_run": {
             "anyOf": [
@@ -33027,6 +33696,17 @@
               "own_memory",
               "fresh"
             ]
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The timezone the run's browser reported against the one its workflow version requested. Null when the version requests no browser settings or the browser has not been measured yet."
           },
           "run_request": {
             "anyOf": [

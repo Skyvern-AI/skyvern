@@ -39,7 +39,6 @@ import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { compactLocalDateTime } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 
 import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
@@ -117,19 +116,6 @@ export function BrowserPaneViewPills() {
   // alone stays true after the browser is up.
   const debugStream = useStudioBrowserStore((s) => s.debugStream);
   const runStream = useStudioBrowserStore((s) => s.runStream);
-  const runCreatedAt = visuals.workflowRun
-    ? compactLocalDateTime(visuals.workflowRun.created_at)
-    : "";
-  const runLabel = runCreatedAt ? (
-    // Grows from zero into leftover space, truncating before the title or
-    // buttons shrink; under 700px its frame alone would squeeze them.
-    <span
-      data-testid="browser-pane-run-label"
-      className="hidden min-w-0 max-w-fit grow-[999] basis-0 truncate rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground [@container_pane-header_(min-width:700px)]:block"
-    >
-      Run · {runCreatedAt}
-    </span>
-  ) : null;
 
   // Recording and Screenshots only ever replay a workflow run; with none open
   // they would point at an old run or at nothing, and Live alone is no switch.
@@ -152,7 +138,12 @@ export function BrowserPaneViewPills() {
           );
       return (
         <>
-          {runLabel}
+          <span
+            data-testid="browser-pane-run-cue"
+            className="min-w-0 truncate px-1.5 text-xs font-medium text-muted-foreground"
+          >
+            Run browser
+          </span>
           <BrowserLiveStatus
             state={runState}
             stoppedHint="The run's browser stream ended"
@@ -185,7 +176,18 @@ export function BrowserPaneViewPills() {
 
   return (
     <>
-      {runLabel}
+      {runId ? (
+        // Constant across views, so picking a pill never re-lays out the row
+        // it sits in. Grows from zero into leftover space only, so it truncates
+        // before the pane title or the pills give up any width.
+        <span
+          data-testid="browser-pane-run-cue"
+          title={`Run ${runId}`}
+          className="min-w-0 max-w-fit grow-[999] basis-0 truncate text-xs font-medium text-muted-foreground"
+        >
+          Run {runId}
+        </span>
+      ) : null}
       <div
         role="group"
         aria-label="Browser view"

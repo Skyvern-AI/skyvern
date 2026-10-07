@@ -9,6 +9,7 @@ import {
 } from "@/routes/streaming/useRecordingMessageChannel";
 import { toast } from "@/components/ui/use-toast";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import { useManualSignInControl } from "@/store/useManualSignInStore";
 import {
   toastClipboardReadFailed,
   toastNothingToPaste,
@@ -301,6 +302,10 @@ function BrowserSessionStream({
     // Recording keeps copy local so the keystroke never lands in the capture.
     forwardCopyShortcut: !exfiltrate,
   });
+  useManualSignInControl(
+    controllable ? browserSessionId : undefined,
+    setUserIsControlling,
+  );
   const keepMessageChannelAlive = !!exfiltrate || userIsControlling;
   keepMessageChannelAliveRef.current = keepMessageChannelAlive;
 

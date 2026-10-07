@@ -2,7 +2,6 @@ import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { RunEngine } from "@/api/types";
 import { RunEngineSelector } from "@/components/EngineSelector";
-import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
@@ -72,7 +71,6 @@ function NavigationEditorBody({
 }) {
   const { editable } = data;
   const update = useUpdate<NavigationNodeData>({ id: blockId, editable });
-  const effectiveDefaultEngine = useEffectiveDefaultEngine();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
@@ -170,7 +168,6 @@ function NavigationEditorBody({
             <HelpTooltip content={helpTooltips["navigation"]["engine"]} />
           </div>
           <RunEngineSelector
-            effectiveDefaultEngine={effectiveDefaultEngine}
             value={data.engine}
             onChange={handleEngineChange}
             className="nopan w-72 text-xs"
@@ -346,7 +343,6 @@ function NavigationEditorBody({
             <HelpTooltip content={helpTooltips["navigation"]["engine"]} />
           </div>
           <RunEngineSelector
-            effectiveDefaultEngine={effectiveDefaultEngine}
             value={data.engine}
             onChange={handleEngineChange}
             className="nopan w-72 text-xs"

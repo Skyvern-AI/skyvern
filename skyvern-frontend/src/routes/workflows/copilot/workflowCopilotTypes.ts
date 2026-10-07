@@ -40,6 +40,8 @@ export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 export interface QuestionChoice {
   choice_id: string;
   text: string;
+  recommended?: boolean;
+  detail_prompt?: string | null;
 }
 
 export interface QuestionPart {
@@ -54,10 +56,75 @@ export interface QuestionAnswer {
   text?: string | null;
 }
 
+export type AccountGroupOutcome =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "unknown"
+  | "canceled";
+
+export interface AccountGroupRow {
+  credential_id: string;
+  label: string;
+  prior_outcome: AccountGroupOutcome | null;
+  preselected: boolean;
+}
+
+export interface AccountGroupReview {
+  workflow_permanent_id: string;
+  workflow_id: string;
+  version: number;
+  workflow_title: string;
+  credential_parameter_key: string;
+  action_summary: string;
+  common_inputs: Record<string, unknown>;
+  clean_group_run_id?: string | null;
+  credential_parameter_used_by?: string[];
+  rows: AccountGroupRow[];
+  workflow_run_group_id: string | null;
+  decision?: AccountGroupDecision | null;
+}
+
+export interface AccountGroupRunRow {
+  credential_id: string;
+  label: string;
+  workflow_run_id: string;
+  outcome: AccountGroupOutcome;
+}
+
+export interface AccountGroupCancelReview {
+  workflow_run_group_id: string;
+  unfinished_rows: AccountGroupRunRow[];
+  decision?: AccountGroupDecision | null;
+}
+
+export interface AccountGroupDecision {
+  approved: boolean;
+  credential_ids: string[];
+}
+
+export type CredentialDeleteOutcomeKind = "deleted" | "not_found" | "failed";
+
+export interface CredentialDeleteRow {
+  credential_id: string;
+  name: string;
+  credential_type: "password" | "credit_card" | "secret";
+}
+
+export interface CredentialDeleteReview {
+  rows: CredentialDeleteRow[];
+  total_credential_count: number;
+  claimed_at?: string | null;
+  approved_credential_ids?: string[] | null;
+  outcomes?: { credential_id: string; outcome: CredentialDeleteOutcomeKind }[];
+}
+
 export interface QuestionResponse {
   answers?: QuestionAnswer[];
   text?: string | null;
   skipped?: boolean;
+  account_group_decision?: AccountGroupDecision;
 }
 
 export interface QuestionInteraction {
@@ -69,6 +136,9 @@ export interface QuestionInteraction {
   response: QuestionResponse | null;
   created_at: string;
   resolved_at: string | null;
+  account_group_review?: AccountGroupReview;
+  account_group_cancel?: AccountGroupCancelReview;
+  credential_delete_review?: CredentialDeleteReview;
 }
 
 export interface WorkflowCopilotQuestionRequired {
@@ -168,9 +238,12 @@ export interface WorkflowCopilotChatRequest {
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
+  supports_credential_generation?: boolean;
   credential_recovery_token?: string;
   supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
+  supports_account_group_card?: boolean;
+  supports_credential_delete_card?: boolean;
 }
 
 export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";
@@ -178,6 +251,35 @@ export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";
 export interface WorkflowCopilotCancelRequest {
   cancel_token: string;
   source: WorkflowCopilotCancelSource;
+}
+
+export interface WorkflowCopilotSteerRequest {
+  workflow_copilot_chat_id: string;
+  cancel_token: string;
+  steer_id: string;
+  message: string;
+}
+
+// A message sent into a running turn, as the server screened and stored it.
+export interface CopilotSteerMessage {
+  steer_id: string;
+  text: string;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+export interface WorkflowCopilotSteerDeliveredUpdate {
+  type: "steer_delivered";
+  turn_id: string;
+  steer_messages: CopilotSteerMessage[];
+}
+
+// A browser frame captured for the agent, stored as a chat-owned artifact.
+export interface WorkflowCopilotScreenshotUpdate {
+  type: "screenshot";
+  artifact_id: string;
+  captured_at: string;
+  tool_call_id?: string | null;
 }
 
 export type WorkflowCopilotMessageFeedbackRating = "up" | "down";
@@ -223,6 +325,9 @@ export interface WorkflowCopilotChatHistoryMessage {
         // turn_start frame carries, so a client can correlate a row to its own send.
         copilot_turn_id?: string | null;
         terminal_reason?: string | null;
+        // Set on every interrupted row the server serves, since no late reply replaces
+        // a stored row. Absent only from a backend that still replaced rows.
+        interrupted_row_final?: boolean;
       })
     | null;
   narrative_payload?: Record<string, unknown> | null;
@@ -314,7 +419,9 @@ export type WorkflowCopilotStreamMessageType =
   | "codegen_progress"
   | "title_update"
   | "credential_required"
-  | "question_required";
+  | "question_required"
+  | "steer_delivered"
+  | "screenshot";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -361,6 +468,7 @@ export interface WorkflowCopilotTurnStartUpdate {
   // edit-vs-build chip; the snap-back source is captured client-side at
   // submit time so unsaved local canvas edits survive.
   prior_block_count?: number | null;
+  workflow_copilot_chat_id?: string | null;
 }
 
 export interface WorkflowCopilotDesignStartUpdate {
@@ -399,6 +507,9 @@ export interface WorkflowCopilotCodegenProgressUpdate {
   blocks_drafted: string[];
   chars_streamed: number;
   iteration: number;
+  // New for every model response; the authoring calls within one response
+  // share it. Absent from servers that predate it.
+  generation_id?: string | null;
   timestamp: string;
 }
 
@@ -429,7 +540,33 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The tool call whose activity row was newest when the pause was raised, so
   // the card renders there. Absent against a backend that predates it.
   anchor_tool_call_id?: string | null;
+  // The live browser the user may sign in to themselves; absent when the card does not offer it.
+  sign_in_browser_session_id?: string | null;
+  signing_in?: boolean;
+  // Present on a card that offers Generate and save; never carries a password.
+  registration?: {
+    username: string;
+    credential_name: string;
+    attempted?: boolean;
+    outcome?: "rejected" | "unknown" | "created_not_connected" | null;
+  } | null;
   timestamp: string;
+}
+
+export interface WorkflowCopilotCredentialResponseResult {
+  result: "accepted" | "signed_in" | "no_sign_in_found" | "save_failed";
+  expires_at?: string | null;
+  host?: string | null;
+  browser_profile_id?: string | null;
+}
+
+export interface WorkflowCopilotCredentialGenerateResult {
+  result: "connected" | "rejected" | "unknown" | "created_not_connected";
+  credential_id?: string | null;
+  name?: string | null;
+  username?: string | null;
+  // The reopened card's new deadline after "rejected" or "unknown".
+  expires_at?: string | null;
 }
 
 export interface WorkflowCopilotCredentialPauseResolvedUpdate {
@@ -437,13 +574,20 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   turn_id: string;
   workflow_copilot_chat_id: string;
   resume_token: string;
-  outcome: "connected" | "skipped" | "not_admitted";
+  outcome: "connected" | "skipped" | "not_admitted" | "signed_in";
   credential_id: string | null;
   name: string | null;
+  browser_profile_id?: string | null;
   timestamp: string;
 }
 
+export type ActivityBucket =
+  | { kind: "design" }
+  | { kind: "block"; workflow_run_block_id: string };
+
 export interface WorkflowCopilotToolCallUpdate {
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
   type: "tool_call";
   tool_name: string;
   display_label?: string | null;
@@ -464,6 +608,9 @@ export interface CodeWriteDiff {
 }
 
 export interface WorkflowCopilotToolResultUpdate {
+  activity_started_at?: string | null;
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
   type: "tool_result";
   tool_name: string;
   display_label?: string | null;
@@ -474,6 +621,8 @@ export interface WorkflowCopilotToolResultUpdate {
   code_diffs?: CodeWriteDiff[] | null;
   // The plan a successful set_work_plan stored. Absent on every other tool.
   work_plan?: string[] | null;
+  // A successful run_browser_code call's operations as display phrases.
+  browser_steps?: string[] | null;
   detail?: string | null;
   timestamp?: string | null;
 }

@@ -20,14 +20,10 @@ from skyvern.forge.taskv3.opaque_refs import (
     urls_in_text,
 )
 
-# Prior-block prose is model output that went through a page: data, never instructions. It is
-# rendered inside a labelled data section, single-line, capped, and with signed URLs masked.
-MAX_HANDOFF_REASON_CHARS = 300
 MAX_HANDOFF_URL_CHARS = 200
 # The persisted finish_reason is model prose too: capped at write time, masked of run secrets.
 MAX_PERSISTED_FINISH_REASON_CHARS = 2000
 _URL_RE = re.compile(r"https?://\S+")
-_WS_RE = re.compile(r"\s+")
 _TRAILING_PUNCT = ")]}>.,;:!?'\""
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -42,15 +38,6 @@ def mask_signed_urls_in_text(text: str) -> str:
         return ("[signed-url]" if is_signed_url(url) else url) + trailer
 
     return _URL_RE.sub(_mask, text)
-
-
-def sanitize_handoff_reason(reason: str | None) -> str | None:
-    if not reason:
-        return None
-    text = mask_signed_urls_in_text(_WS_RE.sub(" ", reason).strip())
-    if len(text) > MAX_HANDOFF_REASON_CHARS:
-        text = text[: MAX_HANDOFF_REASON_CHARS - 1].rstrip() + "…"
-    return text or None
 
 
 def _bare_parts(url: str | None) -> tuple[str, str, str] | None:

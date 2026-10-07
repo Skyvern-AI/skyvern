@@ -8,7 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 import structlog
 from pydantic import JsonValue, ValidationError
 
-from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestPacketPageState
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestPacketPageState, append_omission_notice
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     RUNTIME_SOLVABLE_CHALLENGE_KINDS,
     ChallengeKind,
@@ -67,6 +67,7 @@ _RUNNER_NAME_FAILURE_RE = re.compile(
 )
 _QUOTED_NAME_RE = re.compile(r"'(?P<name>[^']+)'")
 WRAPPER_SCOPE_FAILURE_CLASS = "wrapper_scope_name_resolution"
+UNDECLARED_PRIOR_OUTPUT_FAILURE_CLASS = "undeclared_prior_block_output"
 WRAPPER_SCOPE_REPAIR_INSTRUCTION = (
     "the block body is a wrapper function's body, so top-level names are locals `global` cannot reach; "
     "NameError and UnboundLocalError there are one scope defect. Use a flat top-level loop, or in the "
@@ -146,6 +147,25 @@ def _missing_output_dependency_context(
             "parameter for this missing output key."
         ),
     )
+
+
+def _undeclared_prior_output_key(workflow_yaml: str | None, block_label: str, failure_reason: str) -> str | None:
+    """The prior block's output key when a NameError names that block's label or output key and this block does
+    not list the key in parameter_keys; block outputs reach code only through declared parameter keys."""
+    match = _RUNNER_NAME_FAILURE_RE.search(failure_reason)
+    if match is None or match.group("cls") != "NameError":
+        return None
+    name_match = _QUOTED_NAME_RE.search(match.group("message"))
+    if name_match is None:
+        return None
+    contract = code_block_available_contracts_by_label(workflow_yaml).get(block_label)
+    if contract is None:
+        return None
+    name = name_match.group("name")
+    output_key = name if name.endswith("_output") else f"{name}_output"
+    if output_key not in contract.available_output_keys or output_key in contract.parameter_keys:
+        return None
+    return output_key
 
 
 def _wrapper_scope_failure_class(workflow_yaml: str | None, block_label: str, failure_reason: str) -> str | None:
@@ -289,6 +309,27 @@ def _runtime_form_summaries(value: Any) -> list[str]:
     return (observed + plain)[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
+def _textless_control_summary(control: dict[str, Any]) -> str:
+    """Whole selector candidates in capture order, kept only while the summary fits the compaction cap,
+    because a cut selector addresses nothing."""
+    disabled = " disabled" if control.get("disabled") is True else ""
+    reserved = len(disabled) + (len(" collapsed") if isinstance(control.get("expanded"), bool) else 0)
+    label = ""
+    candidates = control.get("selector_candidates")
+    for candidate in candidates if isinstance(candidates, list) else []:
+        if not isinstance(candidate, dict):
+            continue
+        selector = candidate.get("selector")
+        if not isinstance(selector, str) or not selector.strip():
+            continue
+        selector = redact_raw_secrets_for_prompt(selector)
+        joined = f"{label} | {selector}" if label else selector
+        if len(joined) + reserved > _RUNTIME_SUMMARY_MAX_CHARS:
+            break
+        label = joined
+    return f"{label}{disabled}" if label else ""
+
+
 def _runtime_action_summaries(navigation_targets: Any, clickable_controls: Any) -> list[str]:
     navigation: list[str] = []
     if isinstance(navigation_targets, list):
@@ -299,24 +340,32 @@ def _runtime_action_summaries(navigation_targets: Any, clickable_controls: Any) 
             if len(navigation) == _RUNTIME_SUMMARY_MAX_ITEMS:
                 break
     controls: list[str] = []
+    textless_controls: list[str] = []
     seen: set[str] = set()
     if isinstance(clickable_controls, list):
         for control in clickable_controls:
-            summary = _runtime_summary_entry(control, ("text", "disabled"))
+            textless = isinstance(control, dict) and not _bounded_runtime_text(control.get("text"))
+            summary = (
+                _textless_control_summary(control)
+                if textless
+                else _runtime_summary_entry(control, ("text", "disabled"))
+            )
             if not summary or summary in seen:
                 continue
             seen.add(summary)
             expanded = control.get("expanded") if isinstance(control, dict) else None
-            if isinstance(expanded, bool):
+            if isinstance(expanded, bool) and textless:
+                summary = f"{summary} {'expanded' if expanded else 'collapsed'}"
+            elif isinstance(expanded, bool):
                 summary = _bounded_runtime_text(
                     f"{summary} {'expanded' if expanded else 'collapsed'}",
                     _RUNTIME_SUMMARY_MAX_CHARS + _OBSERVED_STATE_MAX_CHARS + 1,
                 )
-            controls.append(summary)
-            if len(controls) == _RUNTIME_SUMMARY_MAX_ITEMS:
-                break
-    # Controls lead because packet compaction keeps only the first two summaries. Navigation dedupes
-    # against the pre-disclosure control strings, so an element in both collections emits exactly once.
+            (textless_controls if textless else controls).append(summary)
+    controls = (controls + textless_controls)[:_RUNTIME_SUMMARY_MAX_ITEMS]
+    # Controls lead, text-labeled ones first, because packet compaction keeps only the first two summaries.
+    # Navigation dedupes against the pre-disclosure control strings, so an element in both collections emits
+    # exactly once.
     merged = controls + [target for target in navigation if target not in seen]
     return merged[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
@@ -427,7 +476,7 @@ def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
 
 
 def build_test_page_state_from_evidence(
-    evidence: Mapping[str, JsonValue], *, workflow_run_id: str
+    evidence: Mapping[str, JsonValue], *, workflow_run_id: str, omission_notices: list[str]
 ) -> BuildTestPacketPageState | None:
     if (
         not workflow_run_id
@@ -440,7 +489,9 @@ def build_test_page_state_from_evidence(
     rendered_value_excerpt = _bounded_runtime_text(
         evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS
     )
-    obstructions, _ = _typed_runtime_page_obstructions(evidence)
+    obstructions, obstruction_notices = _typed_runtime_page_obstructions(evidence)
+    for notice in obstruction_notices:
+        append_omission_notice(omission_notices, notice)
     page_state = BuildTestPacketPageState(
         current_origin=_origin_from_runtime_url(current_url),
         current_url=_safe_runtime_page_url(current_url),
@@ -648,6 +699,12 @@ def record_pending_runtime_authoring_repair_context(
     )
     if failure_class == WRAPPER_SCOPE_FAILURE_CLASS:
         repair_instruction = WRAPPER_SCOPE_REPAIR_INSTRUCTION
+    elif (output_key := _undeclared_prior_output_key(workflow_yaml, block_label, failure_reason)) is not None:
+        failure_class = UNDECLARED_PRIOR_OUTPUT_FAILURE_CLASS
+        repair_instruction = (
+            f"a prior block's output reaches a code block only through parameter_keys: add `{output_key}` to "
+            f"this block's parameter_keys and read it as the Python variable `{output_key}`."
+        )
     copilot_ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
         block_label=block_label,
         reason_code=_RUNTIME_AUTHORING_REASON_CODE,

@@ -883,7 +883,9 @@ def test_editing_one_of_two_blocks_leaves_the_untouched_block_current() -> None:
 
 
 def test_tested_block_fingerprint_ignores_the_goal_ownership_facts() -> None:
-    hand_edited = _top_level(_READ_PRICE_BLOCK + "  user_owned_goal: true\n  goal_needs_regeneration: false\n")
+    hand_edited = _top_level(
+        _READ_PRICE_BLOCK + "  user_owned_goal: true\n  goal_needs_regeneration: false\n  code_edited_by_hand: true\n"
+    )
     resubmitted = _top_level(_READ_PRICE_BLOCK)
 
     assert workflow_block_fingerprints(hand_edited) == workflow_block_fingerprints(resubmitted)

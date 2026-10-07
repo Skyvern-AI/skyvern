@@ -7,6 +7,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDe
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTENDED_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
+from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
@@ -87,6 +88,17 @@ class CreateBrowserSessionRequest(BaseModel):
         "storing profiles for sessions that never need them. Sessions started with a browser_profile_id always "
         "persist their profile regardless of this flag.",
     )
+
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied when the session's browser is created. A timezone_id here takes precedence "
+        "over the timezone implied by proxy_location.",
+    )
+
+    @field_validator("browser_settings")
+    @classmethod
+    def validate_browser_settings(cls, value: BrowserSettings | None) -> BrowserSettings | None:
+        return require_known_timezone(value)
 
     needs_live_view: bool = Field(
         default=False,

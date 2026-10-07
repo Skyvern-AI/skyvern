@@ -17,9 +17,9 @@ from pydantic import (
     model_validator,
 )
 
-from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
+from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
@@ -130,6 +130,20 @@ def copilot_proposal_metadata(value: object) -> CopilotProposalMetadata | None:
         return None
 
 
+MAX_STEER_MESSAGES_PER_TURN = 20
+
+
+class CopilotSteerMessage(BaseModel):
+    """A message the user sent into a running turn, stored as screened text only."""
+
+    steer_id: str
+    text: str
+    raw_secret_detected: bool = Field(default=False, exclude_if=lambda detected: not detected)
+    created_at: datetime
+    # None until the running loop hands the message to the model.
+    delivered_at: datetime | None = None
+
+
 class CopilotPendingTurn(BaseModel):
     """Durable write-ahead marker for one in-flight copilot turn.
 
@@ -149,6 +163,9 @@ class CopilotPendingTurn(BaseModel):
     copilot_code_available: bool = False
     user_message_id: str | None = None
     recovering_at: datetime | None = None
+    # A credential pause stops the turn's budget clock, so reconcile measures abandonment from here
+    # too, as it does from a resolved question.
+    credential_resumed_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
     # never wrote canonical, so it owns no write to roll back.
     canonical_write_fingerprint: str | None = None
@@ -159,6 +176,7 @@ class CopilotPendingTurn(BaseModel):
     # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
     superseded_build_test_run_ids: list[str] = Field(default_factory=list)
+    steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -443,6 +461,12 @@ class WorkflowCopilotChatRequest(BaseModel):
         ),
     )
     supports_question_tool: bool = Field(False, description="The client can display and answer ask_user requests.")
+    supports_account_group_card: bool = Field(
+        False, description="The client can display account group review and receipt cards."
+    )
+    supports_credential_delete_card: bool = Field(
+        False, description="The client can display the credential deletion card and post its confirmation."
+    )
     credential_recovery_token: SecretStr | None = Field(
         None,
         repr=False,
@@ -451,6 +475,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     )
     supports_credential_pause_recovery: bool = Field(
         False, description="The client restores pending credential cards from chat history."
+    )
+    supports_credential_generation: bool = Field(
+        False, description="The client can render a registration card and post its Generate and save answer."
     )
     supports_credential_pause: bool = Field(
         False,
@@ -520,17 +547,66 @@ class WorkflowCopilotCancelRequest(BaseModel):
     )
 
 
+class WorkflowCopilotSteerRequest(BaseModel):
+    workflow_copilot_chat_id: str
+    cancel_token: str = Field(..., description="The cancel_token sent on the running turn's /chat-post request")
+    steer_id: str = Field(..., max_length=64, description="Client-generated id; a retry with the same id is a no-op")
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
     workflow_copilot_chat_id: str
     interaction_id: str
+    account_group_decision: AccountGroupDecision | None = None
+
+
+class WorkflowCopilotCredentialDeletionRequest(BaseModel):
+    workflow_copilot_chat_id: str
+    interaction_id: str
+    credential_ids: list[str] = Field(min_length=1)
 
 
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
     resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
-    action: Literal["connected", "skip"] = Field(..., description="The user's response to the credential card")
+    action: Literal["connected", "skip", "signing_in", "signed_in"] = Field(
+        ...,
+        description=(
+            "The user's response to the credential card: 'signing_in' when they start signing in themselves in "
+            "the live browser, 'signed_in' when they finish"
+        ),
+    )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+
+
+class WorkflowCopilotCredentialGenerateRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+
+
+class WorkflowCopilotCredentialGenerateResult(BaseModel):
+    result: Literal["connected", "rejected", "unknown", "created_not_connected"] = Field(
+        ...,
+        description=(
+            "'rejected' means nothing was saved; 'unknown' means the vault did not confirm the save, and the "
+            "card stays open without Generate"
+        ),
+    )
+    credential_id: str | None = Field(None, description="The saved credential, when one is known to exist")
+    name: str | None = None
+    username: str | None = None
+    expires_at: datetime | None = Field(
+        None, description="The reopened card's new deadline after 'rejected' or 'unknown'"
+    )
+
+
+class WorkflowCopilotCredentialResponseResult(BaseModel):
+    result: Literal["accepted", "signed_in", "no_sign_in_found", "save_failed"]
+    expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
+    host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
@@ -617,6 +693,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     CREDENTIAL_PAUSE_RESOLVED = "credential_pause_resolved"
     CODEGEN_PROGRESS = "codegen_progress"
     TITLE_UPDATE = "title_update"
+    SCREENSHOT = "screenshot"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -721,6 +798,8 @@ class WorkflowCopilotStreamErrorUpdate(BaseModel):
 
 
 class WorkflowCopilotToolCallUpdate(BaseModel):
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
@@ -739,6 +818,9 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
+    activity_started_at: datetime | None = None
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )
@@ -758,6 +840,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
     work_plan: list[str] | None = Field(
         None,
         description="The plan a successful set_work_plan stored, as stored. None for every other tool",
+    )
+    browser_steps: list[str] | None = Field(
+        None,
+        description="A successful run_browser_code call's reported operations as display phrases, in order",
     )
     detail: str | None = Field(
         None,
@@ -886,6 +972,9 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
         None,
         description="Block count of the canonical workflow at turn entry; drives the FE edit-vs-build chip.",
     )
+    workflow_copilot_chat_id: str | None = Field(
+        None, description="The chat this turn runs in, known to a client that opened the chat with this turn"
+    )
 
 
 class WorkflowCopilotDesignStartUpdate(BaseModel):
@@ -936,6 +1025,29 @@ class WorkflowCopilotTitleUpdate(BaseModel):
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
+class WorkflowCopilotScreenshotUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.SCREENSHOT, description="Message type"
+    )
+    artifact_id: str = Field(..., description="Chat-owned artifact holding the full-size PNG")
+    captured_at: datetime = Field(..., description="Server clock read when the frame was staged for the model")
+    tool_call_id: str | None = Field(None, description="The tool call that staged the frame, when known")
+
+
+class CredentialRegistration(BaseModel):
+    username: str = Field(..., description="Username or email to register with, exactly as the user gave it")
+    credential_name: str = Field(..., description="Name to save the new credential under")
+    password_length: int = Field(24, description="Generated password length; 24 to 128")
+    charset: Literal["alphanumeric", "alphanumeric_symbols"] = Field(
+        "alphanumeric_symbols", description="Characters the site accepts in a password"
+    )
+
+
+class WorkflowCopilotCredentialRegistration(CredentialRegistration):
+    attempted: bool = Field(False, description="Generate and save was used; the card offers it once")
+    outcome: Literal["rejected", "unknown"] | None = Field(None, description="Why an attempt did not connect")
+
+
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
@@ -950,6 +1062,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "login_credentials_unresolved",
         "credential_missing_totp",
         "credential_rejected_by_site",
+        "credential_registration",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
@@ -959,10 +1072,17 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     anchor_tool_call_id: str | None = Field(
         None, description="Tool call whose activity row was newest when the pause was raised"
     )
+    sign_in_browser_session_id: str | None = Field(
+        None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
+    )
+    signing_in: bool = Field(False, description="The user has started signing in themselves")
+    registration: WorkflowCopilotCredentialRegistration | None = Field(
+        None, description="Account details a Generate and save answer would store; never a password"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
-CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted"]
+CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted", "signed_in"]
 
 
 class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
@@ -976,7 +1096,10 @@ class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
         ..., description="The waiter's final verdict, after admission; never the raw POSTed action"
     )
     credential_id: str | None = Field(None, description="The connected credential; set only when connected")
-    name: str | None = Field(None, description="Display name of the connected credential; set only when connected")
+    name: str | None = Field(
+        None, description="Display name of the connected credential, or of the profile saved from a sign-in"
+    )
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1022,6 +1145,10 @@ class WorkflowCopilotCodegenProgressUpdate(BaseModel):
     )
     chars_streamed: int = Field(..., description="Cumulative argument characters streamed so far in this call")
     iteration: int = Field(..., description="Agent loop iteration number; matches the TOOL_CALL frame that follows")
+    generation_id: str | None = Field(
+        None,
+        description="New for every model response; the authoring calls within one response share it",
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1032,3 +1159,16 @@ class WorkflowYAMLConversionRequest(BaseModel):
 
 class WorkflowYAMLConversionResponse(BaseModel):
     workflow_definition: dict = Field(..., description="Converted workflow definition with blocks")
+
+
+class WorkflowCopilotGoalSuggestionRequest(BaseModel):
+    label: str = Field(..., max_length=256, description="Label of the code block whose Goal is suggested")
+    code: str = Field(..., max_length=200_000, description="The block's code as the person edited it")
+    current_goal: str = Field("", max_length=20_000, description="The block's Goal before the suggestion")
+    parameter_keys: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=500, description="Workflow parameters the block can read"
+    )
+
+
+class WorkflowCopilotGoalSuggestionResponse(BaseModel):
+    goal: str | None = Field(None, description="Suggested Goal written from the code; null when none was produced")

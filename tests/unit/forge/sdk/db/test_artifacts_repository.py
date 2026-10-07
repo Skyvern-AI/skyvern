@@ -1,13 +1,21 @@
 import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.forge.sdk.artifact import manager as artifact_manager_module
+from skyvern.forge.sdk.artifact.manager import ArtifactBatchData, ArtifactManager, BulkArtifactCreationRequest
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import ArtifactModel
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
+from tests.unit._sql_recording import recorded_statements
 
 
 @pytest_asyncio.fixture
@@ -95,3 +103,53 @@ async def test_delete_artifacts_by_ids_scopes_to_organization(
     async with sqlite_engine.connect() as conn:
         remaining_ids = set((await conn.scalars(select(ArtifactModel.artifact_id))).all())
     assert remaining_ids == {"a_other_org"}
+
+
+class _RecordingStorage:
+    def __init__(self) -> None:
+        self.stored: dict[str, bytes] = {}
+
+    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+        self.stored[artifact.artifact_id] = data
+
+
+@pytest.mark.asyncio
+async def test_manager_bulk_create_persists_and_uploads_every_row_without_reading_it_back(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, engine, organization_id = org_scoped_db
+    artifact_ids = [generate_artifact_id() for _ in range(3)]
+    request = BulkArtifactCreationRequest(
+        artifacts=[
+            ArtifactBatchData(
+                artifact_model=ArtifactModel(
+                    artifact_id=artifact_id,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    uri=f"s3://bucket/{artifact_id}.png",
+                    organization_id=organization_id,
+                    task_id="tsk_bulk",
+                    step_id="stp_bulk",
+                ),
+                data=artifact_id.encode(),
+            )
+            for artifact_id in artifact_ids
+        ],
+        primary_key="tsk_bulk",
+    )
+    storage = _RecordingStorage()
+    manager = ArtifactManager()
+
+    with (
+        patch.object(artifact_manager_module, "app", SimpleNamespace(DATABASE=db, STORAGE=storage)),
+        recorded_statements(engine) as statements,
+    ):
+        returned_ids = await manager.bulk_create_artifacts([request])
+        await manager.wait_for_upload_aiotasks(["tsk_bulk"])
+
+    assert returned_ids == artifact_ids
+    assert [statement for statement in statements if statement.startswith("SELECT")] == []
+    assert storage.stored == {artifact_id: artifact_id.encode() for artifact_id in artifact_ids}
+    for artifact_id in artifact_ids:
+        stored = await db.artifacts.get_artifact_by_id(artifact_id, organization_id)
+        assert stored is not None
+        assert stored.file_size == len(artifact_id.encode())

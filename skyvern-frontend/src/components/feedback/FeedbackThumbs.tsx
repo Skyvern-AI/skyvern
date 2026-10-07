@@ -1,13 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/util/utils";
 
 export type FeedbackRating = "up" | "down";
 
 export interface FeedbackRateOptions {
-  needsSupport: boolean;
+  needsSupport?: boolean;
+  // Typed detail for the "other" reason option.
+  detail?: string;
 }
 
 interface FeedbackThumbsProps {
@@ -26,6 +30,9 @@ interface FeedbackThumbsProps {
   subtle?: boolean;
   // When set, the reason panel also offers a checkbox that flags the rating for human follow-up.
   supportOption?: { label: string };
+  // When set, a thumbs down offers these optional choices instead of free text; the chosen value is the reason.
+  // Choosing "other" opens a text box whose content arrives as `options.detail`.
+  reasonOptions?: Array<{ value: string; label: string }>;
   // "report" replaces the thumbs pair with a single thumbs-down action for runs that already failed.
   variant?: "thumbs" | "report";
   reportLabel?: string;
@@ -60,6 +67,7 @@ export function FeedbackThumbs({
   prompt,
   subtle = false,
   supportOption,
+  reasonOptions,
   variant = "thumbs",
   reportLabel = "Report this failure",
   className,
@@ -70,6 +78,8 @@ export function FeedbackThumbs({
   const [reason, setReason] = useState(savedReason ?? "");
   const [flash, setFlash] = useState<string | null>(null);
   const [needsSupport, setNeedsSupport] = useState(false);
+  const [otherDetail, setOtherDetail] = useState("");
+  const reasonIdPrefix = useId();
 
   useEffect(() => {
     if (rating !== "down") {
@@ -91,6 +101,11 @@ export function FeedbackThumbs({
     try {
       if (supportOption && text !== undefined) {
         await onRate(next, text, { needsSupport });
+      } else if (reasonOptions && text !== undefined) {
+        await onRate(next, text, {
+          detail:
+            text === "other" ? otherDetail.trim() || undefined : undefined,
+        });
       } else {
         await onRate(next, text);
       }
@@ -218,14 +233,48 @@ export function FeedbackThumbs({
       </div>
       {reasonOpen && rating === "down" ? (
         <div className="flex flex-col gap-2">
-          <Textarea
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            placeholder="What was missing or wrong? (optional)"
-            aria-label="Feedback reason"
-            maxLength={2000}
-            className="min-h-[56px] bg-slate-elevation3 text-xs"
-          />
+          {reasonOptions ? (
+            <RadioGroup
+              value={reason}
+              onValueChange={setReason}
+              aria-label="What went wrong? (optional)"
+              className="gap-1.5"
+            >
+              {reasonOptions.map((option) => (
+                <div key={option.value} className="flex items-center gap-2">
+                  <RadioGroupItem
+                    value={option.value}
+                    id={`${reasonIdPrefix}-${option.value}`}
+                  />
+                  <Label
+                    htmlFor={`${reasonIdPrefix}-${option.value}`}
+                    className="text-xs font-normal"
+                  >
+                    {option.label}
+                  </Label>
+                </div>
+              ))}
+            </RadioGroup>
+          ) : (
+            <Textarea
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              placeholder="What was missing or wrong? (optional)"
+              aria-label="Feedback reason"
+              maxLength={2000}
+              className="min-h-[56px] bg-slate-elevation3 text-xs"
+            />
+          )}
+          {reasonOptions && reason === "other" ? (
+            <Textarea
+              value={otherDetail}
+              onChange={(event) => setOtherDetail(event.target.value)}
+              placeholder="What went wrong? (optional)"
+              aria-label="Describe what went wrong"
+              maxLength={500}
+              className="min-h-[56px] bg-slate-elevation3 text-xs"
+            />
+          ) : null}
           {supportOption ? (
             <label className="flex items-center gap-2 text-xs text-foreground">
               <Checkbox

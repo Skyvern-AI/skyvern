@@ -31,7 +31,8 @@ def count_tokens(text: str) -> int:
     encoding = _get_encoding()
     if encoding is None:
         return math.ceil(len(text) / _APPROX_CHARS_PER_TOKEN)
-    return len(encoding.encode(text))
+    # tiktoken raises on special-token spellings like "<|endoftext|>" by default; counted text is data, never control.
+    return len(encoding.encode(text, disallowed_special=()))
 
 
 def approx_count_tokens(text: str) -> int:

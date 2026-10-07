@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
@@ -220,6 +220,10 @@ async def skyvern_browser_session_create(
             )
         ),
     ] = False,
+    browser_type: Annotated[
+        Literal["msedge", "chrome", "stealth-chromium"] | None,
+        Field(description="Cloud browser engine: msedge, chrome, or stealth-chromium. Null uses the default."),
+    ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
 ) -> dict[str, Any]:
@@ -236,6 +240,16 @@ async def skyvern_browser_session_create(
     returned and browser tools are called without one.
     """
     if _should_default_to_extension() and not local:
+        if browser_type is not None:
+            return make_result(
+                "skyvern_browser_session_create",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "browser_type requires a cloud session",
+                    "Drop browser_type; the extension uses the browser it is installed in.",
+                ),
+            )
         with Timer() as timer:
             if is_stateless_http_mode():
                 return make_result(
@@ -342,14 +356,14 @@ async def skyvern_browser_session_create(
 
     use_cdp, cdp_url = _should_default_to_cdp()
     if use_cdp and not local and cdp_url:
-        if browser_profile_id is not None or generate_browser_profile:
+        if browser_profile_id is not None or generate_browser_profile or browser_type is not None:
             return make_result(
                 "skyvern_browser_session_create",
                 ok=False,
                 error=make_error(
                     ErrorCode.INVALID_INPUT,
-                    "browser_profile_id and generate_browser_profile require a cloud session",
-                    "Unset BROWSER_TYPE=cdp-connect, or drop the browser profile options.",
+                    "browser_profile_id, generate_browser_profile and browser_type require a cloud session",
+                    "Unset BROWSER_TYPE=cdp-connect, or drop the browser profile and browser_type options.",
                 ),
             )
         with Timer() as timer:
@@ -388,14 +402,14 @@ async def skyvern_browser_session_create(
                     ),
                 )
 
-            if local and (browser_profile_id is not None or generate_browser_profile):
+            if local and (browser_profile_id is not None or generate_browser_profile or browser_type is not None):
                 return make_result(
                     "skyvern_browser_session_create",
                     ok=False,
                     error=make_error(
                         ErrorCode.INVALID_INPUT,
-                        "browser_profile_id and generate_browser_profile require a cloud session",
-                        "Remove local=true, or drop the browser profile options.",
+                        "browser_profile_id, generate_browser_profile and browser_type require a cloud session",
+                        "Remove local=true, or drop the browser profile and browser_type options.",
                     ),
                 )
 
@@ -407,6 +421,8 @@ async def skyvern_browser_session_create(
                     create_kwargs["extensions"] = extensions
                 if browser_profile_id is not None:
                     create_kwargs["browser_profile_id"] = browser_profile_id
+                if browser_type is not None:
+                    create_kwargs["browser_type"] = browser_type
                 session = await skyvern.create_browser_session(**create_kwargs)
                 if generate_browser_profile:
                     await do_session_arm_generate_browser_profile(skyvern, session.browser_session_id)
@@ -435,6 +451,7 @@ async def skyvern_browser_session_create(
                 extensions=extensions,
                 browser_profile_id=browser_profile_id,
                 generate_browser_profile=generate_browser_profile,
+                browser_type=browser_type,
                 local=local,
                 headless=headless,
                 # Keep the MCP process from claiming the session's initial page.

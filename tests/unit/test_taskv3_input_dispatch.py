@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from playwright.async_api import ElementHandle, Locator, Page
+from playwright.async_api import ElementHandle
+from structlog.testing import capture_logs
 
-from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import RunArm, SkyvernContext
-from skyvern.forge.sdk.event.base import CursorEventStrategy, InputEventStrategy, ScrollEventStrategy
-from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import input_dispatch
-from skyvern.forge.taskv3.run_arms import HUMANIZED_INPUT_FLAG, resolve_run_arm
+from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 Call = tuple[str, tuple[Any, ...], dict[str, Any]]
 
@@ -33,16 +35,6 @@ class _Device:
 class _FakeLocator(_Device):
     def __init__(self, page: _FakePage, selector: str) -> None:
         super().__init__(page.calls, f"locator({selector})")
-        self.page = page
-        self.first = self
-
-
-class _FakeHandle(_Device):
-    def __init__(self, page: _FakePage) -> None:
-        super().__init__(page.calls, "handle")
-
-    async def bounding_box(self) -> dict[str, float]:
-        return {"x": 10.0, "y": 20.0, "width": 4.0, "height": 6.0}
 
 
 class _FakePage(_Device):
@@ -52,70 +44,20 @@ class _FakePage(_Device):
         self.keyboard = _Device(self.calls, "keyboard")
         self.mouse = _Device(self.calls, "mouse")
 
-    def __getattr__(self, attr: str) -> Callable[..., Awaitable[None]]:
-        # A top-level page has neither, which is how the dispatcher tells it from a frame.
-        if attr in ("page", "parent_frame"):
-            raise AttributeError(attr)
-        return super().__getattr__(attr)
-
     def locator(self, selector: str) -> _FakeLocator:
         return _FakeLocator(self, selector)
 
+    # As a frame realm: the main frame of its own page, never detached, with no navigation events.
+    parent_frame = None
 
-class _RecordingCursor(CursorEventStrategy):
-    def __init__(self, log: list[Call]) -> None:
-        self._log = log
+    def is_detached(self) -> bool:
+        return False
 
-    async def move_to(self, page: Page, x: float, y: float) -> None:
-        self._log.append(("cursor.move_to", (x, y), {}))
+    def on(self, event: str, handler: Callable[..., None]) -> None:
+        pass
 
-    async def move_to_element(self, page: Page, locator: Locator) -> tuple[float, float]:
-        self._log.append(("cursor.move_to_element", (locator,), {}))
-        return 0.0, 0.0
-
-    async def click(self, page: Page, locator: Locator, *, timeout: float | None = None) -> None:
-        self._log.append(("cursor.click", (locator,), {"timeout": timeout}))
-
-
-class _RecordingInput(InputEventStrategy):
-    def __init__(self, log: list[Call]) -> None:
-        self._log = log
-
-    async def type_text(
-        self,
-        page: Page,
-        locator: Locator | None,
-        text: str,
-        *,
-        timeout: float | None,
-        delay: float | None = None,
-        no_wait_after: bool | None = None,
-        allow_batched_playwright: bool = False,
-    ) -> None:
-        self._log.append(("input.type_text", (locator, text), {"delay": delay}))
-
-    async def clear_field(
-        self,
-        page: Page,
-        locator: Locator,
-        char_count: int,
-        *,
-        timeout: float | None,
-        force: bool | None = None,
-        no_wait_after: bool | None = None,
-    ) -> None:
-        self._log.append(("input.clear_field", (locator,), {"timeout": timeout}))
-
-
-class _RecordingScroll(ScrollEventStrategy):
-    def __init__(self, log: list[Call]) -> None:
-        self._log = log
-
-    async def scroll_to_element(self, page: Page, locator: Locator) -> None:
-        self._log.append(("scroll.scroll_to_element", (locator,), {}))
-
-    async def scroll_by(self, page: Page, delta_y: float) -> None:
-        self._log.append(("scroll.scroll_by", (delta_y,), {}))
+    def remove_listener(self, event: str, handler: Callable[..., None]) -> None:
+        pass
 
 
 @pytest.fixture
@@ -123,97 +65,9 @@ def page() -> _FakePage:
     return _FakePage()
 
 
-@pytest.fixture
-def humanized_strategies(page: _FakePage) -> Iterator[list[Call]]:
-    """A humanized registration, as USE_EVENT_STRATEGIES makes it, logging into the page's own call list."""
-    EventStrategyFactory.set_cursor_strategy(_RecordingCursor(page.calls))
-    EventStrategyFactory.set_input_strategy(_RecordingInput(page.calls))
-    EventStrategyFactory.set_scroll_strategy(_RecordingScroll(page.calls))
-    EventStrategyFactory.record_profile("default")
-    try:
-        yield page.calls
-    finally:
-        EventStrategyFactory.reset()
-
-
-def _pin(arm: RunArm) -> Iterator[SkyvernContext]:
-    context = SkyvernContext()
-    context.run_arms = {HUMANIZED_INPUT_FLAG: ("wr_1", arm)}
-    skyvern_context.set(context)
-    try:
-        yield context
-    finally:
-        skyvern_context.reset()
-
-
-@pytest.fixture
-def control() -> Iterator[SkyvernContext]:
-    yield from _pin("control")
-
-
-@pytest.fixture
-def treatment() -> Iterator[SkyvernContext]:
-    yield from _pin("treatment")
-
-
-def _names(calls: list[Call]) -> list[str]:
-    return [name for name, _, _ in calls]
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("reader", "humanized"),
-    [
-        (AsyncMock(return_value="treatment"), True),
-        (AsyncMock(return_value="control"), False),
-        (AsyncMock(return_value=None), False),
-        (AsyncMock(return_value="true"), False),
-        (AsyncMock(side_effect=RuntimeError("flag service down")), False),
-    ],
-    ids=["treatment", "control", "no_variant", "unknown_variant", "flag_error"],
-)
-async def test_only_a_treatment_run_sends_its_clicks_through_the_registered_strategy(
-    monkeypatch: pytest.MonkeyPatch,
-    page: _FakePage,
-    humanized_strategies: list[Call],
-    reader: AsyncMock,
-    humanized: bool,
-) -> None:
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", reader)
-    context = SkyvernContext()
-    skyvern_context.set(context)
-    try:
-        await resolve_run_arm(context, HUMANIZED_INPUT_FLAG, distinct_id="wr_1", organization_id="o_1", forced=False)
-        await input_dispatch.click(page, "#go", timeout=1234)
-    finally:
-        skyvern_context.reset()
-
-    assert _names(page.calls) == (["cursor.click"] if humanized else ["page.click"])
-
-
-@pytest.mark.asyncio
-async def test_input_outside_a_resolved_run_is_plain_playwright(
-    page: _FakePage, humanized_strategies: list[Call]
-) -> None:
-    skyvern_context.reset()
-
-    await input_dispatch.click(page, "#go", timeout=1234)
-    await input_dispatch.type_keys(page, "#q", "abc", delay=15, timeout=900)
-    await input_dispatch.wheel(page, 0, 800)
-
-    assert page.calls == [
-        ("page.click", ("#go",), {"timeout": 1234}),
-        ("page.type", ("#q", "abc"), {"delay": 15, "timeout": 900}),
-        ("mouse.wheel", (0, 800), {}),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_control_sends_each_gesture_as_the_exact_playwright_call_it_replaced(
-    control: SkyvernContext, page: _FakePage, humanized_strategies: list[Call]
-) -> None:
+async def test_each_gesture_is_the_exact_playwright_call_it_replaced(page: _FakePage) -> None:
     locator = page.locator("#seg")
-    await input_dispatch.approach(page, "#go")
     await input_dispatch.click(page, "#go", timeout=5000, force=True)
     await input_dispatch.click(page, locator, timeout=2000)
     await input_dispatch.click_at(page, 10.0, 20.0)
@@ -252,7 +106,7 @@ async def test_control_sends_each_gesture_as_the_exact_playwright_call_it_replac
 
 
 @pytest.mark.asyncio
-async def test_control_clicks_an_element_handle_with_only_the_arguments_given(control: SkyvernContext) -> None:
+async def test_an_element_handle_is_clicked_with_only_the_arguments_given() -> None:
     handle = MagicMock(spec=ElementHandle)
     handle.click = AsyncMock()
 
@@ -261,124 +115,230 @@ async def test_control_clicks_an_element_handle_with_only_the_arguments_given(co
     handle.click.assert_awaited_once_with()
 
 
-@pytest.mark.asyncio
-async def test_treatment_routes_pointer_typing_and_scroll_through_the_registered_strategies(
-    treatment: SkyvernContext, page: _FakePage, humanized_strategies: list[Call]
-) -> None:
-    await input_dispatch.click(page, "#go", timeout=1234)
-    await input_dispatch.click(page, "#go", timeout=5000, force=True)
-    await input_dispatch.click_at(page, 10.0, 20.0)
-    await input_dispatch.hover(page, "#menu", timeout=2000)
-    await input_dispatch.clear(page, "#f", timeout=100)
-    await input_dispatch.wheel(page, 0, 800)
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
 
-    assert _names(page.calls) == [
-        "cursor.click",
-        # The strategy has no forced click: it moves there, then Playwright clicks exactly as before.
-        "cursor.move_to_element",
-        "page.click",
-        "cursor.move_to",
-        "mouse.click",
-        "cursor.move_to_element",
-        "page.hover",
-        "input.clear_field",
-        "scroll.scroll_by",
-    ]
-    assert page.calls[2] == ("page.click", ("#go",), {"timeout": 5000, "force": True})
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
-@pytest.mark.asyncio
-async def test_treatment_clicks_a_locator_through_the_strategy_and_a_handle_after_a_cursor_move(
-    treatment: SkyvernContext, page: _FakePage, humanized_strategies: list[Call]
-) -> None:
-    await input_dispatch.click(page, page.locator("#seg"), timeout=2000)
-    await input_dispatch.click_handle(page, _FakeHandle(page), position={"x": 1.0, "y": 2.0}, timeout=1500)
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    clock = _Clock()
+    monkeypatch.setattr(input_dispatch, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(input_dispatch, "asyncio", ScopedAsyncio(sleep=clock.sleep))
+    return clock
 
-    assert _names(page.calls) == ["cursor.click", "cursor.move_to", "handle.click"]
-    assert page.calls[1:] == [
-        ("cursor.move_to", (12.0, 23.0), {}),
-        ("handle.click", (), {"position": {"x": 1.0, "y": 2.0}, "timeout": 1500}),
-    ]
+
+@pytest.fixture
+def login_page() -> _FakePage:
+    page = _FakePage()
+    page.url = "https://login.test/password"
+    page.page = page
+    return page
+
+
+@pytest.fixture
+def arm(request: pytest.FixtureRequest) -> Iterator[str]:
+    arm = getattr(request, "param", "treatment")
+    skyvern_context.set(SkyvernContext(run_arms={LOGIN_PACE_FLAG: ("wr_login", arm)}))
+    yield arm
+    input_dispatch.end_login_pace()
+    skyvern_context.reset()
 
 
 @pytest.mark.asyncio
-async def test_treatment_types_through_the_keyboard_after_one_focus(
-    treatment: SkyvernContext, page: _FakePage, humanized_strategies: list[Call]
+@pytest.mark.parametrize("arm", ["treatment", "control", "unrandomized"], indirect=True)
+async def test_only_the_treatment_holds_the_submit_after_a_password_fill(
+    arm: str, clock: _Clock, login_page: _FakePage
 ) -> None:
-    await input_dispatch.type_keys(page, "#f", "abc", delay=15, timeout=900)
+    input_dispatch.start_login_pace()
+    clock.now += 5
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    await input_dispatch.click(login_page, "#sign-in")
 
-    # The strategy gets no locator (given one, a humanized keyboard re-focuses the field before every key) and no
-    # delay: as in v1, the registered strategy owns the cadence.
-    assert page.calls == [
-        ("page.focus", ("#f",), {"timeout": 900}),
-        ("input.type_text", (None, "abc"), {"delay": None}),
-    ]
+    assert sum(clock.sleeps) == (40.0 if arm == "treatment" else 0)
+    assert login_page.calls[-1][0] == "page.click"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed, waited", [(30.0, 15.0), (60.0, 0.0)])
+async def test_the_dwell_is_measured_from_the_block_start_across_both_login_pages(
+    arm: str, clock: _Clock, login_page: _FakePage, elapsed: float, waited: float
+) -> None:
+    input_dispatch.start_login_pace()
+    login_page.url = "https://login.test/username"
+    clock.now += elapsed / 2
+    await input_dispatch.click(login_page, "#continue")
+    login_page.url = "https://login.test/password"
+    clock.now += elapsed / 2
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    with capture_logs() as logs:
+        await input_dispatch.press(login_page, "#pw", "Enter")
+
+    # Continue came before the password fill, so only the submit waits, and only for what the floor still needs.
+    assert sum(clock.sleeps) == waited
+    dwell = [log for log in logs if log["event"] == "Task V3 login pace dwell"]
+    assert [(log["waited_s"], log["nav_to_submit_s"]) for log in dwell] == [(waited, max(elapsed, 45.0))]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("replace", "head_write"),
+    "gesture",
     [
-        (True, ("page.fill", ("#f", "Hello, "), {"timeout": 900})),
-        (False, ("keyboard.insert_text", ("Hello, ",), {})),
+        lambda page: input_dispatch.click(page, "#sign-in"),
+        lambda page: input_dispatch.click(page, page.locator("#sign-in")),
+        lambda page: input_dispatch.click_at(page, 10.0, 20.0),
+        lambda page: input_dispatch.press(page, "#pw", "Enter"),
+        lambda page: input_dispatch.press(page, None, "Enter"),
+        lambda page: input_dispatch.js_click(page, "document", {"sel": "#sign-in"}),
     ],
-    ids=["emptied_field_fills_the_head", "append_inserts_the_head_at_the_caret"],
 )
-async def test_treatment_humanizes_only_the_last_ten_characters_as_v1_does(
-    treatment: SkyvernContext,
-    page: _FakePage,
-    humanized_strategies: list[Call],
-    replace: bool,
-    head_write: Call,
+async def test_every_click_and_enter_after_a_password_fill_is_held_once(
+    arm: str, clock: _Clock, login_page: _FakePage, gesture: Callable[[_FakePage], Awaitable[Any]]
 ) -> None:
-    await input_dispatch.type_keys(page, "#f", "Hello, 0123456789", delay=15, timeout=900, replace=replace)
+    input_dispatch.start_login_pace()
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    await input_dispatch.press(login_page, "#pw", "Tab")
+    assert clock.sleeps == []
 
-    assert page.calls[-2:] == [head_write, ("input.type_text", (None, "0123456789"), {"delay": None})]
+    await gesture(login_page)
+    # A retyped password and a second submit on the same login wait no more.
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    await gesture(login_page)
+
+    assert sum(clock.sleeps) == 45.0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm", ["control", "treatment"])
-async def test_a_secret_is_typed_key_by_key_exactly_as_before_in_both_arms(
-    page: _FakePage, humanized_strategies: list[Call], arm: RunArm
+async def test_no_dwell_and_no_mechanism_log_without_a_password_fill(
+    arm: str, clock: _Clock, login_page: _FakePage
 ) -> None:
-    # Split one-time-code boxes advance on each keystroke, so neither a fill nor a humanized keyboard may take over.
-    for _ in _pin(arm):
-        await input_dispatch.type_keys(page, "#code", "s3cret", delay=15, timeout=900, secret=True, replace=True)
-        await input_dispatch.type_keys(page, page.locator("#box"), "7", timeout=1000, secret=True)
+    input_dispatch.start_login_pace()
+    with capture_logs() as logs:
+        await input_dispatch.click(login_page, "#search")
+        await input_dispatch.press(login_page, "#q", "Enter")
+        input_dispatch.end_login_pace()
 
-    assert page.calls == [
-        ("page.type", ("#code", "s3cret"), {"delay": 15, "timeout": 900}),
-        ("locator(#box).press_sequentially", ("7",), {"timeout": 1000}),
+    assert clock.sleeps == []
+    assert logs == []
+
+
+@pytest.mark.asyncio
+async def test_a_submit_the_hook_never_saw_is_logged_as_not_held(
+    arm: str, clock: _Clock, login_page: _FakePage
+) -> None:
+    input_dispatch.start_login_pace()
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    clock.now += 8
+    # The page submitted on its own: the next click is already on another page and must not take the dwell.
+    login_page.url = "https://login.test/challenge"
+    with capture_logs() as logs:
+        await input_dispatch.click(login_page, "#verify")
+        input_dispatch.start_login_pace()
+        input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+        input_dispatch.end_login_pace()
+
+    assert clock.sleeps == []
+    assert [(log["event"], log["reason"], log["nav_s"]) for log in logs] == [
+        ("Task V3 login pace submit not held", "page_moved_before_submit", 8.0),
+        ("Task V3 login pace submit not held", "no_click_or_enter_after_password", 0.0),
     ]
 
 
 @pytest.mark.asyncio
-async def test_treatment_approach_moves_then_waits_for_the_page_to_settle(
-    treatment: SkyvernContext, page: _FakePage, humanized_strategies: list[Call]
+async def test_a_hold_cancelled_by_the_callers_timeout_still_holds_the_submit(
+    arm: str, clock: _Clock, login_page: _FakePage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await input_dispatch.approach(page, "#go")
+    input_dispatch.start_login_pace()
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    real_sleep = clock.sleep
 
-    assert _names(page.calls) == ["locator(#go).scroll_into_view_if_needed", "cursor.move_to_element", "page.evaluate"]
+    async def _cancelled_once(seconds: float) -> None:
+        monkeypatch.setattr(input_dispatch, "asyncio", ScopedAsyncio(sleep=real_sleep))
+        clock.now += 5
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(input_dispatch, "asyncio", ScopedAsyncio(sleep=_cancelled_once))
+    with pytest.raises(asyncio.CancelledError):
+        await input_dispatch.click(login_page, "#captcha-checkbox")
+    await input_dispatch.click(login_page, "#sign-in")
+
+    assert sum(clock.sleeps) == 40.0
+    assert login_page.calls == [("page.click", ("#sign-in",), {})]
 
 
-def test_arm_fields_name_the_arm_whether_it_is_in_effect_and_the_registered_profile(
-    treatment: SkyvernContext, humanized_strategies: list[Call]
+@pytest.mark.asyncio
+async def test_a_task_canceled_during_the_wait_never_sends_any_held_submit(
+    arm: str, clock: _Clock, login_page: _FakePage
 ) -> None:
-    assert input_dispatch.arm_fields() == {
-        "humanized_input_arm": "treatment",
-        "humanized_input_in_effect": True,
-        "global_event_strategy_profile": "default",
-    }
+    polls: list[float] = []
+
+    async def _should_cancel() -> bool:
+        polls.append(clock.now)
+        return len(polls) == 3
+
+    input_dispatch.start_login_pace(_should_cancel)
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    with capture_logs() as logs:
+        with pytest.raises(input_dispatch.LoginPaceRefused):
+            await input_dispatch.click(login_page, "#sign-in")
+        # A caller that swallows the refusal and tries another submit is refused too.
+        with pytest.raises(input_dispatch.LoginPaceRefused):
+            await input_dispatch.press(login_page, "#pw", "Enter")
+        input_dispatch.end_login_pace()
+
+    assert login_page.calls == []
+    assert sum(clock.sleeps) == 6.0
+    assert [log["reason"] for log in logs] == ["canceled_during_wait"]
 
 
-def test_registered_profile_tells_no_registration_from_an_unnamed_one() -> None:
-    EventStrategyFactory.reset()
-    try:
-        assert EventStrategyFactory.registered_profile() == "none"
-        EventStrategyFactory.set_cursor_strategy(_RecordingCursor([]))
-        assert EventStrategyFactory.registered_profile() == "unrecorded"
-        EventStrategyFactory.record_profile("kernel")
-        assert EventStrategyFactory.registered_profile() == "kernel"
-    finally:
-        EventStrategyFactory.reset()
-    assert EventStrategyFactory.registered_profile() == "none"
+@pytest.mark.asyncio
+async def test_a_page_that_moves_during_the_wait_does_not_get_the_held_click(
+    arm: str, clock: _Clock, login_page: _FakePage
+) -> None:
+    async def _page_moves_on_second_poll() -> bool:
+        if clock.now >= 1004:
+            login_page.url = "https://login.test/verify"
+        return False
+
+    input_dispatch.start_login_pace(_page_moves_on_second_poll)
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    with capture_logs() as logs:
+        with pytest.raises(input_dispatch.LoginPaceRefused):
+            await input_dispatch.click(login_page, "#sign-in")
+        await input_dispatch.click(login_page, "#continue-on-new-page")
+
+    assert login_page.calls == [("page.click", ("#continue-on-new-page",), {})]
+    assert [log["reason"] for log in logs] == ["page_moved_during_wait"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cancel_read_still_sends_the_held_submit(arm: str, clock: _Clock, login_page: _FakePage) -> None:
+    async def _status_read_fails() -> bool:
+        raise ConnectionError("db blip")
+
+    input_dispatch.start_login_pace(_status_read_fails)
+    input_dispatch.note_secret_fill(login_page, input_dispatch.secret_fill_anchor(login_page))
+    await input_dispatch.click(login_page, "#sign-in")
+
+    assert sum(clock.sleeps) == 45.0
+    assert login_page.calls == [("page.click", ("#sign-in",), {})]
+
+
+@pytest.mark.asyncio
+async def test_a_frame_that_moved_during_the_password_fill_does_not_hold_the_next_click(
+    arm: str, clock: _Clock, login_page: _FakePage
+) -> None:
+    input_dispatch.start_login_pace()
+    anchor = input_dispatch.secret_fill_anchor(login_page)
+    # The frame's own URL moved while the password went in; the top URL did not.
+    input_dispatch.note_secret_fill(login_page, replace(anchor, frame_url="https://login.test/frame-before"))
+    with capture_logs() as logs:
+        await input_dispatch.click(login_page, "#next")
+
+    assert clock.sleeps == []
+    assert [(log["reason"], log["moved_by"]) for log in logs] == [("page_moved_before_submit", "frame_url")]

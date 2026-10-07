@@ -219,7 +219,10 @@ class TestWorkflowRoutesThreadUser:
         data = WorkflowRequest(json_definition=_yaml_request())
 
         with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=MagicMock())
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
+                return_value=(MagicMock(), ("workflow_definition",))
+            )
+            mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
             await create_workflow(
                 data=data,
                 folder_id=None,
@@ -241,8 +244,11 @@ class TestWorkflowRoutesThreadUser:
 
         with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
             saved = MagicMock()
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=saved)
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
+                return_value=(saved, ("workflow_definition",))
+            )
             mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
+            mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
             await update_workflow(
                 data=data,
                 workflow_id="wpid_1",
@@ -263,11 +269,14 @@ class TestWorkflowRoutesThreadUser:
         organization.organization_id = "o_123"
         raw_request = MagicMock()
         raw_request.body = AsyncMock(
-            return_value=b"title: Funnel Workflow\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
+            return_value=b"title: Funnel Workflow\nfolder_id: fld_body\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
         )
 
         with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=MagicMock())
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
+                return_value=(MagicMock(), ("workflow_definition",))
+            )
+            mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
             await create_workflow_legacy(
                 request=raw_request,
                 folder_id=None,
@@ -278,6 +287,34 @@ class TestWorkflowRoutesThreadUser:
 
         assert kwargs.get("created_by") == "u_456"
         assert kwargs.get("edited_by") == "u_456"
+        _principal, audit_event = mock_app.AGENT_FUNCTION.record_audit_event.await_args.args
+        assert audit_event.related_resource_ids == ("fld_body",)
+
+    @pytest.mark.asyncio
+    async def test_shared_create_route_succeeds_with_oss_audit_noop(self) -> None:
+        from skyvern.forge.sdk.routes.agent_protocol import create_workflow_legacy
+
+        saved = MagicMock()
+        organization = MagicMock()
+        organization.organization_id = "o_123"
+        raw_request = MagicMock()
+        raw_request.body = AsyncMock(
+            return_value=b"title: Funnel Workflow\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
+        )
+
+        with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
+                return_value=(saved, ("workflow_definition",))
+            )
+            mock_app.AGENT_FUNCTION = AgentFunction()
+            result = await create_workflow_legacy(
+                request=raw_request,
+                folder_id=None,
+                current_org=organization,
+                user_id="u_456",
+            )
+
+        assert result is saved
 
     @pytest.mark.asyncio
     async def test_update_workflow_legacy_route_passes_user(self) -> None:
@@ -292,8 +329,11 @@ class TestWorkflowRoutesThreadUser:
 
         with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
             saved = MagicMock()
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=saved)
+            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
+                return_value=(saved, ("workflow_definition",))
+            )
             mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
+            mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
             await update_workflow_legacy(
                 request=raw_request,
                 workflow_id="wpid_1",
@@ -344,10 +384,14 @@ class TestRunCreatedHookWiring:
         checker.check = AsyncMock()
         mock_app = MagicMock()
         mock_app.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
-        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=MagicMock(title="Test"))
 
         with (
             patch.object(agent_protocol.PermissionCheckerFactory, "get_instance", return_value=checker),
+            patch.object(
+                agent_protocol.workflow_service,
+                "run_workflow_returning_owned_workflow",
+                AsyncMock(return_value=(workflow_run, MagicMock(title="Test"))),
+            ),
             patch.object(agent_protocol.workflow_service, "run_workflow", AsyncMock(return_value=workflow_run)),
             patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
             patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),

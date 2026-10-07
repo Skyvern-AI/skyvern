@@ -33,9 +33,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_browser_profile_update": "e83c3227ef13e827bd0c7d6e23bb0e03fefe2fe83e73bfa4b3ca696d151b2b61",
     "skyvern_browser_session_close": "d0923948805b1bbccd7803df1a3748426263a8bf630cf9fcbee5a21f2f463825",
     "skyvern_browser_session_connect": "7c21d99fbb35dc0199e59367373387dca0e8f8d9dd4615303a3f09f579db2d06",
-    # Re-frozen for SKY-13272: `timeout` is now rejected above MAX_TIMEOUT instead of clamped, so the param
-    # description says "max 240" rather than "capped at 240". Description text only; the schema is unchanged.
-    "skyvern_browser_session_create": "6244d9614c04f403ee9db0c6b0cdee10f5be121cf85979b069a106044b08b161",
+    # Re-frozen for SKY-17978: adds the optional `browser_type` param the REST API and SDK already accept.
+    "skyvern_browser_session_create": "34ef250f51908bd925929f0fc9bd7097ac266982d1d9725fffa74ff9f9af704a",
     "skyvern_browser_session_get": "fdf579ac23ce28eea5e243a407a8f810fdcca6ed491c2da7fbe56836b1474109",
     "skyvern_browser_session_list": "dac429184440a1f76d2a787fb81793e37220408d749f0d3cacfbd29222e55f19",
     "skyvern_clear_local_storage": "8a6b80bfdbe3b1e2e36f7f485cb5bb7ff527594e37536816c2f6b614852078f5",
@@ -135,10 +134,11 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_workflow_get": "b9340c5d1cfa0db49431d4e914c0879f15e458d4c6d4879de0d0de653de842da",
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
     "skyvern_workflow_retry": "da8782d457ba3bcc8b87fffb90ce9dbc287943f28260816d699233a7427b6978",
-    "skyvern_workflow_run": "9a149c1cc66deb0afe879b00308aa6c750cfbf4a3fe4ed0af0d7eb307d8229cc",
-    # Re-frozen for SKY-14441: adds the optional `include_child_runs` param (default false, preserving the
-    # existing result set) and says in the description that child runs are excluded by default.
-    "skyvern_workflow_run_list": "5ed785968941b6b3ae3421d6d67ef15af365a2b59a9a1bd21c7bc54dff67e205",
+    # Re-frozen for SKY-17978: adds the optional `max_steps_override` and `ai_fallback` params the SDK accepts.
+    "skyvern_workflow_run": "4c5351d5dce73a8c4513d9ea7de548ccb74c6e6aa613ad2b382f0719a270ef76",
+    # Re-frozen for SKY-15975: the `search_key` description now names webhook callback URLs and the
+    # exact-match browser profile, browser session and credential IDs. Description text only.
+    "skyvern_workflow_run_list": "4e86472ab42dfd49f42bb882a6b966dde69ae34f9fa0cb603b25d84529e46333",
     "skyvern_workflow_status": "730fd46aae7cb9e974b631abdca8fdbc5c5c8a77917c22c3bd76735388103487",
     "skyvern_workflow_update": "3931c7a6b3faee202ebb57291fc2a437b838411ff0082be93d3763dbf727d060",
     "skyvern_workflow_update_folder": "52efdfa02cf84cb9995bfbeb6d00562fdd1364e832e297e853d233ff6f68392d",

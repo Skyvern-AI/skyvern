@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from structlog.testing import capture_logs
 from structlog.types import EventDict
@@ -28,11 +27,13 @@ from skyvern.forge.failure_classifier import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     Base,
     CredentialModel,
+    CredentialParameterModel,
     OrganizationModel,
     PersistentBrowserSessionModel,
     TaskModel,
@@ -50,31 +51,13 @@ from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsReposito
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 from skyvern.schemas.workflows import WorkflowRetryPolicy
-
-
-def _make_workflow_parameter(
-    key: str,
-    *,
-    workflow_parameter_type: WorkflowParameterType = WorkflowParameterType.STRING,
-    default_value: str | int | float | bool | dict | list | None = None,
-) -> WorkflowParameter:
-    now = datetime.now(tz=timezone.utc)
-    return WorkflowParameter(
-        workflow_parameter_id=f"wp_{key}",
-        workflow_id="wf_test",
-        key=key,
-        workflow_parameter_type=workflow_parameter_type,
-        default_value=default_value,
-        created_at=now,
-        modified_at=now,
-    )
 
 
 class _SessionContext:
@@ -146,6 +129,8 @@ def _workflow_run_model(
     organization_id: str = "org_test",
     sequential_credential_id: str | None = None,
     failure_category: list[dict[str, Any]] | None = None,
+    browser_profile_id: str | None = None,
+    webhook_callback_url: str | None = None,
 ) -> WorkflowRunModel:
     return WorkflowRunModel(
         workflow_run_id=workflow_run_id,
@@ -153,6 +138,8 @@ def _workflow_run_model(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
         browser_session_id=browser_session_id,
+        browser_profile_id=browser_profile_id,
+        webhook_callback_url=webhook_callback_url,
         debug_session_id=debug_session_id,
         status=status,
         sequential_key=sequential_key,
@@ -429,6 +416,11 @@ async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
     assert selected == ("cred_b" if rotates else "cred_a")
     actual_seed = (reopened.browser_profile_id, reopened.browser_seed_source, reopened.browser_sink_profile_id)
     assert actual_seed == ((None, None, None) if resets_seed else ("bp_a", seed_source, "bp_sink_a"))
+    if resets_seed:
+        async with sqlite_db.Session() as session:
+            completed_attempt = await session.get(WorkflowRunAttemptModel, ("wr_seed", 1))
+        assert completed_attempt is not None
+        assert completed_attempt.browser_profile_id == "bp_a"
 
 
 @pytest.mark.asyncio
@@ -881,48 +873,6 @@ def _persistent_browser_session_model(
         created_at=now,
         modified_at=now,
     )
-
-
-@pytest.mark.asyncio
-async def test_batch_create_uses_add_all_flush_commit_not_refresh() -> None:
-    """Batch insert should use add_all + flush + commit and never call refresh."""
-    tracked_models: list = []
-    session = MagicMock()
-    session.add_all = MagicMock(side_effect=lambda models: tracked_models.extend(models))
-
-    async def _flush() -> None:
-        now = datetime.now(tz=timezone.utc)
-        for model in tracked_models:
-            model.created_at = now
-
-    session.flush = AsyncMock(side_effect=_flush)
-    session.commit = AsyncMock()
-    session.refresh = AsyncMock()
-
-    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
-
-    string_param = _make_workflow_parameter("url")
-    int_param = _make_workflow_parameter("count", workflow_parameter_type=WorkflowParameterType.INTEGER)
-
-    created = await repo.create_workflow_run_parameters(
-        workflow_run_id="wr_test",
-        workflow_parameter_values=[
-            (string_param, "https://example.com"),
-            (int_param, "7"),
-        ],
-    )
-
-    session.add_all.assert_called_once()
-    session.flush.assert_awaited_once()
-    session.commit.assert_awaited_once()
-    session.refresh.assert_not_awaited()
-
-    assert [p.workflow_parameter_id for p in created] == [
-        string_param.workflow_parameter_id,
-        int_param.workflow_parameter_id,
-    ]
-    assert [p.value for p in created] == ["https://example.com", 7]
-    assert all(p.created_at is not None for p in created)
 
 
 # ── Infra-failure attribution write path (SKY-16588) ──────────────────────────
@@ -1959,65 +1909,7 @@ async def test_batch_create_with_empty_list_returns_empty() -> None:
     )
 
     assert result == []
-    session.add_all.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_batch_create_propagates_sqlalchemy_error_from_flush() -> None:
-    """When flush() raises an IntegrityError, it should propagate without being swallowed."""
-    db_error = IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed"))
-    session = MagicMock()
-    session.add_all = MagicMock()
-    session.flush = AsyncMock(side_effect=db_error)
-    session.commit = AsyncMock()
-
-    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
-
-    param = _make_workflow_parameter("url")
-
-    with pytest.raises(IntegrityError) as exc_info:
-        await repo.create_workflow_run_parameters(
-            workflow_run_id="wr_test",
-            workflow_parameter_values=[(param, "https://example.com")],
-        )
-
-    assert exc_info.value is db_error
-    session.add_all.assert_called_once()
-    session.flush.assert_awaited_once()
-    # commit should NOT be called when flush fails
-    session.commit.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_batch_create_propagates_sqlalchemy_error_from_commit() -> None:
-    """When commit() raises an IntegrityError, it should propagate without being swallowed."""
-    db_error = IntegrityError("INSERT", {}, Exception("FK constraint failed"))
-    tracked_models: list = []
-
-    session = MagicMock()
-    session.add_all = MagicMock(side_effect=lambda models: tracked_models.extend(models))
-
-    async def _flush() -> None:
-        now = datetime.now(tz=timezone.utc)
-        for model in tracked_models:
-            model.created_at = now
-
-    session.flush = AsyncMock(side_effect=_flush)
-    session.commit = AsyncMock(side_effect=db_error)
-
-    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
-
-    param = _make_workflow_parameter("url")
-
-    with pytest.raises(IntegrityError) as exc_info:
-        await repo.create_workflow_run_parameters(
-            workflow_run_id="wr_test",
-            workflow_parameter_values=[(param, "https://example.com")],
-        )
-
-    assert exc_info.value is db_error
-    session.flush.assert_awaited_once()
-    session.commit.assert_awaited_once()
+    session.execute.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2091,6 +1983,411 @@ async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
     assert "extra_http_headers" in primary_where
     # Param search must not drag workflows.title into the primary query (no implicit FROM workflows).
     assert ".".join(("workflows", "title")) not in primary_where
+
+
+# SKY-15975: every run-level identifier a power user has in hand must find its run. Each term is
+# unique to exactly one seeded run, so an over-broad clause fails the same assertion an absent one does;
+# the pool and fallback workflows each carry a sibling run whose recorded selection replaced the
+# definition's credential, so matching the definition alone returns two runs and fails. wr_mentions_ids
+# only mentions a profile and a session id in its webhook URL, so a substring arm on those ids fails too.
+_RUN_IDENTIFIER_SEARCH_CASES = (
+    ("hooks.example.com/notify", "wr_webhook"),
+    ("bp_1001", "wr_profile"),
+    ("pbs_1002", "wr_session"),
+    ("cred_1003", "wr_sequential_credential"),
+    ("cred_1004", "wr_selected_credential"),
+    ("cred_1005", "wr_bound_credential"),
+    ("cred_1006", "wr_pool_primary"),
+    ("cred_1007", "wr_pool_member"),
+    ("cred_1008", "wr_fallback_primary"),
+    ("cred_1009", "wr_fallback_retry"),
+    ("cred_1010", "wr_selected_credential"),
+    ("pbs_1011", "wr_previous_session"),
+    ("pbs_1012", "wr_previous_session"),
+    ("bp_1015", "wr_previous_profile"),
+    ("cred_1016", "wr_two_parameters"),
+    ("cred_1017", "wr_two_parameters"),
+)
+
+
+def _credential_selection(workflow_run_id: str, credential_id: str) -> WorkflowRunCredentialSelectionModel:
+    return WorkflowRunCredentialSelectionModel(
+        organization_id="org_test",
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id="wpid_test",
+        parameter_key="login",
+        credential_id=credential_id,
+    )
+
+
+async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool) -> None:
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    workflow_ids = ("wf_test", "wf_single", "wf_pool", "wf_fallback", "wf_two_parameters")
+    bound_at = created_at - timedelta(days=1)
+    runs = [
+        _workflow_run_model(
+            workflow_run_id="wr_webhook",
+            queued_at=created_at,
+            webhook_callback_url="https://hooks.example.com/notify",
+        ),
+        _workflow_run_model(
+            workflow_run_id="wr_mentions_ids",
+            queued_at=created_at,
+            webhook_callback_url="https://hooks.example.com/bp_1001/pbs_1002",
+        ),
+        _workflow_run_model(workflow_run_id="wr_profile", queued_at=created_at, browser_profile_id="bp_1001"),
+        _workflow_run_model(workflow_run_id="wr_session", queued_at=created_at, browser_session_id="pbs_1002"),
+        _workflow_run_model(
+            workflow_run_id="wr_sequential_credential",
+            queued_at=created_at,
+            sequential_credential_id="cred_1003",
+        ),
+        _workflow_run_model(workflow_run_id="wr_selected_credential", queued_at=created_at),
+        _workflow_run_model(workflow_run_id="wr_previous_session", queued_at=created_at, browser_session_id="pbs_1013"),
+        _workflow_run_model(workflow_run_id="wr_previous_profile", queued_at=created_at, browser_profile_id="bp_1014"),
+        _workflow_run_model(workflow_run_id="wr_bound_credential", queued_at=created_at, workflow_id="wf_single"),
+        _workflow_run_model(workflow_run_id="wr_pool_primary", queued_at=created_at, workflow_id="wf_pool"),
+        _workflow_run_model(workflow_run_id="wr_pool_member", queued_at=created_at, workflow_id="wf_pool"),
+        _workflow_run_model(workflow_run_id="wr_fallback_primary", queued_at=created_at, workflow_id="wf_fallback"),
+        _workflow_run_model(workflow_run_id="wr_fallback_retry", queued_at=created_at, workflow_id="wf_fallback"),
+        _workflow_run_model(workflow_run_id="wr_two_parameters", queued_at=created_at, workflow_id="wf_two_parameters"),
+    ]
+
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                WorkflowModel(
+                    workflow_id=workflow_id,
+                    workflow_permanent_id="wpid_test",
+                    title="identifier fixture",
+                    workflow_definition={},
+                    version=version,
+                )
+                for version, workflow_id in enumerate(workflow_ids, start=1)
+            ]
+        )
+        session.add_all(runs)
+        await session.flush()
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id="wr_previous_profile",
+                attempt_number=1,
+                organization_id="org_test",
+                status="failed",
+                browser_profile_id="bp_1015",
+            )
+        )
+        if with_task_runs:
+            session.add_all(
+                [
+                    _task_run_model(
+                        run_id=run.workflow_run_id,
+                        created_at=created_at,
+                        workflow_permanent_id="wpid_test",
+                    )
+                    for run in runs
+                ]
+            )
+        session.add_all(
+            [
+                _credential_selection("wr_selected_credential", "cred_1004"),
+                _credential_selection("wr_selected_credential:attempt:1", "cred_1010"),
+                _credential_selection("wr_pool_primary", "cred_1006"),
+                _credential_selection("wr_pool_member", "cred_1007"),
+                _credential_selection("wr_fallback_retry", "cred_1009"),
+                _credential_selection("wr_two_parameters", "cred_1017"),
+            ]
+        )
+        session.add_all(
+            [
+                TaskModel(
+                    task_id="tsk_previous_session",
+                    organization_id="org_test",
+                    workflow_run_id="wr_previous_session",
+                    status="completed",
+                    browser_session_id="pbs_1011",
+                ),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_previous_session",
+                    organization_id="org_test",
+                    workflow_run_id="wr_previous_session",
+                    browser_session_id="pbs_1012",
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                CredentialParameterModel(
+                    workflow_id="wf_single", key="login", credential_id="cred_1005", created_at=bound_at
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_pool",
+                    key="login",
+                    credential_id="cred_1006",
+                    credential_ids=["cred_1006", "cred_1007"],
+                    created_at=bound_at,
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_fallback",
+                    key="login",
+                    credential_id="cred_1008",
+                    fallback_credential_ids=["cred_1009"],
+                    created_at=bound_at,
+                ),
+                # The selection above overrides only "login"; "backup_login" still binds the same credential.
+                CredentialParameterModel(
+                    workflow_id="wf_two_parameters", key="login", credential_id="cred_1016", created_at=bound_at
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_two_parameters", key="backup_login", credential_id="cred_1016", created_at=bound_at
+                ),
+            ]
+        )
+        await session.commit()
+
+
+@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_search_key_matches_run_identifiers(
+    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=True)
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+
+    assert {row["run_id"] for row in rows} == {expected_run_id}
+
+
+@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
+@pytest.mark.asyncio
+async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_run_identifiers(
+    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+) -> None:
+    # Covers the shared WorkflowRunModel filter behind the per-workflow runs table, /workflows/runs,
+    # and the orphan fallback leg of the global runs list.
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+
+    runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        search_key=search_key,
+    )
+
+    assert {run.workflow_run_id for run in runs} == {expected_run_id}
+
+
+@pytest.mark.asyncio
+async def test_credential_search_follows_an_in_place_definition_edit(sqlite_db: AgentDB) -> None:
+    # An in-place edit rebinds a workflow version without creating a new one, so each run has to match
+    # the credential its version was bound to when that run was created.
+    bound_at = datetime(2026, 7, 20, 12, 0)
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                WorkflowModel(
+                    workflow_id="wf_edited",
+                    organization_id="org_test",
+                    workflow_permanent_id="wpid_test",
+                    title="edited in place",
+                    workflow_definition={},
+                    version=1,
+                ),
+                CredentialParameterModel(
+                    credential_parameter_id="cp_login",
+                    workflow_id="wf_edited",
+                    key="login",
+                    credential_id="cred_2001",
+                    created_at=bound_at,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_before_edit", queued_at=bound_at + timedelta(hours=1), workflow_id="wf_edited"
+                ),
+            ]
+        )
+        await session.commit()
+
+    await sqlite_db.workflows.update_workflow_and_reconcile_definition_params(
+        workflow_id="wf_edited",
+        workflow_definition=WorkflowDefinition(
+            parameters=[
+                CredentialParameter(
+                    credential_parameter_id="cp_login",
+                    workflow_id="wf_edited",
+                    key="login",
+                    credential_id="cred_2002",
+                    created_at=bound_at,
+                    modified_at=bound_at,
+                )
+            ],
+            blocks=[],
+        ),
+    )
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_after_edit", queued_at=naive_utc_now() + timedelta(hours=1), workflow_id="wf_edited"
+            )
+        )
+        await session.commit()
+
+    for search_key, expected_run_id in (("cred_2001", "wr_before_edit"), ("cred_2002", "wr_after_edit")):
+        runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_test",
+            search_key=search_key,
+        )
+        assert {run.workflow_run_id for run in runs} == {expected_run_id}, search_key
+
+
+@pytest.mark.parametrize(
+    ("search_key", "expected_run_id"),
+    [("cred_1003", "wr_sequential_credential"), ("bp_1001", "wr_profile"), ("pbs_1002", "wr_session")],
+)
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_search_excludes_unmatched_standalone_tasks(
+    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    async with sqlite_db.Session() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_noise",
+                organization_id="org_test",
+                status="completed",
+                title="Unrelated task",
+                url="https://example.com/other",
+                created_at=datetime(2026, 7, 21, 12, 0),
+            )
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key=search_key, page_size=1)
+
+    assert [getattr(run, "workflow_run_id", None) for run in runs] == [expected_run_id]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_search_matches_standalone_browser_session(sqlite_db: AgentDB) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                TaskModel(
+                    task_id="tsk_session",
+                    organization_id="org_test",
+                    status="completed",
+                    browser_session_id="pbs_3001",
+                    url="https://example.com/session",
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+                TaskModel(
+                    task_id="tsk_noise",
+                    organization_id="org_test",
+                    status="completed",
+                    browser_session_id="pbs_3002",
+                    url="https://example.com/other",
+                    created_at=datetime(2026, 7, 21, 12, 0),
+                ),
+            ]
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key="pbs_3001", page_size=1)
+
+    assert [getattr(run, "task_id", None) for run in runs] == ["tsk_session"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_webhook_search_excludes_unmatched_standalone_tasks(sqlite_db: AgentDB) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    async with sqlite_db.Session() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_noise",
+                organization_id="org_test",
+                status="completed",
+                title="Unrelated task",
+                url="https://example.com/other",
+                created_at=datetime(2026, 7, 21, 12, 0),
+            )
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(
+        organization_id="org_test", search_key="hooks.example.com/notify", page_size=1
+    )
+
+    assert [getattr(run, "workflow_run_id", None) for run in runs] == ["wr_webhook"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_legacy_free_text_matches_standalone_task_title(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                TaskModel(
+                    task_id="tsk_match",
+                    organization_id="org_test",
+                    status="completed",
+                    title="Invoice check",
+                    url="https://example.com/invoice",
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+                TaskModel(
+                    task_id="tsk_noise",
+                    organization_id="org_test",
+                    status="completed",
+                    title="Unrelated task",
+                    url="https://example.com/other",
+                    created_at=datetime(2026, 7, 21, 12, 0),
+                ),
+            ]
+        )
+        await session.commit()
+
+    runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key="Invoice", page_size=1)
+
+    assert [getattr(run, "task_id", None) for run in runs] == ["tsk_match"]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_search_key_matches_standalone_task_browser_session(sqlite_db: AgentDB) -> None:
+    # task_v1/task_v2 rows join workflow_runs as NULL, so their session id has to come from the task row.
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add_all(
+            [
+                _task_run_model(
+                    run_id="tsk_1", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v1"
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_1", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v2"
+                ),
+                _task_run_model(
+                    run_id="tsk_2", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v1"
+                ),
+                TaskModel(
+                    task_id="tsk_1", organization_id="org_test", status="completed", browser_session_id="pbs_3001"
+                ),
+                TaskModel(
+                    task_id="tsk_2", organization_id="org_test", status="completed", browser_session_id="pbs_3003"
+                ),
+                TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", browser_session_id="pbs_3002"),
+            ]
+        )
+        await session.commit()
+
+    for search_key, expected in (("pbs_3001", "tsk_1"), ("pbs_3002", "tsk_v2_1")):
+        rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+        assert {row["run_id"] for row in rows} == {expected}
 
 
 @pytest.mark.asyncio
@@ -3971,3 +4268,160 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
         "wr_member": "user_member",
         "tsk_v2_1": "user_prompter",
     }
+
+
+@pytest.mark.asyncio
+async def test_browser_session_metadata_query_is_select_only_scoped_and_includes_copilot_children():
+    session = MagicMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    session.execute = AsyncMock(return_value=result)
+    repo = SimpleNamespace(
+        Session=lambda: _SessionContext(session),
+        _indexed_identifier_run_ids=WorkflowRunsRepository._indexed_identifier_run_ids,
+    )
+    rows = await WorkflowRunsRepository.get_workflow_metadata_for_browser_session(repo, "pbs_123", "org_1")
+    assert rows == []
+    query = session.execute.call_args.args[0]
+    sql = str(query.compile(compile_kwargs={"literal_binds": True}))
+    assert sql.startswith("SELECT ") and "LIMIT 101" in sql
+    assert "workflow_runs.organization_id = 'org_1'" in sql
+    assert "browser_session_id = 'pbs_123'" in sql
+    assert "copilot_session_id IS NULL" not in sql and "parent_workflow_run_id IS NULL" not in sql
+    assert "tasks.browser_session_id" in sql and "observer_cruises.browser_session_id" in sql
+    assert "workflow_run_attempts.pinned_browser_session_id = 'pbs_123'" in sql
+    assert "workflow_run_attempts.organization_id = 'org_1'" in sql
+    assert set(query.selected_columns.keys()) == {
+        "workflow_run_id",
+        "organization_id",
+        "browser_session_id",
+        "workflow_permanent_id",
+        "copilot_session_id",
+        "status",
+        "created_at",
+        "finished_at",
+        "credits_used",
+        "cached_credits_used",
+    }
+    session.commit.assert_not_called()
+    session.flush.assert_not_called()
+    session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provider_call(
+    sqlite_db, sqlite_engine, monkeypatch
+):
+    from skyvern.forge.sdk.routes import browser_sessions as browser_routes
+
+    now = datetime(2026, 10, 7, 9, 13, tzinfo=UTC)
+    copilot = _workflow_run_model(
+        workflow_run_id="wr_201", queued_at=now, browser_session_id="pbs_123", status="paused"
+    )
+    copilot.copilot_session_id = "wcc_201"
+    copilot.credits_used = 7
+    child = _workflow_run_model(workflow_run_id="wr_202", queued_at=now, browser_session_id="pbs_456")
+    child.parent_workflow_run_id = "wr_201"
+    pinned = _workflow_run_model(workflow_run_id="wr_204", queued_at=now, browser_session_id=None, status="paused")
+    pinned.copilot_session_id = "wcc_204"
+    pinned.credits_used = 9
+    foreign = _workflow_run_model(
+        workflow_run_id="wr_203", queued_at=now, browser_session_id="pbs_123", organization_id="org_other"
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                OrganizationModel(organization_id=org, organization_name="Test Organization")
+                for org in ("org_test", "org_other")
+            ]
+        )
+        await session.flush()
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_test",
+                workflow_permanent_id="wpid_test",
+                title="metadata fixture",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        await session.flush()
+        session.add_all([copilot, child, foreign, pinned])
+        await session.flush()
+        session.add_all(
+            [
+                PersistentBrowserSessionModel(
+                    persistent_browser_session_id="pbs_123",
+                    organization_id="org_test",
+                    status="retry",
+                    created_at=now,
+                    modified_at=now,
+                    timeout_minutes=30,
+                    runnable_id="wr_201",
+                    browser_address="PRIVATE_TRANSPORT",
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_204",
+                    organization_id="org_test",
+                    attempt_number=1,
+                    status="paused",
+                    pinned_browser_session_id="pbs_123",
+                ),
+                TaskModel(
+                    task_id="tsk_202",
+                    organization_id="org_test",
+                    workflow_run_id="wr_202",
+                    browser_session_id="pbs_123",
+                    status="completed",
+                    url="https://example.invalid/",
+                ),
+            ]
+        )
+        await session.commit()
+    statements = []
+
+    def forbid_write(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+        assert statement.lstrip().upper().startswith("SELECT"), "Metadata must not write database state"
+
+    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)
+
+    class Forbidden:
+        def __getattr__(self, name):
+            raise AssertionError("Metadata must not call lifecycle, Temporal, transport or provider functions")
+
+    monkeypatch.setattr(
+        browser_routes,
+        "app",
+        SimpleNamespace(
+            DATABASE=sqlite_db,
+            PERSISTENT_SESSIONS_MANAGER=Forbidden(),
+            WORKFLOW_SERVICE=Forbidden(),
+            STORAGE=Forbidden(),
+            AGENT_FUNCTION=Forbidden(),
+        ),
+    )
+    try:
+        response = await browser_routes.get_browser_session_metadata(
+            "pbs_123", current_org=SimpleNamespace(organization_id="org_test")
+        )
+        assert response.status == "retry" and response.completed_at is None
+        assert {run.workflow_run_id for run in response.associated_workflow_runs} == {"wr_201", "wr_202", "wr_204"}
+        by_id = {run.workflow_run_id: run for run in response.associated_workflow_runs}
+        assert by_id["wr_201"].copilot_session_id == "wcc_201" and by_id["wr_201"].status == "paused"
+        assert by_id["wr_201"].credits_used == 7
+        assert (
+            by_id["wr_202"].browser_session_id == "pbs_456"
+            and by_id["wr_202"].association_browser_session_id == "pbs_123"
+        )
+        assert (
+            by_id["wr_204"].browser_session_id is None and by_id["wr_204"].association_browser_session_id == "pbs_123"
+        )
+        assert by_id["wr_204"].status == "paused" and by_id["wr_204"].credits_used == 9
+        assert response.association_index_complete is True and "PRIVATE_" not in response.model_dump_json()
+        async with sqlite_db.Session() as session:
+            after = await session.get(PersistentBrowserSessionModel, "pbs_123")
+            assert after.status == "retry" and after.completed_at is None and after.timeout_minutes == 30
+        assert statements
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)

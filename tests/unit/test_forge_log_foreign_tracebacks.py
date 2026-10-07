@@ -27,6 +27,7 @@ _MAX_EMITTED_JSON_BYTES = 64 * 1024
 @pytest.fixture
 def json_stream(monkeypatch: pytest.MonkeyPatch) -> Iterator[io.StringIO]:
     monkeypatch.setattr(settings, "JSON_LOGGING", True)
+    structlog_config = structlog.get_config()
     setup_logger()
     handler = logging.getLogger().handlers[0]
     assert isinstance(handler, logging.StreamHandler)
@@ -36,6 +37,9 @@ def json_stream(monkeypatch: pytest.MonkeyPatch) -> Iterator[io.StringIO]:
         yield stream
     finally:
         handler.setStream(previous)
+        # monkeypatch puts JSON_LOGGING back, so a JSON-mode processor chain left installed no longer
+        # matches the setting; a logger that derives its chain from both then renames `event` twice.
+        structlog.configure(**structlog_config)
 
 
 def _raise_through_wrapper() -> None:

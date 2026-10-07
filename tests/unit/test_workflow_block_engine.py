@@ -58,10 +58,17 @@ from skyvern.forge.sdk.workflow.models.block import (
     v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
-from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.forge.sdk.workflow.service import WorkflowService, workflow_definitions_differ
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.forge.taskv3.goal_composition import render_block_context
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.schemas.workflows import BlockResult, BlockType, NavigationBlockYAML, WorkflowStatus
+from skyvern.schemas.workflows import (
+    BlockResult,
+    BlockType,
+    NavigationBlockYAML,
+    WorkflowDefinitionYAML,
+    WorkflowStatus,
+)
 from skyvern.services import script_service
 from tests.unit._workflow_block_engine_fakes import (
     WORKFLOW_BLOCK_ENGINE_APP_TARGET,
@@ -517,6 +524,7 @@ async def _persisted_engine_from_execute_workflow_blocks(
     billing_tier: BillingTier = BillingTier.UNKNOWN,
     first_version_created_at: datetime | None = None,
     trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
+    block: BaseTaskBlock | None = None,
 ) -> RunEngine:
     """Drives the real WorkflowService._execute_workflow_blocks -> _execute_single_block ->
     Block.execute_safe chain for a single eligible TaskBlock and returns the engine it persisted,
@@ -532,11 +540,9 @@ async def _persisted_engine_from_execute_workflow_blocks(
         AsyncMock(return_value=first_version_created_at),
     )
 
-    block = _make_block(TaskBlock, label="e2e_block")
+    block = block or _make_block(TaskBlock, label="e2e_block")
     workflow = MagicMock()
-    workflow.workflow_definition.blocks = [block]
-    workflow.workflow_definition.version = 1
-    workflow.workflow_definition.finally_block_label = None
+    workflow.workflow_definition = WorkflowDefinition(parameters=[], blocks=[block])
     workflow.status = workflow_status
 
     workflow_run = MagicMock()
@@ -869,8 +875,8 @@ async def test_branch_eval_synthetic_block_honors_v3_override(scoped_context: Sk
 
 @pytest.mark.asyncio
 async def test_branch_eval_synthetic_block_gets_no_extraction_report_framing(scoped_context: SkyvernContext) -> None:
-    """The branch evaluator's block follows the run's arm and has no navigation goal, so without its marker the
-    TASK_V3_EXTRACTION_REPORTS framing ("absent fields are null, finish completed") would reach it. Its own prompt
+    """The branch evaluator's block has no navigation goal, so without its marker the extraction-report
+    framing ("absent fields are null, finish completed") would reach it. Its own prompt
     judges conditions from their text, and a null result parses as False: a silently wrong branch (SKY-16398)."""
     scoped_context.workflow_block_engine_resolved_run_id = "wr_branch_eval_framing"
     scoped_context.workflow_block_engine_override = RunEngine.skyvern_v3
@@ -902,7 +908,7 @@ async def test_branch_eval_synthetic_block_gets_no_extraction_report_framing(sco
     (block,) = captured
     now = datetime.now(UTC)
     task = make_task(now, make_organization(now), navigation_goal=None, data_extraction_goal=block.data_extraction_goal)
-    assert render_block_context(task, block, None, extraction_reports=True) == render_block_context(task, block, None)
+    assert "This block only reads the page" not in render_block_context(task, block)
 
 
 @pytest.mark.asyncio
@@ -1637,3 +1643,72 @@ async def test_effective_default_engine_follows_the_chosen_engine_cutoff(
         # With no flag provider the resolver never applies the rule, so the editor must not claim it.
         mock_app.EXPERIMENTATION_PROVIDER = NoOpExperimentationProvider()
         assert await effective_default_engine("wpid_1", "org_1") is None
+
+
+@pytest.mark.parametrize(
+    ("engine", "pinned", "born_at", "expected_engine", "expected_reason", "expected_pins"),
+    [
+        # An older workflow's unmarked skyvern-1.0 is usually the old editor's Default and stays in the A/B.
+        (RunEngine.skyvern_v1, False, _BEFORE, RunEngine.skyvern_v3, _R.flag_bucket_treatment, 0),
+        (RunEngine.skyvern_v1, True, _BEFORE, RunEngine.skyvern_v1, _R.pinned_v1_engine, 1),
+        (None, False, _BEFORE, RunEngine.skyvern_v3, _R.flag_bucket_treatment, 0),
+        (RunEngine.skyvern_v3, False, _BEFORE, RunEngine.skyvern_v3, _R.ineligible, 0),
+        (RunEngine.skyvern_v1, True, _AFTER, RunEngine.skyvern_v1, _R.chosen_engine, 1),
+    ],
+)
+@pytest.mark.asyncio
+async def test_only_a_pinned_skyvern_v1_leaves_the_ab_on_an_older_workflow(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: RunEngine | None,
+    pinned: bool,
+    born_at: datetime,
+    expected_engine: RunEngine,
+    expected_reason: WorkflowBlockEngineRouteReason,
+    expected_pins: int,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", CHOSEN_ENGINE_CUTOFF)
+    block = _make_block(TaskBlock, label="e2e_block", engine=engine, engine_pinned=pinned)
+    with patch("skyvern.forge.sdk.experimentation.workflow_block_engine.LOG") as mock_log:
+        persisted = await _persisted_engine_from_execute_workflow_blocks(
+            monkeypatch,
+            FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True}),
+            first_version_created_at=born_at,
+            block=block,
+        )
+
+    assert persisted == expected_engine
+    log = mock_log.info.call_args.kwargs
+    assert log["route_reason"] == expected_reason
+    assert log.get("pinned_v1_blocks", 0) == expected_pins
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"block_type": "navigation", "navigation_goal": "Go"},
+        {"block_type": "task", "navigation_goal": "Go"},
+        {"block_type": "action", "navigation_goal": "Go"},
+        {"block_type": "extraction", "data_extraction_goal": "Read"},
+        {"block_type": "login", "navigation_goal": "Go"},
+        {"block_type": "file_download", "navigation_goal": "Go"},
+        {"block_type": "validation", "complete_criterion": "Done"},
+    ],
+    ids=lambda block: block["block_type"],
+)
+def test_a_pinned_skyvern_v1_survives_the_stored_definition_and_counts_as_a_change(block: dict[str, str]) -> None:
+    def definition(pinned: bool) -> Any:
+        nav = {**block, "label": "nav", "url": "https://example.com"}
+        yaml = WorkflowDefinitionYAML.model_validate(
+            {"parameters": [], "blocks": [{**nav, "engine": "skyvern-1.0", "engine_pinned": pinned}]}
+        )
+        return convert_workflow_definition(yaml, "w_test")
+
+    pinned, unmarked = definition(True), definition(False)
+    stored = pinned.model_dump(mode="json")["blocks"][0]
+
+    assert stored["engine_pinned"] is True
+    assert "engine_pinned" not in unmarked.model_dump(mode="json")["blocks"][0]
+    assert WorkflowDefinition.model_validate(pinned.model_dump(mode="json")).blocks[0].engine_pinned is True
+    # Before the cutoff an unmarked skyvern-1.0 and an unset engine compare alike; a pin must not.
+    assert workflow_definitions_differ(unmarked, pinned)

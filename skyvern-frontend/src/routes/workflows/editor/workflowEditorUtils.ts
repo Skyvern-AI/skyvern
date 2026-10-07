@@ -2,6 +2,7 @@ import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
+import type { QueryClient } from "@tanstack/react-query";
 import {
   applyNodeChanges,
   applyEdgeChanges,
@@ -35,6 +36,7 @@ import {
   BranchCriteriaTypes,
   debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
+  type BranchCondition,
   type BranchCriteriaType,
   type OutputParameter,
   type Parameter,
@@ -91,7 +93,11 @@ import {
   codeBlockNodeDefaultData,
   type CodeBlockNodeData,
 } from "./nodes/CodeBlockNode/types";
-import type { PendingGoalChange } from "@/store/useCopilotActionStore";
+import type {
+  CodeEditedBlock,
+  GoalSuggestion,
+  PendingGoalChange,
+} from "@/store/useCopilotActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -693,16 +699,81 @@ function declaredSmtpParameterKey(
   return parameter.key;
 }
 
-// A stored skyvern-1.0 is only a pin where the workflow honours chosen engines; elsewhere it is the
-// routed Default. `undefined` means the workflow's semantics are unknown, so the stored engine is kept.
+// A stored skyvern-1.0 is a pin where the workflow honours chosen engines or a person marked it; elsewhere
+// it is the routed Default. `undefined` means the workflow's semantics are unknown, so the engine is kept.
 function blockEngineForWorkflow(
   engine: RunEngine | null | undefined,
   effectiveDefaultEngine: RunEngine | null | undefined,
+  enginePinned: boolean = false,
 ): RunEngine | null {
-  if (engine === RunEngine.SkyvernV1 && effectiveDefaultEngine === null) {
+  if (
+    engine === RunEngine.SkyvernV1 &&
+    !enginePinned &&
+    effectiveDefaultEngine === null
+  ) {
     return null;
   }
   return engine ?? null;
+}
+
+// Only the detail GET computes effective_default_engine; save responses and version listings omit it. It is a
+// property of the workflow rather than the version, so the cached detail answers for any version of it.
+function workflowEffectiveDefaultEngine(
+  workflow: Pick<
+    WorkflowApiResponse,
+    "workflow_permanent_id" | "effective_default_engine"
+  >,
+  queryClient: QueryClient,
+): RunEngine | null | undefined {
+  if ("effective_default_engine" in workflow) {
+    return workflow.effective_default_engine;
+  }
+  return queryClient.getQueryData<WorkflowApiResponse>([
+    "workflow",
+    workflow.workflow_permanent_id,
+  ])?.effective_default_engine;
+}
+
+type EngineBearingBlock = {
+  engine: RunEngine | null;
+  engine_pinned?: boolean;
+};
+
+function blockEngineNodeData(
+  block: EngineBearingBlock,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  return {
+    engine: blockEngineForWorkflow(
+      block.engine,
+      effectiveDefaultEngine,
+      block.engine_pinned,
+    ),
+    enginePinned: block.engine_pinned ?? false,
+  };
+}
+
+// The marker is written only beside skyvern-1.0, and only when set, so an unmarked block's YAML is unchanged.
+function engineYAML(engine: RunEngine | null, enginePinned?: boolean) {
+  return {
+    engine,
+    ...(enginePinned &&
+      engine === RunEngine.SkyvernV1 && { engine_pinned: true }),
+  };
+}
+
+function blockEngineYAML(
+  block: EngineBearingBlock,
+  effectiveDefaultEngine: RunEngine | null | undefined,
+) {
+  return engineYAML(
+    blockEngineForWorkflow(
+      block.engine,
+      effectiveDefaultEngine,
+      block.engine_pinned,
+    ),
+    block.engine_pinned,
+  );
 }
 
 function convertToNode(
@@ -777,7 +848,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -825,7 +896,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -846,7 +917,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -871,7 +942,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           legacyV2Available: isV2Engine,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
@@ -921,7 +992,7 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           exportEnabled: block.export_enabled ?? false,
           exportDataSchema:
             block.export_data_schema == null
@@ -952,7 +1023,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
         },
       };
     }
@@ -996,7 +1067,7 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineNodeData(block, effectiveDefaultEngine),
           downloadTimeout: block.download_timeout ?? null, // seconds
           downloadTarget: block.download_target ?? "website",
           path: block.path ?? "{{ workflow_run_id }}",
@@ -1047,6 +1118,7 @@ function convertToNode(
                 : JSON.stringify(block.data_schema, null, 2),
           userOwnedGoal: block.user_owned_goal ?? null,
           goalNeedsRegeneration: block.goal_needs_regeneration ?? null,
+          codeEditedByHand: block.code_edited_by_hand ?? null,
         },
       };
     }
@@ -1425,12 +1497,18 @@ function convertToNode(
   }
 }
 
+function isTargetlessElse(branch: BranchCondition): boolean {
+  return branch.is_default && !branch.next_block_label;
+}
+
 function serializeConditionalBlock(
   node: ConditionalNode,
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): ConditionalBlockYAML {
   const mergeLabel = findConditionalMergeLabel(node, nodes, edges) ?? null;
+  const mergeIsInferred =
+    mergeLabel !== null && mergeLabel === node.data.inferredMergeLabel;
 
   const branchConditions = node.data.branches.map((branch) => {
     const orderedNodes = getConditionalBranchNodeSequence(
@@ -1439,7 +1517,23 @@ function serializeConditionalBlock(
       nodes,
       edges,
     );
-    const nextBlockLabel = orderedNodes[0]?.data.label ?? mergeLabel ?? null;
+    // A branch that owns no blocks keeps the target it was loaded with when
+    // another branch of this same conditional owns that block (for example a
+    // shared first block), so the target can never point outside this subtree.
+    const loadedTarget =
+      branch.next_block_label &&
+      nodes.some(
+        (n) =>
+          isWorkflowBlockNode(n) &&
+          n.data.label === branch.next_block_label &&
+          n.data.conditionalNodeId === node.id,
+      )
+        ? branch.next_block_label
+        : null;
+    const nextBlockLabel =
+      orderedNodes[0]?.data.label ??
+      loadedTarget ??
+      (mergeIsInferred && isTargetlessElse(branch) ? null : mergeLabel);
 
     return {
       ...branch,
@@ -1456,7 +1550,9 @@ function serializeConditionalBlock(
     block_type: "conditional",
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
-    next_block_label: mergeLabel,
+    // An inferred merge point is not written back: the backend routes to the
+    // conditional's own next_block_label when no branch target applies.
+    next_block_label: mergeIsInferred ? null : mergeLabel,
     branch_conditions: branchConditions,
   };
 }
@@ -1839,6 +1935,60 @@ function labelsAtOrBeforeConditional(
   return result;
 }
 
+// A conditional with no next_block_label whose branches all converge on one
+// block gets that block as its editor merge point, so each branch keeps only
+// its own chain instead of the last branch walk claiming the shared tail.
+// An Else with no target (including the one the editor adds on open) neither
+// blocks convergence nor takes the merge on save.
+function inferConditionalMergeLabels(
+  blocks: Array<WorkflowBlock>,
+  blocksByLabel: Map<string, WorkflowBlock>,
+  finallyBlockLabel: string | null,
+  inferred: Map<string, string>,
+): Array<WorkflowBlock> {
+  return blocks.map((block) => {
+    if (isNestedLoopWorkflowBlock(block)) {
+      return {
+        ...block,
+        loop_blocks: inferConditionalMergeLabels(
+          block.loop_blocks,
+          blocksByLabel,
+          finallyBlockLabel,
+          inferred,
+        ),
+      } as WorkflowBlock;
+    }
+    if (block.block_type !== "conditional" || block.next_block_label) {
+      return block;
+    }
+    const excludeLabels = labelsAtOrBeforeConditional(block.label, blocks);
+    const chains = block.branch_conditions
+      .filter((branch) => !isTargetlessElse(branch))
+      .map((branch) =>
+        collectLabelsForBranch(
+          branch.next_block_label,
+          null,
+          blocksByLabel,
+          finallyBlockLabel,
+          excludeLabels,
+        ),
+      );
+    if (chains.length < 2) {
+      return block;
+    }
+    const join = chains[0]!.find((label) =>
+      chains.every((chain) => chain.includes(label)),
+    );
+    if (!join) {
+      return block;
+    }
+    inferred.set(block.label, join);
+    const withMerge = { ...block, next_block_label: join };
+    blocksByLabel.set(block.label, withMerge);
+    return withMerge;
+  });
+}
+
 /**
  * Reconstructs the proper hierarchical structure for conditional blocks from a flat blocks array.
  * This is the deserialization counterpart to the edge-based serialization logic.
@@ -2151,7 +2301,15 @@ function findConditionalMergeLabel(
     edges,
   );
   if (!mergeTargetId) {
-    return null;
+    // A conditional ending an enclosing branch keeps its loaded merge when
+    // that is where the enclosing branch continues.
+    const parentId = conditionalNode.data.conditionalNodeId;
+    const loadedMerge = conditionalNode.data.mergeLabel;
+    return loadedMerge &&
+      parentId &&
+      findNextBlockLabel(parentId, nodes, edges) === loadedMerge
+      ? loadedMerge
+      : null;
   }
   const targetNode = nodes.find(
     (node) => node.id === mergeTargetId && isWorkflowBlockNode(node),
@@ -2258,6 +2416,19 @@ function getElements(
     }
   }
 
+  const inferredMergeLabels = new Map<string, string>();
+  // An outer conditional's branches only reach the shared join once a nested
+  // conditional's own merge is inferred, so repeat until nothing new is found.
+  for (let found = -1; found !== inferredMergeLabels.size; ) {
+    found = inferredMergeLabels.size;
+    blocks = inferConditionalMergeLabels(
+      blocks,
+      buildLabelToBlockMap(blocks),
+      settings.finallyBlockLabel ?? null,
+      inferredMergeLabels,
+    );
+  }
+
   const data = generateNodeData(blocks);
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
@@ -2322,6 +2493,10 @@ function getElements(
       editable,
       effectiveDefaultEngine,
     );
+    if (isConditionalNode(node)) {
+      node.data.inferredMergeLabel =
+        inferredMergeLabels.get(node.data.label) ?? null;
+    }
     nodes.push(node);
     if (isWorkflowBlockNode(node)) {
       labelToNode.set(node.data.label, node);
@@ -3178,7 +3353,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "taskv2": {
@@ -3204,7 +3379,7 @@ function getWorkflowBlock(
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "human_interaction": {
@@ -3244,7 +3419,7 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "navigation": {
@@ -3284,7 +3459,7 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
       };
@@ -3303,7 +3478,7 @@ function getWorkflowBlock(
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         // export_data_schema (like export_file_name/export_records below) is
         // saved regardless of export_enabled -- the backend already no-ops on
         // all three while export is off, and gating persistence here would
@@ -3337,7 +3512,7 @@ function getWorkflowBlock(
         terminate_criterion: node.data.terminateCriterion,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
       };
     }
     case "wait": {
@@ -3375,7 +3550,7 @@ function getWorkflowBlock(
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         disable_cache: node.data.disableCache ?? false,
-        engine: node.data.engine,
+        ...engineYAML(node.data.engine, node.data.enginePinned),
         download_timeout: node.data.downloadTimeout, // seconds
         ...(node.data.downloadTarget &&
           node.data.downloadTarget !== "website" && {
@@ -3428,7 +3603,8 @@ function getWorkflowBlock(
         body_format: node.data.bodyFormat,
         file_attachments: node.data.fileAttachments
           .split(",")
-          .map((attachment) => attachment.trim()),
+          .map((attachment) => attachment.trim())
+          .filter(Boolean),
         recipients: node.data.recipients
           .split(",")
           .map((recipient) => recipient.trim()),
@@ -3463,6 +3639,7 @@ function getWorkflowBlock(
         data_schema: JSONSafeOrStringAllowArrays(node.data.dataSchema),
         user_owned_goal: node.data.userOwnedGoal,
         goal_needs_regeneration: node.data.goalNeedsRegeneration,
+        code_edited_by_hand: node.data.codeEditedByHand,
       };
     }
     case "dataExport": {
@@ -3720,6 +3897,24 @@ function getWorkflowBlock(
   }
 }
 
+// Branch children follow their conditional in branch order, so blocks[] does
+// not depend on node array order, which layout reshuffles on every branch tab
+// switch (hidden nodes move last).
+function conditionalBranchChildren(
+  node: AppNode,
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Array<WorkflowBlockNode> {
+  if (!isConditionalNode(node)) {
+    return [];
+  }
+  return node.data.branches.flatMap((branch) =>
+    getConditionalBranchNodeSequence(node.id, branch.id, nodes, edges).flatMap(
+      (child) => [child, ...conditionalBranchChildren(child, nodes, edges)],
+    ),
+  );
+}
+
 function getOrderedChildrenBlocks(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
@@ -3771,27 +3966,26 @@ function getOrderedChildrenBlocks(
   }
 
   const children: Array<BlockYAML> = [];
-  let currentNode: WorkflowBlockNode | undefined = firstChild;
-  while (currentNode) {
-    includedIds.add(currentNode.id);
-    if (currentNode.type === "loop") {
-      const loopChildren = getOrderedChildrenBlocks(
-        nodes,
-        edges,
-        currentNode.id,
-      );
-      // Compute next_block_label for nested loops (same as regular blocks)
-      const nextBlockLabel = findNextBlockLabel(currentNode.id, nodes, edges);
+  const pushChild = (node: WorkflowBlockNode) => {
+    includedIds.add(node.id);
+    if (node.type === "loop") {
       children.push(
         serializeLoopNodeToYAML(
-          currentNode as LoopNode,
-          loopChildren,
-          nextBlockLabel,
+          node as LoopNode,
+          getOrderedChildrenBlocks(nodes, edges, node.id),
+          findNextBlockLabel(node.id, nodes, edges),
         ),
       );
     } else {
-      children.push(getWorkflowBlock(currentNode, nodes, edges));
+      children.push(getWorkflowBlock(node, nodes, edges));
     }
+  };
+  let currentNode: WorkflowBlockNode | undefined = firstChild;
+  while (currentNode) {
+    pushChild(currentNode);
+    conditionalBranchChildren(currentNode, nodes, edges)
+      .filter((child) => !includedIds.has(child.id))
+      .forEach(pushChild);
     const nextId = edges.find(
       (edge) => edge.source === currentNode?.id,
     )?.target;
@@ -3813,19 +4007,7 @@ function getOrderedChildrenBlocks(
     if (isInsideIncludedLoop(node.id)) {
       return;
     }
-
-    if (node.type === "loop") {
-      const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
-      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
-      children.push(
-        serializeLoopNodeToYAML(node as LoopNode, loopChildren, nextBlockLabel),
-      );
-      includedIds.add(node.id);
-      return;
-    }
-
-    children.push(getWorkflowBlock(node, nodes, edges));
-    includedIds.add(node.id);
+    pushChild(node);
   });
 
   return children;
@@ -3885,10 +4067,15 @@ function getWorkflowBlocksUtil(
       if (!cursorNode || cursorNode.type === "nodeAdder") {
         break;
       }
-      const emitted = emit(cursorNode);
-      if (emitted) {
-        result.push(emitted);
-        includedIds.add(cursorNode.id);
+      for (const node of [
+        cursorNode,
+        ...conditionalBranchChildren(cursorNode, nodes, edges),
+      ]) {
+        const emitted = includedIds.has(node.id) ? null : emit(node);
+        if (emitted) {
+          result.push(emitted);
+          includedIds.add(node.id);
+        }
       }
       const currentId: string = cursorId;
       cursorId = edges.find((edge) => edge.source === currentId)?.target;
@@ -3896,11 +4083,10 @@ function getWorkflowBlocksUtil(
   }
 
   // Phase 2: append any remaining top-level-eligible blocks the chain walk
-  // did not visit. In practice these are conditional-branch children (nodes
-  // with parentId pointing at a conditional and a conditionalNodeId set).
-  // Their relative position in blocks[] is load-irrelevant; getElements
-  // discovers them via reconstructConditionalStructure keyed off
-  // conditionalNodeId rather than array order.
+  // did not visit (e.g. a branch child no branch chain reaches). Their
+  // relative position in blocks[] is load-irrelevant; getElements discovers
+  // them via reconstructConditionalStructure keyed off conditionalNodeId
+  // rather than array order.
   nodes.forEach((node) => {
     if (includedIds.has(node.id)) return;
     if (node.type === "start" || node.type === "nodeAdder") return;
@@ -4305,6 +4491,22 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
         // Update parameterKeys if present
         ...(parameterKeys !== undefined && {
           parameterKeys: updatedParameterKeys,
+        }),
+        // Save reads a conditional's loaded branch targets and merge labels,
+        // so they must follow renames.
+        ...(node.type === "conditional" && {
+          branches: (node.data.branches as Array<BranchCondition>).map(
+            (branch) =>
+              branch.next_block_label === oldLabel
+                ? { ...branch, next_block_label: newLabel }
+                : branch,
+          ),
+          mergeLabel:
+            node.data.mergeLabel === oldLabel ? newLabel : node.data.mergeLabel,
+          inferredMergeLabel:
+            node.data.inferredMergeLabel === oldLabel
+              ? newLabel
+              : node.data.inferredMergeLabel,
         }),
         // Update the label for the node being renamed
         label: node.id === id ? newLabel : node.data.label,
@@ -4753,7 +4955,7 @@ function convertBlocksToBlockYAML(
           disable_cache: block.disable_cache ?? false,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4778,7 +4980,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4830,7 +5032,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4840,7 +5042,7 @@ function convertBlocksToBlockYAML(
           block_type: "navigation",
           url: block.url,
           title: block.title,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           model: block.model,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
@@ -4871,7 +5073,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           export_enabled: block.export_enabled ?? false,
           export_data_schema: block.export_data_schema ?? null,
           export_file_name: block.export_file_name ?? null,
@@ -4897,7 +5099,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
         };
         return blockYaml;
       }
@@ -4933,7 +5135,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
-          engine: blockEngineForWorkflow(block.engine, effectiveDefaultEngine),
+          ...blockEngineYAML(block, effectiveDefaultEngine),
           download_timeout: null, // seconds
           ...(block.download_target &&
             block.download_target !== "website" && {
@@ -5018,6 +5220,7 @@ function convertBlocksToBlockYAML(
           data_schema: block.data_schema,
           user_owned_goal: block.user_owned_goal,
           goal_needs_regeneration: block.goal_needs_regeneration,
+          code_edited_by_hand: block.code_edited_by_hand,
         };
         return blockYaml;
       }
@@ -5356,6 +5559,7 @@ function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
         previousGoal: node.data.goalBeforeEdit
           ? (node.data.goalBeforeEdit.prompt ?? "")
           : null,
+        ...(node.data.codeEditedByHand === true && { codeEditedByHand: true }),
       });
     }
   }
@@ -5369,6 +5573,82 @@ function goalChangeUndoPatch(
     return null;
   }
   return { ...data.goalBeforeEdit, goalBeforeEdit: null };
+}
+
+// The person's new Goal describes the code they edited by hand, so neither needs to change.
+function keepCodeWithGoalPatch(
+  data: CodeBlockNodeData,
+): Partial<CodeBlockNodeData> | null {
+  if (!goalChangeIsPending(data) || data.codeEditedByHand !== true) {
+    return null;
+  }
+  return {
+    goalNeedsRegeneration: false,
+    codeEditedByHand: false,
+    goalBeforeEdit: null,
+  };
+}
+
+function codeEditedNoticeIsShown(data: CodeBlockNodeData): boolean {
+  return data.codeEditedByHand === true && !goalChangeIsPending(data);
+}
+
+// A suggestion is offered only for the exact code and Goal it was written from.
+function freshGoalSuggestion(
+  data: CodeBlockNodeData,
+  suggestion: GoalSuggestion | undefined,
+): string | null {
+  if (
+    !suggestion ||
+    !codeEditedNoticeIsShown(data) ||
+    suggestion.forCode !== data.code ||
+    suggestion.forGoal !== (data.prompt ?? "")
+  ) {
+    return null;
+  }
+  return suggestion.goal;
+}
+
+function codeEditedBlocksOf(
+  nodes: Array<AppNode>,
+  suggestions: Record<string, GoalSuggestion>,
+): Array<CodeEditedBlock> {
+  const blocks: Array<CodeEditedBlock> = [];
+  for (const node of nodes) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      node.data.editable &&
+      codeEditedNoticeIsShown(node.data)
+    ) {
+      blocks.push({
+        label: node.data.label,
+        goal: node.data.prompt ?? "",
+        suggestedGoal: freshGoalSuggestion(
+          node.data,
+          suggestions[node.data.label],
+        ),
+      });
+    }
+  }
+  return blocks;
+}
+
+function acceptGoalSuggestionPatch(
+  data: CodeBlockNodeData,
+  suggestion: GoalSuggestion | undefined,
+): Partial<CodeBlockNodeData> | null {
+  const goal = freshGoalSuggestion(data, suggestion);
+  if (goal === null) {
+    return null;
+  }
+  return {
+    prompt: goal,
+    userOwnedGoal: true,
+    goalNeedsRegeneration: false,
+    codeEditedByHand: false,
+    goalBeforeEdit: null,
+  };
 }
 
 // The undo record is editor-only, so a graph rebuilt from saved form drops it; keep it on a block
@@ -5873,6 +6153,7 @@ function getParentLoopSkipsOnFail(
 
 export {
   blockEngineForWorkflow,
+  workflowEffectiveDefaultEngine,
   containsJinjaReference,
   convert,
   convertEchoParameters,
@@ -5901,6 +6182,11 @@ export {
   getWorkflowBlocks,
   goalChangeIsPending,
   goalChangeUndoPatch,
+  keepCodeWithGoalPatch,
+  codeEditedNoticeIsShown,
+  freshGoalSuggestion,
+  codeEditedBlocksOf,
+  acceptGoalSuggestionPatch,
   blockRunErrors,
   withGoalUndoRecordsFrom,
   pendingGoalChangesOf,

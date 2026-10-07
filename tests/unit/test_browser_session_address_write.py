@@ -16,6 +16,7 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.forge_log import CustomConsoleRenderer
+from tests.unit._sql_recording import recorded_statements
 from tests.unit.conftest import MockAsyncSessionCtx
 
 UPSTREAM = "ws://10.0.0.7:9222/devtools/browser/b1"
@@ -64,18 +65,22 @@ async def _read_model(session_factory: async_sessionmaker, session_id: str) -> P
 
 @pytest.mark.asyncio
 async def test_address_write_persists_the_routing_fields() -> None:
-    repo, session_factory = await _repo_with_open_rows("pbs_open")
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    repo, session_factory = await _repo_with_open_rows("pbs_open", engine=engine)
 
-    await repo.set_persistent_browser_session_browser_address(
-        browser_session_id="pbs_open",
-        browser_address=PROXIED,
-        ip_address="10.0.0.7",
-        ecs_task_arn=None,
-        organization_id=ORG_ID,
-        upstream_cdp_url=UPSTREAM,
-        browser_vendor="websocket",
-    )
+    # The method returns nothing, so reading the row back after commit would only cost a second checkout.
+    with recorded_statements(engine) as statements:
+        await repo.set_persistent_browser_session_browser_address(
+            browser_session_id="pbs_open",
+            browser_address=PROXIED,
+            ip_address="10.0.0.7",
+            ecs_task_arn=None,
+            organization_id=ORG_ID,
+            upstream_cdp_url=UPSTREAM,
+            browser_vendor="websocket",
+        )
 
+    assert [statement for statement in statements if statement.startswith("SELECT")] == []
     row = await _read_model(session_factory, "pbs_open")
     assert row.browser_address == PROXIED
     assert row.upstream_cdp_url == UPSTREAM

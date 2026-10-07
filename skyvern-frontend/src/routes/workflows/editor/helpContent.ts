@@ -221,9 +221,9 @@ export const helpTooltips = {
   terminate: {
     ...baseHelpTooltipContent,
     reason:
-      "Why the run stops here. It is recorded in the run's failure reason and can reference parameters and earlier block outputs, e.g. {{ account_number }}.",
+      "Why the run stops here. It is recorded in the run's failure reason. Other parameters and earlier block outputs can be referenced, e.g. {{ account_number }}. Credentials and secrets cannot be referenced; a template that references one is dropped.",
     errorCode:
-      "Optional. A code recorded with the run, so a retry rule, the run list filter, or a webhook can tell this stop apart. Can reference parameters and earlier block outputs. Leave empty for no code.",
+      "Optional. A code recorded with the run, so a retry rule, the run list filter, or a webhook can tell this stop apart. Other parameters and earlier block outputs can be referenced. Credentials and secrets cannot be referenced; a template that references one is dropped. Leave empty for no code.",
   },
   wait: {
     ...baseHelpTooltipContent,

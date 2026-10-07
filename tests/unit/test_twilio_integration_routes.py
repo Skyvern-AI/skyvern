@@ -169,6 +169,7 @@ def _registered_phone(config: SMSConfig, **overrides: object) -> OrganizationPho
 
 def _database(*, token: SimpleNamespace | None = None) -> SimpleNamespace:
     organizations = SimpleNamespace(
+        has_valid_org_auth_token=AsyncMock(return_value=token is not None),
         get_valid_org_auth_token=AsyncMock(return_value=token),
         replace_org_auth_token=AsyncMock(),
         invalidate_org_auth_tokens=AsyncMock(),

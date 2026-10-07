@@ -8,6 +8,7 @@ import pytest
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -33,6 +34,8 @@ class _LaunchBrowserSessionsRepository:
             browser_address=None,
             upstream_cdp_url=None,
             started_at=None,
+            browser_settings=None,
+            browser_settings_receipt=None,
         )
 
     async def create_persistent_browser_session(self, **kwargs: object) -> SimpleNamespace:
@@ -325,7 +328,7 @@ async def test_standalone_launch_runtime_session_identity(browser_type: str, str
         capture_runtime_logs() as logs,
     ):
         with skyvern_context.scoped(ambient):
-            await manager.create_session(organization_id="org_local", url=page.url)
+            await manager.create_session(organization_id="org_local", url=page.url, session_kind=BrowserSessionKind.api)
             await asyncio.gather(*list(manager._background_tasks))
         if stage != "create_failure":
             assert repository.session.status == "running"

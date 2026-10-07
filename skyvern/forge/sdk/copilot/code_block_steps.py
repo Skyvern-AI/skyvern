@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Any, Collection, Iterator
 from urllib.parse import urlsplit
@@ -11,6 +12,7 @@ import structlog
 import yaml
 
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
 from skyvern.forge.sdk.copilot.code_block_synthesis import _RECORDING_REQUIRED_ACTION_TYPES, _RESERVED_PARAM_NAMES
 from skyvern.utils.templating import mask_jinja_control_blocks, strip_jinja_control_blocks
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
@@ -38,6 +40,7 @@ _METHOD_ACTION_TYPES: dict[str, str] = {
     "select_option": "select_option",
     "set_input_files": "upload_file",
     "hover": "hover",
+    "drag_to": "drag",
     "go_back": "go_back",
     "go_forward": "go_forward",
     "reload": "reload_page",
@@ -88,6 +91,10 @@ _STRING_LITERAL = re.compile(r"""^\s*['"](.*)['"]\s*$""", re.DOTALL)
 _NAME_KWARG = re.compile(r"""name\s*=\s*['"]([^'"]+)['"]""")
 # The repair line code_block_synthesis emits for a recorded action it could not replay.
 _RECORDING_REPAIR_MESSAGE = re.compile(r"Recorded (\w+) needs repair: ")
+_JINJA_TAGS = ("{{", "{%", "{#")
+_UNQUOTABLE_MARKERS = (*_JINJA_TAGS, INERT_SLOT_NAME)
+# Cs: a lone surrogate cannot be UTF-8 encoded, so the request carrying it would fail.
+_UNQUOTABLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 
 @dataclass
@@ -105,6 +112,8 @@ class CodeActionSpan:
     goto_name: str | None = None
     goto_literal: str | None = None  # the string constant goto_name is bound to, when bound exactly once
     goto_url_literal: str | None = None
+    input_literal: str | None = None  # the string literal a text input types, when it is safe to quote
+    input_target: str | None = None  # source of the selector or receiver input_literal is typed into
 
 
 def analyze_code_actions(code: str) -> list[CodeActionSpan]:
@@ -131,7 +140,7 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
                 if isinstance(child, ast.AST):
                     parents[child] = parent
                     parent_fields[child] = field
-    bindings: dict[str, list[ast.AST]] | None = None
+    bindings = _name_bindings(tree)
     store_names: dict[ast.AST, str | None] = {}
     loop_vars: dict[ast.AST, str | None] = {}
 
@@ -173,9 +182,12 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
         first_arg = (call.args[0] if call.args else goto_url) if receiver_node is not None else None
         goto_literal = None
         if goto_arg is not None:
-            if bindings is None:
-                bindings = _name_bindings(tree)
-            goto_literal = _same_body_string_binding(node, goto_arg, bindings, parents, parent_fields)
+            goto_literal = _address_without_secrets(
+                _same_body_string_binding(node, goto_arg, bindings, parents, parent_fields)
+            )
+        input_literal = input_target = None
+        if action_type == "input_text":
+            input_literal, input_target = _typed_value(node, call, receiver_node, bindings, parents, parent_fields)
         spans.append(
             CodeActionSpan(
                 action_type=action_type,
@@ -193,6 +205,8 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
                 goto_name=goto_arg.id if goto_arg else None,
                 goto_literal=goto_literal,
                 goto_url_literal=_constant_str(goto_url) if goto_url is not None else None,
+                input_literal=input_literal,
+                input_target=input_target,
             )
         )
     spans.sort(key=lambda s: (s.line_start, s.line_end))
@@ -219,6 +233,87 @@ def _prompt_literal(call: ast.Call, method: str) -> str | None:
     if method in _PROMPT_POSITIONAL_METHODS and call.args:
         return _constant_str(call.args[0])
     return None
+
+
+def code_typed_values(code: str) -> list[tuple[int, str, str]]:
+    """(line, target, value) for each text input whose value is a literal safe to quote as one line of prompt data."""
+    source = textwrap.dedent(code)
+    lines = source.splitlines()
+    return [
+        (span.line_start, span.input_target, span.input_literal)
+        for span in analyze_code_actions(source)
+        if span.input_literal is not None
+        and span.input_target
+        and not _breaks_a_quoted_line(span.input_target)
+        # Parsing strips Jinja tags even inside string literals, so the literal must be checked on the raw lines too.
+        and not any(tag in line for line in lines[span.line_start - 1 : span.line_end] for tag in _JINJA_TAGS)
+    ]
+
+
+def _typed_value(
+    awaited: ast.Await,
+    call: ast.Call,
+    receiver: ast.expr | None,
+    bindings: dict[str, list[ast.AST]],
+    parents: dict[ast.AST, ast.AST],
+    parent_fields: dict[ast.AST, str],
+) -> tuple[str | None, str | None]:
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+    value_node = keywords.get("value") or keywords.get("text")
+    selector_node = keywords.get("selector")
+    if value_node is None and len(call.args) >= 2:
+        selector_node, value_node = call.args[0], call.args[1]
+    elif value_node is None and len(call.args) == 1 and _is_locator(receiver, bindings, parents):
+        value_node = call.args[0]
+    elif value_node is not None and selector_node is None and call.args:
+        selector_node = call.args[0]
+    if value_node is None:
+        return None, None
+    if isinstance(value_node, ast.Name):
+        value = _same_body_string_binding(awaited, value_node, bindings, parents, parent_fields)
+    else:
+        value = _constant_str(value_node)
+    target: str | None
+    if selector_node is not None:
+        target = _constant_str(selector_node) or _safe_unparse(selector_node)
+    else:
+        target = _safe_unparse(receiver) if receiver is not None else None
+    return _quotable(value), target
+
+
+def _quotable(value: str | None) -> str | None:
+    """The literal unchanged when it cannot break out of one quoted line of data, else None."""
+    return None if value is None or _breaks_a_quoted_line(value) else value
+
+
+def _breaks_a_quoted_line(text: str) -> bool:
+    # json.dumps escapes characters below U+0020, so only the ones it leaves raw can break the rendered row.
+    return any(m in text for m in _UNQUOTABLE_MARKERS) or any(
+        ch >= " " and unicodedata.category(ch) in _UNQUOTABLE_CATEGORIES for ch in text
+    )
+
+
+def _is_locator(receiver: ast.expr | None, bindings: dict[str, list[ast.AST]], parents: dict[ast.AST, ast.AST]) -> bool:
+    """A call result, a name bound once to one, or `.first`/`.last` of either: a Locator, whose lone fill arg is its value."""
+    # ponytail: any Call-shaped receiver counts, so `page.frame(...).fill('#sel')` reads its selector as a value; resolve
+    # receiver types if that shape shows up.
+    receiver = _without_first_last(receiver)
+    if isinstance(receiver, ast.Call):
+        return True
+    if not isinstance(receiver, ast.Name) or len(bindings.get(receiver.id, [])) != 1:
+        return False
+    assign = parents.get(bindings[receiver.id][0])
+    return (
+        isinstance(assign, ast.Assign)
+        and len(assign.targets) == 1
+        and isinstance(_without_first_last(assign.value), ast.Call)
+    )
+
+
+def _without_first_last(node: ast.expr | None) -> ast.expr | None:
+    while isinstance(node, ast.Attribute) and node.attr in ("first", "last"):
+        node = node.value
+    return node
 
 
 def _goto_url_node(call: ast.Call, method: str) -> ast.expr | None:
@@ -328,19 +423,19 @@ def _name_bindings(tree: ast.AST) -> dict[str, list[ast.AST]]:
 
 
 def _same_body_string_binding(
-    goto: ast.AST,
+    awaited: ast.AST,
     name: ast.Name,
     bindings: dict[str, list[ast.AST]],
     parents: dict[ast.AST, ast.AST],
     parent_fields: dict[ast.AST, str],
 ) -> str | None:
-    """The address `name` holds, when its only binding is `name = "<str>"` earlier in the goto's own statement body."""
+    """The string `name` holds, when its only binding is `name = "<str>"` earlier in the call's own statement body."""
     if len(bindings.get(name.id, [])) != 1:
         return None
     assignment = parents.get(bindings[name.id][0])
     if not isinstance(assignment, ast.Assign) or len(assignment.targets) != 1:
         return None
-    statement = goto
+    statement = awaited
     while not isinstance(statement, ast.stmt):
         statement = parents[statement]
     if (
@@ -349,7 +444,7 @@ def _same_body_string_binding(
         or assignment.lineno >= statement.lineno
     ):
         return None
-    return _address_without_secrets(_constant_str(assignment.value))
+    return _constant_str(assignment.value)
 
 
 def _address_without_secrets(value: str | None) -> str | None:
@@ -709,6 +804,7 @@ def _user_owned_goal_labels(workflow_yaml: str, *, awaiting_rebuild: bool) -> li
 
 
 _USER_OWNED_GOAL_FIELDS = ("user_owned_goal", "goal_needs_regeneration")
+_CODE_EDITED_BY_HAND_FIELD = "code_edited_by_hand"
 
 
 def code_block_labels_with_user_owned_goal(workflow_yaml: str) -> list[str]:
@@ -751,9 +847,12 @@ def carry_user_owned_goals_in_yaml(
     *,
     prior_yaml: str | None = None,
     rebuilt_labels: Collection[str] = (),
+    goal_rewritten_labels: Collection[str] = (),
 ) -> UserOwnedGoalCarry:
-    """Ownership is read from prior_yaml alone, so a label the prior does not mark user-owned has both
-    fields stripped; goal_needs_regeneration clears only for labels in rebuilt_labels."""
+    """Ownership and code_edited_by_hand are read from prior_yaml alone, so a submission can neither mint
+    nor drop them. goal_needs_regeneration clears for labels in rebuilt_labels. code_edited_by_hand clears only
+    when the stored Goal now describes the code: a declared and changed Goal on a block the person does not own,
+    or the rebuild of a pending person-owned Goal."""
     try:
         data = safe_load_no_dates(workflow_yaml)
         prior_data = safe_load_no_dates(prior_yaml) if prior_yaml else {}
@@ -763,12 +862,18 @@ def carry_user_owned_goals_in_yaml(
         return UserOwnedGoalCarry(workflow_yaml, [], [])
 
     owned_prior_blocks: dict[str, dict[str, Any]] = {}
+    hand_edited_prior_prompts: dict[str, Any] = {}
     for prior_block in _iter_code_block_dicts(prior_data):
         prior_label = prior_block.get("label")
-        if isinstance(prior_label, str) and prior_block.get("user_owned_goal") is True:
+        if not isinstance(prior_label, str):
+            continue
+        if prior_block.get("user_owned_goal") is True:
             owned_prior_blocks[prior_label] = prior_block
+        if prior_block.get(_CODE_EDITED_BY_HAND_FIELD) is True:
+            hand_edited_prior_prompts[prior_label] = prior_block.get("prompt")
 
     rebuilt = set(rebuilt_labels)
+    goal_rewritten = set(goal_rewritten_labels)
     changed = False
     kept: list[str] = []
     submitted_labels: set[str] = set()
@@ -777,6 +882,21 @@ def carry_user_owned_goals_in_yaml(
         if isinstance(label, str):
             submitted_labels.add(label)
         owner = owned_prior_blocks.get(label) if isinstance(label, str) else None
+        if isinstance(label, str) and label in hand_edited_prior_prompts:
+            goal_matches_code = (
+                label in rebuilt and owner.get("goal_needs_regeneration") is True
+                if owner is not None
+                else label in goal_rewritten and block.get("prompt") != hand_edited_prior_prompts[label]
+            )
+        else:
+            goal_matches_code = True
+        if not goal_matches_code:
+            if block.get(_CODE_EDITED_BY_HAND_FIELD) is not True:
+                block[_CODE_EDITED_BY_HAND_FIELD] = True
+                changed = True
+        elif block.get(_CODE_EDITED_BY_HAND_FIELD):
+            del block[_CODE_EDITED_BY_HAND_FIELD]
+            changed = True
         if owner is None or not isinstance(label, str):
             for field in _USER_OWNED_GOAL_FIELDS:
                 if block.get(field):

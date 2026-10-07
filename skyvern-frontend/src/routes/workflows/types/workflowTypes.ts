@@ -370,6 +370,7 @@ export type TaskBlock = WorkflowBlockBase & {
   disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type Taskv2Block = WorkflowBlockBase & {
@@ -420,6 +421,7 @@ export type CodeBlock = WorkflowBlockBase & {
   data_schema?: CodeBlockDataSchema;
   user_owned_goal?: boolean | null;
   goal_needs_regeneration?: boolean | null;
+  code_edited_by_hand?: boolean | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -501,6 +503,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type HumanInteractionBlock = WorkflowBlockBase & {
@@ -541,6 +544,7 @@ export type ActionBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type NavigationBlock = WorkflowBlockBase & {
@@ -560,6 +564,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   include_action_history_in_verification: boolean;
 };
 
@@ -574,6 +579,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   export_enabled?: boolean;
   export_data_schema?: Record<string, unknown> | null;
   export_file_name?: string | null;
@@ -596,6 +602,7 @@ export type LoginBlock = WorkflowBlockBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type WaitBlock = WorkflowBlockBase & {
@@ -623,6 +630,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   download_timeout: number | null; // seconds
   download_target: "website" | "s3" | "azure" | "google_drive" | "sftp";
   path: string;

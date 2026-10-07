@@ -2128,6 +2128,7 @@ def test_none_valued_registration_fields_are_schema_not_claims() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2151,7 +2152,6 @@ async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
         "execute_user_function_with_timeout",
         AsyncMock(side_effect=_raise_after_download(_isolated_download_path, Exception("Download is starting"))),
     )
-    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", lambda self, e, page, engine_selection: True)
 
     healed = BlockResult(
@@ -2303,6 +2303,7 @@ async def test_cancel_during_registration_does_not_book_the_block_failed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2323,7 +2324,6 @@ async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise
         "execute_user_function_with_timeout",
         AsyncMock(side_effect=_raise_after_download(_isolated_download_path, Exception("Download is starting"))),
     )
-    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", lambda self, e, page, engine_selection: True)
 
     healed = BlockResult(
@@ -3379,7 +3379,6 @@ async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytes
 async def test_downloads_empty_read_reports_listing_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
     monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], False)))
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=True))
     listing = AsyncMock(return_value=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", listing)
 
@@ -3403,7 +3402,6 @@ async def test_downloads_empty_read_reports_failed_row_lookup_as_unknown_count(
         "list_artifacts_for_run_by_type",
         AsyncMock(side_effect=RuntimeError("database unavailable")),
     )
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=False))
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
     with _capture_empty_read_logs() as logs:
@@ -3570,18 +3568,15 @@ async def test_failed_row_lookup_still_lists_instead_of_reporting_no_downloads(
 ) -> None:
     """A DB blip must not be answered with an empty download list.
 
-    The cutover skip exists to avoid listing when a run provably has no rows; a lookup that
-    failed proves nothing, so the legitimate case has to keep its route through the listing.
+    Rows are trusted only when the lookup succeeds; a lookup that failed proves nothing, so the
+    read keeps its route through the listing.
     """
     listed = [FileInfo(url="https://example.test/real")]
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
     monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], True)))
-    skip = AsyncMock(return_value=True)
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", skip)
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=listed))
 
     assert await storage.get_downloaded_files("o_1", "wr_blip") == listed
-    skip.assert_not_awaited()
 
 
 @pytest.mark.asyncio

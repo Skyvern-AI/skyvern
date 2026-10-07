@@ -4357,8 +4357,19 @@ async def test_in_process_retry_reacquires_serialized_lane(
         waiting.set()
         await release.wait()
 
+    admission_timeout: asyncio.Timeout | None = None
+
+    def timeout(seconds: float | None) -> asyncio.Timeout:
+        nonlocal admission_timeout
+        if outcome == "timeout" and seconds == 0.05:
+            # Arm the real cancellation only after the occupied lane is observed;
+            # database latency must not decide whether this ordering test passes.
+            admission_timeout = asyncio.timeout(None)
+            return admission_timeout
+        return asyncio.timeout(seconds)
+
     monkeypatch.setattr(svc, "execute_workflow", execute)
-    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep, timeout=timeout))
     clearance_query = sqlite_db.workflow_runs.get_blocking_sequential_workflow_run
     query_failed = False
 
@@ -4426,6 +4437,9 @@ async def test_in_process_retry_reacquires_serialized_lane(
             release.set()
         elif outcome == "task_cancel":
             task.cancel()
+        elif outcome == "timeout":
+            assert admission_timeout is not None
+            admission_timeout.reschedule(asyncio.get_running_loop().time())
 
         if outcome == "task_cancel":
             with pytest.raises(asyncio.CancelledError):

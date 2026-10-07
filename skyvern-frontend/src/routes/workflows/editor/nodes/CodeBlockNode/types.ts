@@ -14,6 +14,7 @@ export type CodeBlockNodeData = NodeBaseData & {
   dataSchema: string;
   userOwnedGoal: boolean | null;
   goalNeedsRegeneration: boolean | null;
+  codeEditedByHand: boolean | null;
   // Editor-only: the Goal as it was before the pending change, so Undo can restore it. Never saved.
   goalBeforeEdit?: GoalBeforeEdit | null;
 };
@@ -50,5 +51,6 @@ export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   dataSchema: "null",
   userOwnedGoal: null,
   goalNeedsRegeneration: null,
+  codeEditedByHand: null,
   model: null,
 } as const;

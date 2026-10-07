@@ -269,6 +269,8 @@ class RealBrowserState(BrowserState):
         self.built_with_proxy_location: ProxyLocationInput = None
         # A read-only state rebuilds its context from a copy of the saved profile, never the stored one.
         self.profile_read_only = False
+        # A rebuilt context must launch in the same requested timezone, or its receipt would describe another browser.
+        self.timezone_id: str | None = None
         self._ever_connected = browser_context is not None
         self._close_requested = False
         self._runtime_events_deferred = defer_runtime_events
@@ -574,6 +576,7 @@ class RealBrowserState(BrowserState):
                     display_recording_owner_id=display_recording_owner_id,
                     _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
                     _sessionless_init_script_registrations=tuple(sessionless_init_script_registrations),
+                    **({"timezone_id": self.timezone_id} if self.timezone_id is not None else {}),
                 )
                 self._runtime_event_context = with_acquired_browser_runtime(self._runtime_event_context)
             finally:
@@ -1971,4 +1974,5 @@ class RealBrowserState(BrowserState):
             scrolling_number=scrolling_number,
             engine_selection=self.engine_selection,
             runtime_context=self._runtime_event_context,
+            keep_partial_on_timeout=True,
         )

@@ -20,16 +20,18 @@ logs, though a test run's own output can echo one like any run input.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -125,7 +127,11 @@ class OriginExecutionSettings:
 
 @dataclass(frozen=True, slots=True)
 class OriginOutputSnapshot:
-    """The origin run's latest top-level row per label, beside the definition version that run executed."""
+    """Bank-owned recorded facts, shared by producer receipts and never mutated by consumers.
+
+    Capture detaches mutable native values once. Execution copies seeds at its boundary; a
+    later observation replaces the snapshot rather than editing a retained receipt in place.
+    """
 
     definition: WorkflowDefinition = field(repr=False)
     outputs: dict[str, OriginBlockOutput] = field(repr=False)
@@ -133,6 +139,76 @@ class OriginOutputSnapshot:
     settings: OriginExecutionSettings | None = None
     # Every input value the run recorded, unfiltered: an output is only reusable with the inputs it was computed from.
     input_values: dict[str, OriginInputValue] = field(default_factory=dict, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedOutputSource:
+    workflow_run_id: str
+    created_at: datetime
+    snapshot: OriginOutputSnapshot = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedOutputSource:
+    block_label: str
+    workflow_run_id: str
+    source: Literal["verified", "banked", "origin"]
+    snapshot: OriginOutputSnapshot = field(repr=False)
+
+    @property
+    def value(self) -> dict | list | str | None:
+        return self.snapshot.outputs[self.block_label].value
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "block_label": self.block_label,
+            "source_workflow_run_id": self.workflow_run_id,
+            "source": self.source,
+        }
+
+
+@dataclass(slots=True)
+class RunOutputCarrier:
+    origin: OriginOutputSnapshot | OriginOutputRefusal | None = field(default=None, repr=False)
+    sources: dict[str, CompletedOutputSource] = field(default_factory=dict, repr=False)
+    verified_sources: dict[str, SelectedOutputSource] = field(default_factory=dict, repr=False)
+
+
+OutputCarrier = RunOutputCarrier | OriginOutputSnapshot | OriginOutputRefusal | None
+
+
+def origin_snapshot(carrier: OutputCarrier) -> OriginOutputSnapshot | OriginOutputRefusal | None:
+    return carrier.origin if isinstance(carrier, RunOutputCarrier) else carrier
+
+
+def bank_completed_outputs(
+    carrier: OutputCarrier,
+    *,
+    workflow_run_id: str,
+    created_at: datetime,
+    definition: WorkflowDefinition,
+    run_blocks: Iterable[WorkflowRunBlock],
+    output_parameter_rows: Iterable[WorkflowRunOutputParameter],
+    seeded_only_labels: frozenset[str],
+    input_values: dict[str, OriginInputValue] | None = None,
+    settings: OriginExecutionSettings | None = None,
+) -> RunOutputCarrier:
+    state = carrier if isinstance(carrier, RunOutputCarrier) else RunOutputCarrier(origin=deepcopy(carrier))
+    rows = [row for row in run_blocks if row.workflow_run_id == workflow_run_id and row.label not in seeded_only_labels]
+    snapshot = origin_block_outputs_from_rows(
+        definition,
+        rows,
+        [row for row in output_parameter_rows if row.workflow_run_id == workflow_run_id],
+        input_values=input_values,
+        settings=settings,
+    )
+    previous = state.sources.get(workflow_run_id)
+    if previous is not None:
+        snapshot = replace(snapshot, outputs={**previous.snapshot.outputs, **snapshot.outputs})
+    # The receipt retains failed/absent facts for refusal reporting; only completed value-bearing
+    # producers are selected. Copies keep late callbacks and later edits out of recorded facts.
+    state.sources[workflow_run_id] = CompletedOutputSource(workflow_run_id, _as_utc(created_at), snapshot)
+    return state
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,15 +264,15 @@ def origin_block_outputs_from_rows(
         registered = registered_by_parameter_id.get(output_parameter_ids[label])
         row = OriginBlockOutput(status=run_block.status, has_value=False, created_at=run_block.created_at)
         if registered is not None:
-            row = replace(row, has_value=True, value=registered.value)
+            row = replace(row, has_value=True, value=without_output_only_labels(registered.value))
         elif run_block.output is not None:
-            row = replace(row, has_value=True, value=run_block.output)
+            row = replace(row, has_value=True, value=without_output_only_labels(run_block.output))
         outputs[label] = row
     return OriginOutputSnapshot(
-        definition=definition,
-        outputs=outputs,
-        settings=settings,
-        input_values=dict(input_values or {}),
+        definition=definition.model_copy(deep=True),
+        outputs=deepcopy(outputs),
+        settings=deepcopy(settings),
+        input_values=deepcopy(input_values or {}),
     )
 
 
@@ -218,7 +294,7 @@ class RepairTurnContext(Protocol):
     last_run_binding_unavailable_reason: str | None
     repair_origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...]
     repair_origin_is_copilot_run: bool
-    repair_origin_outputs: OriginOutputSnapshot | OriginOutputRefusal | None
+    repair_origin_outputs: OutputCarrier
     repair_origin_outputs_run_id: str | None
 
 

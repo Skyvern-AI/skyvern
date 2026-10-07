@@ -31,8 +31,11 @@ from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.services.browser_recording.redact import is_identifier_field, texts_are_labels
 from skyvern.services.browser_recording.types import (
+    CLICK_NAVIGATION_WINDOW_MS,
     Action,
     ActionClick,
+    ActionDialog,
+    ActionDragDrop,
     ActionHover,
     ActionInputText,
     ActionPressKey,
@@ -44,10 +47,6 @@ from skyvern.services.browser_recording.types import (
 )
 
 LOG = structlog.get_logger(__name__)
-
-# A navigation this soon after a click or text submit was caused by it; the emitted
-# click/press already waits for the load, so no goto is emitted for that navigation.
-CLICK_NAVIGATION_WINDOW_MS = 3000
 
 # Draft steps reference their source action by (kind, timestamp_start); tolerance
 # absorbs float round-tripping through JSON, not clock skew.
@@ -180,7 +179,7 @@ def attribute_click_navigations(pairs: list[ActionDraftPair]) -> dict[int, int]:
                 caused_by[last_interactive] = index
                 last_interactive = None
             continue
-        if isinstance(action, (ActionClick, ActionInputText, ActionPressKey)):
+        if isinstance(action, (ActionClick, ActionDragDrop, ActionInputText, ActionPressKey)):
             last_interactive = index
 
     return caused_by
@@ -230,8 +229,7 @@ def _credential_fill(draft: RecordingDraftStep | None) -> dict[str, t.Any] | Non
     }
 
 
-def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = None) -> dict[str, t.Any] | None:
-    target = action.target
+def _locator_fields(target: ActionTarget) -> dict[str, t.Any]:
     base: dict[str, t.Any] = {}
     if target.selector:
         base["selector"] = target.selector
@@ -241,6 +239,14 @@ def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = N
         base["accessible_name"] = target.accessible_name
     if target.selector or (target.role and target.accessible_name):
         base["observed_hidden"] = True
+    return base
+
+
+def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = None) -> dict[str, t.Any] | None:
+    target = action.target
+    base = _locator_fields(action.source if isinstance(action, ActionDragDrop) else target)
+    if action.incomplete_capture_reason is not None:
+        base["incomplete_capture_reason"] = action.incomplete_capture_reason.value
 
     if isinstance(action, ActionClick):
         if (target.tag_name or "").upper() == "CANVAS":
@@ -248,6 +254,19 @@ def _interaction_for_action(action: Action, draft: RecordingDraftStep | None = N
             has_offset = offset_x is not None and offset_y is not None and isfinite(offset_x) and isfinite(offset_y)
             base["canvas_click_position"] = {"x": offset_x, "y": offset_y} if has_offset else None
         return {"tool_name": "click", **base}
+    if isinstance(action, ActionDialog):
+        dialog_interaction = {
+            "tool_name": "set_dialog_policy",
+            "action": action.response,
+            "dialog_type": action.dialog_type,
+            "prompt_text": action.prompt_text,
+            "prompt_text_redacted": action.prompt_text_redacted,
+        }
+        if action.dialog_type == "beforeunload" and action.response == "dismiss":
+            dialog_interaction["replay_unsupported_reason"] = "beforeunload_dismiss"
+        return dialog_interaction
+    if isinstance(action, ActionDragDrop):
+        return {"tool_name": "drag", **base, "destination": _locator_fields(action.target)}
     if isinstance(action, ActionHover):
         return {"tool_name": "hover", **base}
     if isinstance(action, ActionInputText):
@@ -346,14 +365,24 @@ def _bind_identifier_fills(
 def segment_trajectory(segment: RecordingSegment, *, bind_credentials: bool = True) -> list[dict[str, t.Any]]:
     trajectory: list[dict[str, t.Any]] = []
     sources: list[ActionDraftPair] = []
+    previous_action: Action | None = None
     for action, draft in segment.pairs:
         interaction = _interaction_for_action(action, draft if bind_credentials else None)
         if interaction is None:
+            continue
+        if isinstance(action, ActionDialog):
+            if isinstance(previous_action, ActionDialog):
+                interaction["replay_unsupported_reason"] = "chained_dialog"
+            insert_at = max(len(trajectory) - 1, 0)
+            trajectory.insert(insert_at, interaction)
+            sources.insert(insert_at, (action, draft))
+            previous_action = action
             continue
         if interaction["tool_name"] == "wait" and draft is not None and draft.wait_sec:
             interaction["duration_ms"] = int(draft.wait_sec) * 1000
         trajectory.append(interaction)
         sources.append((action, draft))
+        previous_action = action
     if bind_credentials:
         _bind_identifier_fills(trajectory, sources)
     if trajectory and segment.source_url:
@@ -425,6 +454,8 @@ def _segment_summary(segment: RecordingSegment, emitted_indices: set[int] | None
         if isinstance(action, ActionInputText) and (action.target.input_type or "").lower() != "file"
     ]
     clicks = [action for action in actions if isinstance(action, ActionClick)]
+    drags = [action for action in actions if isinstance(action, ActionDragDrop)]
+    dialogs = [action for action in actions if isinstance(action, ActionDialog)]
 
     if any((action.target.input_type or "").lower() == "password" for action in typed):
         return f"log_in_to_{site}" if site else "log_in"
@@ -444,6 +475,10 @@ def _segment_summary(segment: RecordingSegment, emitted_indices: set[int] | None
         # The last click is the one that advances the page (submit, next, a link).
         name = _target_name(clicks[-1].target)
         return f"click_{name}" if name else "click_through_the_page"
+    if drags:
+        return "drag_and_drop"
+    if dialogs:
+        return f"{dialogs[-1].response}_{dialogs[-1].dialog_type}_dialog"
     presses = [action for action in actions if isinstance(action, ActionPressKey)]
     if presses:
         key = _slugify(presses[-1].key)

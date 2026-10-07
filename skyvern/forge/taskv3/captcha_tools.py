@@ -31,15 +31,16 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.taskv3 import input_dispatch
-from skyvern.forge.taskv3.loop import REF_SELECTOR_RE, ToolResult, ToolSpec
+from skyvern.forge.taskv3.loop import REF_SELECTOR_RE, ToolResult, ToolSpec, current_tool_call_seq
 from skyvern.forge.taskv3.tools import PageProvider, _invalid_selector_result, _normalize_selector
 from skyvern.webeye.utils.captcha_solver import (
     CAPTCHA_IMAGE_TAGS,
     MAX_IMAGE_CAPTCHA_READS,
-    CaptchaChallengeUnsolvedError,
+    ChallengeStatus,
     resolve_captcha_image,
-    solve_challenge_ladder,
+    solve_challenge,
 )
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL
 
 LOG = structlog.get_logger()
 
@@ -260,9 +261,9 @@ def build_captcha_tools(
         try:
             page = await page_provider()
         except Exception:
-            return ToolResult.error(_PAGE_UNAVAILABLE)
+            return ToolResult.error(_PAGE_UNAVAILABLE, error_class="page_unavailable")
         if page is None:
-            return ToolResult.error(_PAGE_UNAVAILABLE)
+            return ToolResult.error(_PAGE_UNAVAILABLE, error_class="page_unavailable")
         try:
             async with asyncio.timeout(_SOLVE_CAPTCHA_CEILING_SECONDS):
                 return await _read_image_text(page, image_selector)
@@ -270,12 +271,16 @@ def build_captcha_tools(
             image_failures += 1
             return ToolResult.error(
                 f"reading the captcha image timed out after {_SOLVE_CAPTCHA_CEILING_SECONDS}s; re-check the "
-                "page, or report the captcha as blocking."
+                "page, or report the captcha as blocking.",
+                error_class="solve_timed_out",
             )
         except Exception:
             image_failures += 1
             LOG.warning("task_v3 image captcha read failed", task_id=task.task_id, exc_info=True)
-            return ToolResult.error("reading the captcha image failed unexpectedly; re-observe the page and continue.")
+            return ToolResult.error(
+                "reading the captcha image failed unexpectedly; re-observe the page and continue.",
+                error_class="solve_raised",
+            )
 
     async def _solve_captcha(args: dict[str, Any]) -> ToolResult:
         nonlocal failed_attempts
@@ -291,13 +296,33 @@ def build_captcha_tools(
         try:
             page = await page_provider()
         except Exception:
-            return ToolResult.error(_PAGE_UNAVAILABLE)
+            return ToolResult.error(_PAGE_UNAVAILABLE, error_class="page_unavailable")
         if page is None:
-            return ToolResult.error(_PAGE_UNAVAILABLE)
+            return ToolResult.error(_PAGE_UNAVAILABLE, error_class="page_unavailable")
+
+        try:
+            # Frame URLs are cached, so this costs no browser round trip. Child frames only, as the solver reads
+            # them; it records that a vendor's frame existed before the solve, not that it rendered or was solved.
+            vendor_frame_present: bool | None = any(
+                frame.parent_frame is not None and CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+                for frame in page.frames
+            )
+        except Exception:
+            vendor_frame_present = None
+
+        def record(receipt: dict[str, str | None]) -> None:
+            # Prefixed: `arm` and `status` are already facets other lines write with other meanings.
+            fields = {f"solve_{key}": value for key, value in receipt.items()}
+            LOG.info(
+                "taskv3 captcha solve outcome",
+                **fields,
+                vendor_frame_present=vendor_frame_present,
+                tool_call_seq=current_tool_call_seq(),
+            )
 
         try:
             async with asyncio.timeout(_SOLVE_CAPTCHA_CEILING_SECONDS):
-                solved = await solve_challenge_ladder(
+                outcome = await solve_challenge(
                     page,
                     organization_id=organization_id,
                     workflow_run_id=task.workflow_run_id,
@@ -306,24 +331,37 @@ def build_captcha_tools(
                     click=functools.partial(input_dispatch.click, page),
                     click_handle=functools.partial(input_dispatch.click_handle, page),
                 )
-        except CaptchaChallengeUnsolvedError:
-            failed_attempts += 1
-            return ToolResult.error(
-                "a captcha challenge is present but could not be solved this attempt; wait briefly and "
-                "re-check, or report the captcha as blocking if it persists."
-            )
         except TimeoutError:
             failed_attempts += 1
+            record({"status": "timed_out"})
             return ToolResult.error(
                 f"captcha solve timed out after {_SOLVE_CAPTCHA_CEILING_SECONDS}s; the widget may need a "
-                "moment or is unsolvable — re-check the page, or report the captcha as blocking."
+                "moment or is unsolvable — re-check the page, or report the captcha as blocking.",
+                error_class="solve_timed_out",
             )
         except Exception:
             failed_attempts += 1
             LOG.warning("task_v3 solve_captcha failed", task_id=task.task_id, exc_info=True)
-            return ToolResult.error("captcha solve failed unexpectedly; re-observe the page and continue.")
+            record({"status": "raised"})
+            return ToolResult.error(
+                "captcha solve failed unexpectedly; re-observe the page and continue.", error_class="solve_raised"
+            )
+        record(outcome.receipt())
 
-        if solved:
+        if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
+            failed_attempts += 1
+            unsolved = (
+                "a captcha challenge is present but could not be solved this attempt; wait briefly and "
+                "re-check, or report the captcha as blocking if it persists."
+            )
+            # Three literal returns rather than one with a computed class: the error-class census reads literals.
+            if outcome.status is ChallengeStatus.UNSUPPORTED:
+                return ToolResult.error(unsolved, error_class="challenge_unsupported")
+            # A challenge frame was seen but no solver arm ran on it.
+            if outcome.arm is None and outcome.page_state == "challenged":
+                return ToolResult.error(unsolved, error_class="challenge_not_attempted")
+            return ToolResult.error(unsolved, error_class="challenge_unsolved")
+        if outcome.status is ChallengeStatus.SOLVED:
             # A real solve is progress; clear the failure streak so a later genuine captcha isn't disabled.
             failed_attempts = 0
             return ToolResult.ok(

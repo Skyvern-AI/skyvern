@@ -132,14 +132,23 @@ class TestEnqueueScreenshot:
         assert entry.provenance == provenance
 
     def test_older_capture_cannot_replace_newer_pending_frame(self) -> None:
-        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[])
+        ctx = SimpleNamespace(
+            supports_vision=True,
+            pending_screenshots=[],
+            pending_chat_screenshots=[],
+            chat_screenshot_capture_ids=set(),
+        )
         provenance = ScreenshotProvenance.unknown(source_tool="inspect_page_for_composition")
+        older = io.BytesIO()
+        Image.new("RGB", (30, 20), (10, 120, 200)).save(older, format="PNG")
+        older_b64 = base64.b64encode(older.getvalue()).decode()
 
         assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=20.0) is True
         newest = ctx.pending_screenshots[0]
-        assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=10.0) is False
+        assert enqueue_screenshot(ctx, older_b64, provenance=provenance, captured_at=10.0) is False
 
         assert ctx.pending_screenshots == [newest]
+        assert [frame.capture_id for frame in ctx.pending_chat_screenshots] == [newest.capture_id]
 
     def test_skips_when_no_vision(self) -> None:
         from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result

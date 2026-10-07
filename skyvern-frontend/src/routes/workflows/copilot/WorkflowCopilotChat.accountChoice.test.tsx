@@ -203,6 +203,9 @@ function chatElement(props: ComponentProps<typeof WorkflowCopilotChat> = {}) {
 
 async function renderChat() {
   const view = render(chatElement());
+  // The composer renders before the history load lands; the mocked load resolves in microtasks,
+  // so one act() turn applies it without racing React's scheduler.
+  await act(async () => {});
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
@@ -411,8 +414,9 @@ describe("WorkflowCopilotChat connected account choices", () => {
     });
     expect(
       Boolean(
-        screen.getByText(/choose below/).compareDocumentPosition(tray) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
+        screen
+          .getByText("Copilot needs a Google account")
+          .compareDocumentPosition(tray) & Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true);
     expect(useCopilotHeaderStore.getState().attention).toBe("account");

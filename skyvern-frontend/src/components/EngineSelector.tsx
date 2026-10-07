@@ -24,10 +24,15 @@ type Props = {
   onChange: (value: RunEngine | null) => void;
   className?: string;
   availableEngines?: Array<RunEngine>;
-  effectiveDefaultEngine?: RunEngine | null;
 };
 
 const engineOptions: Array<EngineOption & { value: RunEngine }> = [
+  {
+    value: RunEngine.SkyvernV3,
+    label: "Skyvern 3.0",
+    badge: "Recommended",
+    badgeVariant: "success",
+  },
   {
     value: RunEngine.SkyvernV1,
     label: "Skyvern 1.0",
@@ -39,12 +44,6 @@ const engineOptions: Array<EngineOption & { value: RunEngine }> = [
     label: "Skyvern 2.0",
     badge: "Legacy",
     badgeVariant: "default",
-  },
-  {
-    value: RunEngine.SkyvernV3,
-    label: "Skyvern 3.0",
-    badge: "Recommended",
-    badgeVariant: "success",
   },
   {
     value: RunEngine.OpenaiCua,
@@ -83,12 +82,8 @@ function RunEngineSelector({
   onChange,
   className,
   availableEngines,
-  effectiveDefaultEngine = null,
 }: Props) {
-  // Without a chosen-engine default, a skyvern-1.0 block is the routed Default, so it cannot be pinned.
-  const engines = (availableEngines ?? defaultEngines).filter(
-    (engine) => engine !== RunEngine.SkyvernV1 || effectiveDefaultEngine,
-  );
+  const engines = availableEngines ?? defaultEngines;
   const visibleEngines =
     value && !engines.includes(value) ? [...engines, value] : engines;
   const options: Array<EngineOption> = [

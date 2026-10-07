@@ -36,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
@@ -92,6 +93,11 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
         if llm_key and llm_key not in reverse_mapping:
             reverse_mapping[llm_key] = model_name
     return reverse_mapping
+
+
+ENGINE_PINNED_DESCRIPTION = (
+    "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
+)
 
 
 class _LLMSelectionBlock(Protocol):
@@ -561,6 +567,8 @@ class BlockResult:
     # False when retry/continuation cannot change the outcome, such as invalid
     # CodeBlock source that fails before execution.
     can_continue_after_failure: bool = True
+    # A failed CodeBlock's failing tab showed a sign-in form. Kept off the output so templates never see it.
+    sign_in_form_visible: bool = False
 
 
 class FileType(StrEnum):
@@ -842,6 +850,7 @@ class TaskBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | str | None = None
@@ -1106,6 +1115,10 @@ class CodeBlockYAML(BlockYAML):
         default=None,
         description="True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
     )
+    code_edited_by_hand: bool | None = Field(
+        default=None,
+        description="True when a person edited this block's code in the editor's code field since the Goal was last confirmed, so the Goal may no longer describe the code. Set by the editor; a value the copilot submits is ignored in favour of the stored one",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1247,6 +1260,7 @@ class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -1262,6 +1276,7 @@ class ActionBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     selector: str | None = None
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
@@ -1285,6 +1300,7 @@ class NavigationBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1310,6 +1326,7 @@ class ExtractionBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1330,6 +1347,7 @@ class LoginBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -1437,6 +1455,7 @@ class FileDownloadBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1790,6 +1809,16 @@ class WorkflowDefinitionYAML(BaseModel):
         default=None,
         description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied to every browser this workflow version creates. Omit to keep the previous "
+        "version's settings; set to null to clear them.",
+    )
+
+    @field_validator("browser_settings")
+    @classmethod
+    def validate_browser_settings(cls, value: BrowserSettings | None) -> BrowserSettings | None:
+        return require_known_timezone(value)
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":

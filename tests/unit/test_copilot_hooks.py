@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
+from skyvern.forge.sdk.copilot.result_evidence import EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
@@ -916,9 +917,14 @@ class TestMCPToolOverlayCompleteness:
             "cancel_workflow_schedule",
             "delete_workflow_schedule",
             "list_workflow_runs",
+            "list_browser_profiles",
+            "get_browser_profile",
+            "create_browser_profile",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
+        assert "skyvern_browser_profile_update" not in alias_map.values()
+        assert "skyvern_browser_profile_delete" not in alias_map.values()
         assert "query" in tools_module._build_skyvern_mcp_overlays()["list_org_workflows"].hide_params
 
     def test_every_alias_has_overlay(self) -> None:
@@ -1683,6 +1689,34 @@ class TestScoutedInteractionCapture:
         )
 
         assert "A screenshot is attached." in result["next_step"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("advertised", "expected"),
+        [
+            ((), "Page loaded."),
+            (
+                (EVALUATE_TOOL_NAME,),
+                "Page loaded." + mcp_hooks._NAVIGATE_READ_GUIDANCE.format(readers=EVALUATE_TOOL_NAME),
+            ),
+        ],
+        ids=["no_reader", "evaluate"],
+    )
+    async def test_navigate_next_step_points_only_at_reads_the_turn_advertises(
+        self, monkeypatch: pytest.MonkeyPatch, advertised: tuple[str, ...], expected: str
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+        ctx = make_copilot_ctx(pending_scout_source_url="https://example.com/login")
+        ctx.eval_mcp_tool_names = advertised
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert result["next_step"] == expected
 
     @pytest.mark.asyncio
     async def test_failed_navigate_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:

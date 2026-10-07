@@ -51,6 +51,9 @@ class WorkflowBlockEngineRouteReason(StrEnum):
     # chosen and is honored as written (``chosen_engine``).
     new_workflow_v3_default = "new_workflow_v3_default"
     chosen_engine = "chosen_engine"
+    # Before that cutoff, a block a person pinned to skyvern-1.0 keeps the run out of the A/B; labelled
+    # apart from ``ineligible`` so reads can count and drop these runs by this value alone.
+    pinned_v1_engine = "pinned_v1_engine"
     ineligible = "ineligible"
     disabled = "disabled"
     flag_undefined = "flag_undefined"
@@ -232,6 +235,7 @@ async def resolve_workflow_block_engine_arm(
     trigger_type: WorkflowRunTriggerType | None,
     ineligibility_reason: V3AbIneligibleReason | None,
     takes_default_engine: bool | None,
+    pinned_v1_blocks: int = 0,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -259,6 +263,9 @@ async def resolve_workflow_block_engine_arm(
     per-call throwaways several endpoints mint and run in one request: most of those run while still
     auto_generated, and the job-recipe endpoints build a published definition, so neither test alone
     covers them.
+
+    ``pinned_v1_blocks`` counts blocks a person pinned to skyvern-1.0 (see ``pinned_v1_block_count``);
+    eligibility already keeps such a run out of the A/B, and this labels it ``pinned_v1_engine``.
     """
     if context.workflow_block_engine_resolved_run_id == workflow_run_id:
         return
@@ -276,7 +283,11 @@ async def resolve_workflow_block_engine_arm(
         honors_chosen_engine = False
         run_is_eligible = ineligibility_reason is None
         billing_tier: BillingTier | None = None
-        route_reason = WorkflowBlockEngineRouteReason.ineligible
+        route_reason = (
+            WorkflowBlockEngineRouteReason.pinned_v1_engine
+            if pinned_v1_blocks
+            else WorkflowBlockEngineRouteReason.ineligible
+        )
         chosen_engine_candidate = (
             settings.TASK_V3_CHOSEN_ENGINE_CUTOFF is not None
             and takes_default_engine is not None
@@ -378,6 +389,7 @@ async def resolve_workflow_block_engine_arm(
             # already stopped -- so the field means "the tier this run was bucketed on" and never
             # doubles as "nobody looked".
             billing_tier=engine_arm_log_value(billing_tier),
+            pinned_v1_blocks=pinned_v1_blocks,
         )
 
 

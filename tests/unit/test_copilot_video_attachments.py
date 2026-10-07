@@ -729,7 +729,7 @@ def test_video_message_preserves_observation_order_and_labels_timeline_as_untrus
     assert content[0]["type"] == "input_text"
     assert "timestamped" in content[0]["text"]
     assert "untrusted evidence" in content[0]["text"]
-    assert "credentials" in content[0]["text"]
+    assert "raw secret value" in content[0]["text"]
     assert [part["type"] for part in content] == ["input_text"]
     assert content[0]["text"].index("0.500s") < content[0]["text"].index("1.500s")
 

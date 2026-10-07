@@ -1,3 +1,4 @@
+import { RunEngine } from "@/api/types";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
 import { useReactFlow } from "@xyflow/react";
@@ -37,7 +38,13 @@ export function useUpdate<T extends Record<string, unknown>>({
         return false;
       if (options?.source !== "workflow")
         useWorkflowTitleStore.getState().recordCopilotGraphEdit();
-      updateNodeData(id, updates);
+      // Only a pick in the engine dropdown marks skyvern-1.0 as a pin; a load carries the stored marker.
+      updateNodeData(
+        id,
+        "engine" in updates
+          ? { ...updates, enginePinned: updates.engine === RunEngine.SkyvernV1 }
+          : updates,
+      );
       return true;
     },
     [id, editable, readOnlyScope, updateNodeData],

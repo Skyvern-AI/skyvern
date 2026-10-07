@@ -62,7 +62,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
-from skyvern.forge.sdk.workflow.context_manager import BlockMetadata
+from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, register_secret_derived_output
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     filter_downloaded_files_for_current_iteration as _filter_downloaded_files_for_current_iteration,
@@ -1079,14 +1079,13 @@ async def _update_workflow_block(
             failure_reason=failure_reason,
             output=final_output,
             ai_fallback_triggered=ai_fallback_triggered,
-            error_codes=error_codes,
         )
 
         # The row carries the block label even when the caller passed none (a cached wait block).
         if updated_block.label:
             try:
                 app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id).record_block_outcome(
-                    updated_block.label, status, updated_block.error_codes or [], failure_reason
+                    updated_block.label, status, error_codes or [], failure_reason
                 )
             except Exception:
                 LOG.warning(
@@ -3576,6 +3575,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     template_data = data.copy() if data else {}
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
+    run_secrets: dict[str, Any] | None = None
     if context:
         template_data.update(context.script_run_parameters)
         if context.workflow_run_id:
@@ -3584,6 +3584,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             template_data.update(workflow_run_context.values)
             if template in template_data:
                 return template_data[template]
+            run_secrets = workflow_run_context.secrets
         # Inject for_loop / while_loop metadata (current_value, current_index, current_item) so
         # that cached function bodies inside script loops can resolve {{ current_value }}
         # in page.goto() and other template-rendered calls. while_loop only sets current_index.
@@ -3591,7 +3592,10 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             for key in ("current_value", "current_index", "current_item"):
                 if key in context.loop_metadata:
                     template_data[key] = context.loop_metadata[key]
-    return jinja_template.render(template_data)
+    rendered = jinja_template.render(template_data)
+    if run_secrets is not None:
+        register_secret_derived_output(run_secrets, jinja_template, template, template_data, rendered)
+    return rendered
 
 
 def render_list(template: str, data: dict[str, Any] | None = None) -> list[str]:

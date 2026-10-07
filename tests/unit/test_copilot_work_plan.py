@@ -71,6 +71,9 @@ class _ChatStore:
         assert workflow_copilot_chat_id == self.row.workflow_copilot_chat_id
         return []
 
+    async def get_workflow_copilot_claim_expires_in(self, organization_id: str, workflow_permanent_id: str) -> None:
+        return None
+
 
 @pytest.fixture
 def store(monkeypatch: pytest.MonkeyPatch) -> _ChatStore:

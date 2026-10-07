@@ -16,7 +16,6 @@ import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { RunEngineSelector } from "@/components/EngineSelector";
-import { useEffectiveDefaultEngine } from "../../hooks/useEffectiveDefaultEngine";
 import { ModelSelector } from "@/components/ModelSelector";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 
@@ -78,7 +77,6 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
   const data = taskNode?.data as TaskNodeData | undefined;
   const editable = data?.editable ?? false;
   const update = useUpdate<TaskNodeData>({ id: blockId, editable });
-  const effectiveDefaultEngine = useEffectiveDefaultEngine();
   const outputParameterKeys = getAvailableOutputParameterKeys(
     nodes,
     edges,
@@ -254,7 +252,6 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   <HelpTooltip content={helpTooltips["task"]["engine"]} />
                 </div>
                 <RunEngineSelector
-                  effectiveDefaultEngine={effectiveDefaultEngine}
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"

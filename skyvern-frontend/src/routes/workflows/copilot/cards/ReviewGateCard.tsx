@@ -108,7 +108,7 @@ const GATE_STATUS: Record<
 > = {
   accepting: {
     label: "Accepting…",
-    variant: "secondary",
+    variant: "progress",
     line: "Saving your accepted changes.",
   },
   accept: {
@@ -145,6 +145,9 @@ interface ReviewGateCardProps {
   pending: boolean;
   verdict: ReviewGateVerdict;
   settled?: ReviewGateSettled;
+  // Whether the footer renders at all, and whether Accept, Reject and Test may act; Review only
+  // reads, so it stays live whenever the footer shows.
+  actionsShown?: boolean;
   actionsEnabled: boolean;
   // Every action in the row acts on a staged proposal, so with none the row is locked: the gates
   // that outlive their proposal render for their message, not their buttons.
@@ -482,6 +485,7 @@ export function ReviewGateCard({
   verdict,
   settled = null,
   actionsEnabled,
+  actionsShown = actionsEnabled,
   hasProposal,
   acceptsEnabled = true,
   onAccept,
@@ -543,7 +547,9 @@ export function ReviewGateCard({
   const accepted = settled === "accepted";
   const title = turn
     ? getDiffCardTitle(turn, { pendingProposal: pending, rejected, accepted })
-    : "Proposed changes";
+    : accepted
+      ? "Applied changes"
+      : "Proposed changes";
 
   if (!pending) {
     return (
@@ -567,7 +573,7 @@ export function ReviewGateCard({
   const billingCreditRefusal =
     turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
   const testFailed = Boolean(turn && hasFailedTestBlock(turn));
-  const showActions = actionsEnabled && hasProposal;
+  const showActions = actionsShown && hasProposal;
   const connectFailure = isBuildTestConnectFailureState(
     turn?.turnFacts?.terminalCause,
   );
@@ -584,7 +590,10 @@ export function ReviewGateCard({
         turn !== undefined &&
         everyTestBlockExecuted(turn) &&
         !testFailed));
+  // The caller already withholds actionsEnabled in these states; this keeps the row locked if it
+  // ever does not.
   const actionsLocked =
+    !actionsEnabled ||
     accepting ||
     failure === "reload" ||
     failure === "recover" ||
@@ -741,7 +750,7 @@ export function ReviewGateCard({
           ) : null}
         </CardBody>
       ) : null}
-      {actionsEnabled ? (
+      {actionsShown ? (
         <CardFooter>
           {gateStatus ? (
             <div
@@ -776,12 +785,11 @@ export function ReviewGateCard({
             </div>
           ) : null}
           {/* A second Accept while one is in flight loses the race server-side, and a
-              proposal that could not be re-read may be stale, so the row stays locked. */}
+              proposal that could not be re-read may be stale, so the decisions stay locked.
+              Review only opens the comparison, which carries the same lock, so it sits
+              outside the disabled groups. */}
           {hasProposal ? (
-            <fieldset
-              disabled={actionsLocked}
-              className="min-w-0 disabled:opacity-60"
-            >
+            <div className="min-w-0">
               {billingCreditRefusal ? (
                 <p className="pb-2 text-[11px] leading-snug text-muted-foreground">
                   No browser or run started because credits are exhausted.{" "}
@@ -829,7 +837,14 @@ export function ReviewGateCard({
                   className="[container-name:gate-actions] [container-type:inline-size]"
                 >
                   <div className="flex flex-wrap items-center gap-2 [@container_gate-actions_(max-width:249px)]:gap-1.5">
-                    {acceptSplit}
+                    {acceptSplit ? (
+                      <fieldset
+                        disabled={actionsLocked}
+                        className="min-w-0 disabled:opacity-60"
+                      >
+                        {acceptSplit}
+                      </fieldset>
+                    ) : null}
                     <Button
                       type="button"
                       size="sm"
@@ -839,7 +854,10 @@ export function ReviewGateCard({
                     >
                       Review
                     </Button>
-                    <div className="ml-auto flex items-center gap-2 [@container_gate-actions_(max-width:249px)]:gap-1.5">
+                    <fieldset
+                      disabled={actionsLocked}
+                      className="ml-auto flex min-w-0 items-center gap-2 disabled:opacity-60 [@container_gate-actions_(max-width:249px)]:gap-1.5"
+                    >
                       {foldRejectIntoMenu ? null : (
                         <Button
                           type="button"
@@ -857,11 +875,11 @@ export function ReviewGateCard({
                         </Button>
                       )}
                       {moreMenu}
-                    </div>
+                    </fieldset>
                   </div>
                 </div>
               )}
-            </fieldset>
+            </div>
           ) : null}
         </CardFooter>
       ) : null}

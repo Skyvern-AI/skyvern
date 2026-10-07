@@ -7,15 +7,32 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   Status,
   type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { compactLocalDateTime } from "@/util/timeFormat";
 
 import { RunSummaryStrip } from "./RunSummaryStrip";
+
+const savedProfile = vi.hoisted(() => ({
+  lookup: "found" as "found" | "refetching" | "refetching_again" | "failed",
+}));
+// A deleted profile's earlier lookup stays cached, and successful, until the
+// refetch on this visit fails.
+vi.mock("@/routes/browserProfiles/hooks/useBrowserProfileQuery", () => ({
+  useBrowserProfileQuery: (profileId: string | undefined) => ({
+    data: profileId ? { browser_profile_id: profileId } : undefined,
+    isSuccess: Boolean(profileId) && savedProfile.lookup !== "failed",
+    isFetchedAfterMount:
+      Boolean(profileId) && savedProfile.lookup !== "refetching",
+    isFetching: savedProfile.lookup.startsWith("refetching"),
+  }),
+}));
 
 afterEach(cleanup);
 
@@ -40,13 +57,15 @@ function renderStrip(
 ) {
   return render(
     // The studio shell provides this in production (StudioShell root).
-    <TooltipProvider delayDuration={0}>
-      <RunSummaryStrip
-        workflowRun={run}
-        timeline={undefined}
-        liveElapsed={liveElapsed}
-      />
-    </TooltipProvider>,
+    <MemoryRouter>
+      <TooltipProvider delayDuration={0}>
+        <RunSummaryStrip
+          workflowRun={run}
+          timeline={undefined}
+          liveElapsed={liveElapsed}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -62,16 +81,21 @@ describe("RunSummaryStrip duration", () => {
   test("shows a single elapsed chip for a finalized run", () => {
     renderStrip(makeRun());
     expect(durationChip("Ran for 5m 0s")).toBeTruthy();
+    expect(
+      screen.getByText(
+        `Created ${compactLocalDateTime("2026-06-30T23:59:00Z")}`,
+      ),
+    ).toBeTruthy();
     expect(screen.queryByText(/^Started /)).toBeNull();
     expect(screen.queryByText(/^Finished /)).toBeNull();
   });
 
-  test("hovering/focusing the chip breaks down all four run times", async () => {
+  test("the duration tooltip adds queue/start/finish without repeating Created", async () => {
     renderStrip(makeRun());
     fireEvent.focus(durationChip("Ran for 5m 0s"));
     const tooltip = await screen.findByRole("tooltip");
     const breakdown = within(tooltip);
-    expect(breakdown.getByText(/Created /)).toBeTruthy();
+    expect(breakdown.queryByText(/Created /)).toBeNull();
     expect(breakdown.getByText(/Queued /)).toBeTruthy();
     expect(breakdown.getByText(/Started /)).toBeTruthy();
     expect(breakdown.getByText(/Finished /)).toBeTruthy();
@@ -140,6 +164,26 @@ describe("RunSummaryStrip failure category", () => {
     expect(within(tooltip).getByText(/billing or credits issue/)).toBeTruthy();
   });
 
+  test("a website's own server error blames the website, not Skyvern", async () => {
+    renderStrip(
+      makeRun({
+        status: Status.Failed,
+        failure_category: [
+          {
+            category: "WEBSITE_ERROR",
+            confidence_float: 1,
+            reasoning: "The site returned 502 Bad Gateway.",
+          },
+        ],
+      }),
+    );
+    expect(screen.queryByText("Temporary system issue")).toBeNull();
+    fireEvent.focus(screen.getByText("Website error"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(within(tooltip).getByText(/website/i)).toBeTruthy();
+    expect(within(tooltip).queryByText(/Skyvern's side/)).toBeNull();
+  });
+
   test("a workflow author's own error code is shown verbatim with its description", async () => {
     renderStrip(
       makeRun({
@@ -156,5 +200,57 @@ describe("RunSummaryStrip failure category", () => {
     fireEvent.focus(screen.getByText("InvalidZip"));
     const tooltip = await screen.findByRole("tooltip");
     expect(within(tooltip).getByText(/not in the service area/)).toBeTruthy();
+  });
+
+  test("a run tagged with a signed-out saved profile links to that profile's Refresh dialog", () => {
+    const signInFailure = (reason_code: string) =>
+      makeRun({
+        status: Status.Failed,
+        browser_profile_id: "bp_1",
+        failure_category: [
+          {
+            category: "AUTH_FAILURE",
+            confidence_float: 0.9,
+            reasoning: "stopped at a sign-in",
+            reason_code,
+          },
+        ],
+      });
+
+    savedProfile.lookup = "found";
+    renderStrip(signInFailure("saved_profile_signed_out"));
+    expect(
+      screen
+        .getByRole("link", { name: "Sign in again to refresh" })
+        .getAttribute("href"),
+    ).toBe("/browser-profiles/bp_1?refresh=1");
+
+    cleanup();
+    renderStrip(signInFailure("sign_in_form_visible"));
+    expect(screen.queryByRole("link")).toBeNull();
+
+    cleanup();
+    const malformed = signInFailure("saved_profile_signed_out");
+    renderStrip({
+      ...malformed,
+      failure_category: [
+        null,
+        ...(malformed.failure_category ?? []),
+      ] as unknown as typeof malformed.failure_category,
+    });
+    expect(
+      screen.getByRole("link", { name: "Sign in again to refresh" }),
+    ).toBeTruthy();
+
+    for (const lookup of [
+      "refetching",
+      "refetching_again",
+      "failed",
+    ] as const) {
+      cleanup();
+      savedProfile.lookup = lookup;
+      renderStrip(signInFailure("saved_profile_signed_out"));
+      expect(screen.queryByRole("link")).toBeNull();
+    }
   });
 });

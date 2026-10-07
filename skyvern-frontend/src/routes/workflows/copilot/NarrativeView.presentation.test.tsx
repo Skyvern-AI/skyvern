@@ -164,7 +164,10 @@ describe("NarrativeView structured turn presentation", () => {
 // codegen_progress frames are live-only and never persisted: the backend
 // streams them while the model writes an authoring tool call's arguments, and
 // the tool_call / workflow_draft frames that follow supersede them.
-const draftingTurn = (frames: string[][]): TurnNarrativeState => {
+const draftingTurn = (
+  frames: string[][],
+  generationIds: string[] = [],
+): TurnNarrativeState => {
   let turn = applyNarrativeEvent(EMPTY_NARRATIVE, {
     type: "turn_start",
     turn_id: "turn-1",
@@ -183,6 +186,7 @@ const draftingTurn = (frames: string[][]): TurnNarrativeState => {
       chars_streamed: (i + 1) * 400,
       iteration: 1,
       timestamp: `2026-05-30T00:00:0${i + 1}Z`,
+      generation_id: generationIds[i],
     });
   });
   return turn;
@@ -244,6 +248,24 @@ describe("NarrativeView drafting row (codegen_progress)", () => {
     expect(text).toContain("Open Page");
     expect(text).toContain("Fill Form");
     expect(text).toContain("Extract Results");
+  });
+
+  // A restarted generation opens exactly like a second authoring call, with an
+  // empty frame, so only the generation id says the earlier labels were abandoned.
+  it("drops an abandoned generation's blocks but keeps every call's within one", () => {
+    const frames = [["open_page"], [], ["fill_form"], [], ["extract_results"]];
+    const ids = ["gen-a", "gen-a", "gen-a", "gen-b", "gen-b"];
+    const { rerender } = render(
+      <NarrativeView turn={draftingTurn(frames.slice(0, 3), ids)} />,
+    );
+    expect(draftingRowText()).toContain("Open Page");
+    expect(draftingRowText()).toContain("Fill Form");
+
+    rerender(<NarrativeView turn={draftingTurn(frames, ids)} />);
+    const text = draftingRowText();
+    expect(text).toContain("Extract Results");
+    expect(text).not.toContain("Open Page");
+    expect(text).not.toContain("Fill Form");
   });
 
   it("keeps the existing placeholder when no frames arrive", () => {

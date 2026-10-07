@@ -1193,21 +1193,26 @@ class TestCredentialFillInCallSubmit:
         assert "matches 2 controls" in result["data"]["submit_skipped"]
 
     @pytest.mark.asyncio
-    async def test_a_failed_submit_click_never_costs_the_fill(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage(click_error=RuntimeError("no element matched #verifyButton for 123456"))
-        _wire_impl(monkeypatch, page, secret_value="123456")
+    @pytest.mark.parametrize(("field", "secret"), [("totp", "123456"), ("password", "Generated-Pa55word!xyz")])
+    async def test_a_failed_submit_click_never_costs_the_fill(
+        self, monkeypatch: pytest.MonkeyPatch, field: str, secret: str
+    ) -> None:
+        page = _FakePage(click_error=RuntimeError(f"no element matched #verifyButton for {secret}"))
+        _wire_impl(monkeypatch, page, secret_value=secret)
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module._fill_credential_field_impl(ctx, f"#{field}", "cred_123", field, "#verifyButton")
 
         assert result["ok"] is True
-        assert result["data"]["typed_length"] == 6
-        assert "123456" not in json.dumps(result)
+        assert result["data"]["typed_length"] == len(secret)
+        assert secret not in json.dumps(result)
         assert "[REDACTED_SECRET]" in result["data"]["submit_error"]
         # The click raised, so whether it reached the page is unknown. Saying only "not submitted"
         # would read as safe to retry, and a retry spends a second code.
         assert result["data"]["submitted"] is False
         assert result["data"]["submit_uncertain"] is True
+        assert "may already have been submitted" in result["data"]["submit_error"]
+        assert page.click_calls == [("#verifyButton",)]
         assert [entry["tool_name"] for entry in ctx.scout_trajectory] == ["fill_credential_field"]
 
     @pytest.mark.asyncio

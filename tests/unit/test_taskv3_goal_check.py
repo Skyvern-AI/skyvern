@@ -16,7 +16,6 @@ from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import loop as taskv3_loop
 from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
-    GoalVerdict,
     NonCompletedStatus,
     ToolTrail,
     TrailEntry,
@@ -60,14 +59,10 @@ async def _judged_prompt(*, typed: str, reason: str, output: str, prose: str) ->
         return {"verdict": "achieved", "quote": "", "missing": ""}
 
     trail = ToolTrail()
-
-    async def goal_check() -> GoalVerdict:
-        return await run_goal_check(goal="Save the shipping address.", trail=trail, judge=judge, timeout_seconds=5)
-
     tools = [
         _tool("observe", PAGE_TEXT, compactable=True),
         _tool("type", "typed into #address", billable=True),
-        make_finish_tool(goal_check=goal_check, goal_check_enforce=True),
+        make_finish_tool(),
     ]
     script = [
         [("observe", {})],
@@ -84,6 +79,7 @@ async def _judged_prompt(*, typed: str, reason: str, output: str, prose: str) ->
         tool_trail=trail,
     )
     assert outcome.status == "completed"
+    await run_goal_check(goal="Save the shipping address.", trail=trail, judge=judge, timeout_seconds=5)
     assert len(prompts) == 1
     return prompts[0]
 
@@ -280,14 +276,6 @@ def test_a_secret_cut_by_truncation_never_leaks_in_part() -> None:
 
     for text in (prompt, evidence):
         assert not any(_SECRET[i : i + 4] in text for i in range(len(_SECRET) - 3))
-
-
-@pytest.mark.parametrize(
-    ("quote", "source"),
-    [("SCREENSHOT: an empty form", "screenshot"), ("Status: Draft", "text"), ("", "none")],
-)
-def test_the_logged_quote_source_names_where_a_quote_came_from(quote: str, source: str) -> None:
-    assert GoalVerdict("not_achieved", quote, "", None, 0.0).quote_source == source
 
 
 @pytest.mark.asyncio
@@ -744,7 +732,7 @@ class _ReaskSpy:
         )
 
 
-def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool, goal: str | None) -> dict[str, Any]:
+def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool) -> dict[str, Any]:
     fingerprints = iter(f"fp-{i}" for i in range(1000))
 
     async def fingerprint() -> str | None:
@@ -756,11 +744,7 @@ def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool, goal: str | N
     async def verification_blocker(status: str) -> str | None:
         return "the verification code step failed" if blocked and status in ("completed", "converted") else None
 
-    async def goal_check() -> GoalVerdict:
-        assert goal is not None
-        return GoalVerdict(goal, "Status: Draft" if goal != "achieved" else "", "x", None, 0.0)  # type: ignore[arg-type]
-
-    kwargs: dict[str, Any] = {
+    return {
         "page_fingerprint": fingerprint,
         "settle_wait_seconds": 0.0,
         "pending_marker": pending_marker,
@@ -768,24 +752,15 @@ def _gate_kwargs(*, pending: bool, blocked: bool, unsettled: bool, goal: str | N
         "verification_blocker": verification_blocker,
         "activity": ActivityRecency(),
     }
-    if goal is not None:
-        kwargs["goal_check"] = goal_check
-        kwargs["goal_check_enforce"] = True
-    return kwargs
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("blocked", [False, True])
 @pytest.mark.parametrize("unsettled", [False, True])
-@pytest.mark.parametrize("goal", [None, "achieved", "not_achieved", "impossible"])
-async def test_a_completed_finish_never_reaches_the_reask(
-    pending: bool, blocked: bool, unsettled: bool, goal: str | None
-) -> None:
+async def test_a_completed_finish_never_reaches_the_reask(pending: bool, blocked: bool, unsettled: bool) -> None:
     spy = _ReaskSpy()
-    finish = make_finish_tool(
-        **_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled, goal=goal), unlisted_reask=spy
-    )
+    finish = make_finish_tool(**_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled), unlisted_reask=spy)
 
     # Every hold and deferral the gates grant, then the verdict that stands.
     for _ in range(6):
@@ -797,7 +772,7 @@ async def test_a_completed_finish_never_reaches_the_reask(
     # The same gates let a terminated finish through to it, so the probe above can fire.
     control_spy = _ReaskSpy()
     control = make_finish_tool(
-        **_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled, goal=goal), unlisted_reask=control_spy
+        **_gate_kwargs(pending=pending, blocked=blocked, unsettled=unsettled), unlisted_reask=control_spy
     )
     await control.handler({"status": "terminated", "reason": "no PIN screen"})
     assert control_spy.calls == [("terminated", "no PIN screen")]
@@ -809,9 +784,7 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
     status: NonCompletedStatus,
 ) -> None:
     spy = _ReaskSpy()
-    finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None), unlisted_reask=spy
-    )
+    finish = make_finish_tool(**_gate_kwargs(pending=False, blocked=False, unsettled=False), unlisted_reask=spy)
     result = await finish.handler({"status": status, "reason": "no PIN screen", "extracted_output": None})
     assert result.data == {
         "status": "completed",
@@ -821,16 +794,10 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
         "converted_from_reason": "no PIN screen",
     }
 
-    # The goal check in enforce mode vetoes a conversion it contradicts, as it would a claimed completion.
-    for veto in ("pending", "blocked", "unsettled", "goal_check"):
+    for veto in ("pending", "blocked", "unsettled"):
         spy = _ReaskSpy()
         finish = make_finish_tool(
-            **_gate_kwargs(
-                pending=veto == "pending",
-                blocked=veto == "blocked",
-                unsettled=veto == "unsettled",
-                goal="not_achieved" if veto == "goal_check" else None,
-            ),
+            **_gate_kwargs(pending=veto == "pending", blocked=veto == "blocked", unsettled=veto == "unsettled"),
             unlisted_reask=spy,
         )
         with capture_logs() as logs:
@@ -846,7 +813,6 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
                 "pending": "pending_marker",
                 "blocked": "verification_blocker",
                 "unsettled": "unsettled",
-                "goal_check": "goal_check",
             }[veto]
         )
         # Once per run: a second give-up is not re-asked.
@@ -876,7 +842,7 @@ class _SettleWindowPage:
 
 
 async def _conversion_veto_for(**overrides: Any) -> tuple[str | None, bool]:
-    kwargs = _gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None)
+    kwargs = _gate_kwargs(pending=False, blocked=False, unsettled=False)
     kwargs.update(overrides)
     finish = make_finish_tool(**kwargs, unlisted_reask=_ReaskSpy())
     with capture_logs() as logs:
@@ -968,7 +934,7 @@ async def test_a_navigation_during_the_judge_vetoes_a_conversion_even_once_the_n
             return await super().__call__(status, reason)
 
     finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None)
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False)
         | {"page_fingerprint": page.fingerprint, "document_identity": page.identity},
         unlisted_reask=_NavigatingJudge(),
     )
@@ -1038,7 +1004,7 @@ async def test_a_deadline_that_elapses_during_the_judge_still_vetoes_as_deadline
             return await super().__call__(status, reason)
 
     finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None)
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False)
         | {
             "page_fingerprint": page.fingerprint,
             "document_identity": page.identity,
@@ -1072,7 +1038,7 @@ async def test_a_run_canceled_during_the_reask_is_left_to_the_loops_cancellation
         return canceled
 
     finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False, goal=None),
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
         should_cancel=should_cancel,
         unlisted_reask=_CancelingSpy(converts=converts),
     )

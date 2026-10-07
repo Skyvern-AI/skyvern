@@ -2296,7 +2296,19 @@ function CredentialsModal({
           setIsOpen(open);
         }}
       >
-        <DialogContent className="ph-no-capture max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
+        <DialogContent
+          // The demo-login guide draws its popover and overlay outside the dialog; clicking them must not dismiss it.
+          onInteractOutside={(event) => {
+            if (
+              (event.target as Element | null)?.closest(
+                ".driver-popover, .driver-overlay",
+              )
+            ) {
+              event.preventDefault();
+            }
+          }}
+          className="ph-no-capture max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
+        >
           <DialogHeader>
             <DialogTitle className="font-bold">
               {isEditMode ? "Edit Credential" : (heading ?? "Add Credential")}
@@ -2357,7 +2369,11 @@ function CredentialsModal({
                     {isTestComplete ? "Retest" : "Test"}
                   </Button>
                 ))}
-              <Button onClick={handleSave} disabled={saveDisabled}>
+              <Button
+                onClick={handleSave}
+                disabled={saveDisabled}
+                data-tour="credential-save"
+              >
                 {activeMutation.isPending ||
                 renameCredentialMutation.isPending ? (
                   <ReloadIcon className="mr-2 size-4 animate-spin" />

@@ -23,6 +23,7 @@ import { useLogging } from "@/hooks/useLogging";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
+import { useManualSignInControl } from "@/store/useManualSignInStore";
 import { wssBaseUrl, newWssBaseUrl } from "@/util/env";
 import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
@@ -241,6 +242,10 @@ function BrowserStream({
     parentSessionState?.isBrowserSessionEnded ?? polledIsBrowserSessionEnded;
   const [hasGivenUp, setHasGivenUp] = useState(false);
   const [userIsControlling, setUserIsControlling] = useState(false);
+  useManualSignInControl(
+    showControlButtons ? browserSessionId : undefined,
+    setUserIsControlling,
+  );
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
   // The message socket must open after VNC's handshake has set the ALB

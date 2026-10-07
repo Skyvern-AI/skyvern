@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import type {
@@ -149,28 +150,29 @@ vi.mock("react-router-dom", async (importOriginal) => {
 });
 
 vi.mock("@/store/WorkflowHasChangesStore", () => {
-  const useWorkflowHasChangesStore = () => ({
-    getSaveData: () => ({
-      title: "Test WF",
-      workflow: {
-        workflow_id: "wf_1",
-        workflow_permanent_id: "wpid_1",
-        description: "",
-        totp_verification_url: null,
-        is_saved_task: false,
-        status: "published",
-      },
-      settings: { proxyLocation: null },
-      parameters: [],
-      blocks: [],
-      workflowDefinitionVersion: 1,
-    }),
+  const getSaveData = () => ({
+    title: "Test WF",
+    workflow: {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+      description: "",
+      totp_verification_url: null,
+      is_saved_task: false,
+      status: "published",
+    },
+    settings: { proxyLocation: null },
+    parameters: [],
+    blocks: [],
+    workflowDefinitionVersion: 1,
   });
+  const useWorkflowHasChangesStore = () => ({ getSaveData });
   // Ordinary history recovery reads hasChanges from the zustand store so it
   // preserves unsaved edits when no persisted outcome needs reconciliation.
   useWorkflowHasChangesStore.getState = () => ({
     hasChanges: hasLocalChanges.current,
     setSaveBlockedReason: () => {},
+    setHasChanges: () => {},
+    getSaveData,
   });
   return { useWorkflowHasChangesStore };
 });
@@ -272,6 +274,9 @@ function chatUi(props: {
   onWorkflowUpdate?: NonNullable<
     ComponentProps<typeof WorkflowCopilotChat>
   >["onWorkflowUpdate"];
+  onReviewWorkflow?: NonNullable<
+    ComponentProps<typeof WorkflowCopilotChat>
+  >["onReviewWorkflow"];
 }) {
   return (
     <FeatureFlagContext.Provider value={(name) => boolFlags.current[name]}>
@@ -281,6 +286,7 @@ function chatUi(props: {
         requiresLiveBrowser={props.requiresLiveBrowser}
         isLiveBrowserReady={props.isLiveBrowserReady}
         onWorkflowUpdate={props.onWorkflowUpdate}
+        onReviewWorkflow={props.onReviewWorkflow}
         captureEditorState={props.captureEditorState}
         restoreEditorState={props.restoreEditorState}
       />
@@ -638,6 +644,8 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
     await act(async () => {
       finishApply({ data: { workflow_id: "wf_chat-1" } });
     });
+    // The Accept reads auto_accept back from its own chat row.
+    await flushHistory(pendingChat("chat-1"));
 
     await act(async () =>
       fireEvent.click(screen.getByText("mock-select-history-chat")),
@@ -891,7 +899,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     });
   }
 
-  function interruptedHistory(): HistoryData {
+  function interruptedHistory(final = false): HistoryData {
     return historyWithRow({
       sender: "ai",
       content: interruptedText,
@@ -901,6 +909,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
         response_kind: "recover",
         terminal_reason: "interrupted",
         copilot_turn_id: turnId,
+        ...(final ? { interrupted_row_final: true } : {}),
       },
     });
   }
@@ -1073,6 +1082,43 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
 
     await resolveNextHistory(recoveredHistory());
     expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("keeps a comparison open when a recovery read assigns the open chat its id", async () => {
+    vi.mocked(toast).mockClear();
+    const onReviewWorkflow = vi.fn();
+    const pendingDraft = { workflow_id: "wf_p", _copilot_unvalidated: true };
+    await renderChat({ onReviewWorkflow });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: null,
+        proposed_workflow: pendingDraft,
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Review" }));
+    });
+    const [, settle] = onReviewWorkflow.mock.calls[0]!;
+    await submit("tweak it");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    await resolveNextHistory({
+      ...recoveredHistory(),
+      proposed_workflow: pendingDraft,
+    });
+
+    await act(async () => {
+      await settle("reject");
+    });
+    expect(toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: expect.stringContaining("The chat changed"),
+      }),
+    );
   });
 
   it("can answer a recovered first question whose chat id never arrived", async () => {
@@ -2790,6 +2836,26 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(historyQueue).toHaveLength(0);
   });
 
+  it("releases the save hold on the first read of an interrupted row the server marked final", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    const readsBeforeRow = workflowGets.length;
+
+    await advance(2_000);
+    await resolveNextHistory(interruptedHistory(true));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(renderedText()).toContain(interruptedText);
+    expect(renderedText()).not.toContain(
+      "Could not confirm whether Copilot saved changes",
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(workflowGets.length).toBeGreaterThan(readsBeforeRow);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
   it("rechecks canonical after the terminal row despite unsaved edits", async () => {
     hasLocalChanges.current = true;
     await startTurn();
@@ -3245,5 +3311,391 @@ describe("WorkflowCopilotChat — question transport", () => {
     expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
     await submit("build after cancellation");
     await waitFor(() => expect(streamCalls).toHaveLength(1));
+  });
+});
+
+// A recording-refinement turn arms a recovery poll that holds no reservation, so the review gate
+// stays usable and an Accept can run while one of its reads is in flight.
+describe("WorkflowCopilotChat — history reads across an Accept", () => {
+  afterEach(() => {
+    useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
+  });
+  const refinementRow = {
+    sender: "product",
+    content: "Refine the recording (1 actions) into a reusable workflow.",
+    turn_id: "turn-r",
+    created_at: "2025-01-01T00:00:00",
+  };
+  const draftRow = aiHistoryMessage(
+    narrativePayload({
+      turnId: "turn-p",
+      proposalDisposition: "review_untested",
+      draft: { blockCount: 1, blockLabels: ["open_example"], summary: null },
+      terminalMessage: "Here is a draft.",
+      narrativeSummary: "Here is a draft.",
+    }),
+    "Here is a draft.",
+  );
+  const refinedRow = (proposalDisposition: string) => ({
+    sender: "ai",
+    content: "Refined the recording.",
+    created_at: "2025-01-01T00:00:01",
+    narrative_payload: narrativePayload({
+      turnId: "turn-r",
+      proposalDisposition,
+      draft:
+        proposalDisposition === "no_proposal"
+          ? null
+          : { blockCount: 1, blockLabels: ["refined"], summary: null },
+    }),
+    turn_outcome: { copilot_turn_id: "turn-r", terminal_reason: null },
+  });
+  const metadata = (ownerTurnId: string, disposition = "review_untested") => ({
+    owner_turn_id: ownerTurnId,
+    revision: 1,
+    canonical_fingerprint: "canonical-1",
+    disposition,
+    workflow_run_id: null,
+  });
+  const proposal = (workflowId: string) => ({
+    workflow_id: workflowId,
+    workflow_permanent_id: "wpid_1",
+    title: workflowId,
+    _copilot_unvalidated: true,
+  });
+  const acceptButtons = () =>
+    screen.queryAllByRole("button", { name: "Accept" });
+
+  async function advance(ms: number): Promise<void> {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  function takeRead(): (resp: { data: HistoryData }) => void {
+    expect(historyQueue.length).toBe(1);
+    historyRejects.shift();
+    return historyQueue.shift()!;
+  }
+
+  async function hydrateWithRefinementPoll(
+    proposalMetadata: Record<string, unknown> | null,
+  ): Promise<void> {
+    // After a successful Accept the saved workflow is the one the editor shows.
+    workflowResponse.current = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+    };
+    await renderChat({ onWorkflowUpdate: vi.fn() });
+    await waitFor(() => expect(historyQueue.length).toBeGreaterThan(0));
+    vi.useFakeTimers();
+    const mountRead = takeRead();
+    await act(async () => {
+      mountRead({
+        data: historyData({
+          chat_history: [draftRow, refinementRow],
+          proposed_workflow: proposal("wf_p"),
+          proposed_workflow_metadata: proposalMetadata,
+        }),
+      });
+      await Promise.resolve();
+    });
+    expect(acceptButtons()).toHaveLength(1);
+  }
+
+  // Without metadata the Accept records no owner turn, so the accepted-turn merge cannot
+  // recognise the old proposal in a read taken before the write.
+  it.each([
+    ["with metadata", metadata("turn-p")],
+    ["without metadata", null],
+  ])(
+    "does not restore an accepted proposal from a poll read in flight when the Accept returned (%s)",
+    async (_label, proposalMetadata) => {
+      await hydrateWithRefinementPoll(proposalMetadata);
+      await advance(2_000);
+      const readBeforeWrite = takeRead();
+      cancelPost.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflow/copilot/apply-proposed-workflow"
+            ? { data: proposal("wf_saved") }
+            : {},
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(cancelPost.mock.calls.map(([path]) => path)).toContain(
+        "/workflow/copilot/apply-proposed-workflow",
+      );
+      expect(acceptButtons()).toHaveLength(0);
+      // The Accept reads auto_accept back; that read touches no proposal state.
+      const autoAcceptRead = takeRead();
+      await act(async () => {
+        autoAcceptRead({
+          data: historyData({
+            chat_history: [draftRow, refinementRow],
+            proposed_workflow: proposal("wf_p"),
+            proposed_workflow_metadata: proposalMetadata,
+          }),
+        });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(acceptButtons()).toHaveLength(0);
+
+      await act(async () => {
+        readBeforeWrite({
+          data: {
+            ...historyData({
+              chat_history: [
+                draftRow,
+                refinementRow,
+                refinedRow("no_proposal"),
+              ],
+              proposed_workflow: proposal("wf_p"),
+              proposed_workflow_metadata: proposalMetadata && {
+                ...proposalMetadata,
+                disposition: "accepting",
+              },
+            }),
+            // The server reports a claim only through a proposal's metadata.
+            proposed_claim_expires_in_seconds: proposalMetadata ? 30 : null,
+          } as HistoryData,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(acceptButtons()).toHaveLength(0);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(useWorkflowYamlEditorStore.getState().pendingAccepts).toEqual({});
+
+      // The discarded read is replaced by one taken after the write, which the poll applies.
+      await advance(30_000);
+      const readAfterWrite = takeRead();
+      await act(async () => {
+        readAfterWrite({
+          data: historyData({
+            chat_history: [draftRow, refinementRow, refinedRow("no_proposal")],
+          }),
+        });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(document.body.textContent).toContain("All set.");
+      expect(acceptButtons()).toHaveLength(0);
+    },
+  );
+
+  async function acceptWhileNewerProposalStages(
+    acceptedMetadata: Record<string, unknown> | null,
+    stagedMetadata: Record<string, unknown>,
+  ): Promise<void> {
+    await hydrateWithRefinementPoll(acceptedMetadata);
+    let finishApply: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((resolve) => (finishApply = resolve))
+        : Promise.resolve({}),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await advance(2_000);
+    const refinementLanded = takeRead();
+    await act(async () => {
+      refinementLanded({
+        data: historyData({
+          chat_history: [
+            draftRow,
+            refinementRow,
+            refinedRow("review_untested"),
+          ],
+          proposed_workflow: proposal("wf_r"),
+          proposed_workflow_metadata: stagedMetadata,
+        }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      finishApply({ data: proposal("wf_saved") });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+  }
+
+  // Without a token the accepted proposal is identified by the turn its diff card names. A token
+  // still tells two proposals apart when another client is already accepting the newer one.
+  it.each([
+    ["with a token", metadata("turn-p"), "chat-1:turn-p:1", "review_untested"],
+    ["without a token", null, "chat-1:legacy", "review_untested"],
+    [
+      "with a token, the newer one already accepting",
+      metadata("turn-p"),
+      "chat-1:turn-p:1",
+      "accepting",
+    ],
+  ])(
+    "keeps a newer proposal staged while an Accept of a proposal %s was in flight",
+    async (_label, acceptedMetadata, acceptedTag, stagedDisposition) => {
+      useWorkflowTitleStore.setState({
+        copilotMetadataEdits: {
+          wpid_1: {
+            proposal: acceptedTag,
+            edits: { title: "Renamed for the first proposal" },
+          },
+        },
+      });
+      await acceptWhileNewerProposalStages(
+        acceptedMetadata,
+        metadata("turn-r", stagedDisposition),
+      );
+
+      expect(
+        within(document.getElementById("copilot-gate-turn-r")!).getByRole(
+          "button",
+          { name: "Accept" },
+        ),
+      ).toBeTruthy();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      // Edits made under the accepted proposal must not ride along to the one kept.
+      expect(
+        useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_1,
+      ).toEqual({ proposal: "chat-1:turn-r:1", edits: {} });
+    },
+  );
+
+  // A turn that ends without a draft re-reads the chat row for the bypassed proposal and frees the
+  // gate before that read returns.
+  it("does not restore a tokenless proposal from a resync read that outlived its Accept", async () => {
+    await renderChat({ onWorkflowUpdate: vi.fn() });
+    await flushHistory(
+      historyData({
+        chat_history: [draftRow],
+        proposed_workflow: proposal("wf_p"),
+      }),
+    );
+    expect(acceptButtons()).toHaveLength(1);
+    await submit("what does this block do?");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "It opens the example page.",
+        updated_workflow: null,
+        response_time: "2026-08-16T02:02:13Z",
+        proposal_disposition: "no_proposal",
+      });
+      streamCalls[0]!.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(historyQueue.length).toBe(1));
+    const resyncBeforeWrite = takeRead();
+    cancelPost.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflow/copilot/apply-proposed-workflow"
+          ? { data: proposal("wf_saved") }
+          : {},
+      ),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+    await waitFor(() => expect(acceptButtons()).toHaveLength(0));
+
+    await act(async () => {
+      resyncBeforeWrite({
+        data: historyData({
+          chat_history: [draftRow],
+          proposed_workflow: proposal("wf_p"),
+        }),
+      });
+    });
+
+    expect(acceptButtons()).toHaveLength(0);
+  });
+
+  // Graph edits send a successful Accept through the saved-workflow conflict, which settles later.
+  it("keeps a newer proposal when a tokenless Accept settles through the saved-workflow conflict", async () => {
+    useWorkflowTitleStore.setState({
+      copilotMetadataEdits: {
+        wpid_1: { proposal: "chat-1:legacy", edits: {}, graphEdited: true },
+      },
+    });
+    await acceptWhileNewerProposalStages(null, metadata("turn-r"));
+    await advance(0);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Keep my edits" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(
+      within(document.getElementById("copilot-gate-turn-r")!).getByRole(
+        "button",
+        { name: "Accept" },
+      ),
+    ).toBeTruthy();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  // A tokenless proposal is given a fresh owner when its Accept claims it, so a read taken during
+  // that Accept shows the accepted proposal under a turn the client never saw.
+  it("clears the accepted proposal when a read shows it claimed under a new owner", async () => {
+    await acceptWhileNewerProposalStages(
+      null,
+      metadata("owner-assigned-at-accept", "accepting"),
+    );
+
+    expect(acceptButtons()).toHaveLength(0);
+  });
+});
+
+describe("WorkflowCopilotChat — first chat selection", () => {
+  it("discards a read that outlived a first selection from a chat with no id", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: null,
+        proposed_workflow: { workflow_id: "wf_p", _copilot_unvalidated: true },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    });
+    await waitFor(() => expect(historyQueue).toHaveLength(1));
+    const resolveLatest = historyQueue.shift()!;
+    historyRejects.shift();
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "mock-select-history-chat" }),
+      );
+    });
+    await flushHistory(historyData({ workflow_copilot_chat_id: "chat_other" }));
+    await act(async () => {
+      resolveLatest({
+        data: historyData({ workflow_copilot_chat_id: "chat-1" }),
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).disabled,
+      ).toBe(false),
+    );
+    await submit("next");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(
+      (
+        postStreaming.mock.calls[0]![1] as {
+          workflow_copilot_chat_id?: string | null;
+        }
+      ).workflow_copilot_chat_id,
+    ).toBe("chat_other");
   });
 });

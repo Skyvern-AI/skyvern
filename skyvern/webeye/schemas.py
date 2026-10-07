@@ -13,10 +13,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    API_BROWSER_SESSION_CREATED_BY,
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 
 LOG = structlog.get_logger()
 
@@ -72,6 +74,14 @@ class BrowserSessionResponse(BaseModel):
     generate_browser_profile: bool = Field(
         default=False,
         description="Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
+    )
+    browser_settings: BrowserSettings | None = Field(
+        default=None, description="Browser settings requested when the session was created."
+    )
+    browser_settings_receipt: BrowserSettingsReceipt | None = Field(
+        default=None,
+        description="What the browser reported after launch for the requested settings. Null until it is measured, "
+        "and always null when no settings were requested.",
     )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     stream_transport: str | None = Field(
@@ -243,5 +253,9 @@ class BrowserSessionResponse(BaseModel):
             browser_type=browser_session.browser_type,
             browser_profile_id=browser_session.browser_profile_id,
             generate_browser_profile=browser_session.generate_browser_profile,
-            created_by=browser_session.created_by,
+            browser_settings=browser_session.browser_settings,
+            browser_settings_receipt=browser_session.browser_settings_receipt,
+            created_by=(
+                None if browser_session.created_by == API_BROWSER_SESSION_CREATED_BY else browser_session.created_by
+            ),
         )

@@ -427,7 +427,7 @@ describe("PromptBox", () => {
       ref.current?.focusAndPrefillExample("AAPLStockPrice", "finditparts"),
     );
     expect((textarea as HTMLTextAreaElement).value).toContain(
-      'find the "AAPL" stock price',
+      'search for "AAPL"',
     );
     expect(document.activeElement).toBe(textarea);
     expect(textarea.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
@@ -440,7 +440,7 @@ describe("PromptBox", () => {
 
     fireEvent.change(textarea, { target: { value: "Keep my agent prompt" } });
     act(() =>
-      ref.current?.focusAndPrefillExample("contact_us_forms", "finditparts"),
+      ref.current?.focusAndPrefillExample("add_employee", "finditparts"),
     );
     expect((textarea as HTMLTextAreaElement).value).toBe(
       "Keep my agent prompt",
@@ -732,9 +732,10 @@ describe("PromptBox", () => {
     const textarea = promptInput() as HTMLTextAreaElement;
     const cases = [
       ["finditparts", "finditparts.com"],
-      ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
-      ["extractIntegrationsFromGong", "Gong integrations page"],
-      ["AAPLStockPrice", "google finance"],
+      ["add_employee", "opensource-demo.orangehrmlive.com"],
+      ["extractIntegrationsFromSkyvern", "skyvern.com"],
+      ["AAPLStockPrice", "Google Finance"],
+      ["download_invoices", "[vendor portal]"],
     ] as const;
 
     for (const [key, expected] of cases) {
@@ -931,6 +932,39 @@ describe("PromptBox", () => {
         filename: "sample-resume.pdf",
       }),
     ]);
+  });
+
+  test("drops only the example's sample resume when switching to an example without one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(new Response(new Blob(["%PDF"]), { status: 200 })),
+      ),
+    );
+    mockPost
+      .mockResolvedValueOnce({ data: { file_id: "file_user" } })
+      .mockResolvedValueOnce({ data: { file_id: "file_example" } });
+
+    renderPromptBox(true);
+    fireEvent.change(screen.getByLabelText("Upload document"), {
+      target: {
+        files: [
+          new File(["%PDF"], "sample-resume.pdf", { type: "application/pdf" }),
+        ],
+      },
+    });
+    await screen.findByText("sample-resume.pdf");
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    await waitFor(() =>
+      expect(screen.getAllByText("sample-resume.pdf")).toHaveLength(2),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add a product to cart" }),
+    );
+    await waitFor(() =>
+      expect(screen.getAllByText("sample-resume.pdf")).toHaveLength(1),
+    );
   });
 
   test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {

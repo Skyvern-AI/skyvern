@@ -61,6 +61,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "delete_block",
     "list_credentials",
     "list_integrations",
+    "read_google_sheet",
     "run_blocks_and_collect_debug",
     "test_workflow_from_blank_browser",
     "get_run_results",
@@ -74,6 +75,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "run_browser_code",
     "solve_page_challenge",
     "start_fresh_browser",
+    "extend_browser_session",
     "upload_attached_file",
 ]
 
@@ -89,6 +91,7 @@ def test_the_tool_joins_every_catalog_combination_without_displacing_one(
         for tool in copilot_native_tools(
             supports_question_tool=supports_question_tool,
             browser_code_available=browser_code_available,
+            run_tools_available=True,
         )
     ]
 

@@ -5,9 +5,10 @@ import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import BitwardenGetItemError, BitwardenUnlockError
+from skyvern.exceptions import BitwardenGetItemError, BitwardenLoginError, BitwardenUnlockError
 from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
@@ -24,6 +25,8 @@ from tests.unit.scoped_asyncio import ScopedAsyncio
 MISSING_TOTP_LOGINS = [
     pytest.param({"username": "user@example.com", "password": "pw"}, id="totp-absent"),
     pytest.param({"username": "user@example.com", "password": "pw", "totp": None}, id="totp-null"),
+    pytest.param({"password": "pw"}, id="username-and-totp-absent"),
+    pytest.param({"username": "user@example.com"}, id="password-and-totp-absent"),
 ]
 
 
@@ -77,6 +80,42 @@ async def test_login_ignores_data_file_creation_notice_on_stderr(
     monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
 
     await BitwardenService.login("client-id", "client-secret", master_password="master-password")
+
+
+_BACKFILL_ADVISORY = (
+    "[UserKeyIdBackfillMigration] Could not determine whether user 11111111-1111-4111-8111-111111111111 "
+    "needs migration: KeyIdBackfillError: User key is not available in key store"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stderr", "tolerated"),
+    [
+        (f"{_BACKFILL_ADVISORY}\n", True),
+        (_BACKFILL_ADVISORY.replace("User key is not available in key store", "Api error"), False),
+        (f"{_BACKFILL_ADVISORY}\nUnable to fetch ServerConfig from https://example.test/api FetchError", False),
+        ("[UserKeyIdBackfillMigration] Could not determine whether user someone needs migration", False),
+    ],
+    ids=["exact-advisory", "other-backfill-error", "advisory-plus-other-line", "malformed-user-id"],
+)
+async def test_apikey_login_tolerates_only_the_exact_user_key_id_backfill_advisory(
+    monkeypatch: pytest.MonkeyPatch, stderr: str, tolerated: bool
+) -> None:
+    async def fake_run_command(*args, **kwargs) -> RunCommandResult:
+        return RunCommandResult(
+            stdout="You are logged in!\n\nTo unlock your vault, use the `unlock` command. ex:\n$ bw unlock",
+            stderr=stderr,
+            returncode=0,
+        )
+
+    monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
+
+    if tolerated:
+        assert await BitwardenService.login("client-id", "client-secret") is None
+    else:
+        with pytest.raises(BitwardenLoginError):
+            await BitwardenService.login("client-id", "client-secret")
 
 
 @pytest.mark.asyncio
@@ -407,18 +446,92 @@ def test_get_item_rejects_malformed_card_payload_and_custom_fields(key: str, val
 
 
 @pytest.mark.parametrize("field", ["cardholderName", "number", "expMonth", "expYear", "code", "brand"])
-@pytest.mark.parametrize("missing", [False, True], ids=["non-string", "missing"])
-def test_get_item_rejects_invalid_consumed_card_fields(field: str, missing: bool) -> None:
+def test_get_item_rejects_non_string_consumed_card_fields(field: str) -> None:
     item = _cli_item(BitwardenItemType.CREDIT_CARD)
-    if missing:
-        del item["card"][field]
-    else:
-        item["card"][field] = 123
+    item["card"][field] = 123
 
     with pytest.raises(BitwardenGetItemError):
         BitwardenService._parse_fetched_item(
             RunCommandResult(stdout=json.dumps(item), stderr="", returncode=0), item["id"]
         )
+
+
+# The same vault entries as the real CLI printed them (synthetic data, captured against a local fake server):
+# 2025.9.0 spells an empty field as an explicit null, 2026.9.0 leaves the key out.
+_CLI_EMPTY_FIELD_SHAPES = {
+    "login-without-username": (
+        BitwardenItemType.LOGIN,
+        {
+            "login": {
+                "username": None,
+                "password": "pw-only",
+                "totp": None,
+                "uris": [{"match": None, "uri": "https://example.test/"}],
+            }
+        },
+        {
+            "login": {
+                "password": "pw-only",
+                "passwordRevisionDate": None,
+                "fido2Credentials": [],
+                "uris": [{"uri": "https://example.test/"}],
+            }
+        },
+    ),
+    "login-without-password": (
+        BitwardenItemType.LOGIN,
+        {
+            "login": {
+                "username": "user-only",
+                "password": None,
+                "totp": None,
+                "uris": [{"match": None, "uri": "https://example.test/"}],
+            }
+        },
+        {
+            "login": {
+                "username": "user-only",
+                "passwordRevisionDate": None,
+                "fido2Credentials": [],
+                "uris": [{"uri": "https://example.test/"}],
+            }
+        },
+    ),
+    "card-without-brand-and-cvv": (
+        BitwardenItemType.CREDIT_CARD,
+        {
+            "card": {
+                "cardholderName": "Only Holder",
+                "number": "4000056655665556",
+                "expMonth": "11",
+                "expYear": "2031",
+                "code": None,
+                "brand": None,
+            }
+        },
+        {"card": {"cardholderName": "Only Holder", "number": "4000056655665556", "expMonth": "11", "expYear": "2031"}},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_CLI_EMPTY_FIELD_SHAPES))
+def test_cli_2026_omitted_keys_read_the_same_as_2025_nulls(case: str) -> None:
+    item_type, shape_2025, shape_2026 = _CLI_EMPTY_FIELD_SHAPES[case]
+    outcomes = []
+    for nested, omits_null_keys in ((shape_2025, False), (shape_2026, True)):
+        item = {**_cli_item(item_type), **nested, "fields": []}
+        if omits_null_keys:
+            item = {key: value for key, value in item.items() if value is not None}
+
+        fetched = BitwardenService._parse_fetched_item(
+            RunCommandResult(stdout=json.dumps(item), stderr="", returncode=0), item["id"]
+        )
+        try:
+            outcomes.append(get_list_response_item_from_bitwarden_item(fetched).credential)
+        except ValidationError as error:
+            outcomes.append(type(error))
+
+    assert outcomes[0] == outcomes[1]
 
 
 @pytest.mark.asyncio
@@ -452,6 +565,25 @@ async def test_run_command_scrubs_inherited_cli_output_modes(
         "NODE_NO_WARNINGS": "1",
     }
     assert all(os.environ[flag] == "true" for flag in flags)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("subcommand", "noninteractive"), [("get", "true"), ("login", None)])
+async def test_run_command_never_lets_a_read_prompt(tmp_path, subcommand: str, noninteractive: str | None) -> None:
+    # A locked read that may prompt exits 0 with no output on a closed stdin and hangs on an open one;
+    # with BW_NOINTERACTION it fails with "Vault is locked.". Login stays interactive for its device prompt.
+    fake_cli = tmp_path / "bw"
+    fake_cli.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        "print(json.dumps({'noninteractive': os.environ.get('BW_NOINTERACTION'),"
+        " 'stdin_is_devnull': os.path.samestat(os.fstat(0), os.stat(os.devnull))}))\n"
+    )
+    fake_cli.chmod(0o755)
+
+    result = await BitwardenService.run_command([str(fake_cli), subcommand])
+
+    assert json.loads(result.stdout) == {"noninteractive": noninteractive, "stdin_is_devnull": True}
 
 
 @pytest.mark.asyncio
@@ -580,11 +712,11 @@ async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.Mo
     )
 
     # Establishing the session and reading the item all run on the attempt's budget. No `bw logout`:
-    # the session is kept for the next run rather than torn down (SKY-14751).
+    # the session is kept for the next run rather than torn down (SKY-14751), and no `bw sync`: the
+    # login already ran a full one.
     assert budgets == {
         "bw login": 37,
         "bw unlock": 37,
-        "bw sync": 37,
         "bw get": 37,
     }
 

@@ -61,6 +61,12 @@ keywords:
 - **Redesigned Discover Home** — The Discover page's prompt, examples, and templates have been redesigned.
 - **Guided Full-Page Welcome for New Sign-Ups** — New accounts now land on a full-page walkthrough covering goals, expected volume, and role, replacing the old setup modal.
 - **Guided Template Walkthrough** — Using a home page template now copies it, opens Copilot with a numbered summary of what it does, and shows an inputs card for the credentials and values it needs. ([#8730](https://github.com/Skyvern-AI/skyvern/pull/8730))
+- **Copilot-Extendable Browser Sessions** — Ask Copilot to extend its own signed-in browser session instead of only being able to do it through the API, up to the existing 6-hour cap.
+- **Terminate Block Error Codes** — The Terminate block can now carry a custom error code, so retry rules and webhook consumers can match on it instead of parsing the free-text reason.
+- **Google Cloud Marketplace Purchases** — Orders purchased through Google Cloud Marketplace now provision, change plan, suspend, reactivate, and cancel automatically.
+- **First-Run Product Tour** — New users now get a guided walkthrough of the Copilot and Browser panes on their first run, replayable anytime from Settings.
+- **Copilot-Saved Browser Profiles** — Ask Copilot to save a closed signed-in browser session, or a run, as a reusable named browser profile.
+- **Activation Credits** — New users now earn activation credits for onboarding steps, shown in a credits meter on the welcome page and Home checklist.
 
 ## Improvements
 
@@ -88,6 +94,35 @@ keywords:
 - **Docked Copilot Sign-In Requests** — Copilot's sign-in and Google account requests now dock above the chat input instead of scrolling out of view with the transcript.
 - **More Reliable Copilot Repairs on SSL Errors** — Copilot no longer gives up early on ambiguous SSL connection errors during automatic repairs; it now attempts a fix. ([#8731](https://github.com/Skyvern-AI/skyvern/pull/8731))
 - **Upstream Output Reuse in Copilot Repair Tests** — Testing a repaired block that reads an earlier block's output no longer fails with a template error; the test now reuses that output automatically. ([#8737](https://github.com/Skyvern-AI/skyvern/pull/8737))
+- **Faster Copilot Repair Tests** — Copilot now reuses outputs from already-completed steps when testing a fix, instead of rerunning them.
+- **Settings Header Alignment** — The Settings page header now aligns with the navigation rail instead of sitting in its own row above it.
+- **Clearer Run Start Time** — The Timeline now labels a run's start time as "Created" instead of a timestamp that could be mistaken for when the run finished.
+- **More Reliable Date Field Filling** — Task runs now tab out of certain hard-to-click date fields before reading their value back, fixing cases where a filled field was incorrectly reported as empty.
+- **Guided Credential Example on Home** — The "Log into an HR portal" example on the Home page now walks new users step by step through connecting and using a demo login.
+- **Copilot Names Agents from the Home Prompt Box** — Agents created from the Home page prompt box now get a short, Copilot-generated name instead of keeping the full prompt as their title.
+- **Smarter Partial Date-of-Birth Handling** — When a task only provides a birth year, Skyvern now enters 01/01/<year> instead of terminating, and never invents an address or phone number. ([#8747](https://github.com/Skyvern-AI/skyvern/pull/8747))
+- **More Reliable Dropdown and Combobox Selection** — Improved how Skyvern verifies that a dropdown list was read completely and that a selection was actually committed, reducing false "not found" and "didn't select" errors.
+- **Behavior-Based Onboarding Emails** — Onboarding emails now adapt to what a new user has actually done, and free accounts are notified when they run out of credits.
+- **Visible Conditional Block Errors** — The run view now shows when a conditional block's condition couldn't be evaluated and which branch was taken, instead of showing nothing.
+- **Enter to Send on the Home Prompt Box** — Press Enter to send a prompt and Shift+Enter for a new line, matching Workflow Copilot's chat input. ([#8741](https://github.com/Skyvern-AI/skyvern/pull/8741))
+- **File Upload on the Classic Home Prompt Box** — Added the "+" upload menu to the original Home page prompt layout, so you can attach files there too.
+- **More Accurate Code Block AI Fallback** — The AI fallback for code blocks now sees the exact values the failed code was typing, instead of guessing from placeholder text.
+- **Goal Update Prompts on Manual Code Edits** — Hand-editing a code block's code now offers to update its Goal to match, or keep your own wording.
+- **Skyvern 3.0 Listed First** — The block engine dropdown now lists Skyvern 3.0 (Recommended) above the legacy 1.0 engine.
+- **Low-Credit Warning Email** — Free accounts now get a one-time email when their free credits run low, instead of finding out only after they run out.
+- **Simplified Onboarding Emails** — Added a Day-1 email introducing Copilot, simplified the Welcome email to two steps, and stopped sending "no successful run yet" nudges to team accounts.
+- **Welcome Questionnaire for New Sign-Ups** — New sign-ups now land directly on the welcome questionnaire instead of briefly landing on Home first.
+- **Clearer Insurance Quote Example** — The Home page's insurance quote example now reads as plain text instead of a JSON blob.
+- **Clearer Extraction Results** — Skyvern 3.0 extraction-only blocks now always report exactly what's on the page, marking any missing field as null. ([#8771](https://github.com/Skyvern-AI/skyvern/pull/8771))
+- **Instant Welcome Email** — New signups now get the Welcome email right after their first app load, instead of waiting up to an hour.
+- **Clearer Copilot Loop Debugging** — Workflow Copilot now shows which input a for_loop block actually used, with recorded row counts, making a failed loop easier to debug.
+- **Readable Copilot Browser-Code Steps** — Copilot's browser-code tool calls now list the steps the code performed, like "Opened a page → clicked next → read ×10," instead of just "Ran browser code."
+- **Clearer Blocked Code-Block Errors** — Copilot now explains which value caused a blocked code block and how earlier outputs reach code, instead of a generic error.
+- **Visible Page-Load Failures in Code Blocks** — A CodeBlock wait-timeout error now shows the page load failure that caused it, instead of just the timeout.
+- **More Complete Copilot Repairs** — Copilot's automatic repairs now see icon-only controls, like expanders and chevrons, even when their selector isn't unique on the page.
+- **Starter-Prompt Onboarding Email** — New signups now get an email with three starter prompts — collecting website data, downloading invoices, and filling out a form — to help them get going.
+- **Readable Copilot Tables** — Copilot replies now render Markdown tables, headings, quotes, and dividers properly instead of as unstyled text.
+- **Search Runs by More Identifiers** — Run History and run search can now find runs by browser profile ID, browser session ID, credential ID, or webhook callback URL, not just run ID or inputs.
 
 ## Bug fixes
 
@@ -129,6 +164,30 @@ keywords:
 - Fixed task runs refusing to click a checkbox that sits on top of its own styled replacement, reporting it as not rendered. ([#8734](https://github.com/Skyvern-AI/skyvern/pull/8734))
 - Fixed task runs losing track of a page after a click opened a new tab, causing the run to stall. ([#8733](https://github.com/Skyvern-AI/skyvern/pull/8733))
 - Fixed a dark-mode flash of a white screen on sign-in, refresh, and other full page loads.
+- Fixed a shared browser session hanging for other users when closing one client's connection failed to cleanly detach.
+- Fixed the Settings organization profile panel showing excess empty space below its content.
+- Fixed Copilot's action explanations sometimes appearing next to the wrong action.
+- Fixed a run's error details sometimes appearing twice due to a duplicate termination error record.
+- Fixed a toolbar flicker on first load of the Home page prompt box.
+- Fixed Copilot being unable to read large pages after signing in with a saved login, and it now tells you when a page is too large to show. ([#8742](https://github.com/Skyvern-AI/skyvern/pull/8742))
+- Fixed data extraction failing partway through on pages with many rows due to hitting a browser handle limit.
+- Fixed cached workflow runs executing every branch of a conditional block inside a loop instead of only the correct one.
+- Fixed Copilot failing with a generic connection error after an Anthropic Bedrock request was denied, instead of falling back correctly.
+- Fixed automatic error recovery sometimes following outdated step instructions instead of the block's actual goal, which could cause it to submit incorrect information.
+- Fixed Copilot showing a misleading "worker unavailable" message when a test run failed to prepare.
+- Fixed the code block AI fallback running during Copilot build tests and editor block runs, hiding real code regressions; run details now show which block it rescued and why the code failed.
+- Fixed a Terminate block's custom error code or reason being able to leak a referenced secret's value.
+- Fixed task runs occasionally being marked failed or terminated right after a successful form submission.
+- Fixed Skyvern 3.0 refusing to finish a task when the page had a live countdown, clock, or rotating headline.
+- Fixed Skyvern 3.0 losing its view of the page entirely on sites that define their own `toJSON`, instead of reading the page correctly. ([#8770](https://github.com/Skyvern-AI/skyvern/pull/8770))
+- Fixed Skyvern 3.0 occasionally picking the wrong row from a long dropdown or menu due to a shifted or guessed row number. ([#8767](https://github.com/Skyvern-AI/skyvern/pull/8767))
+- Fixed a single-action step sometimes being marked complete before its action actually took effect, which could carry the run onto the wrong next page.
+- Fixed Skyvern 3.0 missing icon-only close buttons on overlays and incorrectly reporting that no controls were found. ([#8766](https://github.com/Skyvern-AI/skyvern/pull/8766))
+- Fixed Copilot's automatic repair discarding the notice that a full-screen overlay, like a consent banner, was blocking the page.
+- Fixed Skyvern 3.0 on slow-loading pages misjudging whether the page had actually finished loading.
+- Fixed Skyvern 3.0 incorrectly reporting a search-and-select field as empty when a single result committed automatically.
+- Fixed Skyvern 3.0 clicking the wrong control when its screen-reader label differed from its visible text.
+- Fixed Copilot failing before sending any request on certain Anthropic and Bedrock models.
 
 </Update>
 

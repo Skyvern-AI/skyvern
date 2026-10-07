@@ -8,13 +8,18 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
-from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
+
+_SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")
+_ABSENT = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
+_UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED)
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -47,7 +52,7 @@ def test_build_captcha_tools_always_offered() -> None:
 @pytest.mark.asyncio
 async def test_solve_captcha_page_unavailable_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
     ladder = AsyncMock()
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(None), organization_id="o_1")
     result = await tools[0].handler({})
     assert result.status == "error"
@@ -56,7 +61,7 @@ async def test_solve_captcha_page_unavailable_is_error(monkeypatch: pytest.Monke
 
 @pytest.mark.asyncio
 async def test_solve_captcha_solved_returns_ok(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", AsyncMock(return_value=True))
+    monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=_SOLVED))
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     result = await tools[0].handler({})
     assert result.status == "ok"
@@ -68,8 +73,8 @@ async def test_solve_captcha_absent_is_ok_and_steers_away(monkeypatch: pytest.Mo
     # No challenge present: this must be an ok the model can retry after a fresh observe — never an
     # error, and never a blanket instruction to stop calling solve_captcha, since a later page state
     # (e.g. a frame-nested challenge that appears after further navigation) may genuinely have one.
-    ladder = AsyncMock(return_value=False)
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_ABSENT)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     handler = tools[0].handler
 
@@ -91,16 +96,16 @@ async def test_every_ok_branch_names_a_distinct_outcome_class(monkeypatch: pytes
     # working one are the same row to every downstream reader. Drives all three through the real
     # handler rather than pinning strings: the branches were previously separable only by
     # `len(content)`, which is exactly the accident this replaces (it has already changed once).
-    ladder = AsyncMock(return_value=True)
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_SOLVED)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     handler = tools[0].handler
 
     solved = await handler({})
-    ladder.return_value = False
+    ladder.return_value = _ABSENT
     absent = await handler({})
     # Exhaust the cap on real failures, then the next call is the short-circuit branch.
-    ladder.side_effect = CaptchaChallengeUnsolvedError("x")
+    ladder.return_value = _UNSOLVED
     for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS):
         await handler({})
     declined = await handler({})
@@ -176,9 +181,7 @@ def test_every_ok_construction_in_the_module_names_an_ok_class() -> None:
 
 @pytest.mark.asyncio
 async def test_solve_captcha_unsolved_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        captcha_tools, "solve_challenge_ladder", AsyncMock(side_effect=CaptchaChallengeUnsolvedError("x"))
-    )
+    monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=_UNSOLVED))
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     result = await tools[0].handler({})
     assert result.status == "error"
@@ -190,7 +193,7 @@ async def test_solve_captcha_hang_is_bounded_to_error(monkeypatch: pytest.Monkey
         await asyncio.Event().wait()
         raise AssertionError("should be cancelled")
 
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", AsyncMock(side_effect=_never_returns))
+    monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(side_effect=_never_returns))
     monkeypatch.setattr(captcha_tools, "_SOLVE_CAPTCHA_CEILING_SECONDS", 0.01)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     result = await asyncio.wait_for(tools[0].handler({}), timeout=5)
@@ -199,8 +202,8 @@ async def test_solve_captcha_hang_is_bounded_to_error(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_solve_captcha_threads_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    ladder = AsyncMock(return_value=True)
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_SOLVED)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     page = object()
     tools, _ = captcha_tools.build_captcha_tools(
         _task(workflow_run_id="wr_9", browser_session_id="bs_9"), _provider(page), organization_id="o_9"
@@ -226,8 +229,8 @@ async def test_solve_captcha_threads_ids(monkeypatch: pytest.MonkeyPatch) -> Non
 async def test_solve_captcha_attempt_guard_stops_calling_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
     # A pathological loop must not run the solver forever: after the cap, the tool short-circuits with a
     # steer-away result and never invokes the ladder again.
-    ladder = AsyncMock(side_effect=CaptchaChallengeUnsolvedError("x"))
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_UNSOLVED)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     handler = tools[0].handler
     for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS):
@@ -242,9 +245,9 @@ async def test_solve_captcha_attempt_guard_stops_calling_ladder(monkeypatch: pyt
 async def test_solve_captcha_success_resets_failure_streak(monkeypatch: pytest.MonkeyPatch) -> None:
     # A real solve must clear the failure streak, so a task with several genuine captchas is not
     # disabled by earlier failures.
-    unsolved = CaptchaChallengeUnsolvedError("x")
-    ladder = AsyncMock(side_effect=[unsolved, unsolved, True, unsolved, unsolved, unsolved])
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    unsolved = _UNSOLVED
+    ladder = AsyncMock(side_effect=[unsolved, unsolved, _SOLVED, unsolved, unsolved, unsolved])
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     handler = tools[0].handler
     # 2 failures, then a solve (streak resets), then 3 more failures = 6 ladder calls before the cap trips.
@@ -259,8 +262,8 @@ async def test_solve_captcha_success_resets_failure_streak(monkeypatch: pytest.M
 @pytest.mark.asyncio
 async def test_solve_captcha_absent_does_not_consume_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     # A page with no captcha returns absent(ok); repeated absent no-ops must never trip the failure cap.
-    ladder = AsyncMock(return_value=False)
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_ABSENT)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
     handler = tools[0].handler
     for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS + 3):
@@ -272,7 +275,7 @@ async def test_solve_captcha_absent_does_not_consume_the_cap(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_solve_captcha_provider_raising_is_error_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
     ladder = AsyncMock()
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
 
     async def _raising_provider() -> Any:
         raise RuntimeError("page lost")
@@ -351,8 +354,8 @@ async def test_page_unavailable_never_enters_lifecycle_scope(monkeypatch: pytest
 async def test_without_image_selector_the_ocr_seam_is_never_touched(monkeypatch: pytest.MonkeyPatch) -> None:
     ocr = OcrRecordingAgentFunction("unused")
     monkeypatch.setattr(app, "AGENT_FUNCTION", ocr)
-    ladder = AsyncMock(return_value=False)
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_ABSENT)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
 
     for args in ({}, {"image_selector": ""}, {"image_selector": "   "}):
@@ -369,8 +372,8 @@ async def test_without_an_ocr_solver_the_argument_is_neither_offered_nor_honoure
     # OSS has no solver: advertising the argument would send the model to a read that always fails and spends
     # the failure cap the widget ladder shares.
     monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
-    ladder = AsyncMock(return_value=False)
-    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    ladder = AsyncMock(return_value=_ABSENT)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", ladder)
     tools, guidance = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
 
     assert tools[0].to_openai_tool()["function"]["parameters"]["properties"] == {}
@@ -378,3 +381,64 @@ async def test_without_an_ocr_solver_the_argument_is_neither_offered_nor_honoure
     result = await tools[0].handler({"image_selector": "#cap"})
     assert "image_selector" not in result.content
     assert ladder.await_count == 1
+
+
+class _FramesOnlyPage:
+    """A page whose only readable attribute is `frames`: any other access is a page read the tool did not make
+    before, and fails the test."""
+
+    def __init__(self, main_url: str, child_urls: list[str]) -> None:
+        main = SimpleNamespace(url=main_url, parent_frame=None)
+        self.frames = [main, *(SimpleNamespace(url=url, parent_frame=main) for url in child_urls)]
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"solve_captcha read page.{name}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "error_class"),
+    [
+        (ChallengeOutcome(ChallengeStatus.UNSOLVED, "hcaptcha", page_state="challenged"), "challenge_not_attempted"),
+        (ChallengeOutcome(ChallengeStatus.UNSOLVED, "hcaptcha", "extension", "challenged"), "challenge_unsolved"),
+        (ChallengeOutcome(ChallengeStatus.UNSOLVED), "challenge_unsolved"),
+        (ChallengeOutcome(ChallengeStatus.UNSUPPORTED, "arkose", page_state="challenged"), "challenge_unsupported"),
+    ],
+)
+async def test_an_unsolved_solve_names_its_class_and_logs_the_receipt_without_changing_the_result(
+    monkeypatch: pytest.MonkeyPatch, outcome: ChallengeOutcome, error_class: str
+) -> None:
+    # Every unsolved shape used to reach telemetry as "other". The result the model reads is the one it got before,
+    # and the receipt joins the tool-call record through tool_call_seq.
+    monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=outcome))
+    monkeypatch.setattr(captcha_tools, "current_tool_call_seq", lambda: 7)
+    page = _FramesOnlyPage("https://app.example/login", ["https://challenge.example/captcha/frame"])
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(page), organization_id="o_1")
+
+    with capture_logs() as logs:
+        result = await tools[0].handler({})
+
+    assert (result.status, result.error_class) == ("error", error_class)
+    assert result.content.startswith("a captcha challenge is present but could not be solved this attempt")
+    [line] = [e for e in logs if e["event"] == "taskv3 captcha solve outcome"]
+    assert {key.removeprefix("solve_"): line[key] for key in line if key.startswith("solve_")} == outcome.receipt()
+    assert (line["vendor_frame_present"], line["tool_call_seq"]) == (True, 7)
+
+
+@pytest.mark.asyncio
+async def test_a_solved_outcome_line_carries_classes_only_and_no_vendor_frame() -> None:
+    # The line carries the arm and booleans, never a URL it read: frame URLs can hold a solved token. The main
+    # frame's own "captcha" path is not a vendor frame, as the solver reads only child frames.
+    token = "03AFcWeA_planted_solved_token"
+    solved = ChallengeOutcome(ChallengeStatus.SOLVED, arm="token")
+    page = _FramesOnlyPage("https://app.example/captcha-verify", [f"https://app.example/embed?state={token}"])
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(page), organization_id="o_1")
+
+    with capture_logs() as logs, pytest.MonkeyPatch.context() as mp:
+        mp.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=solved))
+        result = await tools[0].handler({})
+
+    assert (result.status, result.ok_class) == ("ok", "solved")
+    [line] = [e for e in logs if e["event"] == "taskv3 captcha solve outcome"]
+    assert (line["solve_status"], line["solve_arm"], line["vendor_frame_present"]) == ("solved", "token", False)
+    assert token not in repr(logs)

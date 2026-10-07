@@ -27,6 +27,7 @@ from tests.unit.test_copilot_runtime import _FakeBrowserContext, _make_ctx
 _SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, "perimeterx", "vendor_handler", "clear")
 _ABSENT = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
 _UNSUPPORTED = ChallengeOutcome(ChallengeStatus.UNSUPPORTED, "arkoselabs", None, "challenged")
+_PX_UNSUPPORTED = ChallengeOutcome(ChallengeStatus.UNSUPPORTED, "perimeterx", "vendor_handler", "challenged")
 _UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED, "datadome", "vendor_handler", "challenged")
 _UNTRIED_FRESH_BROWSER = "start_fresh_browser: a new browser session with no cookies, storage or challenge history"
 
@@ -89,6 +90,15 @@ async def _hang(*_args: object, **_kwargs: object) -> bool:
             },
         ),
         (
+            AsyncMock(return_value=_PX_UNSUPPORTED),
+            True,
+            {
+                "outcome": "unsupported",
+                "challenge": _PX_UNSUPPORTED.receipt(),
+                "untried_in_this_request": [_UNTRIED_FRESH_BROWSER],
+            },
+        ),
+        (
             AsyncMock(return_value=_UNSOLVED),
             True,
             {
@@ -102,7 +112,7 @@ async def _hang(*_args: object, **_kwargs: object) -> bool:
         (AsyncMock(side_effect=RuntimeError("boom")), True, {"outcome": "unsolved", "solver_failed": True}),
         (AsyncMock(return_value=_SOLVED), False, {"outcome": "unavailable"}),
     ],
-    ids=["solved", "none", "unsupported", "unsolved", "timed_out", "solver_failed", "unavailable"],
+    ids=["solved", "none", "unsupported", "px_unsupported", "unsolved", "timed_out", "solver_failed", "unavailable"],
 )
 async def test_each_ladder_result_is_reported_as_its_own_outcome(
     monkeypatch: pytest.MonkeyPatch,

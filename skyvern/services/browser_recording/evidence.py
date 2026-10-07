@@ -21,12 +21,16 @@ from skyvern.services.browser_recording.redact import (
 )
 from skyvern.services.browser_recording.types import (
     Action,
+    ActionDialog,
+    ActionDragDrop,
     ActionInputText,
     ActionKind,
     ActionPressKey,
+    ActionTarget,
     ActionUrlChange,
     ActionWait,
     CredentialKind,
+    IncompleteCaptureReason,
     RecordingDraftStep,
 )
 
@@ -64,6 +68,18 @@ class RecordedCredentialEvidence(BaseModel):
     credential_kind: CredentialKind
 
 
+class RecordedDialogEvidence(BaseModel):
+    dialog_type: str
+    response: Literal["accept", "dismiss"]
+    prompt_input: RecordedInputEvidence | None
+    prompt_text_redacted: bool
+
+
+class RecordedDragDropEvidence(BaseModel):
+    source: RecordedTargetEvidence
+    destination: RecordedTargetEvidence
+
+
 class RecordedActionEvidence(BaseModel):
     action_id: str
     kind: ActionKind
@@ -73,11 +89,14 @@ class RecordedActionEvidence(BaseModel):
     target: RecordedTargetEvidence | None
     input: RecordedInputEvidence | None
     credential: RecordedCredentialEvidence | None
+    dialog: RecordedDialogEvidence | None = None
+    drag_drop: RecordedDragDropEvidence | None = None
     key: str | None
     duration_ms: int | None
     observed_effects: list[str]
     navigated_to: str | None
     draft_label: str | None
+    incomplete_capture_reason: IncompleteCaptureReason | None = None
 
 
 class RecordingIdentity(BaseModel):
@@ -123,6 +142,22 @@ def _redact_input_values(value: str | None, input_values: list[str]) -> str | No
     return redacted
 
 
+def _recorded_input_values(actions: list[Action]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            value
+            for action in actions
+            for value in (
+                [action.input_value]
+                if isinstance(action, ActionInputText)
+                else [action.prompt_text]
+                if isinstance(action, ActionDialog) and action.prompt_text is not None
+                else []
+            )
+        )
+    )
+
+
 def _visible_texts(action: Action) -> list[str]:
     target = action.target
     if texts_are_labels(target.tag_name):
@@ -139,10 +174,9 @@ def _pointer_evidence(action: Action) -> RecordedPointerEvidence | None:
     return RecordedPointerEvidence(viewport_x_fraction=xp, viewport_y_fraction=yp)
 
 
-def _target_evidence(action: Action, input_values: list[str]) -> RecordedTargetEvidence | None:
-    if isinstance(action, (ActionWait, ActionUrlChange)):
-        return None
-    target = action.target
+def _target_evidence_for_target(
+    action: Action, target: ActionTarget, input_values: list[str]
+) -> RecordedTargetEvidence:
     selector_candidates = []
     if target.selector:
         selector_candidates.append(target.selector)
@@ -160,7 +194,9 @@ def _target_evidence(action: Action, input_values: list[str]) -> RecordedTargetE
             redacted
             for text in _visible_texts(action)
             if (redacted := _redact_input_values(text, input_values)) is not None
-        ],
+        ]
+        if target is action.target
+        else [],
         input_type=target.input_type,
         autocomplete=target.autocomplete,
         selector_candidates=[
@@ -168,8 +204,18 @@ def _target_evidence(action: Action, input_values: list[str]) -> RecordedTargetE
             for selector in selector_candidates
             if (redacted := _redact_input_values(selector, input_values)) is not None
         ],
-        pointer=_pointer_evidence(action),
+        pointer=RecordedPointerEvidence(viewport_x_fraction=target.mouse.xp, viewport_y_fraction=target.mouse.yp)
+        if target.mouse.xp is not None
+        and target.mouse.yp is not None
+        and all(math.isfinite(v) and 0 <= v <= 1 for v in (target.mouse.xp, target.mouse.yp))
+        else None,
     )
+
+
+def _target_evidence(action: Action, input_values: list[str]) -> RecordedTargetEvidence | None:
+    if isinstance(action, (ActionDialog, ActionWait, ActionUrlChange)):
+        return None
+    return _target_evidence_for_target(action, action.target, input_values)
 
 
 def _credential_kind(action: Action, draft: RecordingDraftStep | None) -> CredentialKind | None:
@@ -205,6 +251,8 @@ def _action_evidence(
     credential_evidence: RecordedCredentialEvidence | None = None
     key: str | None = None
     duration_ms: int | None = None
+    dialog: RecordedDialogEvidence | None = None
+    drag_drop: RecordedDragDropEvidence | None = None
 
     if isinstance(action, ActionInputText):
         input_evidence, credential_evidence = _input_or_credential(action, draft, action_id)
@@ -212,6 +260,24 @@ def _action_evidence(
         key = action.key
     elif isinstance(action, ActionWait):
         duration_ms = action.duration_ms
+    elif isinstance(action, ActionDialog):
+        prompt_input = None
+        if action.prompt_text is not None:
+            prompt_input = RecordedInputEvidence(
+                opaque_id=f"{action_id}.dialog_prompt",
+                typed_length=len(action.prompt_text),
+            )
+        dialog = RecordedDialogEvidence(
+            dialog_type=action.dialog_type,
+            response=action.response,
+            prompt_input=prompt_input,
+            prompt_text_redacted=action.prompt_text_redacted,
+        )
+    elif isinstance(action, ActionDragDrop):
+        drag_drop = RecordedDragDropEvidence(
+            source=_target_evidence_for_target(action, action.source, input_values),
+            destination=_target_evidence_for_target(action, action.target, input_values),
+        )
 
     return RecordedActionEvidence(
         action_id=action_id,
@@ -222,11 +288,14 @@ def _action_evidence(
         target=_target_evidence(action, input_values),
         input=input_evidence,
         credential=credential_evidence,
+        dialog=dialog,
+        drag_drop=drag_drop,
         key=key,
         duration_ms=duration_ms,
         observed_effects=["navigation"] if navigated_to else [],
         navigated_to=_redact_input_values(navigated_to, input_values),
         draft_label=_redact_input_values(draft.label, input_values) if draft is not None else None,
+        incomplete_capture_reason=action.incomplete_capture_reason,
     )
 
 
@@ -258,9 +327,7 @@ def recorded_credential_urls(
 ) -> list[tuple[str, str]]:
     """Every (credential_id, url) the evidence packet would report, including actions past `MAX_EVIDENCE_CHARS`."""
     ordered_actions = sorted(actions, key=lambda action: action.timestamp_start)
-    input_values = list(
-        dict.fromkeys(action.input_value for action in ordered_actions if isinstance(action, ActionInputText))
-    )
+    input_values = _recorded_input_values(ordered_actions)
     return [
         (draft.credential_id, _redact_input_values(action.url, input_values) or "")
         for action, draft in transfer_focus_click_credentials(apply_draft_overlay(ordered_actions, draft_steps))
@@ -283,20 +350,21 @@ def build_recording_evidence(
     pairs = transfer_focus_click_credentials(apply_draft_overlay(ordered_actions, draft_steps))
     kept, deleted_action_ids = _label_kept_actions(ordered_actions, pairs)
     navigations = attribute_click_navigations(pairs)
-    input_values = list(
-        dict.fromkeys(action.input_value for action in ordered_actions if isinstance(action, ActionInputText))
-    )
+    input_values = _recorded_input_values(ordered_actions)
 
     evidence_actions: list[RecordedActionEvidence] = []
     evidence_chars = 0
     truncated_action_count = 0
     for index, (action_id, action, draft) in enumerate(kept):
         navigation_index = navigations.get(index)
+        navigated_to = action.navigated_to
+        if navigated_to is None and navigation_index is not None:
+            navigated_to = pairs[navigation_index][0].url
         item = _action_evidence(
             action_id,
             action,
             draft,
-            pairs[navigation_index][0].url if navigation_index is not None else None,
+            navigated_to,
             input_values,
         )
         item_chars = len(item.model_dump_json())

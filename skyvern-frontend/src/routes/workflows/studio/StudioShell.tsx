@@ -48,7 +48,6 @@ import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
 import { RunPaneActions, RunPaneViewToggles } from "./runview/RunPaneHeader";
 import { StudioBrowserStream } from "./StudioBrowserStream";
-import { StudioCoachMark } from "./StudioCoachMark";
 import {
   PANE_HEADER_ICON_BUTTON_CLASS,
   studioPanelId,
@@ -83,6 +82,7 @@ import {
   StudioWorkflowDeletedContext,
 } from "./StudioShellContext";
 import { StudioStageLauncher } from "./StudioStageLauncher";
+import { useStudioOnboardingTour } from "./useStudioOnboardingTour";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
 import { useStudioPanes } from "./useStudioPanes";
@@ -713,6 +713,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   const postHog = usePostHog();
   const logging = useLogging();
   const embedded = searchParams.get("embed") === "true";
+  useStudioOnboardingTour(!embedded, props.workflow.workflow_permanent_id);
   const { panes, closePane, openPane, setOpenPanes, setPanesOrder } =
     useStudioPanes();
   const {
@@ -1111,7 +1112,6 @@ function StudioStage(props: StudioWorkspaceProps) {
                     ))
                 : null}
               {!embedded && panes.length === 0 ? <StudioStageLauncher /> : null}
-              {embedded ? null : <StudioCoachMark />}
               {embedded ? null : <StudioWorkflowPanels />}
               {/* Overlay target for Workspace-wired panels (pointer-events off
                   while empty so the stage stays clickable). */}

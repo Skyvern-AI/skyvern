@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -15,13 +16,13 @@ from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WaitBlock
+from skyvern.forge.sdk.workflow.models.block import Block, CodeBlock, ForLoopBlock, WaitBlock
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import on_terminal_transition
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
-from skyvern.schemas.workflows import BlockStatus, BlockType, TerminateBlockYAML, WorkflowRetryPolicy
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, TerminateBlockYAML, WorkflowRetryPolicy
 from tests.unit.conftest import make_block_output_parameter
 
 
@@ -76,6 +77,98 @@ async def test_blank_rendered_reason_still_terminates_with_a_fallback_reason(run
     assert result.status is BlockStatus.terminated
     assert result.failure_reason == "Terminated by the stop block"
     assert result.can_continue_after_failure is False
+
+
+@pytest.mark.asyncio
+async def test_reason_referencing_registered_secret_uses_fallback(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["token"] = "hunter2"
+    run_context.values["token"] = "hunter2"
+    block = _terminate_block("{{ token|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.failure_reason is not None
+    assert result.failure_reason.startswith("Terminated by the stop block.")
+    assert "Reason was dropped" in result.failure_reason
+    assert "2retnuh" not in result.failure_reason
+    assert result.output_parameter_value["reason"] == result.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_dropping_reason_does_not_mutate_block_metadata_from_context_values(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["token"] = "hunter2"
+    run_context.values["stop"] = {"token": "hunter2"}
+    run_context.update_block_metadata("stop", {"existing": "metadata"})
+    block = _terminate_block("{{ stop.token|reverse }}")
+    metadata_before = run_context.get_block_metadata(block.label).copy()
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.failure_reason is not None and "Reason was dropped" in result.failure_reason
+    assert run_context.get_block_metadata(block.label) == metadata_before
+
+
+@pytest.mark.asyncio
+async def test_reason_fallback_does_not_persist_a_secret_bearing_label(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["token"] = "hunter2"
+    run_context.values["token"] = "hunter2"
+    block = _terminate_block("{{ token|reverse }}")
+    block.label = "HUNTER2"
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    persisted_output = app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter.await_args.kwargs[
+        "value"
+    ]
+    assert "hunter2" not in (result.failure_reason or "").casefold()
+    assert "hunter2" not in persisted_output["reason"].casefold()
+    assert persisted_output["reason"] == result.failure_reason == result.output_parameter_value["reason"]
+
+
+@pytest.mark.asyncio
+async def test_reason_assembling_registered_secret_uses_fallback(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.values.update(prefix="hunt", suffix="er2")
+    block = _terminate_block("{{ (prefix ~ suffix)|upper }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert (
+        result.failure_reason
+        == "Terminated by the stop block. Reason was dropped because it was unusable after rendering."
+    )
+    assert result.output_parameter_value["reason"] == result.failure_reason
+    assert "HUNTER2" not in result.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_short_secret_collision_does_not_drop_rendered_reason(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["card_expiry"] = "09"
+    block = _terminate_block("Checkout declined: HTTP 409 Conflict")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.failure_reason == "Checkout declined: HTTP 409 Conflict"
+
+
+@pytest.mark.asyncio
+async def test_short_secret_collision_in_referenced_value_does_not_drop_error_code(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["card_expiry"] = "09"
+    run_context.values["order"] = {"message": "HTTP 409 Conflict"}
+    block = _terminate_block("stop", error_code="{% if order.message %}PAYMENT_FAILED{% endif %}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == ["PAYMENT_FAILED"]
+    assert "error_code_dropped" not in result.output_parameter_value
 
 
 @pytest.mark.asyncio
@@ -207,6 +300,430 @@ async def test_embedded_registered_secret_never_reaches_error_codes(
     assert result.output_parameter_value["reason"] == result.failure_reason
     assert "error code" in result.failure_reason.lower() and "dropped" in result.failure_reason.lower()
     assert app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["error_codes"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret, error_code",
+    [
+        ("True", "{{ true|string|reverse }}"),
+        ("None", "{{ none|string|reverse }}"),
+    ],
+)
+async def test_boolean_and_none_constants_do_not_render_registered_secrets(
+    run_context: WorkflowRunContext, secret: str, error_code: str
+) -> None:
+    run_context.secrets["registered"] = secret
+    block = _terminate_block("stop", error_code=error_code)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["error_codes"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name, value, error_code",
+    [
+        ("token", "hunter2", "AUTH_{{ token|upper }}"),
+        ("token", "hunter2", "{{ token|reverse }}"),
+        ("token", "secret_token_id", "AUTH_{{ token|upper }}"),
+        ("token", "AUTH-hunter2", "{{ token|upper }}"),
+        ("credential", {"password": "secret_token_id"}, "{{ credential.password|upper }}"),
+    ],
+)
+async def test_templated_error_code_referencing_registered_secret_is_dropped(
+    run_context: WorkflowRunContext, name: str, value: Any, error_code: str
+) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.values[name] = value
+    block = _terminate_block("stop", error_code=error_code)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert "error code" in result.failure_reason.lower() and "dropped" in result.failure_reason.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret, value",
+    [
+        ("1234", 1234),
+        ("123456", 123456),
+        ("12.34", 12.34),
+        ("True", True),
+        ("12.34", Decimal("12.34")),
+    ],
+)
+async def test_templated_error_code_drops_non_string_secret_references(
+    run_context: WorkflowRunContext, secret: str, value: int | float | bool | Decimal
+) -> None:
+    run_context.secrets["pin"] = secret
+    run_context.values["resp_num"] = {"pin": value}
+    block = _terminate_block("stop", error_code="{{ resp_num.pin|string|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert "error code" in result.failure_reason.lower() and "dropped" in result.failure_reason.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template_kind", ["reference", "literal"])
+async def test_short_secret_encoding_is_dropped_before_rendering(
+    run_context: WorkflowRunContext, template_kind: str
+) -> None:
+    run_context.secrets["pin"] = "123"
+    if template_kind == "reference":
+        run_context.values["response"] = {"pin": "MTIz"}
+        template = "{{ response.pin|reverse }}"
+    else:
+        template = "{{ 'MTIz'|reverse }}"
+    block = _terminate_block(template, error_code=template)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.failure_reason.startswith("Terminated by the stop block.")
+    assert "Reason was dropped" in result.failure_reason
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "{{ response.error_code }}",
+        '{{ response.get("error_code") }}',
+        '{{ response.get("error_code", "") }}',
+        "{{ response[field] }}",
+    ],
+)
+async def test_error_code_template_ignores_unreferenced_secret_sibling(
+    run_context: WorkflowRunContext, error_code: str
+) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.values["response"] = {"error_code": "ACCOUNT_LOCKED", "access_token": "secret_token_id"}
+    run_context.values["field"] = "error_code"
+    block = _terminate_block("stop", error_code=error_code)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == ["ACCOUNT_LOCKED"]
+    assert "error_code_dropped" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_ignores_secret_collision_in_variable_name(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["secret"] = "code"
+    run_context.values["error_code"] = "ACCOUNT_LOCKED"
+    block = _terminate_block("stop", error_code="{{ error_code }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == ["ACCOUNT_LOCKED"]
+    assert "error_code_dropped" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_drops_secret_from_mapping_method(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.values["response"] = {"access_token": "hunter2"}
+    block = _terminate_block("stop", error_code='{{ response.get("access_token")|upper }}')
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_drops_condition_only_secret_name_reference(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["pw"] = "hunter2"
+    run_context.values["pw"] = "placeholder"
+    block = _terminate_block("stop", error_code="{% if pw %}LOCKED{% endif %}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    persisted_output = app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter.await_args.kwargs[
+        "value"
+    ]
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert "error code" in (result.failure_reason or "").lower() and "dropped" in result.failure_reason.lower()
+    assert persisted_output["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_drops_secret_from_loop_metadata(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.update_block_metadata("stop", {"current_item": "hunter2"})
+    block = _terminate_block("stop", error_code="{{ current_item|upper }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "{{ 'hunter2'|upper }}",
+        "{{ missing|default('hunter2')|upper }}",
+        r'{{ "hunter\x32"|upper }}',
+        r'{{ "hunter\x32"|replace("hunter\x32", "SAFE_CODE") }}',
+        "{# hunter2 #}SAFE_CODE",
+    ],
+)
+async def test_error_code_template_drops_registered_secret_literals(
+    run_context: WorkflowRunContext, error_code: str
+) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    block = _terminate_block("stop", error_code=error_code)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert "error code" in result.failure_reason.lower() and "dropped" in result.failure_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_drops_numeric_registered_secret_literal(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["pin"] = "123456"
+    block = _terminate_block("stop", error_code="{{ 123456|string|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert "654321" not in result.failure_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code, expected_code",
+    [
+        ("{{ 'HTTP 409 Conflict'|replace('HTTP 409 Conflict', 'PAYMENT_FAILED') }}", "PAYMENT_FAILED"),
+        ("{{ 409|string|reverse }}", "904"),
+    ],
+)
+async def test_short_secret_source_literal_collision_does_not_drop_error_code(
+    run_context: WorkflowRunContext, error_code: str, expected_code: str
+) -> None:
+    run_context.secrets["card_expiry"] = "09"
+    block = _terminate_block("stop", error_code=error_code)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == [expected_code]
+    assert "error_code_dropped" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_short_secret_in_condition_does_not_drop_reason_or_error_code(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["card_expiry"] = "12"
+    run_context.values["attempt"] = 120
+    template = "{% if attempt == 12 %}ACCOUNT_LOCKED{% else %}ACCOUNT_FAILED{% endif %}"
+    block = _terminate_block(template, error_code=template)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.failure_reason == "ACCOUNT_FAILED"
+    assert result.error_codes == ["ACCOUNT_FAILED"]
+    assert "error_code_dropped" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_short_secret_equal_integer_reference_drops_error_code(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["card_expiry"] = "12"
+    run_context.values["attempt"] = 12
+    template = "{% if attempt == 12 %}ACCOUNT_LOCKED{% else %}ACCOUNT_FAILED{% endif %}"
+    block = _terminate_block("stop", error_code=template)
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    persisted_output = app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter.await_args.kwargs[
+        "value"
+    ]
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert "error code" in result.failure_reason.lower() and "dropped" in result.failure_reason.lower()
+    assert persisted_output == result.output_parameter_value
+    assert app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["error_codes"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret, literal", [("12", "12"), ("123", "MTIz")])
+async def test_short_secret_in_source_data_token_drops_reason(
+    run_context: WorkflowRunContext, secret: str, literal: str
+) -> None:
+    run_context.secrets["registered"] = secret
+    run_context.values["prefix"] = "PREFIX"
+    block = _terminate_block(f"{{{{ prefix }}}}{literal}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.failure_reason.startswith("Terminated by the stop block.")
+    assert "Reason was dropped" in result.failure_reason
+    assert result.output_parameter_value["reason"] == result.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_drops_exact_short_numeric_output_constant(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["pin"] = "1234"
+    block = _terminate_block("stop", error_code="{{ 1234|string|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+    assert app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["error_codes"] is None
+
+
+@pytest.mark.asyncio
+async def test_reason_drops_floored_secret_contained_in_reference(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["token"] = "hunter2-token"
+    run_context.values["resp"] = {"auth": "Bearer hunter2-token"}
+    block = _terminate_block("{{ resp.auth|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.failure_reason.startswith("Terminated by the stop block.")
+    assert "Reason was dropped" in result.failure_reason
+    assert result.output_parameter_value["reason"] == result.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_short_registered_secret_reference_is_still_dropped(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["card_expiry"] = "12"
+    run_context.values["token"] = "12"
+    block = _terminate_block("stop", error_code="{{ token|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_short_secret_in_decoded_constant_is_dropped(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["card_expiry"] = "12"
+    block = _terminate_block("{{ '12'|reverse }}", error_code="{{ '12'|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.failure_reason.startswith("Terminated by the stop block.")
+    assert "21" not in result.failure_reason
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "template_variable",
+    ["workflow_title", "workflow_id", "workflow_permanent_id", "workflow_run_id", "browser_session_id"],
+)
+async def test_error_code_template_drops_secret_from_renderer_builtins(
+    run_context: WorkflowRunContext, template_variable: str
+) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    setattr(run_context, template_variable, "hunter2")
+    block = _terminate_block("stop", error_code=f"{{{{ {template_variable}|upper }}}}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_guard_uses_renderer_workflow_title(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.workflow_title = "hunter2"
+    block = _terminate_block("stop", error_code="{{ workflow_title|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_guard_checks_referenced_workflow_run_summary(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.workflow_run_outputs["previous"] = {"failure_reason": "hunter2"}
+    block = _terminate_block("stop", error_code="{{ workflow_run_summary.failure_reason|reverse }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_post_render_error_code_check_ignores_case_for_combined_values(
+    run_context: WorkflowRunContext,
+) -> None:
+    run_context.secrets["secret_token_id"] = "hunter2"
+    run_context.values.update(prefix="hunt", suffix="er2")
+    block = _terminate_block("stop", error_code="{{ (prefix ~ suffix)|upper }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_error_code_template_drops_encoded_secret_before_filter(run_context: WorkflowRunContext) -> None:
+    run_context.secrets["secret_token_id"] = "abcdef"
+    run_context.values["token"] = "YWJjZGVm"
+    block = _terminate_block("stop", error_code="{{ token|upper }}")
+
+    result = await block.execute("run-id", "block-id", organization_id="org-id")
+
+    assert result.status is BlockStatus.terminated
+    assert result.error_codes == []
+    assert result.output_parameter_value["error_code_dropped"] is True
 
 
 @pytest.mark.asyncio
@@ -413,3 +930,26 @@ def test_error_code_survives_yaml_to_model_to_yaml() -> None:
     assert TerminateBlock.model_validate(stored).error_code == "ACCOUNT_NOT_FOUND"
     resaved = TerminateBlockYAML(label=stored["label"], reason=stored["reason"], error_code=stored["error_code"])
     assert resaved.error_code == "ACCOUNT_NOT_FOUND"
+
+
+def test_a_declared_error_on_a_sign_in_form_keeps_its_category_first() -> None:
+    output_parameter = make_block_output_parameter("code_1")
+    block = CodeBlock(label="code_1", code="pass", output_parameter=output_parameter)
+    declared = [{"category": "LOGIN_FAILED", "confidence_float": 1.0, "reasoning": "login page never loaded"}]
+    result = BlockResult(
+        success=False,
+        output_parameter=output_parameter,
+        output_parameter_value={"failure_category": declared},
+        status=BlockStatus.failed,
+        failure_reason="login page never loaded",
+        sign_in_form_visible=True,
+    )
+
+    _, _, run_category = WorkflowService._resolve_block_terminal_outcome(block=block, block_result=result)
+
+    assert run_category is not None
+    assert run_category[:-1] == declared
+    assert (run_category[-1]["category"], run_category[-1]["reason_code"]) == (
+        "WRONG_PAGE_STATE",
+        "sign_in_form_visible",
+    )

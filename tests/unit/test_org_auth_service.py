@@ -19,7 +19,7 @@ from skyvern.forge import request_logging
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
-from skyvern.forge.sdk.core.security import create_access_token
+from skyvern.forge.sdk.core.security import assert_signing_key_usable, create_access_token
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth as streaming_auth
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
@@ -1109,11 +1109,26 @@ def test_bearer_scheme_is_matched_case_insensitively() -> None:
     assert org_auth_service._extract_bearer_token("Bearer ") is None
 
 
-_PRINCIPAL_FIELDS = ("auth_kind", "user_id", "org_role", "org_role_claim")
-_NO_USER = {"user_id": None, "org_role": None, "org_role_claim": None}
-_ADMIN = {"user_id": "user_admin", "org_role": "org:admin", "org_role_claim": "org_role"}
-_MEMBER = {"user_id": "user_member", "org_role": "member", "org_role_claim": "o.rol"}
-_ROLELESS = {"user_id": "user_roleless", "org_role": None, "org_role_claim": None}
+_PRINCIPAL_FIELDS = ("auth_kind", "user_id", "org_role", "org_role_claim", "token_has_organization_claim")
+_NO_USER = {"user_id": None, "org_role": None, "org_role_claim": None, "token_has_organization_claim": None}
+_ADMIN = {
+    "user_id": "user_admin",
+    "org_role": "org:admin",
+    "org_role_claim": "org_role",
+    "token_has_organization_claim": None,
+}
+_MEMBER = {
+    "user_id": "user_member",
+    "org_role": "member",
+    "org_role_claim": "o.rol",
+    "token_has_organization_claim": None,
+}
+_ROLELESS = {
+    "user_id": "user_roleless",
+    "org_role": None,
+    "org_role_claim": None,
+    "token_has_organization_claim": None,
+}
 
 
 class _StubIdentityProvider(AgentFunction):
@@ -1138,12 +1153,12 @@ def _principal_app() -> FastAPI:
     fastapi_app = FastAPI()
     fastapi_app.add_middleware(RequestLoggingMiddleware)
 
-    def principal() -> dict[str, str | None] | None:
+    def principal() -> dict[str, object] | None:
         resolved = get_request_principal()
         return asdict(resolved) if resolved else None
 
     @fastapi_app.post("/org")
-    async def org(_: Organization = Depends(org_auth_service.get_current_org)) -> dict[str, str | None] | None:
+    async def org(_: Organization = Depends(org_auth_service.get_current_org)) -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.post("/stable-response")
@@ -1155,32 +1170,32 @@ def _principal_app() -> FastAPI:
     @fastapi_app.post("/credential")
     async def credential(
         _: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.post("/organizations/{organization_id}/api-token")
     async def api_token(
         _: Organization = Depends(org_auth_service.get_current_org_with_api_token),
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.post("/caller")
     async def caller(
         _: CallerContext = Depends(org_auth_service.get_current_caller_context),
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.post("/authentication")
     async def authentication(
         _: Organization = Depends(org_auth_service.get_current_org_with_authentication),
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.post("/org-and-user")
     async def org_and_user(
         _: Organization = Depends(org_auth_service.get_current_org),
         __: str | None = Depends(org_auth_service.get_current_user_id_or_none),
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.post("/credential-and-user")
@@ -1191,7 +1206,7 @@ def _principal_app() -> FastAPI:
         return {"organization_id": current_org.organization_id, "user_id": user_id, "principal": principal()}
 
     @fastapi_app.post("/anonymous")
-    async def anonymous() -> dict[str, str | None] | None:
+    async def anonymous() -> dict[str, object] | None:
         return principal()
 
     @fastapi_app.websocket("/stream")
@@ -1289,7 +1304,7 @@ async def test_raw_request_record_carries_the_request_principal(
     raw_request_log: MagicMock,
     key_type: str | None,
     authorization: str | None,
-    expected: dict[str, str | None],
+    expected: dict[str, object],
 ) -> None:
     headers, organization_id, _ = await _principal_credentials(monkeypatch, key_type, authorization)
 
@@ -1326,7 +1341,7 @@ async def test_every_org_auth_dependency_resolves_the_principal_without_changing
     path: str,
     key_type: str | None,
     authorization: str,
-    expected: dict[str, str | None],
+    expected: dict[str, object],
 ) -> None:
     # The base agent function, which the stub inherits, lets credential routes accept a ui_session token.
     headers, organization_id, _ = await _principal_credentials(monkeypatch, key_type, authorization)
@@ -1646,3 +1661,22 @@ async def test_principal_does_not_leak_into_a_later_unauthenticated_request(
 
     assert response.json() is None
     assert not set(_PRINCIPAL_FIELDS) & set(raw_request_log.info.call_args.kwargs)
+
+
+@pytest.mark.parametrize(
+    ("secret_key", "usable"),
+    [
+        ("q3Zt9vJxR2mN8kL0pWfYcH7sA1dE5gU6iO4bT2nVwXy", True),
+        ("-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----", False),
+        ('{"kty":"oct","k":"abc"}', False),
+    ],
+)
+def test_signing_key_shape_is_checked_at_startup(
+    monkeypatch: pytest.MonkeyPatch, secret_key: str, usable: bool
+) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", secret_key)
+    if usable:
+        assert_signing_key_usable()
+    else:
+        with pytest.raises(RuntimeError, match="SECRET_KEY"):
+            assert_signing_key_usable()

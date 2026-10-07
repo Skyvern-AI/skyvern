@@ -9,10 +9,13 @@ import io
 import json
 import time
 import uuid
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import structlog
 from PIL import Image
@@ -90,6 +93,33 @@ class PendingFrameLease:
     capture_event_id: str
     capture_id: str
     input_fingerprint: str
+
+
+@dataclass(frozen=True)
+class ChatScreenshotFrame:
+    image: bytes
+    capture_id: str
+    captured_at: datetime
+    tool_call_id: str | None
+
+
+_capturing_tool_call_id: ContextVar[str | None] = ContextVar("copilot_capturing_tool_call_id", default=None)
+
+
+@contextlib.contextmanager
+def capturing_tool_call(tool_call_id: str | None) -> Iterator[None]:
+    """Name the tool call running in this task, so a frame it stages can be shown under that call."""
+    token = _capturing_tool_call_id.set(tool_call_id)
+    try:
+        yield
+    finally:
+        _capturing_tool_call_id.reset(token)
+
+
+@runtime_checkable
+class CarriesChatScreenshots(Protocol):
+    pending_chat_screenshots: list[ChatScreenshotFrame]
+    chat_screenshot_capture_ids: set[str]
 
 
 def screenshot_result_facts(
@@ -183,6 +213,16 @@ def resize_screenshot_b64(
     )
 
 
+def as_png(image: bytes) -> bytes:
+    # A tool result may carry a JPEG, and the chat's artifact type is served as image/png.
+    with Image.open(io.BytesIO(image)) as img:
+        if img.format == "PNG":
+            return image
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue()
+
+
 def enqueue_screenshot(
     ctx: Any,
     b64_png: str,
@@ -212,6 +252,16 @@ def enqueue_screenshot(
         return False
     pending.clear()
     pending.append(entry)
+    if isinstance(ctx, CarriesChatScreenshots) and entry.capture_id not in ctx.chat_screenshot_capture_ids:
+        ctx.chat_screenshot_capture_ids.add(entry.capture_id)
+        ctx.pending_chat_screenshots.append(
+            ChatScreenshotFrame(
+                image=base64.b64decode(b64_png),
+                capture_id=entry.capture_id,
+                captured_at=datetime.now(UTC),
+                tool_call_id=_capturing_tool_call_id.get(),
+            )
+        )
     if getattr(ctx, "eval_mode", None) == "browser_ablation":
         frames = getattr(ctx, "eval_screenshot_frames", None)
         if isinstance(frames, list) and not any(frame.get("capture_id") == entry.capture_id for frame in frames):

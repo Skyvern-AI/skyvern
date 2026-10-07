@@ -43,6 +43,8 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockType
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
@@ -905,6 +907,7 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         failure_reason="click failed",
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
+        workflow_definition_sha256=None,
     )
     now = datetime.now(UTC)
     block = WorkflowRunBlock(
@@ -921,15 +924,26 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         modified_at=now,
     )
     workflow = SimpleNamespace(
-        workflow_definition={
-            "blocks": [
-                {
-                    "label": "click_submit",
-                    "block_type": "code",
-                    "code": 'await page.locator("#submit").click()',
-                }
+        workflow_id="w_prior",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                CodeBlock(
+                    label="click_submit",
+                    code='await page.locator("#submit").click()',
+                    output_parameter=OutputParameter(
+                        output_parameter_id="op_click_submit",
+                        key="click_submit_output",
+                        workflow_id="w_prior",
+                        created_at=now,
+                        modified_at=now,
+                    ),
+                )
             ]
-        }
+        ),
     )
     database = SimpleNamespace(
         workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)),
