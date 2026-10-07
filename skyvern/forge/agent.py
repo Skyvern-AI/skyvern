@@ -194,7 +194,7 @@ from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
 )
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
-from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
+from skyvern.forge.taskv3.loop import ACTION_BLOCK_TARGET_ACTION_RESERVE, LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
@@ -2627,6 +2627,7 @@ class ForgeAgent:
                     return step, task
                 step_cap = min(step_cap, remaining_workflow_steps)
                 workflow_step_ceiling = remaining_workflow_steps
+        workflow_pool_ceiling = workflow_step_ceiling
         if atomic_block_budget:
             # A block that owns a deliberately small budget (action/validation) keeps it: the
             # in-loop extension is refused by pinning the hard ceiling to the cap itself.
@@ -2948,6 +2949,12 @@ class ForgeAgent:
             )
             # A block that completes on a download is not done by its one action.
             single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
+            target_action_reserve = 0
+            if single_action_block:
+                # The pinned ceiling above refuses the extension; the reserve answers to the org's run-wide pool.
+                target_action_reserve = ACTION_BLOCK_TARGET_ACTION_RESERVE
+                if workflow_pool_ceiling is not None:
+                    target_action_reserve = max(0, min(target_action_reserve, workflow_pool_ceiling - step_cap))
             block_completion_judge: GoalJudge | None = None
             if single_action_block:
                 # The run's own model, on its non-flex twin as flex queueing outlasts the judge's timeout.
@@ -3055,6 +3062,7 @@ class ForgeAgent:
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
                 single_action_block=single_action_block,
+                target_action_reserve=target_action_reserve,
                 block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
