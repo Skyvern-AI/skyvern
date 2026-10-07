@@ -47,6 +47,7 @@ async def test_run_local_screencast_happy_path(monkeypatch: pytest.MonkeyPatch) 
         check_finalized=check_finalized,
         workflow_run_id="wr_123",
         organization_id="org_123",
+        on_frame_sent=None,
     )
     get_current_status.assert_awaited_once()
     send_status_mock.assert_awaited_once_with(websocket, "task_id", "task_123", "completed")
@@ -112,7 +113,9 @@ async def test_expired_browser_session_is_distinct_from_stream_launch_timeout(
         "app",
         SimpleNamespace(
             PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(
-                get_session=AsyncMock(return_value=SimpleNamespace(status="timeout"))
+                get_session=AsyncMock(
+                    return_value=SimpleNamespace(status="timeout", runnable_type=None, runnable_id=None)
+                )
             )
         ),
     )
@@ -138,8 +141,8 @@ async def test_browser_session_expiring_while_waiting_for_browser_state_is_disti
     websocket = object()
     get_session = AsyncMock(
         side_effect=[
-            SimpleNamespace(status="running"),
-            SimpleNamespace(status="timeout"),
+            SimpleNamespace(status="running", runnable_type=None, runnable_id=None),
+            SimpleNamespace(status="timeout", runnable_type=None, runnable_id=None),
         ]
     )
     send_status_mock = AsyncMock()
@@ -169,7 +172,7 @@ async def test_browser_state_timeout_survives_status_refresh_failure(monkeypatch
     websocket = object()
     get_session = AsyncMock(
         side_effect=[
-            SimpleNamespace(status="running"),
+            SimpleNamespace(status="running", runnable_type=None, runnable_id=None),
             RuntimeError("status unavailable"),
         ]
     )

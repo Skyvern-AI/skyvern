@@ -173,15 +173,17 @@ export function BrowserPaneViewPills() {
   // the run's own status. Once that run is over this view is the debug browser
   // — a surface the run left behind — so it has to say so.
   const finishedRun = visuals.finalized;
-  const showRunCue = view !== "live" || !finishedRun;
 
   return (
     <>
-      {runId && showRunCue ? (
+      {runId ? (
+        // Constant across views, so picking a pill never re-lays out the row
+        // it sits in. Grows from zero into leftover space only, so it truncates
+        // before the pane title or the pills give up any width.
         <span
           data-testid="browser-pane-run-cue"
           title={`Run ${runId}`}
-          className="min-w-0 truncate px-1.5 text-xs font-medium text-muted-foreground"
+          className="min-w-0 max-w-fit grow-[999] basis-0 truncate text-xs font-medium text-muted-foreground"
         >
           Run {runId}
         </span>

@@ -506,16 +506,20 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
   });
 
-  it("hides the inspected run cue when Debug browser is selected", () => {
+  it("keeps the inspected run cue in place across every view so the pills never shift", () => {
     seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
-    const debugBrowser = screen.getByRole("button", { name: "Debug browser" });
-    fireEvent.click(debugBrowser);
-
-    expect(debugBrowser.getAttribute("aria-pressed")).toBe("true");
-    expect(screen.queryByTestId("browser-pane-run-cue")).toBeNull();
+    const cue = screen.getByTestId("browser-pane-run-cue");
+    for (const name of ["Debug browser", "Recording", "Debug browser"]) {
+      const pill = screen.getByRole("button", { name });
+      fireEvent.click(pill);
+      expect(pill.getAttribute("aria-pressed")).toBe("true");
+      // Same node, same text: the row before the pills does not re-lay out.
+      expect(screen.getByTestId("browser-pane-run-cue")).toBe(cue);
+      expect(cue.textContent).toBe("Run wr_1");
+    }
   });
 
   it("registers the shell stream slot while live", () => {

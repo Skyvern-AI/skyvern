@@ -506,6 +506,7 @@ async def _build_workflow_payload(
         finished_at=status_response.finished_at,
         errors=status_response.errors,
         browser_seed_source=status_response.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
     )
 
     payload_dict = json.loads(

@@ -343,7 +343,7 @@ def test_non_paused_watchdog_exit_still_classifies_as_a_failed_run() -> None:
         source_tool="run_blocks_and_collect_debug",
         result={
             "ok": False,
-            "error": "The run exceeded the 600s absolute ceiling while still showing progress.",
+            "error": "The run did not reach a terminal status within the 600s absolute ceiling.",
             "data": {
                 "workflow_run_id": "wr_ceiling",
                 "overall_status": "running",
@@ -3474,6 +3474,9 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
         modified_at=now,
     )
     run_workflow = SimpleNamespace(
+        workflow_id="wf_run_snapshot",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
         organization_id=ctx.organization_id,
         created_by=None,
         modified_at=datetime(2026, 4, 21, 12, 0),
@@ -3484,12 +3487,14 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
     )
     run = SimpleNamespace(
         workflow_run_id="wr_completed_missing_output",
+        workflow_id="wf_run_snapshot",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_completed_missing_output",
         status="completed",
         failure_reason=None,
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
+        workflow_definition_sha256=None,
     )
     block = WorkflowRunBlock(
         workflow_run_block_id="wrb_completed_missing_output",

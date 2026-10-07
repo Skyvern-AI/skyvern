@@ -5,7 +5,7 @@ import contextvars
 import hmac
 import json
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from datetime import datetime, timedelta
 from hashlib import sha256
 from http import HTTPStatus
@@ -115,6 +115,7 @@ async def submit_workflow_run_group(
     request: WorkflowRunGroupCreateRequest,
     *,
     expected_workflow_modified_at: datetime | None = None,
+    expected_latest_groups: tuple[str, Mapping[str, str]] | None = None,
 ) -> WorkflowRunGroupResponse:
     organization_id = organization.organization_id
     fingerprint = submission_fingerprint(request)
@@ -170,6 +171,7 @@ async def submit_workflow_run_group(
             items=[(item.key, item.parameters) for item in request.items],
             # Without a reviewed timestamp, bind to the row validation read so an edit landing after it is refused.
             expected_workflow_modified_at=expected_workflow_modified_at or workflow.modified_at,
+            expected_latest_groups=expected_latest_groups,
         )
     except IntegrityError:
         raced = await app.DATABASE.workflow_run_groups.get_group_by_submission_key(

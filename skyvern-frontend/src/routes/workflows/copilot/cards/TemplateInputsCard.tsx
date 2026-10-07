@@ -3,6 +3,7 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
@@ -10,6 +11,7 @@ import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore"
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 
 import { useSaveWorkflow } from "../../editor/hooks/useSaveWorkflow";
+import { ControlTooltip } from "../../studio/ControlTooltip";
 import { CredentialCombobox } from "../../components/CredentialCombobox";
 import { parameterIsSkyvernCredential } from "../../editor/types";
 import { WorkflowParameterValueType } from "../../types/workflowTypes";
@@ -40,6 +42,9 @@ function TemplateInputsCard() {
   const { parameters, setParametersFromUser } = useWorkflowParametersStore();
   const setHasChanges = useWorkflowHasChangesStore(
     (state) => state.setHasChanges,
+  );
+  const saveBlockedReason = useWorkflowHasChangesStore(
+    (state) => state.saveBlockedReason,
   );
   const [edits, setEdits] = useState<Record<string, string>>({});
   const onSave = useSaveWorkflow();
@@ -107,6 +112,26 @@ function TemplateInputsCard() {
       .catch(() => setSaved("applied"))
       .finally(() => setSaving(false));
   };
+
+  const saveButton = (
+    <Button
+      size="sm"
+      disabled={
+        Object.keys(edits).length === 0 ||
+        saving ||
+        hasInvalidEdit ||
+        Boolean(saveBlockedReason)
+      }
+      aria-label={
+        saveBlockedReason
+          ? `Save inputs (paused): ${saveBlockedReason}`
+          : undefined
+      }
+      onClick={save}
+    >
+      Save inputs
+    </Button>
+  );
 
   return (
     <CopilotCard>
@@ -182,13 +207,20 @@ function TemplateInputsCard() {
             </div>
           );
         })}
-        <Button
-          size="sm"
-          disabled={Object.keys(edits).length === 0 || saving || hasInvalidEdit}
-          onClick={save}
-        >
-          Save inputs
-        </Button>
+        {saveBlockedReason ? (
+          <TooltipProvider>
+            <ControlTooltip
+              content={
+                <span className="block max-w-xs">{saveBlockedReason}</span>
+              }
+              blocked
+            >
+              {saveButton}
+            </ControlTooltip>
+          </TooltipProvider>
+        ) : (
+          saveButton
+        )}
       </div>
       <CredentialsModal
         isOpen={creatingFor !== null}

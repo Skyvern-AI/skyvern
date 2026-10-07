@@ -1,13 +1,19 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useState } from "react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
+import { useRef, useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { useQuestionStepper } from "../useQuestionStepper";
 import type {
   QuestionInteraction,
   QuestionResponse,
 } from "../workflowCopilotTypes";
-import { QuestionTray } from "./QuestionTray";
+import { QUESTION_DETAIL_ID, QuestionTray } from "./QuestionTray";
 
 afterEach(cleanup);
 
@@ -21,6 +27,7 @@ function Composer({
 }) {
   const [draft, setDraft] = useState("");
   const stepper = useQuestionStepper(interaction, draft, setDraft);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   return (
     <>
       <QuestionTray
@@ -32,8 +39,10 @@ function Composer({
         onCollapsedChange={() => {}}
         onSend={() => onAnswer(stepper.buildResponse())}
         onSkip={() => onAnswer(stepper.buildResponse({ omitCurrent: true }))}
+        onAnswerInComposer={() => composerRef.current?.focus()}
       />
       <textarea
+        ref={composerRef}
         aria-label="Your response"
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
@@ -188,5 +197,164 @@ it("reaches every part and choice without text, choice-count, or part-count veto
   fireEvent.click(screen.getByRole("button", { name: "Send" }));
   expect(onAnswer).toHaveBeenCalledWith({
     answers: [{ part_id: "part-8", choice_id: "choice-8-8" }],
+  });
+});
+
+const restaurant: QuestionInteraction = {
+  ...pending,
+  parts: [
+    {
+      part_id: "restaurant",
+      prompt: "Which restaurant should I order from?",
+      choices: [
+        {
+          choice_id: "saved",
+          text: "Use the saved restaurant",
+          recommended: true,
+        },
+        { choice_id: "another", text: "Choose another restaurant" },
+      ],
+    },
+    pending.parts[1]!,
+  ],
+};
+
+it("tags the recommended choice without making it look picked", () => {
+  render(<Composer interaction={restaurant} onAnswer={vi.fn()} />);
+  const recommended = screen.getByRole("button", {
+    name: /^Use the saved restaurant/,
+  });
+  expect(within(recommended).getByText("Recommended")).toBeTruthy();
+  expect(recommended.getAttribute("aria-pressed")).toBe("false");
+  expect(
+    screen.getByRole("button", { name: "Choose another restaurant" }),
+  ).toBeTruthy();
+});
+
+it("ends the choices with a numbered Other that takes its answer from the composer", () => {
+  const onAnswer = vi.fn();
+  render(<Composer interaction={restaurant} onAnswer={onAnswer} />);
+  expect(screen.queryByText(/None of these fit/)).toBeNull();
+  const other = screen.getByRole("button", { name: "Other" });
+  expect(other.textContent).toBe("3Other");
+  const next = screen.getByRole("button", { name: "Next" });
+
+  fireEvent.keyDown(other, { key: "3" });
+  expect(other.getAttribute("aria-pressed")).toBe("true");
+  expect(document.activeElement).toBe(composer());
+  expect(next.matches(":disabled")).toBe(true);
+
+  // A later pick replaces Other, so one choice is sent.
+  fireEvent.click(
+    screen.getByRole("button", { name: /^Use the saved restaurant/ }),
+  );
+  expect(other.getAttribute("aria-pressed")).toBe("false");
+  expect(next.matches(":disabled")).toBe(false);
+
+  fireEvent.click(other);
+  expect(next.matches(":disabled")).toBe(true);
+  fireEvent.change(composer(), { target: { value: "The corner bistro" } });
+  fireEvent.click(next);
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  expect(onAnswer).toHaveBeenCalledWith({
+    answers: [{ part_id: "restaurant", text: "The corner bistro" }],
+  });
+});
+
+const needsDetail: QuestionInteraction = {
+  ...restaurant,
+  parts: [
+    {
+      ...restaurant.parts[0]!,
+      choices: [
+        restaurant.parts[0]!.choices[0]!,
+        {
+          choice_id: "another",
+          text: "Choose another restaurant",
+          detail_prompt: "Which restaurant?",
+        },
+      ],
+    },
+    pending.parts[1]!,
+  ],
+};
+
+it("asks for the detail a picked choice needs, and sends the choice with it", () => {
+  const onAnswer = vi.fn();
+  render(<Composer interaction={needsDetail} onAnswer={onAnswer} />);
+  const next = screen.getByRole("button", { name: "Next" });
+
+  fireEvent.click(
+    screen.getByRole("button", { name: "Choose another restaurant" }),
+  );
+  expect(document.activeElement).toBe(composer());
+  expect(document.getElementById(QUESTION_DETAIL_ID)?.textContent).toBe(
+    "Which restaurant?",
+  );
+  expect(next.matches(":disabled")).toBe(true);
+  expect(
+    screen.getByRole("button", { name: "Skip" }).matches(":disabled"),
+  ).toBe(false);
+
+  fireEvent.change(composer(), { target: { value: "The corner pizzeria" } });
+  fireEvent.click(next);
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  expect(onAnswer).toHaveBeenCalledWith({
+    answers: [
+      {
+        part_id: "restaurant",
+        choice_id: "another",
+        text: "The corner pizzeria",
+      },
+    ],
+  });
+});
+
+it("keeps number keys for nine generated choices and leaves the tenth, Other, unnumbered", () => {
+  const nine: QuestionInteraction = {
+    ...pending,
+    parts: [
+      {
+        part_id: "pick",
+        prompt: "Pick one",
+        choices: Array.from({ length: 9 }, (_, index) => ({
+          choice_id: `choice-${index}`,
+          text: `Choice ${index + 1}`,
+        })),
+      },
+    ],
+  };
+  render(<Composer interaction={nine} onAnswer={vi.fn()} />);
+  const ninth = screen.getByRole("button", { name: "Choice 9" });
+  expect(ninth.textContent).toBe("9Choice 9");
+  expect(screen.getByRole("button", { name: "Other" }).textContent).toBe(
+    "Other",
+  );
+  fireEvent.keyDown(ninth, { key: "9" });
+  expect(ninth.getAttribute("aria-pressed")).toBe("true");
+});
+
+it("drops text a picked choice asked for when the pick moves to another choice", () => {
+  const onAnswer = vi.fn();
+  render(<Composer interaction={needsDetail} onAnswer={onAnswer} />);
+  const another = screen.getByRole("button", {
+    name: "Choose another restaurant",
+  });
+
+  // Unpicking keeps the text: alone it is still an answer, not a contradiction.
+  fireEvent.click(another);
+  fireEvent.change(composer(), { target: { value: "The corner pizzeria" } });
+  fireEvent.click(another);
+  expect((composer() as HTMLTextAreaElement).value).toBe("The corner pizzeria");
+
+  fireEvent.click(another);
+  fireEvent.click(
+    screen.getByRole("button", { name: /^Use the saved restaurant/ }),
+  );
+  expect((composer() as HTMLTextAreaElement).value).toBe("");
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  expect(onAnswer).toHaveBeenCalledWith({
+    answers: [{ part_id: "restaurant", choice_id: "saved" }],
   });
 });

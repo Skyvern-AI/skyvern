@@ -119,6 +119,8 @@ async def run_task(
     ab_routing_eligible: bool = True,
     file_ids: list[str] | None = None,
 ) -> tuple[Task, RunEngine]:
+    if engine == RunEngine.ui_tars and not settings.ENABLE_VOLCENGINE:
+        raise InvalidTaskV1ModelError("The ui-tars engine is not enabled on this server")
     await _validate_task_v1_model_for_org(organization, task.model)
     if task.url:
         task.url = await asyncio.to_thread(validate_fetch_url, task.url)

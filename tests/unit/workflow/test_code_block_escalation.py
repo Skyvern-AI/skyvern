@@ -3939,6 +3939,74 @@ async def test_secure_heal_declined_writes_failed_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("error_code", "receiver_url", "worker_saw_sign_in_form", "expected"),
+    [
+        pytest.param("user_code_error", None, None, True, id="block_page_checked_here"),
+        pytest.param("user_code_error", None, False, False, id="worker_answer_wins"),
+        pytest.param(
+            "user_code_error", "https://example.com/detail", True, True, id="opened_tab_checked_by_the_worker"
+        ),
+        pytest.param("user_code_error", "https://example.com/detail", None, False, id="opened_tab_already_closed"),
+        # The runner's own budget timeout names no operation, so the tab the code waited on is unknown.
+        pytest.param("timeout", None, None, False, id="timeout_tab_unknown"),
+    ],
+)
+async def test_secure_failure_records_a_sign_in_form_only_on_the_page_it_failed_on(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    error_code: str,
+    receiver_url: str | None,
+    worker_saw_sign_in_form: bool | None,
+    expected: bool,
+) -> None:
+    ai_fallback_flag("o_test")
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    fake_page = MagicMock()
+    fake_page.evaluate = AsyncMock(return_value=True)
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=_make_context(), fake_browser_state=fake_browser_state, use_codeblock_runner=True
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code=error_code,
+                    safe_message=None,
+                    failure_reason="CodeBlock failed while running user code.",
+                    exception_class="playwright._impl._errors.TimeoutError",
+                    failing_line=2,
+                    healability_hint=True,
+                    receiver_url=receiver_url,
+                    sign_in_form_visible=worker_saw_sign_in_form,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    assert result.success is False
+    assert result.sign_in_form_visible is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("runner_code", "recorder_code", "healability_hint", "expected_episodes"),
     [
         pytest.param(

@@ -774,7 +774,7 @@ if typing.TYPE_CHECKING:
         RangeNotSatisfiableError,
         UnprocessableEntityError,
     )
-    from . import agents, schedules, scripts
+    from . import agents, artifacts, schedules, scripts
     from .client import AsyncSkyvern, Skyvern
     from .environment import SkyvernEnvironment
     from .schedules import SchedulesListAllRequestStatus
@@ -1550,6 +1550,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowTriggerBlockYaml": ".types",
     "__version__": ".version",
     "agents": ".agents",
+    "artifacts": ".artifacts",
     "schedules": ".schedules",
     "scripts": ".scripts",
 }
@@ -2347,6 +2348,7 @@ __all__ = [
     "WorkflowTriggerBlockYaml",
     "__version__",
     "agents",
+    "artifacts",
     "schedules",
     "scripts",
 ]

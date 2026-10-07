@@ -7,6 +7,7 @@ import re
 import time
 import warnings
 from asyncio import CancelledError
+from collections.abc import Collection
 from json import JSONDecodeError
 from types import MappingProxyType
 from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
@@ -420,36 +421,58 @@ def _current_secret_values_for_redaction() -> set[str]:
     return secret_values
 
 
-def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
+def _current_placeholder_ids_for_redaction() -> frozenset[str]:
+    """The run's registered placeholder ids, exempted from the scrub below.
+
+    Both directions of the model boundary carry these tokens: the prompt offers them in place of
+    credential values, and the model types them back for the run to resolve. Redacting one would
+    break that round trip, so they are named here rather than matched by shape.
+    """
+    try:
+        context = skyvern_context.current()
+        return app.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run(
+            context.workflow_run_id if context else None
+        )
+    except Exception:
+        return frozenset()
+
+
+def _redact_prompt_text(text: str | None, secret_values: set[str], placeholder_ids: Collection[str] = ()) -> str | None:
     if text is None:
         return None
 
     if not secret_values:
         return text
 
-    return redact_secrets_from_text(text, secret_values)
+    return redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
 
 
-def _redact_content_blocks(blocks: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_content_blocks(
+    blocks: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_blocks: list[Any] = []
     changed = False
     for block in blocks:
-        redacted_block, block_changed = _redact_content_block(block, secret_values)
+        redacted_block, block_changed = _redact_content_block(block, secret_values, placeholder_ids)
         redacted_blocks.append(redacted_block)
         changed = changed or block_changed
     return (redacted_blocks, True) if changed else (blocks, False)
 
 
-def _redact_content_value(content: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_value(
+    content: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if isinstance(content, str):
-        redacted_content = redact_secrets_from_text(content, secret_values)
+        redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
         return redacted_content, redacted_content != content
     if isinstance(content, list):
-        return _redact_content_blocks(content, secret_values)
+        return _redact_content_blocks(content, secret_values, placeholder_ids)
     return content, False
 
 
-def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_block(
+    block: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if not isinstance(block, dict):
         return block, False
 
@@ -458,14 +481,14 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
         text = block.get("text")
         if not isinstance(text, str):
             return block, False
-        redacted_text = redact_secrets_from_text(text, secret_values)
+        redacted_text = redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
         if redacted_text == text:
             return block, False
         return {**block, "text": redacted_text}, True
 
     if block_type == "tool_result":
         content = block.get("content")
-        redacted_content, content_changed = _redact_content_value(content, secret_values)
+        redacted_content, content_changed = _redact_content_value(content, secret_values, placeholder_ids)
         if not content_changed:
             return block, False
         return {**block, "content": redacted_content}, True
@@ -473,7 +496,9 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
     return block, False
 
 
-def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_tool_calls(
+    tool_calls: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_tool_calls: list[Any] = []
     changed = False
     for tool_call in tool_calls:
@@ -488,7 +513,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
         if not isinstance(arguments, str):
             redacted_tool_calls.append(tool_call)
             continue
-        redacted_arguments = redact_secrets_from_text(arguments, secret_values)
+        redacted_arguments = redact_secrets_from_text(arguments, secret_values, placeholder_ids=placeholder_ids)
         if redacted_arguments == arguments:
             redacted_tool_calls.append(tool_call)
             continue
@@ -501,6 +526,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
 def _redact_message_text_content(
     messages: list[dict[str, Any]] | None,
     secret_values: set[str],
+    placeholder_ids: Collection[str] = (),
 ) -> list[dict[str, Any]] | None:
     if messages is None or not secret_values:
         return messages
@@ -511,18 +537,18 @@ def _redact_message_text_content(
         redacted_message = message
         content = message.get("content")
         if isinstance(content, str):
-            redacted_content = redact_secrets_from_text(content, secret_values)
+            redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
             if redacted_content != content:
                 redacted_message = {**redacted_message, "content": redacted_content}
                 changed = True
         elif isinstance(content, list):
-            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values)
+            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values, placeholder_ids)
             if content_changed:
                 redacted_message = {**redacted_message, "content": redacted_content_blocks}
                 changed = True
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
-            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values)
+            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values, placeholder_ids)
             if tool_calls_changed:
                 redacted_message = {**redacted_message, "tool_calls": redacted_tool_calls}
                 changed = True
@@ -1958,10 +1984,11 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -2812,10 +2839,11 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -3726,8 +3754,9 @@ class LLMCaller:
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()
+        placeholder_ids = _current_placeholder_ids_for_redaction()
         original_prompt = prompt
-        prompt = _redact_prompt_text(prompt, secret_values)
+        prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -3818,7 +3847,9 @@ class LLMCaller:
                 message_pattern = "anthropic"
 
             if use_message_history:
-                redacted_message_history = _redact_message_text_content(self.message_history, secret_values)
+                redacted_message_history = _redact_message_text_content(
+                    self.message_history, secret_values, placeholder_ids
+                )
                 messages = await llm_messages_builder_with_history(
                     prompt,
                     screenshots,

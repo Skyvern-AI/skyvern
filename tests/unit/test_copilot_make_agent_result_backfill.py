@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.google_connection_notice import GoogleConnectionNotice
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run
@@ -383,14 +384,45 @@ def test_blocker_override_path_adds_credential_prompt_from_request_policy() -> N
     assert overridden.narrative_payload["credentialPrompt"] == {"reason": "workflow_credential_inputs_unbound"}
 
 
-def test_backfill_adds_credential_prompt_from_text_marker_when_no_policy_signal() -> None:
+def test_backfill_omits_credential_prompt_for_prose_link_without_policy_signal() -> None:
     result = _result(
         _ctx(),
-        user_response="You can add one at https://app.skyvern.com/credentials.",
+        user_response="To remove saved credentials, select them on [Credentials](/credentials) and confirm.",
         narrative_payload=_payload(),
     )
     assert result.narrative_payload is not None
-    assert result.narrative_payload["credentialPrompt"] == {"reason": "assistant_directed"}
+    assert "credentialPrompt" not in result.narrative_payload
+
+
+def test_backfill_adds_credential_prompt_from_unbound_run_without_clarification_or_pause() -> None:
+    ctx = _ctx(request_policy=RequestPolicy())
+    ctx.last_run_skipped_unbound_credentials = True
+    result = _result(
+        ctx,
+        user_response="Add a credential at [Credentials](/credentials) so I can test the sign-in.",
+        narrative_payload=_payload(),
+    )
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialPrompt"] == {"reason": "workflow_credential_inputs_unbound"}
+    assert "credentialPause" not in result.narrative_payload
+
+
+def test_backfill_omits_credential_prompt_once_the_run_derived_ask_was_answered() -> None:
+    ctx = _ctx(request_policy=RequestPolicy())
+    ctx.last_run_skipped_unbound_credentials = True
+    ctx.credential_pause_outcome = "connected"
+    result = _result(ctx, narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert "credentialPrompt" not in result.narrative_payload
+
+
+def test_backfill_omits_run_derived_credential_prompt_while_origin_recovery_is_pending() -> None:
+    ctx = _ctx(request_policy=RequestPolicy())
+    ctx.last_run_skipped_unbound_credentials = True
+    ctx.credential_origin_recovery = CredentialOriginRecovery("https://idp.example.test", "pending", "cred_service")
+    result = _result(ctx, narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert "credentialPrompt" not in result.narrative_payload
 
 
 def test_backfill_emits_credential_auto_bound_receipt() -> None:

@@ -19,8 +19,10 @@ import {
   useWorkflowYamlEditorStore,
   type YamlCommitOwner,
 } from "@/store/WorkflowYamlEditorStore";
+import { useRecordingFeedbackStore } from "@/store/RecordingFeedbackStore";
 import {
   captureRecordBrowser,
+  getRecordBrowserContext,
   markRecordBrowserProcessed,
 } from "@/util/recordBrowserTelemetry";
 
@@ -218,6 +220,11 @@ const useProcessRecordingMutation = ({
 
       if (blocks && blocks.length > 0) {
         if (!isRecordingOwnerCurrent(owner)) return;
+        useRecordingFeedbackStore.getState().show({
+          ...getRecordBrowserContext(),
+          workflow_permanent_id: owner.workflowPermanentId,
+          recording_id: recordingId ?? undefined,
+        });
         if (recordingId) {
           useWorkflowHasChangesStore
             .getState()

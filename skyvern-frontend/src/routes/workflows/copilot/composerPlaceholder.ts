@@ -6,6 +6,7 @@ export function composerPlaceholder({
   isWaitingForLiveBrowser,
   latestTurnIsAsk,
   askPartChoices = "none",
+  detailPrompt = null,
 }: {
   // Whether a send adds to the queued message or replaces it (a programmatic one).
   queuedPrompt: "add" | "replace" | null;
@@ -15,6 +16,8 @@ export function composerPlaceholder({
   // The question on screen's choices: without any the composer is the answer, and typing never
   // clears a picked one, so text sent after a pick goes alongside it rather than replacing it.
   askPartChoices?: "none" | "unpicked" | "picked";
+  // What the picked choice still needs typed, which outranks the generic invitations.
+  detailPrompt?: string | null;
 }): string {
   if (queuedPrompt === "add") return "Add to the queued message…";
   if (queuedPrompt === "replace") return "Type to replace the queued message…";
@@ -22,6 +25,7 @@ export function composerPlaceholder({
   if (isWaitingForLiveBrowser) return "Type a prompt to send when ready...";
   // While a question is pending the composer is the text field for the question on screen, so
   // it says so rather than inviting an unrelated new request.
+  if (latestTurnIsAsk && detailPrompt) return detailPrompt;
   if (latestTurnIsAsk)
     return askPartChoices === "picked"
       ? "Add details…"

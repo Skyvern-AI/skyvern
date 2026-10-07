@@ -75,9 +75,8 @@ USER_FACING_REASON_PARAM = "user_facing_reason"
 USER_FACING_REASON_SCHEMA = {
     "type": ["string", "null"],
     "description": (
-        "A short user-facing sentence explaining what this action is intended to accomplish. "
-        "This is displayed above this action while it runs; write it with the ordinary action arguments, "
-        "in product language without secrets. Null or absence is accepted when no useful explanation is available."
+        "One short sentence displayed above this action while it runs, saying what it is for. "
+        "Null or absence is accepted."
     ),
 }
 
@@ -256,6 +255,12 @@ class NarrativeWorkPlan(TypedDict):
     items: list[str]
 
 
+class NarrativeScreenshot(TypedDict):
+    artifactId: str
+    capturedAt: str
+    toolCallId: str | None
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -265,7 +270,8 @@ class TurnNarrativePayload(TypedDict):
     # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     questionInteractions: NotRequired[list[dict[str, Any]]]
-    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    steerMessages: NotRequired[list[dict[str, Any]]]
+    # {"reason": <token>}, set when this turn surfaces a typed credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
@@ -289,6 +295,7 @@ class TurnNarrativePayload(TypedDict):
     # The last plan a successful set_work_plan stored this turn. Kept off designActivity, whose cap
     # can trim the call's row in a long turn.
     workPlan: NotRequired[NarrativeWorkPlan]
+    screenshots: NotRequired[list[NarrativeScreenshot]]
     startedAt: str | None
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
@@ -1199,6 +1206,7 @@ class CopilotContext(AgentContext):
 
     workflow_copilot_chat_id: str | None = None
     copilot_cancel_token: str | None = None
+    handled_steer_ids: set[str] = field(default_factory=set)
     copilot_question_pause_seconds: float = 0.0
     human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None
@@ -1247,6 +1255,7 @@ class CopilotContext(AgentContext):
     last_run_skipped_unbound_credentials: bool = False
     client_supports_credential_pause: bool = False
     client_supports_credential_pause_recovery: bool = False
+    client_supports_credential_generation: bool = False
     credential_recovery_token_digest: str | None = field(default=None, repr=False)
     credential_recovery_armed: bool = False
     credential_pause_used: bool = False
@@ -1259,6 +1268,9 @@ class CopilotContext(AgentContext):
     credential_pause_reaskable_by_run: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
+    credential_registration_outcome: Literal["rejected", "unknown"] | None = None
+    # Generate and save created, or may have created, a credential; a second generate card could mint a duplicate.
+    credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
@@ -1433,6 +1445,9 @@ class CopilotContext(AgentContext):
     proposal_revision: int | None = None
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
+    # for what a test under this token would run, so binding a run to it is refused.
+    settings_diverged_proposal_token: tuple[str, int] | None = None
     # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
     # staged draft at turn end. None on entrypoints that load no chat row.
     auto_accept: bool | None = None
@@ -1502,3 +1517,8 @@ class CopilotContext(AgentContext):
             "dispatched_run_count_this_turn": len(self.dispatched_run_ids_this_turn),
             "ctx_last_workflow_present": self.last_workflow is not None,
         }
+
+
+def advertises(ctx: CopilotContext | None, tool_name: str) -> bool:
+    # A context that never resolved a tool surface advertises nothing.
+    return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)

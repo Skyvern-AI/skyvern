@@ -193,10 +193,13 @@ async def test_get_secret_value_by_item_id_preserves_raw_totp_uri(
     assert result[BitwardenConstants.TOTP] == totp_uri
 
 
+_OMITTED = object()
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("card_code", [None, "123"], ids=["null-code", "with-code"])
+@pytest.mark.parametrize("card_code", [None, "123", _OMITTED], ids=["null-code", "with-code", "omitted-code-and-brand"])
 async def test_get_credit_card_data_includes_billing_custom_fields(
-    monkeypatch: pytest.MonkeyPatch, card_code: str | None
+    monkeypatch: pytest.MonkeyPatch, card_code: str | None | object
 ) -> None:
     item_payload = {
         "object": "item",
@@ -219,6 +222,8 @@ async def test_get_credit_card_data_includes_billing_custom_fields(
             {"name": "metadata_customer_id", "value": "cus_123"},
         ],
     }
+    if card_code is _OMITTED:
+        del item_payload["card"]["code"], item_payload["card"]["brand"]
 
     async def fake_run_command(command: list[str], **_: object) -> RunCommandResult:
         return RunCommandResult(stdout=json.dumps(item_payload), stderr="", returncode=0)
@@ -236,7 +241,8 @@ async def test_get_credit_card_data_includes_billing_custom_fields(
     )
 
     assert result[BitwardenConstants.CREDIT_CARD_NUMBER] == "4111111111111111"
-    assert result[BitwardenConstants.CREDIT_CARD_CVV] == card_code
+    assert result[BitwardenConstants.CREDIT_CARD_CVV] == (None if card_code is _OMITTED else card_code)
+    assert result[BitwardenConstants.CREDIT_CARD_BRAND] == (None if card_code is _OMITTED else "visa")
     assert result["billing_address_line1"] == "123 Main St"
     assert result["billing_address_country_code"] == "US"
     assert result["billing_email"] == "billing@example.com"

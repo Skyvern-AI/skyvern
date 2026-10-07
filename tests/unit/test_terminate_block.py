@@ -16,13 +16,13 @@ from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WaitBlock
+from skyvern.forge.sdk.workflow.models.block import Block, CodeBlock, ForLoopBlock, WaitBlock
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import on_terminal_transition
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
-from skyvern.schemas.workflows import BlockStatus, BlockType, TerminateBlockYAML, WorkflowRetryPolicy
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, TerminateBlockYAML, WorkflowRetryPolicy
 from tests.unit.conftest import make_block_output_parameter
 
 
@@ -930,3 +930,26 @@ def test_error_code_survives_yaml_to_model_to_yaml() -> None:
     assert TerminateBlock.model_validate(stored).error_code == "ACCOUNT_NOT_FOUND"
     resaved = TerminateBlockYAML(label=stored["label"], reason=stored["reason"], error_code=stored["error_code"])
     assert resaved.error_code == "ACCOUNT_NOT_FOUND"
+
+
+def test_a_declared_error_on_a_sign_in_form_keeps_its_category_first() -> None:
+    output_parameter = make_block_output_parameter("code_1")
+    block = CodeBlock(label="code_1", code="pass", output_parameter=output_parameter)
+    declared = [{"category": "LOGIN_FAILED", "confidence_float": 1.0, "reasoning": "login page never loaded"}]
+    result = BlockResult(
+        success=False,
+        output_parameter=output_parameter,
+        output_parameter_value={"failure_category": declared},
+        status=BlockStatus.failed,
+        failure_reason="login page never loaded",
+        sign_in_form_visible=True,
+    )
+
+    _, _, run_category = WorkflowService._resolve_block_terminal_outcome(block=block, block_result=result)
+
+    assert run_category is not None
+    assert run_category[:-1] == declared
+    assert (run_category[-1]["category"], run_category[-1]["reason_code"]) == (
+        "WRONG_PAGE_STATE",
+        "sign_in_form_visible",
+    )

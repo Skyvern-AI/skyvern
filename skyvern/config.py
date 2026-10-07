@@ -172,7 +172,11 @@ class Settings(BaseSettings):
     # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
     # so one fetch can't consume the whole block. TOTP re-mint is instant and unaffected.
     CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS: int = 120
-    OPTION_LOADING_TIMEOUT_MS: int = 600000
+    # Backstop for the dropdown option-loading scroll loop, which now ends on its own once the menu
+    # is scrolled to the bottom and has stopped growing. Exceeding it is non-fatal — the LLM still
+    # picks from whatever loaded — so this is kept short enough that a never-settling menu costs
+    # seconds rather than the minutes a run's elapsed budget cannot absorb.
+    OPTION_LOADING_TIMEOUT_MS: int = 60000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
@@ -230,6 +234,8 @@ class Settings(BaseSettings):
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
+    # Synthetic browser fixture: never installed outside staging, disabled by default.
+    COPILOT_EVAL_AUTH_FIXTURE_ENABLED: bool = False
     BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
@@ -301,6 +307,13 @@ class Settings(BaseSettings):
     # /stream sockets all count -- so size it against connections per task, not request concurrency.
     # Set it empty or 0 to disable shedding.
     API_LIMIT_CONCURRENCY: int | None = Field(default=512, gt=0)
+    # Run submissions one API process dispatches at once; later ones wait without holding a pooled connection, and
+    # get a retryable 503 before anything is written if no slot frees. 0 (the default) leaves them unbounded and 32
+    # is the suggested first value, checked against the skyvern.run_submission.in_flight gauge, which records either
+    # way; the DISABLE_RUN_SUBMISSION_GATE feature flag switches an enabled gate off without a restart.
+    RUN_SUBMISSION_MAX_CONCURRENCY: int = Field(default=0, ge=0)
+    # Below the SDK's 60 s client timeout, so a waiting caller is answered before it gives up.
+    RUN_SUBMISSION_SLOT_WAIT_SECONDS: float = Field(default=20.0, gt=0)
     # Must exceed the load balancer's idle timeout (infra/terraform/production/alb.tf); otherwise
     # the ALB reuses a connection the server already closed and answers the client with a 502.
     UVICORN_TIMEOUT_KEEP_ALIVE: int = 125
@@ -327,6 +340,9 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
+    # Strict-Transport-Security value for API responses. Off by default: HSTS binds every port on the host,
+    # so a self-hosted install serving anything else there over plain HTTP would be forced onto HTTPS.
+    STRICT_TRANSPORT_SECURITY: str | None = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
     UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
@@ -357,11 +373,6 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
-    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
-    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
-    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
-    # None keeps the LIST fallback for every run.
-    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -457,10 +468,12 @@ class Settings(BaseSettings):
     # How long a cached vault may go without a `bw sync`. A miss forces a sync and one retry,
     # so this is the staleness ceiling for an *edit*, not for a newly created item.
     BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS: float = 60.0
-    # How long an unused session may keep an unlocked vault in memory and on disk before it is
-    # logged out. Long enough that a batch stays warm throughout, short enough that an idle pod is
-    # not sitting on someone's open vault. Set to 0 to keep sessions for the pod's lifetime.
+    # How long an unused session may keep an unlocked vault in memory and on disk before it is logged
+    # out (0 disables): long enough to keep a batch warm, short enough that an idle pod holds no open vault.
     BITWARDEN_SESSION_MAX_IDLE_SECONDS: float = 900.0
+    # Retires even a busy session after this long, ±15% per session (0 disables); each retirement costs a
+    # cold login. The periodic sync catches a revoked login sooner, so this only bounds an open vault's age.
+    BITWARDEN_SESSION_MAX_LIFETIME_SECONDS: float = 14400.0
     # Each `bw` invocation is a Node process costing real CPU and ~hundreds of MB. Bound how many
     # run at once so a burst of runs cannot starve the browsers sharing the pod.
     BITWARDEN_MAX_CONCURRENT_CLI_COMMANDS: int = 4
@@ -547,10 +560,9 @@ class Settings(BaseSettings):
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
     TASK_V3_DATE_SEGMENT_AIM: bool = False
-    # Move the pointer onto an input or click target before acting, as v1 does, and take the click and typing
-    # pre-snapshots without writing an attribute to every visible element. Force-on term only: runs are randomized per run by the
-    # flag of the same name, read through run_arm_enabled(POINTER_PARITY_FLAG, ...).
-    TASK_V3_POINTER_PARITY: bool = False
+    # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
+    # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
+    TASK_V3_LOGIN_PACE: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
@@ -998,6 +1010,10 @@ class Settings(BaseSettings):
     WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
     """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
     dispatch of already-submitted groups continue."""
+    COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
+    """Offer Copilot's run_workflow_for_accounts tool. Turning it off keeps group status, cancel and receipts."""
+    COPILOT_CREDENTIAL_DELETE_ENABLED: bool = True
+    """Offer Copilot's delete_saved_credentials card. Turning it off hides the tool and refuses confirmations."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

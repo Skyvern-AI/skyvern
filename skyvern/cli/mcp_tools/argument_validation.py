@@ -46,16 +46,19 @@ _MAX_REPAIR_LIST_ITEMS = 100
 # Repair only production-observed fields whose comma-delimited meaning is known;
 # the schema check below prevents this policy from outliving a signature change.
 _COMMA_SEPARATED_LIST_ARGUMENTS = frozenset({("skyvern_workflow_run_list", "status")})
+# Same policy for production-observed fields documented as a JSON string that callers send as
+# the object that string is supposed to encode.
+_JSON_STRING_OBJECT_ARGUMENTS = frozenset({("skyvern_workflow_run", "parameters")})
 
 
-def _schema_accepts_array(schema: Any) -> bool:
+def _schema_accepts_type(schema: Any, json_type: str) -> bool:
     if not isinstance(schema, dict):
         return False
     schema_type = schema.get("type")
-    if schema_type == "array" or (isinstance(schema_type, list) and "array" in schema_type):
+    if schema_type == json_type or (isinstance(schema_type, list) and json_type in schema_type):
         return True
     return any(
-        _schema_accepts_array(option)
+        _schema_accepts_type(option, json_type)
         for alternatives in (schema.get("anyOf"), schema.get("oneOf"))
         if isinstance(alternatives, list)
         for option in alternatives
@@ -74,6 +77,16 @@ def _split_comma_separated_list(value: Any) -> Any:
     return items
 
 
+def _encode_json_object(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    try:
+        encoded = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return value
+    return encoded if len(encoded) <= _MAX_REPAIR_STRING_LENGTH else value
+
+
 def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any]) -> None:
     if tool_name == "skyvern_browser_session_create" and arguments.get("generate_browser_profile") is None:
         arguments.pop("generate_browser_profile", None)
@@ -86,8 +99,15 @@ def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any])
         return
 
     for name, value in arguments.items():
-        if (tool_name, name) in _COMMA_SEPARATED_LIST_ARGUMENTS and _schema_accepts_array(properties.get(name)):
+        schema = properties.get(name)
+        if (tool_name, name) in _COMMA_SEPARATED_LIST_ARGUMENTS and _schema_accepts_type(schema, "array"):
             arguments[name] = _split_comma_separated_list(value)
+        elif (
+            (tool_name, name) in _JSON_STRING_OBJECT_ARGUMENTS
+            and _schema_accepts_type(schema, "string")
+            and not _schema_accepts_type(schema, "object")
+        ):
+            arguments[name] = _encode_json_object(value)
 
     timeout = arguments.get("timeout")
     if (

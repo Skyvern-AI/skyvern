@@ -116,14 +116,20 @@ def evaluate_retry_policy(
     status: WorkflowRunStatus,
     error_codes: set[str],
     retries_used: int,
+    *,
+    worker_container_restarted: bool = False,
 ) -> tuple[bool, str]:
     if status is WorkflowRunStatus.canceled:
         return False, "canceled"
     if retries_used >= policy.max_retries:
         return False, "budget_exhausted"
 
+    statuses = {status.value}
+    # Worker-restart recovery persists failed for a loss the heartbeat deadline used to end timed_out.
+    if worker_container_restarted:
+        statuses.add(WorkflowRunStatus.timed_out.value)
     for rule in policy.retry_on:
-        if rule.status == status.value and (not rule.error_codes or error_codes.intersection(rule.error_codes)):
+        if rule.status in statuses and (not rule.error_codes or error_codes.intersection(rule.error_codes)):
             return True, "matched"
     return False, "no_match"
 
@@ -496,6 +502,7 @@ async def on_terminal_transition(
     attempt_number: int | None = None,
     *,
     refresh_finished_at: bool = True,
+    worker_container_restarted: bool = False,
 ) -> RetryDecision:
     if not status.is_final():
         raise ValueError(f"Cannot record retry decision for non-terminal status: {status.value}")
@@ -584,7 +591,9 @@ async def on_terminal_transition(
         retry_decision = RETRY_DECISION_ABANDONED
     elif policy is not None:
         retries_used = sum(1 for row in attempts if row.retry_decision == RETRY_DECISION_RETRY)
-        retry, decision_reason = evaluate_retry_policy(policy, status, error_codes, retries_used)
+        retry, decision_reason = evaluate_retry_policy(
+            policy, status, error_codes, retries_used, worker_container_restarted=worker_container_restarted
+        )
         if retry:
             next_attempt_at = naive_utc_now() + timedelta(seconds=policy.delay_seconds)
             retry_decision = RETRY_DECISION_RETRY

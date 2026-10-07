@@ -7,6 +7,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { getClientWithRequestHeaders } from "@/api/AxiosClient";
+import { retryTransientNetworkFailures } from "@/api/QueryClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useUser } from "@/hooks/useUser";
 import { useActiveOrgId } from "@/store/ActiveOrgContext";
@@ -252,6 +253,8 @@ function OnboardingProvider({ children }: Readonly<Props>) {
   >({
     scope: MUTATION_SCOPE,
     mutationFn: writeState,
+    // Callers fire and forget, so a request routed to a dying API task would drop the write.
+    retry: retryTransientNetworkFailures,
     onMutate: async ({
       patch,
       generation: writeGeneration,

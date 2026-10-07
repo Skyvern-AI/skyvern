@@ -125,6 +125,16 @@ async def _refuse_if_pinned_by_run_group(session: AsyncSession, workflow_id: str
         raise WorkflowPinnedByRunGroup(workflow_id)
 
 
+def with_carried_browser_settings(definition: dict[str, Any], previous_definition: object) -> dict[str, Any]:
+    """An absent key keeps the previous definition's settings and an explicit null clears them, because the
+    editor rebuilds definitions from a fixed key list and would otherwise drop the setting on every save."""
+    if "browser_settings" in definition or not isinstance(previous_definition, dict):
+        return definition
+    if "browser_settings" not in previous_definition:
+        return definition
+    return {**definition, "browser_settings": previous_definition["browser_settings"]}
+
+
 class WorkflowsRepository(BaseRepository):
     """Database operations for workflow management."""
 
@@ -185,7 +195,7 @@ class WorkflowsRepository(BaseRepository):
                 async with self.Session.bind_connection(connection):
                     yield
 
-    async def _policy_of_latest_version(
+    async def _latest_version_definition(
         self, session: Any, workflow_permanent_id: str, organization_id: str | None
     ) -> object | None:
         """Deliberately does NOT exclude soft-deleted rows, unlike the read used at bind time.
@@ -203,7 +213,7 @@ class WorkflowsRepository(BaseRepository):
         )
         if organization_id:
             query = query.filter_by(organization_id=organization_id)
-        return carried_policy(await session.scalar(query))
+        return await session.scalar(query)
 
     @db_operation("rename_workflow_if_still_default")
     async def rename_workflow_if_still_default(
@@ -288,8 +298,8 @@ class WorkflowsRepository(BaseRepository):
         async with self.Session() as session:
             # Policy is never taken from the caller's definition: a new version inherits exactly what
             # the previous one stored, so no save path can add, widen or clear an enrollment.
-            carried = (
-                await self._policy_of_latest_version(session, workflow_permanent_id, organization_id)
+            previous_definition = (
+                await self._latest_version_definition(session, workflow_permanent_id, organization_id)
                 if workflow_permanent_id and version != 1
                 else None
             )
@@ -297,7 +307,10 @@ class WorkflowsRepository(BaseRepository):
                 organization_id=organization_id,
                 title=title,
                 description=description,
-                workflow_definition=with_policy(workflow_definition, carried),
+                workflow_definition=with_policy(
+                    with_carried_browser_settings(workflow_definition, previous_definition),
+                    carried_policy(previous_definition),
+                ),
                 proxy_location=serialize_proxy_location(proxy_location),
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
@@ -1014,7 +1027,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.description = description
                 if workflow_definition is not None:
                     workflow.workflow_definition = with_policy(
-                        workflow_definition, carried_policy(workflow.workflow_definition)
+                        with_carried_browser_settings(workflow_definition, workflow.workflow_definition),
+                        carried_policy(workflow.workflow_definition),
                     )
                 if version is not None:
                     workflow.version = version
@@ -1400,7 +1414,8 @@ class WorkflowsRepository(BaseRepository):
                     # default above because their models omit this field without intending a clear.
                     definition_json.pop("completion_contract", None)
                 workflow.workflow_definition = with_policy(
-                    definition_json, carried_policy(workflow.workflow_definition)
+                    with_carried_browser_settings(definition_json, workflow.workflow_definition),
+                    carried_policy(workflow.workflow_definition),
                 )
             if version is not None:
                 workflow.version = version

@@ -45,8 +45,8 @@ type Props = {
   onClearSelection: () => void;
   onDeleteRequest: () => void;
   onMoveToFolder: (folderId: string | null) => Promise<void>;
-  // Defaults to shown; only an explicit false (cloud flag off) hides tagging.
-  taggingEnabled?: boolean;
+  // From useWorkflowTaggingEnabled: true only once the WORKFLOW_TAGGING flag resolves on.
+  taggingEnabled: boolean;
   tagKeys: Array<TagKey>;
   labelSuggestions: Array<string>;
   valueSuggestionsByKey?: Map<string, Array<string>>;
@@ -105,7 +105,7 @@ function BulkActionBar({
   onClearSelection,
   onDeleteRequest,
   onMoveToFolder,
-  taggingEnabled = true,
+  taggingEnabled,
   tagKeys,
   labelSuggestions,
   valueSuggestionsByKey,

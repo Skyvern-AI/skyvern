@@ -90,9 +90,9 @@ export const claimHoldDeadline = (
  * What a hydrated chat row does to the Accept fence. It ARMS the hold when the row reports a
  * claim, and preserves the two holds a chat row cannot disprove:
  *
- * - `recover`, because "the server reports no claim" is not proof no write is in flight: the
- *   apply route acquires its claim only after its canonical lookup and normalization, so a read
- *   can overtake a POST that is about to write. Releasing is that hold's own job, via its deadline.
+ * - `recover`, because "the server reports no claim" is not proof no write is in flight: a read
+ *   can overtake a POST that has not yet reached the server and taken its claim. Releasing is that
+ *   hold's own job, via its deadline.
  * - `saved`, because that gate carries the ONLY copy of a workflow the server confirmed. Dropping
  *   it discards the retry's copy and releases Save over a canvas known to be older than the
  *   server - the exact overwrite this fence exists to prevent.
