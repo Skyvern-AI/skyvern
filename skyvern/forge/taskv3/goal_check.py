@@ -1,5 +1,5 @@
 """LLM checks at the Task V3 finish gate: the goal check, which asks whether the evidence contradicts a
-finish(status=completed), and the unlisted-outcome re-ask, which asks whether a failed or terminated finish stopped
+single-action block's step-cap completion, and the unlisted-outcome re-ask, which asks whether a failed or terminated finish stopped
 only because the site skipped a screen the completion criterion expects. The goal-check judge never sees the agent's
 reason or reported output, and neither prompt renders a trail entry's `entered` values."""
 
@@ -22,8 +22,7 @@ from skyvern.utils.strings import escape_code_fences, neutralize_untrusted_web_p
 LOG = structlog.get_logger()
 
 GOAL_CHECK_PROMPT_NAME = "taskv3-goal-check"
-# The same prompt, asked on a step-cap block completion outside the goal-check arm; its own name keeps the arm's calls
-# countable on their own.
+# The goal-check prompt as asked on a step-cap block completion.
 BLOCK_COMPLETION_CHECK_PROMPT_NAME = "taskv3-block-completion-check"
 GOAL_CHECK_TIMEOUT_SECONDS = 20.0
 TRAIL_SIZE = 8
@@ -34,10 +33,6 @@ PAGE_READ_MAX_CHARS = 16000
 INSTRUCTIONS_MAX_CHARS = 4000
 TRUNCATION_MARKER = "…[truncated]…"
 SCREENSHOT_QUOTE_PREFIX = "SCREENSHOT:"
-# Skips decided before the judge is called: no screenshot is captured for them.
-PRE_JUDGE_SKIP_REASONS = frozenset({"deadline", "secret_entered", "instructions_too_long"})
-MISSING_MAX_CHARS = 300
-DEFAULT_MISSING = "the page or recent tool results contradict it"
 UNLISTED_REASK_PROMPT_NAME = "taskv3-unlisted-outcome-check"
 REASON_MAX_CHARS = 2000
 CONVERTED_REASON_MAX_CHARS = 300
@@ -57,7 +52,6 @@ _QUOTE_FOLD = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201
 GoalJudge = Callable[[str], Awaitable[dict[str, Any] | None]]
 Redactor = Callable[[str], str]
 Verdict = Literal["achieved", "not_achieved", "impossible"]
-GoalCheckAction = Literal["accept", "hold", "fail", "terminate"]
 NonCompletedStatus = Literal["failed", "terminated"]
 
 
@@ -76,15 +70,11 @@ class TrailEntry:
 
 
 class ToolTrail:
-    def __init__(self, size: int = TRAIL_SIZE, *, secret_entered: bool = False) -> None:
+    def __init__(self, size: int = TRAIL_SIZE) -> None:
         self.entries: deque[TrailEntry] = deque(maxlen=size)
         self.page_read: TrailEntry | None = None
         self.calls_since_page_read = 0
         self.page_changes_since_page_read = 0
-        # Sticky: once a secret reached the page, a finish-time screenshot can show it (v3 tools apply
-        # no visual secret mask), so the goal-check arm's judge is not called for the rest of the run. Seeded when one
-        # may already be on the page before this loop starts.
-        self.secret_entered = secret_entered
         # Only this loop's own calls: the typed secret can still be on screen, possibly in the run's first screenshot.
         self.secret_entered_in_loop = False
         # Unbounded, unlike `entries`: a value typed early in the run is still one this block entered.
@@ -114,7 +104,6 @@ class ToolTrail:
                 self.url_after_last_page_change = url
         if url is not None:
             self._urls_seen.add(url)
-        self.secret_entered = self.secret_entered or entry.secret_entered
         self.secret_entered_in_loop = self.secret_entered_in_loop or entry.secret_entered
         if entry.status == "ok" and not entry.secret_entered:
             self.entered_values.update(entry.entered)
@@ -150,28 +139,6 @@ class GoalVerdict:
     missing: str
     skipped_reason: str | None
     latency_s: float
-    action: GoalCheckAction | None = None
-    # A hold the run had no budget left to fund, so the completion was accepted instead.
-    no_headroom: bool = False
-    # Shadow only: whether an immediate second check of a would-be hold also contradicted the goal,
-    # i.e. whether enforce would have failed the block. None when there was no usable second verdict.
-    would_fail: bool | None = None
-    # The shadow re-check of a would-be hold, as opposed to a finish gate's own decision.
-    recheck: bool = False
-
-    @property
-    def quote_source(self) -> str:
-        if self.quote.startswith(SCREENSHOT_QUOTE_PREFIX):
-            return "screenshot"
-        return "text" if self.quote else "none"
-
-    @property
-    def is_contradiction(self) -> bool:
-        return self.verdict in ("not_achieved", "impossible")
-
-    @property
-    def bounded_missing(self) -> str:
-        return (self.missing.strip() or DEFAULT_MISSING)[:MISSING_MAX_CHARS]
 
 
 def goal_check_eligible(*, page_free: bool, completion_blocker_present: bool, extraction_requested: bool) -> bool:
@@ -448,8 +415,6 @@ class UnlistedReask:
     # The conversion's settle window: None when it did not run; rounds are fingerprint pairs.
     settled: bool | None = None
     settle_rounds: int = 0
-    # The goal check's verdict on the converted completion, when a goal judge is wired.
-    goal_check_verdict: str | None = None
     llm_key: str | None = None
     reask_llm_key: str | None = None
 

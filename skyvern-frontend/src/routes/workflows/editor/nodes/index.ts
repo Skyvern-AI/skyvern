@@ -71,6 +71,7 @@ import { DataExportNode as DataExportNodeComponent } from "./DataExportNode/Data
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
+import { withRunValidationHighlight } from "../runValidation/withRunValidationHighlight";
 import { withReviewAnnotation } from "../review/withReviewAnnotation";
 
 export type UtilityNode = StartNode | NodeAdderNode;
@@ -126,23 +127,36 @@ export type AppNode = UtilityNode | WorkflowBlockNode;
 //   withSortableBlock   - registers `useSortable({ id })`; the inner tree
 //                         must mount in both open and collapsed states so
 //                         drag pickup works on either
+//   withRunValidationHighlight - amber outline + badge on run-blocking blocks,
+//                         and a rolled-up count badge on containers, inside the
+//                         drag registration
 //   withSelectableBlock - reads `useSortable.isDragging` to suppress
 //                         selection on drag pickup
 //   withCollapsible     - leaf wrapper for body chrome
 function wrapBlock<P extends NodeProps>(Component: ComponentType<P>) {
   return memo(
     withReviewAnnotation(
-      withSortableBlock(withSelectableBlock(withCollapsible(Component))),
+      withSortableBlock(
+        withRunValidationHighlight(
+          withSelectableBlock(withCollapsible(Component)),
+        ),
+      ),
     ),
   );
 }
 
 // `loop` and `conditional` are containers — RF renders their bodies as
 // child nodes, so collapsing the parent to a header-only card would leave
-// children visually overflowing the card and break edge layout.
+// children visually overflowing the card and break edge layout. They still
+// carry withRunValidationHighlight so a collapsed container can show a
+// rolled-up count of the offending blocks nested inside it.
 function wrapContainerBlock<P extends NodeProps>(Component: ComponentType<P>) {
   return memo(
-    withReviewAnnotation(withSortableBlock(withSelectableBlock(Component))),
+    withReviewAnnotation(
+      withSortableBlock(
+        withRunValidationHighlight(withSelectableBlock(Component)),
+      ),
+    ),
   );
 }
 

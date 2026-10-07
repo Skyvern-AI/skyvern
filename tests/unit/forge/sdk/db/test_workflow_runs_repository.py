@@ -4268,3 +4268,160 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
         "wr_member": "user_member",
         "tsk_v2_1": "user_prompter",
     }
+
+
+@pytest.mark.asyncio
+async def test_browser_session_metadata_query_is_select_only_scoped_and_includes_copilot_children():
+    session = MagicMock()
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = []
+    session.execute = AsyncMock(return_value=result)
+    repo = SimpleNamespace(
+        Session=lambda: _SessionContext(session),
+        _indexed_identifier_run_ids=WorkflowRunsRepository._indexed_identifier_run_ids,
+    )
+    rows = await WorkflowRunsRepository.get_workflow_metadata_for_browser_session(repo, "pbs_123", "org_1")
+    assert rows == []
+    query = session.execute.call_args.args[0]
+    sql = str(query.compile(compile_kwargs={"literal_binds": True}))
+    assert sql.startswith("SELECT ") and "LIMIT 101" in sql
+    assert "workflow_runs.organization_id = 'org_1'" in sql
+    assert "browser_session_id = 'pbs_123'" in sql
+    assert "copilot_session_id IS NULL" not in sql and "parent_workflow_run_id IS NULL" not in sql
+    assert "tasks.browser_session_id" in sql and "observer_cruises.browser_session_id" in sql
+    assert "workflow_run_attempts.pinned_browser_session_id = 'pbs_123'" in sql
+    assert "workflow_run_attempts.organization_id = 'org_1'" in sql
+    assert set(query.selected_columns.keys()) == {
+        "workflow_run_id",
+        "organization_id",
+        "browser_session_id",
+        "workflow_permanent_id",
+        "copilot_session_id",
+        "status",
+        "created_at",
+        "finished_at",
+        "credits_used",
+        "cached_credits_used",
+    }
+    session.commit.assert_not_called()
+    session.flush.assert_not_called()
+    session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provider_call(
+    sqlite_db, sqlite_engine, monkeypatch
+):
+    from skyvern.forge.sdk.routes import browser_sessions as browser_routes
+
+    now = datetime(2026, 10, 7, 9, 13, tzinfo=UTC)
+    copilot = _workflow_run_model(
+        workflow_run_id="wr_201", queued_at=now, browser_session_id="pbs_123", status="paused"
+    )
+    copilot.copilot_session_id = "wcc_201"
+    copilot.credits_used = 7
+    child = _workflow_run_model(workflow_run_id="wr_202", queued_at=now, browser_session_id="pbs_456")
+    child.parent_workflow_run_id = "wr_201"
+    pinned = _workflow_run_model(workflow_run_id="wr_204", queued_at=now, browser_session_id=None, status="paused")
+    pinned.copilot_session_id = "wcc_204"
+    pinned.credits_used = 9
+    foreign = _workflow_run_model(
+        workflow_run_id="wr_203", queued_at=now, browser_session_id="pbs_123", organization_id="org_other"
+    )
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                OrganizationModel(organization_id=org, organization_name="Test Organization")
+                for org in ("org_test", "org_other")
+            ]
+        )
+        await session.flush()
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_test",
+                workflow_permanent_id="wpid_test",
+                title="metadata fixture",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        await session.flush()
+        session.add_all([copilot, child, foreign, pinned])
+        await session.flush()
+        session.add_all(
+            [
+                PersistentBrowserSessionModel(
+                    persistent_browser_session_id="pbs_123",
+                    organization_id="org_test",
+                    status="retry",
+                    created_at=now,
+                    modified_at=now,
+                    timeout_minutes=30,
+                    runnable_id="wr_201",
+                    browser_address="PRIVATE_TRANSPORT",
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_204",
+                    organization_id="org_test",
+                    attempt_number=1,
+                    status="paused",
+                    pinned_browser_session_id="pbs_123",
+                ),
+                TaskModel(
+                    task_id="tsk_202",
+                    organization_id="org_test",
+                    workflow_run_id="wr_202",
+                    browser_session_id="pbs_123",
+                    status="completed",
+                    url="https://example.invalid/",
+                ),
+            ]
+        )
+        await session.commit()
+    statements = []
+
+    def forbid_write(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+        assert statement.lstrip().upper().startswith("SELECT"), "Metadata must not write database state"
+
+    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)
+
+    class Forbidden:
+        def __getattr__(self, name):
+            raise AssertionError("Metadata must not call lifecycle, Temporal, transport or provider functions")
+
+    monkeypatch.setattr(
+        browser_routes,
+        "app",
+        SimpleNamespace(
+            DATABASE=sqlite_db,
+            PERSISTENT_SESSIONS_MANAGER=Forbidden(),
+            WORKFLOW_SERVICE=Forbidden(),
+            STORAGE=Forbidden(),
+            AGENT_FUNCTION=Forbidden(),
+        ),
+    )
+    try:
+        response = await browser_routes.get_browser_session_metadata(
+            "pbs_123", current_org=SimpleNamespace(organization_id="org_test")
+        )
+        assert response.status == "retry" and response.completed_at is None
+        assert {run.workflow_run_id for run in response.associated_workflow_runs} == {"wr_201", "wr_202", "wr_204"}
+        by_id = {run.workflow_run_id: run for run in response.associated_workflow_runs}
+        assert by_id["wr_201"].copilot_session_id == "wcc_201" and by_id["wr_201"].status == "paused"
+        assert by_id["wr_201"].credits_used == 7
+        assert (
+            by_id["wr_202"].browser_session_id == "pbs_456"
+            and by_id["wr_202"].association_browser_session_id == "pbs_123"
+        )
+        assert (
+            by_id["wr_204"].browser_session_id is None and by_id["wr_204"].association_browser_session_id == "pbs_123"
+        )
+        assert by_id["wr_204"].status == "paused" and by_id["wr_204"].credits_used == 9
+        assert response.association_index_complete is True and "PRIVATE_" not in response.model_dump_json()
+        async with sqlite_db.Session() as session:
+            after = await session.get(PersistentBrowserSessionModel, "pbs_123")
+            assert after.status == "retry" and after.completed_at is None and after.timeout_minutes == 30
+        assert statements
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)

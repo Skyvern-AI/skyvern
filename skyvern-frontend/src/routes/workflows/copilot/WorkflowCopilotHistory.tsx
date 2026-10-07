@@ -12,6 +12,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { handleInfiniteScroll } from "@/util/utils";
 import { compactLocalDateTime } from "@/util/timeFormat";
@@ -180,9 +181,7 @@ function WorkflowCopilotHistory({
         // No title here: this button is disabled when there IS a reason, and a disabled
         // button receives no hover and takes no focus, so a title on it can never be read.
         // The reason hangs off a wrapper below instead.
-        aria-label={
-          lockedReason ? `History unavailable: ${lockedReason}` : "History"
-        }
+        aria-label="History"
         onMouseDown={(e) => e.stopPropagation()}
         className={
           compact
@@ -199,35 +198,26 @@ function WorkflowCopilotHistory({
     </PopoverTrigger>
   );
 
+  // A disabled trigger cannot open its own tooltip, so the reason hangs off the
+  // focusable wrapper instead (see ControlTooltip). Without the compact icon, the
+  // trigger's text names it, so the tooltip only ever carries the lock reason.
+  const reasoned = (
+    <ControlTooltip
+      content={compact ? "History" : undefined}
+      reason={lockedReason}
+      blocked={disabled}
+    >
+      {trigger}
+    </ControlTooltip>
+  );
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
       {compact ? (
-        // A disabled trigger cannot open its own tooltip, so the reason hangs off the
-        // focusable wrapper instead (see ControlTooltip).
-        <ControlTooltip
-          content={
-            lockedReason ? (
-              <span className="block max-w-xs">{lockedReason}</span>
-            ) : (
-              "History"
-            )
-          }
-          blocked={disabled}
-        >
-          {trigger}
-        </ControlTooltip>
+        reasoned
       ) : (
-        // The floating chat's header is outside any TooltipProvider, so ControlTooltip cannot
-        // render here - but the reason still has to be reachable. A wrapper that is NOT
-        // disabled receives the hover the button cannot, and takes focus while the control is
-        // blocked so a keyboard reaches it too.
-        <span
-          title={lockedReason}
-          tabIndex={disabled && lockedReason ? 0 : undefined}
-          className="inline-flex"
-        >
-          {trigger}
-        </span>
+        // The floating chat's header is outside any TooltipProvider.
+        <TooltipProvider>{reasoned}</TooltipProvider>
       )}
       <PopoverContent
         className="w-80 p-0"

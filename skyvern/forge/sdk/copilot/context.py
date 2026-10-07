@@ -17,7 +17,6 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
-from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -385,9 +384,6 @@ _TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_valu
 _RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
 
 
-OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
-
-
 class PageObstructionSelectorCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -456,7 +452,6 @@ class CodeAuthoringRepairContext(BaseModel):
     available_parameter_keys: list[str] = Field(default_factory=list)
     binding_candidates: list[str] = Field(default_factory=list)
     selector: str | None = None
-    source_url: str | None = None
     refiner_selector: str | None = None
     runtime_failure_reason: str | None = None
     runtime_failure_class: str | None = None
@@ -485,12 +480,7 @@ class CodeAuthoringRepairContext(BaseModel):
     page_obstruction_summaries: list[str] = Field(default_factory=list)
     page_obstructions: list[PageObstruction] = Field(default_factory=list)
     page_obstruction_omission_notices: list[str] = Field(default_factory=list)
-    required_block_structure: str = ""
-    spine_stage_count: int | None = None
-    spine_split_blockers: list[str] = Field(default_factory=list)
-    output_owner_candidate_labels: list[str] = Field(default_factory=list)
-    parameter_binding_directive: AuthoringParameterBindingDirective | None = None
-    repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
+    repair_instruction: str = ""
 
 
 class StructuredContext(BaseModel):

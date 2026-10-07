@@ -36,26 +36,15 @@ export function CopilotPaneControls() {
       {/* Disabled buttons swallow the trigger's events, so the reason a locked control gives
           has to hang off a focusable wrapper or a keyboard user never reaches it. */}
       <ControlTooltip
-        content={
-          controls.navigationLockedReason ? (
-            <span className="block max-w-xs">
-              {controls.navigationLockedReason}
-            </span>
-          ) : (
-            "New chat"
-          )
-        }
+        content="New chat"
+        reason={controls.navigationLockedReason}
         blocked={controls.newChatDisabled}
       >
         <button
           type="button"
           onClick={controls.onNewChat}
           disabled={controls.newChatDisabled}
-          aria-label={
-            controls.navigationLockedReason
-              ? `New chat unavailable: ${controls.navigationLockedReason}`
-              : "New chat"
-          }
+          aria-label="New chat"
           className={PANE_HEADER_ICON_BUTTON_CLASS}
         >
           <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />

@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.client.core import RequestOptions
 from skyvern.client.types.extensions import Extensions
+from skyvern.client.types.persistent_browser_type import PersistentBrowserType
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
@@ -642,6 +643,7 @@ class Skyvern(AsyncSkyvern):
         proxy_location: ProxyLocationInput = None,
         extensions: list[Extensions] | None = None,
         browser_profile_id: str | None = None,
+        browser_type: PersistentBrowserType | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -654,6 +656,7 @@ class Skyvern(AsyncSkyvern):
                 This is only available in Skyvern Cloud.
             extensions: Browser extensions to install in the session.
             browser_profile_id: Browser profile ID to load into the session.
+            browser_type: Browser engine for the session (msedge, chrome, or stealth-chromium).
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
@@ -667,6 +670,8 @@ class Skyvern(AsyncSkyvern):
             create_kwargs["extensions"] = extensions
         if browser_profile_id is not None:
             create_kwargs["browser_profile_id"] = browser_profile_id
+        if browser_type is not None:
+            create_kwargs["browser_type"] = browser_type
         browser_session = await self.create_browser_session(**create_kwargs)
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(

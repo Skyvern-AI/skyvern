@@ -2376,6 +2376,7 @@ _FIND_SUGGESTION_BODY_JS = (
     }
   } catch (e) { openNarrowed = false; }
   const cands = [];
+  const skippedEls = [];
   for (const el of pScopeAll()) {
     // Pre-existing → not a reaction, unless it is a surviving row of that narrowed list.
     if (preHas(el) && !(openNarrowed && focusHas(el))) continue;
@@ -2424,16 +2425,19 @@ _FIND_SUGGESTION_BODY_JS = (
       if (isExact && score > 0) score += 100;
     }
     if (score <= 0) continue;
-    // Last, so a count of skipped nodes is a count of nodes that would otherwise have been rows.
-    if (isAnnouncement(el, field)) { announceSkipped++; continue; }
+    // Last, so a skipped node is one that scored (a wrapper around a region included).
+    if (isAnnouncement(el, field)) { announceSkipped++; skippedEls.push(el); continue; }
     cands.push({ el, score, h: r.height, exactRow: isExact, r });
   }
-  if (!cands.length) return null;
+  // A skipped node still takes part in containment: a wrapper whose scoring content is an announcement is no row.
+  // A declared row keeps its own status badge, which is part of the row and not a reason to drop it.
+  const kept = cands.filter((c) => !!composedClosest(c.el, rowSel) || !skippedEls.some((s) => pContains(c.el, s)));
+  if (!kept.length) return null;
   // Drop any candidate that CONTAINS another candidate (a dropdown container over its own rows).
-  const leaves = cands.filter((c) => !cands.some((o) => o.el !== c.el && pContains(c.el, o.el)));
+  const leaves = kept.filter((c) => !kept.some((o) => o.el !== c.el && pContains(c.el, o.el)));
   // A searched row built from parts must reach the matcher whole, so nothing is dropped for containing
   // another candidate; the caller tells nested copies of one candidate from siblings.
-  const pool = searched ? cands : leaves.length ? leaves : cands;
+  const pool = searched ? kept : leaves.length ? leaves : kept;
   const declaredCands = pool.filter((c) => !!composedClosest(c.el, rowSel));
   if (declaredCands.length) {
     // The ROW the widget DECLARED is the unit, not the fragment that happens to hold the matched
@@ -2460,7 +2464,7 @@ _FIND_SUGGESTION_BODY_JS = (
     // It clears safeToTag, the same hazards the fully-undeclared branch below clears: the candidate
     // loop's isNavRow only asks whether this node IS navigational, so a plain <div> WRAPPING an
     // <a href> or a reset control reaches here unflagged, and the searched pool keeps containers on
-    // purpose (pool = cands), so a roleless box whose AGGREGATE text is the value would otherwise be
+    // purpose (pool = kept), so a roleless box whose AGGREGATE text is the value would otherwise be
     // clicked, landing on an arbitrary one of its rows.
     const bare = pool.filter(
       (c) => safeToTag(c.el) && !composedClosest(c.el, rowSel) && !rows.some((o) => pContains(o.el, c.el) || pContains(c.el, o.el))
@@ -2745,18 +2749,20 @@ _DECLARED_LIST_ANSWER_JS = (
   if (!field) return 'rows';
   const typedNorm = String(arg.typed || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const ROW = DECLARED_ROW_SEL + ',[role="gridcell"]';
+  // A natively disabled row is not an answer; a label drawn in a shadow root still is.
+  const dead = (row) => emptyStateRow(row, typedNorm) || row.hasAttribute('disabled');
+  const label = (row) => ((row.innerText || '').trim() || composedRowText(row)).replace(/\s+/g, ' ').trim().toLowerCase();
   const owned = fieldOwnPopup(field, false);
   if (owned) {
     for (const row of pScopeAll()) {
-      if (!pContains(owned, row) || !row.matches(ROW) || emptyStateRow(row, typedNorm)) continue;
-      if (typedNorm && (row.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase() === typedNorm) return 'option';
+      if (!pContains(owned, row) || !row.matches(ROW) || dead(row)) continue;
+      if (typedNorm && label(row) === typedNorm) return 'option';
     }
   }
   const popup = fieldOwnPopup(field, true);
   if (!popup) return (field.getAttribute('aria-expanded') || '').toLowerCase() === 'false' ? 'none' : 'rows';
   for (const row of pScopeAll()) {
-    if (!pContains(popup, row) || !row.matches(ROW) || emptyStateRow(row, typedNorm)) continue;
-    if (row.hasAttribute('disabled')) continue;
+    if (!pContains(popup, row) || !row.matches(ROW) || dead(row)) continue;
     const r = row.getBoundingClientRect();
     if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') return 'rows';
   }
@@ -4880,6 +4886,184 @@ _INTERACTIVE_HIT_SEL = (
     '[role~="scrollbar" i], [draggable="true" i]'
 )
 
+_PAINT_VISIBLE_JS = r"""
+  // forPaint asks "would a person SEE this", not "could a person interact with it": a scrim with
+  // pointer-events:none is still seen even though clicks pass through it, so the paint scan
+  // (layerShowsPaint) passes forPaint=true to keep such a child in view. Every other caller omits it
+  // and keeps the interaction-strict default.
+  // The ONE definition of "this ancestor clips that box away", called by both readers of it: the
+  // visibility walk below, which asks it of a control's whole box, and the covered diagnosis, which
+  // asks it of the single point its verdict was made at. 'hidden' and 'clip' count; scroll/auto do
+  // not, because those stay reachable via the ordinary auto-scroll a click does on its own and
+  // treating them as clipped would wrongly drop a control that only needs that. 'clip' is the
+  // clearer of the two: it establishes no scroll container at all, so nothing can ever bring its
+  // outside content back, where 'hidden' is at least programmatically scrollable. The axes are
+  // independent:
+  // setting overflow-x:hidden alone computes overflow-y to 'auto' (the CSS interop rule for a
+  // hidden/visible pair), so a control merely scrolled out vertically must not be treated as
+  // X-clipped just because the container clips X. The ancestor's rect is read only AFTER the
+  // overflow test, because the visibility walk calls this per ancestor on its hot path and an
+  // unconditional getBoundingClientRect there is a layout read per step for nothing.
+  const clipsAway = (cs, ancestor, box, countClip) => {
+    // `countClip` is the caller's, not the rule's. The covered DIAGNOSIS counts `clip`, because it
+    // is asking whether a control can be recovered and `clip` establishes no scroll container at
+    // all. The visibility walk does NOT: it feeds control enumeration, the paint scan and the
+    // layer readings, and a rect test that mistakes a positioned descendant for a clipped one costs
+    // a real layer its dismiss button there. That flaw is older than `clip` and answers only NO, so
+    // the conservative reading is to leave that walk exactly as it was and pay for `clip` only
+    // where a wrong answer is caught by the hit-stack check the diagnosis makes anyway.
+    const axisClips = (v) => v === 'hidden' || (countClip && v === 'clip');
+    const clipX = axisClips(cs.overflowX);
+    const clipY = axisClips(cs.overflowY);
+    if (!clipX && !clipY) return false;
+    const ar = ancestor.getBoundingClientRect();
+    const bw = (v) => parseFloat(v) || 0;
+    // The clip edge is the PADDING box, not the border box getBoundingClientRect returns: on a
+    // bordered container a point in the border band is inside the rect and outside the edge the
+    // browser clips at. `overflow-clip-margin` re-bases that edge and grows it, but it has no
+    // effect under `hidden` -- so both ride PER AXIS with that axis being `clip`, or an
+    // `overflow-x:clip; overflow-y:hidden` element with a content-box margin would move the Y edge
+    // off the padding box where `hidden` actually clips.
+    const clipAxisX = !!countClip && cs.overflowX === 'clip';
+    const clipAxisY = !!countClip && cs.overflowY === 'clip';
+    const ocm = clipAxisX || clipAxisY ? cs.overflowClipMargin || '' : '';
+    const toBorderBox = ocm.indexOf('border-box') !== -1;
+    const toContentBox = ocm.indexOf('content-box') !== -1;
+    const mm = ocm.match(/(\d+(?:\.\d+)?)px/);
+    const m = mm ? parseFloat(mm[1]) : 0;
+    const inset = (axisIsClip, border, padding) => {
+      if (!axisIsClip) return bw(border);
+      if (toBorderBox) return 0;
+      return bw(border) + (toContentBox ? bw(padding) : 0);
+    };
+    const mx = clipAxisX ? m : 0;
+    const my = clipAxisY ? m : 0;
+    const edgeL = ar.left + inset(clipAxisX, cs.borderLeftWidth, cs.paddingLeft) - mx;
+    const edgeR = ar.right - inset(clipAxisX, cs.borderRightWidth, cs.paddingRight) + mx;
+    const edgeT = ar.top + inset(clipAxisY, cs.borderTopWidth, cs.paddingTop) - my;
+    const edgeB = ar.bottom - inset(clipAxisY, cs.borderBottomWidth, cs.paddingBottom) + my;
+    return (
+      (clipX && (box.right <= edgeL || box.left >= edgeR)) ||
+      (clipY && (box.bottom <= edgeT || box.top >= edgeB))
+    );
+  };
+  const visible = (n, forPaint) => {
+    const r = n.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    // pointer-events and visibility are both inherited, but either can be explicitly overridden by
+    // a descendant (a click-through overlay with a poking-through button; a hidden wrapper with one
+    // child restored via visibility:visible) -- the candidate's own computed value already resolves
+    // cascade + override in one read, so both are checked once here, not per-ancestor below.
+    // display has no such override: display:none removes the whole subtree from the render tree,
+    // so it stays an ancestor-walk check, same as opacity and overflow.
+    let ownCs;
+    try { ownCs = getComputedStyle(n); } catch (e) { return false; }
+    if ((!forPaint && ownCs.pointerEvents === 'none') || ownCs.visibility === 'hidden') return false;
+    let steps = 0;
+    for (
+      let a = n;
+      a && a !== document.body && a !== document.documentElement && steps < 40;
+      a = a.parentNode || a.host || null, steps++
+    ) {
+      // A ShadowRoot reached mid-walk (nodeType 11, not 1) carries no style of its own -- skip
+      // straight to its host via the update expression's `.host` fallback rather than stopping
+      // the walk there, or a hidden host (or anything above it) never gets checked.
+      if (a.nodeType !== 1) continue;
+      // inert makes a subtree non-focusable and non-actionable without changing any computed style
+      // property -- the .inert IDL property reflects the attribute directly, no matching needed.
+      if (a.inert) return false;
+      let cs;
+      try { cs = getComputedStyle(a); } catch (e) { return false; }
+      if (cs.display === 'none') return false;
+      if (parseFloat(cs.opacity) === 0) return false;
+      // A carousel/wizard routinely keeps an inactive slide's markup in the DOM, translated out of
+      // its own overflow:hidden container -- present, sized, but never painted.
+      if (a !== n && clipsAway(cs, a, r, false)) return false;
+    }
+    return true;
+  };
+"""
+
+_OWN_LABEL_HIT_JS = (
+    r"""
+  // A thing that announces itself as an overlay is one. This is the least ambiguous signal here --
+  // a decoration has no role, while a tooltip, dialog or toast says so in its markup.
+  const LAYER_ROLE = /^(tooltip|dialog|alertdialog|alert|status|menu|listbox|log|marquee)$/i;
+  const _roleTokens = (role) => String(role).trim().split(/\s+/);
+  const isLayerNode = (n) => {
+    const role = n.getAttribute && n.getAttribute('role');
+    return !!((role && _roleTokens(role).some((t) => LAYER_ROLE.test(t))) || n.hasAttribute('aria-modal') || n.tagName === 'DIALOG');
+  };
+  const ownLabelHitClear = (top, el, boundary) => {
+    // A label that paints nothing is the invisible-occluder shape the caller already refuses.
+    let boundaryVisible = false;
+    try { boundaryVisible = !!(boundary && visible(boundary)); } catch (e) { boundaryVisible = false; }
+    // The property being guarded is the CONTROL's own renderability, not the label's: a visible label
+    // over a visibility:hidden control is still an invisible-occluder shape, just wearing the label.
+    let ctl = el;
+    try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+    let ctlRenderable = false;
+    try { ctlRenderable = visible(ctl, true); } catch (e) { ctlRenderable = false; }
+    if (!boundaryVisible || !ctlRenderable) return false;
+    const area = (b) => Math.max(1, b.width * b.height);
+    const viewport = Math.max(1, innerWidth * innerHeight);
+    const INTERACTIVE_HIT_SEL = """
+    + json.dumps(_INTERACTIVE_HIT_SEL)
+    + r""";
+    let interactiveDescendantHit = false;
+    let layerOnTheWay = false;
+    // A view-sized node anywhere in the hit chain up to the label is a backdrop wearing a label.
+    let chainCoversTheView = false;
+    // A pseudo-element hit-tests as its originating element, so a control-sized label can paint a
+    // fixed full-viewport sheet with no view-sized node in the chain. Measured rather than parsed
+    // from CSS: a node returned for most of the view outside its own box paints across the view.
+    const paintsAcrossTheView = (n) => {
+      let rect = null, root = null;
+      try { rect = n.getBoundingClientRect(); root = n.getRootNode(); } catch (e) { return true; }
+      if (!root || typeof root.elementsFromPoint !== 'function') root = document;
+      const steps = [0.02, 0.26, 0.5, 0.74, 0.98];
+      let outside = 0;
+      for (const fx of steps) for (const fy of steps) {
+        const x = innerWidth * fx, y = innerHeight * fy;
+        if (x >= rect.left - 1 && x <= rect.right + 1 && y >= rect.top - 1 && y <= rect.bottom + 1) continue;
+        let hits = [];
+        try { hits = root.elementsFromPoint(x, y); } catch (e) { return true; }
+        if (hits.indexOf(n) !== -1) outside++;
+      }
+      return outside >= 0.6 * steps.length * steps.length;
+    };
+    // The other way a pseudo-element can be a layer: pinned to the viewport. Its computed style is
+    // the exact signal there, where the node's own position says nothing about its `::before`.
+    const pseudoPinned = (n) => {
+      for (const which of ['::before', '::after']) {
+        let cs = null;
+        try { cs = getComputedStyle(n, which); } catch (e) { return true; }
+        if (!cs || cs.content === 'none' || cs.display === 'none') continue;
+        if (cs.position === 'fixed' || cs.position === 'sticky') return true;
+      }
+      return false;
+    };
+    // The boundary itself is never its own interceptor: it IS the control in the LABEL-target case, and
+    // a label may carry role=radio/checkbox itself.
+    for (let n = top, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+      if (n.nodeType === 1 && (isLayerNode(n) || pseudoPinned(n))) { layerOnTheWay = true; break; }
+      if (n.nodeType === 1) {
+        let a = 0;
+        try { a = area(n.getBoundingClientRect()); } catch (e) { a = 0; }
+        if (a > 0.6 * viewport || paintsAcrossTheView(n)) { chainCoversTheView = true; break; }
+      }
+      if (n === boundary) break;
+      if (n !== el && n.nodeType === 1 && n.matches) {
+        try {
+          if (n.matches(INTERACTIVE_HIT_SEL)) { interactiveDescendantHit = true; break; }
+        } catch (e) { /* best-effort */ }
+      }
+    }
+    return !interactiveDescendantHit && !chainCoversTheView && !layerOnTheWay;
+  };
+"""
+)
+
 _TYPE_TARGET_PROBE_JS = (
     r"""(arg) => {
   const _q = """
@@ -4887,6 +5071,8 @@ _TYPE_TARGET_PROBE_JS = (
     + r""";
 """
     + _NATIVE_LABEL_JS
+    + _PAINT_VISIBLE_JS
+    + _OWN_LABEL_HIT_JS
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
@@ -4956,66 +5142,6 @@ _TYPE_TARGET_PROBE_JS = (
       if (pos === 'fixed' || pos === 'sticky') return true;
     }
     return false;
-  };
-  // forPaint asks "would a person SEE this", not "could a person interact with it": a scrim with
-  // pointer-events:none is still seen even though clicks pass through it, so the paint scan
-  // (layerShowsPaint) passes forPaint=true to keep such a child in view. Every other caller omits it
-  // and keeps the interaction-strict default.
-  // The ONE definition of "this ancestor clips that box away", called by both readers of it: the
-  // visibility walk below, which asks it of a control's whole box, and the covered diagnosis, which
-  // asks it of the single point its verdict was made at. 'hidden' and 'clip' count; scroll/auto do
-  // not, because those stay reachable via the ordinary auto-scroll a click does on its own and
-  // treating them as clipped would wrongly drop a control that only needs that. 'clip' is the
-  // clearer of the two: it establishes no scroll container at all, so nothing can ever bring its
-  // outside content back, where 'hidden' is at least programmatically scrollable. The axes are
-  // independent:
-  // setting overflow-x:hidden alone computes overflow-y to 'auto' (the CSS interop rule for a
-  // hidden/visible pair), so a control merely scrolled out vertically must not be treated as
-  // X-clipped just because the container clips X. The ancestor's rect is read only AFTER the
-  // overflow test, because the visibility walk calls this per ancestor on its hot path and an
-  // unconditional getBoundingClientRect there is a layout read per step for nothing.
-  const clipsAway = (cs, ancestor, box, countClip) => {
-    // `countClip` is the caller's, not the rule's. The covered DIAGNOSIS counts `clip`, because it
-    // is asking whether a control can be recovered and `clip` establishes no scroll container at
-    // all. The visibility walk does NOT: it feeds control enumeration, the paint scan and the
-    // layer readings, and a rect test that mistakes a positioned descendant for a clipped one costs
-    // a real layer its dismiss button there. That flaw is older than `clip` and answers only NO, so
-    // the conservative reading is to leave that walk exactly as it was and pay for `clip` only
-    // where a wrong answer is caught by the hit-stack check the diagnosis makes anyway.
-    const axisClips = (v) => v === 'hidden' || (countClip && v === 'clip');
-    const clipX = axisClips(cs.overflowX);
-    const clipY = axisClips(cs.overflowY);
-    if (!clipX && !clipY) return false;
-    const ar = ancestor.getBoundingClientRect();
-    const bw = (v) => parseFloat(v) || 0;
-    // The clip edge is the PADDING box, not the border box getBoundingClientRect returns: on a
-    // bordered container a point in the border band is inside the rect and outside the edge the
-    // browser clips at. `overflow-clip-margin` re-bases that edge and grows it, but it has no
-    // effect under `hidden` -- so both ride PER AXIS with that axis being `clip`, or an
-    // `overflow-x:clip; overflow-y:hidden` element with a content-box margin would move the Y edge
-    // off the padding box where `hidden` actually clips.
-    const clipAxisX = !!countClip && cs.overflowX === 'clip';
-    const clipAxisY = !!countClip && cs.overflowY === 'clip';
-    const ocm = clipAxisX || clipAxisY ? cs.overflowClipMargin || '' : '';
-    const toBorderBox = ocm.indexOf('border-box') !== -1;
-    const toContentBox = ocm.indexOf('content-box') !== -1;
-    const mm = ocm.match(/(\d+(?:\.\d+)?)px/);
-    const m = mm ? parseFloat(mm[1]) : 0;
-    const inset = (axisIsClip, border, padding) => {
-      if (!axisIsClip) return bw(border);
-      if (toBorderBox) return 0;
-      return bw(border) + (toContentBox ? bw(padding) : 0);
-    };
-    const mx = clipAxisX ? m : 0;
-    const my = clipAxisY ? m : 0;
-    const edgeL = ar.left + inset(clipAxisX, cs.borderLeftWidth, cs.paddingLeft) - mx;
-    const edgeR = ar.right - inset(clipAxisX, cs.borderRightWidth, cs.paddingRight) + mx;
-    const edgeT = ar.top + inset(clipAxisY, cs.borderTopWidth, cs.paddingTop) - my;
-    const edgeB = ar.bottom - inset(clipAxisY, cs.borderBottomWidth, cs.paddingBottom) + my;
-    return (
-      (clipX && (box.right <= edgeL || box.left >= edgeR)) ||
-      (clipY && (box.bottom <= edgeT || box.top >= edgeB))
-    );
   };
   // Which END of each physical axis a scroll container's origin sits at. Chromium runs the scroll
   // offset NEGATIVE toward content on the far side, so reading it as unsigned room sees zero at that
@@ -5133,41 +5259,6 @@ _TYPE_TARGET_PROBE_JS = (
     }
     const usable = (v) => (v > 0 && Math.abs(v - 1) > 1e-9 ? v : null);
     return { x: usable(sx), y: usable(sy) };
-  };
-  const visible = (n, forPaint) => {
-    const r = n.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return false;
-    // pointer-events and visibility are both inherited, but either can be explicitly overridden by
-    // a descendant (a click-through overlay with a poking-through button; a hidden wrapper with one
-    // child restored via visibility:visible) -- the candidate's own computed value already resolves
-    // cascade + override in one read, so both are checked once here, not per-ancestor below.
-    // display has no such override: display:none removes the whole subtree from the render tree,
-    // so it stays an ancestor-walk check, same as opacity and overflow.
-    let ownCs;
-    try { ownCs = getComputedStyle(n); } catch (e) { return false; }
-    if ((!forPaint && ownCs.pointerEvents === 'none') || ownCs.visibility === 'hidden') return false;
-    let steps = 0;
-    for (
-      let a = n;
-      a && a !== document.body && a !== document.documentElement && steps < 40;
-      a = a.parentNode || a.host || null, steps++
-    ) {
-      // A ShadowRoot reached mid-walk (nodeType 11, not 1) carries no style of its own -- skip
-      // straight to its host via the update expression's `.host` fallback rather than stopping
-      // the walk there, or a hidden host (or anything above it) never gets checked.
-      if (a.nodeType !== 1) continue;
-      // inert makes a subtree non-focusable and non-actionable without changing any computed style
-      // property -- the .inert IDL property reflects the attribute directly, no matching needed.
-      if (a.inert) return false;
-      let cs;
-      try { cs = getComputedStyle(a); } catch (e) { return false; }
-      if (cs.display === 'none') return false;
-      if (parseFloat(cs.opacity) === 0) return false;
-      // A carousel/wizard routinely keeps an inactive slide's markup in the DOM, translated out of
-      // its own overflow:hidden container -- present, sized, but never painted.
-      if (a !== n && clipsAway(cs, a, r, false)) return false;
-    }
-    return true;
   };
   // A native control's own <label> is a sibling, not an ancestor, so related()'s composed walk never
   // reaches it on its own -- check the control's genuine labels (and the reverse, a LABEL's genuine
@@ -5315,14 +5406,6 @@ _TYPE_TARGET_PROBE_JS = (
       ).some((c) => c !== el && !related(el, c));
     } catch (e) { unitOwnsOnlyThisField = false; }
   }
-  // A thing that announces itself as an overlay is one. This is the least ambiguous signal here --
-  // a decoration has no role, while a tooltip, dialog or toast says so in its markup.
-  const LAYER_ROLE = /^(tooltip|dialog|alertdialog|alert|status|menu|listbox|log|marquee)$/i;
-  const _roleTokens = (role) => String(role).trim().split(/\s+/);
-  const isLayerNode = (n) => {
-    const role = n.getAttribute && n.getAttribute('role');
-    return !!((role && _roleTokens(role).some((t) => LAYER_ROLE.test(t))) || n.hasAttribute('aria-modal') || n.tagName === 'DIALOG');
-  };
   let declaresItselfALayer = false;
   for (let n = top; n && n.nodeType === 1 && n !== unit; n = n.parentNode || n.host || null) {
     if (isLayerNode(n)) {
@@ -5333,71 +5416,7 @@ _TYPE_TARGET_PROBE_JS = (
   // A hit inside the field's own <label> counts as its own subtree unless it landed on an interactive
   // descendant (a link, another control), whose activation would replace the field's.
   const ownLabelBoundaryNode = ownLabelBoundary(top);
-  let ownLabelHit = false;
-  // A label that paints nothing is the invisible-occluder shape the caller already refuses.
-  let boundaryVisible = false;
-  try { boundaryVisible = !!(ownLabelBoundaryNode && visible(ownLabelBoundaryNode)); } catch (e) { boundaryVisible = false; }
-  // The property being guarded is the CONTROL's own renderability, not the label's: a visible label
-  // over a visibility:hidden control is still an invisible-occluder shape, just wearing the label.
-  let ownLabelCtl = el;
-  try { if (_isLabel(el)) ownLabelCtl = nativeControlOf(el) || el; } catch (e) { ownLabelCtl = el; }
-  let ctlRenderable = false;
-  try { ctlRenderable = visible(ownLabelCtl, true); } catch (e) { ctlRenderable = false; }
-  if (arg.allowOwnLabel !== false && boundaryVisible && ctlRenderable) {
-    const INTERACTIVE_HIT_SEL = """
-    + json.dumps(_INTERACTIVE_HIT_SEL)
-    + r""";
-    let interactiveDescendantHit = false;
-    let layerOnTheWay = false;
-    // A view-sized node anywhere in the hit chain up to the label is a backdrop wearing a label.
-    let chainCoversTheView = false;
-    // A pseudo-element hit-tests as its originating element, so a control-sized label can paint a
-    // fixed full-viewport sheet with no view-sized node in the chain. Measured rather than parsed
-    // from CSS: a node returned for most of the view outside its own box paints across the view.
-    const paintsAcrossTheView = (n) => {
-      let rect = null, root = null;
-      try { rect = n.getBoundingClientRect(); root = n.getRootNode(); } catch (e) { return true; }
-      if (!root || typeof root.elementsFromPoint !== 'function') root = document;
-      const steps = [0.02, 0.26, 0.5, 0.74, 0.98];
-      let outside = 0;
-      for (const fx of steps) for (const fy of steps) {
-        const x = innerWidth * fx, y = innerHeight * fy;
-        if (x >= rect.left - 1 && x <= rect.right + 1 && y >= rect.top - 1 && y <= rect.bottom + 1) continue;
-        let hits = [];
-        try { hits = root.elementsFromPoint(x, y); } catch (e) { return true; }
-        if (hits.indexOf(n) !== -1) outside++;
-      }
-      return outside >= 0.6 * steps.length * steps.length;
-    };
-    // The other way a pseudo-element can be a layer: pinned to the viewport. Its computed style is
-    // the exact signal there, where the node's own position says nothing about its `::before`.
-    const pseudoPinned = (n) => {
-      for (const which of ['::before', '::after']) {
-        let cs = null;
-        try { cs = getComputedStyle(n, which); } catch (e) { return true; }
-        if (!cs || cs.content === 'none' || cs.display === 'none') continue;
-        if (cs.position === 'fixed' || cs.position === 'sticky') return true;
-      }
-      return false;
-    };
-    // The boundary itself is never its own interceptor: it IS the control in the LABEL-target case, and
-    // a label may carry role=radio/checkbox itself.
-    for (let n = top, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-      if (n.nodeType === 1 && (isLayerNode(n) || pseudoPinned(n))) { layerOnTheWay = true; break; }
-      if (n.nodeType === 1) {
-        let a = 0;
-        try { a = area(n.getBoundingClientRect()); } catch (e) { a = 0; }
-        if (a > 0.6 * viewport || paintsAcrossTheView(n)) { chainCoversTheView = true; break; }
-      }
-      if (n === ownLabelBoundaryNode) break;
-      if (n !== el && n.nodeType === 1 && n.matches) {
-        try {
-          if (n.matches(INTERACTIVE_HIT_SEL)) { interactiveDescendantHit = true; break; }
-        } catch (e) { /* best-effort */ }
-      }
-    }
-    ownLabelHit = !interactiveDescendantHit && !chainCoversTheView && !layerOnTheWay;
-  }
+  const ownLabelHit = arg.allowOwnLabel !== false && ownLabelHitClear(top, el, ownLabelBoundaryNode);
   // An own-label hit is folded in here via ownLabelHit and surfaces below as out.ownLabel.
   const inFieldsOwnSubtree =
     related(top, el) ||
@@ -5993,6 +6012,14 @@ _OTHER_CLICK_BLOCKERS = ("intercepts pointer events", "not visible", "not stable
 # A page that enables its submit once a tick or keystroke settles does so within this window, so the
 # click still lands as it did under Playwright's own wait; a control still disabled after it fails fast.
 _DISABLED_CLICK_GRACE_SECONDS = 2.0
+
+
+async def _engine_enabled(realm: input_dispatch.Realm, selector: str) -> bool:
+    # A selector only the executor can resolve gets no answer here; the click's own wait still decides it.
+    try:
+        return bool(await realm.is_enabled(selector, timeout=1000))
+    except Exception:
+        return True
 
 
 # A spinbutton group (the nearest ancestor holding another spinbutton) can keep one cursor for all its fields and send
@@ -6964,6 +6991,8 @@ _SKINNED_CHECKBOX_PROBE_JS = (
 """
     + _NATIVE_LABEL_JS
     + _NATIVE_PROXY_JS
+    + _PAINT_VISIBLE_JS
+    + _OWN_LABEL_HIT_JS
     + r"""
   const _toggleOwner = """
     + _TOGGLE_OWNER_JS
@@ -6984,12 +7013,15 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     if (el.tagName !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) {
       return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
     }
-    if (!invisible) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+    const drawn = { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
     const radio = type === 'radio';
+    // :disabled covers a disabled <fieldset>, unlike el.disabled.
+    const disabled = el.matches(':disabled');
     // The click lands on coordinates this realm measured, never through a marker the page could move
     // onto something else, so the point has to be the target's own: a cover there is a cover.
     // Returns the point on a hit on the target, false under an unrelated element, null for no hit or a clipped-off point.
     // A clip that can scroll (a long list) is scrolled once to bring the target into it; only one that cannot is final.
+    let lastHit = null;
     const centreHit = (t, retried) => {
       const mid = () => { const b = t.getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; };
       let [x, y] = mid();
@@ -7008,6 +7040,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
         if (!inner || inner === hit) break;
         hit = inner;
       }
+      lastHit = hit;
       for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
         if (n === t || n === el) return { x, y };
       }
@@ -7033,6 +7066,23 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       }
       return o < 0.05;
     };
+    // A label that also wraps another control (a button, link, or a second input) is not a safe
+    // proxy: a real click on it can activate that control instead.
+    const wrapsOther = (l) => Array.from(_qsa(l, 'button,a[href],input,select,textarea')).some((c) => c !== el);
+    const ownLabel = () => nativeLabelsOf(el).find((l) => {
+      const b = l.getBoundingClientRect();
+      return b.width > 0 && b.height > 0 && !wrapsOther(l);
+    }) || null;
+    if (!invisible) {
+      // A drawn input the pointer cannot reach at its own centre (a 1px clipped box, one stacked under a
+      // sibling's label) is clicked through its own clear label; anything else keeps the plain click's diagnosis.
+      if (arg.allowOwnLabel === false || !_nativeProxy(el) || fadedAncestry() || disabled) return drawn;
+      if (centreHit(el) !== false) return drawn;
+      const label = ownLabel();
+      const at = label && nativeControlOf(label) === el ? centreHit(label) : null;
+      if (!at || !ownLabelHitClear(lastHit, el, label)) return drawn;
+      return { ...drawn, skinned: true, labelClick: at, radio, disabled: false, drawnLabel: true };
+    }
     if (!_nativeProxy(el)) {
       // Only the input's own transparency is waived: it still needs a box, no visibility:hidden, visible
       // ancestors, and to be on top at its own centre, so it is clicked directly and read back as a toggle.
@@ -7041,7 +7091,6 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       if (at === false) return { exists: true, skinned: false, labelClick: null, radio, covered: true };
       return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
     }
-    const disabled = !!el.disabled;
     const none = { exists: true, skinned: true, labelClick: null, radio, disabled };
     // `none` still gets a script click, so a proxy inside a faded panel is refused outright.
     if (fadedAncestry()) return { ...none, unproxied: true };
@@ -7049,13 +7098,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     // counts: an `el.labels` the page shadows names a decoy, not a proxy. A realm the page can patch
     // (the main-world fallback) never offers one.
     if (arg.allowOwnLabel === false) return none;
-    // A label that also wraps another control (a button, link, or a second input) is not a safe
-    // proxy: a real click on it can activate that control instead.
-    const wrapsOther = (l) => Array.from(_qsa(l, 'button,a[href],input,select,textarea')).some((c) => c !== el);
-    const label = nativeLabelsOf(el).find((l) => {
-      const b = l.getBoundingClientRect();
-      return b.width > 0 && b.height > 0 && !wrapsOther(l);
-    }) || null;
+    const label = ownLabel();
     if (!label || nativeControlOf(label) !== el) return none;
     const at = centreHit(label);
     if (!at) return { ...none, labelCovered: true };
@@ -11658,6 +11701,66 @@ _STAMPED_ROW_GUARD_JS = (
 )
 
 
+# A row a scroller clips part-way is clicked at a point of its visible strip that hit-tests to it, where Playwright's
+# own click would first scroll it whole. A virtualized list re-mounts its rows on that scroll, detaching the row.
+_CLIPPED_ROW_MIN_VISIBLE_PX = 6
+_CLIPPED_ROW_CLICK_OFFSET_JS = (
+    r"""(el) => {
+  const MIN = """
+    + str(_CLIPPED_ROW_MIN_VISIBLE_PX)
+    + r""";
+  const r = el.getBoundingClientRect();
+  if (!(r.width > 0 && r.height > 0)) return null;
+  let top = Math.max(r.top, 0), left = Math.max(r.left, 0);
+  let bottom = Math.min(r.bottom, window.innerHeight), right = Math.min(r.right, window.innerWidth);
+  const up = (n) => n.assignedSlot || n.parentElement || (n.parentNode && n.parentNode.host) || null;
+  for (let a = up(el), i = 0; a && i < 64; a = up(a), i++) {
+    if (a.localName === 'html' || a.localName === 'body') break;
+    const cs = getComputedStyle(a);
+    if (/auto|scroll|hidden|clip/.test(cs.overflowY + ' ' + cs.overflowX)) {
+      const c = a.getBoundingClientRect();
+      top = Math.max(top, c.top + a.clientTop);
+      bottom = Math.min(bottom, c.top + a.clientTop + a.clientHeight);
+      left = Math.max(left, c.left + a.clientLeft);
+      right = Math.min(right, c.left + a.clientLeft + a.clientWidth);
+    }
+    if (cs.position === 'fixed') break;
+  }
+  if (bottom - top < MIN || right - left < MIN) return null;
+  if (top <= r.top && bottom >= r.bottom && left <= r.left && right >= r.right) return null;
+  // The topmost element at a point, through open shadow roots, and whether it is `el` or inside it.
+  const hitsEl = (x, y) => {
+    let hit = document.elementFromPoint(x, y);
+    for (let i = 0; hit && hit.shadowRoot && i < 32; i++) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    for (let n = hit, i = 0; n && i < 256; n = up(n), i++) if (n === el) return true;
+    return false;
+  };
+  const cy = (top + bottom) / 2, cx = (left + right) / 2;
+  const ys = [cy], xs = [cx, left + (right - left) / 4, left + (3 * (right - left)) / 4];
+  for (let d = 3; cy - d > top + 1 || cy + d < bottom - 1; d += 3) {
+    if (cy - d > top + 1) ys.push(cy - d);
+    if (cy + d < bottom - 1) ys.push(cy + d);
+  }
+  const s = getComputedStyle(el);
+  for (const y of ys) {
+    for (const x of xs) {
+      if (hitsEl(x, y)) {
+        return {
+          x: x - r.left - (parseInt(s.borderLeftWidth, 10) || 0),
+          y: y - r.top - (parseInt(s.borderTopWidth, 10) || 0),
+        };
+      }
+    }
+  }
+  return null;
+}"""
+)
+
+
 async def _click_stamped_row(page: Any, stamp: str, want: str, timeout: int) -> bool:
     handle = await page.query_selector(stamp)
     if handle is None:
@@ -11665,7 +11768,14 @@ async def _click_stamped_row(page: Any, stamp: str, want: str, timeout: int) -> 
     try:
         if not await handle.evaluate(_STAMPED_ROW_GUARD_JS, want):
             return False
-        await input_dispatch.click_handle(page, handle, timeout=timeout)
+        try:
+            offset = await handle.evaluate(_CLIPPED_ROW_CLICK_OFFSET_JS)
+        except Exception:
+            offset = None
+        position = None
+        if isinstance(offset, dict) and all(isinstance(offset.get(k), (int, float)) for k in ("x", "y")):
+            position = {"x": float(offset["x"]), "y": float(offset["y"])}
+        await input_dispatch.click_handle(page, handle, timeout=timeout, position=position)
     finally:
         try:
             await handle.dispose()
@@ -14581,10 +14691,27 @@ def build_browser_tools(
         label_over_control = isinstance(reach_pre, dict) and (
             (bool(reach_pre.get("slotted")) and not reach_pre.get("occluded")) or bool(reach_pre.get("ownLabel"))
         )
-        try:
-            skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
-        except Exception:
-            skin_probe = None
+        while True:
+            try:
+                skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
+            except Exception:
+                skin_probe = None
+            # Every toggle answer carries `radio`. The browser engine's own enabled check decides (Playwright reads
+            # aria-disabled only on roles that take it), so the label click below is never looser than a plain click.
+            if not (isinstance(skin_probe, dict) and "radio" in skin_probe) or await _engine_enabled(page, selector):
+                break
+            if time.monotonic() >= enable_deadline:
+                return ToolResult.error(
+                    f"{selector} is disabled — it cannot be clicked until the page enables it",
+                    error_class="disabled",
+                )
+            await asyncio.sleep(0.1)
+            # Enabling can re-render or move the control, so the label point is measured again after the wait.
+            pre_click_arg = await _probe_arg(page, selector)
+        if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and (label_over_control or _acted_realm):
+            # A drawn input under its own label is already force-clicked below, and a frame's label point is
+            # frame-relative, so neither takes the label route.
+            skin_probe = {**skin_probe, "skinned": False, "labelClick": None}
         if isinstance(skin_probe, dict) and skin_probe.get("file"):
             return ToolResult.error(
                 f"{selector} is a file input — clicking it opens a native picker the run cannot drive; "
@@ -14864,14 +14991,15 @@ def build_browser_tools(
                 # pre-read raced): as before the unified verdict, fall through to the ordinary post path
                 # rather than claim the control left the page.
             if verdict is CommitStatus.DID_NOT_COMMIT:
-                if skinned:
+                drawn_label = skinned and bool(skin_probe.get("drawnLabel"))
+                if skinned and not drawn_label:
                     return ToolResult.error(
                         f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
                         "the styled proxy may not sync from its hidden control; re-observe and act on the visible "
                         "proxy instead",
                         data=transition_data,
                     )
-                if verify_toggle:
+                if verify_toggle or drawn_label:
                     return ToolResult.error(
                         f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
                         "its label took the click but the control did not change (the page may refuse the toggle, "
@@ -15471,9 +15599,17 @@ def build_browser_tools(
                 announce_logged_call[0] = seq
                 # A distinct message per outcome, so a plain message count is the census without facets.
                 if isinstance(found, dict) and found.get("count"):
-                    LOG.info("taskv3 combobox announcement skipped", tool_call_seq=seq, skipped=skipped)
+                    LOG.info(
+                        "taskv3 combobox announcement skipped", tool_call_seq=seq, skipped=skipped, list_emptied=False
+                    )
                 else:
-                    LOG.info("taskv3 combobox announcement skipped, list emptied", tool_call_seq=seq, skipped=skipped)
+                    # One message is a prefix of the other, so a phrase search counts both; the field splits them.
+                    LOG.info(
+                        "taskv3 combobox announcement skipped, list emptied",
+                        tool_call_seq=seq,
+                        skipped=skipped,
+                        list_emptied=True,
+                    )
         return found if isinstance(found, dict) and found.get("count") else None
 
     async def _await_suggestion_rows(

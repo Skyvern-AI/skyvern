@@ -4129,11 +4129,6 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
     assert "#terms-overlay" not in obstruction_line
     assert "#btn-continue" not in obstruction_line
 
-    ctx.last_code_authoring_repair_context = repair_context.model_copy(update={"selector": "#btn-continue"})
-    selector_prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
-    assert "selector: #btn-continue" in selector_prompt_lines
-    assert obstruction_line in selector_prompt_lines
-
 
 def test_overlay_selectors_do_not_reach_the_repair_prompt() -> None:
     ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))

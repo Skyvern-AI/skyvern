@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import cast
@@ -2134,6 +2135,7 @@ async def test_session_create_forwards_extensions_to_stateful_session_create(
         extensions=[CAPTCHA_SOLVER_EXTENSION],
         browser_profile_id=None,
         generate_browser_profile=False,
+        browser_type=None,
         local=False,
         headless=False,
         connect_browser=False,
@@ -2169,6 +2171,7 @@ async def test_session_create_forwards_browser_profile_id_to_stateful_session_cr
         extensions=None,
         browser_profile_id="bp_123",
         generate_browser_profile=False,
+        browser_type=None,
         local=False,
         headless=False,
         connect_browser=False,
@@ -2205,6 +2208,7 @@ async def test_session_create_forwards_generate_browser_profile_to_stateful_sess
         extensions=None,
         browser_profile_id=None,
         generate_browser_profile=True,
+        browser_type=None,
         local=False,
         headless=False,
         connect_browser=False,
@@ -2354,3 +2358,64 @@ async def test_an_attach_is_charged_however_long_the_tool_takes_to_open_its_time
         _attach_clock[0] += 0.5
 
     assert timer.timing_ms == {"attach": 1500, "total": 500}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hosted", [True, False])
+async def test_session_create_sends_browser_type_to_the_api(monkeypatch: pytest.MonkeyPatch, hosted: bool) -> None:
+    monkeypatch.setattr(client_mod.settings, "SKYVERN_BASE_URL", "http://skyvern.test")
+    session_manager.set_stateless_http_mode(hosted)
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "browser_session_id": "pbs_edge",
+                "organization_id": "o_1",
+                "created_at": "2026-01-01T00:00:00Z",
+                "modified_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    token = client_mod.set_api_key_override("sk_test")
+    try:
+        skyvern = client_mod.get_skyvern()
+    finally:
+        client_mod.reset_api_key_override(token)
+    skyvern._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: skyvern)
+    try:
+        result = await mcp_session.skyvern_browser_session_create(timeout=30, browser_type="msedge")
+    finally:
+        await skyvern.aclose()
+
+    assert result["ok"] is True, result
+    assert bodies[0]["browser_type"] == "msedge"
+
+
+@pytest.mark.asyncio
+async def test_session_create_rejects_browser_type_for_a_local_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    do_session_create = AsyncMock()
+    monkeypatch.setattr(mcp_session, "get_skyvern", MagicMock)
+    monkeypatch.setattr(mcp_session, "do_session_create", do_session_create)
+
+    result = await mcp_session.skyvern_browser_session_create(local=True, browser_type="msedge")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
+    do_session_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_create_rejects_browser_type_in_extension_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_or_start = AsyncMock()
+    monkeypatch.setattr(mcp_session, "_should_default_to_extension", lambda: True)
+    monkeypatch.setattr(mcp_session.BrowserExtensionRuntime, "get_or_start", get_or_start)
+
+    result = await mcp_session.skyvern_browser_session_create(browser_type="msedge")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_session.ErrorCode.INVALID_INPUT
+    get_or_start.assert_not_awaited()

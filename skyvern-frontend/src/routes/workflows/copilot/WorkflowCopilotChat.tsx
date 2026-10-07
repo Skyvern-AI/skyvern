@@ -10541,23 +10541,35 @@ export function WorkflowCopilotChat({
             </div>
           )}
           <div className="flex items-center gap-2">
-            <WorkflowCopilotHistory
-              workflowPermanentId={workflowPermanentId}
-              currentChatId={workflowCopilotChatId}
-              onSelect={handleSelectHistoryChat}
-              disabled={headerControlsDisabled}
-              lockedReason={acceptHoldReason ?? undefined}
-            />
-            <button
-              type="button"
-              disabled={acceptHoldReason !== null}
-              title={acceptHoldReason ?? undefined}
-              onClick={handleNewChat}
+            {/* A locked control takes no pointer events, so a press on it lands on its tooltip
+                wrapper; stop it here before it starts a header drag. */}
+            <span
+              className="flex items-center gap-2"
               onMouseDown={(e) => e.stopPropagation()}
-              className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
             >
-              New chat
-            </button>
+              <WorkflowCopilotHistory
+                workflowPermanentId={workflowPermanentId}
+                currentChatId={workflowCopilotChatId}
+                onSelect={handleSelectHistoryChat}
+                disabled={headerControlsDisabled}
+                lockedReason={acceptHoldReason ?? undefined}
+              />
+              <TooltipProvider>
+                <ControlTooltip
+                  reason={acceptHoldReason}
+                  blocked={acceptHoldReason !== null}
+                >
+                  <button
+                    type="button"
+                    disabled={acceptHoldReason !== null}
+                    onClick={handleNewChat}
+                    className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+                  >
+                    New chat
+                  </button>
+                </ControlTooltip>
+              </TooltipProvider>
+            </span>
             <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
             <span className="text-xs text-muted-foreground">Active</span>
             {/* Only the floating window closes itself; docked chrome is external. */}

@@ -273,52 +273,39 @@ def _achieving_judge(prompts: list[str]):
     return judge
 
 
-@pytest.mark.asyncio
-async def test_engine_block_completion_judge_stays_out_of_the_goal_check_arm(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A secret on the page skips the arm's judge but not the block's, which runs on the loop's own model; neither
-    # judge's verdict is counted as the other's.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome
+async def _run_then_judge_block(
+    monkeypatch: pytest.MonkeyPatch,
+    judge: Any,
+    *,
+    script: list[list[tuple[str, dict[str, Any]]]] | None = None,
+    **kwargs: Any,
+) -> tuple[Any, list[Any]]:
+    """Run the real loop on a single-action block, then ask its completion judge once, as the step cap would."""
+    real_loop = engine_mod.run_agent_tool_loop
+    verdicts: list[Any] = []
 
-    arm_prompts: list[str] = []
-    block_prompts: list[str] = []
+    async def _loop_then_judge(**loop_kwargs: Any) -> Any:
+        outcome = await real_loop(**loop_kwargs)
+        if loop_kwargs["block_completion_check"] is not None:
+            verdicts.append(await loop_kwargs["block_completion_check"]())
+        return outcome
 
-    async def _capture(**kwargs: Any) -> LoopOutcome:
-        verdict = await kwargs["block_completion_check"]()
-        assert verdict.verdict == "achieved" and verdict.skipped_reason is None
-        assert (await finish_kwargs["goal_check"]()).skipped_reason == "secret_entered"
-        return LoopOutcome(status="completed", reason="ok")
-
-    finish_kwargs: dict[str, Any] = {}
-    real_make_finish_tool = engine_mod.make_finish_tool
-
-    def _capture_finish(**kwargs: Any) -> Any:
-        finish_kwargs.update(kwargs)
-        return real_make_finish_tool(**kwargs)
-
-    monkeypatch.setattr(engine_mod, "make_finish_tool", _capture_finish)
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _loop_then_judge)
     outcome = await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="x",
+        llm_caller=_ScriptedCaller(script or [[("finish", {"status": "completed", "reason": "done"})]]),
         single_action_block=True,
-        goal_judge=_achieving_judge(arm_prompts),
-        block_completion_judge=_achieving_judge(block_prompts),
-        secret_on_page_at_start=True,
+        block_completion_judge=judge,
+        **kwargs,
     )
-
-    assert len(block_prompts) == 1 and not arm_prompts
-    assert outcome.goal_check is not None and outcome.goal_check["checks"] == 1
-    assert outcome.goal_check["judged"] == 0
+    return outcome, verdicts
 
 
 @pytest.mark.asyncio
 async def test_engine_block_completion_judge_skips_after_a_secret_typed_in_this_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The secret's field can still be on screen and pixels cannot be redacted; a secret from an earlier block
-    # (secret_on_page_at_start) does not skip it.
+    # The secret's field can still be on screen and pixels cannot be redacted.
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.goal_check import TrailEntry
     from skyvern.forge.taskv3.loop import LoopOutcome
@@ -530,7 +517,7 @@ async def test_bare_run_finishes_without_settle_probe() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_engine_call_kwargs_carry_only_the_step_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
@@ -541,13 +528,11 @@ async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPat
         return LoopOutcome(status="completed", reason="ok")
 
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    monkeypatch.setattr(engine_mod.settings, "TASK_V3_TOOL_CHOICE_REQUIRED", False)
 
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
     )
-    # None, not {} -- the loop splats **(call_kwargs or {}), so preserving None keeps the
-    # default (lever-off) path byte-identical to before this lever existed.
+    # None, not {} -- the loop splats **(call_kwargs or {}).
     assert captured["call_kwargs"] is None
 
     step = object()
@@ -555,41 +540,6 @@ async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPat
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", step=step
     )
-    assert captured["call_kwargs"] == {"step": step}
-
-
-@pytest.mark.asyncio
-async def test_engine_requests_tool_choice_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    captured: dict[str, object] = {}
-
-    async def _capture(**kwargs: object) -> LoopOutcome:
-        captured.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    monkeypatch.setattr(engine_mod.settings, "TASK_V3_TOOL_CHOICE_REQUIRED", True)
-
-    step = object()
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", step=step
-    )
-
-    assert captured["call_kwargs"] == {"step": step, "tool_choice": "required"}
-
-    # The engine asking the caller is what keeps tool_choice_in_effect honest rather than
-    # aspirational: a model that cannot take the parameter must not have it added at all.
-    class _UnsupportedCaller(_ScriptedCaller):
-        def supports_tool_choice(self) -> bool:
-            return False
-
-    captured.clear()
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_UnsupportedCaller([]), goal="x", step=step
-    )
-
     assert captured["call_kwargs"] == {"step": step}
 
 
@@ -2245,30 +2195,26 @@ async def _no_download_pending(_staged: frozenset[str]) -> str | None:
     ],
     ids=["navigation", "download_gated", "extraction", "page_free"],
 )
-async def test_goal_check_skips_blocks_that_verify_their_own_completion(scope: dict[str, Any], judged: int) -> None:
+async def test_block_completion_judge_skips_blocks_that_verify_their_own_completion(
+    monkeypatch: pytest.MonkeyPatch, scope: dict[str, Any], judged: int
+) -> None:
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]),
+    outcome, verdicts = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
+        script=[[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
         goal="Open the settings page.",
-        goal_judge=judge,
-        goal_check_enforce=True,
         **scope,
     )
 
     assert outcome.status == "completed"
     assert len(prompts) == judged
-    assert (outcome.goal_check is not None) == bool(judged)
+    assert len(verdicts) == judged
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("deadline_seconds", "judged"), [(10.0, True), (1.0, False)])
-async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
+async def test_block_completion_judge_timeout_is_bounded_by_the_runs_deadline(
     monkeypatch: pytest.MonkeyPatch, deadline_seconds: float, judged: bool
 ) -> None:
     timeouts: list[float] = []
@@ -2280,22 +2226,11 @@ async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
 
     monkeypatch.setattr(engine_mod, "run_goal_check", recording_run_goal_check)
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
-        goal="Open the settings page.",
-        goal_judge=judge,
-        goal_check_enforce=True,
-        deadline_seconds=deadline_seconds,
+    outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch, _achieving_judge(prompts), goal="Open the settings page.", deadline_seconds=deadline_seconds
     )
 
     assert outcome.status == "completed"
-    assert outcome.goal_check is not None
     if judged:
         (timeout,) = timeouts
         assert 0 < timeout <= deadline_seconds - engine_mod.GOAL_CHECK_DEADLINE_MARGIN_SECONDS
@@ -2304,72 +2239,26 @@ async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
         # One second left is inside the margin: the judge is never called, and the check says why.
         assert timeouts == []
         assert prompts == []
-        assert outcome.goal_check["last_skipped_reason"] == "deadline"
+        assert verdict.skipped_reason == "deadline"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("enforce", "second", "holds", "would_holds", "would_fails"),
-    [
-        (True, "achieved", 1, 0, 0),
-        (False, "achieved", 0, 1, 0),
-        (False, "not_achieved", 0, 1, 1),
-    ],
-)
-async def test_goal_check_summary_separates_real_holds_from_shadow_ones(
-    enforce: bool, second: str, holds: int, would_holds: int, would_fails: int
+async def test_block_completion_judge_prompt_is_redacted_and_carries_the_instructions(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verdicts = iter(["not_achieved", second])
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": next(verdicts), "quote": "SCREENSHOT: an empty form", "missing": "nothing saved"}
-
-    finish = ("finish", {"status": "completed", "reason": "done"})
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[finish], [finish]]),
-        goal="Save the form.",
-        goal_judge=judge,
-        goal_check_enforce=enforce,
-        goal_instructions="If the form is already saved, finish completed.",
-    )
-
-    assert outcome.status == "completed"
-    assert outcome.goal_check is not None
-    assert outcome.goal_check["holds"] == holds
-    assert outcome.goal_check["would_holds"] == would_holds
-    assert outcome.goal_check["would_fails"] == would_fails
-    assert len(prompts) == 2
-    # The summary describes the finish gate's decisions; the shadow re-check is counted apart.
-    assert outcome.goal_check["checks"] == (2 if enforce else 1)
-    assert outcome.goal_check["judged"] == (2 if enforce else 1)
-    assert outcome.goal_check["rechecks"] == (0 if enforce else 1)
-    assert outcome.goal_check["last_verdict"] == ("achieved" if enforce else "not_achieved")
-    assert outcome.goal_check["last_action"] == ("accept" if enforce else "hold")
-    assert "If the form is already saved, finish completed." in prompts[0]
-
-
-@pytest.mark.asyncio
-async def test_goal_check_redactor_reaches_the_judge_prompt() -> None:
-    prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+    await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
         goal="Enter the code Qz7Wk2Pm9Rt4.",
-        goal_judge=judge,
+        goal_instructions="If the form is already saved, finish completed.",
         goal_check_redactor=lambda: lambda text: text.replace("Qz7Wk2Pm9Rt4", "[REDACTED_SECRET]"),
     )
 
     (prompt,) = prompts
     assert "Enter the code [REDACTED_SECRET]." in prompt
     assert "Qz7Wk2Pm9Rt4" not in prompt
+    assert "If the form is already saved, finish completed." in prompt
 
 
 def _code_delivering_tool() -> ToolSpec:
@@ -2386,99 +2275,74 @@ def _code_delivering_tool() -> ToolSpec:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("step", "on_page_at_start", "judged"),
+    ("step", "judged"),
     [
-        (("type", {"selector": "#first", "text": "John"}), False, True),
-        (("type", {"selector": "#first", "text": f"{RANDOM_SECRET_ID_PREFIX}password_1"}), False, False),
-        (("fetch_code", {}), False, False),
-        (("navigate", {"url": f"https://example.test/login?t={RANDOM_SECRET_ID_PREFIX}token_1"}), False, False),
-        (("type", {"selector": "#first", "text": "John"}), True, False),
+        (("type", {"selector": "#first", "text": "John"}), True),
+        (("type", {"selector": "#first", "text": f"{RANDOM_SECRET_ID_PREFIX}password_1"}), False),
+        (("fetch_code", {}), False),
+        (("navigate", {"url": f"https://example.test/login?t={RANDOM_SECRET_ID_PREFIX}token_1"}), False),
     ],
-    ids=["plain_type", "credential_placeholder", "verification_code", "navigate_placeholder", "already_on_page"],
+    ids=["plain_type", "credential_placeholder", "verification_code", "navigate_placeholder"],
 )
-async def test_goal_check_never_judges_a_run_that_entered_a_secret(
-    step: tuple[str, Any], on_page_at_start: bool, judged: bool
+async def test_block_completion_judge_never_judges_a_block_that_entered_a_secret(
+    monkeypatch: pytest.MonkeyPatch, step: tuple[str, Any], judged: bool
 ) -> None:
-    # The finish screenshot could show the secret, and v3 tools apply no visual secret mask.
+    # The judge's screenshot could show the secret, and v3 tools apply no visual secret mask.
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
     skyvern_context.set(SkyvernContext())
     try:
-        outcome = await run_task_v3_agent_loop(
-            page_provider=_fixed_page_provider(_FakePage()),
+        outcome, (verdict,) = await _run_then_judge_block(
+            monkeypatch,
+            _achieving_judge(prompts),
             # An observe after the secret: the flag must outlive the entry that set it.
-            llm_caller=_ScriptedCaller(
-                [[step], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]
-            ),
+            script=[[step], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
             goal="Sign in.",
             extra_tools=[_code_delivering_tool()],
-            goal_judge=judge,
-            goal_check_enforce=True,
-            secret_on_page_at_start=on_page_at_start,
         )
     finally:
         skyvern_context.reset()
 
     assert outcome.status == "completed"
-    assert outcome.goal_check is not None
     assert len(prompts) == (1 if judged else 0)
-    assert outcome.goal_check["last_skipped_reason"] == (None if judged else "secret_entered")
+    assert verdict.skipped_reason == (None if judged else "secret_entered")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("extra_chars", "judged"), [(0, True), (1, False)], ids=["at_cap", "over_cap"])
-async def test_goal_check_never_judges_against_truncated_instructions(extra_chars: int, judged: bool) -> None:
+async def test_block_completion_judge_never_judges_against_truncated_instructions(
+    monkeypatch: pytest.MonkeyPatch, extra_chars: int, judged: bool
+) -> None:
     # A rule that decides "done" can sit past the cap; judging against a prefix could fail a correct completion.
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+    _outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
         goal="Save the form.",
-        goal_judge=judge,
-        goal_check_enforce=True,
         goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS + extra_chars),
     )
 
-    assert outcome.status == "completed"
-    assert outcome.goal_check is not None
     assert len(prompts) == (1 if judged else 0)
-    assert outcome.goal_check["last_skipped_reason"] == (None if judged else "instructions_too_long")
+    assert verdict.skipped_reason == (None if judged else "instructions_too_long")
 
 
 @pytest.mark.asyncio
-async def test_goal_check_measures_instructions_after_redaction() -> None:
+async def test_block_completion_judge_measures_instructions_after_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
     # Redaction can lengthen text (a short secret becomes a longer marker), and the judge sees the redacted text.
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
 
     def redactor() -> Callable[[str], str]:
         return lambda text: text.replace("PIN", "[REDACTED_SECRET]")
 
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+    _outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
         goal="Save the form.",
-        goal_judge=judge,
-        goal_check_enforce=True,
         goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS - 3) + "PIN",
         goal_check_redactor=redactor,
     )
 
-    assert outcome.goal_check is not None
     assert prompts == []
-    assert outcome.goal_check["last_skipped_reason"] == "instructions_too_long"
+    assert verdict.skipped_reason == "instructions_too_long"
 
 
 class _ReaskAnsweringCaller(_ScriptedCaller):
@@ -2791,35 +2655,6 @@ async def test_the_reask_runs_on_the_non_flex_twin_of_the_runs_key(
     assert (line["llm_key"], line["reask_llm_key"]) == (run_key, reask_key)
 
 
-@pytest.mark.asyncio
-async def test_a_flex_runs_goal_check_stays_on_the_judge_it_was_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Only the re-ask moves to the standard tier; the goal check's model and timeout are its own.
-    built = _route_reask_to_standard_tier(monkeypatch, registered=True)
-    prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    caller = _ReaskAnsweringCaller(
-        [[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]], answer=_NOT_COMPLETED_REASK
-    )
-    caller.llm_key = "SCRIPTED_FLEX_KEY"
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=caller,
-        goal="Create the account.",
-        goal_judge=judge,
-        goal_check_enforce=True,
-        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
-    )
-
-    assert outcome.status == "completed"
-    assert outcome.goal_check is not None
-    assert len(prompts) == 1
-    assert built == []
-
-
 async def _captured_request(
     monkeypatch: pytest.MonkeyPatch, caller: _ScriptedCaller, values: tuple[CodeTypedValue, ...]
 ) -> dict[str, Any]:
@@ -2871,20 +2706,13 @@ def test_an_unknown_router_model_counts_as_the_one_request_ceiling_not_the_known
 
 
 @pytest.mark.asyncio
-async def test_typed_values_reach_the_acting_model_but_never_the_goal_judge() -> None:
+async def test_typed_values_reach_the_acting_model_but_never_the_goal_judge(monkeypatch: pytest.MonkeyPatch) -> None:
     judge_prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        judge_prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=caller,
+    outcome, _verdicts = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(judge_prompts),
+        script=[[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
         goal="Fill the form\n\nCode outline (a record of this block's code in source order, not steps to perform):",
-        goal_judge=judge,
-        goal_check_enforce=True,
         code_typed_values=(CodeTypedValue(line=2, target="#name", value="Zephyrine Quill"),),
     )
 

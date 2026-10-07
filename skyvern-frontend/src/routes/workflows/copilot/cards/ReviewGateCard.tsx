@@ -108,7 +108,7 @@ const GATE_STATUS: Record<
 > = {
   accepting: {
     label: "Accepting…",
-    variant: "secondary",
+    variant: "progress",
     line: "Saving your accepted changes.",
   },
   accept: {

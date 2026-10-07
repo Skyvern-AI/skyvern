@@ -5063,7 +5063,10 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-    expect(await screen.findByText("Confirming…")).toBeTruthy();
+    // Unconfirmed is amber and still: only work in flight carries the progress indicator.
+    expect(
+      (await screen.findByText("Confirming…")).querySelector("svg"),
+    ).toBeNull();
     await act(async () => {
       finishReload();
     });
@@ -5169,7 +5172,10 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         true,
       );
     }
-    expect(screen.getByText("Accepting…")).toBeTruthy();
+    // The in-flight pole carries a moving indicator, so it never reads by colour alone.
+    expect(
+      screen.getByText("Accepting…").querySelector("svg[aria-hidden]"),
+    ).not.toBeNull();
 
     await act(async () => {
       resolveApply({ data: proposedWorkflowPayload() });
@@ -5201,10 +5207,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         return docked
           ? [controls!.disabled, controls!.navigationLockedReason !== null]
           : ["History", "New chat"].map((name) =>
-              // The reason joins the accessible name once a control is locked.
-              screen
-                .getByRole("button", { name: new RegExp(`^${name}`) })
-                .matches(":disabled"),
+              screen.getByRole("button", { name }).matches(":disabled"),
             );
       };
       expect(navigationLocked()).toEqual([false, false]);
@@ -5485,6 +5488,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
     historyResponse.data.proposed_workflow = null;
+    vi.useFakeTimers({ toFake: ["Date"] });
     leaseDecrementingFrom(0.4);
     cancelPost.mockRejectedValueOnce(new Error("Network Error"));
     await act(async () => {
@@ -5926,8 +5930,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       expect(saveHeld()).toBe(true);
       expect(locked("History")).toBe(true);
       expect(locked("New chat")).toBe(true);
+      // The lock states its reason as the control's description, not a title on a dead button.
       expect(
-        screen.getByRole("button", { name: "New chat" }).title,
+        screen.getByRole("button", { name: "New chat", description: /\S/ }),
       ).toBeTruthy();
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "New chat" }));
@@ -6888,6 +6893,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
     historyResponse.data.proposed_workflow = null;
+    vi.useFakeTimers({ toFake: ["Date"] });
     leaseDecrementingFrom(0.4);
     cancelPost.mockRejectedValueOnce(new Error("Network Error"));
     await act(async () => {
@@ -7435,6 +7441,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
     historyResponse.data.proposed_workflow = null;
+    vi.useFakeTimers({ toFake: ["Date"] });
     leaseDecrementingFrom(0.4);
     cancelPost.mockRejectedValueOnce(new Error("Network Error"));
     await act(async () => {
@@ -9766,6 +9773,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
     historyResponse.data.proposed_workflow = null;
+    vi.useFakeTimers({ toFake: ["Date"] });
     leaseDecrementingFrom(0.4);
     cancelPost.mockRejectedValueOnce(new Error("Network Error"));
     await act(async () => {
@@ -10786,9 +10794,8 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   });
 
   it("keeps the History lock reason reachable on the floating header", async () => {
-    // The floating header is outside any TooltipProvider, so the reason is a native title -
-    // and a DISABLED button receives no hover and takes no focus, so a title ON IT can never
-    // be read. It has to hang off something that is not disabled.
+    // A DISABLED button receives no hover and takes no focus, so a reason hung on it alone
+    // can never be read. It has to hang off something that is not disabled.
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -10802,15 +10809,29 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
 
-    const history = screen.getByRole("button", { name: /^History/ });
+    const history = screen.getByRole("button", {
+      name: "History",
+      description: "Copilot is saving your accepted changes.",
+    });
     expect(history.matches(":disabled")).toBe(true);
-    const explained = screen
-      .getAllByTitle("Copilot is saving your accepted changes.")
-      .find((el) => el.contains(history))!;
-    expect(explained).toBeTruthy();
-    // Whatever carries the reason must be able to receive a hover: not the disabled control.
-    expect(explained.matches(":disabled")).toBe(false);
-    expect(explained.contains(history)).toBe(true);
+    const wrapper = history.closest<HTMLElement>("[tabindex='0']");
+    expect(wrapper?.getAttribute("aria-describedby")).toBe(
+      history.getAttribute("aria-describedby"),
+    );
+
+    // A locked control takes no pointer events, so a press on it lands on its wrapper - and
+    // must not start dragging the floating window by its header.
+    const panel = history.closest<HTMLElement>(".fixed")!;
+    const left = panel.style.left;
+    for (const name of ["History", "New chat"]) {
+      const locked = screen
+        .getByRole("button", { name })
+        .closest<HTMLElement>("[tabindex='0']")!;
+      fireEvent.mouseDown(locked, { clientX: 10, clientY: 10 });
+      fireEvent.mouseMove(document, { clientX: 200, clientY: 200 });
+      fireEvent.mouseUp(document);
+    }
+    expect(panel.style.left).toBe(left);
   });
 
   it("retains and resyncs a typed proposal when atomic Accept fails", async () => {
