@@ -1,8 +1,10 @@
 import { type ReactNode } from "react";
+import { Link } from "react-router-dom";
 
 import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
+import { useBrowserProfileQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileQuery";
 import {
   Tooltip,
   TooltipContent,
@@ -56,6 +58,20 @@ export function RunSummaryStrip({
           ? `Finished ${compactLocalDateTime(workflowRun.finished_at)}`
           : null,
       ].filter((chip): chip is string => Boolean(chip));
+  // failure_category is untyped JSON on the backend, so guard each entry at runtime.
+  const signedOutProfileId = (Array.isArray(workflowRun.failure_category)
+    ? workflowRun.failure_category
+    : []
+  ).some((entry) => entry?.reason_code === "saved_profile_signed_out")
+    ? workflowRun.browser_profile_id
+    : null;
+  // A run keeps its profile id after the profile is deleted, and the Refresh
+  // dialog cannot open for a deleted profile. Cached data stays successful
+  // until a refetch fails, so only a settled lookup from this visit counts.
+  const signedOutProfile = useBrowserProfileQuery(
+    signedOutProfileId ?? undefined,
+    { retry: false, staleTime: 0 },
+  );
 
   return (
     <div className="flex shrink-0 items-start gap-2 [container-name:status] [container-type:inline-size]">
@@ -74,6 +90,18 @@ export function RunSummaryStrip({
           <FailureCategoryBadge
             failureCategory={workflowRun.failure_category}
           />
+        ) : null}
+        {!statusUnavailable &&
+        signedOutProfileId &&
+        signedOutProfile.isSuccess &&
+        signedOutProfile.isFetchedAfterMount &&
+        !signedOutProfile.isFetching ? (
+          <Link
+            to={`/browser-profiles/${signedOutProfileId}?refresh=1`}
+            className="whitespace-nowrap text-blue-400 hover:text-blue-300"
+          >
+            Sign in again to refresh
+          </Link>
         ) : null}
         {workflowRun.created_at ? (
           <span className="whitespace-nowrap text-muted-foreground">

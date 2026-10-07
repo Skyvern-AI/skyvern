@@ -141,6 +141,7 @@ import {
   CopilotSteerMessage,
   WorkflowCopilotSteerDeliveredUpdate,
   WorkflowCopilotSteerRequest,
+  WorkflowCopilotScreenshotUpdate,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { AutoAcceptChip } from "./AutoAcceptChip";
@@ -175,6 +176,7 @@ import {
   type CopilotComposerStatus,
 } from "./CopilotWorkingStatus";
 import { QueuedMessageStrip } from "./QueuedMessageStrip";
+import { ScreenshotThumbnail } from "./ScreenshotThumbnail";
 import { SteerReceipt } from "./SteerReceipt";
 import {
   RecordingRefinementProgressCard,
@@ -195,8 +197,16 @@ import {
   AccountGroupCancelCard,
   AccountGroupReviewCard,
 } from "./cards/AccountGroupReviewCard";
+import {
+  CredentialDeleteReceipt,
+  CredentialDeleteReviewCard,
+} from "./cards/CredentialDeleteCard";
 import { QuestionReceipt } from "./cards/QuestionReceipt";
-import { QUESTION_PROMPT_ID, QuestionTray } from "./cards/QuestionTray";
+import {
+  QUESTION_DETAIL_ID,
+  QUESTION_PROMPT_ID,
+  QuestionTray,
+} from "./cards/QuestionTray";
 import { useQuestionStepper } from "./useQuestionStepper";
 import { WorkPlanCard } from "./cards/WorkPlanCard";
 import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
@@ -227,6 +237,7 @@ import {
   NarrativeEvent,
   RecordedActionSummary,
   TurnNarrativeState,
+  TurnScreenshot,
   activityMayBeTrimmed,
   applyNarrativeEvent,
   hydrateHistoryNarrative,
@@ -261,6 +272,7 @@ import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runvie
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useLogging } from "@/hooks/useLogging";
 import { getCopilotFailureLogFields } from "./copilotFailureLogFields";
+import { captureChatScope, type ChatScopeRefs } from "./chatReadScope";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -575,6 +587,8 @@ function collectTimelineBlockActions(
 // visible Stop is not dead while a turn hangs. The first frame arms sooner and clears it.
 const STOP_ARM_DOUBLE_TAP_MS = 500;
 
+const DELETION_STOP_BLOCKED_REASON =
+  "Stop unavailable until the credential deletion finishes";
 const STOP_UNCONFIRMED_NOTICE =
   "I sent the stop, but couldn't confirm what this turn recorded. Reload to see the turn's own report.";
 
@@ -873,6 +887,8 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
 
 const ACCEPT_IN_FLIGHT_SAVE_REASON = "Copilot is saving your accepted changes.";
 
+const DETACHED_GATE_RECEIPT = "detached";
+
 const ACCEPT_SAVED_NOT_SHOWN_SAVE_REASON =
   "Copilot saved this change but the editor couldn't load it, so saving now would write an older workflow over it.";
 
@@ -1025,7 +1041,8 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCredentialPauseResolvedUpdate
   | WorkflowCopilotQuestionRequired
   | WorkflowCopilotQuestionResolved
-  | WorkflowCopilotSteerDeliveredUpdate;
+  | WorkflowCopilotSteerDeliveredUpdate
+  | WorkflowCopilotScreenshotUpdate;
 
 // The live pause frame is a structural superset of the card's frame; only
 // reason needs narrowing (the card tolerates unknown tokens either way).
@@ -1527,7 +1544,13 @@ type CanonicalRecovery = {
   gateAttempt?: AcceptAttempt;
   unattributedClaim?: boolean;
   savedWorkflow?: WorkflowApiResponse;
+  // True only when savedWorkflow is a 200's own body; a canonical read proves no Accept.
+  savedFromApply?: boolean;
   savedOwnerTurnId?: string | null;
+  // A newer draft the server kept past this commit; reconciling canonical must not clear it.
+  keepProposalTurnId?: string;
+  // The turn whose proposal this Accept took, kept for a proposal with no token to say it.
+  acceptedTurnId?: string | null;
   acceptAttempt?: Pick<
     CopilotProposalMetadata,
     "owner_turn_id" | "revision" | "disposition"
@@ -1725,8 +1748,18 @@ export function WorkflowCopilotChat({
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
-  const [pendingProposalMetadata, setPendingProposalMetadata] =
+  const [pendingProposalMetadata, setPendingProposalMetadataState] =
     useState<CopilotProposalMetadata | null>(null);
+  // Written with the state, not after a commit: an Accept resuming from its await reads it to
+  // tell whether the staged proposal is still the one it accepted.
+  const stagedProposalMetadata = useRef<CopilotProposalMetadata | null>(null);
+  const setPendingProposalMetadata = useCallback(
+    (metadata: CopilotProposalMetadata | null) => {
+      stagedProposalMetadata.current = metadata;
+      setPendingProposalMetadataState(metadata);
+    },
+    [],
+  );
   const [pendingProposalRun, setPendingProposalRun] =
     useState<CopilotProposalRunFacts | null>(null);
   // Owning turn of the current proposedWorkflow. Kept alongside it (never
@@ -1822,14 +1855,20 @@ export function WorkflowCopilotChat({
     new Set(),
   );
   const acceptedTurnIdsRef = useRef<Set<string>>(new Set());
+  // Only a narrative row keeps its own resolved card, so a gate rendered anywhere else unmounts
+  // with its proposal; this keeps the receipt where that gate was until the chat moves on.
+  const [acceptReceiptAnchor, setAcceptReceiptAnchor] = useState<string | null>(
+    null,
+  );
+  const gateReceiptAnchorRef = useRef<string | null>(null);
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
-  // A running turn's stream handler reads this, so Turn off reaches the turn already in flight.
-  const autoAcceptRef = useRef(autoAccept);
-  useEffect(() => {
-    autoAcceptRef.current = autoAccept;
-  }, [autoAccept]);
   // Counts the user's own auto-accept writes, so a chat-row read that started before one cannot undo it.
   const autoAcceptWrites = useRef(0);
+  // Counts Accept applies that settled, so a recovery-poll or chat-row resync read that started
+  // before one cannot restore the proposal, or re-arm the claim, that the apply replaced.
+  const acceptApplies = useRef(0);
+  // Bumped when a question answer starts sending; a history read that began before it is stale for cards.
+  const answerEpochRef = useRef(0);
   // Accepts still running, per chat. Each apply writes its chat's auto_accept when it lands, so that chat's
   // Turn off must go after it; another chat's Accept cannot write it and must not hold it back.
   const acceptsInFlight = useRef(new Map<string, Promise<void>>());
@@ -2265,6 +2304,14 @@ export function WorkflowCopilotChat({
   // workflowCopilotChatIdRef, which lags by a commit - comparing against a lagging value reports
   // a change every time hydration runs twice before the effect catches up.
   const hydratedChatIdRef = useRef<string | null>(null);
+  const chatScopeRefs = useMemo<ChatScopeRefs>(
+    () => ({
+      chatId: workflowCopilotChatIdRef,
+      navEpoch: chatNavEpochRef,
+      sendEpoch: sendEpochRef,
+    }),
+    [],
+  );
   useLayoutEffect(() => {
     const activePolls = actionPollRef.current;
     const activeRecoveryPolls = recoveryPolls.current;
@@ -3276,6 +3323,7 @@ export function WorkflowCopilotChat({
     setRejectedTurnIds(new Set());
     acceptedTurnIdsRef.current = new Set();
     setAcceptedTurnIds(new Set());
+    setAcceptReceiptAnchor(null);
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
@@ -3544,7 +3592,12 @@ export function WorkflowCopilotChat({
       }
       setWorkPlan(data.work_plan ?? []);
     },
-    [rememberTurnOwnedRun, rememberRecoveryCancelTokens, workflowPermanentId],
+    [
+      rememberTurnOwnedRun,
+      rememberRecoveryCancelTokens,
+      setPendingProposalMetadata,
+      workflowPermanentId,
+    ],
   );
 
   const stopRecoveryPolls = useCallback(() => {
@@ -3825,7 +3878,10 @@ export function WorkflowCopilotChat({
       const retry = () => {
         if (stopped || !isCurrent()) return;
         clearTimer();
-        if (canonicalRecovery?.retryAcceptAvailable)
+        if (
+          canonicalRecovery?.retryAcceptAvailable &&
+          !canonicalRecovery.unattributedClaim
+        )
           canonicalRecovery.retryAccept = true;
         if (canonicalRecovery?.savedWorkflow) {
           void tick(true);
@@ -4055,6 +4111,8 @@ export function WorkflowCopilotChat({
             schedule();
             return;
           }
+          const acceptAppliesBeforeRead = acceptApplies.current;
+          const answerEpochBeforeRead = answerEpochRef.current;
           const historyRead = (async () => {
             const client = await getClient(credentialGetter, "sans-api-v1");
             if (stopped || controller.signal.aborted)
@@ -4096,6 +4154,13 @@ export function WorkflowCopilotChat({
           clearTimeout(historyTimeout);
           if (stopped || inFlight !== controller || controller.signal.aborted)
             return;
+          if (
+            acceptApplies.current !== acceptAppliesBeforeRead ||
+            answerEpochRef.current !== answerEpochBeforeRead
+          ) {
+            schedule();
+            return;
+          }
           // Without a chat id the read resolves "the workflow's latest chat",
           // which another tab can move by creating a newer one. Latching the
           // first id keeps every later read on the chat this turn recovered in.
@@ -4563,11 +4628,21 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId || !row.workflow_copilot_chat_id) return;
     const remaining = row.proposed_claim_expires_in_seconds;
     const metadata = row.proposed_workflow_metadata;
+    // The marker counts only for the proposal it was written for, so one that outlived its own
+    // Accept cannot claim a later proposal; a tokenless Accept's marker never matches.
     const stored = readStoredAccept(workflowPermanentId);
+    const ownStored =
+      stored !== null &&
+      metadata != null &&
+      stored.chatId === row.workflow_copilot_chat_id &&
+      stored.acceptAttempt?.owner_turn_id === metadata.owner_turn_id &&
+      stored.acceptAttempt?.revision === metadata.revision
+        ? stored
+        : null;
     if (
       !(typeof remaining === "number" && remaining > 0) &&
       metadata?.disposition !== "accepting" &&
-      !stored
+      !ownStored
     )
       return;
     const parked =
@@ -4585,10 +4660,12 @@ export function WorkflowCopilotChat({
       workflowPermanentId,
       chatId: row.workflow_copilot_chat_id,
       acceptChatId: row.workflow_copilot_chat_id,
-      acceptAttempt: stored?.acceptAttempt ?? metadata ?? null,
-      unattributedClaim: !metadata,
+      acceptAttempt: ownStored?.acceptAttempt ?? metadata ?? null,
+      // History reports a live claim from any chat on the workflow, and a proposal can stay
+      // accepting after its own claim died, so only this tab's stored Accept makes the claim its own.
+      unattributedClaim: !ownStored,
       gateAttempt: {
-        alwaysAccept: stored?.alwaysAccept ?? row.auto_accept ?? false,
+        alwaysAccept: ownStored?.alwaysAccept ?? row.auto_accept ?? false,
         token: proposalTokenOf(metadata ?? null),
         wroteNothing: false,
       },
@@ -4602,11 +4679,14 @@ export function WorkflowCopilotChat({
       waitingForUnlock: existing?.waitingForUnlock ?? false,
       yaml: existing?.yaml ?? null,
     };
-    storePendingAccept(workflowPermanentId, {
-      chatId: snapshot.chatId,
-      acceptAttempt: snapshot.acceptAttempt,
-      alwaysAccept: snapshot.gateAttempt?.alwaysAccept ?? false,
-    });
+    // The stored marker claims the Accept as this tab's own. A foreign claim is read again
+    // from history after a reload.
+    if (!snapshot.unattributedClaim)
+      storePendingAccept(workflowPermanentId, {
+        chatId: snapshot.chatId,
+        acceptAttempt: snapshot.acceptAttempt,
+        alwaysAccept: snapshot.gateAttempt?.alwaysAccept ?? false,
+      });
     const recovery = existing
       ? (Object.assign(existing, snapshot) as typeof snapshot)
       : snapshot;
@@ -4712,7 +4792,7 @@ export function WorkflowCopilotChat({
   );
 
   const loadChatInPlace = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, selected = false) => {
       if (pendingCanonicalRecovery.current?.acceptChatId) return;
       if (!workflowPermanentId) return;
       const isChatSwitch = workflowCopilotChatIdRef.current !== chatId;
@@ -4726,6 +4806,7 @@ export function WorkflowCopilotChat({
       const loadSeq = beginHistoryLoad();
       discardQueuedPrompt();
       setRejectedTurnIds(new Set());
+      setAcceptReceiptAnchor(null);
       if (isChatSwitch) {
         acceptedTurnIdsRef.current = new Set();
         setAcceptedTurnIds(new Set());
@@ -4761,6 +4842,9 @@ export function WorkflowCopilotChat({
         ) {
           return;
         }
+        // Hydration bumps only when it replaces a chat that had an id, so a chat getting its first
+        // id is not navigation. A user's selection always is, even from a chat with no id.
+        if (selected) chatNavEpochRef.current += 1;
         applyHistoryResponse(response.data, !isChatSwitch);
         adoptRecoveredTurns(response.data, response.hadCredentialRecoveryToken);
         // Mark history loaded for this workflow so the mount effect won't reload
@@ -4807,7 +4891,7 @@ export function WorkflowCopilotChat({
       if (chat.workflow_copilot_chat_id === workflowCopilotChatIdRef.current) {
         return;
       }
-      void loadChatInPlace(chat.workflow_copilot_chat_id);
+      void loadChatInPlace(chat.workflow_copilot_chat_id, true);
     },
     [acceptUnresolved, loadChatInPlace],
   );
@@ -5017,14 +5101,53 @@ export function WorkflowCopilotChat({
     [credentialGetter],
   );
 
-  const markProposalAccepted = useCallback((ownerTurnId: string | null) => {
-    if (ownerTurnId) {
-      const accepted = new Set(acceptedTurnIdsRef.current).add(ownerTurnId);
-      acceptedTurnIdsRef.current = accepted;
-      setAcceptedTurnIds(accepted);
-    }
-    setPendingProposalTurnId(null);
-  }, []);
+  // Clears the staged proposal unless it is provably another (another token, or another owner turn
+  // when the Accept had no token); missing identity clears, since keeping a replaced proposal is a
+  // false receipt. Without a token an accepting proposal never counts, as a tokenless one gets a
+  // fresh owner when its Accept claims it.
+  const settleAcceptedProposal = useCallback(
+    (
+      ownerTurnId: string | null,
+      acceptedToken: string | null,
+      acceptedTurnId: string | null,
+    ): boolean => {
+      if (ownerTurnId) {
+        const accepted = new Set(acceptedTurnIdsRef.current).add(ownerTurnId);
+        acceptedTurnIdsRef.current = accepted;
+        setAcceptedTurnIds(accepted);
+      }
+      const staged = stagedProposalMetadata.current;
+      if (
+        staged !== null &&
+        (acceptedToken !== null
+          ? proposalTokenOf(staged) !== acceptedToken
+          : acceptedTurnId !== null &&
+            staged.disposition !== "accepting" &&
+            staged.owner_turn_id !== acceptedTurnId)
+      ) {
+        // Staging skips retagging while an Accept is pending, so the kept proposal still carries
+        // the accepted one's tag, and with it that proposal's title and graph edits.
+        if (workflowPermanentId)
+          useWorkflowTitleStore
+            .getState()
+            .trackCopilotMetadata(
+              workflowPermanentId,
+              `${workflowCopilotChatIdRef.current}:${proposalTokenOf(staged)}`,
+            );
+        return false;
+      }
+      if (workflowPermanentId)
+        useWorkflowTitleStore
+          .getState()
+          .trackCopilotMetadata(workflowPermanentId, null);
+      setPendingProposalTurnId(null);
+      setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
+      return true;
+    },
+    [setPendingProposalMetadata, workflowPermanentId],
+  );
 
   // A follow-up turn that ends without a new draft no longer nulls a bypassed
   // proposal client-side; re-fetch the chat row instead, since the
@@ -5078,8 +5201,29 @@ export function WorkflowCopilotChat({
         nextProposal ? (proposalTurnId ?? currentTurnId) : null,
       );
     },
-    [workflowPermanentId],
+    [setPendingProposalMetadata, workflowPermanentId],
   );
+
+  // The apply route writes auto_accept best-effort after the version, so its 200 cannot vouch
+  // for it. Reads that one field only: a whole-row resync could re-stage the cleared proposal.
+  // A send does not write auto_accept, so it does not invalidate this read; setting writes do.
+  const readBackAutoAccept = useCallback(() => {
+    const scope = captureChatScope(chatScopeRefs);
+    const writes = autoAcceptWrites.current;
+    void fetchChatRow(scope.chatId)
+      .then((row) => {
+        if (
+          row &&
+          composerMountedRef.current &&
+          !scope.navigated() &&
+          autoAcceptWrites.current === writes
+        )
+          setAutoAccept(row.auto_accept ?? false);
+      })
+      .catch((error) =>
+        logCopilotRequestFailure("proposal_sync", error, scope.chatId),
+      );
+  }, [chatScopeRefs, fetchChatRow, logCopilotRequestFailure]);
 
   const reconcileCanonicalWorkflow = useCallback(
     async (turnReservation?: symbol, signal?: AbortSignal) => {
@@ -5159,34 +5303,29 @@ export function WorkflowCopilotChat({
             pending.draftChoice === "discard",
           );
           if (!applied) return false;
-          if (!pending.gateAttempt?.wroteNothing)
-            markProposalAccepted(pending.savedOwnerTurnId ?? null);
-          setProposedWorkflow(null);
-          setPendingProposalMetadata(null);
-          setPendingProposalRun(null);
+          const observedSave =
+            pending.savedFromApply === true &&
+            !pending.gateAttempt?.wroteNothing;
+          if (
+            settleAcceptedProposal(
+              pending.gateAttempt?.wroteNothing
+                ? null
+                : (pending.savedOwnerTurnId ??
+                    (observedSave ? pending.acceptedTurnId : null) ??
+                    null),
+              pending.gateAttempt?.token ?? null,
+              pending.acceptedTurnId ?? pending.savedOwnerTurnId ?? null,
+            ) &&
+            observedSave
+          )
+            setAcceptReceiptAnchor(gateReceiptAnchorRef.current);
           setGateFailure(
             pending.gateAttempt?.wroteNothing
               ? { kind: "changed", ...pending.gateAttempt }
               : null,
           );
           pendingCanonicalRecovery.current = null;
-          const chatId = workflowCopilotChatIdRef.current;
-          const navEpoch = chatNavEpochRef.current;
-          const sendEpoch = sendEpochRef.current;
-          const writes = autoAcceptWrites.current;
-          void fetchChatRow(chatId)
-            .then((row) => {
-              if (
-                row &&
-                composerMountedRef.current &&
-                workflowCopilotChatIdRef.current === chatId &&
-                chatNavEpochRef.current === navEpoch &&
-                sendEpochRef.current === sendEpoch &&
-                autoAcceptWrites.current === writes
-              )
-                setAutoAccept(row.auto_accept ?? false);
-            })
-            .catch(() => undefined);
+          readBackAutoAccept();
           return true;
         }
         if (pending.retryApply) {
@@ -5212,12 +5351,18 @@ export function WorkflowCopilotChat({
           workflowCopilotChatIdRef.current === pending.chatId;
         const clearRecoveryProposal = () => {
           if (!stillOnRecoveryChat()) return;
+          if (
+            pending.keepProposalTurnId &&
+            pendingProposalTurnIdRef.current === pending.keepProposalTurnId
+          )
+            return;
           setProposedWorkflow(null);
           setPendingProposalMetadata(null);
           setPendingProposalRun(null);
           setPendingProposalTurnId(null);
         };
         let noWriteRow: WorkflowCopilotChatHistoryResponse | null = null;
+        let foreignClaimEnded = false;
         const autoAcceptWritesAtRead = autoAcceptWrites.current;
         const response = await Promise.race([
           cancelled,
@@ -5255,7 +5400,15 @@ export function WorkflowCopilotChat({
                 (typeof remaining === "number" &&
                   Number.isFinite(remaining) &&
                   remaining <= 0);
+              foreignClaimEnded = Boolean(
+                pending.unattributedClaim &&
+                claimInactive &&
+                proposal &&
+                metadata,
+              );
+              // Only this chat's own Accept may be re-sent; a foreign claim's hold never Accepts.
               pending.retryAcceptAvailable = Boolean(
+                !pending.unattributedClaim &&
                 claimInactive &&
                 proposal &&
                 attempt &&
@@ -5294,10 +5447,13 @@ export function WorkflowCopilotChat({
                     pendingCanonicalRecovery.current === pending
                   ) {
                     pending.savedWorkflow = applied.data;
+                    pending.savedFromApply = true;
                     pending.savedOwnerTurnId = attempt?.owner_turn_id ?? null;
                   }
                 } catch {
                   /* A retry cannot settle the original request's outcome. */
+                } finally {
+                  acceptApplies.current += 1;
                 }
                 return { data: null, proposal };
               }
@@ -5350,6 +5506,12 @@ export function WorkflowCopilotChat({
           pendingCanonicalRecovery.current = null;
           return true;
         }
+        // The server shows a tokened proposal only while the saved workflow still matches it, so
+        // another writer whose claim ended beside it wrote nothing here.
+        if (foreignClaimEnded) {
+          pendingCanonicalRecovery.current = null;
+          return true;
+        }
         if (pending.acceptChatId) {
           if (response.proposal !== null) return false;
         }
@@ -5369,6 +5531,7 @@ export function WorkflowCopilotChat({
           ]) === hashKey([response.data]);
         if (pending.acceptChatId && pending.hadGraphEdits) {
           pending.savedWorkflow = response.data;
+          pending.savedFromApply = false;
           pending.localDraftConflict = true;
           return false;
         }
@@ -5492,9 +5655,10 @@ export function WorkflowCopilotChat({
       isCopilotTurnCurrent,
       restoreTurnSnapshot,
       onWorkflowPersisted,
-      fetchChatRow,
-      markProposalAccepted,
+      settleAcceptedProposal,
       applyChatRowProposal,
+      setPendingProposalMetadata,
+      readBackAutoAccept,
     ],
   );
   reconcileCanonicalWorkflowRef.current = reconcileCanonicalWorkflow;
@@ -5612,6 +5776,7 @@ export function WorkflowCopilotChat({
         chatId,
         acceptChatId: chatId,
         acceptAttempt,
+        acceptedTurnId: acceptAttempt?.owner_turn_id ?? pendingProposalTurnId,
         gateAttempt: {
           alwaysAccept,
           token: proposalTokenOf(pendingProposalMetadata),
@@ -5671,6 +5836,7 @@ export function WorkflowCopilotChat({
             { timeout: ACCEPT_SETTLE_CEILING_MS, signal },
           );
         }).finally(() => {
+          acceptApplies.current += 1;
           // Queries outlive the submitting editor, including on a lost response.
           for (const queryKey of [
             ["workflow", workflowPermanentId],
@@ -5704,6 +5870,7 @@ export function WorkflowCopilotChat({
           noteAutoAcceptWrite();
           snapshot.localDraftConflict = snapshot.hadGraphEdits;
           snapshot.savedWorkflow = response.data;
+          snapshot.savedFromApply = true;
           snapshot.savedOwnerTurnId = acceptAttempt?.owner_turn_id ?? null;
           recovering = true;
           setGateFailure({
@@ -5718,20 +5885,21 @@ export function WorkflowCopilotChat({
         if (!stillOnAcceptedChat()) {
           return;
         }
-        markProposalAccepted(acceptAttempt?.owner_turn_id ?? null);
-        setProposedWorkflow(null);
-        setPendingProposalMetadata(null);
-        setPendingProposalRun(null);
+        if (
+          settleAcceptedProposal(
+            acceptAttempt?.owner_turn_id ?? snapshot.acceptedTurnId ?? null,
+            snapshot.gateAttempt!.token,
+            snapshot.acceptedTurnId ?? null,
+          )
+        )
+          setAcceptReceiptAnchor(gateReceiptAnchorRef.current);
         if (alwaysAccept) {
           setAutoAcceptFromWrite(true);
         } else {
           // A plain Accept writes auto_accept=false on the row, so reads taken before it are stale too.
           noteAutoAcceptWrite();
         }
-        if (alwaysAccept !== autoAcceptRef.current) {
-          // Apply writes auto-accept best-effort after creating the version, so show what the chat row kept.
-          void resyncProposalFromChatRow();
-        }
+        readBackAutoAccept();
       } catch (error) {
         const rejection = definitiveAcceptRejection(error);
         if (
@@ -5825,20 +5993,14 @@ export function WorkflowCopilotChat({
       toast({ title: acceptHoldReason, variant: "destructive" });
       return false;
     }
-    const rejectSendEpoch = sendEpochRef.current;
-    const rejectNavEpoch = chatNavEpochRef.current;
+    const scope = captureChatScope(chatScopeRefs);
     setGateFailure(null);
     const acceptance = reserveCopilotTurn();
     if (!acceptance) return false;
     copilotReservation.current = acceptance;
     let recovering = false;
     try {
-      if (
-        !(await clearProposedWorkflow(false)) ||
-        !isCopilotTurnCurrent(acceptance) ||
-        sendEpochRef.current !== rejectSendEpoch ||
-        chatNavEpochRef.current !== rejectNavEpoch
-      ) {
+      if (!(await clearProposedWorkflow(false)) || scope.navigated()) {
         return false;
       }
       // The staged proposal was rendered onto the canvas mid-turn (via
@@ -5894,6 +6056,7 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId) {
       return null;
     }
+    const scope = captureChatScope(chatScopeRefs);
     const client = await getClient(credentialGetter, "sans-api-v1");
     const response =
       await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
@@ -5903,6 +6066,7 @@ export function WorkflowCopilotChat({
           params: { workflow_permanent_id: workflowPermanentId },
         },
       );
+    if (scope.navigated()) return null;
     const latestChatId = response.data.workflow_copilot_chat_id ?? null;
     setWorkflowCopilotChatId(latestChatId);
     return latestChatId;
@@ -6239,13 +6403,13 @@ export function WorkflowCopilotChat({
   const resyncProposalFromChatRow = useCallback(async () => {
     // Navigation stays open during a plain reload, so its result belongs only to
     // the chat that started it.
-    const chatId = workflowCopilotChatIdRef.current;
-    const sendEpoch = sendEpochRef.current;
+    const scope = captureChatScope(chatScopeRefs);
     const editor = useWorkflowYamlEditorStore.getState().editorOwner;
     const recoveryEpoch = recoveryGeneration.current;
     const autoAcceptWritesAtRead = autoAcceptWrites.current;
+    const acceptAppliesAtRead = acceptApplies.current;
     // Try again on a `reload` with no attempt neither locks the card nor sets `isAccepting`, so
-    // two of these can be in flight at once. The chat id and send epoch below are unchanged
+    // two of these can be in flight at once. Their chat scope is unchanged
     // between them, so only call identity separates a late answer from the current one - the same
     // guard `reconcileFailedAccept` carries, for the same reason.
     const generation = (resyncGeneration.current += 1);
@@ -6257,16 +6421,19 @@ export function WorkflowCopilotChat({
       Boolean(editor && !editor.active);
     try {
       const row = await fetchChatRow();
-      if (
-        superseded() ||
-        workflowCopilotChatIdRef.current !== chatId ||
-        sendEpochRef.current !== sendEpoch
-      ) {
+      if (superseded() || scope.outlived()) {
         return null;
       }
       if (row) {
-        restoreAcceptFromHistory.current(row);
-        applyChatRowProposal(row, autoAcceptWritesAtRead);
+        const outlivedAccept = acceptApplies.current !== acceptAppliesAtRead;
+        // A row read before an Accept settled still witnesses another writer's claim, but not the
+        // proposal, nor an accepting claim: that is most likely the Accept that just settled.
+        if (
+          !outlivedAccept ||
+          row.proposed_workflow_metadata?.disposition !== "accepting"
+        )
+          restoreAcceptFromHistory.current(row);
+        if (!outlivedAccept) applyChatRowProposal(row, autoAcceptWritesAtRead);
         // This path does NOT clear staleCanvas. Only a persisted refresh the server gave us in
         // the same act does - applyWorkflowUpdate requires `persisted` AND `fresh` - because a
         // surviving proposal is not evidence the canvas is current.
@@ -6274,18 +6441,19 @@ export function WorkflowCopilotChat({
       return row;
     } catch (error) {
       console.error("Failed to resync pending proposal:", error);
-      logCopilotRequestFailure("proposal_sync", error, chatId);
-      if (
-        !superseded() &&
-        workflowCopilotChatIdRef.current === chatId &&
-        sendEpochRef.current === sendEpoch
-      ) {
+      logCopilotRequestFailure("proposal_sync", error, scope.chatId);
+      if (!superseded() && !scope.outlived()) {
         if (!pendingCanonicalRecovery.current?.acceptChatId)
           setGateFailure({ kind: "reload", attempt: null });
       }
       return null;
     }
-  }, [applyChatRowProposal, fetchChatRow, logCopilotRequestFailure]);
+  }, [
+    applyChatRowProposal,
+    chatScopeRefs,
+    fetchChatRow,
+    logCopilotRequestFailure,
+  ]);
 
   // Unlike `resyncProposalFromChatRow`, a failed read here must not raise the `reload` gate or
   // overwrite the fresher proposal the terminal frame already carried.
@@ -6295,14 +6463,12 @@ export function WorkflowCopilotChat({
       chatId: string,
       workflowRunId: string,
     ) => {
-      const sendEpoch = sendEpochRef.current;
-      const navEpoch = chatNavEpochRef.current;
+      const scope = captureChatScope(chatScopeRefs);
       try {
         const row = await fetchChatRow(chatId);
         if (
           !row?.proposed_workflow_run ||
-          chatNavEpochRef.current !== navEpoch ||
-          sendEpochRef.current !== sendEpoch ||
+          scope.outlived() ||
           (row.proposed_workflow_metadata?.owner_turn_id ?? null) !==
             ownerTurnId ||
           row.proposed_workflow_run.workflow_run_id !== workflowRunId
@@ -6315,7 +6481,7 @@ export function WorkflowCopilotChat({
         logCopilotRequestFailure("proposal_sync", error, chatId);
       }
     },
-    [fetchChatRow, logCopilotRequestFailure],
+    [chatScopeRefs, fetchChatRow, logCopilotRequestFailure],
   );
 
   const clearProposedWorkflow = async (
@@ -6408,7 +6574,7 @@ export function WorkflowCopilotChat({
     handleRejectWorkflow,
     proposedWorkflow,
     proposalToken: proposalTokenOf(pendingProposalMetadata),
-    acceptHoldReason: null as string | null,
+    holdReason: null as string | null,
     acceptsEnabled: true,
     gateLocked: false,
   });
@@ -6417,7 +6583,7 @@ export function WorkflowCopilotChat({
     handleRejectWorkflow,
     proposedWorkflow,
     proposalToken: proposalTokenOf(pendingProposalMetadata),
-    acceptHoldReason,
+    holdReason: saveHoldReason,
     acceptsEnabled: !(
       workflowCopilotChatId !== null &&
       (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0
@@ -6432,18 +6598,12 @@ export function WorkflowCopilotChat({
     // The chat stays mounted beside the comparison, so History or New chat can
     // move it on before the user decides; the decision must not then settle
     // that other chat's proposal.
-    // A null id captured before the chat resolved its id is not a switch.
-    const originChatId = workflowCopilotChatIdRef.current;
-    const originNavEpoch = chatNavEpochRef.current;
+    const scope = captureChatScope(chatScopeRefs);
     const originToken = proposalTokenOf(pendingProposalMetadata);
     onReviewWorkflow?.(
       workflow,
       async (decision) => {
-        if (
-          (originChatId !== null &&
-            workflowCopilotChatIdRef.current !== originChatId) ||
-          chatNavEpochRef.current !== originNavEpoch
-        ) {
+        if (scope.navigated()) {
           toast({
             title: "Review dismissed",
             description:
@@ -6475,13 +6635,14 @@ export function WorkflowCopilotChat({
           });
           return true;
         }
+        // The comparison shows this hold as its lock reason, and the gate holds both decisions in
+        // the same states, including a proposal that could not be re-read.
+        if (live.holdReason !== null) {
+          toast({ title: live.holdReason, variant: "destructive" });
+          return false;
+        }
         if (decision === "reject") {
           return live.handleRejectWorkflow();
-        }
-        // Reject reports an unresolved Accept itself; a second Accept would return silently.
-        if (live.acceptHoldReason !== null) {
-          toast({ title: live.acceptHoldReason, variant: "destructive" });
-          return false;
         }
         // The gate disables its accepts while Turn off is in flight.
         if (!live.acceptsEnabled) {
@@ -6518,6 +6679,7 @@ export function WorkflowCopilotChat({
       setAutoAccept(false);
       setWorkPlan([]);
       setNarrative(EMPTY_NARRATIVE);
+      setAcceptReceiptAnchor(null);
       historyLoadedForRef.current = null;
       return;
     }
@@ -6560,6 +6722,7 @@ export function WorkflowCopilotChat({
       );
     }
     if (isWorkflowSwitch) {
+      setAcceptReceiptAnchor(null);
       setRecoveredPauseFrames([]);
       setQuestionInteractions([]);
       setQuestionCancelToken(null);
@@ -6633,6 +6796,7 @@ export function WorkflowCopilotChat({
     endHistoryLoad,
     discardQueuedPrompt,
     logCopilotRequestFailure,
+    setPendingProposalMetadata,
   ]);
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
@@ -6781,6 +6945,8 @@ export function WorkflowCopilotChat({
     }
   }, [credentialGetter, requeueSteers, takePendingSteers, updateQueuedPrompt]);
 
+  // A confirmed credential deletion cannot be undone, so Stop does nothing while it runs.
+  const stopBlockedByDeletionRef = useRef(false);
   const cancelSend = useCallback(
     async (
       source: WorkflowCopilotCancelSource,
@@ -6790,6 +6956,7 @@ export function WorkflowCopilotChat({
       // frame is still stoppable rather than leaving every path dead for that window.
       { requireArmed = true }: { requireArmed?: boolean } = {},
     ) => {
+      if (stopBlockedByDeletionRef.current) return;
       // A stop must never let a queued message auto-fire. Hand its text back to
       // the composer synchronously, before isLoading flips and the drain effect
       // would otherwise send it as a fresh turn.
@@ -6959,7 +7126,7 @@ export function WorkflowCopilotChat({
       }
       // Dismissing an IME conversion candidate fires Escape with isComposing
       // set; the user is editing text, not stopping their turn.
-      if (event.isComposing) {
+      if (event.isComposing || stopBlockedByDeletionRef.current) {
         return;
       }
       if (queuedPrompt) {
@@ -6985,9 +7152,15 @@ export function WorkflowCopilotChat({
   ]);
 
   const [isSubmittingQuestion, setIsSubmittingQuestion] = useState(false);
+  const [confirmingDeletion, setConfirmingDeletion] =
+    useState<QuestionInteraction | null>(null);
   const submittingQuestion = useRef(false);
   const handleQuestionAnswer = useCallback(
-    async (interaction: QuestionInteraction, response: QuestionResponse) => {
+    async (
+      interaction: QuestionInteraction,
+      response: QuestionResponse | { credential_ids: string[] },
+      path = "/workflow/copilot/question-response",
+    ) => {
       if (
         !workflowCopilotChatId ||
         submittingQuestion.current ||
@@ -7008,18 +7181,16 @@ export function WorkflowCopilotChat({
       const reservation = copilotReservation.current;
       if (!reservation || !isCopilotTurnCurrent(reservation)) return false;
       submittingQuestion.current = true;
+      answerEpochRef.current += 1;
       setIsSubmittingQuestion(true);
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         if (!isCopilotTurnCurrent(reservation)) return false;
-        const accepted = await client.post<QuestionInteraction>(
-          "/workflow/copilot/question-response",
-          {
-            workflow_copilot_chat_id: workflowCopilotChatId,
-            interaction_id: interaction.interaction_id,
-            ...response,
-          },
-        );
+        const accepted = await client.post<QuestionInteraction>(path, {
+          workflow_copilot_chat_id: workflowCopilotChatId,
+          interaction_id: interaction.interaction_id,
+          ...response,
+        });
         if (
           !isCopilotTurnCurrent(reservation) ||
           workflowCopilotChatIdRef.current !== workflowCopilotChatId
@@ -7052,8 +7223,9 @@ export function WorkflowCopilotChat({
           description: "Please check the question and try again.",
           variant: "destructive",
         });
+        // A lost response may still have been accepted, so return only once history says what happened.
         if (workflowCopilotChatIdRef.current === workflowCopilotChatId)
-          void loadChatInPlace(workflowCopilotChatId);
+          await loadChatInPlace(workflowCopilotChatId);
         return false;
       } finally {
         submittingQuestion.current = false;
@@ -7076,11 +7248,40 @@ export function WorkflowCopilotChat({
   const trayQuestion = questionInteractions.find(
     (item) => item.status === "pending",
   );
-  // An account card is answered on the card alone, so the composer stays a message field.
+  // An account or deletion card is answered on the card alone, so the composer stays a message field.
   const composerQuestion =
-    trayQuestion?.account_group_review || trayQuestion?.account_group_cancel
+    trayQuestion?.account_group_review ||
+    trayQuestion?.account_group_cancel ||
+    trayQuestion?.credential_delete_review
       ? undefined
       : trayQuestion;
+  const isDeleting = (item: QuestionInteraction | undefined) =>
+    Boolean(
+      item?.status === "pending" &&
+      item.credential_delete_review &&
+      (item.credential_delete_review.claimed_at ||
+        confirmingDeletion?.interaction_id === item.interaction_id),
+    );
+  // A confirmed deletion keeps running after a Stop, so every Stop stays blocked even when another card leads the tray.
+  const deletingCredentials = questionInteractions.some(isDeleting);
+  // A confirm whose response was lost may still have been claimed, so the local guard holds until the server sends
+  // this card again (ack, stream frame or a history read that succeeded) and its own claimed_at takes over.
+  useEffect(() => {
+    if (!confirmingDeletion || isSubmittingQuestion) return;
+    const current = questionInteractions.find(
+      (item) => item.interaction_id === confirmingDeletion.interaction_id,
+    );
+    if (current !== confirmingDeletion) setConfirmingDeletion(null);
+  }, [confirmingDeletion, isSubmittingQuestion, questionInteractions]);
+  stopBlockedByDeletionRef.current = deletingCredentials;
+  const setBlockStopBlockedReason = useCopilotActionStore(
+    (state) => state.setStopBlockedReason,
+  );
+  useEffect(() => {
+    if (!deletingCredentials) return;
+    setBlockStopBlockedReason(DELETION_STOP_BLOCKED_REASON);
+    return () => setBlockStopBlockedReason(null);
+  }, [deletingCredentials, setBlockStopBlockedReason]);
   const questionStepper = useQuestionStepper(
     composerQuestion,
     inputValue,
@@ -7381,6 +7582,7 @@ export function WorkflowCopilotChat({
     const generation = recoveryGeneration.current;
     const editor = useWorkflowYamlEditorStore.getState().editorOwner;
     const refresh = async () => {
+      const answerEpoch = answerEpochRef.current;
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const { data } =
@@ -7393,6 +7595,7 @@ export function WorkflowCopilotChat({
           );
         if (
           disposed ||
+          answerEpochRef.current !== answerEpoch ||
           !composerMountedRef.current ||
           recoveryGeneration.current !== generation ||
           useWorkflowYamlEditorStore.getState().editorOwner !== editor ||
@@ -7465,7 +7668,8 @@ export function WorkflowCopilotChat({
         (item) =>
           item.status === "pending" &&
           !item.account_group_review &&
-          !item.account_group_cancel,
+          !item.account_group_cancel &&
+          !item.credential_delete_review,
       );
       // The composer is the text field for the question on screen, so Enter steps through the
       // tray and the last step sends every part's answer together.
@@ -7473,6 +7677,7 @@ export function WorkflowCopilotChat({
         // Same lock as the tray's buttons while an answer is posting.
         if (submittingQuestion.current) return false;
         const stepper = questionStepperRef.current;
+        if (stepper.advanceBlocked) return false;
         if (!stepper.isLast) {
           stepper.goTo(stepper.index + 1);
           return false;
@@ -7823,6 +8028,7 @@ export function WorkflowCopilotChat({
       sendEpoch.current += 1;
       sendEpochRef.current += 1;
       setGateFailure(null);
+      setAcceptReceiptAnchor(null);
       // Stamped here, before the awaits below consume messageAudioBlob
       // and blockBuildTargetLabelRef.
       lastTurnRef.current = {
@@ -8439,13 +8645,22 @@ export function WorkflowCopilotChat({
               auto: true,
             });
             if (responseEntry) responseEntry.workflowPersisted = true;
+            const newerDraftTurnId =
+              response.proposed_workflow_metadata?.owner_turn_id &&
+              response.proposed_workflow_metadata.owner_turn_id !==
+                responseTurnId
+                ? response.proposed_workflow_metadata.owner_turn_id
+                : undefined;
             // This turn's auto-commit already moved canonical past any earlier
             // bypassed proposal — drop the stale handle so its gate cannot
             // reapply an outdated draft over what was just committed.
             setProposedWorkflow(null);
             setPendingProposalMetadata(null);
             setPendingProposalRun(null);
-            setPendingProposalTurnId(null);
+            // A newer draft superseded this commit and the row holds it. Its turn stays pending,
+            // so a send that beats the read still asks the server to keep it.
+            setPendingProposalTurnId(newerDraftTurnId ?? null);
+            if (newerDraftTurnId) void resyncProposalFromChatRow();
             const autoApplied =
               response.updated_workflow &&
               shouldAutoApplyWorkflowResponse(response) &&
@@ -8464,6 +8679,7 @@ export function WorkflowCopilotChat({
                 rollback: responseEntry ?? undefined,
                 terminalConfirmed: true,
                 waitingForUnlock: true,
+                keepProposalTurnId: newerDraftTurnId,
               });
               if (!pending) return;
               const chatId = response.workflow_copilot_chat_id;
@@ -8480,6 +8696,7 @@ export function WorkflowCopilotChat({
                     wroteNothing: false,
                   },
                   savedWorkflow: response.updated_workflow,
+                  savedFromApply: true,
                   savedOwnerTurnId: responseTurnId,
                 };
                 pendingCanonicalRecovery.current = snapshot;
@@ -8699,6 +8916,7 @@ export function WorkflowCopilotChat({
             credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
             supports_account_group_card: true,
+            supports_credential_delete_card: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             if (
@@ -8868,6 +9086,7 @@ export function WorkflowCopilotChat({
               case "design_start":
               case "design_end":
               case "codegen_progress":
+              case "screenshot":
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "steer_delivered": {
@@ -9148,6 +9367,7 @@ export function WorkflowCopilotChat({
       resyncProposalFromChatRow,
       returnFilesToTray,
       rollbackPendingTerminalContinuation,
+      setPendingProposalMetadata,
       startRecoveryPoll,
       stopSpeech,
       takeSpeechAudioBlob,
@@ -9305,7 +9525,8 @@ export function WorkflowCopilotChat({
     if (e.key === "Escape" && queuedPrompt) {
       e.preventDefault();
       e.stopPropagation();
-      if (!composerQuestion) restoreQueuedPromptToComposer();
+      if (!composerQuestion && !deletingCredentials)
+        restoreQueuedPromptToComposer();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -9930,13 +10151,25 @@ export function WorkflowCopilotChat({
               </Button>
             ) : null}
             {!outstandingAccept ? (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={recoveryControls.reject}
-              >
-                Reject
-              </Button>
+              <TooltipProvider>
+                <ControlTooltip
+                  content={
+                    deletingCredentials
+                      ? DELETION_STOP_BLOCKED_REASON
+                      : "Cancel the Copilot turn"
+                  }
+                  blocked={deletingCredentials}
+                >
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={deletingCredentials}
+                    onClick={recoveryControls.reject}
+                  >
+                    Reject
+                  </Button>
+                </ControlTooltip>
+              </TooltipProvider>
             ) : null}
           </>
         )}
@@ -9995,28 +10228,45 @@ export function WorkflowCopilotChat({
       )
     ),
   );
-  // Mid-turn Accept would be clobbered by the in-flight turn's terminal
-  // restore, so gate actions wait for idle.
   // Is there anything for the gate to show? A staged proposal, or one of the three gates that
   // outlive one - `saved`, `recover`, `changed` - keyed on the gate rather than on how the subject
-  // became null; actionability does not follow, since `ReviewGateCard` locks its action row
-  // whenever there is no proposal to act on.
+  // became null.
   const gateHasSubject =
     Boolean(proposedWorkflow) ||
     (Boolean(outstandingAccept) && !unattributedClaim) ||
     gateFailure?.kind === "saved" ||
     gateFailure?.kind === "recover" ||
     gateFailure?.kind === "changed";
-  // The action row stays locked for `saved` by its own fieldset, so this enables the exit only.
-  const gateActionable = gateHasSubject && !isLoading && !isLoadingHistory;
-  // The chip jumps to the gate, so it waits for the gate's actions rather than pointing at a card
+  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate's
+  // footer waits for idle. Another writer's claim holds the workflow, and an Accept now would only
+  // be refused.
+  const gateActionsShown =
+    gateHasSubject && !isLoading && !isLoadingHistory && !unattributedClaim;
+  // Accept, Reject and Test write over the proposal, so they wait out an Accept whose outcome is
+  // unresolved, and a proposal that could not be re-read.
+  const gateActionable =
+    gateActionsShown &&
+    !isAccepting &&
+    gateFailureKind !== "reload" &&
+    gateFailureKind !== "recover" &&
+    gateFailureKind !== "saved";
+  // The chip jumps to the gate, so it waits for the gate's footer rather than pointing at a card
   // with nothing to click.
   const pendingChipVisible = Boolean(
     proposedWorkflow &&
     pendingProposalTurnId &&
-    gateActionable &&
+    gateActionsShown &&
     gateOwnerIndex !== lastTurnIndex,
   );
+  // Where a confirmed Accept leaves its receipt when the gate is not a narrative row's own card:
+  // the narrative-less row it renders on, or after the transcript.
+  gateReceiptAnchorRef.current = !gateOwnerRendersInline
+    ? DETACHED_GATE_RECEIPT
+    : gateOwnerNarrative
+      ? null
+      : (gateOwnerMessage?.id ?? null);
+  const detachedReceiptShown =
+    !gateHasSubject && acceptReceiptAnchor === DETACHED_GATE_RECEIPT;
   const turningOffThisChat =
     workflowCopilotChatId !== null &&
     (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
@@ -10067,8 +10317,12 @@ export function WorkflowCopilotChat({
     livePauseFrame === null &&
     turnChatIdRef.current,
   );
+  // A question pause ends isLoading, so the deletion shows its own disabled Stop rather than Send.
+  const stopBlockedByDeletion = deletingCredentials && !hasComposerText;
   const showsStopGlyph =
-    isStopping || (turnObservablyRunning && !hasComposerText);
+    isStopping ||
+    stopBlockedByDeletion ||
+    (turnObservablyRunning && !hasComposerText);
   const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
   // Sent, no frame yet: the control reports the wait rather than an action, and
   // cancelSend's own guard is what makes a press in this window issue no cancel.
@@ -10080,37 +10334,40 @@ export function WorkflowCopilotChat({
     !authoringBlocksComposerAction &&
     !isStopping &&
     !waitingOnQueueOnly;
-  // Attachments alone can't answer a question, so the last step needs a choice or text.
+  // Attachments alone can't answer a question, so the last step needs a choice or text, and a
+  // choice that asks for text needs it before any step moves on.
   const questionAnswerMissing =
     Boolean(composerQuestion) &&
-    questionStepper.isLast &&
-    questionStepper.answeredCount === 0 &&
+    (questionStepper.advanceBlocked ||
+      (questionStepper.isLast && questionStepper.answeredCount === 0)) &&
     (!turnObservablyRunning || hasComposerText);
-  const morphButtonLabel = authoringBlocksComposerAction
-    ? "Send disabled — finish the current authoring action"
-    : isStopping
-      ? "Stopping…"
-      : waitingOnQueueOnly
-        ? "Send disabled — waiting for live browser"
-        : morphButtonStarting
-          ? "Starting…"
-          : questionAnswerMissing
-            ? "Send disabled — answer or skip the question"
-            : composerQuestion && (!turnObservablyRunning || hasComposerText)
-              ? questionStepper.isLast
-                ? "Send answer"
-                : "Next question"
-              : queuedPrompt && hasComposerText
-                ? queuedPrompt.origin === "typed"
-                  ? "Add to the queued message"
-                  : "Replace queued message"
-                : !turnObservablyRunning
-                  ? isLoading
-                    ? "Queue for next turn"
-                    : "Send"
-                  : hasComposerText
-                    ? "Queue for next turn"
-                    : "Stop";
+  const morphButtonLabel = stopBlockedByDeletion
+    ? DELETION_STOP_BLOCKED_REASON
+    : authoringBlocksComposerAction
+      ? "Send disabled — finish the current authoring action"
+      : isStopping
+        ? "Stopping…"
+        : waitingOnQueueOnly
+          ? "Send disabled — waiting for live browser"
+          : morphButtonStarting
+            ? "Starting…"
+            : questionAnswerMissing
+              ? "Send disabled — answer or skip the question"
+              : composerQuestion && (!turnObservablyRunning || hasComposerText)
+                ? questionStepper.isLast
+                  ? "Send answer"
+                  : "Next question"
+                : queuedPrompt && hasComposerText
+                  ? queuedPrompt.origin === "typed"
+                    ? "Add to the queued message"
+                    : "Replace queued message"
+                  : !turnObservablyRunning
+                    ? isLoading
+                      ? "Queue for next turn"
+                      : "Send"
+                    : hasComposerText
+                      ? "Queue for next turn"
+                      : "Stop";
 
   const renderQuestionReceipt = (interaction: QuestionInteraction) =>
     interaction.account_group_review ? (
@@ -10128,6 +10385,12 @@ export function WorkflowCopilotChat({
         key={interaction.interaction_id}
         interaction={interaction}
         review={interaction.account_group_cancel}
+      />
+    ) : interaction.credential_delete_review ? (
+      <CredentialDeleteReceipt
+        key={interaction.interaction_id}
+        interaction={interaction}
+        review={interaction.credential_delete_review}
       />
     ) : (
       <QuestionReceipt
@@ -10153,6 +10416,13 @@ export function WorkflowCopilotChat({
     at: steer.delivered_at,
     node: <SteerReceipt text={steer.text} sending={false} />,
   });
+  const anchoredScreenshot = (shot: TurnScreenshot): AnchoredTurnItem => ({
+    key: `screenshot-${shot.artifactId}`,
+    toolCallId: shot.toolCallId,
+    at: shot.capturedAt,
+    inline: true,
+    node: <ScreenshotThumbnail artifactId={shot.artifactId} />,
+  });
   if (liveTurnShown) {
     liveAnchored.push(
       ...questionInteractions
@@ -10165,6 +10435,7 @@ export function WorkflowCopilotChat({
         at: steer.sentAt,
         node: <SteerReceipt text={steer.text} sending />,
       })),
+      ...narrative.screenshots.map(anchoredScreenshot),
     );
   }
   // Straight to the answer path rather than through handleSend, whose authoring and YAML-commit
@@ -10173,6 +10444,7 @@ export function WorkflowCopilotChat({
     trayQuestion &&
     handleQuestionAnswer(trayQuestion, questionStepper.buildResponse(options));
   const cancelPendingQuestion = async () => {
+    if (stopBlockedByDeletionRef.current) return;
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       await client.post("/workflow/copilot/cancel", {
@@ -10531,9 +10803,12 @@ export function WorkflowCopilotChat({
                     selectedConnectionId,
                     hasUnconsumedAdjacentMessage,
                   } = connectedAccountChoiceStateFor(messages, index);
+                  // An accepted turn keeps its receipt even when its draft lists no blocks.
                   const showReviewGate =
                     shouldShowDiffCard(message.narrative) ||
-                    (turnId !== null && turnId === pendingProposalTurnId);
+                    (turnId !== null &&
+                      (turnId === pendingProposalTurnId ||
+                        acceptedTurnIds.has(turnId)));
                   const credentialCard = (() => {
                     if (isLoadingHistory) return null;
                     const ask = terminalCredentialAskFor(
@@ -10640,6 +10915,7 @@ export function WorkflowCopilotChat({
                   anchored.push(
                     ...turnInteractions.map(anchoredQuestion),
                     ...message.narrative.steerMessages.map(anchoredSteer),
+                    ...message.narrative.screenshots.map(anchoredScreenshot),
                   );
                   return (
                     <div
@@ -10749,6 +11025,7 @@ export function WorkflowCopilotChat({
                                   ? "rejected"
                                   : null
                             }
+                            actionsShown={gateActionsShown}
                             actionsEnabled={gateActionable}
                             hasProposal={Boolean(proposedWorkflow)}
                             acceptsEnabled={gateAcceptsEnabled}
@@ -10795,6 +11072,8 @@ export function WorkflowCopilotChat({
                   );
                 }
                 const isGateOwnerOrLast = index === gateIndex && gateHasSubject;
+                const acceptedReceiptHere =
+                  !gateHasSubject && acceptReceiptAnchor === message.id;
                 const selectionReceipt = connectedAccountSelectionReceipt(
                   messages,
                   index,
@@ -10821,7 +11100,9 @@ export function WorkflowCopilotChat({
                         : null
                     }
                     footer={
-                      isGateOwnerOrLast || feedbackControl ? (
+                      isGateOwnerOrLast ||
+                      acceptedReceiptHere ||
+                      feedbackControl ? (
                         <div className="w-full space-y-2">
                           {isGateOwnerOrLast && pendingProposalRun ? (
                             <TestRunOutputCard
@@ -10829,14 +11110,15 @@ export function WorkflowCopilotChat({
                               workflow={proposedWorkflow}
                             />
                           ) : null}
-                          {isGateOwnerOrLast ? (
+                          {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
-                              pending
+                              pending={isGateOwnerOrLast}
                               verdict={getReviewGateVerdict(
                                 gateOwnerNarrative,
                                 proposedWorkflow,
                               )}
-                              settled={null}
+                              settled={acceptedReceiptHere ? "accepted" : null}
+                              actionsShown={gateActionsShown}
                               actionsEnabled={gateActionable}
                               hasProposal={Boolean(proposedWorkflow)}
                               acceptsEnabled={gateAcceptsEnabled}
@@ -10896,7 +11178,8 @@ export function WorkflowCopilotChat({
               </div>
             ) : null}
             {recoveryBanner}
-            {gateHasSubject && !gateOwnerRendersInline ? (
+            {(gateHasSubject && !gateOwnerRendersInline) ||
+            detachedReceiptShown ? (
               <div className="space-y-2">
                 {pendingProposalRun ? (
                   <TestRunOutputCard
@@ -10905,9 +11188,10 @@ export function WorkflowCopilotChat({
                   />
                 ) : null}
                 <ReviewGateCard
-                  pending
+                  pending={!detachedReceiptShown}
                   verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
-                  settled={null}
+                  settled={detachedReceiptShown ? "accepted" : null}
+                  actionsShown={gateActionsShown}
                   actionsEnabled={gateActionable}
                   hasProposal={Boolean(proposedWorkflow)}
                   acceptsEnabled={gateAcceptsEnabled}
@@ -10918,8 +11202,8 @@ export function WorkflowCopilotChat({
                     proposedWorkflow
                       ? () => handleReviewWorkflow(proposedWorkflow)
                       : // Reached in the gates that outlive the proposal they were opened over.
-                        // There is nothing staged to open, and `hasProposal` locks the fieldset
-                        // Review sits in, so nothing in the UI calls this.
+                        // There is nothing staged to open, and without `hasProposal` the card
+                        // renders no Review, so nothing in the UI calls this.
                         () => {}
                   }
                   onTestEndToEnd={handleTestEndToEnd}
@@ -11223,6 +11507,30 @@ export function WorkflowCopilotChat({
             }
             upNext={attentionUpNext}
           />
+        ) : trayQuestion?.credential_delete_review ? (
+          <CredentialDeleteReviewCard
+            key={trayQuestion.interaction_id}
+            review={trayQuestion.credential_delete_review}
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            deleting={isDeleting(trayQuestion)}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onConfirm={(credentialIds) => {
+              void handleQuestionAnswer(
+                trayQuestion,
+                { credential_ids: credentialIds },
+                "/workflow/copilot/credential-deletion",
+              );
+              // handleQuestionAnswer runs synchronously up to its send, so this is set only when a confirm went out.
+              if (submittingQuestion.current)
+                setConfirmingDeletion(trayQuestion);
+            }}
+            onCancel={() =>
+              void handleQuestionAnswer(trayQuestion, { skipped: true })
+            }
+            upNext={attentionUpNext}
+          />
         ) : trayQuestion?.account_group_cancel ? (
           <AccountGroupCancelCard
             key={trayQuestion.interaction_id}
@@ -11252,6 +11560,7 @@ export function WorkflowCopilotChat({
             onSend={() => void sendQuestionTray()}
             // Skip on the last step sends what was answered, or skips the question outright.
             onSkip={() => void sendQuestionTray({ omitCurrent: true })}
+            onAnswerInComposer={() => textareaRef.current?.focus()}
             onCancel={
               questionCancelToken
                 ? () => void cancelPendingQuestion()
@@ -11260,9 +11569,16 @@ export function WorkflowCopilotChat({
             // Cancelling reloads the turn, which can stage a newer proposal for a pending
             // Accept to overwrite. Same reason the answer path is fenced.
             cancelDisabled={
-              isLoading || acceptUnresolved || isSubmittingQuestion
+              isLoading ||
+              acceptUnresolved ||
+              isSubmittingQuestion ||
+              deletingCredentials
             }
-            cancelTitle={acceptHoldReason ?? undefined}
+            cancelTitle={
+              deletingCredentials
+                ? DELETION_STOP_BLOCKED_REASON
+                : (acceptHoldReason ?? undefined)
+            }
             upNext={attentionUpNext}
           />
         ) : null}
@@ -11350,6 +11666,7 @@ export function WorkflowCopilotChat({
                 : questionStepper.choices[trayPart.part_id] === undefined
                   ? "unpicked"
                   : "picked",
+              detailPrompt: questionStepper.detailPrompt,
             })}
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
@@ -11358,7 +11675,9 @@ export function WorkflowCopilotChat({
             aria-label={composerQuestion ? "Your response" : undefined}
             aria-describedby={
               composerQuestion && !questionTrayCollapsed
-                ? QUESTION_PROMPT_ID
+                ? questionStepper.detailPrompt
+                  ? `${QUESTION_PROMPT_ID} ${QUESTION_DETAIL_ID}`
+                  : QUESTION_PROMPT_ID
                 : undefined
             }
             disabled={authoringInProgress}
@@ -11443,6 +11762,7 @@ export function WorkflowCopilotChat({
                   )
                 }
                 blocked={
+                  stopBlockedByDeletion ||
                   waitingOnQueueOnly ||
                   acceptUnresolved ||
                   authoringBlocksComposerAction ||
@@ -11452,6 +11772,7 @@ export function WorkflowCopilotChat({
                 <button
                   type="button"
                   disabled={
+                    stopBlockedByDeletion ||
                     waitingOnQueueOnly ||
                     isStopping ||
                     acceptUnresolved ||

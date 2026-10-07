@@ -140,11 +140,17 @@ FINAL_REPLY_OBSERVATION = (
     NUDGE_SENTINEL + "Your last response was empty. Tools are unavailable for this one response; "
     "reply to the user now with your final response for this turn."
 )
-RAW_SECRET_REPLY_WITHHELD_OBSERVATION = (
-    NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it contained "
-    "text shaped like a raw secret: a value written after a password, passcode, secret, API key, or token label. "
-    "Tools are unavailable for this one response; reply to the user now with your final response for this turn."
-)
+
+
+def raw_secret_reply_withheld_observation(label: str | None) -> str:
+    flagged = f" The flagged value was the one given for `{label}`." if label else ""
+    return (
+        NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it read the "
+        f"reply as containing a raw secret value.{flagged} Tools are unavailable for this one response; reply to the user now with your "
+        "final response for this turn."
+    )
+
+
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
@@ -1003,9 +1009,9 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
     return unread
 
 
-def stable_prefix_anchor(items: Sequence[TResponseInputItem]) -> int | None:
-    """Return the index of the last tool output or real user message that precedes both the compaction window and
-    every unpruned screenshot. Later model calls resend every item up to that index unchanged."""
+def stable_prefix_anchors(items: Sequence[TResponseInputItem]) -> list[int]:
+    """Return, oldest first, the index of every tool output or real user message that precedes both the compaction
+    window and every unpruned screenshot. Later model calls resend every item up to the last of them unchanged."""
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
     unstable = {
@@ -1018,13 +1024,12 @@ def stable_prefix_anchor(items: Sequence[TResponseInputItem]) -> int | None:
             if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
         ),
     }
-    for index in range(min(unstable, default=len(items)) - 1, -1, -1):
-        item = items[index]
-        if _item_field(item, "type") == "function_call_output" or (
-            _item_field(item, "role") == "user" and not is_synthetic_user_message(item)
-        ):
-            return index
-    return None
+    return [
+        index
+        for index, item in enumerate(items[: min(unstable, default=len(items))])
+        if _item_field(item, "type") == "function_call_output"
+        or (_item_field(item, "role") == "user" and not is_synthetic_user_message(item))
+    ]
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:

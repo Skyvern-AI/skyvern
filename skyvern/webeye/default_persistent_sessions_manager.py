@@ -22,6 +22,7 @@ from skyvern.exceptions import (
     BrowserSessionNotExtendable,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSettingsUnsupported,
     MissingBrowserAddressError,
 )
 from skyvern.forge import app
@@ -52,9 +53,11 @@ from skyvern.schemas.browser_session_timeouts import (
     MAX_TIMEOUT,
     creation_timeout_minutes,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, requested_timezone_id
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
+from skyvern.webeye.browser_settings_receipts import record_session_timezone_receipt
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _allocate_cdp_port, _release_cdp_port
 from skyvern.webeye.persistent_sessions_manager import (
@@ -683,8 +686,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
         expected_browser_session_id: str | None = None,
+        browser_settings: BrowserSettings | None = None,
+        created_for_workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
+        # The browser launches after this returns, so a dialed CDP browser that cannot take a timezone is refused now.
+        if settings.BROWSER_TYPE == "cdp-connect" and requested_timezone_id(browser_settings) is not None:
+            raise BrowserSettingsUnsupported()
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
@@ -712,6 +720,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
                 profile_read_only=profile_read_only,
                 created_by=created_by,
+                browser_settings=browser_settings,
+                created_for_workflow_run_id=created_for_workflow_run_id,
             )
         except BaseException as error:
             # A failed acknowledgement does not prove the committed session is an orphan.
@@ -765,6 +775,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 browser_profile_id=session.browser_profile_id,
                 profile_read_only=session.profile_read_only,
                 cdp_port=cdp_port,
+                timezone_id=requested_timezone_id(session.browser_settings),
                 runtime_event_context=BrowserRuntimeLogContext(
                     browser_session_id=session_id,
                     organization_id=organization_id,
@@ -777,6 +788,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )
+            if requested_timezone_id(session.browser_settings) is not None:
+                await record_session_timezone_receipt(session, await browser_state.get_working_page())
             browser_address = await _probe_local_cdp_address(cdp_port) if cdp_port is not None else None
 
             session = await self.get_session(session_id, organization_id)

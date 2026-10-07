@@ -206,6 +206,14 @@ async def click(
         await target.click(**options)
 
 
+async def dblclick(realm: Realm, target: str | Locator, *, timeout: float | None = None) -> None:
+    await _hold_submit(realm)
+    if isinstance(target, str):
+        await realm.dblclick(target, **_opts(timeout=timeout))
+    else:
+        await target.dblclick(**_opts(timeout=timeout))
+
+
 async def click_handle(
     realm: Realm,
     handle: ElementHandle,

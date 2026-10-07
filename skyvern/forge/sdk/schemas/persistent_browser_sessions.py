@@ -13,6 +13,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_timeouts import lived_full_lifetime
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 
@@ -127,6 +128,10 @@ class PersistentBrowserSession(BaseModel):
     generate_browser_profile: bool = False
     bound_workflow_permanent_id: str | None = None
     bound_key: str | None = None
+    browser_settings: BrowserSettings | None = None
+    browser_settings_receipt: BrowserSettingsReceipt | None = None
+    # The workflow run whose own setup created this session; never set for a session a caller attaches.
+    created_for_workflow_run_id: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True

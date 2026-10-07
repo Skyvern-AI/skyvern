@@ -1600,11 +1600,14 @@ async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None
 
 
 @pytest.mark.asyncio
-async def test_age_default_rides_the_task_message_only_and_leaves_the_system_prompt_alone(
+async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system_prompt_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def run(hook_result: tuple[str | None, str] | None) -> tuple[str, str, dict[str, Any]]:
-        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: hook_result)
+    Hook = tuple[str | None, str] | None
+
+    async def run(age: Hook, application: Hook) -> tuple[str, str, dict[str, Any]]:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: age)
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", lambda parameters: application)
         with capture_logs() as logs:
             outcome = await run_task_v3_agent_loop(
                 page_provider=_fixed_page_provider(_FakePage()),
@@ -1616,15 +1619,25 @@ async def test_age_default_rides_the_task_message_only_and_leaves_the_system_pro
         terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
         return by_role["system"], by_role["user"], terminal
 
-    base_system, base_user, base_log = await run(None)
-    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"))
-    rendered_system, rendered_user, rendered_log = await run(("AGE DEFAULT TEXT", "rendered"))
+    base_system, base_user, base_log = await run(None, None)
+    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"), None)
+    age_system, age_user, age_log = await run(("AGE DEFAULT TEXT", "rendered"), None)
+    both_system, both_user, both_log = await run((None, "age_field_present"), ("APPLICATION DEFAULTS TEXT", "rendered"))
+    all_system, all_user, all_log = await run(
+        ("AGE DEFAULT TEXT", "rendered"), ("APPLICATION DEFAULTS TEXT", "rendered")
+    )
 
-    assert base_system.startswith(SYSTEM_PROMPT) and base_system == withheld_system == rendered_system
-    assert base_user == withheld_user and rendered_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert base_system.startswith(SYSTEM_PROMPT)
+    assert base_system == withheld_system == age_system == both_system == all_system
+    assert base_user == withheld_user and age_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert both_user == base_user + "\n\nAPPLICATION DEFAULTS TEXT"
+    assert all_user == base_user + "\n\nAGE DEFAULT TEXT\n\nAPPLICATION DEFAULTS TEXT"
     assert (base_log["age_default_rendered"], base_log["age_default_reason"]) == (False, None)
     assert (withheld_log["age_default_rendered"], withheld_log["age_default_reason"]) == (False, "age_field_present")
-    assert (rendered_log["age_default_rendered"], rendered_log["age_default_reason"]) == (True, "rendered")
+    assert (age_log["age_default_rendered"], age_log["age_default_reason"]) == (True, "rendered")
+    # Each default keeps its own field, so one entry's outcome read never counts the other's renders.
+    assert (both_log["age_default_rendered"], both_log["application_defaults_rendered"]) == (False, True)
+    assert (age_log["application_defaults_rendered"], age_log["application_defaults_reason"]) == (False, None)
 
 
 @pytest.mark.asyncio

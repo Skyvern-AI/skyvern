@@ -590,7 +590,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 8
+CLASSIFIER_VERSION = 10
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -614,41 +614,83 @@ WORKER_CONTAINER_RESTARTED_REASON_CODE = "worker_container_restarted"
 UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
 SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
+SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
+SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
 
 # ANTI_BOT_DETECTION entries carrying one of these are labels only: runtime consumers must treat the
 # failure exactly as they did before it was labeled anti-bot. Code that acts on a failure_category it
-# reads (or hands to a model) must go through without_output_only_anti_bot or skip these entries.
+# reads (or hands to a model) must go through without_output_only_labels or skip these entries.
 OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
     {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE}
 )
+# Entries of any category carrying one of these are labels for the run page; the same scrub hides them.
+OUTPUT_ONLY_LABEL_REASON_CODES = frozenset({SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE})
 
 
-def is_output_only_anti_bot_entry(category: object) -> bool:
-    return (
-        isinstance(category, dict)
-        and category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
-        and category.get("reason_code") in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+def with_sign_in_form_visible(categories: list[dict] | None) -> list[dict]:
+    """Append a record that the failure stopped on a visible sign-in form. Appending keeps the primary entry, which
+    attribution, run tags and metrics read, and WRONG_PAGE_STATE has no runtime reader (ADR 0028)."""
+    sign_in = {
+        "category": FailureCategory.WRONG_PAGE_STATE.value,
+        "confidence_float": 0.9,
+        "reason_code": SIGN_IN_FORM_VISIBLE_REASON_CODE,
+        "reasoning": "A sign-in form was showing on the page when the block failed",
+    }
+    return [*(categories or []), sign_in]
+
+
+def with_saved_profile_signed_out(categories: list[dict] | None) -> list[dict] | None:
+    """``categories`` with its sign-in form entry marked as a saved profile to sign in again, or None if it has none;
+    only that reason code changes, and no runtime decision reads it (ADR 0028). AUTH_FAILURE and CREDENTIAL_ERROR do
+    not count: keyword matches, author-declared codes and vault lookups produce them without any sign-in page."""
+    entries = categories or []
+    index = next(
+        (
+            i
+            for i, entry in enumerate(entries)
+            if isinstance(entry, dict) and entry.get("reason_code") == SIGN_IN_FORM_VISIBLE_REASON_CODE
+        ),
+        None,
+    )
+    if index is None:
+        return None
+    tagged = list(entries)
+    tagged[index] = {
+        **entries[index],
+        "reason_code": SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        "reasoning": "The run started from a saved browser profile no credential backs, and stopped at a sign-in",
+    }
+    return tagged
+
+
+def is_output_only_entry(category: object) -> bool:
+    if not isinstance(category, dict):
+        return False
+    reason_code = category.get("reason_code")
+    return reason_code in OUTPUT_ONLY_LABEL_REASON_CODES or (
+        category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
+        and reason_code in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
     )
 
 
-def without_output_only_anti_bot_categories(categories: list) -> list:
-    return [category for category in categories if not is_output_only_anti_bot_entry(category)]
+def without_output_only_categories(categories: list) -> list:
+    return [category for category in categories if not is_output_only_entry(category)]
 
 
-def without_output_only_anti_bot(value: Any) -> Any:
-    """``value`` with output-only anti-bot entries removed from every ``failure_category`` list in it; customer
+def without_output_only_labels(value: Any) -> Any:
+    """``value`` with output-only entries removed from every ``failure_category`` list in it; customer
     data shaped like a category elsewhere is left alone, and a value with no marked entry is returned as is."""
-    return _scrub_output_only_anti_bot(value) if _has_output_only_anti_bot(value) else value
+    return _scrub_output_only_labels(value) if _has_output_only_label(value) else value
 
 
 # Iterative and copy-free: every registered block output pays this walk, and almost none carry a marked entry.
-def _has_output_only_anti_bot(value: Any) -> bool:
+def _has_output_only_label(value: Any) -> bool:
     pending = [value]
     while pending:
         item = pending.pop()
         if isinstance(item, dict):
             categories = item.get("failure_category")
-            if isinstance(categories, list) and any(is_output_only_anti_bot_entry(c) for c in categories):
+            if isinstance(categories, list) and any(is_output_only_entry(c) for c in categories):
                 return True
             pending.extend(item.values())
         elif isinstance(item, list):
@@ -656,14 +698,14 @@ def _has_output_only_anti_bot(value: Any) -> bool:
     return False
 
 
-def _scrub_output_only_anti_bot(value: Any) -> Any:
+def _scrub_output_only_labels(value: Any) -> Any:
     if isinstance(value, list):
-        return [_scrub_output_only_anti_bot(item) for item in value]
+        return [_scrub_output_only_labels(item) for item in value]
     if isinstance(value, dict):
         return {
-            key: without_output_only_anti_bot_categories(item)
+            key: without_output_only_categories(item)
             if key == "failure_category" and isinstance(item, list)
-            else _scrub_output_only_anti_bot(item)
+            else _scrub_output_only_labels(item)
             for key, item in value.items()
         }
     return value
@@ -688,6 +730,8 @@ _REASON_CODE_LITERALS = frozenset(
         EXTERNAL_SERVICE_THROTTLE_REASON_CODE,
         UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
         WORKER_CONTAINER_RESTARTED_REASON_CODE,
+        SIGN_IN_FORM_VISIBLE_REASON_CODE,
+        SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
     }
 )
 

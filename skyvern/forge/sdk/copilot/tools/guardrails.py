@@ -154,7 +154,7 @@ def _authority_tool_error(
                 classifier_mode="code_block_ai_fallback",
                 internal_reason_code="code_block_ai_fallback_native_tool_blocked",
                 agent_steering_text=(
-                    "The code block AI fallback allows browser MCP tools only; do not call native copilot tools."
+                    "The code block AI fallback can use only the browser tools; this tool is not available here."
                 ),
                 user_facing_reason="The code block AI fallback cannot use this tool.",
                 recovery_hint="stop",

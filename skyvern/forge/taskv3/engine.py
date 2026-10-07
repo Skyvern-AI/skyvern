@@ -116,6 +116,10 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
 # may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
+# The token guards charge the prefix re-sent on every call only up to this; 99.5% of v3 tasks' prefixes are below it.
+PREFIX_REF_TOKENS = 20_000
+# Never-extended spend cap on all tokens sent: 30 of 36 token deaths at a 60K+ prefix reach 67 turns under it (6M: 15).
+MAX_RAW_TOKENS = 2 * MAX_TOKENS_CEILING
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
@@ -587,6 +591,9 @@ async def run_task_v3_agent_loop(
         system_prompt += OPAQUE_URL_GUIDANCE
     age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
     age_default_text, age_default_reason = age_default or (None, None)
+    application_defaults = None if page_free else app.AGENT_FUNCTION.task_v3_application_defaults(parameters)
+    application_defaults_text, application_defaults_reason = application_defaults or (None, None)
+    defaults_text = "\n\n".join(text for text in (age_default_text, application_defaults_text) if text)
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal
@@ -594,7 +601,7 @@ async def run_task_v3_agent_loop(
         # The goal is message 1 of every turn and an over-limit request is refused without retry, so typed rows get
         # what the smallest dispatchable model's input limit leaves after the rest of the request, the tool schemas,
         # and the page-read characters the loop retains (at approx_count_tokens' 4 characters per token).
-        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{age_default_text or ''}"
+        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{defaults_text}"
         budget = (
             (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
             - count_tokens(system_prompt)
@@ -605,8 +612,8 @@ async def run_task_v3_agent_loop(
         prompt_goal = "\n".join([model_goal, *typed_value_rows(code_typed_values, budget)])
     user_prompt = build_user_prompt(prompt_goal, refs.masked, model_starting_url)
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
-    if age_default_text:
-        user_prompt += f"\n\n{age_default_text}"
+    if defaults_text:
+        user_prompt += f"\n\n{defaults_text}"
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
@@ -624,6 +631,8 @@ async def run_task_v3_agent_loop(
             on_action_round=on_action_round,
             on_pre_action=on_pre_action,
             max_tokens=max_tokens,
+            prefix_ref_tokens=PREFIX_REF_TOKENS,
+            max_raw_tokens=MAX_RAW_TOKENS,
             deadline_seconds=deadline_seconds,
             retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
             max_call_retries=DEFAULT_MAX_CALL_RETRIES,
@@ -730,6 +739,8 @@ async def run_task_v3_agent_loop(
         has_navigation_goal=has_navigation_goal,
         age_default_rendered=bool(age_default_text),
         age_default_reason=age_default_reason,
+        application_defaults_rendered=bool(application_defaults_text),
+        application_defaults_reason=application_defaults_reason,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_CANCEL_TOOL_NAME,
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    CREDENTIAL_DELETE_TOOL_NAME,
     AskUserArguments,
     QuestionInput,
 )
@@ -31,7 +32,7 @@ from skyvern.forge.sdk.copilot.browser_target import (
     resolve_browser_session_binding,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
-    composition_page_evidence_error as composition_page_evidence_error,
+    composition_page_evidence_missing as composition_page_evidence_missing,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema as has_bounded_page_schema
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -70,6 +71,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
+    capturing_tool_call,
     enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
@@ -81,6 +83,13 @@ from skyvern.forge.sdk.copilot.tools.account_groups import (
     account_group_submit_enabled,
     cancel_account_group,
     run_for_accounts,
+)
+from skyvern.forge.sdk.copilot.tools.credential_deletion import (
+    DELETE_TOOL_DESCRIPTION as CREDENTIAL_DELETE_TOOL_DESCRIPTION,
+)
+from skyvern.forge.sdk.copilot.tools.credential_deletion import (
+    credential_delete_enabled,
+    delete_saved_credentials,
 )
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
@@ -110,7 +119,9 @@ from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPP
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
+from ._shared import EDIT_BLOCK_AND_RUN_TOOL_NAME, EDIT_BLOCK_TOOL_NAME
 from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEILING_SECONDS
+from ._shared import UPDATE_AND_RUN_BLOCKS_TOOL_NAME, UPDATE_WORKFLOW_TOOL_NAME
 from ._shared import AdmittedOutputRead as AdmittedOutputRead
 from ._shared import RequestedOutputRead as RequestedOutputRead
 from ._shared import _composition_get_html as _composition_get_html
@@ -318,7 +329,7 @@ def _credential_deferred_draft_message(copilot_ctx: CopilotContext) -> str:
     if not credential_pause_transport_ready(copilot_ctx, copilot_ctx.copilot_config):
         return _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
     origins = {raw_secret_card_origin(url) for url in policy.user_provided_site_urls} - {""}
-    site_hint = f" ({', '.join(sorted(origins))})" if origins else "; ask with `ask_user` if the user gave none"
+    site_hint = f" ({', '.join(sorted(origins))})" if origins else "; ask the user for it if they gave none"
     return _REDACTED_SECRET_DEFERRED_DRAFT_MESSAGE.format(site_hint=site_hint)
 
 
@@ -376,8 +387,8 @@ async def update_workflow_tool(
     in observed MCP evidence or information the user supplied.
     When you compose no-url blocks from a page reached by prior clicks, include
     `block_observation_refs` entries with each block label and the
-    `observation_step` returned by inspect_page_for_composition for the page
-    that block acts on.
+    `observation_step` the page observation returned for the page that block
+    acts on.
     For authored code blocks, include `code_artifact_metadata` rows describing
     declared goals, claimed outcomes, page dependencies, criteria, evidence
     refs, observation refs, and terminal verifier expectations.
@@ -401,7 +412,6 @@ async def update_workflow_tool(
         result = await _update_workflow(
             {
                 **arguments,
-                "raw_block_observation_refs": block_observation_refs,
                 "raw_code_artifact_metadata": code_artifact_metadata,
             },
             copilot_ctx,
@@ -456,7 +466,6 @@ async def _persist_block_scoped_edit(
         params["raw_code_artifact_metadata"] = code_artifact_metadata
     if block_observation_refs is not None:
         params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
-        params["raw_block_observation_refs"] = block_observation_refs
     if rebuilt_block_labels:
         params["_rebuilt_block_labels"] = rebuilt_block_labels
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
@@ -482,7 +491,7 @@ def _stored_workflow_yaml(copilot_ctx: Any) -> str:
     return stored_workflow_yaml(copilot_ctx)
 
 
-@function_tool(failure_error_function=copilot_tool_failure, name_override="edit_block", strict_mode=False)
+@function_tool(failure_error_function=copilot_tool_failure, name_override=EDIT_BLOCK_TOOL_NAME, strict_mode=False)
 async def edit_block_tool(
     ctx: RunContextWrapper,
     label: str,
@@ -492,8 +501,8 @@ async def edit_block_tool(
 ) -> str:
     """Change one block, leaving every other block exactly as it is.
 
-    Prefer this over update_and_run_blocks whenever you are changing an existing block: you send only
-    the change, so a block that already works cannot be disturbed and the workflow is not retyped.
+    Prefer this over resending the whole workflow whenever you are changing an existing block: you send
+    only the change, so a block that already works cannot be disturbed and the workflow is not retyped.
 
     For a `code` block, pass `expected_code` (a snippet of its current code, unique within that block)
     and `replacement_code`. The edit is rejected if the snippet is missing or appears more than once,
@@ -550,7 +559,7 @@ async def edit_block_tool(
 
 @function_tool(
     failure_error_function=copilot_tool_failure,
-    name_override="edit_block_and_run",
+    name_override=EDIT_BLOCK_AND_RUN_TOOL_NAME,
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
 )
@@ -578,9 +587,8 @@ async def edit_block_and_run_tool(
     evidence returned by ``run_blocks_and_collect_debug``; a failed run still leaves the edited draft
     and recorded workflow run available for the next turn.
 
-    Pass current non-secret values for runtime workflow parameters in ``parameters``. For sensitive
-    values (password, secret, token, api_key, credential, totp, otp, one_time_code, private_key,
-    auth), do NOT pass an inline value. Ask the user to store it as a saved
+    Pass current non-secret values for runtime workflow parameters in ``parameters``. For a raw
+    secret value (for example, a password), do NOT pass an inline value. Ask the user to store it as a saved
     credential and reply with the credential name; do not build or run with the raw value.
     """
     copilot_ctx = ctx.context
@@ -765,8 +773,8 @@ async def add_block_tool(
 ) -> str:
     """Add one new block after an existing one, leaving every other block exactly as it is.
 
-    Prefer this over update_and_run_blocks whenever you are adding to a workflow that already exists:
-    you send only the new block, so the blocks that already work cannot be disturbed and the workflow
+    Prefer this over resending the whole workflow whenever you are adding to a workflow that already
+    exists: you send only the new block, so the blocks that already work cannot be disturbed and the workflow
     is not retyped. `after_label` must name a block that exists; the new block is linked in directly
     after it and inherits what that block pointed at.
 
@@ -776,11 +784,9 @@ async def add_block_tool(
     have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
     code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
 
-    Each workflow parameter is a flat object. For example:
-    `{"parameter_type": "workflow", "key": "billing_history_path",
-    "workflow_parameter_type": "string", "default_value": "BillingHistory.jsp"}`.
-    Inspect or run the saved workflow to obtain a useful editable default when
-    the page can reveal it; do not nest these fields under `workflow`.
+    Each workflow parameter is a flat object, for example
+    `{"parameter_type": "workflow", "key": "...", "workflow_parameter_type": "string", "default_value": "..."}`.
+    Take its `default_value` from the page when inspecting or running the saved workflow shows one.
 
     To change a block that already exists use edit_block; to remove one use delete_block.
     """
@@ -965,7 +971,7 @@ async def list_credentials_tool(
     exact_reference: str | None = None,
 ) -> str:
     """List stored credentials (metadata only — never passwords or secrets).
-    Use this to find credential IDs for login blocks.
+    Use this to find the credential IDs a workflow can log in with.
 
     When the agent selects a saved name or credential ID that appears as a complete
     credential reference in the latest literal user turn, or is already selected in the saved
@@ -1066,15 +1072,29 @@ async def request_credential_tool(
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override="ask_user")
 async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionInput]) -> str:
-    """Ask the user questions in an inline card and receive their response before continuing.
+    """Ask the user questions in an inline card when information is required before you can continue, and
+    receive their response in this same call.
 
     Keep questions and choice labels concise. Aim for 200 characters or fewer per question or choice, and offer no more than eight choices.
 
-    Give each question a prompt and optional choices. The card always has a bottom free-text
-    field. Users can submit choices, free text, or both, answer some parts, or skip. The result
+    Use it for general preferences, missing information, partial answers, or clarification. Give one
+    part per thing you need, each with a prompt and optional choices. The card always has a bottom
+    free-text field. Users can submit choices, free text, or both, answer some parts, or skip. The result
     preserves the questions, chosen options, free text, and unanswered parts. Decide what to do
-    next from those facts, including explaining or asking again. Use request_credential for
-    credentials; an ordinary answer does not change existing action or credential permissions.
+    next from those facts, including explaining or asking again. A choice the user picked is their
+    decision: act on that option, never on a different option or a default of your own; if it still
+    needs a detail they did not give, ask for that detail. When something only the user can supply is
+    still missing, including a part they skipped or left unanswered, ask for it again with this tool,
+    offering choices when there are only a few possible answers, rather than listing it in your reply.
+    Use request_credential for credentials; an ordinary answer does not change existing action or
+    credential permissions.
+
+    When you already prefer one choice, set `recommended` on it; the card lists it first and tags
+    it. The card always ends the choices with its own "Other" that takes a typed answer, so never
+    add a catch-all choice such as "Other" or "Something else". Give a choice a `detail_prompt`
+    when it cannot be acted on without more detail ("Choose another restaurant" with "Which
+    restaurant?"); the user must type that detail to pick it, and a part whose status is
+    `detail_missing` came back without it.
     """
     from skyvern.forge.sdk.copilot.ask_user import ask_user
 
@@ -1125,6 +1145,17 @@ async def cancel_account_group_tool(ctx: ToolContext[CopilotContext], workflow_r
     return result.model_dump_json(exclude_none=True)
 
 
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=CREDENTIAL_DELETE_TOOL_NAME,
+    description_override=CREDENTIAL_DELETE_TOOL_DESCRIPTION,
+)
+async def delete_saved_credentials_tool(ctx: ToolContext[CopilotContext], credential_ids: list[str]) -> str:
+    return json.dumps(
+        await delete_saved_credentials(ctx.context, tool_call_id=ctx.tool_call_id, credential_ids=credential_ids)
+    )
+
+
 # This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
 # Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
 @function_tool(failure_error_function=copilot_tool_failure, name_override="set_work_plan")
@@ -1155,10 +1186,10 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     login credentials returned by `list_credentials` — the two lists are disjoint,
     so check this one before concluding the user has no Google or Microsoft access.
     Prefer a purpose-built native integration block over automating that connected
-    service through its browser UI. For Google Sheets, call `get_block_schema` for
-    `google_sheets_read` or `google_sheets_write`, then pass an active compatible
-    connection's `connection_id` as the block's `credential_id`. Not paginated; one
-    call returns every connection.
+    service through its browser UI. For Google Sheets, author a `google_sheets_read`
+    or `google_sheets_write` block and pass an active compatible connection's
+    `connection_id` as its `credential_id`. Not paginated; one call returns every
+    connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block
@@ -1168,17 +1199,14 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
     When the current request identifies one active, scope-compatible row, bind its
     exact `connection_id` as the native block's `credential_id` and continue.
-    For a build-and-test request, pass the completed workflow and the bound block
-    label to `update_and_run_blocks` in the same turn; do not stop at
-    `update_workflow`.
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
 
     A `credential_id` may instead be the connection `name` or `email_address`
     exactly as the user wrote it in this turn. The server resolves it and reports
-    the outcome under `google_connection_resolution` in the `update_workflow`
-    result: `resolved` rewrites the slot to the `connection_id`, while `ambiguous`,
+    the outcome under `google_connection_resolution` in the result of the call
+    that saves the workflow: `resolved` rewrites the slot to the `connection_id`, while `ambiguous`,
     `not_found`, `ineligible`, and `not_cited` leave it alone and return the
     eligible rows to clarify against. A slot still holding an unresolved reference
     cannot run.
@@ -1283,21 +1311,10 @@ async def run_blocks_tool(
     user saved by signing in from the credential card this turn: a draft that selects it loads it now.
 
     If an existing saved block can establish the state you need, run that
-    block unchanged before scouting the resulting page. In particular, a saved
-    login block can use its bound credential during the workflow run even when
-    that credential is not authorized for direct debug-browser filling.
-
-    For diagnostic complaints with no prior edit goal, inspect the current
-    workflow and existing run evidence before deciding whether a fresh run is
-    needed. If prior context establishes a resolvable edit, use
-    `update_and_run_blocks` instead of rerunning unchanged blocks.
+    block unchanged before scouting the resulting page.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
-    keys must match the workflow parameter `key` field. When the user has
-    supplied concrete non-secret values in their message (names, emails, IDs),
-    pass them on the first call rather than letting the workflow fall back to
-    placeholders. For sensitive values (password, secret, token, api_key,
-    credential, totp, otp, one_time_code, private_key, auth) — call
+    keys must match the workflow parameter `key` field. For a raw secret value (for example, a password), call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
     the inline value via `parameters`. Ask the user to store it as a saved
@@ -1385,7 +1402,7 @@ async def test_workflow_from_blank_browser_tool(
     This tests code-established prerequisites, not configured authenticated-profile behavior;
     the workflow's saved profile settings are retained. Choose this test when useful; ordinary
     partial-run tools keep their current scope. Supply runtime workflow inputs in parameters.
-    For secrets, use saved credential references rather than raw passwords or one-time codes.
+    For a raw secret value (for example, a password), use a saved credential reference instead.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
@@ -1514,7 +1531,7 @@ def _promote_executed_sources(
 
 @function_tool(
     failure_error_function=copilot_tool_failure,
-    name_override="update_and_run_blocks",
+    name_override=UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
     tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
@@ -1551,16 +1568,8 @@ async def update_and_run_blocks_tool(
     reusable domain value the user supplies, not the page widget or action used
     to enter it.
 
-    For diagnostic complaints with no prior edit goal, inspect the current
-    workflow and run evidence first. A diagnostic follow-up after an explicit
-    edit goal may update and run once the correction is clear.
-
     Pass runtime values for workflow parameters via the `parameters` dict —
-    keys must match the workflow parameter `key` field. When the user has
-    supplied concrete non-secret values in their message (names, emails, IDs),
-    pass them on the first call rather than letting the workflow fall back to
-    placeholders. For sensitive values (password, secret, token, api_key,
-    credential, totp, otp, one_time_code, private_key, auth) — call
+    keys must match the workflow parameter `key` field. For a raw secret value (for example, a password), call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
     the inline value via `parameters`. Ask the user to store it as a saved
@@ -1571,8 +1580,6 @@ async def update_and_run_blocks_tool(
     building, editing, or debugging the workflow. Do not invent URL params,
     form fields, result affordances, or page structure from memory; ground
     workflow blocks in observed MCP evidence or information the user supplied.
-    Only refine URL params when they are grounded in observed DOM/link/form
-    state or observed URL deltas.
     Browser inspection is build-time context; add durable workflow blocks only
     for the reusable actions/checks the workflow actually needs.
     When you compose no-url blocks from a page reached by prior clicks, include
@@ -1582,9 +1589,6 @@ async def update_and_run_blocks_tool(
     For authored code blocks, include `code_artifact_metadata` rows describing
     declared goals, claimed outcomes, page dependencies, criteria, evidence
     refs, observation refs, and terminal verifier expectations.
-    When inspected evidence shows an anti-bot challenge gating a disabled
-    submit/search control, account for challenge resolution before submit;
-    do not compose a click against a control observed as disabled.
     """
     workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
@@ -1622,7 +1626,6 @@ async def update_and_run_blocks_tool(
     update_params: dict[str, Any] = {
         "workflow_yaml": workflow_yaml,
         "block_observation_refs": normalized_block_observation_refs,
-        "raw_block_observation_refs": block_observation_refs,
         "code_artifact_metadata": serialized_code_artifact_metadata,
         "raw_code_artifact_metadata": code_artifact_metadata,
         "block_labels": block_labels,
@@ -1836,9 +1839,7 @@ async def discover_workflow_entrypoint_tool(
 async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int = 10) -> str:
     """Search the web for pages matching a query, when you need candidate sites rather than one known page.
 
-    Use this while scouting -- to find companies, suppliers, listings, or
-    documentation pages the user described but did not name, or the URL of a
-    site the user named without giving one. ``results`` holds
+    It also finds the URL of a site you know only by name. ``results`` holds
     up to ``max_results`` (1 to 100) entries with ``title``, ``url`` and ``snippet``, each
     ``url`` a direct absolute link to the result site.
 
@@ -1964,16 +1965,13 @@ async def inspect_page_for_composition_tool(
     can also inspect the current browser page after a run by passing
     target_url="current_page". `target="debug"` (the default) keeps the read on
     the browser this chat drives; `target="last_run"` reads the browser used by
-    the most recent test run. Use the latter after partial/budgeted runs so you do
-    not replay a search that already advanced the page. Passing any other
+    the most recent test run. Passing any other
     `target_url` navigates the targeted browser there and reports the reached
     `current_url`, so a further `navigate_browser` to that same URL is redundant. Navigating
     `target="last_run"` leaves the page that run stopped on, losing the state you are diagnosing,
     and anything it submits there is real; pass `target_url="current_page"` to observe that browser
     without moving it. The packet
-    describes the page only as it is at that moment: a control that appears solely after an
-    interaction -- a Delete control after an Add click, a cart after add-to-cart, the secure area
-    after login -- is absent from it until that interaction has happened.
+    describes the page only as it is at that moment.
 
     Returns observed page evidence: current URL, title, navigation targets, form
     fields with labels and selectors, submit/search controls, result containers,
@@ -2109,7 +2107,7 @@ async def fill_credential_field_tool(
     An `empty` readback still succeeds when `landing_inferred_from_navigation` is true:
     the page left the one the fill acted on, so the field was cleared by its own submit.
 
-    To test an existing saved login block, run that block unchanged with `run_blocks_and_collect_debug`.
+    To test an existing saved login block, run that block unchanged.
     When repairing its login in the live browser, reuse the saved block's credential here;
     its saved login origin, tested site, or vault site can authorize the fill without another ask.
 
@@ -2135,9 +2133,8 @@ async def fill_credential_field_tool(
     clicked at all rather than guessed between. A one-time code expires in
     seconds, so for `field="totp"` always
     inspect the page for the submit control FIRST and pass its selector here —
-    submitting on a later turn can send an already-expired code. Take that
-    selector from `inspect_page_for_composition`, which you have already run on
-    the sign-in page; this tool's own `form_submit_controls` is reported only when
+    submitting on a later turn can send an already-expired code.
+    This tool's own `form_submit_controls` is reported only when
     nothing was submitted, so it cannot supply the selector for the same call. Omit `submit_selector` and the
     tool fills only; it never clicks on its own. Each successful fill is recorded
     as a scouted interaction with the credential identity and field, and an
@@ -2280,6 +2277,7 @@ NATIVE_TOOLS = [
     run_workflow_for_accounts_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,
+    delete_saved_credentials_tool,
 ]
 
 
@@ -2358,14 +2356,15 @@ def _with_action_reason(tool: FunctionTool) -> FunctionTool:
     schema.setdefault("properties", {})[USER_FACING_REASON_PARAM] = dict(USER_FACING_REASON_SCHEMA)
 
     async def invoke(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
-        try:
-            ordinary = json.loads(arguments)
-        except (json.JSONDecodeError, TypeError):
+        with capturing_tool_call(_originating_call_id(ctx)):
+            try:
+                ordinary = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                return await tool.on_invoke_tool(ctx, arguments)
+            if isinstance(ordinary, dict):
+                ordinary.pop(USER_FACING_REASON_PARAM, None)
+                arguments = json.dumps(ordinary)
             return await tool.on_invoke_tool(ctx, arguments)
-        if isinstance(ordinary, dict):
-            ordinary.pop(USER_FACING_REASON_PARAM, None)
-            arguments = json.dumps(ordinary)
-        return await tool.on_invoke_tool(ctx, arguments)
 
     return dataclasses.replace(tool, params_json_schema=schema, strict_json_schema=False, on_invoke_tool=invoke)
 
@@ -2402,12 +2401,20 @@ def _with_executed_source_param(tool: FunctionTool, *, browser_code_available: b
     return dataclasses.replace(tool, params_json_schema=schema)
 
 
+_LIST_INTEGRATIONS_RUN_GUIDANCE = (
+    "For a build-and-test request, pass the completed workflow and the bound block label to "
+    f"`{UPDATE_AND_RUN_BLOCKS_TOOL_NAME}` in the same turn; do not stop at `{UPDATE_WORKFLOW_TOOL_NAME}`."
+)
+
+
 def copilot_native_tools(
     *,
     supports_question_tool: bool,
     browser_code_available: bool,
     authoring_capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
+    run_tools_available: bool,
     supports_account_group_card: bool = False,
+    supports_credential_delete_card: bool = False,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
@@ -2419,10 +2426,16 @@ def copilot_native_tools(
             or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
+            or (
+                tool.name == CREDENTIAL_DELETE_TOOL_NAME
+                and not (supports_credential_delete_card and credential_delete_enabled())
+            )
         ):
             continue
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
+        if tool.name == list_integrations_tool.name and run_tools_available:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
         elif tool.name in _PAGE_STATE_TOOL_NAMES:

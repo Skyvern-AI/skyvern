@@ -1714,8 +1714,7 @@ def _metadata_output_repair_context(
         metadata_contract_reason_code=coverage_reason_code,
         repair_instruction=(
             "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths "
-            f"{path_text}, make the code return those paths, then rerun update_and_run_blocks."
-            + _declaration_repair_sentence(declaration)
+            f"{path_text}, and make the code return those paths." + _declaration_repair_sentence(declaration)
         ),
     )
 
@@ -4465,7 +4464,6 @@ async def _update_workflow(
     raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
     if raw_conflict_marker_error is not None:
         return _tool_error(raw_conflict_marker_error, user_facing_summary=_compiled_authoring_user_summary())
-    ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(params.get("code_artifact_metadata"))

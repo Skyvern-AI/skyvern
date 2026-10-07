@@ -7,7 +7,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { AxiosError, type AxiosResponse } from "axios";
+import { AxiosError, type AxiosRequestConfig, type AxiosResponse } from "axios";
 import { useEffect, useState, type ComponentProps } from "react";
 import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ import {
 } from "./WorkflowCopilotChat";
 import { toast } from "@/components/ui/use-toast";
 
+import { getClient } from "@/api/AxiosClient";
 import { getSseClient } from "@/api/sse";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
@@ -2470,6 +2471,342 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       }),
     );
     outside.remove();
+  });
+
+  it.each([
+    ["composer Stop", (stop: HTMLElement) => fireEvent.click(stop)],
+    [
+      "Escape outside the composer",
+      () => fireEvent.keyDown(window, { key: "Escape" }),
+    ],
+    [
+      "Escape in the composer",
+      () => fireEvent.keyDown(textarea(), { key: "Escape" }),
+    ],
+    ["block Stop", () => useCopilotActionStore.getState().requestCancel()],
+  ])(
+    "%s neither cancels nor unqueues while a confirmed credential deletion runs",
+    async (_name, gesture) => {
+      await renderChat();
+      await submit("delete my saved credentials");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await deliverFirstFrame();
+      await submit("then build the export workflow");
+      expect(
+        queuedStrip().getByText(/then build the export workflow/),
+      ).toBeTruthy();
+
+      const call = streamCalls[0];
+      if (!call) throw new Error("no pending stream");
+      await act(async () => {
+        call.onMessage({
+          type: "question_required",
+          turn_id: "turn-1",
+          workflow_copilot_chat_id: "wcc_1",
+          cancel_token: null,
+          interactions: [
+            {
+              interaction_id: "qi_del",
+              turn_id: "turn-1",
+              tool_call_id: "tc_del",
+              parts: [],
+              status: "pending",
+              response: null,
+              created_at: "2026-01-01T00:00:00Z",
+              resolved_at: null,
+              credential_delete_review: {
+                rows: [
+                  {
+                    credential_id: "cred_a",
+                    name: "Billing",
+                    credential_type: "password",
+                  },
+                ],
+                total_credential_count: 1,
+                claimed_at: "2026-01-01T00:00:01Z",
+                approved_credential_ids: ["cred_a"],
+              },
+            },
+          ],
+        });
+      });
+
+      const stop = screen.getByRole("button", {
+        name: /Stop unavailable until the credential deletion finishes/,
+      });
+      expect(stop.hasAttribute("disabled")).toBe(true);
+      await act(async () => {
+        gesture(stop);
+      });
+
+      expect(cancelPost).not.toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(
+        queuedStrip().getByText(/then build the export workflow/),
+      ).toBeTruthy();
+      expect(textarea().value).toBe("");
+    },
+  );
+
+  it("keeps Stop and Cancel question blocked for a confirmed deletion that a question now leads in the tray", async () => {
+    await renderChat();
+    await submit("delete my saved credentials");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream");
+    await act(async () => {
+      call.onMessage({
+        type: "question_required",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "wcc_1",
+        cancel_token: "tok",
+        interactions: [
+          {
+            interaction_id: "qi_ask",
+            turn_id: "turn-1",
+            tool_call_id: "tc_ask",
+            parts: [{ part_id: "p1", prompt: "Which folder?", choices: [] }],
+            status: "pending",
+            response: null,
+            created_at: "2026-01-01T00:00:00Z",
+            resolved_at: null,
+          },
+          {
+            interaction_id: "qi_del",
+            turn_id: "turn-1",
+            tool_call_id: "tc_del",
+            parts: [],
+            status: "pending",
+            response: null,
+            created_at: "2026-01-01T00:00:00Z",
+            resolved_at: null,
+            credential_delete_review: {
+              rows: [
+                {
+                  credential_id: "cred_a",
+                  name: "Billing",
+                  credential_type: "password",
+                },
+              ],
+              total_credential_count: 1,
+              claimed_at: "2026-01-01T00:00:01Z",
+              approved_credential_ids: ["cred_a"],
+            },
+          },
+        ],
+      });
+    });
+
+    const cancelQuestion = screen.getByRole("button", {
+      name: "Cancel question",
+    });
+    expect(cancelQuestion.hasAttribute("disabled")).toBe(true);
+    await act(async () => {
+      fireEvent.click(cancelQuestion);
+      useCopilotActionStore.getState().requestCancel();
+    });
+
+    expect(useCopilotActionStore.getState().stopBlockedReason).toBeTruthy();
+    expect(
+      cancelPost.mock.calls.some(([url]) => url === "/workflow/copilot/cancel"),
+    ).toBe(false);
+  });
+
+  it("keeps Stop blocked after a deletion confirm whose response was lost and whose history reload failed", async () => {
+    await renderChat();
+    await submit("delete my saved credentials");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream");
+    await act(async () => {
+      call.onMessage({
+        type: "question_required",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "wcc_1",
+        cancel_token: "tok",
+        interactions: [
+          {
+            interaction_id: "qi_del",
+            turn_id: "turn-1",
+            tool_call_id: "tc_del",
+            parts: [],
+            status: "pending",
+            response: null,
+            created_at: "2026-01-01T00:00:00Z",
+            resolved_at: null,
+            credential_delete_review: {
+              rows: [
+                {
+                  credential_id: "cred_a",
+                  name: "Billing",
+                  credential_type: "password",
+                },
+              ],
+              total_credential_count: 1,
+            },
+          },
+        ],
+      });
+    });
+
+    const client = await getClient(null, "sans-api-v1");
+    vi.mocked(client.get).mockImplementationOnce(() =>
+      Promise.reject(new Error("network down")),
+    );
+    cancelPost.mockImplementationOnce(() =>
+      Promise.reject(new Error("socket hang up")),
+    );
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Delete 1 credential" }),
+      );
+    });
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Failed to load chat" }),
+      ),
+    );
+
+    expect(useCopilotActionStore.getState().stopBlockedReason).toBeTruthy();
+    expect(
+      cancelPost.mock.calls.some(([url]) => url === "/workflow/copilot/cancel"),
+    ).toBe(false);
+
+    // A fresh server copy showing the card still unclaimed means the confirm never landed, so Stop frees up.
+    await act(async () => {
+      call.onMessage({
+        type: "question_required",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "wcc_1",
+        cancel_token: "tok",
+        interactions: [
+          {
+            interaction_id: "qi_del",
+            turn_id: "turn-1",
+            tool_call_id: "tc_del",
+            parts: [],
+            status: "pending",
+            response: null,
+            created_at: "2026-01-01T00:00:00Z",
+            resolved_at: null,
+            credential_delete_review: {
+              rows: [
+                {
+                  credential_id: "cred_a",
+                  name: "Billing",
+                  credential_type: "password",
+                },
+              ],
+              total_credential_count: 1,
+            },
+          },
+        ],
+      });
+    });
+    await waitFor(() =>
+      expect(useCopilotActionStore.getState().stopBlockedReason).toBeNull(),
+    );
+  });
+
+  it("drops a question refresh that began before a deletion confirm", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const client = await getClient(null, "sans-api-v1");
+    const get = vi.mocked(client.get);
+    const original = get.getMockImplementation();
+    try {
+      await renderChat();
+      await submit("delete my saved credentials");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await deliverFirstFrame();
+
+      const call = streamCalls[0];
+      if (!call) throw new Error("no pending stream");
+      const card = {
+        interaction_id: "qi_del",
+        turn_id: "turn-1",
+        tool_call_id: "tc_del",
+        parts: [],
+        status: "pending",
+        response: null,
+        created_at: "2026-01-01T00:00:00Z",
+        resolved_at: null,
+        credential_delete_review: {
+          rows: [
+            {
+              credential_id: "cred_a",
+              name: "Billing",
+              credential_type: "password",
+            },
+          ],
+          total_credential_count: 1,
+        },
+      };
+      await act(async () => {
+        call.onMessage({
+          type: "question_required",
+          turn_id: "turn-1",
+          workflow_copilot_chat_id: "wcc_1",
+          cancel_token: "tok",
+          interactions: [card],
+        });
+      });
+
+      let refreshStarted = false;
+      let releaseRefresh: () => void = () => {};
+      get.mockImplementation((path: string, config?: AxiosRequestConfig) => {
+        if (path !== "/workflow/copilot/chat-history")
+          return original!(path, config);
+        if (
+          (config?.params as { workflow_permanent_id?: string } | undefined)
+            ?.workflow_permanent_id
+        )
+          return Promise.reject(new Error("network down"));
+        refreshStarted = true;
+        return new Promise((resolve) => {
+          releaseRefresh = () =>
+            resolve({
+              data: {
+                ...historyResponse.data,
+                question_interactions: [{ ...card }],
+                pending_question_cancel_token: "tok",
+              },
+            });
+        });
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      await waitFor(() => expect(refreshStarted).toBe(true));
+
+      cancelPost.mockImplementationOnce(() =>
+        Promise.reject(new Error("socket hang up")),
+      );
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Delete 1 credential" }),
+        );
+      });
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({ title: "Failed to load chat" }),
+        ),
+      );
+      await act(async () => {
+        releaseRefresh();
+      });
+
+      expect(useCopilotActionStore.getState().stopBlockedReason).toBeTruthy();
+    } finally {
+      get.mockImplementation(original!);
+      vi.useRealTimers();
+    }
   });
 
   it("the stop control does not cancel before the turn's first frame arrives", async () => {

@@ -168,6 +168,7 @@ export type FailureCategory = {
   category: string;
   confidence_float: number;
   reasoning: string;
+  reason_code?: string | null;
 };
 
 export type TaskApiResponse = {

@@ -7,10 +7,24 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from skyvern.cli.mcp_tools import mcp as skyvern_mcp
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.browser_ablation import (
+    REPAIR_PROBE_MODES,
+    CopilotBrowserCodeMode,
+    CopilotEvalMode,
+    resolve_copilot_tool_surface,
+    surface_runs_blocks,
+)
 from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
-from skyvern.forge.sdk.copilot.tools import copilot_native_tools, list_integrations_tool
+from skyvern.forge.sdk.copilot.tools import (
+    _LIST_INTEGRATIONS_RUN_GUIDANCE,
+    _build_skyvern_mcp_overlays,
+    copilot_native_tools,
+    get_skyvern_mcp_alias_map,
+    list_integrations_tool,
+)
 from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations, _read_google_sheet, _serialize
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
@@ -168,6 +182,38 @@ def test_tool_description_states_facts_without_prescribing_dialogue() -> None:
     assert "state` is `error`" in description
     assert "ask the user" not in description.lower()
     assert "reconnect" not in description.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, *REPAIR_PROBE_MODES, CopilotEvalMode.BROWSER_ABLATION])
+@pytest.mark.parametrize("browser_tools_available", [True, False])
+@pytest.mark.parametrize("browser_code_mode", [CopilotBrowserCodeMode.ADD, CopilotBrowserCodeMode.REPLACE])
+async def test_run_guidance_joins_the_description_only_on_a_surface_that_runs_blocks(
+    mode: CopilotEvalMode | None, browser_tools_available: bool, browser_code_mode: CopilotBrowserCodeMode
+) -> None:
+    surface = resolve_copilot_tool_surface(
+        mode=mode,
+        native_tools=copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=browser_code_mode == CopilotBrowserCodeMode.REPLACE,
+            run_tools_available=surface_runs_blocks(mode=mode, browser_tools_available=browser_tools_available),
+        ),
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        registered_mcp_tools=(
+            await skyvern_mcp.list_tools(run_middleware=False) if mode == CopilotEvalMode.BROWSER_ABLATION else None
+        ),
+        browser_tools_available=browser_tools_available,
+        browser_code_mode=browser_code_mode,
+    )
+    [tool] = [tool for tool in surface.native_tools if tool.name == "list_integrations"]
+
+    runs_blocks = "update_and_run_blocks" in surface.ordered_native_names
+    assert tool.description == (
+        f"{list_integrations_tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}"
+        if runs_blocks
+        else list_integrations_tool.description
+    )
 
 
 SPREADSHEET_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
@@ -426,7 +472,10 @@ async def test_read_google_sheet_bounds_an_oversized_sheet_and_says_so(
 
 def test_read_google_sheet_description_states_facts_without_steering() -> None:
     registered = {
-        tool.name: tool for tool in copilot_native_tools(supports_question_tool=True, browser_code_available=False)
+        tool.name: tool
+        for tool in copilot_native_tools(
+            supports_question_tool=True, browser_code_available=False, run_tools_available=True
+        )
     }
     tool = registered["read_google_sheet"]
     description = tool.description.lower()

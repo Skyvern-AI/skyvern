@@ -8,7 +8,6 @@ from enum import StrEnum
 from typing import Any, cast
 
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
-from skyvern.forge.sdk.copilot.output_utils import looks_like_workflow_yaml_in_chat
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     contains_email_password_pair,
@@ -16,6 +15,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
+    SECRET_KEYWORD_LABEL_PATTERN,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
@@ -48,81 +48,6 @@ _SANCTIONED_SECRET_REFERENCE_RE = re.compile(
 # Callers pass the single line containing the match, so this is not expected to
 # consume across embedded newlines.
 _SECRET_ASSIGNMENT_RHS_RE = re.compile(r"[:=]\s*(.+)\s*$")
-_UNVALIDATED_PROPOSAL_AFFORDANCE_RE = re.compile(
-    r"\baccept\b(?=[\s\S]{0,120}\bsav(?:e|ed|ing)\b)(?=[\s\S]{0,160}\b(?:reject|discard)\b)",
-    re.IGNORECASE,
-)
-UNVALIDATED_DISCLOSURE_PHRASES = (
-    "not tested",
-    "not been tested",
-    "not verified",
-    "not been verified",
-    "hasn't been tested",
-    "hasn't been verified",
-    "unvalidated",
-)
-_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
-_IDENTIFIER_DELIMITERS = frozenset({"`", '"', "'"})
-
-_INTERNAL_CLASSIFIER_REASON_CODE_LABEL_RE = re.compile(r"\bsafe_reason_code\s*[:=]")
-_INTERNAL_CLASSIFIER_REASON_CODE_PREFIXES = ("request_policy_",)
-_INTERNAL_CLASSIFIER_DELIMITED_NAMES = frozenset({"requestpolicy"})
-
-_INTERNAL_TOOL_PARAPHRASE_PHRASES = ("nudge turn", "nudge-turn")
-_INTERNAL_COPILOT_SENTINEL_PREFIX = "[copilot:"
-
-# Copilot's own paraphrase for a formatting change it made — not standard YAML
-# vocabulary, so a legitimate clarification is not going to phrase itself this way.
-# Runs for every response type, including ASK_QUESTION.
-_YAML_AUTHORING_JARGON_PHRASES = (
-    "folded code formatting",
-    "literal code formatting",
-)
-# Standard YAML block-scalar terminology (folded `>` vs literal `|`). A legitimate
-# ASK_QUESTION can ask the user which style they want for a multi-line value, so these
-# only count as a leak once the reply is final and user-visible.
-_YAML_BLOCK_SCALAR_TERM_PHRASES = (
-    "folded block scalar",
-    "literal block scalar",
-)
-
-
-def _contains_yaml_authoring_vocab_leak(user_response: str, response_type: str) -> bool:
-    lower = user_response.lower()
-    if any(phrase in lower for phrase in _YAML_AUTHORING_JARGON_PHRASES):
-        return True
-    return response_type in _USER_VISIBLE_REPLY_TYPES and any(
-        phrase in lower for phrase in _YAML_BLOCK_SCALAR_TERM_PHRASES
-    )
-
-
-_SELF_PRESCRIPTIVE_FIXED_PHRASE = "send me a normal instruction like"
-_SELF_PRESCRIPTIVE_IMPERATIVE_VERBS = frozenset({"send", "reply", "type", "respond"})
-_SELF_PRESCRIPTIVE_POLITE_PREFIXES = frozenset({"please", "kindly", "just", "now"})
-# Apostrophes inside contractions (`you'd`, `I'll`, `won't`) are not quote openers;
-# treat the single-quote characters as exemplar openers only at word boundaries.
-_SELF_PRESCRIPTIVE_UNCONDITIONAL_QUOTES = frozenset('"“”')
-_SELF_PRESCRIPTIVE_BOUNDARY_QUOTES = frozenset("'‘’")
-_SELF_PRESCRIPTIVE_QUOTED_WINDOW = 60
-_SELF_PRESCRIPTIVE_CONTINUATION_WINDOW = 120
-_SELF_PRESCRIPTIVE_POSITION_TERMINATORS = frozenset({"\n", ";", ".", "!", "?"})
-_SELF_PRESCRIPTIVE_POSITION_COORDINATORS = (", ", "and ", "or ")
-# Continuation cues distinguish chat-direction prescription ("type X to continue", "send X
-# next and I'll keep going") from imperative docs prose ("type X in the field", "send X
-# as JSON"). The fixed phrase above still fires without a cue; this guard only applies
-# to the looser verb+quoted-exemplar heuristic.
-_SELF_PRESCRIPTIVE_CONTINUATION_RE = re.compile(
-    r"\b(?:"
-    r"next|then|instead|keep going"
-    r"|to (?:continue|proceed|stop|abort|cancel|resume|retry)"
-    r"|and (?:i|we|you)['‘’]ll"
-    r")\b",
-    re.IGNORECASE,
-)
-# Response types whose `user_response` is rendered verbatim as the agent's final
-# message — REPLY and REPLACE_WORKFLOW. ASK_QUESTION is excluded because legitimate
-# clarifications ("Reply 'yes' to proceed") would false-positive the residual detectors.
-_USER_VISIBLE_REPLY_TYPES: frozenset[str] = frozenset({"REPLY", "REPLACE_WORKFLOW"})
 
 
 @dataclass(frozen=True)
@@ -291,18 +216,15 @@ def build_output_policy_diagnostics(
     final_verdict: OutputPolicyVerdict,
     final_output_kind: CopilotOutputKind,
     hard_block_reason_codes: list[OutputPolicyReason],
-    soft_rewrite_reason_codes: list[OutputPolicyReason],
 ) -> dict[str, Any]:
     raw_would_have_failed = bool(raw_verdict.reason_codes)
-    contained_failure = bool(hard_block_reason_codes or soft_rewrite_reason_codes)
     return {
         "raw_output_kind": raw_verdict.output_kind.value,
         "final_output_kind": final_output_kind.value,
         "raw_reason_codes": [reason.value for reason in raw_verdict.reason_codes],
         "hard_block_reason_codes": [reason.value for reason in hard_block_reason_codes],
-        "soft_rewrite_reason_codes": [reason.value for reason in soft_rewrite_reason_codes],
         "raw_would_have_failed": raw_would_have_failed,
-        "contained_failure": raw_would_have_failed and contained_failure,
+        "contained_failure": raw_would_have_failed and bool(hard_block_reason_codes),
         "final_output_policy_allowed": final_verdict.allowed,
     }
 
@@ -355,21 +277,8 @@ def evaluate_output_policy(
     verdict = OutputPolicyVerdict(output_kind=output_kind)
     # Only the reply is scanned for a raw secret: rebinding and persistence scrubbing own what
     # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
-    if _contains_raw_secret(user_response):
+    if raw_secret_label(user_response) is not None:
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
-    if _contains_internal_block_taxonomy_leak(user_response, response_type):
-        verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
-    if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_classifier_vocab_leak(user_response):
-        verdict.add(OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK)
-    if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_self_prescriptive_phrase(user_response):
-        verdict.add(OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK)
-    # Without a proposal, block YAML in a reply is usually an example answering a question.
-    if (
-        has_workflow_proposal
-        and response_type in ("REPLY", "ASK_QUESTION")
-        and looks_like_workflow_yaml_in_chat(user_response)
-    ):
-        verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
         _apply_credential_policy(verdict, request_policy, workflow_yaml)
@@ -388,19 +297,31 @@ def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     return message
 
 
-def _contains_raw_secret(value: Any) -> bool:
-    for text in _policy_text_values(value):
-        if contains_email_password_pair(text):
-            return True
-        for pattern in RAW_SECRET_PATTERNS:
-            for match in pattern.finditer(text):
-                matched = match.group(0)
-                if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
-                    continue
-                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and _keyword_assignment_is_exempt(text, match):
-                    continue
-                return True
-    return False
+def raw_secret_label(value: str | None) -> str | None:
+    """None when the output check flags no raw secret; else the label the detector matched before its value, or ""."""
+    if not value:
+        return None
+    if contains_email_password_pair(value):
+        return ""
+    for pattern in RAW_SECRET_PATTERNS:
+        for match in pattern.finditer(value):
+            matched = match.group(0)
+            if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
+                continue
+            if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and _keyword_assignment_is_exempt(value, match):
+                continue
+            label, separator, _ = matched.replace("=", ":").partition(":")
+            label = label.strip()
+            if not separator:
+                code_label = re.fullmatch(r"([A-Za-z0-9 ]+?)(?:\s+is)?\s*\d{6,8}", matched)
+                return code_label.group(1) if code_label else ""
+            if "_" not in label:
+                return label
+            # Underscore-joined text before the keyword is free text that can carry part of a secret; keep the keyword.
+            parts = label.split("_")
+            suffixes = ("_".join(parts[i:]) for i in range(len(parts) - 1, -1, -1))
+            return next((suffix for suffix in suffixes if SECRET_KEYWORD_LABEL_PATTERN.fullmatch(suffix)), "")
+    return None
 
 
 def _line_end_after_match(text: str, match: re.Match[str]) -> int:
@@ -503,170 +424,6 @@ def _is_lexical_token_assignment(matched: str, assignment: str) -> bool:
     # The keyword pattern ends at the first whitespace, so the rest of the line carries the expression.
     rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(assignment)
     return rhs_match is not None and _parses_a_value_out_of_something(rhs_match.group(1))
-
-
-def _policy_text_values(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        values: list[str] = []
-        for key, item in value.items():
-            values.extend(_policy_text_values(key))
-            values.extend(_policy_text_values(item))
-        return values
-    if isinstance(value, (list, tuple, set)):
-        values = []
-        for item in value:
-            values.extend(_policy_text_values(item))
-        return values
-    return [str(value)]
-
-
-def _has_unvalidated_affordance(user_response: str | None) -> bool:
-    if not user_response:
-        return False
-    lower = user_response.lower()
-    has_disclosure = any(phrase in lower for phrase in UNVALIDATED_DISCLOSURE_PHRASES)
-    return bool(_UNVALIDATED_PROPOSAL_AFFORDANCE_RE.search(user_response) and has_disclosure)
-
-
-def _contains_internal_block_taxonomy_leak(user_response: str | None, response_type: str) -> bool:
-    if not user_response:
-        return False
-    if _contains_deprecated_block_identifier(user_response):
-        return True
-    if _contains_yaml_authoring_vocab_leak(user_response, response_type):
-        return True
-    return response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response)
-
-
-def _contains_internal_tool_vocab_leak(user_response: str) -> bool:
-    lower = user_response.lower()
-    if _INTERNAL_COPILOT_SENTINEL_PREFIX in lower:
-        return True
-    return any(phrase in lower for phrase in _INTERNAL_TOOL_PARAPHRASE_PHRASES)
-
-
-def _contains_deprecated_block_identifier(text: str) -> bool:
-    tokens = [_compact_identifier_token(match.group(0)) for match in _IDENTIFIER_TOKEN_RE.finditer(text)]
-    if "taskv2" in tokens:
-        return True
-    return any(left == "task" and right == "v2" for left, right in zip(tokens, tokens[1:]))
-
-
-def _compact_identifier_token(raw: str) -> str:
-    return raw.lower().replace("_", "")
-
-
-def _is_delimited_identifier(text: str, start: int, end: int) -> bool:
-    if start == 0 or end >= len(text):
-        return False
-    left = text[start - 1]
-    return left == text[end] and left in _IDENTIFIER_DELIMITERS
-
-
-def _contains_internal_classifier_vocab_leak(user_response: str | None) -> bool:
-    if not isinstance(user_response, str) or not user_response:
-        return False
-    lower = user_response.lower()
-    if _INTERNAL_CLASSIFIER_REASON_CODE_LABEL_RE.search(lower):
-        return True
-    for match in _IDENTIFIER_TOKEN_RE.finditer(user_response):
-        token = match.group(0)
-        lowered = token.lower()
-        if "_" in token and any(lowered.startswith(prefix) for prefix in _INTERNAL_CLASSIFIER_REASON_CODE_PREFIXES):
-            return True
-        # CamelCase classifier names are internal vocabulary even without backticks;
-        # the lowercase forms (`turn intent`, `request policy`) remain natural prose.
-        if token == "RequestPolicy":
-            return True
-        if lowered in _INTERNAL_CLASSIFIER_DELIMITED_NAMES and _is_delimited_identifier(
-            user_response, match.start(), match.end()
-        ):
-            return True
-    return False
-
-
-def _contains_self_prescriptive_phrase(user_response: str | None) -> bool:
-    if not isinstance(user_response, str) or not user_response:
-        return False
-    lower = user_response.lower()
-    if _SELF_PRESCRIPTIVE_FIXED_PHRASE in lower:
-        return True
-    for match in _IDENTIFIER_TOKEN_RE.finditer(user_response):
-        verb = match.group(0).lower()
-        if verb not in _SELF_PRESCRIPTIVE_IMPERATIVE_VERBS:
-            continue
-        if not _is_imperative_position(user_response, match.start()):
-            continue
-        window_end = min(len(user_response), match.end() + _SELF_PRESCRIPTIVE_QUOTED_WINDOW)
-        if not _contains_quoted_exemplar(user_response, match.end(), window_end):
-            continue
-        cue_end = min(len(user_response), match.end() + _SELF_PRESCRIPTIVE_CONTINUATION_WINDOW)
-        if _SELF_PRESCRIPTIVE_CONTINUATION_RE.search(user_response, match.end(), cue_end):
-            return True
-    return False
-
-
-def _contains_quoted_exemplar(text: str, window_start: int, window_end: int) -> bool:
-    for index in range(window_start, window_end):
-        char = text[index]
-        if char in _SELF_PRESCRIPTIVE_UNCONDITIONAL_QUOTES:
-            return True
-        if char in _SELF_PRESCRIPTIVE_BOUNDARY_QUOTES and not _is_embedded_apostrophe(text, index):
-            return True
-    return False
-
-
-def _is_embedded_apostrophe(text: str, index: int) -> bool:
-    if index == 0:
-        return False
-    return text[index - 1].isalnum()
-
-
-def _is_imperative_position(text: str, verb_start: int) -> bool:
-    return _is_position_at_sentence_start(text, verb_start) or _is_position_after_polite_prefix(text, verb_start)
-
-
-def _is_position_at_sentence_start(text: str, index: int) -> bool:
-    if index == 0:
-        return True
-    # Walk past intra-clause whitespace (spaces, tabs, leading newlines) so terminators
-    # followed by whitespace still count as sentence boundaries.
-    cursor = index - 1
-    while cursor >= 0 and text[cursor] in (" ", "\t"):
-        cursor -= 1
-    if cursor < 0:
-        return True
-    char = text[cursor]
-    if char in _SELF_PRESCRIPTIVE_POSITION_TERMINATORS:
-        return True
-    lower = text.lower()
-    for coordinator in _SELF_PRESCRIPTIVE_POSITION_COORDINATORS:
-        start = index - len(coordinator)
-        if start >= 0 and lower[start:index] == coordinator:
-            return True
-    return False
-
-
-def _is_position_after_polite_prefix(text: str, verb_start: int) -> bool:
-    if verb_start == 0:
-        return False
-    cursor = verb_start - 1
-    while cursor > 0 and text[cursor] == " ":
-        cursor -= 1
-    word_end = cursor + 1
-    word_start = word_end
-    while word_start > 0 and text[word_start - 1].isalpha():
-        word_start -= 1
-    if word_start == word_end:
-        return False
-    prefix = text[word_start:word_end].lower()
-    if prefix not in _SELF_PRESCRIPTIVE_POLITE_PREFIXES:
-        return False
-    return _is_position_at_sentence_start(text, word_start)
 
 
 def _apply_credential_policy(

@@ -45,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     DOCUMENT_FAILURE_ATTRIBUTE,
     RECORDED_FAILURE_CAPTURE_MAX_CHARS,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    SIGN_IN_FORM_SCRIPT,
     DocumentFailureReceipt,
     PendingAction,
     PlaywrightInputDefaults,
@@ -68,6 +69,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.self_heal import HealSkipReason, HealStatus
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
@@ -3617,6 +3619,32 @@ async def test_a_wait_after_a_failed_locator_call_keeps_that_calls_failure(wait:
 
 
 @pytest.mark.asyncio
+async def test_a_failure_overtaken_by_a_concurrent_call_still_names_its_own_tab() -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    opened = recording._wrap_page(other_tab)
+    error = PlaywrightTimeoutError("Locator.click: Timeout 5000ms exceeded.")
+    newer_call_started = asyncio.Event()
+
+    async def fail_after_the_newer_call_starts(**kwargs: Any) -> None:
+        await newer_call_started.wait()
+        raise error
+
+    async def start(**kwargs: Any) -> None:
+        newer_call_started.set()
+
+    other_tab.inner.click = fail_after_the_newer_call_starts  # type: ignore[method-assign]
+    page.inner.click = start  # type: ignore[method-assign]
+    older, _ = await asyncio.gather(
+        opened.locator("#orders").click(), recording.locator("#search").click(), return_exceptions=True
+    )
+
+    assert older is error
+    assert recording.failing_tab(error) is other_tab
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("call", ["wait_for_selector", "click"])
 @pytest.mark.parametrize("failed_tab", ["own", "other"])
 async def test_an_element_handle_call_binds_the_receipt_of_the_page_that_produced_it(
@@ -4125,6 +4153,28 @@ async def test_inline_declared_and_timeout_failures_carry_the_receipt_as_context
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sign_in_form", [True, False])
+async def test_a_block_timeout_on_a_sign_in_form_is_recorded_on_the_run(
+    monkeypatch: pytest.MonkeyPatch, sign_in_form: bool
+) -> None:
+    page = DocumentEventPage()
+
+    async def evaluate(expression: str, *args: object, **kwargs: object) -> bool | None:
+        return sign_in_form if expression == SIGN_IN_FORM_SCRIPT else None
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    monkeypatch.setattr(settings, "CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS", 0.2)
+    block = _make_code_block("await sleep(5)\n")
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    _, _, run_category = WorkflowService._resolve_block_terminal_outcome(block=block, block_result=result)
+    reason_codes = {entry.get("reason_code") for entry in run_category or []}
+    assert ("sign_in_form_visible" in reason_codes) is sign_in_form
+
+
+@pytest.mark.asyncio
 async def test_a_block_cancelled_during_setup_leaves_no_document_listeners(monkeypatch: pytest.MonkeyPatch) -> None:
     page = DocumentEventPage()
     mocks = _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
@@ -4244,3 +4294,300 @@ async def test_a_main_frame_locator_or_handle_behind_a_failed_document_carries_t
     assert [action.action_type for action in recording.recorded_actions()] == (
         [ActionType.CLICK] * (1 if shape == "locator_wait" else 2) if frame == "main" else []
     )
+
+
+class _FakeCountLocator:
+    """Minimal locator stand-in whose count() is instrumented for the diagnostic probe."""
+
+    def __init__(self, *, value: int | None = None, exc: BaseException | None = None, hang: bool = False) -> None:
+        self._value = value
+        self._exc = exc
+        self._hang = hang
+        self.count_awaited = 0
+
+    async def count(self) -> int:
+        self.count_awaited += 1
+        if self._hang:
+            await asyncio.sleep(10)
+        if self._exc is not None:
+            raise self._exc
+        assert self._value is not None
+        return self._value
+
+
+def _probe_code_block() -> CodeBlock:
+    now = datetime(2026, 8, 9, 15, 0, tzinfo=timezone.utc)
+    output_parameter = OutputParameter(
+        parameter_type=ParameterType.OUTPUT,
+        key="code_output",
+        description="test output",
+        output_parameter_id="op_code",
+        workflow_id="w_test",
+        created_at=now,
+        modified_at=now,
+    )
+    return CodeBlock(label="code_1", code="pass", output_parameter=output_parameter)
+
+
+@pytest.mark.parametrize("count_value", [0, 1, 2, 7])
+@pytest.mark.asyncio
+async def test_locator_probe_reports_exact_count(count_value: int) -> None:
+    locator = _FakeCountLocator(value=count_value)
+    result = await _probe_code_block()._probe_failed_locator_count(locator)
+    assert result == (count_value, "counted")
+    assert locator.count_awaited == 1  # exact locator instance is the one probed
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_reports_large_count_exactly() -> None:
+    # The probe records the exact non-negative Locator.count(); it must never bucket or cap at
+    # emission (query-time aggregation may bucket later).
+    locator = _FakeCountLocator(value=6000)
+    assert await _probe_code_block()._probe_failed_locator_count(locator) == (6000, "counted")
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_error_is_fail_open() -> None:
+    locator = _FakeCountLocator(exc=RuntimeError("boom"))
+    assert await _probe_code_block()._probe_failed_locator_count(locator) == (None, "error")
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_timeout_is_fail_open() -> None:
+    from skyvern.forge.sdk.workflow.models.block import CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS
+
+    assert CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS <= 0.2
+    locator = _FakeCountLocator(hang=True)
+    # Use the real bounded probe; it must return a timeout status rather than hang the caller.
+    count, status = await asyncio.wait_for(_probe_code_block()._probe_failed_locator_count(locator), timeout=2.0)
+    assert (count, status) == (None, "timeout")
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_reraises_cancellation() -> None:
+    class _CancelLocator:
+        async def count(self) -> int:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _probe_code_block()._probe_failed_locator_count(_CancelLocator())
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_consumes_a_late_failing_count_after_timeout() -> None:
+    import gc
+
+    # A driver reply that lands after the bounded wait (a navigation that destroys the execution
+    # context) must be retrieved by the probe, not left as an unretrieved-future error -- the exact
+    # signal this telemetry measures. Without the detached-task consume wiring, the late task
+    # exception is logged by asyncio at GC; this asserts it is not.
+    loop = asyncio.get_running_loop()
+    captured: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, ctx: captured.append(ctx))
+
+    class _LateNavFailLocator:
+        async def count(self) -> int:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation") from None
+
+    try:
+        result = await _probe_code_block()._probe_failed_locator_count(_LateNavFailLocator())
+        assert result == (None, "timeout")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert not any("never retrieved" in str(ctx.get("message", "")) for ctx in captured)
+
+
+@pytest.mark.asyncio
+async def test_operation_attribution_event_allowlist_and_privacy() -> None:
+    from structlog.testing import capture_logs
+
+    from skyvern.forge.sdk.workflow.models.block import _OPERATION_ATTRIBUTION_ALLOWLIST
+
+    context = WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+        mask_secrets=True,
+    )
+    sentinel_selector = "SENTINEL_SELECTOR_should_never_appear"
+    exc = PlaywrightError(f'locator("{sentinel_selector}") resolved to 2 elements')
+
+    with capture_logs() as logs:
+        _probe_code_block()._emit_operation_attribution_failure(
+            organization_id="o_test",
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            failing_line=3,
+            exception_class=type(exc).__name__,
+            probe_match_count=2,
+            probe_status="counted",
+        )
+
+    events = [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"]
+    assert len(events) == 1
+    envelope = events[0]["operation_attribution"]
+    assert set(envelope.keys()) == set(_OPERATION_ATTRIBUTION_ALLOWLIST)
+    assert envelope["exception_class"] == "Error"  # class name only, never the message
+    assert envelope["probe_match_count"] == 2
+    assert envelope["probe_status"] == "counted"
+    assert envelope["code_line"] == 3
+    # ambiguous_operation is intentionally not emitted (misleading on the secure arm; derivable at
+    # query time from the persisted recorded-action rows).
+    assert "ambiguous_operation" not in envelope
+    assert envelope["block_label"] == "code_1"
+    assert sentinel_selector not in json.dumps(envelope)
+    assert "resolved to 2 elements" not in json.dumps(envelope)
+
+
+class _StrictFailLocator(FakeLocator):
+    """A recorded locator whose action raises a non-timeout strict-style Playwright Error and whose
+    exact match count is 2 -- the 2+ cohort the probe exists to measure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count_calls = 0
+
+    async def click(self, **kwargs):  # noqa: ANN003, ANN201
+        raise PlaywrightError('locator("#x") resolved to 2 elements')
+
+    async def count(self) -> int:
+        self.count_calls += 1
+        return 2
+
+
+async def _run_probe_failure_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, list[dict[str, Any]], list[Action], _StrictFailLocator]:
+    from structlog.testing import capture_logs
+
+    page = FakePage()
+    locator = _StrictFailLocator()
+    page.inner = locator
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+    events = [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"]
+    return result, events, _created_actions(mocks), locator
+
+
+@pytest.mark.asyncio
+async def test_execute_arm_emits_probe_unconditionally_without_polluting_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No config/feature gate: a recorder-bound locator failure always probes and emits.
+    result, events, actions, locator = await _run_probe_failure_scenario(monkeypatch)
+
+    assert result.success is False
+    assert locator.count_calls == 1  # the exact failed locator is counted exactly once
+    assert len(events) == 1
+    envelope = events[0]["operation_attribution"]
+    assert envelope["probe_match_count"] == 2
+    assert envelope["probe_status"] == "counted"
+    assert envelope["engine"] == "inline"
+    assert envelope["exception_class"] == "Error"  # non-timeout strict-style Playwright Error
+    assert envelope["workflow_run_block_id"] == "wrb_test"
+    assert envelope["block_label"] == "code_1"
+    assert isinstance(envelope["code_line"], int)
+    assert "ambiguous_operation" not in envelope
+
+    # No probe/envelope field leaks into the outcome or persisted rows.
+    outcome_blob = json.dumps(
+        {
+            "failure_reason": result.failure_reason,
+            "output": result.output_parameter_value,
+            "error_codes": result.error_codes,
+        },
+        default=str,
+    )
+    assert "operation_attribution" not in outcome_blob
+    assert "probe_match_count" not in outcome_blob
+    assert "probe_status" not in outcome_blob
+    actions_blob = json.dumps([a.model_dump(mode="json") for a in actions], default=str)
+    assert "operation_attribution" not in actions_blob
+    assert "probe_match_count" not in actions_blob
+
+
+@pytest.mark.asyncio
+async def test_execute_arm_skips_probe_for_non_recorder_bound_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A plain user-raised exception is not bound to any recorded locator, so failure_locator(e) is
+    # None and the structural gate (`if probe_locator is not None`) must skip the probe entirely --
+    # no probe call, no codeblock.locator_probe event. Removing that gate would call the probe with
+    # None and emit an event, failing both assertions below.
+    from structlog.testing import capture_logs
+
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+
+    probe_calls: list[Any] = []
+    real_probe = CodeBlock._probe_failed_locator_count
+
+    async def spy_probe(self: CodeBlock, locator: Any) -> tuple[int | None, str]:
+        probe_calls.append(locator)
+        return await real_probe(self, locator)
+
+    monkeypatch.setattr(CodeBlock, "_probe_failed_locator_count", spy_probe)
+
+    block = _make_code_block("raise RuntimeError('boom')", goal="go")
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    assert result.success is False
+    assert probe_calls == []  # the locator count() probe is never entered for a non-recorder failure
+    assert [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"] == []
+
+
+@pytest.mark.asyncio
+async def test_execute_arm_attribution_failure_is_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The diagnostic probe/emit runs inside the CodeBlock failure handler. Any failure there --
+    # locator identification, probe, attribute assembly, or emission -- must leave the original
+    # classified failure/result unchanged. Here emission is forced to raise: without the outer
+    # fail-open guard that RuntimeError escapes execute() (RED); with it, execute() still returns
+    # the original strict-style locator failure and the diagnostic exception never surfaces.
+    page = FakePage()
+    page.inner = _StrictFailLocator()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+
+    def _raise_emit(self: CodeBlock, **_kwargs: Any) -> None:
+        raise RuntimeError("attribution emit must never surface")
+
+    monkeypatch.setattr(CodeBlock, "_emit_operation_attribution_failure", _raise_emit)
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    # The original classified failure is preserved; the diagnostic exception never surfaces.
+    assert result.success is False
+    assert result.failure_reason  # a real classified failure reason, not an empty/replaced outcome
+    outcome_blob = json.dumps(
+        {
+            "failure_reason": result.failure_reason,
+            "output": result.output_parameter_value,
+            "error_codes": result.error_codes,
+        },
+        default=str,
+    )
+    assert "attribution emit must never surface" not in outcome_blob

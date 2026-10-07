@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
+from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflow_run_groups import WorkflowRunGroupItemOutcome
 from skyvern.utils.contained_effects import contained_effect
@@ -22,11 +24,38 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+class QuestionChoiceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    recommended: bool = Field(
+        default=False,
+        description="True for the one choice you would go with unless the user prefers another.",
+    )
+    detail_prompt: str | None = Field(
+        default=None,
+        description="Set when this choice cannot be acted on without more detail (e.g. 'Which restaurant?').",
+    )
+
+    @field_validator("detail_prompt")
+    @classmethod
+    def _blank_prompt_is_none(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+
 class QuestionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prompt: str = Field(min_length=1)
-    choices: list[str] = Field(default_factory=list)
+    choices: list[QuestionChoiceInput] = Field(default_factory=list)
+
+    # Strict tool schemas are not enforced on every LiteLLM provider, so a bare label still parses.
+    @field_validator("choices", mode="before")
+    @classmethod
+    def _accept_bare_labels(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        return [{"text": choice} if isinstance(choice, str) else choice for choice in value]
 
 
 class AskUserArguments(BaseModel):
@@ -38,6 +67,8 @@ class AskUserArguments(BaseModel):
 class QuestionChoice(BaseModel):
     choice_id: str
     text: str
+    recommended: bool = Field(default=False, exclude_if=lambda recommended: not recommended)
+    detail_prompt: str | None = Field(default=None, exclude_if=lambda prompt: prompt is None)
 
 
 class QuestionPart(BaseModel):
@@ -119,6 +150,57 @@ class AccountGroupCancelReview(BaseModel):
     decision: AccountGroupDecision | None = Field(default=None, exclude_if=lambda decision: decision is None)
 
 
+CREDENTIAL_DELETE_TOOL_NAME = "delete_saved_credentials"
+MAX_CREDENTIALS_PER_CARD = 50
+CREDENTIAL_DELETE_CONCURRENCY = 5
+CREDENTIAL_DELETE_TIMEOUT = timedelta(seconds=30)
+CREDENTIAL_DELETE_RECORD_ATTEMPTS = 3
+CREDENTIAL_DELETE_RECORD_RETRY_DELAY = timedelta(seconds=1)
+# Past this, a claim whose outcomes never arrived (the deleting process died) resolves with its entries failed.
+CREDENTIAL_DELETE_CLAIM_LEASE = (
+    math.ceil(MAX_CREDENTIALS_PER_CARD / CREDENTIAL_DELETE_CONCURRENCY) * CREDENTIAL_DELETE_TIMEOUT
+    + CREDENTIAL_DELETE_RECORD_ATTEMPTS * CREDENTIAL_DELETE_RECORD_RETRY_DELAY
+    + timedelta(minutes=1)
+)
+CREDENTIAL_DELETE_OUTCOME_NOTE = (
+    "Only entries with outcome deleted are confirmed deleted. A failed entry may or may not still be saved, a "
+    "not_found entry was already gone, and entries the user did not select were not touched."
+)
+
+
+class CredentialDeleteRow(BaseModel):
+    credential_id: str
+    name: str
+    credential_type: CredentialType
+
+
+class CredentialDeleteOutcome(BaseModel):
+    credential_id: str
+    # failed covers a vault error or timeout, after which the entry may or may not still be saved.
+    outcome: Literal["deleted", "not_found", "failed"]
+
+
+class CredentialDeleteReview(BaseModel):
+    rows: list[CredentialDeleteRow]
+    total_credential_count: int
+    claimed_at: datetime | None = Field(default=None, exclude_if=lambda claimed: claimed is None)
+    confirmed_by: str | None = Field(default=None, exclude_if=lambda user: user is None)
+    approved_credential_ids: list[str] | None = Field(default=None, exclude_if=lambda ids: ids is None)
+    outcomes: list[CredentialDeleteOutcome] | None = Field(default=None, exclude_if=lambda outcomes: outcomes is None)
+
+    def outcome_rows(self) -> list[dict[str, str]]:
+        names = {row.credential_id: row for row in self.rows}
+        return [
+            {
+                "credential_id": item.credential_id,
+                "name": names[item.credential_id].name,
+                "credential_type": names[item.credential_id].credential_type.value,
+                "outcome": item.outcome,
+            }
+            for item in self.outcomes or []
+        ]
+
+
 class QuestionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -144,6 +226,28 @@ class QuestionInteraction(BaseModel):
     account_group_cancel: AccountGroupCancelReview | None = Field(
         default=None, exclude_if=lambda review: review is None
     )
+    credential_delete_review: CredentialDeleteReview | None = Field(
+        default=None, exclude_if=lambda review: review is None
+    )
+
+    @property
+    def awaiting_answer(self) -> bool:
+        # A confirmed deletion stays pending while its deletes run, and nothing but its outcomes may end it.
+        return self.status == "pending" and (
+            self.credential_delete_review is None or self.credential_delete_review.claimed_at is None
+        )
+
+    @property
+    def last_activity_at(self) -> datetime | None:
+        claimed_at = self.credential_delete_review.claimed_at if self.credential_delete_review is not None else None
+        return max((at for at in (self.resolved_at, claimed_at) if at is not None), default=None)
+
+    @property
+    def claimed_credential_ids(self) -> list[str]:
+        review = self.credential_delete_review
+        if review is None or review.claimed_at is None:
+            return []
+        return list(review.approved_credential_ids or [])
 
     @property
     def account_group_decision(self) -> AccountGroupDecision | None:
@@ -173,6 +277,17 @@ class QuestionInteraction(BaseModel):
                 "dispatched": dispatched,
                 "workflow_run_group_id": group_id,
             }
+        if self.credential_delete_review is not None:
+            review = self.credential_delete_review
+            return {
+                "ok": True,
+                "interaction_id": self.interaction_id,
+                "tool_call_id": self.tool_call_id,
+                "confirmed": review.outcomes is not None,
+                "outcomes": review.outcome_rows(),
+                "total_credential_count_at_review": review.total_credential_count,
+                "note": CREDENTIAL_DELETE_OUTCOME_NOTE,
+            }
         if self.account_group_cancel is not None:
             decision = self.account_group_decision
             return {
@@ -190,11 +305,15 @@ class QuestionInteraction(BaseModel):
                 (choice for choice in part.choices if answer is not None and choice.choice_id == answer.choice_id),
                 None,
             )
+            status = "answered" if answer is not None else "unanswered"
+            # A client that predates detail_prompt sends the choice alone.
+            if choice is not None and choice.detail_prompt and not (answer and answer.text and answer.text.strip()):
+                status = "detail_missing"
             parts.append(
                 {
                     "part_id": part.part_id,
                     "prompt": part.prompt,
-                    "status": "answered" if answer is not None else "unanswered",
+                    "status": status,
                     "choice": choice.model_dump() if choice is not None else None,
                     "text": answer.text if answer is not None else None,
                 }
@@ -238,16 +357,24 @@ def create_question_interaction(
             text = scrub_secrets_from_text(ctx, text)
         return redact_raw_secrets_for_prompt(text)
 
+    def choices(part: QuestionInput) -> list[QuestionChoice]:
+        lead = next((choice for choice in part.choices if choice.recommended), None)
+        return [
+            QuestionChoice(
+                choice_id=uuid4().hex,
+                text=safe_text(choice.text),
+                recommended=choice is lead,
+                detail_prompt=safe_text(choice.detail_prompt) if choice.detail_prompt else None,
+            )
+            for choice in sorted(part.choices, key=lambda choice: choice is not lead)
+        ]
+
     return QuestionInteraction(
         interaction_id=uuid4().hex,
         turn_id=turn_id,
         tool_call_id=tool_call_id,
         parts=[
-            QuestionPart(
-                part_id=uuid4().hex,
-                prompt=safe_text(part.prompt),
-                choices=[QuestionChoice(choice_id=uuid4().hex, text=safe_text(choice)) for choice in part.choices],
-            )
+            QuestionPart(part_id=uuid4().hex, prompt=safe_text(part.prompt), choices=choices(part))
             for part in arguments.parts
         ],
     )
@@ -257,6 +384,10 @@ def _validate_account_group_decision(
     interaction: QuestionInteraction, response: QuestionResponse, decision: AccountGroupDecision | None
 ) -> None:
     review = interaction.account_group_review
+    if interaction.credential_delete_review is not None:
+        if not response.skipped or decision is not None:
+            raise ValueError("A credential deletion is confirmed on its card; this route only declines it")
+        return
     if interaction.account_group_cancel is not None:
         if response.answers or response.text is not None:
             raise ValueError("A cancel review takes only a decision")
@@ -292,7 +423,7 @@ def resolve_question_response(
     response: QuestionResponse,
     account_group_decision: AccountGroupDecision | None = None,
 ) -> QuestionInteraction:
-    if interaction.status != "pending":
+    if not interaction.awaiting_answer:
         raise ValueError("Question is no longer pending")
     if response.skipped and (response.answers or response.text is not None or account_group_decision):
         raise ValueError("A skipped response cannot also contain answers")
@@ -327,6 +458,73 @@ def resolve_question_response(
             **decided,
         }
     )
+
+
+def claim_credential_deletion(
+    interaction: QuestionInteraction, approved_ids: list[str], confirmed_by: str | None
+) -> QuestionInteraction:
+    review = interaction.credential_delete_review
+    if review is None:
+        raise ValueError("This question has no credential deletion")
+    if not interaction.awaiting_answer:
+        raise ValueError("This deletion was already answered")
+    if not approved_ids:
+        raise ValueError("Select at least one credential")
+    if len(set(approved_ids)) != len(approved_ids):
+        raise ValueError("A confirmation lists a credential twice")
+    if not set(approved_ids) <= {row.credential_id for row in review.rows}:
+        raise ValueError("A confirmation lists a credential the card did not")
+    return interaction.model_copy(
+        update={
+            "credential_delete_review": review.model_copy(
+                update={
+                    "claimed_at": datetime.now(UTC),
+                    "confirmed_by": confirmed_by,
+                    "approved_credential_ids": list(approved_ids),
+                }
+            )
+        }
+    )
+
+
+def finish_credential_deletion(
+    interaction: QuestionInteraction, outcomes: list[CredentialDeleteOutcome]
+) -> QuestionInteraction:
+    review = interaction.credential_delete_review
+    if review is None or review.claimed_at is None or interaction.status != "pending":
+        raise ValueError("This deletion was not claimed")
+    return interaction.model_copy(
+        update={
+            "status": "resolved",
+            "response": QuestionResponse(),
+            "resolved_at": datetime.now(UTC),
+            "credential_delete_review": review.model_copy(update={"outcomes": list(outcomes)}),
+        }
+    )
+
+
+def credential_deletion_lease_expired(interaction: QuestionInteraction, now: datetime) -> bool:
+    review = interaction.credential_delete_review
+    return (
+        interaction.status == "pending"
+        and review is not None
+        and review.claimed_at is not None
+        and now - review.claimed_at >= CREDENTIAL_DELETE_CLAIM_LEASE
+    )
+
+
+def fail_unrecorded_credential_deletion(interaction: QuestionInteraction) -> QuestionInteraction:
+    review = interaction.credential_delete_review
+    if review is None:
+        raise ValueError("This question has no credential deletion")
+    recorded = list(review.outcomes or [])
+    seen = {item.credential_id for item in recorded}
+    failed = [
+        CredentialDeleteOutcome(credential_id=credential_id, outcome="failed")
+        for credential_id in interaction.claimed_credential_ids
+        if credential_id not in seen
+    ]
+    return finish_credential_deletion(interaction, [*recorded, *failed])
 
 
 async def wait_for_interaction(ctx: CopilotContext, interaction: QuestionInteraction) -> QuestionInteraction:

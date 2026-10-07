@@ -943,7 +943,7 @@ async def test_redacted_secret_turn_opens_the_card_for_the_users_site_and_keeps_
     assert policy.allow_run_blocks is False
     assert policy.allow_missing_credentials_in_draft is True
     assert ctx.test_after_update_done is True
-    assert credential_prompt_reason(policy, None) is None
+    assert credential_prompt_reason(policy) is None
     assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is True
     for tool_name in (
         "run_blocks_and_collect_debug",
@@ -990,7 +990,7 @@ async def test_a_user_url_carrying_userinfo_authorizes_no_card_on_a_redacted_sec
     ("user_url", "card_can_open", "expected"),
     [
         ("https://portal.example.com/login?pw=" + _CARD_SECRET, True, "request_credential"),
-        ("", True, "ask_user"),
+        ("", True, "ask the user for it"),
         ("https://portal.example.com/login", False, "Credentials UI"),
     ],
     ids=["user_site", "no_site", "card_unavailable"],

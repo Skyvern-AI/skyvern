@@ -77,6 +77,9 @@ _PLATFORM_VAULT_BINDINGS = (ParameterType.CREDENTIAL, WorkflowParameterType.CRED
 class CredentialFetch:
     provider: CredentialFetchProvider
     parameter_type: ParameterType | WorkflowParameterType
+    parameter_key: str
+    # Set only once the ID is found among the org's stored credentials: before that it is caller input.
+    credential_id: str | None = None
 
     @property
     def customer_owned(self) -> bool:
@@ -149,6 +152,8 @@ def _log_outcome(
         RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE,
         provider=str(fetch.provider),
         parameter_type=str(fetch.parameter_type),
+        parameter_key=fetch.parameter_key,
+        credential_id=fetch.credential_id,
         outcome=outcome,
         failure_type=failure_type,
         duration_seconds=round(time.monotonic() - started, 3),
@@ -170,7 +175,7 @@ async def record_credential_fetch(
     parameter_type = (
         parameter.workflow_parameter_type if isinstance(parameter, WorkflowParameter) else parameter.parameter_type
     )
-    fetch = CredentialFetch(provider=provider, parameter_type=parameter_type)
+    fetch = CredentialFetch(provider=provider, parameter_type=parameter_type, parameter_key=parameter.key)
     started = time.monotonic()
     with track_bitwarden_session_usage() as session:
         try:

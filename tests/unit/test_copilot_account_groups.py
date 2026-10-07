@@ -503,7 +503,10 @@ def test_withholding_submission_hides_only_the_run_tool(
     surface = resolve_copilot_tool_surface(
         mode=None,
         native_tools=copilot_native_tools(
-            supports_question_tool=True, supports_account_group_card=True, browser_code_available=False
+            supports_question_tool=True,
+            supports_account_group_card=True,
+            browser_code_available=False,
+            run_tools_available=True,
         ),
         alias_map={},
         overlays={},

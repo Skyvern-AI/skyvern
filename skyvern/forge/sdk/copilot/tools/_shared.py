@@ -288,11 +288,20 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
     )
 
 
+EDIT_BLOCK_TOOL_NAME = "edit_block"
+EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
+UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
+UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
+RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
+BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+
 BLOCK_RUNNING_TOOLS = frozenset(
-    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run", "test_workflow_from_blank_browser"}
+    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
 
-WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks", "edit_block_and_run"})
+WORKFLOW_MUTATION_TOOLS = frozenset(
+    {UPDATE_WORKFLOW_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME}
+)
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})

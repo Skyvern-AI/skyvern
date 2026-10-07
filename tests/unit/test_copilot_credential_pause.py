@@ -2,8 +2,7 @@
 
 Covers:
 
-- ``credential_pause_reason`` fires only on the three typed mid-build signals
-  and never on ``credential_prompt_reason``'s text-marker tier.
+- ``credential_pause_reason`` fires only on the three typed mid-build signals.
 - ``maybe_credential_pause``'s waiter: connect mutates ``RequestPolicy`` and
   resolves, skip leaves the policy untouched, timeout/disconnect/no-cache
   degrade to None without sending a frame, an invalid/foreign credential id
@@ -46,12 +45,13 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import tools as tools_module
-from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override
+from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _turn_credential_prompt_reason
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
     CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
@@ -95,7 +95,6 @@ from skyvern.forge.sdk.copilot.narration import NarratorState, build_tool_call_a
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _seed_prior_approved_credentials,
-    credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery, CredentialOriginRecoveryState
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
@@ -303,23 +302,6 @@ def test_reason_ignores_deferred_draft_when_user_explicitly_skipped_testing() ->
     """skip_test means the user already said not to run/verify this -- pausing to
     ask for a credential would contradict that explicit request."""
     policy = RequestPolicy(credential_draft_deferred_explicitly=True, testing_intent="skip_test")
-    ctx = SimpleNamespace(
-        last_run_skipped_unbound_credentials=False,
-        latest_diagnosis_repair_contract=None,
-        request_policy=policy,
-        update_workflow_called=True,
-    )
-    assert credential_pause_module.credential_pause_reason(ctx) is None
-
-
-def test_reason_ignores_text_marker_tier_that_credential_prompt_reason_catches() -> None:
-    """Pins the SKY-11988 false-positive lesson: no text-marker fallback here."""
-    policy = RequestPolicy()
-    final_text = "I couldn't test this. Please add the credential via the Credentials UI."
-
-    # The sibling function DOES classify this via its text-marker tier.
-    assert credential_prompt_reason(policy, final_text) == "assistant_directed"
-
     ctx = SimpleNamespace(
         last_run_skipped_unbound_credentials=False,
         latest_diagnosis_repair_contract=None,
@@ -1569,7 +1551,7 @@ async def test_connect_clears_credential_draft_deferred_explicitly(monkeypatch: 
     await maybe_credential_pause(ctx, _fake_result(), stream, config)
 
     assert ctx.request_policy.credential_draft_deferred_explicitly is False
-    assert credential_prompt_reason(ctx.request_policy, "any final text") is None
+    assert _turn_credential_prompt_reason(ctx) is None
 
 
 @pytest.mark.asyncio
@@ -2541,6 +2523,24 @@ async def test_no_update_card_for_a_credential_with_a_code_method_or_outside_the
     ctx.stream.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_an_authenticator_code_method_names_the_fill_tool_only_when_the_turn_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = []
+    for native_tool_names in ((CREDENTIAL_FILL_TOOL_NAME,), ()):
+        ctx = _tool_ctx(monkeypatch)
+        ctx.eval_native_tool_names = native_tool_names
+        secrets = PasswordCredential(username="u", password="p", totp="fake-seed")
+        ctx.request_policy.resolved_credentials = [wire_credential_vault(monkeypatch, secrets)]
+        results.append(await _call_ask_tool(ctx, credential_id="cred_1"))
+    with_tool, without_tool = results
+
+    assert without_tool == {"ok": True, "status": "has_code_method", "method": "authenticator"}
+    assert {key: value for key, value in with_tool.items() if key != "next"} == without_tool
+    assert with_tool["next"]
+
+
 _IDP_ORIGIN = "https://idp.example.test"
 
 
@@ -2925,7 +2925,7 @@ async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_
     assert resume_msgs is not None
     assert credential_pause_module.signed_in_facts(signed_in) in json.dumps(resume_msgs)
     assert ctx.credential_pause_outcome == "signed_in"
-    assert credential_prompt_reason(ctx.request_policy, None) is None
+    assert _turn_credential_prompt_reason(ctx) is None
     assert await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config) is None
 
 

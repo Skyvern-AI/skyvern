@@ -978,6 +978,8 @@ class WorkflowRunModel(Base):
     sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
@@ -1698,6 +1700,9 @@ class PersistentBrowserSessionModel(Base):
     browser_profile_id = Column(String, nullable=True, index=True)
     bound_workflow_permanent_id = Column(String, nullable=True)
     bound_key = Column(String, nullable=True)
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
+    created_for_workflow_run_id = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())

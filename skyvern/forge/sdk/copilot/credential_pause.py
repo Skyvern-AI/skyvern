@@ -721,12 +721,7 @@ async def finish_credential_generation(
 
 
 def credential_pause_reason(ctx: Any) -> str | None:
-    """Typed-signal-only detector for a mid-build credential ask.
-
-    Deliberately narrower than ``credential_prompt_reason`` (request_policy.py):
-    no text-marker tier, so a REPLY that merely mentions credentials in prose
-    can't trigger a pause -- see the SKY-11988 false-positive lesson.
-    """
+    """Typed-signal-only detector for a run-derived credential ask; reply prose never counts."""
     policy = getattr(ctx, "request_policy", None)
     raw_secret_redacted_draft = (
         isinstance(policy, RequestPolicy)

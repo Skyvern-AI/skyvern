@@ -759,7 +759,6 @@ def test_code_schema_guidance_advertises_clear_browser_data_instead_of_browser_s
     guidance = " ".join(_code_only_browser_schema_guidance())
 
     assert "await clear_browser_data(page)" in guidance
-    assert "chrome://" in guidance
     assert "clear_cookies" not in guidance
 
 
@@ -786,7 +785,6 @@ def test_code_only_schema_guidance_exposes_secret_credential_runtime_accessor() 
     assert "magic_link" not in secret_line
     assert "fill_credential_field" not in secret_line
     assert "<key>.secret_value" not in password_line
-    assert "fill_credential_field" in password_line
     for accessors in CREDENTIAL_CODE_ACCESSORS.values():
         for accessor in (*accessors.fields, accessors.otp, accessors.magic_link):
             assert accessor is None or accessor in "\n".join(lines)
@@ -1496,6 +1494,7 @@ def test_authoring_guidance_reaches_the_three_write_tools_only_under_both_famili
             supports_question_tool=True,
             browser_code_available=True,
             authoring_capability=capability,
+            run_tools_available=True,
         )
     }
 
@@ -1515,6 +1514,7 @@ def test_read_the_schema_first_reaches_the_write_tools_under_every_capability(ca
             supports_question_tool=True,
             browser_code_available=True,
             authoring_capability=capability,
+            run_tools_available=True,
         )
     }
 
@@ -1529,6 +1529,7 @@ def test_agent_blocks_only_keeps_direct_browser_scouting_without_the_code_tool()
             supports_question_tool=True,
             browser_code_available=False,
             authoring_capability=AGENT_BLOCKS_ONLY,
+            run_tools_available=True,
         )
     }
 

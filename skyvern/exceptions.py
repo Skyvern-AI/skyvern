@@ -252,6 +252,15 @@ class BrowserActionPolicyNotEnforceable(SkyvernHTTPException):
         )
 
 
+class BrowserSettingsUnsupported(SkyvernHTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            "browser_settings.timezone_id cannot be applied by the browser provider selected for this run. Remove "
+            "the timezone setting or run on Skyvern's own browsers.",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
 class RateLimitExceeded(SkyvernHTTPException):
     def __init__(self, organization_id: str, max_requests: int, window_seconds: int):
         message = (
@@ -1282,6 +1291,12 @@ class TerminationError(SkyvernException):
 class StepTerminationError(TerminationError):
     def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
         super().__init__(f"Step {step_id} cannot be executed and task is failed. Reason: {reason}")
+
+
+class CompletionGateTerminationError(TerminationError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class TaskTerminationError(TerminationError):

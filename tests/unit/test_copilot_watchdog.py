@@ -294,13 +294,12 @@ async def test_task_exit_unfinalized_message_tolerates_unreadable_run() -> None:
 
 @pytest.mark.asyncio
 async def test_paused_error_message_reports_a_wait_not_an_uncertain_outcome() -> None:
-    """This arm is the only one that tells the model to relay its own text to the user, so relaying
-    it verbatim has to clear the output guard. It must also not inherit the "outcome is uncertain"
-    tail, which would push a re-run of blocks that are still live and waiting on a person."""
+    """A pause is a wait on a person, so the message states the waiting facts and must not inherit
+    the "outcome is uncertain" tail. The text must clear the output guard if the model relays it."""
     msg = await _watchdog_error_message("paused", _ErrorCtx(), "wr_test", _fake_run(status="paused"), 240)
 
     assert "paused" in msg.lower()
-    assert "tell the user" in msg.lower()
+    assert "waiting for a person" in msg.lower()
     assert "wr_test" not in msg
     assert contains_internal_machinery_leak(msg) is False
     assert "uncertain" not in msg.lower()
@@ -309,8 +308,7 @@ async def test_paused_error_message_reports_a_wait_not_an_uncertain_outcome() ->
 
 @pytest.mark.asyncio
 async def test_non_paused_error_messages_keep_the_run_id_for_the_model() -> None:
-    """The other arms never direct a relay — they tell the model to look the run up — so stripping
-    the id there would take away the only handle it has."""
+    """The run id is the model's only handle on a run whose outcome is uncertain."""
     exit_reasons: tuple[WatchdogExitReason, ...] = ("ceiling", "task_exit_unfinalized")
     for exit_reason in exit_reasons:
         msg = await _watchdog_error_message(exit_reason, _ErrorCtx(), "wr_test", _fake_run(), 240)

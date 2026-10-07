@@ -15,7 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 import structlog
 from pydantic import JsonValue
 
-from skyvern.forge.failure_classifier import without_output_only_anti_bot
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
@@ -57,7 +57,6 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_settings
-from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -280,26 +279,6 @@ def parse_final_response(text: str) -> dict[str, Any]:
         return {"type": sniffed_type, "user_response": "Done."}
 
     return {"type": "REPLY", "user_response": text}
-
-
-# A `block_type:` line whose value is a real BlockType, or a `workflow_definition:`
-# line — both keyed to canonical identifiers and anchored at line start, so inline
-# prose ("the block_type field") cannot trip them. The optional quote group also
-# matches the JSON serialization (`"block_type": "navigation"`).
-_BLOCK_TYPE_LINE_RE = re.compile(
-    r'^\s*-?\s*["\']?block_type["\']?\s*:\s*["\']?(?:' + "|".join(re.escape(bt.value) for bt in BlockType) + r")\b",
-    re.MULTILINE,
-)
-_WORKFLOW_DEFINITION_LINE_RE = re.compile(r'^\s*["\']?workflow_definition["\']?\s*:', re.MULTILINE)
-
-
-def looks_like_workflow_yaml_in_chat(text: Any) -> bool:
-    """Return True when ``text`` contains serialized Skyvern workflow YAML/JSON."""
-    if not isinstance(text, str):
-        return False
-    if "block_type" not in text and "workflow_definition" not in text:
-        return False
-    return bool(_WORKFLOW_DEFINITION_LINE_RE.search(text) or _BLOCK_TYPE_LINE_RE.search(text))
 
 
 def extract_screenshot_b64(result: dict[str, Any]) -> str | None:
@@ -1653,7 +1632,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
     """Strip large/binary fields from tool results before sending to the LLM."""
     sanitized = sanitize_generic_tool_result_for_llm(
         tool_name,
-        without_output_only_anti_bot(result),
+        without_output_only_labels(result),
         drop_top_level_keys=(
             "action",
             "browser_context",

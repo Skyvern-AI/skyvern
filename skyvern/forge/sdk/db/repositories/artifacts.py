@@ -422,6 +422,7 @@ class ArtifactsRepository(BaseRepository):
         *,
         organization_id: str | None,
         artifact_type: ArtifactType | None = None,
+        artifact_types: list[ArtifactType] | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -437,6 +438,8 @@ class ArtifactsRepository(BaseRepository):
 
             if artifact_type is not None:
                 query = query.filter_by(artifact_type=artifact_type)
+            if artifact_types is not None:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
             if task_id is not None:
                 query = query.filter_by(task_id=task_id)
             if step_id is not None:

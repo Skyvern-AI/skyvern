@@ -55,6 +55,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     OutputParameter,
     ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
@@ -1166,3 +1168,46 @@ async def test_email_download_directory_ignores_previous_attempt_files(
 
     assert [part.get_filename() for part in message.iter_attachments()] == ["fresh.txt"]
     assert (download_dir / "old.txt").read_text() == "old.txt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", ["", "  "])
+async def test_a_blank_attachment_entry_is_skipped_and_the_email_still_builds(
+    blank: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    report = tmp_path / "wr_1" / "report.txt"
+    report.parent.mkdir()
+    report.write_text("report")
+    context = _workflow_run_context({})
+
+    with patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None):
+        only_blank = await _send_email_block(file_attachments=[blank])._build_email_message(context, "wr_1")
+        mixed = await _send_email_block(file_attachments=[blank, str(report), blank])._build_email_message(
+            context, "wr_1"
+        )
+
+    assert list(only_blank.iter_attachments()) == []
+    assert [part.get_filename() for part in mixed.iter_attachments()] == ["report.txt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["{{ report_path }}", "report_path"])
+async def test_an_attachment_that_resolves_to_an_empty_path_still_fails(
+    entry: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    context = _workflow_run_context({"report_path": ""})
+    now = datetime.now(UTC)
+    context.parameters["report_path"] = WorkflowParameter(
+        key="report_path",
+        workflow_parameter_id="wp_1",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+    with patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None):
+        with pytest.raises(PermissionError, match="path must not be empty"):
+            await _send_email_block(file_attachments=[entry])._build_email_message(context, "wr_1")

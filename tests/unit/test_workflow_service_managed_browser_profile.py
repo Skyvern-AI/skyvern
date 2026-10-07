@@ -113,6 +113,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         browser_profile_id="bp_managed",
         browser_seed_source=BrowserSeedSource.own_memory,
         browser_address=None,
+        browser_settings=None,
         start_fresh_browser=None,
         reuse_browser_session=None,
         reuse_bound_key=None,
@@ -414,6 +415,8 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
         proxy_location=None,
         inherit_profile_proxy=True,
         session_kind=BrowserSessionKind.workflow_run,
+        browser_settings=None,
+        created_for_workflow_run_id=None,
     )
 
 
@@ -1383,6 +1386,7 @@ async def test_execute_workflow_persists_profile_when_only_finally_block_fails(
                     status=BlockStatus.failed,
                     failure_reason="cleanup failed",
                     output_parameter_value=None,
+                    sign_in_form_visible=False,
                 ),
             )
         ),
@@ -1431,6 +1435,7 @@ async def test_execute_workflow_defers_finally_failure_status_until_after_writeb
         status=BlockStatus.failed,
         failure_reason="upload failed",
         output_parameter_value=None,
+        sign_in_form_visible=False,
     )
 
     svc = WorkflowService()
@@ -1443,6 +1448,14 @@ async def test_execute_workflow_defers_finally_failure_status_until_after_writeb
     status_write = AsyncMock(side_effect=RuntimeError("status write must remain deferred"))
     monkeypatch.setattr(svc, "_update_workflow_run_status_if_not_final", status_write)
     order: list[str] = []
+
+    def tag_signed_out(
+        _workflow_run_id: str, _status: WorkflowRunStatus, category: list[dict] | None
+    ) -> list[dict] | None:
+        order.append("tag")
+        return category
+
+    monkeypatch.setattr(svc, "_with_saved_profile_signed_out", tag_signed_out)
     _patch_browser_cleanup(monkeypatch, svc, order)
     persist_browser_session = AsyncMock(side_effect=lambda **_kwargs: order.append("store"))
     monkeypatch.setattr(
@@ -1463,7 +1476,8 @@ async def test_execute_workflow_defers_finally_failure_status_until_after_writeb
     result = await _run_execute_workflow(svc)
 
     assert result is failed_run
-    assert order == ["teardown", "store", "finalize"]
+    # The saved-profile tag reads the run's open browser, so it is applied before teardown.
+    assert order == ["tag", "teardown", "store", "finalize"]
     status_write.assert_not_awaited()
     persist_browser_session.assert_awaited_once()
     assert persist_browser_session.await_args is not None

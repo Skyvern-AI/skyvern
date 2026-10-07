@@ -497,9 +497,6 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
-# Matches any final reply containing these substrings, not just credential-blocking
-# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
-_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 RAW_SECRET_QUESTION = (
@@ -1212,18 +1209,15 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
     )
 
 
-def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
-    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
-    # allow_missing_credentials_in_draft alone also covers the generic skip_test
-    # fallthrough with no credential involvement — then a text marker.
-    if isinstance(policy, RequestPolicy):
-        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
-            return policy.clarification_reason
-        if policy.credential_draft_deferred_explicitly:
-            return "credential_deferred_draft"
-    normalized = " ".join((final_text or "").lower().split())
-    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
-        return "assistant_directed"
+def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
+    # The explicit-defer flag, not allow_missing_credentials_in_draft, because the latter
+    # also covers the generic skip_test fallthrough with no credential involvement.
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+        return policy.clarification_reason
+    if policy.credential_draft_deferred_explicitly:
+        return "credential_deferred_draft"
     return None
 
 

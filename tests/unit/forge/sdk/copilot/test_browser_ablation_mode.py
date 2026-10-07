@@ -252,7 +252,9 @@ def _production_surfaces(registered: list[RegisteredTool]) -> tuple[CopilotToolS
     # browser-code tool is not available to it; where it is, they are withdrawn.
     normal = resolve_copilot_tool_surface(
         mode=None,
-        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=False),
+        native_tools=copilot_native_tools(
+            supports_question_tool=True, browser_code_available=False, run_tools_available=True
+        ),
         alias_map=aliases,
         overlays=overlays,
     )

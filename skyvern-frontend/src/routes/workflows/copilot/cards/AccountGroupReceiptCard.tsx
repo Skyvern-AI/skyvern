@@ -94,7 +94,7 @@ function useGroup(groupId: string | null) {
   });
 }
 
-function Heading({
+export function Heading({
   tone,
   title,
   meta,
@@ -141,11 +141,10 @@ export function AccountGroupReceiptCard({
           icon={
             <QuestionMarkCircledIcon
               aria-hidden
-              className="size-3.5 shrink-0 text-amber-500"
+              className="size-3.5 shrink-0"
             />
           }
           title={`Copilot asked you to review ${plural(review.rows.length, "account")}`}
-          hint="answer below"
         />
       </div>
     );
@@ -263,11 +262,10 @@ export function AccountGroupCancelReceipt({
           icon={
             <QuestionMarkCircledIcon
               aria-hidden
-              className="size-3.5 shrink-0 text-amber-500"
+              className="size-3.5 shrink-0"
             />
           }
           title={`Copilot asked whether to stop ${plural(count, "account run")}`}
-          hint="answer below"
         />
       </div>
     );

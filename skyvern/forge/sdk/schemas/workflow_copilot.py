@@ -464,6 +464,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_account_group_card: bool = Field(
         False, description="The client can display account group review and receipt cards."
     )
+    supports_credential_delete_card: bool = Field(
+        False, description="The client can display the credential deletion card and post its confirmation."
+    )
     credential_recovery_token: SecretStr | None = Field(
         None,
         repr=False,
@@ -555,6 +558,12 @@ class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
     workflow_copilot_chat_id: str
     interaction_id: str
     account_group_decision: AccountGroupDecision | None = None
+
+
+class WorkflowCopilotCredentialDeletionRequest(BaseModel):
+    workflow_copilot_chat_id: str
+    interaction_id: str
+    credential_ids: list[str] = Field(min_length=1)
 
 
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
@@ -684,6 +693,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     CREDENTIAL_PAUSE_RESOLVED = "credential_pause_resolved"
     CODEGEN_PROGRESS = "codegen_progress"
     TITLE_UPDATE = "title_update"
+    SCREENSHOT = "screenshot"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -1015,6 +1025,15 @@ class WorkflowCopilotTitleUpdate(BaseModel):
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
+class WorkflowCopilotScreenshotUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.SCREENSHOT, description="Message type"
+    )
+    artifact_id: str = Field(..., description="Chat-owned artifact holding the full-size PNG")
+    captured_at: datetime = Field(..., description="Server clock read when the frame was staged for the model")
+    tool_call_id: str | None = Field(None, description="The tool call that staged the frame, when known")
+
+
 class CredentialRegistration(BaseModel):
     username: str = Field(..., description="Username or email to register with, exactly as the user gave it")
     credential_name: str = Field(..., description="Name to save the new credential under")
@@ -1126,6 +1145,10 @@ class WorkflowCopilotCodegenProgressUpdate(BaseModel):
     )
     chars_streamed: int = Field(..., description="Cumulative argument characters streamed so far in this call")
     iteration: int = Field(..., description="Agent loop iteration number; matches the TOOL_CALL frame that follows")
+    generation_id: str | None = Field(
+        None,
+        description="New for every model response; the authoring calls within one response share it",
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

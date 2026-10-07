@@ -47,11 +47,8 @@ import {
 import { TURN_ROW_INSET } from "./cardLayout";
 import { useDemoLoginGuide } from "@/hooks/useDemoLoginGuide";
 
-// Union of both a request-policy-time classifier's real reason tokens and a
-// mid-build run-failure reason that isn't emitted by any shipped backend
-// path yet. `type`/`reason` are the only fields a minimal signal guarantees;
-// everything else on the frame below is populated only by a richer,
-// timed pause signal and stays undefined otherwise.
+// Union of the request-policy reason tokens and the run-derived pause reasons. `type`/`reason` are the
+// only fields a minimal signal guarantees; the rest is populated only by a timed pause signal.
 export type CredentialRequiredReason =
   | "workflow_credential_inputs_unbound"
   | "credential_name_unresolved"
@@ -169,7 +166,7 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
   string
 > = {
   workflow_credential_inputs_unbound: SIGN_IN_WHY_LINE,
-  // Lower-confidence text-marker detection of the same underlying need.
+  // Neutral reason when no more specific typed cause applies; older stored chats also carry it.
   assistant_directed: SIGN_IN_WHY_LINE,
   credential_name_unresolved:
     "I couldn't tell which saved credential you meant — connect or pick the right one so the workflow can sign in.",
@@ -684,14 +681,8 @@ export function CredentialAskMarker({ message }: { message?: string }) {
     <div>
       <AskMessage message={message} />
       <AttentionMarker
-        icon={
-          <LockClosedIcon
-            aria-hidden
-            className="size-3.5 shrink-0 text-amber-500"
-          />
-        }
+        icon={<LockClosedIcon aria-hidden className="size-3.5 shrink-0" />}
         title="Copilot needs to sign in"
-        hint="continue below"
       />
     </div>
   );

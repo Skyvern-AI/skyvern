@@ -110,7 +110,7 @@ Browser API (async, Playwright-shaped):
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
 - After a sensitive sign-in on this page, screenshots, `page.evaluate` and `search_web` are refused for the rest of
   the turn. Reading text still works; that is the way to inspect such a page.
-- Tabs and popups: each call starts on the browser's current tab, the one the direct browser tools act on.
+- Tabs and popups: each call starts on the browser's current tab.
   `await tabs()` lists open tabs; `await switch_tab(index)` makes that tab `page` for the rest of the call;
   `await click_and_wait_for_popup(selector)` clicks and returns the new tab's `index` and `url`.
 - Downloads and files: `await click_and_download(selector)` clicks and returns `{file_id, name, size}`

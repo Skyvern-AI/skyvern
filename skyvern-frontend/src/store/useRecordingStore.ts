@@ -107,8 +107,11 @@ export type MessageInExfiltratedEvent =
 
 export type RecordingActionKind =
   | "click"
+  | "dialog"
+  | "drag_drop"
   | "hover"
   | "input_text"
+  | "press_key"
   | "url_change"
   | "wait";
 

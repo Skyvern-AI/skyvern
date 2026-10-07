@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 import pytest
@@ -1235,7 +1235,7 @@ async def test_setup_workflow_run_opens_one_outer_session() -> None:
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
-        mock_app.DATABASE.workflow_runs.Session = lambda: _Counter()
+        mock_app.DATABASE.workflow_runs.Session = MagicMock(side_effect=_Counter)
         await service.setup_workflow_run(
             request_id="req_test",
             workflow_request=request,
@@ -1291,7 +1291,7 @@ async def test_setup_workflow_run_rolls_back_outer_session_on_batch_failure() ->
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
-        mock_app.DATABASE.workflow_runs.Session = lambda: _Session()
+        mock_app.DATABASE.workflow_runs.Session = MagicMock(side_effect=_Session)
         await service.setup_workflow_run(
             request_id="req_test",
             workflow_request=request,

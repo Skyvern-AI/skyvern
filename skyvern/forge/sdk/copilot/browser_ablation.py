@@ -11,6 +11,7 @@ from enum import StrEnum
 from typing import Any, Protocol, TypedDict, TypeVar
 
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME
 
 
 class CopilotEvalMode(StrEnum):
@@ -298,10 +299,7 @@ def _required_code_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
 ) -> CopilotToolSurface:
-    from skyvern.forge.sdk.copilot.tools.composition_capture import (
-        COMPOSITION_INSPECTION_TOOL_NAME,
-        current_page_inspection_tool,
-    )
+    from skyvern.forge.sdk.copilot.tools.composition_capture import current_page_inspection_tool
 
     missing_aliases = sorted(REQUIRED_CODE_BROWSER_ALIASES.difference(alias_map.keys() & overlays.keys()))
     if missing_aliases:
@@ -324,6 +322,11 @@ def _required_code_surface(
         ordered_mcp_names=tuple(selected_aliases),
         identity=CopilotToolSurfaceIdentity.REQUIRED_CODE,
     )
+
+
+def surface_runs_blocks(*, mode: CopilotEvalMode | None, browser_tools_available: bool) -> bool:
+    # Mirrors which surfaces resolve_copilot_tool_surface leaves the block-running tools on.
+    return browser_tools_available and mode != CopilotEvalMode.BROWSER_ABLATION
 
 
 def resolve_copilot_tool_surface(

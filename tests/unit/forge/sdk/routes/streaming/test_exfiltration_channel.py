@@ -91,6 +91,27 @@ def restore_exfiltration_channel_class_state() -> t.Iterator[None]:
 
 
 class TestExfiltrationChannelEvents:
+    @pytest.mark.asyncio
+    async def test_page_cdp_dialog_events_are_forwarded(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data()])
+        _adopt_page(channel, page)
+        cdp_session = MagicMock()
+        cdp_session.send = AsyncMock()
+        cdp_session.on = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await channel._attach_page_cdp_console_capture(page)
+
+        listeners = {call.args[0]: call.args[1] for call in cdp_session.on.call_args_list}
+        listeners["Page.javascriptDialogOpening"]({"type": "confirm", "message": "Continue?"})
+        listeners["Page.javascriptDialogClosed"]({"result": True, "userInput": ""})
+        await asyncio.gather(*channel._pending_event_tasks)
+
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        assert [event.event_name for event in emitted] == ["user_interaction", "dialog:opening", "dialog:closed"]
+        assert [event.capture_seq for event in emitted] == sorted(event.capture_seq for event in emitted)
+
     def test_binding_event_emits_user_interaction(self) -> None:
         channel, on_event = _make_channel()
         page = _make_page()
@@ -231,8 +252,12 @@ class TestExfiltrationChannelEvents:
         # binding script + exfiltrate script + stale-queue discard
         assert page.evaluate.await_count == 3
         assert channel._page_console_captures[page].cdp_session is cdp_session
-        cdp_session.send.assert_awaited_once_with("Runtime.enable")
-        cdp_session.on.assert_called_once()
+        assert {call.args[0] for call in cdp_session.send.await_args_list} == {"Runtime.enable", "Page.enable"}
+        assert {call.args[0] for call in cdp_session.on.call_args_list} == {
+            "Runtime.consoleAPICalled",
+            "Page.javascriptDialogOpening",
+            "Page.javascriptDialogClosed",
+        }
 
     @pytest.mark.asyncio
     async def test_page_cdp_console_callback_tracks_event_task(self) -> None:
@@ -246,8 +271,8 @@ class TestExfiltrationChannelEvents:
 
         await channel._attach_page_cdp_console_capture(page)
 
-        event_name, callback = cdp_session.on.call_args.args
-        assert event_name == "Runtime.consoleAPICalled"
+        listeners = {call.args[0]: call.args[1] for call in cdp_session.on.call_args_list}
+        callback = listeners["Runtime.consoleAPICalled"]
 
         callback(
             {

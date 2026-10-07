@@ -94,6 +94,7 @@ async def test_create_browser_session_passes_start_url_to_session_manager() -> N
         created_by="user_1",
         # A signed-in user on the API route is still an API session, which created_by cannot tell.
         session_kind=BrowserSessionKind.api,
+        browser_settings=None,
     )
     from_browser_session.assert_awaited_once_with(created_session)
 

@@ -1122,7 +1122,7 @@ class TestSharedFactoryBaseUrlGuard:
         monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
         monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
         client_constructor = MagicMock(return_value=object())
-        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(client_module, "_LoopbackSkyvern", client_constructor)
 
         client_module._build_cloud_client("test-api-key")
 

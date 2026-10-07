@@ -87,6 +87,31 @@ COVERING_ELEMENT_SCRIPT = """el => {
   return '<' + hit.tagName.toLowerCase() + (hit.id ? ' id=' + JSON.stringify(hit.id) : '') + (hit.getAttribute('class') ? ' class=' + JSON.stringify(hit.getAttribute('class')) : '') + '>';
 }"""
 
+# A sign-in form is exactly one visible password field not marked new-password; sign-up and change-password forms
+# show two or mark one new-password, and a one-time-code field alone also appears on payment confirmations.
+# ponytail: main frame only, and an email-first sign-in page (password on the next page) is not detected.
+SIGN_IN_FORM_SCRIPT = """() => {
+  const visible = el => {
+    if (el.disabled) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return typeof el.checkVisibility === 'function' ? el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}) : true;
+  };
+  const tokens = el => (el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/);
+  const passwords = [...document.querySelectorAll('input[type="password" i]')].filter(visible);
+  return passwords.length === 1 && !tokens(passwords[0]).includes('new-password');
+}"""
+
+
+async def page_shows_sign_in_form(page: Page | None) -> bool:
+    if page is None:
+        return False
+    try:
+        async with asyncio.timeout(0.5):
+            return await page.evaluate(SIGN_IN_FORM_SCRIPT) is True
+    except Exception:  # noqa: BLE001 - failure evidence is best effort.
+        return False
+
 
 def append_failure_page_state(
     reason: str,
@@ -130,6 +155,7 @@ _LOCATOR_ACTION_MAP: dict[str, ActionType] = {
     "check": ActionType.CHECKBOX,
     "uncheck": ActionType.CHECKBOX,
     "hover": ActionType.HOVER,
+    "drag_to": ActionType.DRAG,
     "set_input_files": ActionType.UPLOAD_FILE,
 }
 # Sync locator factories on both Page and Locator; their results must stay wrapped.
@@ -198,6 +224,7 @@ OnPendingAction = Callable[[PendingAction], None]
 
 # Spelled out again where this module cannot be imported; both spellings must stay equal.
 DOCUMENT_FAILURE_ATTRIBUTE = "_skyvern_document_failure"
+FAILURE_PAGE_ATTRIBUTE = "_skyvern_failure_page"
 DocumentFailureRelation = Literal["associated", "context"]
 _ABORTED_NAVIGATION_CODE = "net::ERR_ABORTED"
 
@@ -233,6 +260,24 @@ def _stamp_document_failure(exc: BaseException, receipt: DocumentFailureReceipt 
             stamps[DOCUMENT_FAILURE_ATTRIBUTE] = receipt
         else:
             stamps.setdefault(DOCUMENT_FAILURE_ATTRIBUTE, None)
+
+
+def _stamp_failure_page(exc: BaseException, locator: Locator | None, page: Page | None) -> None:
+    """The latest recorded call to raise ``exc`` names its page, whatever ran concurrently since."""
+    with suppress(Exception):
+        if locator is not None:
+            # An element handle has no page; its call keeps the page it was given.
+            with suppress(AttributeError):
+                page = locator.page
+        if page is not None:
+            BaseException.__getattribute__(exc, "__dict__")[FAILURE_PAGE_ATTRIBUTE] = page
+
+
+def _stamped_failure_page(exc: BaseException) -> Page | None:
+    try:
+        return BaseException.__getattribute__(exc, "__dict__").get(FAILURE_PAGE_ATTRIBUTE)
+    except Exception:
+        return None
 
 
 def _document_origin(url: str) -> str | None:
@@ -382,9 +427,10 @@ def _recorded_action_fields(
         fields["x"] = kwargs.get("x", _arg(args, 0))
         fields["y"] = kwargs.get("y", _arg(args, 1))
     elif action_type == ActionType.DRAG:
-        fields["start_x"] = kwargs.get("start_x", _arg(args, 0))
-        fields["start_y"] = kwargs.get("start_y", _arg(args, 1))
-        fields["path"] = kwargs.get("path", _arg(args, 2))
+        if not name.endswith(".drag_to"):
+            fields["start_x"] = kwargs.get("start_x", _arg(args, 0))
+            fields["start_y"] = kwargs.get("start_y", _arg(args, 1))
+            fields["path"] = kwargs.get("path", _arg(args, 2))
     elif action_type == ActionType.LEFT_MOUSE:
         fields["x"] = kwargs.get("x", _arg(args, 0))
         fields["y"] = kwargs.get("y", _arg(args, 1))
@@ -715,6 +761,7 @@ class _Recorder:
                     captured = ""
                 action.response = captured or type(exc).__name__
             self.last_exception = exc
+            _stamp_failure_page(exc, failure_locator, failure_page if failure_page is not None else document_page)
             # A navigation's own failure is reported by its nav code, never as an associated document.
             if action_type in _NAVIGATION_ACTION_TYPES:
                 _stamp_document_failure(exc, None)
@@ -814,6 +861,7 @@ def _bind_document_failure_on_raise(
 ) -> Any:
     def fail(exc: BaseException) -> None:
         recorder.bind_document_failure(exc, generation, page)
+        _stamp_failure_page(exc, failed_locator, page)
         if failed_locator is not None and generation == recorder.failure_operation_generation:
             recorder.failed_locator_exception = exc
             recorder.failed_locator = failed_locator
@@ -938,7 +986,15 @@ class RecordingLocator:
                                 delay=delay,
                                 no_wait_after=no_wait_after,
                             )
-                return await attr(*args, **kwargs)
+                native_args = (
+                    tuple(
+                        arg._skyvern_page_operation_argument() if isinstance(arg, RecordingLocator) else arg
+                        for arg in args
+                    )
+                    if name == "drag_to"
+                    else args
+                )
+                return await attr(*native_args, **kwargs)
 
             return await self.__recorder.record(
                 action_type,
@@ -1337,6 +1393,11 @@ class RecordingPage:
         if recorder.failed_locator is not None:
             return recorder.failed_locator.page
         return recorder.failed_page
+
+    def failing_tab(self, exception: BaseException) -> Page | None:
+        """The raw page the call that raised ``exception`` ran on, whatever ran concurrently since; a wrapped
+        failure gives None."""
+        return _stamped_failure_page(exception)
 
     def failure_nav_error_code(self, exception: BaseException) -> str | None:
         """The driver code of the navigation that raised ``exception``, or None.

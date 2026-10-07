@@ -40,6 +40,7 @@ _METHOD_ACTION_TYPES: dict[str, str] = {
     "select_option": "select_option",
     "set_input_files": "upload_file",
     "hover": "hover",
+    "drag_to": "drag",
     "go_back": "go_back",
     "go_forward": "go_forward",
     "reload": "reload_page",

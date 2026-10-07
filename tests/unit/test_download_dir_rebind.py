@@ -78,6 +78,8 @@ def _workflow_attach_run() -> SimpleNamespace:
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_address=None,
+        browser_settings=None,
+        browser_settings_receipt=None,
     )
 
 

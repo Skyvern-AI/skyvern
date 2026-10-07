@@ -530,7 +530,8 @@ class VerificationState:
         # differencing poll timestamps, so it cannot be counted directly. `finish_status` is carried
         # because failed and terminated are separate populations in that read and the record is the
         # only place they can be told apart.
-        if not held and self.polling_spent_seconds <= 0:
+        # A run offered the code tool that never polled is kept: it is the "offered, never called" give-up.
+        if not held and self.polling_spent_seconds <= 0 and not self.code_tool_offered:
             return
         try:
             LOG.info(
@@ -545,6 +546,9 @@ class VerificationState:
                 remaining_seconds=round(remaining, 1),
                 budget_seconds=self.budget_seconds,
                 giveup_deferrals=self.giveup_deferrals,
+                code_tool_offered=self.code_tool_offered,
+                values_delivered=self.values_delivered,
+                source_failed=self.source_failed,
             )
         except Exception:
             # Narration must never cost the gate its verdict, for the same reason `arm` swallows.

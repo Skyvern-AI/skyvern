@@ -227,7 +227,7 @@ def test_prior_expiry_and_question_are_serialized_into_next_model_history(resolv
     )
 
     question_line, message_line, _ = history.splitlines()
-    prefix = "ask_user result: " if resolved else "ask_user request: "
+    prefix = "user question result: " if resolved else "user question request: "
     expected = interaction.tool_result() if resolved else interaction.model_dump(mode="json")
     assert json.loads(question_line.removeprefix(prefix)) == expected
     assert message_line == "ai: I saved the draft."
