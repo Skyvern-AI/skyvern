@@ -259,6 +259,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     DocumentFailureReceipt,
     RecordingPage,
+    is_element_handle,
     json_safe_recorder_output,
     page_shows_sign_in_form,
     user_code_line_from_exception,
@@ -5059,6 +5060,9 @@ _OPERATION_ATTRIBUTION_ALLOWLIST = (
     "probe_status",
     "exception_class",
 )
+# The secure runner reports probe_status as a free string over gRPC; only these reach the envelope.
+_LOCATOR_PROBE_STATUSES = frozenset({"counted", "timeout", "error"})
+_NATIVE_EXCEPTION_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 
 
 def _consume_probe_result(task: asyncio.Future[Any]) -> None:
@@ -9580,6 +9584,37 @@ async def wrapper({default_args}):
                         )
                     await recorder.persist(recorded)
                     if secure_failure is not None:
+                        # The worker measured the failed locator's match count; emitting it here must never
+                        # alter the classified secure failure below.
+                        if secure_failure.locator_probe_status in _LOCATOR_PROBE_STATUSES:
+                            try:
+                                self._emit_operation_attribution_failure(
+                                    organization_id=organization_id,
+                                    workflow_run_context=workflow_run_context,
+                                    workflow_run_id=workflow_run_id,
+                                    workflow_run_block_id=workflow_run_block_id,
+                                    failing_line=secure_failure.failing_line,
+                                    # Never the broker wrapper class: it would not group with inline events.
+                                    exception_class=(
+                                        secure_failure.native_exception_class
+                                        if secure_failure.native_exception_class is not None
+                                        and _NATIVE_EXCEPTION_CLASS.fullmatch(secure_failure.native_exception_class)
+                                        else None
+                                    ),
+                                    probe_match_count=(
+                                        secure_failure.locator_match_count
+                                        if secure_failure.locator_match_count is not None
+                                        and secure_failure.locator_match_count >= 0
+                                        else None
+                                    ),
+                                    probe_status=secure_failure.locator_probe_status,
+                                    engine="secure",
+                                )
+                            except Exception:
+                                LOG.debug(
+                                    "codeblock.locator_probe failed open; original failure preserved",
+                                    exc_info=True,
+                                )
                         # The runner's code is uncorroborated; the worker recorder resolved the host, so a dead
                         # site behind the proxy (reported there as the sentinel) keeps healing.
                         secure_nav_code = (
@@ -10163,7 +10198,9 @@ async def wrapper({default_args}):
             # action row/error code.
             try:
                 probe_locator = recording_page.failure_locator(e)
-                if probe_locator is not None:
+                # An ElementHandle was already resolved, so there is no selector left to count; the
+                # secure arm skips element handles too.
+                if probe_locator is not None and not is_element_handle(probe_locator):
                     probe_match_count, probe_status = await self._probe_failed_locator_count(probe_locator)
                     self._emit_operation_attribution_failure(
                         organization_id=organization_id,

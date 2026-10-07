@@ -304,6 +304,13 @@ class CodeBlockEngineFailure:
     sign_in_form_visible: bool | None = None
     # Unredacted; associated_navigation_output masks it where it is persisted.
     document_failure: DocumentFailureReceipt | None = None
+    # Worker-measured non-strict match count of the failed locator and how the probe resolved
+    # ("counted"/"timeout"/"error"); internal operation-attribution evidence, never user-facing.
+    locator_match_count: int | None = None
+    locator_probe_status: str | None = None
+    # Bare native worker exception class for operation attribution, so secure events are comparable
+    # to inline ones; distinct from the healing-facing exception_class above.
+    native_exception_class: str | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]

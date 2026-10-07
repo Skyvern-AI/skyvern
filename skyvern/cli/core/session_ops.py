@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from skyvern.client.types.extensions import Extensions
+from skyvern.client.types.persistent_browser_type import PersistentBrowserType
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, proxy_location_to_request
 
 
@@ -66,6 +67,7 @@ async def do_session_create(
     extensions: list[Extensions] | None = None,
     browser_profile_id: str | None = None,
     generate_browser_profile: bool = False,
+    browser_type: PersistentBrowserType | None = None,
     local: bool = False,
     headless: bool = False,
     connect_browser: bool = True,
@@ -89,6 +91,8 @@ async def do_session_create(
             create_kwargs["extensions"] = extensions
         if browser_profile_id is not None:
             create_kwargs["browser_profile_id"] = browser_profile_id
+        if browser_type is not None:
+            create_kwargs["browser_type"] = browser_type
         browser_session = await skyvern.create_browser_session(**create_kwargs)
         session_id = browser_session.browser_session_id
         if generate_browser_profile and session_id:
@@ -104,6 +108,8 @@ async def do_session_create(
         launch_kwargs["extensions"] = extensions
     if browser_profile_id is not None:
         launch_kwargs["browser_profile_id"] = browser_profile_id
+    if browser_type is not None:
+        launch_kwargs["browser_type"] = browser_type
     browser = await skyvern.launch_cloud_browser(**launch_kwargs)
     session_id = browser.browser_session_id
     if generate_browser_profile and session_id:

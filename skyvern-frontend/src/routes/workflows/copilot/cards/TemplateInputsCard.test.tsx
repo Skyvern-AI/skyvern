@@ -136,12 +136,17 @@ describe("TemplateInputsCard", () => {
       target: { value: "https://example.com" },
     });
 
+    // The name stays the action; the reason is the description, not part of the name.
     const held = screen.getByRole("button", {
-      name: `Save inputs (paused): ${reason}`,
+      name: "Save inputs (paused)",
+      description: reason,
     }) as HTMLButtonElement;
     expect(held.disabled).toBe(true);
     // A disabled button swallows its own tooltip trigger's events.
-    expect(held.closest("[tabindex='0']")).not.toBeNull();
+    const wrapper = held.closest<HTMLElement>("[tabindex='0']");
+    expect(wrapper?.getAttribute("aria-describedby")).toBe(
+      held.getAttribute("aria-describedby"),
+    );
 
     act(() => useWorkflowHasChangesStore.getState().setSaveBlockedReason(null));
     expect(saveButton().disabled).toBe(false);

@@ -176,6 +176,7 @@ export default {
         "copilot-sparkle-breathe":
           "copilot-sparkle-breathe 2.8s ease-in-out infinite",
         glow: "glow 2.5s ease-in-out infinite",
+        "run-blocking-locate": "glow 0.85s ease-in-out 3",
         "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
         "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",
         "copilot-row-flash-error": "copilot-row-flash-error 0.6s ease-out",

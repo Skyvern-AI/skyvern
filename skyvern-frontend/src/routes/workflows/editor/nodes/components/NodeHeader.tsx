@@ -1145,14 +1145,11 @@ function NodeHeader({
             isDebuggable && (
               <TooltipProvider delayDuration={300}>
                 <ControlTooltip
-                  content={
-                    saveBlockedReason ? (
-                      <span className="block max-w-xs">
-                        Save is paused: {saveBlockedReason}
-                      </span>
-                    ) : (
-                      "Run this block"
-                    )
+                  content="Run this block"
+                  reason={
+                    saveBlockedReason
+                      ? `Save is paused: ${saveBlockedReason}`
+                      : null
                   }
                   blocked={Boolean(saveBlockedReason)}
                   side="top"
@@ -1160,11 +1157,7 @@ function NodeHeader({
                 >
                   <button
                     type="button"
-                    aria-label={
-                      saveBlockedReason
-                        ? `Run this block (save is paused): ${saveBlockedReason}`
-                        : "Run this block"
-                    }
+                    aria-label="Run this block"
                     // Must match the click guard below: any inert state the
                     // attribute misses is a control that still takes focus
                     // and announces as enabled while doing nothing. isPending

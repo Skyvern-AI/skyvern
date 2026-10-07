@@ -324,6 +324,10 @@ def _factory_selector(name: str, args: tuple[Any, ...]) -> str:
     return f"{name}({arg})" if arg is not None else name
 
 
+def is_element_handle(value: Any) -> bool:
+    return type(value).__name__ == "ElementHandle"
+
+
 def _string_value(value: Any) -> str | None:
     if isinstance(value, (str, int, float)):
         return str(value)
@@ -812,6 +816,11 @@ def _wrap_recording_result(
     type_name = type(value).__name__
     if type_name in _RECORDABLE_HANDLE_TYPE_NAMES:
         return RecordingLocator(value, recorder, selector, page)
+    if owner is None and page is not None:
+        # A locator or element handle call (el.owner_frame()) knows only its raw page; the proxy recording
+        # that page owns the frames it hands back, as it does for the page's own calls.
+        cached = recorder.page_proxies.get(id(page))
+        owner = cached[1] if cached is not None and cached[0] is page else None
     # A call can hand back a page or a frame too -- page.frame(name=...), page.opener(), a popup --
     # and navigating through one of those has to be recorded like any other. ``owner`` is the page
     # the call was made on, so a frame from a second tab is bound to that tab rather than the first.
@@ -865,6 +874,7 @@ def _bind_document_failure_on_raise(
         if failed_locator is not None and generation == recorder.failure_operation_generation:
             recorder.failed_locator_exception = exc
             recorder.failed_locator = failed_locator
+            recorder.failed_page = page
 
     # An expect_* wait raises from __aexit__ or from its info's value, after the body's trigger began.
     if isinstance(value, AbstractAsyncContextManager):
@@ -934,6 +944,9 @@ class RecordingLocator:
             return factory
         action_type = _LOCATOR_ACTION_MAP.get(name)
         if not callable(attr):
+            # Locator.content_frame and FrameLocator.owner are properties that continue the chain.
+            if type(attr).__name__ in _RECORDABLE_HANDLE_TYPE_NAMES:
+                return RecordingLocator(attr, self.__recorder, self.__selector, self.__page)
             return attr
         if action_type is None:
 
@@ -1004,6 +1017,7 @@ class RecordingLocator:
                 args,
                 kwargs,
                 failure_locator=self.__locator,
+                failure_page=self.__page,
                 document_page=self.__page,
             )
 
@@ -1218,11 +1232,10 @@ class RecordingFrame:
             return attr
         page = self.__page._underlying_page
         # Only the main frame's locators and handles are the page's own; a child frame's stay unrecorded.
-        wrap_for_page = (
-            name == "locator" or name in _LOCATOR_FACTORY_METHODS or name in _HANDLE_RETURNING_METHODS
-        ) and self.__frame is page.main_frame
+        locator_factory = name in ("locator", "frame_locator") or name in _LOCATOR_FACTORY_METHODS
+        wrap_for_page = (locator_factory or name in _HANDLE_RETURNING_METHODS) and self.__frame is page.main_frame
         # A locator factory starts no browser call, so like the page's it opens no new failure window.
-        if name == "locator" or name in _LOCATOR_FACTORY_METHODS:
+        if locator_factory:
             if not wrap_for_page:
                 return attr
 
@@ -1390,7 +1403,8 @@ class RecordingPage:
         recorder = self.__recorder
         if recorder.failed_locator_exception is not exception:
             return None
-        if recorder.failed_locator is not None:
+        # An ElementHandle has no page attribute; its RecordingLocator carried the page that produced it.
+        if recorder.failed_locator is not None and not is_element_handle(recorder.failed_locator):
             return recorder.failed_locator.page
         return recorder.failed_page
 

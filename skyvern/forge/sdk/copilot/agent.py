@@ -97,7 +97,6 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
-    OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
     SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP,
     AgentResult,
     CodeAuthoringRepairContext,
@@ -954,31 +953,6 @@ def _render_authoring_repair_prompt_list(items: list[str], *, max_items: int = 2
     return ", ".join(item for item in cleaned if item) or "(none)"
 
 
-def _render_unresolved_name_binding_actions(
-    unresolved_names: list[str], available_parameter_keys: list[str], *, max_items: int = 20
-) -> list[str]:
-    available_keys = {
-        key
-        for raw_key in available_parameter_keys
-        for key in [_clean_authoring_repair_prompt_atom(raw_key, max_chars=80)]
-        if key
-    }
-    lines: list[str] = []
-    for raw_name in unresolved_names[:max_items]:
-        name = _clean_authoring_repair_prompt_atom(raw_name, max_chars=80)
-        if not name:
-            continue
-        if name in available_keys:
-            lines.append(
-                f"- {name} -> existing workflow parameter key {name} -> parameter_keys -> bare variable {name}"
-            )
-            continue
-        lines.append(
-            f"- {name} -> create workflow string parameter key {name} -> parameter_keys -> bare variable {name}"
-        )
-    return lines
-
-
 # Matches the turn context's workflow budget, so a block the model is told to repair is never less
 # visible than the whole workflow was at the start of the turn.
 _REPAIR_CONTEXT_BLOCK_CODE_CHAR_BUDGET = 12_000
@@ -1058,12 +1032,6 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
                 f"{_render_authoring_repair_prompt_list(repair_context.current_block_parameter_keys)}",
             ]
         )
-    if repair_context.selector:
-        lines.append(f"selector: {_clean_authoring_repair_prompt_atom(repair_context.selector)}")
-    if repair_context.source_url:
-        lines.append(f"source_url: {_clean_authoring_repair_prompt_atom(repair_context.source_url)}")
-    if repair_context.refiner_selector:
-        lines.append(f"refiner_selector: {_clean_authoring_repair_prompt_atom(repair_context.refiner_selector)}")
     if repair_context.reason_code == "runtime_block_failure":
         if repair_context.runtime_failure_reason:
             runtime_failure_reason = _clean_authoring_repair_prompt_atom(
@@ -1159,70 +1127,7 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
                 "required_code_return_paths: "
                 f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
             )
-    if repair_context.required_block_structure:
-        lines.append(
-            f"required_block_structure: {_clean_authoring_repair_prompt_atom(repair_context.required_block_structure)}"
-        )
-        if repair_context.spine_stage_count is not None:
-            lines.append(f"spine_stage_count: {repair_context.spine_stage_count}")
-        if repair_context.spine_split_blockers:
-            lines.append(
-                f"spine_split_blockers: {_render_authoring_repair_prompt_list(repair_context.spine_split_blockers)}"
-            )
-        lines.append(
-            "Author one browser-stage code block per scouted mutation stage and a final extraction-only code block "
-            "that returns the required output paths; do not collapse the browser spine into the extraction block."
-        )
-    if repair_context.reason_code == OUTPUT_OWNER_AMBIGUITY_REASON_CODE:
-        lines.append(
-            "output_owner_candidate_labels: "
-            f"{_render_authoring_repair_prompt_list(repair_context.output_owner_candidate_labels)}"
-        )
-        lines.append(
-            "required_output_owner_paths: "
-            f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
-        )
-        lines.append(
-            "Designate exactly one code block as the sole output owner for the required paths and declare its "
-            "code_artifact_metadata; do not leave the requested output split across or absent from the code blocks."
-        )
-    if repair_context.parameter_binding_directive is not None:
-        lines.append("parameter_binding_pairs:")
-        for candidate in repair_context.parameter_binding_directive.candidates:
-            key = _clean_authoring_repair_prompt_atom(candidate.declared_key, max_chars=80)
-            selector = _clean_authoring_repair_prompt_atom(candidate.field_selector, max_chars=160)
-            if key and selector:
-                lines.append(f"- {key} -> {selector}")
-    if repair_context.reason_code == "synthesized_parameter_binding_ambiguous":
-        binding_action_lines = _render_unresolved_name_binding_actions(
-            repair_context.unresolved_names, available_parameter_keys
-        )
-        if binding_action_lines:
-            lines.append("binding_actions:")
-            lines.extend(binding_action_lines)
-        lines.append(
-            "For synthesized parameter binding, declare and use the exact workflow input key, include that exact "
-            "key in the code block's parameter_keys, reference it as a bare Python variable in code, and do not "
-            "guess or hardcode the runtime value."
-        )
-    if repair_context.reason_code == "runtime_block_failure":
-        lines.append(
-            "For runtime failures, adapt the next code block to the observed page state and do not re-emit "
-            "the same failing selector or name path."
-        )
-    if repair_context.reason_code == "runtime_missing_output_dependency":
-        lines.append(
-            "For missing prior block outputs, bind to an actual available_output_key or repair the producing/current "
-            "code block so the output exists; do not create a workflow parameter for missing_output_key."
-        )
-    if repair_context.reason_code == "metadata_reject":
-        lines.append(
-            "For metadata rejects, author code_artifact_metadata with goal_value_paths, valid extraction_schema, "
-            "and code return paths matching required requested output child paths."
-        )
-    if repair_context.reason_code in {"synthesized_parameter_binding_ambiguous", "metadata_reject"} and advertises(
-        ctx, UPDATE_AND_RUN_BLOCKS_TOOL_NAME
-    ):
+    if repair_context.reason_code == "metadata_reject" and advertises(ctx, UPDATE_AND_RUN_BLOCKS_TOOL_NAME):
         lines.append(_RERUN_WITH_UPDATE_AND_RUN_BLOCKS)
     lines.append(
         _clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=REPAIR_INSTRUCTION_MAX_CHARS)

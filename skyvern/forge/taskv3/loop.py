@@ -34,7 +34,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3.goal_check import (
-    GoalCheckAction,
     GoalVerdict,
     NonCompletedStatus,
     ToolTrail,
@@ -620,9 +619,6 @@ class LoopOutcome:
     # Turns where the model answered with prose instead of a tool call, costing a full round trip
     # plus the NO_TOOL_CALL_NUDGE recovery turn.
     no_tool_call_turns: int = 0
-    # Whether tool_choice was still being sent when the run ended. Distinguishes a run that was
-    # asked to force tool calls from one where the request was degraded away mid-run.
-    tool_choice_in_effect: bool = False
     billable_actions: list[str] = field(default_factory=list)
     # Perception snapshots are compacted in place during the run, so superseded observe/get_html
     # content is already elided here — treat as lossy if ever persisted for audit.
@@ -631,10 +627,6 @@ class LoopOutcome:
     # The None default only covers an outcome built by someone else; the caller still writes its
     # record and simply carries no progress fields on it.
     telemetry: TerminalTelemetry | None = None
-    goal_check: dict[str, Any] | None = None
-    # The finish-gate goal check ended this run; its verdict discards the model's output, so the
-    # final-turn stamp must not refill it.
-    goal_check_ended: bool = False
     # Set when the unlisted-outcome re-ask turned the model's failed/terminated finish into completed; a
     # post-loop veto of that completion restores this status and reason instead of failing the task.
     converted_from: NonCompletedStatus | None = None
@@ -1559,10 +1551,6 @@ class ActivityRecency:
     attempts_at_hold_gate: int | None = None
     perceptions_at_hold_gate: int | None = None
     status_at_hold_gate: str | None = None
-    # Raised only by the goal-check enforce hold and consumed later in the SAME batch, whose queued calls
-    # predate the hold. Named `_batch_skip` because `test_canonical_ring_state_is_touched_only_through_the_tracker`
-    # greps this module for the canonical ring's field-name fragments.
-    held_verdict_batch_skip: bool = False
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -2425,8 +2413,6 @@ def make_finish_tool(
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
-    goal_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
-    goal_check_enforce: bool = False,
     unlisted_reask: UnlistedReaskCheck | None = None,
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
 ) -> ToolSpec:
@@ -2469,7 +2455,6 @@ def make_finish_tool(
     deferrals = 0
     failure_deferrals = 0
     failure_deferral_trigger_generation: int | None = None
-    goal_check_held = False
     reask_asked = False
 
     async def _bounded_fingerprint() -> str | None:
@@ -2581,16 +2566,6 @@ def make_finish_tool(
                     return "navigating"
             elif not settled:
                 return "unsettled"
-        if goal_check is not None:
-            try:
-                verdict = await goal_check()
-            except Exception:
-                LOG.warning("taskv3 goal check of a reask conversion failed", exc_info=True)
-                return "goal_check" if goal_check_enforce else None
-            result.goal_check_verdict = verdict.verdict
-            # One check, no hold: the model never claimed completion, so there is no turn to give back.
-            if goal_check_enforce and verdict.is_contradiction:
-                return "goal_check"
         return None
 
     async def _reask(original: NonCompletedStatus, args: dict[str, Any]) -> ToolResult | None:
@@ -2620,7 +2595,6 @@ def make_finish_tool(
             veto=result.veto if result is not None else None,
             settled=result.settled if result is not None else None,
             settle_rounds=result.settle_rounds if result is not None else 0,
-            goal_check_verdict=result.goal_check_verdict if result is not None else None,
             llm_key=result.llm_key if result is not None else None,
             reask_llm_key=result.reask_llm_key if result is not None else None,
             skipped_reason=result.skipped_reason if result is not None else "reask_error",
@@ -2643,7 +2617,7 @@ def make_finish_tool(
         )
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, failure_deferral_trigger_generation, goal_check_held, reask_asked
+        nonlocal deferrals, failure_deferrals, failure_deferral_trigger_generation, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2748,106 +2722,6 @@ def make_finish_tool(
                     "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
                     "report failure."
                 )
-        if status == "completed" and goal_check is not None:
-            try:
-                verdict: GoalVerdict | None = await goal_check()
-            except Exception:
-                LOG.warning("taskv3 finish goal check failed; accepting the verdict", exc_info=True)
-                verdict = None
-            if verdict is not None:
-                # Every first contradiction is held, `impossible` included: a transient error page or
-                # a page still loading reads as the site refusing, and one re-check absorbs it. Only a
-                # verdict AFTER a hold can end the run, and the second verdict decides how.
-                action: GoalCheckAction
-                if verdict.verdict == "achieved":
-                    action = "accept"
-                elif not goal_check_held:
-                    action = "hold"
-                    verdict.no_headroom = not _has_hold_headroom(activity, deadline_at)
-                elif verdict.verdict == "impossible":
-                    action = "terminate"
-                else:
-                    action = "fail"
-                verdict.action = action
-                second: GoalVerdict | None = None
-                second_skipped_reason: str | None = None
-                if not goal_check_enforce and action == "hold" and not verdict.no_headroom:
-                    # Shadow accepts here and the run ends, so the second check enforce would make after
-                    # the held turn is asked now instead, once. An upper bound on enforce's false
-                    # failures: enforce's agent gets a turn to scroll or re-observe first.
-                    try:
-                        cancelled = should_cancel is not None and await should_cancel()
-                    except Exception:
-                        cancelled = True
-                    if cancelled:
-                        second_skipped_reason = "cancelled"
-                    else:
-                        try:
-                            second = await goal_check()
-                        except Exception:
-                            LOG.warning("taskv3 finish goal check recheck failed", exc_info=True)
-                    if second is not None:
-                        second.recheck = True
-                        second_skipped_reason = second.skipped_reason
-                        second.action = (
-                            ("terminate" if second.verdict == "impossible" else "fail")
-                            if second.is_contradiction
-                            else "accept"
-                        )
-                        # A skipped or failed recheck is no answer; an ungrounded contradiction is one
-                        # (enforce would accept it).
-                        if second.skipped_reason in (None, "ungrounded_quote"):
-                            verdict.would_fail = second.is_contradiction
-                LOG.info(
-                    "taskv3 finish goal check",
-                    mode="enforce" if goal_check_enforce else "shadow",
-                    verdict=verdict.verdict,
-                    would_be_action=action,
-                    no_headroom=verdict.no_headroom,
-                    # Never the quote itself: it is page text, possibly customer data, and this index is
-                    # searchable. The judge's full response is stored as the step's LLM response artifact.
-                    quote_chars=len(verdict.quote),
-                    quote_source=verdict.quote_source,
-                    skipped_reason=verdict.skipped_reason,
-                    latency_s=verdict.latency_s,
-                    second_verdict=second.verdict if second is not None else None,
-                    second_skipped_reason=second_skipped_reason,
-                    second_latency_s=second.latency_s if second is not None else None,
-                    would_fail=verdict.would_fail,
-                    turn=activity.turn if activity is not None else None,
-                )
-                try:
-                    canceled_during_check = should_cancel is not None and await should_cancel()
-                except Exception:
-                    canceled_during_check = False
-                if canceled_during_check:
-                    # Defer, like the settle probe: the loop's cancellation check ends the run before another
-                    # turn, instead of this finish persisting a completion for a canceled run.
-                    return ToolResult.error("the run was canceled while the completion was being checked.")
-                if goal_check_enforce and action == "hold" and not verdict.no_headroom:
-                    goal_check_held = True
-                    if activity is not None:
-                        activity.held_verdict_batch_skip = True
-                    found = (
-                        "the site preventing the goal"
-                        if verdict.verdict == "impossible"
-                        else "them contradicting the goal"
-                    )
-                    return ToolResult.error(
-                        "completed verdict held once: an independent check of the page and of your recent "
-                        f"tool results found {found}: {verdict.bounded_missing.rstrip('.')}. Look at the page "
-                        "once more and confirm which verdict is right before finishing again."
-                    )
-                if goal_check_enforce and action in ("fail", "terminate"):
-                    return ToolResult.ok(
-                        content="Task attempt ended. No further actions are permitted.",
-                        data={
-                            "status": "failed" if action == "fail" else "terminated",
-                            "reason": f"goal check: {verdict.bounded_missing}",
-                            "extracted_output": None,
-                            "goal_check_ended": True,
-                        },
-                    )
         if (
             status in ("failed", "terminated")
             and activity is not None
@@ -2905,7 +2779,7 @@ def make_finish_tool(
             activity.perceptions_at_hold_gate = activity.perceptions
             activity.status_at_hold_gate = status
         original = _non_completed(status)
-        if original is not None and unlisted_reask is not None and not reask_asked and not goal_check_held:
+        if original is not None and unlisted_reask is not None and not reask_asked:
             reask_asked = True
             converted = await _reask(original, args)
             try:
@@ -2913,7 +2787,7 @@ def make_finish_tool(
             except Exception:
                 canceled_during_reask = False
             if canceled_during_reask:
-                # Defer, like the goal check: the loop's cancellation check persists `canceled` before another turn.
+                # Defer: the loop's cancellation check persists `canceled` before another turn.
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
             if converted is not None:
                 return converted
@@ -3715,15 +3589,14 @@ async def run_agent_tool_loop(
             stall_nudges.append((tool_name, snap.tool_identical))
         return None, stall_nudges
 
-    # Mutable for the run: a provider that rejects tool_choice rejects it every turn, so a drop
-    # made once must stick.
+    # Mutable for the run: a provider that rejects the reasoning-summary dict rejects it every turn, so a
+    # drop made once must stick.
     active_call_kwargs = dict(call_kwargs or {})
     if on_llm_call_exhausted is not None:
         active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
-    def _degrade_tool_choice(exc: BaseException) -> bool:
-        """Drop the optional call parameters (tool_choice, the reasoning-summary dict) and report
-        whether the turn is worth re-issuing.
+    def _degrade_call_params(exc: BaseException) -> bool:
+        """Drop the optional reasoning-summary dict and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
         on a run that was already failing. A context-window overflow is excluded because dropping a
@@ -3732,14 +3605,14 @@ async def run_agent_tool_loop(
         """
         if isinstance(exc, SkyvernContextWindowExceededError):
             return False
-        # One parameter per degrade, least-proven first: a provider that rejects only the summary
-        # dict keeps its independently supported tool_choice; a second rejection drops that too.
-        for key in ("reasoning_effort", "tool_choice"):
-            if active_call_kwargs.pop(key, None) is not None:
-                LOG.warning(
-                    "taskv3 loop retrying without optional call param", dropped=key, turn=st.turns, exc_info=True
-                )
-                return True
+        if active_call_kwargs.pop("reasoning_effort", None) is not None:
+            LOG.warning(
+                "taskv3 loop retrying without optional call param",
+                dropped="reasoning_effort",
+                turn=st.turns,
+                exc_info=True,
+            )
+            return True
         return False
 
     # Images produced by an on-demand `look` this turn, to show the model on the NEXT call only. Passed
@@ -3967,7 +3840,7 @@ async def run_agent_tool_loop(
                     # below: litellm's 400s subclass openai.APIError, which the LLM layer maps to
                     # the retryable type. Degrading only after the transient budget is spent keeps
                     # a passing blip from disabling the lever for the rest of the run.
-                    if _degrade_tool_choice(exc):
+                    if _degrade_call_params(exc):
                         # Spend the transient budget once, not once per parameter set: the degraded
                         # turn gets a single shot, which is what "last resort" is worth.
                         call_attempt = max_call_retries
@@ -3982,7 +3855,7 @@ async def run_agent_tool_loop(
                 LOG.info("taskv3 loop retrying transient LLM error", turn=st.turns, attempt=call_attempt)
                 await asyncio.sleep(call_retry_base_delay * (2 ** (call_attempt - 1)))
             except Exception as exc:
-                if _degrade_tool_choice(exc):
+                if _degrade_call_params(exc):
                     continue
                 LOG.warning("taskv3 loop LLM call failed", turn=st.turns, exc_info=True)
                 if on_llm_call_exhausted is not None:
@@ -4084,13 +3957,6 @@ async def run_agent_tool_loop(
                 # incumbent stall counters keep their end-of-batch turn_dispatched_billable gate.
                 st.canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
-        if activity is not None:
-            # Scoped to THIS batch, and cleared here rather than only on the consume path: several
-            # branches between the hold and that path can `break` out of the batch first (the
-            # refresh signal is the reachable one -- a held finish makes `verdict_stands` false, so a
-            # pending signal takes that exit). A flag surviving into the next batch would drop
-            # everything queued behind its first tool, citing a hold that did not happen there.
-            activity.held_verdict_batch_skip = False
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -4458,8 +4324,6 @@ async def run_agent_tool_loop(
                             except Exception:
                                 LOG.warning("taskv3 block completion finish raised", exc_info=True)
                                 block_finish = ToolResult.error("")
-                            if activity is not None:
-                                activity.held_verdict_batch_skip = False
                             if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
                                 st.outcome = LoopOutcome("completed", block_reason)
                                 break
@@ -5061,24 +4925,12 @@ async def run_agent_tool_loop(
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
 
-            if activity is not None and activity.held_verdict_batch_skip:
-                # Raised only by the goal-check enforce hold. Its held finish is neither billable nor recordable,
-                # so the generic error branch below would let a click or type batched behind it dispatch.
-                activity.held_verdict_batch_skip = False
-                _append_skipped_tool_results(
-                    st.messages,
-                    tool_calls[idx + 1 :],
-                    "queued behind a verdict that was held; re-observe the page before choosing again",
-                )
-                break
-
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
                 st.outcome = LoopOutcome(
                     status=data.get("status", "completed"),
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
-                    goal_check_ended=bool(data.get("goal_check_ended")),
                     converted_from=_non_completed(data.get("converted_from")),
                     converted_from_reason=data.get("converted_from_reason", ""),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
@@ -5377,7 +5229,7 @@ async def run_agent_tool_loop(
     ):
         if st.outcome.cap_trip is None:
             st.outcome.cap_trip = st.cap_trip_pending
-        if st.outcome.extracted_output is None and not st.outcome.goal_check_ended:
+        if st.outcome.extracted_output is None:
             st.outcome.extracted_output = st.final_turn_staged_output
 
     ledger_fields: LedgerTerminalFields | None = None
@@ -5414,7 +5266,6 @@ async def run_agent_tool_loop(
 
     st.outcome.turns = st.turns
     st.outcome.no_tool_call_turns = st.no_tool_call_turns
-    st.outcome.tool_choice_in_effect = "tool_choice" in active_call_kwargs
     st.outcome.tool_calls = st.total_tool_calls
     st.outcome.tool_seconds = st.tool_seconds
     st.outcome.action_steps = st.action_steps

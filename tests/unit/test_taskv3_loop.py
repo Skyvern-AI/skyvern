@@ -134,9 +134,6 @@ class _ScriptedCaller:
         self.screenshots_per_call: list[list[bytes] | None] = []
         self.image_blocks_per_call: list[int] = []
 
-    def supports_tool_choice(self) -> bool:
-        return True
-
     async def call(
         self,
         *,
@@ -146,7 +143,6 @@ class _ScriptedCaller:
         tools: list[dict[str, Any]] | None = None,
         use_message_history: bool = False,
         raw_response: bool = False,
-        tool_choice: str | None = None,
         screenshots: list[bytes] | None = None,
         caller_owns_exhaustion_receipt: bool = False,
     ) -> dict[str, Any]:
@@ -1105,27 +1101,6 @@ async def test_a_navigation_that_landed_on_an_error_page_is_no_evidence_for_the_
     )
 
     assert outcome.status == "budget_exhausted"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforce"])
-async def test_a_contradicting_goal_check_vetoes_the_step_cap_completion_only_under_enforce(enforce: bool) -> None:
-    # A URL change can land on the wrong page; the finish gate's goal check catches it, and its shadow arm logs
-    # without changing the outcome.
-    goal_check, verdicts = _scripted_goal_check("not_achieved")
-    click_calls: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", click_calls, billable=True, ok_data=_REACHED_TARGET)
-    script = [[("click", {})], [("click", {})], [("click", {})]]
-    outcome, _ = await _run(
-        script,
-        [click, make_finish_tool(goal_check=goal_check, goal_check_enforce=enforce)],
-        single_action_block=True,
-        block_completion_check=_achieved_block_check,
-        max_action_steps=1,
-    )
-
-    assert verdicts
-    assert outcome.status == ("budget_exhausted" if enforce else "completed")
 
 
 @pytest.mark.asyncio
@@ -4566,46 +4541,8 @@ async def test_no_tool_call_turn_is_counted_and_nudged() -> None:
     assert len(nudges) == 1
 
 
-class _ToolChoiceSensitiveCaller(_ScriptedCaller):
-    """Rejects any call carrying ``tool_choice``, as a provider that does not accept it would."""
-
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
-        super().__init__(script)
-        self.tool_choice_per_call: list[str | None] = []
-
-    async def call(self, **kwargs: Any) -> dict[str, Any]:
-        self.tool_choice_per_call.append(kwargs.get("tool_choice"))
-        if kwargs.get("tool_choice") is not None:
-            # The LLM layer maps a provider 400 onto the retryable type, so that -- not a bare
-            # exception -- is what the loop actually has to degrade from.
-            raise LLMProviderErrorRetryableTask("TEST_KEY")
-        return await super().call(**kwargs)
-
-
 @pytest.mark.asyncio
-async def test_loop_drops_tool_choice_and_retries_the_turn_after_a_call_failure() -> None:
-    caller = _ToolChoiceSensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
-    outcome = await run_agent_tool_loop(
-        llm_caller=caller,
-        system_prompt="sys",
-        user_prompt="goal",
-        tools=[make_finish_tool()],
-        max_turns=5,
-        max_tool_calls=10,
-        call_kwargs={"tool_choice": "required"},
-        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
-        max_call_retries=2,
-        call_retry_base_delay=0.0,
-    )
-
-    assert outcome.status == "completed"
-    assert outcome.tool_choice_in_effect is False
-    # The transient budget is spent first, then the parameter is dropped and the turn re-issued.
-    assert caller.tool_choice_per_call == ["required", "required", "required", None]
-
-
-@pytest.mark.asyncio
-async def test_loop_does_not_blame_tool_choice_for_a_context_window_overflow() -> None:
+async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_overflow() -> None:
     # Dropping a parameter cannot shrink a transcript, so re-issuing would burn a second oversized
     # request and mislabel the failure.
     class _OverflowingCaller(_ScriptedCaller):
@@ -4621,7 +4558,7 @@ async def test_loop_does_not_blame_tool_choice_for_a_context_window_overflow() -
         tools=[make_finish_tool()],
         max_turns=5,
         max_tool_calls=10,
-        call_kwargs={"tool_choice": "required"},
+        call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
     )
 
     assert outcome.status == "loop_error"
@@ -9760,41 +9697,6 @@ async def test_loop_drops_reasoning_dict_and_retries_the_turn_after_a_call_failu
     assert dict_calls and caller.reasoning_per_call[-1] is None
 
 
-class _ReasoningDictOnlySensitiveCaller(_ScriptedCaller):
-    """Rejects only the dict reasoning_effort; tool_choice is independently supported."""
-
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
-        super().__init__(script)
-        self.kwargs_per_call: list[tuple[Any, Any]] = []
-
-    async def call(self, **kwargs: Any) -> dict[str, Any]:
-        self.kwargs_per_call.append((kwargs.get("reasoning_effort"), kwargs.get("tool_choice")))
-        if isinstance(kwargs.get("reasoning_effort"), dict):
-            raise LLMProviderErrorRetryableTask("TEST_KEY")
-        return await super().call(**kwargs)
-
-
-@pytest.mark.asyncio
-async def test_degrading_the_summary_dict_keeps_tool_choice() -> None:
-    caller = _ReasoningDictOnlySensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
-    outcome = await run_agent_tool_loop(
-        llm_caller=caller,
-        system_prompt="sys",
-        user_prompt="goal",
-        tools=[make_finish_tool()],
-        max_turns=5,
-        max_tool_calls=10,
-        call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}, "tool_choice": "required"},
-        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
-        max_call_retries=2,
-        call_retry_base_delay=0.0,
-    )
-    assert outcome.status == "completed"
-    final_reasoning, final_tool_choice = caller.kwargs_per_call[-1]
-    assert final_reasoning is None
-    assert final_tool_choice == "required"
-
-
 def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
     from skyvern.forge.taskv3.loop import _CanonicalProgressTracker, _ProgressEvidence
 
@@ -13131,61 +13033,6 @@ async def test_a_mutation_batched_behind_an_accepted_verdict_never_dispatches() 
 
 
 @pytest.mark.asyncio
-async def test_the_held_batch_skip_does_not_leak_into_the_next_batch() -> None:
-    # The skip flag means "drop the rest of THIS batch". Several branches between the hold and the
-    # consume path can break out of the batch first -- the reachable one is the refresh signal, since
-    # a held finish is terminal-and-error so `verdict_stands` is false and a pending signal takes
-    # that exit with the flag still raised. Leaked, the NEXT batch drops everything queued behind its
-    # first tool and tells the model it was "queued behind a verdict that was held", which did not
-    # happen there: the run loses a real action and is told a false reason for it.
-    goal_check, _ = _scripted_goal_check("not_achieved", "achieved")
-    activity = ActivityRecency()
-    reload_calls: list[None] = []
-    typed: list[tuple[str, dict[str, Any]]] = []
-
-    async def reload_page() -> None:
-        reload_calls.append(None)
-
-    # The signal must land DURING the finish call, not before it: the pre-dispatch checks consume a
-    # signal raised earlier, so only one raised while the call runs survives to the post-dispatch
-    # branch that breaks. That is the race the branch exists for ("a route handler finishing during
-    # the model's turn"), reproduced here by wrapping the real finish handler.
-    real_finish = make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)
-
-    async def finish_then_signal(args: dict[str, Any]) -> ToolResult:
-        result = await real_finish.handler(args)
-        ctx = skyvern_context.current()
-        assert ctx is not None
-        ctx.refresh_working_page = True
-        return result
-
-    finish_spec = ToolSpec(
-        name=real_finish.name,
-        description=real_finish.description,
-        parameters=real_finish.parameters,
-        handler=finish_then_signal,
-        terminal=real_finish.terminal,
-    )
-    tools = [_recording_tool("type", typed, billable=True), finish_spec]
-    script = [
-        # The goal-check hold fires, and the signal raised during that same call breaks the batch afterwards.
-        [_COMPLETED],
-        # A fresh batch: the type must dispatch. It is not queued behind anything that was held.
-        [("type", {"selector": "ref=1", "text": "x"}), _COMPLETED],
-    ]
-    ctx = SkyvernContext(task_id="tsk_hold_leak")
-    skyvern_context.set(ctx)
-    try:
-        outcome, _ = await _run(script, tools, activity=activity, reload_page=reload_page)
-    finally:
-        skyvern_context.reset()
-
-    assert typed, "the next batch's action was dropped by a stale held-verdict skip"
-    assert activity.held_verdict_batch_skip is False
-    assert outcome.status == "completed"
-
-
-@pytest.mark.asyncio
 async def test_hold_gate_snapshot_records_the_verdict_after_a_refused_completion() -> None:
     # A zero-action finish(completed) refused by a gate above -- here the completion blocker -- is
     # followed by finish(failed); the snapshot records that failed verdict, not the refused completion.
@@ -13279,361 +13126,6 @@ def test_every_finish_status_is_defined_on_its_own_in_the_tool_description() -> 
         (line,) = definitions[status]
         shared = sorted(other for other in statuses if other != status and other in line)
         assert not shared, f"the definition of {status!r} also decides {shared}; the model is left to pick"
-
-
-def _scripted_goal_check(*verdicts: str, missing: str = "the confirmation is not shown"):
-    calls: list[GoalVerdict] = []
-
-    async def goal_check() -> GoalVerdict:
-        verdict = GoalVerdict(
-            verdict=verdicts[min(len(calls), len(verdicts) - 1)],  # type: ignore[arg-type]
-            quote="Status: Draft",
-            missing=missing,
-            skipped_reason=None,
-            latency_s=0.1,
-        )
-        calls.append(verdict)
-        return verdict
-
-    return goal_check, calls
-
-
-_COMPLETED = ("finish", {"status": "completed", "reason": "done", "extracted_output": {"order": "A-1"}})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("first", "second", "held_says", "ends"),
-    [
-        ("not_achieved", "not_achieved", "contradicting the goal", "failed"),
-        ("impossible", "impossible", "preventing the goal", "terminated"),
-        ("not_achieved", "impossible", "contradicting the goal", "terminated"),
-        ("impossible", "not_achieved", "preventing the goal", "failed"),
-    ],
-)
-async def test_goal_check_holds_the_first_contradiction_and_the_second_decides(
-    first: str, second: str, held_says: str, ends: str
-) -> None:
-    goal_check, calls = _scripted_goal_check(first, second)
-    activity = ActivityRecency()
-    tools = [make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)]
-
-    outcome, caller = await _run([[_COMPLETED], [_COMPLETED], [_COMPLETED]], tools, activity=activity)
-
-    assert len(calls) == 2
-    assert caller.calls == 2
-    first_finish = next(m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish")
-    assert "held once" in first_finish["content"]
-    assert held_says in first_finish["content"]
-    assert "the confirmation is not shown" in first_finish["content"]
-    assert outcome.status == ends
-    assert "the confirmation is not shown" in outcome.reason
-    assert outcome.extracted_output is None
-
-
-@pytest.mark.asyncio
-async def test_goal_check_achieved_keeps_the_completion_and_its_output() -> None:
-    goal_check, calls = _scripted_goal_check("achieved")
-    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=True)]
-
-    outcome, _ = await _run([[_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert outcome.extracted_output == {"order": "A-1"}
-    assert len(calls) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("verdicts", "judge_calls", "would_fail"),
-    [
-        (("not_achieved", "not_achieved"), 2, True),
-        (("not_achieved", "impossible"), 2, True),
-        (("impossible", "achieved"), 2, False),
-        (("achieved",), 1, None),
-    ],
-)
-async def test_goal_check_shadow_rechecks_a_would_be_hold_and_never_changes_the_outcome(
-    verdicts: tuple[str, ...], judge_calls: int, would_fail: bool | None
-) -> None:
-    # Enforce fails a block on two consecutive contradictions; shadow ends the run on the first, so it
-    # asks the second question at once to measure that gate.
-    goal_check, calls = _scripted_goal_check(*verdicts)
-    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=False)]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run([[_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert outcome.extracted_output == {"order": "A-1"}
-    assert len(calls) == judge_calls
-    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
-    assert line["mode"] == "shadow"
-    assert line["verdict"] == verdicts[0]
-    assert line["would_be_action"] == ("accept" if verdicts[0] == "achieved" else "hold")
-    assert line["would_fail"] is would_fail
-    assert line["second_verdict"] == (verdicts[1] if len(verdicts) > 1 else None)
-    assert (line["second_latency_s"] is None) is (len(verdicts) == 1)
-    # Page text can be customer data and the log index is searchable: only the quote's shape is logged.
-    assert "quote" not in line
-    assert line["quote_chars"] == len("Status: Draft")
-    assert line["quote_source"] == "text"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("enforce", [True, False], ids=["enforce", "shadow"])
-async def test_goal_check_logs_never_carry_page_text(enforce: bool) -> None:
-    # The judge's quote is copied page text, which can be customer data, and the log index is searchable.
-    goal_check, _calls = _scripted_goal_check("not_achieved", "not_achieved")
-    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=enforce)]
-
-    with capture_logs() as logs:
-        await _run([[_COMPLETED], [_COMPLETED]], tools)
-
-    assert [log for log in logs if log["event"] == "taskv3 finish goal check"]
-    assert [log for log in logs if "Status: Draft" in repr(log)] == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("enforce", "verdict"), [(True, "achieved"), (False, "achieved"), (False, "not_achieved")])
-async def test_goal_check_honors_a_cancellation_that_lands_during_the_judge_call(enforce: bool, verdict: str) -> None:
-    # The judge can take seconds; a run cancelled meanwhile must end canceled, not with a persisted completion.
-    canceled = False
-
-    async def goal_check() -> GoalVerdict:
-        nonlocal canceled
-        canceled = True
-        return GoalVerdict(verdict, "Status: Draft" if verdict != "achieved" else "", "not saved", None, 0.0)
-
-    async def should_cancel() -> bool:
-        return canceled
-
-    tools = [
-        make_finish_tool(
-            activity=ActivityRecency(),
-            goal_check=goal_check,
-            goal_check_enforce=enforce,
-            should_cancel=should_cancel,
-        )
-    ]
-    outcome, _ = await _run([[_COMPLETED]], tools, should_cancel=should_cancel)
-
-    assert outcome.status == "canceled"
-
-
-@pytest.mark.asyncio
-async def test_goal_check_that_raises_accepts_the_completion() -> None:
-    async def goal_check() -> GoalVerdict:
-        raise RuntimeError("judge exploded")
-
-    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=True)]
-
-    outcome, _ = await _run([[_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert outcome.extracted_output == {"order": "A-1"}
-
-
-@pytest.mark.asyncio
-async def test_goal_check_without_hold_headroom_accepts_and_records_the_would_be_hold() -> None:
-    goal_check, calls = _scripted_goal_check("not_achieved")
-    tools = [
-        make_finish_tool(
-            activity=ActivityRecency(final_turn_active=True), goal_check=goal_check, goal_check_enforce=True
-        )
-    ]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run([[_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert outcome.extracted_output == {"order": "A-1"}
-    assert len(calls) == 1
-    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
-    assert line["would_be_action"] == "hold"
-    assert line["no_headroom"] is True
-    assert line["would_fail"] is None
-
-
-@pytest.mark.asyncio
-async def test_goal_check_hold_skips_calls_queued_behind_the_finish() -> None:
-    goal_check, _ = _scripted_goal_check("not_achieved", "achieved")
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    activity = ActivityRecency()
-    tools = [
-        _recording_tool("click", clicks, billable=True),
-        make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True),
-    ]
-
-    outcome, _ = await _run([[_COMPLETED, ("click", {"selector": "#submit"})], [_COMPLETED]], tools, activity=activity)
-
-    assert outcome.status == "completed"
-    assert clicks == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("missing", "expected_reason"),
-    [
-        ("", "goal check: the page or recent tool results contradict it"),
-        ("x" * 1000, "goal check: " + "x" * 300),
-    ],
-)
-async def test_goal_check_reason_is_bounded_and_never_empty(missing: str, expected_reason: str) -> None:
-    goal_check, _ = _scripted_goal_check("not_achieved", missing=missing)
-    activity = ActivityRecency()
-    tools = [make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)]
-
-    outcome, _ = await _run([[_COMPLETED], [_COMPLETED]], tools, activity=activity)
-
-    assert outcome.status == "failed"
-    assert outcome.reason == expected_reason
-
-
-@pytest.mark.asyncio
-async def test_goal_check_ending_on_the_granted_final_turn_does_not_republish_the_output() -> None:
-    # Held on turn 1, the cap trips at max_turns, and the second contradicted completion lands on the
-    # granted final turn -- whose post-loop stamp would otherwise refill the staged output.
-    goal_check, calls = _scripted_goal_check("not_achieved")
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    activity = ActivityRecency()
-    tools = [
-        _recording_tool("click", clicks, billable=True),
-        make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True),
-    ]
-    script = [[_COMPLETED]] + [[("click", {"i": i})] for i in range(5)] + [[_COMPLETED]]
-
-    outcome, _ = await _run(script, tools, activity=activity, max_turns=6)
-
-    assert len(calls) == 2
-    assert outcome.cap_trip == "max_turns (6) reached"
-    assert outcome.status == "failed"
-    assert outcome.extracted_output is None
-
-
-@pytest.mark.asyncio
-async def test_goal_check_waits_for_the_settle_gate() -> None:
-    goal_check, calls = _scripted_goal_check("achieved")
-    samples = iter(["a", "b", "c", "c"])
-
-    async def fingerprint() -> str | None:
-        return next(samples)
-
-    tools = [
-        make_finish_tool(
-            page_fingerprint=fingerprint,
-            settle_wait_seconds=0,
-            activity=ActivityRecency(),
-            goal_check=goal_check,
-            goal_check_enforce=True,
-        )
-    ]
-
-    outcome, caller = await _run([[_COMPLETED], [_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert caller.calls == 2
-    assert len(calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_goal_check_shadow_without_headroom_asks_once() -> None:
-    goal_check, calls = _scripted_goal_check("not_achieved")
-    tools = [
-        make_finish_tool(
-            activity=ActivityRecency(final_turn_active=True), goal_check=goal_check, goal_check_enforce=False
-        )
-    ]
-
-    outcome, _ = await _run([[_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert len(calls) == 1
-
-
-def _goal_check_then(second: GoalVerdict | BaseException):
-    calls: list[str] = []
-
-    async def goal_check() -> GoalVerdict:
-        calls.append("call")
-        if len(calls) == 1:
-            return GoalVerdict("not_achieved", "Status: Draft", "not saved", None, 0.1)
-        if isinstance(second, BaseException):
-            raise second
-        return second
-
-    return goal_check, calls
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("second", "would_fail", "second_skip"),
-    [
-        (RuntimeError("judge exploded"), None, None),
-        (GoalVerdict("achieved", "", "", "timeout", 20.0), None, "timeout"),
-        (GoalVerdict("achieved", "", "", "deadline", 0.0), None, "deadline"),
-        # An ungrounded contradiction is an answer: enforce would accept it, so enforce would not fail.
-        (GoalVerdict("achieved", "made up", "x", "ungrounded_quote", 1.0), False, "ungrounded_quote"),
-    ],
-    ids=["raises", "timeout", "deadline", "ungrounded"],
-)
-async def test_goal_check_shadow_recheck_without_an_answer_leaves_would_fail_unknown(
-    second: GoalVerdict | BaseException, would_fail: bool | None, second_skip: str | None
-) -> None:
-    goal_check, calls = _goal_check_then(second)
-    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=False)]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run([[_COMPLETED]], tools)
-
-    assert outcome.status == "completed"
-    assert len(calls) == 2
-    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
-    assert line["would_fail"] is would_fail
-    assert line["second_skipped_reason"] == second_skip
-
-
-@pytest.mark.asyncio
-async def test_goal_check_shadow_recheck_is_skipped_once_the_run_is_cancelled() -> None:
-    goal_check, calls = _goal_check_then(GoalVerdict("not_achieved", "Status: Draft", "x", None, 0.1))
-
-    async def cancelled() -> bool:
-        # Canceled while the first check was running.
-        return bool(calls)
-
-    tools = [
-        make_finish_tool(
-            activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=False, should_cancel=cancelled
-        )
-    ]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run([[_COMPLETED]], tools, should_cancel=cancelled)
-
-    assert outcome.status == "canceled"
-    assert len(calls) == 1
-    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
-    assert line["would_fail"] is None
-    assert line["second_skipped_reason"] == "cancelled"
-    assert line["second_latency_s"] is None
-
-
-@pytest.mark.asyncio
-async def test_goal_check_enforce_asks_once_per_finish_and_logs_the_recheck_fields_as_null() -> None:
-    goal_check, calls = _scripted_goal_check("not_achieved", "achieved")
-    activity = ActivityRecency()
-    tools = [make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run([[_COMPLETED], [_COMPLETED]], tools, activity=activity)
-
-    assert outcome.status == "completed"
-    assert len(calls) == 2
-    first = next(log for log in logs if log["event"] == "taskv3 finish goal check")
-    assert first["would_be_action"] == "hold"
-    assert first["second_verdict"] is None
-    assert first["would_fail"] is None
-    assert first["second_latency_s"] is None
 
 
 @pytest.mark.parametrize("reason", sorted(taskv3_tools_module._MENU_WITHHOLD_REASONS))
