@@ -249,6 +249,7 @@ const CARD_TOOLS = new Set([
   "set_work_plan",
   ACCOUNT_GROUP_SUBMIT_TOOL,
   "cancel_account_group",
+  "delete_saved_credentials",
 ]);
 
 export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {

@@ -856,7 +856,10 @@ function FlowRenderer({
   // when copy-pasting triggers rapid successive dimension changes
   const debouncedLayoutForDimensions = useDebouncedCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
-      if (isLockedByOther()) return;
+      if (isLockedByOther()) {
+        pendingLayoutRef.current = true;
+        return;
+      }
       if (isLayoutingRef.current) {
         return;
       }
@@ -912,7 +915,12 @@ function FlowRenderer({
 
   const queueDimensionLayout = useCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
-      if (isLockedByOther()) return;
+      // The measured size is already stored on the node, so a dropped layout
+      // never re-triggers; replay it once the lock clears.
+      if (isLockedByOther()) {
+        pendingLayoutRef.current = true;
+        return;
+      }
       debouncedLayoutForDimensions(tempNodes, currentEdges);
     },
     [debouncedLayoutForDimensions],
@@ -2465,7 +2473,8 @@ function FlowRenderer({
                         ? "has a new Goal it doesn't follow yet. Apply it"
                         : "have new Goals they don't follow yet. Apply them"
                     } first, or continue with the last saved version.`
-                  : "Your workflow has unsaved changes. Do you want to save them before leaving?"}
+                  : workflowChangesStore.saveBlockedReason ||
+                    "Your workflow has unsaved changes. Do you want to save them before leaving?"}
               </DialogDescription>
             </DialogHeader>
             <WorkflowChangesList changes={unsavedChangeSummary} />
@@ -2504,7 +2513,10 @@ function FlowRenderer({
                       }
                     });
                   }}
-                  disabled={workflowChangesStore.saveIsPending}
+                  disabled={
+                    workflowChangesStore.saveIsPending ||
+                    Boolean(workflowChangesStore.saveBlockedReason)
+                  }
                 >
                   {workflowChangesStore.saveIsPending && (
                     <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

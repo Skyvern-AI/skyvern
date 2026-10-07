@@ -597,7 +597,7 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     // The server sends no frame on timeout, so the deadline alone has to release the dock.
     await act(async () => vi.advanceTimersByTimeAsync(300_001));
     expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
-    expect(screen.queryByText(/continue below/)).toBeNull();
+    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
     expect(screen.getAllByText("Timed out").length).toBeGreaterThan(0);
     expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
@@ -615,7 +615,7 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     const precedes = (a: Node, b: Node) =>
       Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
     const tray = await screen.findByRole("group", { name: "Sign-in request" });
-    const marker = screen.getByText(/continue below/);
+    const marker = screen.getByText("Copilot needs to sign in");
     expect(
       precedes(
         document.querySelector('[data-activity-row-id="tc-1"]')!,
@@ -657,7 +657,7 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     });
     expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
     expect(screen.queryByRole("group", { name: "Sign-in request" })).toBeNull();
-    expect(screen.queryByText(/continue below/)).toBeNull();
+    expect(screen.queryByText("Copilot needs to sign in")).toBeNull();
     expect(useCopilotHeaderStore.getState().attention).toBeNull();
   });
 

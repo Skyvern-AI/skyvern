@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -2231,7 +2232,7 @@ function FActivityLog({
   ];
   return (
     <div ref={logRef} className="flex flex-col gap-1.5">
-      {folded ? leadingCards.map(anchoredNode) : null}
+      {folded ? logAnchoredNodes(leadingCards.filter(isCard)) : null}
       {summary === null ? null : (
         <FTurnFoldHeader
           summary={summary}
@@ -2254,11 +2255,13 @@ function FActivityLog({
           ).map(({ key, note }) => <FOutcomeNote key={key} note={note} />)}
       {/* Folding the steps must not hide the cards that happened among them. */}
       {folded
-        ? rows
-            .slice(1)
-            .flatMap((row) => anchoredAfterRow?.get(row.id) ?? [])
-            .map(anchoredNode)
-        : anchoredBeforeRows.map(anchoredNode)}
+        ? logAnchoredNodes(
+            rows
+              .slice(1)
+              .flatMap((row) => anchoredAfterRow?.get(row.id) ?? [])
+              .filter(isCard),
+          )
+        : logAnchoredNodes(anchoredBeforeRows)}
       {summary !== null && !foldOpen
         ? null
         : rows.map((row, i) => {
@@ -2312,7 +2315,7 @@ function FActivityLog({
                   outcomeOwnerKey={outcomeOwnerKey}
                 />
               </div>,
-              ...(anchoredAfterRow?.get(row.id) ?? []).map(anchoredNode),
+              ...logAnchoredNodes(anchoredAfterRow?.get(row.id) ?? []),
             ];
           })}
     </div>
@@ -2348,6 +2351,8 @@ export interface AnchoredTurnItem {
   key: string;
   toolCallId: string | null;
   at?: string | null;
+  // A small item: neighbors placed together share one wrapping row, and a folded turn hides it.
+  inline?: boolean;
   node: React.ReactNode;
 }
 
@@ -2396,22 +2401,40 @@ function placeAnchoredItems(
   return { anchoredAfterRow, anchoredBeforeRows, unanchored };
 }
 
-function anchoredNode(item: AnchoredTurnItem) {
-  return (
-    <div key={item.key} className={`${TURN_ROW_OUTSET} py-0.5`}>
-      {item.node}
-    </div>
-  );
+const isCard = (item: AnchoredTurnItem) => !item.inline;
+
+function anchoredNodes(
+  items: AnchoredTurnItem[],
+  cardClass: string | undefined,
+  inlineClass: string,
+) {
+  const groups: AnchoredTurnItem[][] = [];
+  for (const item of items) {
+    const last = groups[groups.length - 1];
+    if (item.inline && last?.[0]?.inline) last.push(item);
+    else groups.push([item]);
+  }
+  return groups.map((group) => {
+    const first = group[0]!;
+    return first.inline ? (
+      <div key={first.key} className={`flex flex-wrap gap-1.5 ${inlineClass}`}>
+        {group.map((item) => (
+          <Fragment key={item.key}>{item.node}</Fragment>
+        ))}
+      </div>
+    ) : (
+      <div key={first.key} className={cardClass}>
+        {first.node}
+      </div>
+    );
+  });
 }
 
+const logAnchoredNodes = (items: AnchoredTurnItem[]) =>
+  anchoredNodes(items, `${TURN_ROW_OUTSET} py-0.5`, "ml-[18px] py-0.5");
+
 function AnchoredFallback({ items }: { items: AnchoredTurnItem[] }) {
-  return (
-    <>
-      {items.map((item) => (
-        <div key={item.key}>{item.node}</div>
-      ))}
-    </>
-  );
+  return <>{anchoredNodes(items, undefined, TURN_ROW_INSET)}</>;
 }
 
 interface DetailViewProps {

@@ -19,6 +19,7 @@ import {
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotSteerDeliveredUpdate,
@@ -123,6 +124,7 @@ export type NarrativeEvent =
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCodegenProgressUpdate
   | WorkflowCopilotSteerDeliveredUpdate
+  | WorkflowCopilotScreenshotUpdate
   | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
@@ -427,7 +429,10 @@ export interface TurnNarrativeState {
   // Live-only drafting progress from codegen_progress, never persisted. Holds
   // only what the row renders: the frames' cumulative character count changes
   // on every frame and would re-render the chat for nothing.
-  codegenProgress: { blockLabels: string[] } | null;
+  codegenProgress: {
+    blockLabels: string[];
+    generationId: string | null;
+  } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -460,6 +465,15 @@ export interface TurnNarrativeState {
   budgetExpiry: BudgetExpiryState | null;
   // Messages the user sent into this turn, in the order the model received them.
   steerMessages: CopilotSteerMessage[];
+  // Browser frames captured for the agent this turn, in capture order.
+  screenshots: TurnScreenshot[];
+}
+
+export interface TurnScreenshot {
+  artifactId: string;
+  capturedAt: string;
+  // The call that staged the frame; null places it by time alone.
+  toolCallId: string | null;
 }
 
 export interface GoogleConnectionNotice {
@@ -501,6 +515,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   turnFacts: null,
   budgetExpiry: null,
   steerMessages: [],
+  screenshots: [],
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -796,6 +811,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   [ACCOUNT_GROUP_SUBMIT_TOOL]: "Reviewing the accounts with you",
   get_account_group_status: "Checking the account runs",
   cancel_account_group: "Reviewing a cancel with you",
+  delete_saved_credentials: "Reviewing a credential deletion with you",
 };
 
 // What kind of work a call did, for the activity log's per-step rollup. Keyed
@@ -847,6 +863,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   [ACCOUNT_GROUP_SUBMIT_TOOL]: "run",
   get_account_group_status: "other",
   cancel_account_group: "other",
+  delete_saved_credentials: "other",
 };
 
 export function toolCallKind(toolName: string): ToolCallKind {
@@ -1374,10 +1391,14 @@ export function applyNarrativeEvent(
       // producer keys its state by output_index and opens each call with an
       // empty frame. One generation can carry several authoring calls, so union
       // rather than replace — otherwise a second call's opening frame erases
-      // the blocks the first one drafted. The tool_call that ends the
-      // generation is what clears the row, so this cannot accumulate past it.
+      // the blocks the first one drafted. A restarted generation opens the same
+      // way, so a changed generation_id is what drops the abandoned labels; an
+      // older server sends none, and every frame then counts as one generation.
+      const generationId = event.generation_id ?? null;
       const drafting = prev.codegenProgress;
-      const drafted = drafting?.blockLabels ?? [];
+      const sameGeneration =
+        drafting !== null && drafting.generationId === generationId;
+      const drafted = sameGeneration ? drafting.blockLabels : [];
       const merged = drafted.concat(
         event.blocks_drafted.filter((label) => !drafted.includes(label)),
       );
@@ -1386,12 +1407,12 @@ export function applyNarrativeEvent(
       // on every one. Returning prev unchanged is what keeps a fast stream from
       // re-rendering the chat between labels. The first frame of a generation
       // still has to land: it is what opens the row, and it carries no labels.
-      if (drafting !== null && merged.length === drafted.length) {
+      if (sameGeneration && merged.length === drafted.length) {
         return prev;
       }
       return {
         ...prev,
-        codegenProgress: { blockLabels: merged },
+        codegenProgress: { blockLabels: merged, generationId },
       };
     }
 
@@ -1548,6 +1569,23 @@ export function applyNarrativeEvent(
         codegenProgress: null,
       };
     }
+
+    case "screenshot":
+      return prev.screenshots.some(
+        (shot) => shot.artifactId === event.artifact_id,
+      )
+        ? prev
+        : {
+            ...prev,
+            screenshots: [
+              ...prev.screenshots,
+              {
+                artifactId: event.artifact_id,
+                capturedAt: event.captured_at,
+                toolCallId: event.tool_call_id ?? null,
+              },
+            ],
+          };
 
     case "tool_result": {
       const planItems = parseStringList(event.work_plan);
@@ -2021,7 +2059,27 @@ export function hydrateNarrativeFromPayload(
     turnFacts,
     budgetExpiry,
     steerMessages: parseSteerMessages(payload.steerMessages),
+    screenshots: parseScreenshots(payload.screenshots),
   };
+}
+
+function parseScreenshots(value: unknown): TurnScreenshot[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) =>
+    typeof item === "object" &&
+    item !== null &&
+    typeof item.artifactId === "string" &&
+    typeof item.capturedAt === "string"
+      ? [
+          {
+            artifactId: item.artifactId,
+            capturedAt: item.capturedAt,
+            toolCallId:
+              typeof item.toolCallId === "string" ? item.toolCallId : null,
+          },
+        ]
+      : [],
+  );
 }
 
 function parseSteerMessages(value: unknown): CopilotSteerMessage[] {

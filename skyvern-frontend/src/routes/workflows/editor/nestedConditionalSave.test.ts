@@ -28,6 +28,7 @@ import {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getWorkflowBlocks,
   getWorkflowSettings,
+  layout,
   validateWorkflowBlocks,
 } from "./workflowEditorUtils";
 
@@ -791,6 +792,92 @@ describe("conditional without a merge label", () => {
             ?.next_block_label
         : undefined,
     ).toBeNull();
+  });
+
+  test("a conditional with no Else draws the join after it, before and after a save", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "join" },
+        { id: "b2", next: "child" },
+      ]),
+      code("child", "join"),
+      code("join", null),
+    ];
+    const first = getElements(blocks, DEFAULT_SETTINGS, true);
+    const decide = first.nodes.find(isConditionalNode)!;
+    decide.data.branches = [
+      ...decide.data.branches,
+      createBranchCondition({ id: "else", is_default: true }),
+    ];
+    const saved = getWorkflowBlocks(first.nodes, first.edges);
+    const second = getElements(
+      saved as Array<WorkflowBlock>,
+      DEFAULT_SETTINGS,
+      true,
+    );
+
+    for (const { nodes } of [first, second]) {
+      expect(branchOf(nodes, "child")).toBe("b2");
+      expect(branchOf(nodes, "join")).toBeNull();
+    }
+    expect(
+      routingOf(saved).find((block) => block.label === "decide"),
+    ).toMatchObject({
+      nextBlockLabel: null,
+      branches: [
+        { id: "b1", nextBlockLabel: "join" },
+        { id: "b2", nextBlockLabel: "child" },
+        { id: "else", nextBlockLabel: null },
+      ],
+    });
+    expect(routingOf(getWorkflowBlocks(second.nodes, second.edges))).toEqual(
+      routingOf(saved),
+    );
+  });
+
+  test("the saved block order follows the stored order whichever branch tab is showing", () => {
+    const diamond = (): Array<WorkflowBlock> => [
+      code("start_step", "decide"),
+      conditional("decide", null, [
+        { id: "b1", next: "a" },
+        { id: "b2", next: "b", isDefault: true },
+      ]),
+      code("a", "join"),
+      code("b", "join"),
+      code("join", null),
+    ];
+    const order = ["start_step", "decide", "a", "b", "join"];
+
+    type Saved = ReturnType<typeof getWorkflowBlocks>;
+    const cases: Array<[Array<WorkflowBlock>, (saved: Saved) => Saved]> = [
+      [diamond(), (saved) => saved],
+      [
+        [forLoop("loop", diamond())],
+        (saved) =>
+          saved[0]?.block_type === "for_loop" ? saved[0].loop_blocks : [],
+      ],
+    ];
+    for (const [blocks, savedOrder] of cases) {
+      const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+      for (const activeBranch of ["b1", "b2"]) {
+        // Layout moves hidden nodes to the end, as a branch tab switch does.
+        const shown = layout(
+          nodes.map((node) =>
+            isWorkflowBlockNode(node) && node.data.conditionalBranchId
+              ? {
+                  ...node,
+                  hidden: node.data.conditionalBranchId !== activeBranch,
+                }
+              : node,
+          ),
+          edges,
+        );
+        const saved = savedOrder(getWorkflowBlocks(shown.nodes, shown.edges));
+
+        expect(saved.map((block) => block.label)).toEqual(order);
+      }
+    }
   });
 
   test("a branch that owns no blocks keeps its target when only some branches converge", () => {

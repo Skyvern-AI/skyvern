@@ -3,6 +3,13 @@ import { createContext, useContext } from "react";
 import { type PaneWidths } from "@/store/paneWidths";
 import { DEFAULT_STUDIO_PANES, type StudioPaneId } from "./panes";
 
+// Panes trimmed from a fuller arrangement; the dropped ones keep their slots
+// in it, so reopening one puts it back where it was.
+export type PanesCutFrom = {
+  panes: StudioPaneId[];
+  arrangement: readonly StudioPaneId[];
+};
+
 export type StudioPaneDefaultsValue = {
   isStudio: boolean;
   panes: readonly StudioPaneId[];
@@ -13,7 +20,8 @@ export type StudioPaneDefaultsValue = {
     compute: (
       panes: StudioPaneId[],
       slots: readonly StudioPaneId[],
-    ) => StudioPaneId[],
+      stageWidth: number,
+    ) => StudioPaneId[] | PanesCutFrom,
   ) => void;
   setPaneWidths: (widths: PaneWidths) => void;
   resetPaneWidths: () => void;

@@ -64,6 +64,13 @@ type WorkflowHasChangesStore = {
   saveGeneration: number;
   saveGenerationsByWorkflow: Record<string, number>;
   recordPersistedSave: (workflowPermanentId?: string) => void;
+  // The server version each workflow's canvas descends from; a save sends it as its precondition.
+  baseVersions: Record<string, number>;
+  // The workflow whose last save the server rejected because a newer version exists.
+  saveConflict: string | null;
+  recordBaseVersion: (
+    workflow: Pick<WorkflowApiResponse, "workflow_permanent_id" | "version">,
+  ) => void;
   // Why workflow saves are held (an Accept whose server outcome is unconfirmed), or null.
   saveBlockedReason: string | null;
   saidOkToCodeCacheDeletion: boolean;
@@ -89,6 +96,8 @@ type WorkflowHasChangesStore = {
     workflowPermanentId: string,
   ) => void;
   clearPendingRecording: (recordingId: string) => void;
+  // Clears the marker and deletes the recording, which nothing will attach.
+  discardPendingRecording: (recordingId: string) => void;
   beginInternalUpdate: () => void;
   endInternalUpdate: () => void;
 };
@@ -151,6 +160,19 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>(
                 [workflowPermanentId]: state.saveGeneration + 1,
               }
             : state.saveGenerationsByWorkflow,
+        })),
+      baseVersions: {},
+      saveConflict: null,
+      recordBaseVersion: ({ workflow_permanent_id, version }) =>
+        set((state) => ({
+          baseVersions: {
+            ...state.baseVersions,
+            [workflow_permanent_id]: version,
+          },
+          saveConflict:
+            state.saveConflict === workflow_permanent_id
+              ? null
+              : state.saveConflict,
         })),
       saidOkToCodeCacheDeletion: false,
       showConfirmCodeCacheDeletion: false,
@@ -247,6 +269,11 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>(
               }
             : {},
         );
+      },
+      discardPendingRecording: (recordingId) => {
+        if (get().pendingRecordingId !== recordingId) return;
+        get().clearPendingRecording(recordingId);
+        deleteDiscardedRecordingCallbacks.values().next().value?.(recordingId);
       },
       beginInternalUpdate: () => {
         set((state) => ({
@@ -407,8 +434,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         if (recordingId !== null) requestBody.recording_id = recordingId;
 
         const yaml = convertToYAML(requestBody);
+        const baseVersion =
+          changesState.baseVersions[saveData.workflow.workflow_permanent_id] ??
+          saveData.workflow.version;
 
-        if (owner) markWorkflowSavePersisting(owner, saveData.workflow.version);
+        if (owner) markWorkflowSavePersisting(owner, baseVersion);
         const requestStartedAt = Date.now();
         const noticeTimer = setTimeout(() => {
           if (!owner) return;
@@ -439,6 +469,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
                 delete_code_cache_is_ok: codeCacheDeletionApproved
                   ? "true"
                   : "false",
+                expected_version: baseVersion,
               },
             },
           );
@@ -466,10 +497,26 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             )
               setHasChanges(false, { fromYamlCommit: true });
           }
+          // The marker was dropped while this PUT owned the recording; a
+          // definite failure leaves nothing else that can attach or delete it.
+          if (
+            (error as AxiosError | null)?.response &&
+            recordingId !== null &&
+            useWorkflowHasChangesStore.getState().pendingRecordingId !==
+              recordingId
+          )
+            deleteDiscardedRecordingCallbacks
+              .values()
+              .next()
+              .value?.(recordingId);
           throw error;
         } finally {
           clearTimeout(noticeTimer);
         }
+        if (!owner || owner.active)
+          useWorkflowHasChangesStore
+            .getState()
+            .recordBaseVersion(response.data);
         savedRecordingIdRef.current = recordingId;
         if (recordingId !== null)
           useWorkflowHasChangesStore
@@ -640,6 +687,15 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         !isYamlCommitOwnerCurrent(override.yamlCommit.owner)
       )
         return;
+      if (status === 409 && context?.workflowPermanentId) {
+        useWorkflowHasChangesStore.setState({
+          saveConflict: context.workflowPermanentId,
+        });
+        void queryClient.invalidateQueries({
+          queryKey: ["workflowVersions", context.workflowPermanentId],
+        });
+        return;
+      }
       if (
         error instanceof SaveRefusedError ||
         error instanceof SaveStaleError
@@ -743,6 +799,7 @@ function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
   )
     return false;
   hydrate(workflow, { hydrateGraph: true });
+  useWorkflowHasChangesStore.getState().recordBaseVersion(workflow);
   applyYamlCommitMetadata(workflow, {}, true);
   return true;
 }
@@ -773,6 +830,14 @@ export function discardRestoredWorkflowSave(
   workflow: WorkflowApiResponse,
 ): void {
   hydrateRestoredWorkflowSave(workflow, owner);
+}
+
+export function reloadConflictedWorkflow(workflow: WorkflowApiResponse): void {
+  if (!hydrateWorkflowEditor(workflow)) return;
+  useWorkflowYamlEditorStore.getState().close();
+  useWorkflowHasChangesStore
+    .getState()
+    .setHasChanges(false, { fromYamlCommit: true });
 }
 
 export function usePendingWorkflowSaveRecovery(

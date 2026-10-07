@@ -1504,7 +1504,7 @@ describe("deriveActivityLog — drafting", () => {
           success: true,
         }),
       ]),
-      codegenProgress: { blockLabels: ["open_page"] },
+      codegenProgress: { blockLabels: ["open_page"], generationId: null },
     });
 
     expect(log.rows.map((row) => row.live)).toEqual([false, true]);
@@ -1522,12 +1522,15 @@ describe("deriveActivityLog — append only", () => {
         result("tr-schema", "get_block_schema"),
         result("tr-plan", "set_work_plan"),
         result("tr-nav", "navigate_browser"),
+        result("tr-delete", "delete_saved_credentials"),
+        result("tr-list", "list_credentials"),
       ]),
     );
     expect(log.rows.map((row) => row.entries.map((e) => e.id))).toEqual([
       ["tr-ask"],
       ["tr-schema", "tr-plan"],
-      ["tr-nav"],
+      ["tr-nav", "tr-delete"],
+      ["tr-list"],
     ]);
   });
 
@@ -1594,6 +1597,9 @@ describe("callRollup", () => {
       "Looked up guidance, added 1 block, edited 1 block, tested the workflow",
     );
     expect(callRollup([entry({ id: "n-1", kind: "narration" })])).toBeNull();
+    expect(
+      callRollup([call("tr-1", "delete_saved_credentials", "tool_result")]),
+    ).toBe("1 other step");
   });
 
   it("claims only the writes that succeeded once a step finished", () => {

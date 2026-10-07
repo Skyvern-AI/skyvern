@@ -40,6 +40,8 @@ export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 export interface QuestionChoice {
   choice_id: string;
   text: string;
+  recommended?: boolean;
+  detail_prompt?: string | null;
 }
 
 export interface QuestionPart {
@@ -102,6 +104,22 @@ export interface AccountGroupDecision {
   credential_ids: string[];
 }
 
+export type CredentialDeleteOutcomeKind = "deleted" | "not_found" | "failed";
+
+export interface CredentialDeleteRow {
+  credential_id: string;
+  name: string;
+  credential_type: "password" | "credit_card" | "secret";
+}
+
+export interface CredentialDeleteReview {
+  rows: CredentialDeleteRow[];
+  total_credential_count: number;
+  claimed_at?: string | null;
+  approved_credential_ids?: string[] | null;
+  outcomes?: { credential_id: string; outcome: CredentialDeleteOutcomeKind }[];
+}
+
 export interface QuestionResponse {
   answers?: QuestionAnswer[];
   text?: string | null;
@@ -120,6 +138,7 @@ export interface QuestionInteraction {
   resolved_at: string | null;
   account_group_review?: AccountGroupReview;
   account_group_cancel?: AccountGroupCancelReview;
+  credential_delete_review?: CredentialDeleteReview;
 }
 
 export interface WorkflowCopilotQuestionRequired {
@@ -224,6 +243,7 @@ export interface WorkflowCopilotChatRequest {
   supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
   supports_account_group_card?: boolean;
+  supports_credential_delete_card?: boolean;
 }
 
 export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";
@@ -252,6 +272,14 @@ export interface WorkflowCopilotSteerDeliveredUpdate {
   type: "steer_delivered";
   turn_id: string;
   steer_messages: CopilotSteerMessage[];
+}
+
+// A browser frame captured for the agent, stored as a chat-owned artifact.
+export interface WorkflowCopilotScreenshotUpdate {
+  type: "screenshot";
+  artifact_id: string;
+  captured_at: string;
+  tool_call_id?: string | null;
 }
 
 export type WorkflowCopilotMessageFeedbackRating = "up" | "down";
@@ -392,7 +420,8 @@ export type WorkflowCopilotStreamMessageType =
   | "title_update"
   | "credential_required"
   | "question_required"
-  | "steer_delivered";
+  | "steer_delivered"
+  | "screenshot";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -478,6 +507,9 @@ export interface WorkflowCopilotCodegenProgressUpdate {
   blocks_drafted: string[];
   chars_streamed: number;
   iteration: number;
+  // New for every model response; the authoring calls within one response
+  // share it. Absent from servers that predate it.
+  generation_id?: string | null;
   timestamp: string;
 }
 

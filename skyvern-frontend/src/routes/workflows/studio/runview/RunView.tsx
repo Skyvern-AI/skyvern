@@ -694,50 +694,6 @@ export function RunView({
     timelineIsPlaceholder,
   ]);
 
-  // A run that had already succeeded when it was opened lands on its Outputs;
-  // a failed one keeps the timeline, where its failure section and Fix/Retry live.
-  // Explicit choices win here for the same reason they do for the pin above:
-  // a deep link names what to show, and switching the pane hides it.
-  const outputsLandingDecidedForRunRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (
-      !workflowRunId ||
-      outputsLandingDecidedForRunRef.current === workflowRunId ||
-      !workflowRun ||
-      runIsPlaceholder ||
-      timelineIsPlaceholder
-    ) {
-      return;
-    }
-    outputsLandingDecidedForRunRef.current = workflowRunId;
-    if (!finalized || outcome !== "success") {
-      return;
-    }
-    const landingSearchParams = new URLSearchParams(
-      window.location.search || searchParamsRef.current.toString(),
-    );
-    if (
-      landingSearchParams.has("view") ||
-      hasExplicitSelection(landingSearchParams)
-    ) {
-      return;
-    }
-    if (
-      runHasOutputs(workflowRun) &&
-      useRunPaneViewStore.getState().view === "timeline"
-    ) {
-      setPaneView("outputs");
-    }
-  }, [
-    workflowRunId,
-    workflowRun,
-    finalized,
-    outcome,
-    runIsPlaceholder,
-    timelineIsPlaceholder,
-    setPaneView,
-  ]);
-
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
   // the live edge — the same resolution the Browser pane applies in useRunVisuals.
   const selectedId =
