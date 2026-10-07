@@ -3352,7 +3352,8 @@ async def test_forced_retirement_claim_propagates_cancellation(monkeypatch, forc
         await asyncio.wait_for(entered.wait(), timeout=5)
         if case == "cancelled":
             task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=1)
+        # A propagation bug leaves the task parked forever; the bound only has to outlast a GC pause (~1s).
+        done, _ = await asyncio.wait({task}, timeout=10)
         assert task in done, "retirement claim did not propagate cancellation or timeout"
         with pytest.raises(expected) as raised:
             await task
