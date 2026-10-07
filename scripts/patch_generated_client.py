@@ -12,6 +12,10 @@ Patches:
 2. update_forward_refs — Pydantic v2 can raise internal schema-gathering
    KeyErrors for Fern-generated recursive unions even with raise_errors=False.
    Suppress KeyErrors that mention the "definitions" key.
+3. context_parameter_source cross-import — Fern emits `from .context_parameter
+   import ContextParameter` mid-file, so entering context_parameter_source as the
+   entry point sees a partially initialized context_parameter. Move the import
+   below the union definition so both entry orders resolve.
 """
 
 from __future__ import annotations
@@ -96,6 +100,41 @@ FORWARD_REFS_NEW = """def update_forward_refs(model: Type["Model"], **localns: A
         model.update_forward_refs(**localns)"""
 
 
+CONTEXT_PARAMETER_SOURCE = "types/context_parameter_source.py"
+
+# Two edits to one file: drop Fern's mid-file cross-import, then re-add it after
+# the union is defined. Applied in order.
+CONTEXT_PARAMETER_SOURCE_PATCHES: tuple[tuple[str, str], ...] = (
+    (
+        """            extra = pydantic.Extra.allow
+
+
+from .context_parameter import ContextParameter  # noqa: E402, F401, I001
+
+
+class ContextParameterSource_AwsSecret(UniversalBaseModel):""",
+        """            extra = pydantic.Extra.allow
+
+
+class ContextParameterSource_AwsSecret(UniversalBaseModel):""",
+    ),
+    (
+        """    ContextParameterSource_Credential,
+]
+update_forward_refs(ContextParameterSource_Context)""",
+        """    ContextParameterSource_Credential,
+]
+
+# Manual patch: Fern v4.31.1 emits this cross-import mid-file, so entering
+# context_parameter_source first sees a partially initialized context_parameter.
+# Importing after the union is defined makes both entry orders resolve.
+from .context_parameter import ContextParameter  # noqa: E402, F401, I001
+
+update_forward_refs(ContextParameterSource_Context)""",
+    ),
+)
+
+
 def patch_file(rel_path: str, old: str, new: str) -> str:
     path = CLIENT / rel_path
     text = path.read_text()
@@ -112,6 +151,11 @@ def main() -> int:
     for rel_path, (old, new) in LOOP_BLOCK_PATCHES.items():
         result = patch_file(rel_path, old, new)
         print(f"{rel_path}: {result}")
+        failed |= result == "PATTERN NOT FOUND"
+
+    for index, (old, new) in enumerate(CONTEXT_PARAMETER_SOURCE_PATCHES, start=1):
+        result = patch_file(CONTEXT_PARAMETER_SOURCE, old, new)
+        print(f"{CONTEXT_PARAMETER_SOURCE} [{index}/{len(CONTEXT_PARAMETER_SOURCE_PATCHES)}]: {result}")
         failed |= result == "PATTERN NOT FOUND"
 
     result = patch_file("core/pydantic_utilities.py", FORWARD_REFS_OLD, FORWARD_REFS_NEW)
