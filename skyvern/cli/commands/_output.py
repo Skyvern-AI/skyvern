@@ -7,13 +7,13 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, NoReturn
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
+from skyvern.cli.console import make_console
 from skyvern.cli.core.guards import STALE_FRAME_HINT, stale_frame_selection_in
 from skyvern.cli.core.telemetry import capture_cli_tool_call
 
-console = Console()
+console = make_console()
 
 ENVELOPE_SCHEMA_VERSION = "1.0"
 
