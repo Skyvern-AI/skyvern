@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 import yaml
 from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
+from skyvern.cli.core import client as client_mod
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS, size_capped
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowRequest,
@@ -23,7 +26,7 @@ from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_
 
 
 def _fake_workflow_response() -> SimpleNamespace:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return SimpleNamespace(
         workflow_permanent_id="wpid_test",
         workflow_id="wf_test",
@@ -197,6 +200,7 @@ def _known_drift_definition(block_type: str) -> dict[str, object]:
         }
     elif block_type == "terminate":
         block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        block["error_code"] = "ACCOUNT_NOT_FOUND"
     else:
         raise ValueError(f"Unsupported known drift block type: {block_type}")
 
@@ -283,6 +287,7 @@ async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     elif block_type == "terminate":
         assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
@@ -328,6 +333,7 @@ async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     elif block_type == "terminate":
         assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
@@ -4772,3 +4778,129 @@ async def test_registered_large_workflow_get_reports_skills_with_overflow_hint(
     assert f"carries {len(prompt)} persisted skill-instruction characters" in skills["hint"]
     assert "--id wpid_test --version 7 --definition-file wf.json" in skills["hint"]
     assert "data.workflow_definition.workflow_system_prompt" not in skills["hint"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run",
+    [
+        {
+            "workflow_run_id": "wr_api",
+            "status": "terminated",
+            "created_at": "2026-09-20T08:30:00+00:00",
+            "trigger_type": "api",
+            "copilot_session_id": "wcc_1",
+        },
+        SimpleNamespace(
+            workflow_run_id="wr_api",
+            status="terminated",
+            created_at=datetime(2026, 9, 20, 8, 30, tzinfo=UTC),
+            trigger_type=WorkflowRunTriggerType.api,
+            copilot_session_id="wcc_1",
+        ),
+    ],
+    ids=["api_json", "typed"],
+)
+async def test_workflow_run_list_summary_carries_when_and_how_each_run_started(
+    run: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", AsyncMock(return_value=[run]))
+
+    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", status=["terminated"])
+
+    summary = json.loads(json.dumps(result))["data"]["runs"][0]
+    assert summary["created_at"] == "2026-09-20T08:30:00+00:00"
+    assert summary["trigger_type"] == "api"
+    assert summary["copilot_session_id"] == "wcc_1"
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_list_does_not_report_absent_run_details_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_row = {"workflow_run_id": "wr_done", "status": "completed", "created_at": "2026-10-06T06:40:10+00:00"}
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", AsyncMock(return_value=[list_row]))
+    status_payload = {
+        **list_row,
+        "recording_url": None,
+        "screenshot_urls": None,
+        "downloaded_files": None,
+        "outputs": None,
+    }
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=status_payload))
+
+    listed = (await workflow_tools.skyvern_workflow_run_list("wpid_x"))["data"]
+    status = (await workflow_tools.skyvern_workflow_status("wr_done"))["data"]
+
+    summary = listed["runs"][0]
+    assert "output_summary" not in summary
+    assert "recording_available" not in summary.get("artifact_summary", {})
+    assert "artifact_id_count" not in summary.get("artifact_summary", {})
+    assert "skyvern_workflow_status" in listed["run_details_hint"]
+    assert status["output_summary"] == {"present": False}
+    assert status["artifact_summary"]["recording_available"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_count", [13, 10])
+async def test_workflow_run_list_pages_through_every_run_in_order(
+    run_count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_ids = [f"wr_{i}" for i in range(run_count)]
+
+    async def list_runs(workflow_id: str, *, page: int, page_size: int, **_: object) -> list[dict[str, str]]:
+        offset = (page - 1) * page_size
+        return [{"workflow_run_id": run_id, "status": "terminated"} for run_id in run_ids[offset : offset + page_size]]
+
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", list_runs)
+
+    seen: list[str] = []
+    for page in range(1, 10):
+        data = (await workflow_tools.skyvern_workflow_run_list("wpid_x", page=page, page_size=5))["data"]
+        assert data["runs"], f"has_more promised page {page}, which was empty"
+        seen.extend(run["run_id"] for run in data["runs"])
+        if not data["has_more"]:
+            break
+
+    assert seen == run_ids
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_sends_max_steps_override_and_ai_fallback_to_the_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_mod.settings, "SKYVERN_BASE_URL", "http://skyvern.test")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "wr_123",
+                "run_type": "workflow_run",
+                "status": "queued",
+                "created_at": "2026-01-01T00:00:00Z",
+                "modified_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    token = client_mod.set_api_key_override("sk_test")
+    try:
+        skyvern = client_mod.get_skyvern()
+    finally:
+        client_mod.reset_api_key_override(token)
+    skyvern._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+    _patch_skyvern_client(monkeypatch, skyvern)
+    try:
+        result = await workflow_tools.skyvern_workflow_run(
+            workflow_id="wpid_123", max_steps_override=7, ai_fallback=False
+        )
+    finally:
+        await skyvern.aclose()
+
+    assert result["ok"] is True, result
+    assert requests[0].headers["x-max-steps-override"] == "7"
+    assert json.loads(requests[0].content)["ai_fallback"] is False
+    assert "max_steps_override=7" in result["data"]["sdk_equivalent"]
+    assert "ai_fallback=False" in result["data"]["sdk_equivalent"]

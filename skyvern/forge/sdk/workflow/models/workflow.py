@@ -1,19 +1,23 @@
+import hashlib
+import json
 from datetime import datetime
-from enum import StrEnum
 from typing import Any, List
 
 from pydantic import (
     BaseModel,
     Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
     ValidationInfo,
     computed_field,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import Self, deprecated
 
-from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunStatus, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -32,6 +36,8 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_run_metadata,
     normalize_run_with,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE,
@@ -177,6 +183,19 @@ class WorkflowDefinition(BaseModel):
         default=None,
         description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied to every browser this workflow version creates.",
+    )
+
+    # An omitted key tells a save to keep the previous version's settings, while an explicit null clears them.
+    # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
+    @model_serializer(mode="wrap")
+    def _omit_unset_browser_settings(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if "browser_settings" not in self.model_fields_set and isinstance(data, dict):
+            data.pop("browser_settings", None)
+        return data
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -260,6 +279,13 @@ class Workflow(BaseModel):
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False
+    effective_default_engine: RunEngine | None = Field(
+        default=None,
+        description="The engine a task block with no `engine` set runs on in this agent, or null when "
+        "engine routing decides it. Populated by the detail endpoint only.",
+    )
+    # Set by the detail GET; elsewhere the key is omitted, since a null would claim routing decides the engine.
+    _effective_default_engine_computed: bool = PrivateAttr(default=False)
     original_created_by: str | None = Field(
         default=None,
         description="Who created the agent's first version. Populated by the list endpoint only.",
@@ -278,6 +304,18 @@ class Workflow(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    # No return annotation: pydantic would publish it as the response schema in place of the model's fields.
+    @model_serializer(mode="wrap")
+    def _omit_uncomputed_engine(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if not self._effective_default_engine_computed:
+            data.pop("effective_default_engine", None)
+        return data
+
+    def set_effective_default_engine(self, engine: RunEngine | None) -> None:
+        self.effective_default_engine = engine
+        self._effective_default_engine_computed = True
+
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -295,38 +333,6 @@ class Workflow(BaseModel):
         return None
 
 
-class WorkflowRunStatus(StrEnum):
-    created = "created"
-    queued = "queued"
-    running = "running"
-    failed = "failed"
-    terminated = "terminated"
-    canceled = "canceled"
-    timed_out = "timed_out"
-    completed = "completed"
-    paused = "paused"
-
-    def is_final(self) -> bool:
-        return self in [
-            WorkflowRunStatus.failed,
-            WorkflowRunStatus.terminated,
-            WorkflowRunStatus.canceled,
-            WorkflowRunStatus.timed_out,
-            WorkflowRunStatus.completed,
-        ]
-
-    def is_final_excluding_canceled(self) -> bool:
-        """Like :meth:`is_final` but excludes ``canceled``.
-
-        For callers that can't distinguish a legitimate user/block cancel from
-        a synthetic ``canceled`` written as a last-resort fallback — e.g. the
-        copilot tool reading the row AFTER ``mark_workflow_run_as_canceled_if_not_final``
-        has run. Callers that want to trust a legitimate ``canceled`` must read
-        the row BEFORE invoking any cancel helper.
-        """
-        return self.is_final() and self is not WorkflowRunStatus.canceled
-
-
 class WorkflowRun(BaseModel):
     workflow_run_id: str
     workflow_id: str
@@ -342,6 +348,8 @@ class WorkflowRun(BaseModel):
     reuse_bound_key: str | None = Field(default=None, exclude=True)
     # Internal routing: the worker queue the run was dispatched to. Never an API field.
     task_queue: str | None = Field(default=None, exclude=True)
+    # Digest of the definition the run was created against; the saved row can be overwritten in place later.
+    workflow_definition_sha256: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")
@@ -375,6 +383,10 @@ class WorkflowRun(BaseModel):
     browser_address: str | None = None
     run_with: str | None = None
     browser_type: str | None = None
+    browser_settings: BrowserSettings | None = Field(
+        default=None, description="Browser settings copied from the workflow version when the run was created"
+    )
+    browser_settings_receipt: BrowserSettingsReceipt | None = None
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
     depends_on_workflow_run_id: str | None = None
@@ -411,6 +423,23 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+
+# Stored when attempts of one run executed different definitions; it never equals a real digest.
+MIXED_RUN_DEFINITION_DIGEST = "mixed"
+
+
+def workflow_definition_sha256(definition: WorkflowDefinition) -> str:
+    return hashlib.sha256(json.dumps(definition.model_dump(mode="json"), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def start_hold_reason(*, sequential_key: str | None, depends_on_workflow_run_id: str | None) -> str:
+    """Why a run may wait by design before it starts: a sequential lane, a dependency, or neither."""
+    if sequential_key:
+        return "sequential"
+    if depends_on_workflow_run_id:
+        return "dependency"
+    return "none"
 
 
 def resolve_reuse_browser_session(*, run_override: bool | None, workflow_default: bool) -> bool:

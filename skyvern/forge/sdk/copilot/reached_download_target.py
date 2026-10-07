@@ -289,34 +289,6 @@ def derive_from_block_outputs(
     return None
 
 
-_AUTHOR_DOWNLOAD_GUIDANCE = (
-    "A correct click reached a download affordance on the current page. Author ONE terminal "
-    "download code block as a single `await click_and_claim_download(page, selector)` call with the "
-    "captured affordance selector — not page.expect_download (the selector is already known, so the "
-    "one-call helper is the simpler form here), not a static-fetch request, and not "
-    "another page re-evaluation. The platform clicks the "
-    "affordance once, claims the fired browser download, and registers it to the workflow output "
-    "surface (downloaded_files); never place file bytes or URLs in the chat reply. The call returns "
-    "the sanitized file name as a plain string — bind it and return it as-is. It is not a Download "
-    "object, so reading `.suggested_filename` or any other attribute off it fails."
-)
-
-_CONFIRMED_DOWNLOAD_GUIDANCE = (
-    "A browser download already registered into the workflow output surface (downloaded_files). "
-    "The download flow is reached — finalize one terminal download code block rather than "
-    "re-evaluating the page or re-authoring static-fetch scout blocks. Never place file bytes or "
-    "URLs in the chat reply."
-)
-
-_OBSERVED_RENDER_GUIDANCE = (
-    "This click opens the document as an inline render in a new tab — no browser download event "
-    "fires here, so do NOT author page.expect_download for this affordance (it waits forever) and "
-    "do not return a downloaded_files entry the platform did not register. If the viewer offers a "
-    "real download/print/export control, exercise that instead; otherwise report plainly that the "
-    "document renders on screen but cannot be registered as a downloaded file yet."
-)
-
-
 def can_deliver_registered_download(target: ReachedDownloadTarget | None) -> bool:
     """Whether this target can still become a registered download in the generated workflow.
 
@@ -326,12 +298,6 @@ def can_deliver_registered_download(target: ReachedDownloadTarget | None) -> boo
     if target is None:
         return False
     return target.download_kind != DOWNLOAD_KIND_OBSERVED_RENDER
-
-
-def guidance_for(target: ReachedDownloadTarget) -> str:
-    if target.download_kind == DOWNLOAD_KIND_OBSERVED_RENDER:
-        return _OBSERVED_RENDER_GUIDANCE
-    return _CONFIRMED_DOWNLOAD_GUIDANCE if target.already_registered else _AUTHOR_DOWNLOAD_GUIDANCE
 
 
 _EXPECT_DOWNLOAD_ATTR = "expect_download"

@@ -59,7 +59,10 @@ import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import {
@@ -89,7 +92,7 @@ import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
 import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
 import { TagFilterControl } from "@/routes/workflows/components/tagging/TagFilterControl";
 import { useRunTagFilterParam } from "@/routes/workflows/hooks/useRunTagFilterParam";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { RUN_HISTORY_SEARCH_FIELDS_HINT } from "@/util/runSearch";
 import {
   SelectionCheckboxCell,
   SelectionHeaderCheckboxCell,
@@ -223,9 +226,11 @@ function RunHistory() {
     searchParams,
     setSearchParams,
   );
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
-  // A stale ?tags= URL param would 403 the request when tagging is disabled.
-  const effectiveTagsParam = taggingEnabled ? tagsParam : undefined;
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // A stale ?tags= URL param would 403 the request when tagging is off.
+  const { tags: urlTags, hold: holdForTaggingFlag } =
+    useUrlTagFilter(tagsParam);
+  const effectiveTagsParam = urlTags || undefined;
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
@@ -247,6 +252,7 @@ function RunHistory() {
     tags: effectiveTagsParam,
     workflowPermanentIds,
     failureCategory,
+    enabled: !holdForTaggingFlag,
   });
   const navigate = useNavigate();
 
@@ -259,7 +265,7 @@ function RunHistory() {
     tags: effectiveTagsParam,
     workflowPermanentIds,
     failureCategory,
-    enabled: runs?.length === itemsPerPage,
+    enabled: !holdForTaggingFlag && runs?.length === itemsPerPage,
   });
 
   const isNextDisabled =
@@ -370,7 +376,7 @@ function RunHistory() {
 
   const displayTableBody = () => {
     // Show loading skeleton
-    if (isFetching) {
+    if (isFetching || holdForTaggingFlag) {
       return Array.from({ length: 10 }).map((_, index) => (
         <TableRow key={`row-${index}`}>
           <TableCell colSpan={columnCount}>
@@ -653,7 +659,8 @@ function RunHistory() {
                   params.set("page", "1");
                   setSearchParams(params, { replace: true });
                 }}
-                placeholder="Search by run ID or input..."
+                placeholder="Search by run ID, input, credential..."
+                title={RUN_HISTORY_SEARCH_FIELDS_HINT}
                 className="w-48 lg:w-72"
               />
               {taggingEnabled ? (

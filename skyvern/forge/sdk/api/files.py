@@ -855,13 +855,42 @@ async def resolve_local_or_download_file(
 ) -> str:
     """Resolve a file input to a local path.
 
-    Absolute paths are validated against the run's download directory; anything else is downloaded.
+    Run-local paths are validated against the run's download directory; anything else is downloaded.
     """
-    # Absolute paths are the run-local convention; treating all non-remote strings as paths would misroute bad URLs.
-    if file_url.startswith("/"):
-        resolved = validate_local_file_path(file_url, run_id)
+    parsed_url = urlparse(file_url)
+    local_path: str | None = file_url if file_url.startswith("/") else None
+    if parsed_url.scheme == "file":
+        candidate_path = parse_uri_to_path(file_url)
+        download_root = Path(settings.DOWNLOAD_PATH).absolute()
+        candidate = Path(candidate_path)
+        local_download_root = False
+        if (
+            organization_id
+            and organization_id not in (".", "..")
+            and not os.path.isabs(organization_id)
+            and "/" not in organization_id
+            and "\\" not in organization_id
+        ):
+            resolved_candidate = candidate.resolve()
+            local_download_root = any(
+                resolved_candidate.is_relative_to((Path(root) / settings.ENV / organization_id).resolve())
+                for root in _LOCAL_DOWNLOAD_ROOTS
+            )
+        if not local_download_root and (
+            candidate.is_relative_to(download_root) or candidate.resolve().is_relative_to(download_root.resolve())
+        ):
+            # Preserve org-scoped local uploads; other files under DOWNLOAD_PATH must be run-scoped.
+            file_id = await uploaded_file_id_for_local_uri(file_url, organization_id)
+            if file_id is not None:
+                file_url = file_id
+            else:
+                local_path = candidate_path
+
+    # Explicit local paths are run-scoped; arbitrary strings must not be treated as paths instead of URLs.
+    if local_path is not None:
+        resolved = validate_local_file_path(local_path, run_id)
         if not os.path.isfile(resolved):
-            raise FileNotFoundError(f"Local file not found: {file_url}")
+            raise FileNotFoundError(f"Local file not found: {local_path}")
         if max_size_mb is not None and os.path.getsize(resolved) > max_size_mb * 1024 * 1024:
             raise DownloadFileMaxSizeExceeded(max_size_mb)
         return resolved

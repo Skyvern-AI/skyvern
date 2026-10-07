@@ -55,6 +55,36 @@ def test_questions_preserve_content_and_correlate_answers_by_id():
     assert result["parts"][5]["choice"]["text"] == "CSV"
 
 
+def test_recommended_choice_leads_and_only_one_is_marked():
+    interaction = create_question_interaction(
+        AskUserArguments.model_validate(
+            {
+                "parts": [
+                    {
+                        "prompt": "Which restaurant?",
+                        "choices": [
+                            {"text": "Choose another restaurant"},
+                            {"text": "Use the saved restaurant", "recommended": True},
+                            {"text": "Use the last order", "recommended": True},
+                        ],
+                    },
+                    {"prompt": "Size?", "choices": ["Large"]},
+                ]
+            }
+        ),
+        turn_id="turn",
+        tool_call_id="call",
+    )
+    persisted = type(interaction).model_validate_json(interaction.model_dump_json())
+    assert [(choice.text, choice.recommended) for choice in persisted.parts[0].choices] == [
+        ("Use the saved restaurant", True),
+        ("Choose another restaurant", False),
+        ("Use the last order", False),
+    ]
+    # Unrecommended choices keep today's stored shape.
+    assert persisted.parts[1].choices[0].model_dump().keys() == {"choice_id", "text"}
+
+
 @pytest.mark.parametrize("skipped,text", [(True, None), (False, "why do you need this?")])
 def test_skip_and_composer_text_are_observations(skipped, text):
     pending = create_question_interaction(
@@ -68,6 +98,38 @@ def test_skip_and_composer_text_are_observations(skipped, text):
     assert resolved.tool_result()["text"] == text
     assert resolved.tool_result()["parts"][0]["status"] == "unanswered"
     assert pending.status == "pending"
+
+
+@pytest.mark.parametrize(
+    "text,status", [(None, "detail_missing"), ("  ", "detail_missing"), ("Corner pizzeria", "answered")]
+)
+def test_a_detail_choice_sent_without_its_detail_reports_it_missing(text, status):
+    # A client that predates detail_prompt can send the choice alone; the model must see that.
+    pending = create_question_interaction(
+        AskUserArguments.model_validate(
+            {"parts": [{"prompt": "Where from?", "choices": [{"text": "Another", "detail_prompt": "Which one?"}]}]}
+        ),
+        turn_id="turn",
+        tool_call_id="call",
+    )
+    part = pending.parts[0]
+    answer = QuestionAnswer(part_id=part.part_id, choice_id=part.choices[0].choice_id, text=text)
+    result = resolve_question_response(pending, QuestionResponse(answers=[answer])).tool_result()
+    assert result["parts"][0]["status"] == status
+    assert result["parts"][0]["choice"]["detail_prompt"] == "Which one?"
+
+
+@pytest.mark.parametrize("prompt", ["", "   ", "\n"])
+def test_a_blank_detail_prompt_is_no_detail_prompt(prompt):
+    # A blank prompt would hold Next behind an instruction the user cannot see.
+    interaction = create_question_interaction(
+        AskUserArguments.model_validate(
+            {"parts": [{"prompt": "Where?", "choices": [{"text": "Another", "detail_prompt": prompt}]}]}
+        ),
+        turn_id="turn",
+        tool_call_id="call",
+    )
+    assert "detail_prompt" not in interaction.parts[0].choices[0].model_dump()
 
 
 def test_response_cannot_attribute_a_foreign_choice_or_part():
@@ -112,7 +174,7 @@ def test_question_secret_screen_preserves_safe_content():
                 "parts": [
                     {
                         "prompt": f"Use token {secret}?",
-                        "choices": ["Send me the receipt", secret],
+                        "choices": ["Send me the receipt", {"text": "Use another", "detail_prompt": f"Not {secret}?"}],
                     }
                 ]
             }
@@ -163,6 +225,7 @@ async def setup_question_chat(sqlite_engine, monkeypatch):
     api.add_api_route("/reply", routes.workflow_copilot_question_response, methods=["POST"])
     api.add_api_route("/history", routes.workflow_copilot_chat_history, methods=["GET"])
     api.add_api_route("/cancel", routes.workflow_copilot_cancel, methods=["POST"], status_code=204)
+    api.add_api_route("/steer", routes.workflow_copilot_steer, methods=["POST"])
     client = AsyncClient(transport=ASGITransport(app=api), base_url="http://fixture")
     frames = asyncio.Queue()
     ctx = CopilotContext(
@@ -215,7 +278,7 @@ async def test_actual_handler_reply_endpoint_and_reloaded_history(sqlite_engine:
             assert frame["cancel_token"] == "stop"
             assert [part["prompt"] for part in question["parts"]] == [part.prompt for part in args.parts]
             assert [[choice["text"] for choice in part["choices"]] for part in question["parts"]] == [
-                part.choices for part in args.parts
+                [choice.text for choice in part.choices] for part in args.parts
             ]
             # Reload the saved record while the same handler is still waiting.
             history = await client.get("/history", params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id})
@@ -382,7 +445,18 @@ async def test_registered_tool_returns_both_observations_in_next_model_input_and
 
     repo, client, ctx, frames = await setup_question_chat(sqlite_engine, monkeypatch)
     inputs = []
-    arguments = {"parts": [{"prompt": "Delivery?", "choices": ["Email", "Download"]}]}
+    arguments = {
+        "parts": [
+            {"prompt": "Delivery?", "choices": ["Email", "Download"]},
+            {
+                "prompt": "Where should I order from?",
+                "choices": [
+                    "Use the saved restaurant",
+                    {"text": "Choose another restaurant", "detail_prompt": "Which restaurant?"},
+                ],
+            },
+        ]
+    }
 
     class FixtureModel(Model):
         async def get_response(self, *args, **kwargs):
@@ -427,11 +501,20 @@ async def test_registered_tool_returns_both_observations_in_next_model_input_and
         try:
             frame = await asyncio.wait_for(frames.get(), 5)
             question = frame["interactions"][0]
-            part = question["parts"][0]
+            part, restaurant = question["parts"]
+            another = restaurant["choices"][1]
+            assert another["detail_prompt"] == "Which restaurant?"
             body = {
                 "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
                 "interaction_id": question["interaction_id"],
-                "answers": [{"part_id": part["part_id"], "choice_id": part["choices"][0]["choice_id"]}],
+                "answers": [
+                    {"part_id": part["part_id"], "choice_id": part["choices"][0]["choice_id"]},
+                    {
+                        "part_id": restaurant["part_id"],
+                        "choice_id": another["choice_id"],
+                        "text": "The corner pizzeria",
+                    },
+                ],
                 "text": "Do not email it.\nLet me download it instead.",
             }
             accepted = await client.post("/reply", json=body)
@@ -442,6 +525,9 @@ async def test_registered_tool_returns_both_observations_in_next_model_input_and
             assert outputs[0]["call_id"] == "fixture-call"
             result = json.loads(outputs[0]["output"])
             assert result["parts"][0]["choice"]["text"] == "Email"
+            # The model sees the option the user picked together with the detail they typed for it.
+            assert result["parts"][1]["choice"] == another
+            assert result["parts"][1]["text"] == "The corner pizzeria"
             assert result["text"] == body["text"]
             chat = await repo.get_workflow_copilot_chat_by_id("org", ctx.workflow_copilot_chat_id)
             await _persist_turn_messages(
@@ -536,7 +622,7 @@ async def test_long_wait_reply_cannot_be_recovered_before_delivery_and_redaction
             model_history = _format_chat_history(loaded.chat_history)
             assert "CSV;" in model_history
             assert "fixture-secret-value" not in model_history
-            assert "ask_user result:" in model_history
+            assert "user question result:" in model_history
         finally:
             if not task.done():
                 task.cancel()
@@ -829,6 +915,9 @@ def test_question_records_do_not_exempt_dead_turns_from_retention():
     recent = resolved.model_dump(mode="json")
     resolved.question_interactions[0].resolved_at = old
     expired = resolved.model_dump(mode="json")
+    [dead_question] = dead["question_interactions"]
+    review = {"rows": [], "total_credential_count": 0, "claimed_at": now.isoformat()}
+    claimed = {**dead, "question_interactions": [{**dead_question, "credential_delete_review": review}]}
     assert _prune_pending_turns(
-        {"live": live, "dead": dead, "absent": absent, "recent": recent, "expired": expired}
-    ) == {"live": live, "recent": recent}
+        {"live": live, "dead": dead, "absent": absent, "recent": recent, "expired": expired, "claimed": claimed}
+    ) == {"live": live, "recent": recent, "claimed": claimed}

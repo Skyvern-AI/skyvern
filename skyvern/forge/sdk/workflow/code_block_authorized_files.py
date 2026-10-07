@@ -10,20 +10,22 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path, PurePath
 from types import SimpleNamespace
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast, get_args
 
 import structlog
-from playwright.async_api import BrowserContext
+from playwright.async_api import BrowserContext, Page
 
 from skyvern.constants import SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.webeye.browser_factory import resolve_artifact_path
@@ -42,6 +44,20 @@ AUTHORIZED_FILE_CHANGED_ERROR = "The authorized file is unavailable or changed. 
 AUTHORIZED_FILE_SHAPE_ERROR = (
     "attach_authorized_file accepts only a materialized file_url parameter or a download this run claimed."
 )
+AUTHORIZED_FILE_MODE_ERROR = 'attach_authorized_file parameter \'mode\' must be "input" or "file_chooser".'
+AUTHORIZED_FILE_CHOOSER_UNAVAILABLE_ERROR = (
+    "File chooser mode is unavailable: this page or its browser worker does not support it, or the file is no "
+    "longer authorized for this run (phase=chooser, trigger_state=not_attempted)."
+)
+
+AuthorizedFileAttachMode = Literal["input", "file_chooser"]
+AuthorizedFileChooserPhase = Literal["chooser", "trigger", "attachment"]
+AuthorizedFileTriggerState = Literal["not_attempted", "confirmed", "unknown"]
+AUTHORIZED_FILE_ATTACH_MODES: tuple[AuthorizedFileAttachMode, ...] = get_args(AuthorizedFileAttachMode)
+# One bound for arming, the single click, the chooser wait and set_files.
+_CHOOSER_WAIT_SECONDS = 30
+# Ends the bound this far before the block deadline, so the typed failure returns before the block is cut off.
+_CHOOSER_DEADLINE_MARGIN_SECONDS = 1.0
 
 LOG = structlog.get_logger()
 
@@ -58,12 +74,73 @@ class AuthorizedFileAccessError(Exception):
     pass
 
 
-class FileInputTarget(Protocol):
-    def locator(self, selector: str) -> FileInputLocator: ...
+class AuthorizedFileChooserError(AuthorizedFileAccessError):
+    def __init__(
+        self,
+        phase: AuthorizedFileChooserPhase,
+        trigger_state: AuthorizedFileTriggerState,
+        message: str | None = None,
+    ) -> None:
+        self.phase = phase
+        self.trigger_state = trigger_state
+        suffix = "" if trigger_state == "not_attempted" else "; the trigger is not clicked again"
+        super().__init__(
+            message or f"The file chooser attach failed (phase={phase}, trigger_state={trigger_state}){suffix}."
+        )
 
 
 class FileInputLocator(Protocol):
     async def set_input_files(self, files: dict[str, str | bytes]) -> None: ...
+
+
+class ChooserTrigger(Protocol):
+    async def click(self, *, timeout: float | None = None, trial: bool | None = None) -> None: ...
+
+
+class AttachLocator(FileInputLocator, ChooserTrigger, Protocol): ...
+
+
+class FileInputTarget(Protocol):
+    def locator(self, selector: str) -> AttachLocator: ...
+
+
+class InlineAttach(Protocol):
+    async def __call__(
+        self, page: FileInputTarget, file: str | DownloadLike, selector: str, mode: str = "input"
+    ) -> dict[str, str | int]: ...
+
+
+class FileChooserHandle(Protocol):
+    async def set_files(self, files: dict[str, str | bytes], *, timeout: float | None = None) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FileChooserPins:
+    """Unrecorded locator and listener methods taken from the raw page's class before authored code runs."""
+
+    page: Page
+    locate: Callable[[str], ChooserTrigger]
+    listen: Callable[[str, Callable[[FileChooserHandle], None]], None]
+    unlisten: Callable[[str, Callable[[FileChooserHandle], None]], None]
+
+
+def authorized_file_attach_modes(raw_page: Page) -> frozenset[AuthorizedFileAttachMode]:
+    # The raw-CDP engine's FileChooser accepts host paths only, so it cannot take the verified in-memory bytes.
+    if type(raw_page).__module__.startswith(("playwright.", "patchright.")):
+        return frozenset(AUTHORIZED_FILE_ATTACH_MODES)
+    return frozenset({"input"})
+
+
+def pin_file_chooser(raw_page: Page) -> FileChooserPins | None:
+    if "file_chooser" not in authorized_file_attach_modes(raw_page):
+        return None
+    page_class = type(raw_page)
+    return FileChooserPins(
+        page=raw_page,
+        locate=partial(page_class.locator, raw_page),
+        listen=partial(page_class.on, raw_page),
+        unlisten=partial(page_class.remove_listener, raw_page),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -768,10 +845,7 @@ async def attach_materialized_authorized_file(
 ) -> dict[str, str | int]:
     # `locate` must be captured before authored code runs: inline code can reassign `page.locator`,
     # and a target resolved through the live page would hand the verified bytes to that object.
-    if not isinstance(selector, str) or not selector:
-        raise AuthorizedFileAccessError(
-            "attach_authorized_file parameter 'selector' must be a non-empty selector string."
-        )
+    _require_selector(selector)
     target = locate(selector)
     verified = await asyncio.to_thread(
         read_authorized_file,
@@ -781,8 +855,104 @@ async def attach_materialized_authorized_file(
         organization_id=organization_id,
         max_bytes=max_bytes,
     )
+    await target.set_input_files(_file_payload(verified))
+    return {"filename": verified.filename, "size": verified.size}
+
+
+def _require_selector(selector: str) -> None:
+    if not isinstance(selector, str) or not selector:
+        raise AuthorizedFileAccessError(
+            "attach_authorized_file parameter 'selector' must be a non-empty selector string."
+        )
+
+
+def _file_payload(verified: AuthorizedFileBytes) -> dict[str, str | bytes]:
     mime_type = mimetypes.guess_type(verified.filename)[0] or "application/octet-stream"
-    await target.set_input_files({"name": verified.filename, "mimeType": mime_type, "buffer": verified.content})
+    return {"name": verified.filename, "mimeType": mime_type, "buffer": verified.content}
+
+
+async def attach_authorized_file_via_chooser(
+    locate: Callable[[str], ChooserTrigger],
+    file_chooser: FileChooserPins | None,
+    authorized_file: MaterializedAuthorizedFile,
+    selector: str,
+    *,
+    download_root: str | Path,
+    workflow_run_id: str,
+    organization_id: str | None,
+    max_bytes: int,
+    deadline: float | None = None,
+    passes_through: Callable[[Exception], bool] | None = None,
+) -> dict[str, str | int]:
+    """Verify the file, click ``selector`` once and fill the chooser it opens, before the monotonic ``deadline``.
+    An error ``passes_through`` accepts is re-raised as is instead of becoming the typed chooser failure."""
+    _require_selector(selector)
+    verified = await asyncio.to_thread(
+        read_authorized_file,
+        authorized_file,
+        download_root=download_root,
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        max_bytes=max_bytes,
+    )
+    if file_chooser is None:
+        raise AuthorizedFileChooserError("chooser", "not_attempted", AUTHORIZED_FILE_CHOOSER_UNAVAILABLE_ERROR)
+    bound: float = _CHOOSER_WAIT_SECONDS
+    if deadline is not None:
+        bound = min(bound, deadline - time.monotonic() - _CHOOSER_DEADLINE_MARGIN_SECONDS)
+    if bound <= 0:
+        raise AuthorizedFileChooserError("trigger", "not_attempted")
+    # An agent UPLOAD_FILE that never saw its chooser leaves a listener on the page that would fill this one first.
+    context = skyvern_context.current()
+    if context is not None and context.pending_file_chooser is not None:
+        if context.pending_file_chooser.page is file_chooser.page:
+            context.cleanup_pending_file_chooser()
+    loop = asyncio.get_running_loop()
+    ends_at = loop.time() + bound
+    opened: asyncio.Future[FileChooserHandle] = loop.create_future()
+
+    def remaining_ms() -> float:
+        # Playwright keeps a call running after its task is cancelled, so each call carries the bound itself.
+        return max((ends_at - loop.time()) * 1000, 1)
+
+    phase: AuthorizedFileChooserPhase = "chooser"
+    trigger_state: AuthorizedFileTriggerState = "not_attempted"
+
+    def on_file_chooser(chooser: FileChooserHandle) -> None:
+        # A chooser the page opens before the real click is not the trigger's, so it never gets the bytes.
+        if trigger_state != "not_attempted" and not opened.done():
+            opened.set_result(chooser)
+
+    try:
+        async with asyncio.timeout_at(ends_at):
+            # A listener rather than expect_file_chooser: a cancelled Playwright waiter keeps its listener,
+            # and with it chooser interception, until its own timer fires.
+            file_chooser.listen("filechooser", on_file_chooser)
+            try:
+                phase = "trigger"
+                # Trial runs the actionability and strictness checks without dispatching, so a trigger
+                # that cannot be clicked fails before anything reaches the page.
+                await file_chooser.locate(selector).click(trial=True, timeout=remaining_ms())
+                trigger_state = "unknown"
+                await locate(selector).click(timeout=remaining_ms())
+                trigger_state = "confirmed"
+                phase = "chooser"
+                chooser = await opened
+                phase = "attachment"
+                await chooser.set_files(_file_payload(verified), timeout=remaining_ms())
+            finally:
+                with suppress(Exception):
+                    file_chooser.unlisten("filechooser", on_file_chooser)
+    except Exception as exc:
+        if passes_through is not None and passes_through(exc):
+            raise
+        LOG.warning(
+            "codeblock.authorized_file_chooser_failed",
+            phase=phase,
+            trigger_state=trigger_state,
+            error_type=type(exc).__name__,
+        )
+        raise AuthorizedFileChooserError(phase, trigger_state) from None
     return {"filename": verified.filename, "size": verified.size}
 
 
@@ -797,9 +967,11 @@ def bind_inline_attach_authorized_file(
     max_bytes: int,
     download_run_id: str | None = None,
     download_log: BlockDownloadLog | None = None,
-    locate: Callable[[str], FileInputLocator] | None = None,
+    locate: Callable[[str], AttachLocator] | None = None,
     registered_downloads: RegisteredDownloadSource | None = None,
-) -> Callable[[FileInputTarget, str | DownloadLike, str], Awaitable[dict[str, str | int]]]:
+    file_chooser: FileChooserPins | None = None,
+    deadline: float | None = None,
+) -> InlineAttach:
     authorized_by_path = {
         inline_authorized_file_path(item, download_root=download_root): item
         for item in materializations.values()
@@ -826,9 +998,12 @@ def bind_inline_attach_authorized_file(
         page: FileInputTarget,
         file: str | DownloadLike,
         selector: str,
+        mode: str = "input",
     ) -> dict[str, str | int]:
         if page is not expected_page:
             raise AuthorizedFileAccessError("attach_authorized_file requires the current CodeBlock page.")
+        if type(mode) is not str or mode not in AUTHORIZED_FILE_ATTACH_MODES:
+            raise AuthorizedFileAccessError(AUTHORIZED_FILE_MODE_ERROR)
         # Capability, not class identity: a raw-CDP download is not a Playwright ``Download``, and the
         # bytes come from the run's own download directory either way, never from this object.
         if is_download_like(file):
@@ -867,6 +1042,18 @@ def bind_inline_attach_authorized_file(
             authorized_file = resolved
         if locate is None:
             raise AuthorizedFileAccessError("attach_authorized_file requires the current CodeBlock page.")
+        if mode == "file_chooser":
+            return await attach_authorized_file_via_chooser(
+                locate,
+                file_chooser,
+                authorized_file,
+                selector,
+                download_root=download_root,
+                workflow_run_id=run_key,
+                organization_id=organization_id,
+                max_bytes=max_bytes,
+                deadline=deadline,
+            )
         return await attach_materialized_authorized_file(
             locate,
             authorized_file,
@@ -884,6 +1071,7 @@ async def unbound_attach_authorized_file(
     page: FileInputTarget,
     file: str,
     selector: str,
+    mode: str = "input",
 ) -> dict[str, str | int]:
     raise AuthorizedFileAccessError(
         "attach_authorized_file is only available for a materialized file_url parameter during a workflow run."

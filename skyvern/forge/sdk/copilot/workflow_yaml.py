@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block
 from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
     derive_code_block_steps_in_yaml,
+    is_code_block_type,
 )
 from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     WorkflowBlockLocation,
@@ -28,7 +29,7 @@ from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     workflow_link_node_mappings,
 )
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.private_settings import (
     resolve_cdp_connect_headers,
 )
@@ -41,7 +42,7 @@ from skyvern.forge.sdk.workflow.private_settings import (
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.proxy_location import GeoTarget
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, RunEngine
 from skyvern.schemas.workflows import (
     BlockYAML,
     BranchConditionYAML,
@@ -242,7 +243,7 @@ def runner_code_block_associations(
     for location in workflow_block_locations(parsed):
         block = location.block
         label = block.get("label")
-        if block.get("block_type") == "code" and isinstance(label, str) and label:
+        if is_code_block_type(block.get("block_type")) and isinstance(label, str) and label:
             associations[label] = (
                 prior_associations[label] if preserve_existing and label in prior_associations else f"cba_{uuid4().hex}"
             )
@@ -281,11 +282,8 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def workflow_to_copilot_yaml(workflow: Workflow) -> str:
-    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
-    strip_private_workflow_settings(workflow_data)
-    workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
-
+def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> dict[str, Any]:
+    workflow_definition = deepcopy(persisted_definition)
     parameters = workflow_definition.get("parameters")
     if isinstance(parameters, list):
         workflow_definition["parameters"] = [
@@ -293,12 +291,26 @@ def workflow_to_copilot_yaml(workflow: Workflow) -> str:
             for parameter in parameters
             if not (isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.OUTPUT.value)
         ]
+        for parameter in workflow_definition["parameters"]:
+            if isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.CONTEXT.value:
+                source = parameter.get("source")
+                if isinstance(source, dict) and isinstance(source.get("key"), str):
+                    parameter["source_parameter_key"] = source["key"]
+                    parameter.pop("source")
+                    parameter.pop("value", None)
 
     blocks = workflow_definition.get("blocks")
     if isinstance(blocks, list):
         workflow_definition["blocks"] = [
             _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
         ]
+    return workflow_definition
+
+
+def workflow_to_copilot_yaml(workflow: Workflow) -> str:
+    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
+    strip_private_workflow_settings(workflow_data)
+    workflow_definition = _copilot_yaml_workflow_definition(workflow_data.get("workflow_definition") or {})
 
     request_data = {
         key: workflow_data[key]
@@ -828,6 +840,34 @@ def redact_credentials_in_workflow_yaml(
     return workflow_yaml
 
 
+def _copilot_definition_from_yaml(
+    workflow_yaml: str, workflow_id: str
+) -> tuple[WorkflowCreateYAMLRequest, WorkflowDefinition]:
+    # Single seam every copilot YAML->Workflow conversion passes through, so code
+    # blocks get their plain-view steps regardless of which path produced the YAML
+    # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
+    # fallbacks would otherwise surface "No steps yet").
+    workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
+    # Same reasoning one field over: a block whose code names a declared parameter but omits it
+    # from parameter_keys gets no value at runtime and dies on NameError mid-login.
+    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
+    workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
+    return workflow_yaml_request, convert_workflow_definition(
+        workflow_definition_yaml=workflow_yaml_request.workflow_definition,
+        workflow_id=workflow_id,
+    )
+
+
+def copilot_round_trip_definition(definition: WorkflowDefinition, *, workflow_id: str) -> WorkflowDefinition:
+    """The definition as Copilot's own save path would persist it, whoever authored it."""
+    workflow_definition = _copilot_yaml_workflow_definition(definition.model_dump(mode="json", exclude_none=True))
+    # The save path stitches next_block_label after validating, so a version it persisted can carry
+    # version 1 beside explicit routing; letting validation derive the version again round-trips it.
+    workflow_definition.pop("version", None)
+    workflow_yaml = yaml.safe_dump({"title": "", "workflow_definition": workflow_definition}, sort_keys=False)
+    return _copilot_definition_from_yaml(workflow_yaml, workflow_id)[1]
+
+
 async def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
@@ -838,19 +878,7 @@ async def _process_workflow_yaml(
     private_workflow_settings: dict[str, Any] | None = None,
     prefer_live_title: bool = False,
 ) -> Workflow:
-    # Single seam every copilot YAML->Workflow conversion passes through, so code
-    # blocks get their plain-view steps regardless of which path produced the YAML
-    # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
-    # fallbacks would otherwise surface "No steps yet").
-    workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
-    # Same reasoning one field over: a block whose code names a declared parameter but omits it
-    # from parameter_keys gets no value at runtime and dies on NameError mid-login.
-    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
-    workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
-    updated_workflow_definition = convert_workflow_definition(
-        workflow_definition_yaml=workflow_yaml_request.workflow_definition,
-        workflow_id=workflow_id,
-    )
+    workflow_yaml_request, updated_workflow_definition = _copilot_definition_from_yaml(workflow_yaml, workflow_id)
 
     enable_self_healing = workflow_yaml_request.enable_self_healing
     if enable_self_healing is None:
@@ -1333,6 +1361,60 @@ def stored_workflow_yaml(copilot_ctx: Any) -> str:
         return latest
     stored = getattr(copilot_ctx, "workflow_yaml", None)
     return stored if isinstance(stored, str) else ""
+
+
+def preserve_untouched_block_configuration(
+    workflow_yaml: str, prior_definition: WorkflowDefinition | None, *, edited_label: str
+) -> str:
+    """Reverse known editor-export defaults without reverting explicit draft configuration."""
+    if prior_definition is None:
+        return workflow_yaml
+    prior_blocks = {
+        location.block["label"]: location.block
+        for location in workflow_block_locations({"workflow_definition": prior_definition.model_dump(mode="json")})
+    }
+    # ExtractionNode/types.ts initializes this schema when no export schema was authored.
+    export_schema_default = {"type": "array", "items": {"type": "object", "properties": {"value": {"type": "string"}}}}
+    for location in workflow_block_locations(safe_load_no_dates(workflow_yaml)):
+        block = location.block
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        prior = prior_blocks.get(label)
+        if label == edited_label or prior is None or prior.get("block_type") != block.get("block_type"):
+            continue
+        fields: dict[str, Any] = {}
+        # workflowEditorUtils.blockEngineForWorkflow omits V1 under the legacy default engine.
+        # V2/V3 are explicit pins: clearing either selects Default and must survive the repair.
+        # The current editor exports a pin as skyvern-1.0 plus the marker, so a pinned block with no engine is a
+        # Default pick and must not be re-pinned.
+        if (
+            block.get("engine") is None
+            and prior.get("engine") == RunEngine.skyvern_v1.value
+            and not prior.get("engine_pinned")
+        ):
+            fields["engine"] = prior["engine"]
+        if (
+            prior.get("engine_pinned")
+            and prior.get("engine") == RunEngine.skyvern_v1.value
+            and block.get("engine") == RunEngine.skyvern_v1.value
+            and not block.get("engine_pinned")
+        ):
+            fields["engine_pinned"] = True
+        # The editor writes node.data.label as a task block's title.
+        if "title" in prior and block.get("title") == label and prior["title"] != label:
+            fields["title"] = prior["title"]
+        if (
+            block.get("block_type") == "extraction"
+            and not block.get("export_enabled")
+            and not prior.get("export_enabled")
+            and prior.get("export_data_schema") is None
+            and block.get("export_data_schema") == export_schema_default
+        ):
+            fields["export_data_schema"] = None
+        if fields:
+            workflow_yaml = _replace_block_fields_source(workflow_yaml, label, fields)
+    return workflow_yaml
 
 
 def stored_block_code(stored_yaml: str, label: str, *, allow_empty: bool = False) -> str | None:

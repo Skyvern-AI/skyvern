@@ -308,9 +308,9 @@ async def save_client_config(
     return GoogleOAuthClientConfigResolution(config=config, source="organization")
 
 
-async def delete_client_config(organization_id: str) -> None:
+async def delete_client_config(organization_id: str) -> bool:
     _require_organization_client_config_enabled()
-    await app.DATABASE.organizations.invalidate_org_auth_tokens(
+    invalidated = await app.DATABASE.organizations.invalidate_org_auth_tokens(
         organization_id=organization_id,
         token_type=OrganizationAuthTokenType.google_oauth_client_config,
     )
@@ -327,6 +327,7 @@ async def delete_client_config(organization_id: str) -> None:
             organization_id=organization_id,
             count=flipped,
         )
+    return bool(invalidated or flipped)
 
 
 def _require_client_credentials(client_config: GoogleOAuthClientConfig | None = None) -> tuple[str, str]:

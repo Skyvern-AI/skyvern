@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -5,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -44,7 +46,18 @@ const { streamCalls, postStreaming, historyGet, historyResponse } = vi.hoisted(
         work_plan: [] as string[],
       },
     };
-    const get = vi.fn().mockImplementation(() => Promise.resolve(history));
+    const get = vi.fn().mockImplementation((url: string) =>
+      Promise.resolve(
+        url.startsWith("/artifacts/")
+          ? {
+              data: {
+                artifact_id: url.split("/")[2],
+                signed_url: `https://files.test${url}.png`,
+              },
+            }
+          : history,
+      ),
+    );
     return {
       streamCalls: calls,
       postStreaming: streaming,
@@ -140,9 +153,11 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 async function renderChat() {
   const view = render(
-    <FeatureFlagContext.Provider value={() => false}>
-      <WorkflowCopilotChat />
-    </FeatureFlagContext.Provider>,
+    <QueryClientProvider client={new QueryClient()}>
+      <FeatureFlagContext.Provider value={() => false}>
+        <WorkflowCopilotChat />
+      </FeatureFlagContext.Provider>
+    </QueryClientProvider>,
   );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
@@ -457,5 +472,130 @@ describe("WorkflowCopilotChat — a plan renders in the turn that wrote it", () 
     expect(extra).toHaveLength(0);
     expect(precedes(finalPlan!, summary)).toBe(true);
     expect(screen.getByText("reach the payment step")).toBeTruthy();
+  });
+});
+
+describe("WorkflowCopilotChat — screenshots render where they were captured", () => {
+  it("places frames after their steps, hides them under the fold, retries a failed image once, and opens one full size", async () => {
+    await renderChat();
+    await submitTurn("check the pricing page");
+    const steps = [
+      { id: "n1", toolName: "navigate_browser", at: "2026-09-04T00:00:01Z" },
+      { id: "w1", toolName: "update_workflow", at: "2026-09-04T00:00:04Z" },
+    ];
+    // a_2 belongs to the first step but was captured after the second one started.
+    const frames = [
+      { artifactId: "a_1", capturedAt: "2026-09-04T00:00:02Z" },
+      {
+        artifactId: "a_2",
+        capturedAt: "2026-09-04T00:00:04.500Z",
+        toolCallId: "n1",
+      },
+      { artifactId: "a_3", capturedAt: "2026-09-04T00:00:05Z" },
+    ];
+    const send = (payload: unknown) => streamCalls[0]!.onMessage(payload);
+    const runStep = (step: (typeof steps)[number]) => {
+      const call = {
+        tool_name: step.toolName,
+        display_label: step.toolName,
+        iteration: 0,
+        tool_call_id: step.id,
+        timestamp: step.at,
+      };
+      send({ type: "tool_call", tool_input: {}, ...call });
+      send({ type: "tool_result", success: true, summary: "done", ...call });
+    };
+    const capture = (frame: (typeof frames)[number]) =>
+      send({
+        type: "screenshot",
+        artifact_id: frame.artifactId,
+        captured_at: frame.capturedAt,
+        tool_call_id: frame.toolCallId,
+      });
+    await act(async () => {
+      send({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        timestamp: "2026-09-04T00:00:00Z",
+      });
+      send({ type: "design_start" });
+      runStep(steps[0]!);
+      capture(frames[0]!);
+      capture(frames[1]!);
+      runStep(steps[1]!);
+      capture(frames[2]!);
+    });
+
+    const thumbnails = () =>
+      screen.queryAllByRole("button", { name: "View screenshot" });
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const row = (id: string) =>
+      document.querySelector(`[data-activity-row-id="${id}"]`)!;
+    const expectEachAfterItsStep = () => {
+      const [first, second, third] = thumbnails();
+      expect(precedes(row("n1"), first!)).toBe(true);
+      expect(second!.parentElement).toBe(first!.parentElement);
+      expect(precedes(second!, row("w1"))).toBe(true);
+      expect(precedes(row("w1"), third!)).toBe(true);
+    };
+    await waitFor(() => expect(thumbnails()).toHaveLength(3));
+    expectEachAfterItsStep();
+
+    await act(async () => {
+      send({
+        ...terminalResponse(null),
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          draft: { blockCount: 1, blockLabels: ["search"] },
+          blocks: [],
+          terminal: "response",
+          terminalMessage: "Saved a draft.",
+          narrativeSummary: "Saved a draft.",
+          designActivity: steps.map((step) => ({
+            kind: "tool_result",
+            id: `tr-${step.id}`,
+            text: "done",
+            toolName: step.toolName,
+            iteration: 0,
+            success: true,
+            timestamp: step.at,
+          })),
+          screenshots: frames,
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    const fold = await screen.findByRole("button", {
+      name: /^Worked through 2 steps/,
+    });
+    expect(thumbnails()).toHaveLength(0);
+
+    fireEvent.click(fold);
+    expect(thumbnails()).toHaveLength(3);
+    expectEachAfterItsStep();
+
+    const image = (index: number) => thumbnails()[index]?.querySelector("img");
+    await waitFor(() => expect(image(2)).toBeTruthy());
+    fireEvent.error(image(2)!);
+    await waitFor(() =>
+      expect(image(2)!.getAttribute("src")).toBe(
+        "https://files.test/artifacts/a_3/signed-url.png",
+      ),
+    );
+    fireEvent.error(image(2)!);
+    expect(thumbnails()).toHaveLength(2);
+    expect(screen.getByText("Screenshot unavailable")).toBeTruthy();
+
+    fireEvent.click(thumbnails()[0]!);
+    const dialog = screen.getByRole("dialog", { name: "Screenshot" });
+    expect(within(dialog).getByRole("img").getAttribute("src")).toBe(
+      "https://files.test/artifacts/a_1.png",
+    );
   });
 });

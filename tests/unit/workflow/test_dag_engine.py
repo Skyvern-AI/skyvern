@@ -442,6 +442,7 @@ async def test_dag_conditional_fallback_to_own_next_block_label(monkeypatch: pyt
         is_script_run,
         blocks_to_update,
         parent_workflow_run_block_id=None,
+        denied_cached_labels=frozenset(),
     ):
         executed_blocks.append(block.label)
         branch_metadata = None
@@ -570,6 +571,7 @@ async def test_dag_execution_continues_after_nested_conditional_branch(monkeypat
         is_script_run,
         blocks_to_update,
         parent_workflow_run_block_id=None,
+        denied_cached_labels=frozenset(),
     ):
         executed_blocks.append(block.label)
         branch_metadata = branch_responses.get(block.label)

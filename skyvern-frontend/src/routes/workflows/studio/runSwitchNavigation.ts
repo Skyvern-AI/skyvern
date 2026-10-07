@@ -5,12 +5,24 @@ import { useRunViewStore } from "@/store/RunViewStore";
 
 import { liveSearch } from "./liveSearch";
 import {
+  fitPanesToWidth,
+  panesFitWidth,
   searchWithRunReference,
   SYSTEM_RUN_FOCUS_PARAM,
   toReadableSearch,
+  withPaneOpen,
+  type StudioPaneId,
 } from "./panes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
+
+// Which panes a Copilot run keeps on a narrow stage, first to last.
+const NARROW_RUN_PANE_RANK: Record<StudioPaneId, number> = {
+  browser: 0,
+  copilot: 1,
+  overview: 2,
+  editor: 3,
+};
 
 // Point the studio at a different run: set ?wr=, drop the per-run selection
 // params (?active=, ?bl=, ?iteration=). User navigation drops pane overrides.
@@ -47,6 +59,21 @@ export function searchWithRunSwitched(
   return toReadableSearch(params);
 }
 
+// Point the studio back at its live browser: drop the inspected run and its per-run selection.
+export function searchWithoutRun(search: string): string {
+  const params = new URLSearchParams(search);
+  for (const key of [
+    "wr",
+    SYSTEM_RUN_FOCUS_PARAM,
+    "active",
+    "bl",
+    "iteration",
+  ]) {
+    params.delete(key);
+  }
+  return toReadableSearch(params);
+}
+
 /**
  * Switch the studio's inspected run from a user action (e.g. the Past Runs
  * list). The single place run-switch navigation lives, so surfaces that touch
@@ -56,7 +83,8 @@ export function searchWithRunSwitched(
  * `replace` and `systemFocus` are for a caller that focuses a run on the
  * user's behalf rather than at their request, so Back never re-focuses it.
  * `systemFocus` keeps the layout in whatever class it already had,
- * so following the run never remaps the user's pane arrangement.
+ * so following the run never remaps the user's pane arrangement; it only adds
+ * the Browser pane, so a Copilot test run started from Edit is visible.
  */
 export function useSwitchStudioRun(options?: {
   replace?: boolean;
@@ -64,7 +92,7 @@ export function useSwitchStudioRun(options?: {
 }): (runId: string) => void {
   const navigate = useNavigate();
   const location = useLocation();
-  const { preserveNextEntry } = useStudioPaneDefaults();
+  const { preserveNextEntry, updatePanes } = useStudioPaneDefaults();
   const studioRunId = useStudioRunId();
   const replace = options?.replace ?? false;
   const systemFocus = options?.systemFocus ?? false;
@@ -84,6 +112,25 @@ export function useSwitchStudioRun(options?: {
       const nextSearch = searchWithRunSwitched(effectiveSearch, runId, {
         systemFocus,
       });
+      if (systemFocus) {
+        updatePanes((panes, slots, stageWidth) => {
+          if (panes.includes("browser")) return panes;
+          const opened = withPaneOpen(panes, "browser", slots);
+          if (stageWidth <= 0 || panesFitWidth(opened, stageWidth)) {
+            return opened;
+          }
+          // Narrow stage: keep Browser, then Copilot, then whatever else fits,
+          // with Editor dropped first (the sign-in rule); keep on-screen order.
+          const priority = [...opened].sort(
+            (a, b) => NARROW_RUN_PANE_RANK[a] - NARROW_RUN_PANE_RANK[b],
+          );
+          const kept = fitPanesToWidth(priority, stageWidth);
+          return {
+            panes: opened.filter((id) => kept.includes(id)),
+            arrangement: opened,
+          };
+        });
+      }
       preserveNextEntry(systemFocus ? nextSearch : null);
       navigate({ search: nextSearch }, { replace });
     },
@@ -94,6 +141,7 @@ export function useSwitchStudioRun(options?: {
       replace,
       systemFocus,
       preserveNextEntry,
+      updatePanes,
     ],
   );
 }

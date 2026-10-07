@@ -20,6 +20,7 @@ from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.cli.mcp_tools.argument_validation import _repair_argument_types, _split_comma_separated_list
 from tests.unit._mcp_browser_fakes import make_mock_page, make_skyvern_page
+from tests.unit._mcp_test_helpers import patch_skyvern_client
 
 
 def _structured(result: object) -> dict:
@@ -59,8 +60,8 @@ def _mock_navigation(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         ("skyvern_script_get_code", {"workflow_id": "wpid_1"}, ["workflow_id"], ["script_id"]),
         (
             "skyvern_workflow_run",
-            {"workflow_id": "wpid_1", "ai_fallback": True, "timeout": 2700},
-            ["ai_fallback", "timeout"],
+            {"workflow_id": "wpid_1", "max_steps": 5, "timeout": 2700},
+            ["max_steps", "timeout"],
             [],
         ),
     ],
@@ -139,6 +140,32 @@ async def test_workflow_run_list_bare_status_string_is_wrapped_into_list_before_
 
     assert payload["ok"] is True
     assert _awaited_kwargs(list_runs)["status"] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_object_parameters_are_json_encoded_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = SimpleNamespace(
+        run_workflow=AsyncMock(return_value=SimpleNamespace(run_id="wr_test", status="queued"))
+    )
+    patch_skyvern_client(monkeypatch, fake_client)
+    workflow_parameters = {"account_id": "acct_1", "reference": "REF-0001"}
+
+    payload = await _call("skyvern_workflow_run", {"workflow_id": "wpid_test", "parameters": workflow_parameters})
+
+    assert payload["ok"] is True
+    assert _awaited_kwargs(fake_client.run_workflow)["parameters"] == workflow_parameters
+
+
+@pytest.mark.asyncio
+async def test_object_value_is_not_json_encoded_for_unapproved_string_parameter() -> None:
+    tool = await mcp.get_tool("skyvern_workflow_create")
+    arguments = {"title": "Example", "definition": {"workflow_definition": {"blocks": []}}}
+
+    _repair_argument_types("skyvern_workflow_create", tool, arguments)
+
+    assert arguments["definition"] == {"workflow_definition": {"blocks": []}}
 
 
 @pytest.mark.asyncio

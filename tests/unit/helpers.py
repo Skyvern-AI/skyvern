@@ -10,8 +10,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 from pytest import MonkeyPatch  # type: ignore[import-not-found]
 
+from skyvern.exceptions import MissingBrowserStatePage, get_user_facing_exception_message
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
@@ -20,6 +22,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.actions.actions import ActionStatus, ActionType
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class FakeLLMResponse:
@@ -143,6 +146,18 @@ def router_test_context(
         yield RouterTestContext(llm_key=llm_key, router_config=router_config, logger=logger)
     finally:
         LLMConfigRegistry._configs.pop(llm_key, None)  # type: ignore[attr-defined]
+
+
+def unsolved_captcha_relabel_categories() -> tuple[list[dict], list[dict]]:
+    """A browser loss's merge-base categories, and the same failure relabeled after an unsolved captcha."""
+    browser_loss = MissingBrowserStatePage()
+    reason = get_user_facing_exception_message(browser_loss)
+    before = classify_from_failure_reason(reason, exception=browser_loss, fallback_to_unknown=True)
+    after = classify_from_failure_reason(
+        reason, exception=browser_loss, fallback_to_unknown=True, unsolved_captcha_exception="CaptchaNotSolvedInTime"
+    )
+    assert before is not None and after is not None and after != before
+    return before, after
 
 
 def make_organization(now: datetime) -> Organization:
@@ -269,7 +284,7 @@ def setup_parallel_verification_mocks(
     monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", get_task_steps_mock)
 
     sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
+    monkeypatch.setattr("skyvern.forge.agent.asyncio", ScopedAsyncio(sleep=sleep_mock))
 
     check_user_goal_complete_mock = AsyncMock(return_value=complete_action)
     monkeypatch.setattr(agent, "check_user_goal_complete", check_user_goal_complete_mock)

@@ -1,3 +1,7 @@
+import { createElement } from "react";
+import { render, fireEvent, cleanup } from "@testing-library/react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { NarrativeView } from "./NarrativeView";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -783,12 +787,7 @@ describe("condenseActivityEntries", () => {
     expect(condensed.every((entry) => entry.attempts === undefined)).toBe(true);
   });
 
-  it("folds a retry across a narration sitting between two attempts (narration never breaks the fold)", () => {
-    // Array position can't reliably tell "narration between attempts" from
-    // "narration mid-flight during the retry itself" (see the regression
-    // pin below, where the same ordered shape arises from a genuinely
-    // different case) — so narration is never treated as a fold-breaking
-    // gap, full stop.
+  it("keeps standalone legacy text between failed and successful attempts", () => {
     const s = reduceEvents([
       toolCall({ tool_call_id: "c1", tool_name: "extract" }),
       toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
@@ -797,51 +796,13 @@ describe("condenseActivityEntries", () => {
       toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
     ]);
     const condensed = condenseActivityEntries(s.designActivity);
-    // Narration arrived before the merged (2nd-attempt) result, so the
-    // fold keeps that order — narration first, not stranded after a row
-    // whose content is chronologically later than it.
-    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
-    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
-  });
-
-  it("REGRESSION PIN: folds a retry when the narration fires mid-flight during the RETRY itself (Codex catch)", () => {
-    // Ordering fix (pass 1) puts this narration in the identical array
-    // position as narration genuinely between two attempts — attempt 1's
-    // clean result already sits before attempt 2's call, so the retry's
-    // own mid-flight narration lands right after it either way. Only a
-    // narration-agnostic fold (last TOOL row, not literal adjacency)
-    // survives this case.
-    const s = reduceEvents([
-      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
-      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
-      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
-      narration(),
-      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    expect(condensed.map((e) => e.kind)).toEqual([
+      "tool_result",
+      "narration",
+      "tool_result",
     ]);
-    const condensed = condenseActivityEntries(s.designActivity);
-    // The merge must not leave the (chronologically later) result parked
-    // at attempt 1's old position, ahead of narration that streamed
-    // before it arrived.
-    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
-    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
-  });
-
-  it("REGRESSION PIN: folds a retry even when the narration fires mid-flight, during the FIRST attempt (reviewer catch)", () => {
-    // The narrator can emit a progress narration while a call is still
-    // pending. Pairing (pass 1) then places attempt 1's result at attempt
-    // 1's call position, ahead of that narration — which used to make the
-    // narration look like it sat BETWEEN the two attempts and break the
-    // fold, even though nothing genuinely interrupted the retry.
-    const s = reduceEvents([
-      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
-      narration(),
-      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
-      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
-      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
-    ]);
-    const condensed = condenseActivityEntries(s.designActivity);
-    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
-    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+    expect(condensed[0]).toMatchObject({ success: false });
+    expect(condensed[2]).toMatchObject({ success: true });
   });
 
   it("does not fold two consecutive different-tool results", () => {
@@ -1173,6 +1134,48 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
   });
 });
 
+describe("applyNarrativeEvent — screenshot", () => {
+  const frames = [
+    { artifactId: "a_1", capturedAt: "2026-06-10T07:23:00Z", toolCallId: "c1" },
+    { artifactId: "a_2", capturedAt: "2026-06-10T07:24:00Z", toolCallId: null },
+  ];
+
+  it("keeps the turn's frames in capture order live and after a reload, and ends on what the saved turn holds", () => {
+    let live = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    for (const frame of [frames[0]!, frames[1]!, frames[0]!]) {
+      live = applyNarrativeEvent(live, {
+        type: "screenshot",
+        artifact_id: frame.artifactId,
+        captured_at: frame.capturedAt,
+        tool_call_id: frame.toolCallId,
+      });
+    }
+    expect(live.screenshots).toEqual(frames);
+
+    const reloaded = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        screenshots: [...frames, { artifactId: "a_3" }, "a_4", null],
+      }),
+    );
+    expect(reloaded?.screenshots).toEqual(live.screenshots);
+
+    const ended = applyNarrativeEvent(
+      live,
+      response({
+        narrative_payload: reproClarifyPayload({ screenshots: [frames[0]] }),
+      }),
+    );
+    expect(ended.turnId).toBe("turn-repro");
+    expect(ended.screenshots).toEqual([frames[0]]);
+
+    const endedWithoutFrames = applyNarrativeEvent(
+      live,
+      response({ narrative_payload: reproClarifyPayload() }),
+    );
+    expect(endedWithoutFrames.screenshots).toEqual([]);
+  });
+});
+
 describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
   it("grafts clarify from the adjacent turn_outcome onto a pre-fix payload", () => {
     const turn = hydrateHistoryNarrative(reproClarifyPayload(), {
@@ -1417,5 +1420,119 @@ describe("a real cancel's backend payload still renders neutrally", () => {
       cancelled: false,
     })!;
     expect(turn.blocks[0]?.state).toBe("failed");
+  });
+});
+
+describe("actor reason rendered projection", () => {
+  it("renders immutable distinct explanations above their actions live, settled and reopened", () => {
+    let turn: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "render-actor",
+      turnIndex: 0,
+      designStarted: true,
+    };
+    const reasons = ["Inspect the travel date", "Check the selected fare"];
+    for (const [index, id] of ["a", "b"].entries()) {
+      turn = applyNarrativeEvent(turn, {
+        type: "tool_call",
+        tool_name: "evaluate",
+        tool_call_id: id,
+        iteration: 0,
+        tool_input: {},
+        reason: reasons[index],
+        activity_bucket: { kind: "design" },
+        timestamp: `2026-01-01T00:00:0${index + 1}Z`,
+      });
+    }
+    const assertRendered = (state: TurnNarrativeState) => {
+      const view = render(createElement(NarrativeView, { turn: state }));
+      const fold = view.container.querySelector<HTMLButtonElement>(
+        "[data-activity-fold]",
+      );
+      if (fold) fireEvent.click(fold);
+      const html = view.container.innerHTML;
+      for (const [index, id] of ["a", "b"].entries()) {
+        const start = html.indexOf(`data-tool-call-id="${id}"`);
+        const next = html.indexOf('data-tool-call-id="', start + 1);
+        const owned = html.slice(start, next === -1 ? undefined : next);
+        expect(start).toBeGreaterThan(-1);
+        expect(owned).toContain(reasons[index]);
+        expect(owned).not.toContain(reasons[1 - index]);
+      }
+      cleanup();
+    };
+    assertRendered(turn);
+    for (const id of ["b", "a"])
+      turn = applyNarrativeEvent(turn, {
+        type: "tool_result",
+        tool_name: "evaluate",
+        tool_call_id: id,
+        iteration: 0,
+        success: id === "a",
+        summary: id === "a" ? "Read date" : "Fare unavailable",
+        timestamp: "2026-01-01T00:00:05Z",
+        reason: "This replacement must never be shown",
+        activity_bucket: { kind: "design" },
+      });
+    assertRendered(turn);
+    const payload = {
+      turnId: turn.turnId,
+      turnIndex: 0,
+      designActivity: turn.designActivity,
+      blocks: turn.blocks,
+      terminal: "response",
+      responseType: "REPLY",
+      responseKind: "answer",
+      terminalMessage: "Finished",
+      startedAt: null,
+      endedAt: "2026-01-01T00:00:06Z",
+    };
+    assertRendered(
+      applyNarrativeEvent(turn, {
+        type: "response",
+        workflow_copilot_chat_id: "chat_render",
+        proposal_disposition: "no_proposal",
+        message: "Finished",
+        response_time: "2026-01-01T00:00:06Z",
+        narrative_payload: payload,
+      }),
+    );
+    assertRendered(hydrateNarrativeFromPayload(payload)!);
+  });
+  it("keeps an explained run visible when its action renders as block cards", () => {
+    const turn: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "run-cards",
+      turnIndex: 0,
+      designStarted: true,
+      designActivity: [
+        {
+          id: "tr-run",
+          kind: "tool_result",
+          toolName: "run_blocks_and_collect_debug",
+          iteration: 0,
+          text: "Test completed",
+          reason: "Test the booking before saving it",
+          success: true,
+          activityStartedAt: "2026-01-01T00:00:01Z",
+          timestamp: "2026-01-01T00:00:05Z",
+        },
+      ],
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_booking",
+          label: "booking",
+          blockType: "code",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-01-01T00:00:02Z",
+          endedAt: "2026-01-01T00:00:04Z",
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(createElement(NarrativeView, { turn }));
+    expect(html).toContain("Test the booking before saving it");
+    expect(html).toContain("Booking");
   });
 });

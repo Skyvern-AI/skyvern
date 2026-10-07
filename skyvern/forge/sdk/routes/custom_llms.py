@@ -5,6 +5,7 @@ import structlog
 from fastapi import Depends, HTTPException, Path
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     deregister_custom_llm_config,
     register_custom_llm_config,
@@ -118,6 +119,12 @@ async def create_custom_llm(
     )
     custom_llm = custom_llm_from_org_auth_token(token)
     register_custom_llm_config(custom_llm.id, custom_llm.organization_id, custom_llm.config)
+    await record_request_audit_event(
+        current_org.organization_id,
+        "custom_model.create",
+        "custom_llm",
+        token.id,
+    )
     return CustomLLMResponse(custom_llm=custom_llm_response_from_org_auth_token(token))
 
 
@@ -154,6 +161,21 @@ async def update_custom_llm(
 
     custom_llm = custom_llm_from_org_auth_token(token)
     register_custom_llm_config(custom_llm.id, custom_llm.organization_id, custom_llm.config)
+    changed_fields = tuple(
+        sorted(
+            field_name
+            for field_name in CustomLLMConfig.model_fields
+            if getattr(config, field_name) != getattr(existing_custom_llm.config, field_name)
+        )
+    )
+    if changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "custom_model.update",
+            "custom_llm",
+            custom_llm_id,
+            changed_fields=changed_fields,
+        )
     return CustomLLMResponse(custom_llm=custom_llm_response_from_org_auth_token(token))
 
 
@@ -184,4 +206,10 @@ async def delete_custom_llm(
         raise HTTPException(status_code=404, detail="Custom LLM not found") from e
 
     deregister_custom_llm_config(custom_llm_id)
+    await record_request_audit_event(
+        current_org.organization_id,
+        "custom_model.delete",
+        "custom_llm",
+        custom_llm_id,
+    )
     return ClearOrganizationAuthTokenResponse(success=True)

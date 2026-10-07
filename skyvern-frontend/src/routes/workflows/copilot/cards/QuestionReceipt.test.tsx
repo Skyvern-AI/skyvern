@@ -34,9 +34,10 @@ const asked: QuestionInteraction = {
   ],
 };
 
-it("points at the composer while pending instead of offering controls", () => {
+it("marks where a pending question was asked without repeating the tray's call to action", () => {
   render(<QuestionReceipt interaction={asked} />);
   expect(screen.getByText("Copilot asked 2 questions")).toBeTruthy();
+  expect(screen.queryByText(/answer below/)).toBeNull();
   expect(screen.queryByRole("button")).toBeNull();
   expect(screen.queryByText("Which format?")).toBeNull();
 });
@@ -58,12 +59,15 @@ it("hydrates the record from persisted IDs after remounting", () => {
   const { container } = render(
     <QuestionReceipt interaction={JSON.parse(JSON.stringify(resolved))} />,
   );
-  expect(screen.getByText("CSV · Zip it")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: /Show questions/ }));
+  expect(screen.getByText("You answered 1 of 3 questions")).toBeTruthy();
+  expect(screen.queryByText("CSV")).toBeNull();
+  fireEvent.click(
+    screen.getByRole("button", { name: /You answered 1 of 3 questions/ }),
+  );
   const part = (id: string) =>
     within(container.querySelector(`[data-part-id="${id}"]`) as HTMLElement);
-  expect(part("first").getByText("No choice selected")).toBeTruthy();
-  expect(part("third").getByText("No answer")).toBeTruthy();
+  expect(part("first").getByText("Skipped")).toBeTruthy();
+  expect(part("third").getByText("Skipped")).toBeTruthy();
   expect(
     part("second")
       .getByText("CSV")
@@ -71,6 +75,30 @@ it("hydrates the record from persisted IDs after remounting", () => {
       ?.getAttribute("data-selected"),
   ).toBe("true");
   expect(part("second").getByText("Zip it")).toBeTruthy();
+  expect(part("second").getByText("Selected:")).toBeTruthy();
+});
+
+it("counts an empty-string answer as answered, as the backend does", () => {
+  render(
+    <QuestionReceipt
+      interaction={{
+        ...asked,
+        status: "resolved",
+        response: {
+          answers: [
+            { part_id: "first", choice_id: "pdf" },
+            { part_id: "second", choice_id: null, text: "" },
+          ],
+        },
+      }}
+    />,
+  );
+  expect(screen.getByText("You answered 2 questions")).toBeTruthy();
+  fireEvent.click(
+    screen.getByRole("button", { name: /You answered 2 questions/ }),
+  );
+  expect(screen.getByText("Sent with no text")).toBeTruthy();
+  expect(screen.queryByText("Skipped")).toBeNull();
 });
 
 it("keeps skipped, cancelled, and interrupted questions read-only", () => {
@@ -83,14 +111,29 @@ it("keeps skipped, cancelled, and interrupted questions read-only", () => {
       }}
     />,
   );
-  expect(screen.getByText("Skipped 2 questions")).toBeTruthy();
+  expect(screen.getByText("You skipped 2 questions")).toBeTruthy();
   rerender(<QuestionReceipt interaction={{ ...asked, status: "cancelled" }} />);
   expect(screen.getByText("Question cancelled")).toBeTruthy();
   rerender(
     <QuestionReceipt interaction={{ ...asked, status: "interrupted" }} />,
   );
   expect(screen.getByText("Question interrupted")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: /Show questions/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Question interrupted/ }));
   expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
   expect(screen.queryByRole("textbox")).toBeNull();
+});
+
+it("shows a whole-question reply without marking each part skipped", () => {
+  render(
+    <QuestionReceipt
+      interaction={{
+        ...asked,
+        status: "resolved",
+        response: { text: "Use whichever is smaller" },
+      }}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: /You replied/ }));
+  expect(screen.getByText("Use whichever is smaller")).toBeTruthy();
+  expect(screen.queryByText("Skipped")).toBeNull();
 });

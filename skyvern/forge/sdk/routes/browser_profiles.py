@@ -1,7 +1,13 @@
 import asyncio
+import secrets
 import shutil
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path as FilePath
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import structlog
 from fastapi import Depends, HTTPException, Path, Query, status
@@ -16,6 +22,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import discard_temp_working_dir, make_temp_directory
+from skyvern.forge.sdk.credential_site_policy import same_release_scope
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
     CREATE_BROWSER_PROFILE_CODE_SAMPLE_TS,
@@ -42,11 +49,31 @@ from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_pers
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
+from skyvern.webeye.profile_cookie_merge import cookies_for_login_urls, sanitize_cookies, write_signin_cookies
+
+try:
+    from redis.exceptions import LockError
+except ImportError:
+
+    class LockError(Exception):  # type: ignore[no-redef]
+        pass
+
 
 LOG = structlog.get_logger()
 
 DEFAULT_PROFILE_BROWSER_TYPES = ("chrome", "chromium")
+
+# How long a save waits for a closing session's teardown to upload the archive before the retryable 400.
+_CLOSING_SESSION_ARCHIVE_WAIT_SECONDS = 10.0
+_CLOSING_SESSION_ARCHIVE_FIRST_POLL_SECONDS = 0.25
+_CLOSING_SESSION_ARCHIVE_MAX_POLL_SECONDS = 1.0
+# The lock must outlive the archive wait plus the download, re-zip and upload of a large profile, or a save on another
+# worker could copy the archive before this save reaps it. A holder that dies keeps the session locked this long.
+_SESSION_PROFILE_SAVE_LOCK_SECONDS = 300
+_SESSION_PROFILE_SAVE_LOCK_WAIT_SECONDS = 30
+_SESSION_PROFILE_SAVED_MARKER_TTL = timedelta(days=1)
 
 
 def _normalize_proxy_pin_fields(
@@ -653,10 +680,13 @@ async def _create_empty_profile(
     description: str | None,
     proxy_location: ProxyLocationInput = None,
     proxy_session_id: str | None = None,
+    seed_cookies: list[dict] | None = None,
 ) -> BrowserProfile:
     # Seed before inserting so local setup failures never reserve a profile name.
     profile_dir = _create_empty_browser_profile_directory()
     try:
+        if seed_cookies:
+            write_signin_cookies(profile_dir, seed_cookies)
         try:
             profile = await app.DATABASE.browser_sessions.create_browser_profile(
                 organization_id=organization_id,
@@ -674,7 +704,8 @@ async def _create_empty_profile(
                 profile_id=profile.browser_profile_id,
                 directory=profile_dir,
             )
-        except Exception:
+        # BaseException: a caller's timeout cancels mid-store, and the row must not outlive its files.
+        except BaseException:
             rolled_back = await _hard_delete_created_profile_after_store_failure(
                 organization_id=organization_id,
                 browser_profile_id=profile.browser_profile_id,
@@ -698,6 +729,186 @@ async def _create_empty_profile(
     return profile
 
 
+async def create_profile_from_running_session(
+    *,
+    organization_id: str,
+    browser_session_id: str,
+    login_urls: list[str],
+    name: str,
+    description: str | None,
+) -> tuple[BrowserProfile | None, int]:
+    """Save a live session's cookies for the sign-in hosts as a new profile; ``(None, 0)`` means none matched.
+
+    Raises when the live browser cannot be read, so callers can tell a failed read from an empty one.
+    """
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        browser_session_id, organization_id
+    )
+    if browser_session is None:
+        raise BrowserSessionNotFound(browser_session_id)
+    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(
+        browser_session_id, organization_id
+    )
+    if browser_state is None or browser_state.browser_context is None:
+        raise RuntimeError(f"The live browser for {browser_session_id} is not reachable")
+    try:
+        page = await browser_state.get_working_page(prune_excess_pages=False)
+        candidates = [*login_urls, page.url] if page is not None else list(login_urls)
+        # Only the site the card names: an identity provider's or another tab's cookies never ride along.
+        hosts = [url for url in candidates if login_urls and same_release_scope(url, login_urls[0])]
+        cookies = sanitize_cookies(cookies_for_login_urls(await browser_state.browser_context.cookies(), hosts))
+    finally:
+        await app.PERSISTENT_SESSIONS_MANAGER.release_observer_browser_state(browser_session_id, browser_state)
+    if not cookies:
+        return None, 0
+
+    proxy_location, proxy_session_id = _normalize_proxy_pin_fields(
+        proxy_location=browser_session.proxy_location,
+        proxy_session_id=browser_session.proxy_session_id,
+    )
+    # Each renewed sign-in adds a profile under the same name, so a taken name goes straight to a dated one.
+    stamp = f"{datetime.now(UTC):%Y-%m-%d %H:%M:%S}"
+    candidates = [name, f"{name} ({stamp})", f"{name} ({stamp} {secrets.token_hex(2)})"]
+    for candidate in candidates:
+        try:
+            profile = await _create_empty_profile(
+                organization_id=organization_id,
+                name=candidate,
+                description=description,
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                seed_cookies=cookies,
+            )
+            break
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_409_CONFLICT or candidate == candidates[-1]:
+                raise
+    LOG.info(
+        "Created browser profile from running session",
+        organization_id=organization_id,
+        browser_profile_id=profile.browser_profile_id,
+        browser_session_id=browser_session_id,
+        cookie_count=len(cookies),
+    )
+    return profile, len(cookies)
+
+
+async def _session_archive_exists(*, organization_id: str, profile_id: str) -> bool | None:
+    """None when storage could not answer, which proves neither presence nor absence."""
+    try:
+        return await app.STORAGE.browser_profile_exists(organization_id=organization_id, profile_id=profile_id)
+    except Exception as exc:
+        # Polled up to a dozen times per save, so log the error without a traceback each time.
+        LOG.warning(
+            "Failed to check for browser session archive",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return None
+
+
+async def _wait_for_closing_session_archive(
+    *,
+    organization_id: str,
+    browser_session_id: str,
+    source_profile_id: str,
+) -> Literal["found", "session_ended", "timed_out"]:
+    # Teardown uploads the archive before it stamps completed_at, so a row read before the storage
+    # check that is already terminal means no archive is coming.
+    deadline = time.monotonic() + _CLOSING_SESSION_ARCHIVE_WAIT_SECONDS
+    delay = _CLOSING_SESSION_ARCHIVE_FIRST_POLL_SECONDS
+    while (remaining := deadline - time.monotonic()) > 0:
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 2, _CLOSING_SESSION_ARCHIVE_MAX_POLL_SECONDS)
+        browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+            browser_session_id, organization_id
+        )
+        archive_exists = await _session_archive_exists(organization_id=organization_id, profile_id=source_profile_id)
+        if archive_exists:
+            return "found"
+        if archive_exists is False and (browser_session is None or browser_session.completed_at is not None):
+            return "session_ended"
+    return "timed_out"
+
+
+@dataclass
+class _LocalSaveLock:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+_LOCAL_SESSION_SAVE_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], _LocalSaveLock] = {}
+
+
+@asynccontextmanager
+async def _session_profile_save_lock(*, organization_id: str, browser_session_id: str) -> AsyncIterator[None]:
+    lock_name = f"browser_profile_from_session_lock:{organization_id}:{browser_session_id}"
+    # Without Redis the cache lock is a no-op, so saves in one process also queue on a local lock; the cache
+    # lock then covers saves on other workers.
+    local_key = (asyncio.get_running_loop(), lock_name)
+    local = _LOCAL_SESSION_SAVE_LOCKS.setdefault(local_key, _LocalSaveLock(lock=asyncio.Lock()))
+    local.users += 1
+    try:
+        async with local.lock:
+            cache_lock = app.CACHE.get_lock(
+                lock_name,
+                blocking_timeout=_SESSION_PROFILE_SAVE_LOCK_WAIT_SECONDS,
+                timeout=_SESSION_PROFILE_SAVE_LOCK_SECONDS,
+            )
+            try:
+                await cache_lock.__aenter__()
+            except LockError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A browser profile is already being saved from this browser session. Retry in a few seconds.",
+                ) from exc
+            try:
+                yield
+            finally:
+                try:
+                    await cache_lock.__aexit__(None, None, None)
+                except LockError:
+                    # The save outlived the lock's expiry; its outcome stands, so don't replace it with this error.
+                    with contained_effect("browser profile save lock release failure"):
+                        LOG.warning(
+                            "Browser profile save outlived its session lock",
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            exc_info=True,
+                        )
+    finally:
+        local.users -= 1
+        if local.users == 0 and _LOCAL_SESSION_SAVE_LOCKS.get(local_key) is local:
+            del _LOCAL_SESSION_SAVE_LOCKS[local_key]
+
+
+def _session_profile_saved_marker_key(organization_id: str, browser_session_id: str) -> str:
+    return f"browser_profile_from_session:{organization_id}:{browser_session_id}"
+
+
+async def _profile_already_saved_from_session(
+    *, organization_id: str, browser_session_id: str, name: str
+) -> BrowserProfile | None:
+    try:
+        saved_profile_id = await app.CACHE.get(_session_profile_saved_marker_key(organization_id, browser_session_id))
+    except Exception:
+        LOG.warning(
+            "Failed to read browser profile saved from session",
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            exc_info=True,
+        )
+        return None
+    if not saved_profile_id:
+        return None
+    profile = await app.DATABASE.browser_sessions.get_browser_profile(saved_profile_id, organization_id)
+    if profile is None or profile.name != name:
+        return None
+    return profile
+
+
 async def _create_profile_from_session(
     *,
     organization_id: str,
@@ -706,6 +917,28 @@ async def _create_profile_from_session(
     browser_session_id: str,
     proxy_location: ProxyLocationInput = None,
     proxy_session_id: str | None = None,
+) -> BrowserProfile:
+    # A save consumes the session's archive, so a client retrying a save whose response it lost (or that is
+    # still running) must get that save's profile back rather than a 400 or a second profile.
+    async with _session_profile_save_lock(organization_id=organization_id, browser_session_id=browser_session_id):
+        return await _create_profile_from_session_locked(
+            organization_id=organization_id,
+            name=name,
+            description=description,
+            browser_session_id=browser_session_id,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+        )
+
+
+async def _create_profile_from_session_locked(
+    *,
+    organization_id: str,
+    name: str,
+    description: str | None,
+    browser_session_id: str,
+    proxy_location: ProxyLocationInput,
+    proxy_session_id: str | None,
 ) -> BrowserProfile:
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id, organization_id
@@ -717,6 +950,18 @@ async def _create_profile_from_session(
             browser_session_id=browser_session_id,
         )
         raise BrowserSessionNotFound(browser_session_id)
+
+    saved_profile = await _profile_already_saved_from_session(
+        organization_id=organization_id, browser_session_id=browser_session_id, name=name
+    )
+    if saved_profile is not None:
+        LOG.info(
+            "Returning browser profile already created from session",
+            organization_id=organization_id,
+            browser_profile_id=saved_profile.browser_profile_id,
+            browser_session_id=browser_session_id,
+        )
+        return saved_profile
 
     # Read the storage id the session actually exported to: reuse writes back to its bp_, but a fallback
     # (saved profile failed to load) exported under the session id, so resolve from the loaded profile.
@@ -732,6 +977,30 @@ async def _create_profile_from_session(
         organization_id=organization_id,
         profile_id=source_profile_id,
     )
+    archive_wait_seconds = 0.0
+    wait_outcome: Literal["found", "session_ended", "timed_out"] | None = None
+    # The close call returns before teardown uploads the archive, so only a closing session that exports under its own
+    # id waits for it. A pure-reuse session reads its bp_ archive as it stood before the session, because teardown
+    # writes the session's changes back over that archive later.
+    if (
+        not session_dir
+        and browser_session.close_requested_at is not None
+        and browser_session.completed_at is None
+        and browser_session.should_export_profile()
+        and reused_profile_id is None
+    ):
+        wait_started = time.monotonic()
+        wait_outcome = await _wait_for_closing_session_archive(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            source_profile_id=source_profile_id,
+        )
+        archive_wait_seconds = round(time.monotonic() - wait_started, 3)
+        if wait_outcome == "found":
+            session_dir = await app.STORAGE.retrieve_browser_profile(
+                organization_id=organization_id,
+                profile_id=source_profile_id,
+            )
     if not session_dir:
         # An opted-out session never uploads an archive, so retrying can't help — fail fast with a
         # distinct message the client can tell apart from the transient "upload not finished yet" case.
@@ -765,11 +1034,32 @@ async def _create_profile_from_session(
                     "generate_browser_profile enabled to capture a new profile."
                 ),
             )
+        if wait_outcome is None:
+            # A failed download also reads as no archive, so an ended row is final only once storage confirms the miss.
+            session_ended = (
+                browser_session.completed_at is not None
+                and await _session_archive_exists(organization_id=organization_id, profile_id=source_profile_id)
+                is False
+            )
+        else:
+            session_ended = wait_outcome == "session_ended"
         LOG.warning(
             "Browser session archive not found for profile creation",
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            archive_wait_seconds=archive_wait_seconds,
+            session_ended=session_ended,
         )
+        if session_ended:
+            # Clients retry on the "persisted profile archive" wording below, so this final case must not use it.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "This browser session has ended and has no profile archive to save, so retrying will not help. "
+                    "A session's archive can be saved as a profile only once; start a new session with "
+                    "generate_browser_profile enabled to capture another profile."
+                ),
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -822,6 +1112,21 @@ async def _create_profile_from_session(
     finally:
         discard_temp_working_dir(session_dir)
 
+    try:
+        await app.CACHE.set(
+            _session_profile_saved_marker_key(organization_id, browser_session_id),
+            profile.browser_profile_id,
+            ex=_SESSION_PROFILE_SAVED_MARKER_TTL,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to record browser profile saved from session",
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            browser_profile_id=profile.browser_profile_id,
+            exc_info=True,
+        )
+
     # The promote copied the session's own export (profiles/{pbs_session}.zip) into the new bp_, so
     # reap that source now that it's redundant. Keyed on the session id, never a reused bp_ profile.
     # Best-effort: only after a successful promote, and a reap failure must not fail the request.
@@ -843,6 +1148,7 @@ async def _create_profile_from_session(
         organization_id=organization_id,
         browser_profile_id=profile.browser_profile_id,
         browser_session_id=browser_session_id,
+        archive_wait_seconds=archive_wait_seconds,
     )
     return profile
 

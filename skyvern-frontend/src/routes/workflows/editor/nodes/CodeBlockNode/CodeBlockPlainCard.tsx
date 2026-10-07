@@ -1,6 +1,8 @@
 import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 
 import { Label } from "@/components/ui/label";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
 import { cn } from "@/util/utils";
@@ -15,9 +17,15 @@ type Props = {
   steps: Array<CodeBlockStep>;
   generating?: boolean;
   onStop?: () => void;
+  stopBlockedReason?: string | null;
 };
 
-function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
+function CodeBlockPlainCard({
+  steps,
+  generating = false,
+  onStop,
+  stopBlockedReason = null,
+}: Props) {
   return (
     <div data-testid="code-block-plain-card" className="space-y-2">
       <div className="flex items-center justify-between gap-2">
@@ -29,14 +37,22 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
               Generating…
             </span>
             {onStop && (
-              <button
-                type="button"
-                onClick={onStop}
-                className="nodrag nopan flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-tertiary-foreground hover:bg-slate-elevation2"
-              >
-                <Cross2Icon className="size-3" />
-                Stop
-              </button>
+              <TooltipProvider>
+                <ControlTooltip
+                  content={stopBlockedReason ?? "Stop generating"}
+                  blocked={stopBlockedReason !== null}
+                >
+                  <button
+                    type="button"
+                    onClick={onStop}
+                    disabled={stopBlockedReason !== null}
+                    className="nodrag nopan flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-tertiary-foreground hover:bg-slate-elevation2 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Cross2Icon className="size-3" />
+                    Stop
+                  </button>
+                </ControlTooltip>
+              </TooltipProvider>
             )}
           </div>
         ) : (

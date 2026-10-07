@@ -19,9 +19,11 @@ import { RecordingPill } from "@/components/RecordingPill";
 import { Tip } from "@/components/Tip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
+import { useManualSignInControl } from "@/store/useManualSignInStore";
 import { wssBaseUrl, newWssBaseUrl } from "@/util/env";
 import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
@@ -76,8 +78,29 @@ interface BrowserSession {
   completed_at?: string | null;
 }
 
+type BrowserSessionLiveness = Pick<
+  BrowserSession,
+  "browser_address" | "started_at" | "completed_at"
+>;
+
+function getBrowserSessionState(browserSession: BrowserSessionLiveness | null) {
+  const hasBrowserSession = Boolean(
+    browserSession && !browserSession.completed_at,
+  );
+  return {
+    hasBrowserSession,
+    isBrowserSessionStarted:
+      hasBrowserSession &&
+      Boolean(browserSession?.started_at || browserSession?.browser_address),
+    isBrowserSessionEnded: !hasBrowserSession,
+  };
+}
+
 type Props = {
   browserSessionId?: string;
+  // The session behind browserSessionId, from a parent that already polls it.
+  // The stream then reads this instead of polling the session a second time.
+  browserSession?: BrowserSessionLiveness;
   exfiltrate?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
@@ -124,6 +147,7 @@ function applyVncStreamProfile(
 
 function BrowserStream({
   browserSessionId = undefined,
+  browserSession: parentBrowserSession = undefined,
   exfiltrate = false,
   interactive = true,
   showControlButtons = undefined,
@@ -162,6 +186,10 @@ function BrowserStream({
     runId = null;
   }
 
+  const parentSessionState = parentBrowserSession
+    ? getBrowserSessionState(parentBrowserSession)
+    : null;
+
   useQuery({
     queryKey: ["hasBrowserSession", browserSessionId],
     queryFn: async () => {
@@ -171,21 +199,12 @@ function BrowserStream({
         const response = await client.get<BrowserSession | null>(
           `/browser_sessions/${browserSessionId}`,
         );
-        const browserSession = response.data;
+        const sessionState = getBrowserSessionState(response.data);
 
-        if (!browserSession || browserSession.completed_at) {
-          setHasBrowserSession(false);
-          setIsBrowserSessionStarted(false);
-          setIsBrowserSessionEnded(true);
-          return false;
-        }
-
-        setHasBrowserSession(true);
-        const sessionStarted = Boolean(
-          browserSession.started_at || browserSession.browser_address,
-        );
-        setIsBrowserSessionStarted(sessionStarted);
-        return sessionStarted;
+        setHasBrowserSession(sessionState.hasBrowserSession);
+        setIsBrowserSessionStarted(sessionState.isBrowserSessionStarted);
+        setIsBrowserSessionEnded(sessionState.isBrowserSessionEnded);
+        return sessionState.isBrowserSessionStarted;
       } catch (error) {
         setHasBrowserSession(false);
         setIsBrowserSessionStarted(false);
@@ -199,7 +218,8 @@ function BrowserStream({
         return false;
       }
     },
-    enabled: entity === "browserSession" && !!browserSessionId,
+    enabled:
+      entity === "browserSession" && !!browserSessionId && !parentSessionState,
     refetchInterval: (query) =>
       query.state.status === "error" && isForbiddenError(query.state.error)
         ? false
@@ -208,11 +228,24 @@ function BrowserStream({
           : 1000,
   });
 
-  const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
-  const [isBrowserSessionStarted, setIsBrowserSessionStarted] = useState(false);
-  const [isBrowserSessionEnded, setIsBrowserSessionEnded] = useState(false);
+  const [polledHasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
+  const [polledIsBrowserSessionStarted, setIsBrowserSessionStarted] =
+    useState(false);
+  const [polledIsBrowserSessionEnded, setIsBrowserSessionEnded] =
+    useState(false);
+  const hasBrowserSession =
+    parentSessionState?.hasBrowserSession ?? polledHasBrowserSession;
+  const isBrowserSessionStarted =
+    parentSessionState?.isBrowserSessionStarted ??
+    polledIsBrowserSessionStarted;
+  const isBrowserSessionEnded =
+    parentSessionState?.isBrowserSessionEnded ?? polledIsBrowserSessionEnded;
   const [hasGivenUp, setHasGivenUp] = useState(false);
   const [userIsControlling, setUserIsControlling] = useState(false);
+  useManualSignInControl(
+    showControlButtons ? browserSessionId : undefined,
+    setUserIsControlling,
+  );
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
   // The message socket must open after VNC's handshake has set the ALB
@@ -250,12 +283,16 @@ function BrowserStream({
   const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
+  const gaveUpLoggedRef = useRef(false);
+  const streamLogFieldsRef = useRef({ browserSessionId, entity, runId });
+  streamLogFieldsRef.current = { browserSessionId, entity, runId };
   const isRecording = useRecordingStore((state) => state.isRecording);
   const workflowPermanentId = useRecordingStore(
     (state) => state.workflowPermanentId,
   );
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const getWebSocketParams = useWebSocketParams();
   const isBrowserSessionAvailable =
     entity !== "browserSession" || hasBrowserSession;
@@ -326,6 +363,7 @@ function BrowserStream({
     setIsBrowserSessionEnded(false);
     setHasGivenUp(false);
     setTerminalDiagnostic(null);
+    gaveUpLoggedRef.current = false;
     messageReconnectAttemptsRef.current = 0;
     if (messageReconnectTimerRef.current) {
       clearTimeout(messageReconnectTimerRef.current);
@@ -433,6 +471,20 @@ function BrowserStream({
     if (messageReconnectAttemptsRef.current >= MESSAGE_MAX_RECONNECT_ATTEMPTS) {
       setTerminalDiagnostic((prev) => prev ?? STREAM_GAVE_UP_DIAGNOSTIC);
       setHasGivenUp(true);
+      if (!gaveUpLoggedRef.current) {
+        gaveUpLoggedRef.current = true;
+        logging.warn("Stream gave up", {
+          stream: "vnc",
+          browser_session_id:
+            streamLogFieldsRef.current.browserSessionId ?? null,
+          workflow_run_id:
+            streamLogFieldsRef.current.entity === "workflow"
+              ? streamLogFieldsRef.current.runId
+              : null,
+          reason: "message_reconnect_exhausted",
+          reconnect_attempts: messageReconnectAttemptsRef.current,
+        });
+      }
       return;
     }
 
@@ -444,7 +496,7 @@ function BrowserStream({
       messageReconnectTimerRef.current = null;
       setMessagesDisconnectedTrigger((x) => x + 1);
     }, MESSAGE_RECONNECT_DELAY_MS);
-  }, [isMessageConnected, isVncConnected]);
+  }, [isMessageConnected, isVncConnected, logging]);
 
   useEffect(() => {
     return () => {
@@ -585,6 +637,20 @@ function BrowserStream({
             );
           } else {
             setHasGivenUp(true);
+            if (!gaveUpLoggedRef.current) {
+              gaveUpLoggedRef.current = true;
+              logging.warn("Stream gave up", {
+                stream: "vnc",
+                browser_session_id:
+                  streamLogFieldsRef.current.browserSessionId ?? null,
+                workflow_run_id:
+                  streamLogFieldsRef.current.entity === "workflow"
+                    ? streamLogFieldsRef.current.runId
+                    : null,
+                reason: "reconnect_exhausted",
+                reconnect_attempts: vncReconnectAttemptsRef.current,
+              });
+            }
           }
           onClose?.();
           const clean = Boolean(e.detail?.clean);
@@ -636,6 +702,7 @@ function BrowserStream({
       runId,
       showStream,
       vncDisconnectedTrigger, // will re-run on disconnects
+      logging,
     ],
   );
 

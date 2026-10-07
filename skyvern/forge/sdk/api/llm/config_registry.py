@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import litellm
 import structlog
@@ -9,14 +9,23 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMConfigError,
     MissingLLMProviderEnvVarsError,
 )
+from skyvern.forge.sdk.forge_log import _generated_log_value
 from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
+# Variant key -> upstream model name. The key also builds the llm keys and settings, e.g. OPENAI_GPT6_1_SOL.
+GPT6_MODEL_NAMES: dict[str, str] = {
+    "astra": "gpt-6-astra",
+    "sol": "gpt-6-sol",
+    "1_sol": "gpt-6.1-sol",
+    "luna": "gpt-6-luna",
+}
 GPT6_REASONING_EFFORT: dict[str, str] = {
     "astra": "xhigh",
-    "sol": "xhigh",
+    "sol": "medium",
+    "1_sol": "medium",
     "luna": settings.GPT6_LUNA_REASONING_EFFORT,
 }
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"
@@ -198,8 +207,36 @@ class LLMConfigRegistry:
         return list(cls._configs.keys())
 
 
+def _register_builtin_config(llm_key: str, config: LLMRouterConfig | LLMConfig) -> None:
+    config = replace(config, model_name=_generated_log_value("model_name", config.model_name))
+    if isinstance(config, LLMRouterConfig):
+        fallback = config.fallback_model_group
+        models = []
+        for model in config.model_list:
+            parameters = dict(model.litellm_params)
+            provider_model = parameters.get("model")
+            if isinstance(provider_model, str):
+                parameters["model"] = _generated_log_value("model_name", provider_model)
+            models.append(
+                replace(
+                    model, model_name=_generated_log_value("model_name", model.model_name), litellm_params=parameters
+                )
+            )
+        config = replace(
+            config,
+            model_list=models,
+            main_model_group=_generated_log_value("model_name", config.main_model_group),
+            fallback_model_group=(
+                [_generated_log_value("model_name", name) for name in fallback]
+                if isinstance(fallback, list)
+                else _generated_log_value("model_name", fallback)
+            ),
+        )
+    LLMConfigRegistry.register_config(llm_key, config)
+
+
 if settings.ENABLE_OPENAI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5",
         LLMConfig(
             "gpt-5-2025-08-07",
@@ -211,7 +248,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_MINI",
         LLMConfig(
             "gpt-5-mini-2025-08-07",
@@ -223,7 +260,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_MINI_FLEX",
         LLMConfig(
             "gpt-5-mini-2025-08-07",
@@ -241,7 +278,7 @@ if settings.ENABLE_OPENAI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_NANO",
         LLMConfig(
             "gpt-5-nano-2025-08-07",
@@ -253,7 +290,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_NANO_FLEX",
         LLMConfig(
             "gpt-5-nano-2025-08-07",
@@ -271,7 +308,7 @@ if settings.ENABLE_OPENAI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_1",
         LLMConfig(
             "gpt-5.1",
@@ -283,7 +320,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_2",
         LLMConfig(
             "gpt-5.2",
@@ -295,7 +332,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_4",
         LLMConfig(
             "gpt-5.4",
@@ -307,7 +344,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_4_MINI",
         LLMConfig(
             "gpt-5.4-mini",
@@ -319,7 +356,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_4_MINI_FLEX",
         LLMConfig(
             "gpt-5.4-mini",
@@ -337,7 +374,7 @@ if settings.ENABLE_OPENAI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_4_NANO",
         LLMConfig(
             "gpt-5.4-nano",
@@ -349,7 +386,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_4_NANO_FLEX",
         LLMConfig(
             "gpt-5.4-nano",
@@ -367,7 +404,7 @@ if settings.ENABLE_OPENAI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_5",
         LLMConfig(
             "gpt-5.5",
@@ -380,10 +417,10 @@ if settings.ENABLE_OPENAI:
         ),
     )
     for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
-        LLMConfigRegistry.register_config(
+        _register_builtin_config(
             f"OPENAI_GPT6_{variant.upper()}",
             LLMConfig(
-                f"openai/responses/gpt-6-{variant}",
+                f"openai/responses/{GPT6_MODEL_NAMES[variant]}",
                 ["OPENAI_API_KEY"],
                 supports_vision=True,
                 add_assistant_prefix=False,
@@ -393,7 +430,7 @@ if settings.ENABLE_OPENAI:
                 pin_reasoning_effort=True,
             ),
         )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_6_SOL",
         LLMConfig(
             "gpt-5.6-sol",
@@ -405,7 +442,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_6_TERRA",
         LLMConfig(
             "gpt-5.6-terra",
@@ -417,7 +454,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT5_6_LUNA",
         LLMConfig(
             "gpt-5.6-luna",
@@ -429,7 +466,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -438,7 +475,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4_1",
         LLMConfig(
             "gpt-4.1",
@@ -448,7 +485,7 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=32768,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4_1_MINI",
         LLMConfig(
             "gpt-4.1-mini",
@@ -458,7 +495,7 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=32768,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4_1_NANO",
         LLMConfig(
             "gpt-4.1-nano",
@@ -468,7 +505,7 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=32768,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4_5",
         LLMConfig(
             "gpt-4.5-preview",
@@ -477,7 +514,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4V",
         LLMConfig(
             "gpt-4-turbo",
@@ -486,13 +523,13 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4O",
         LLMConfig(
             "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_O3_MINI",
         LLMConfig(
             "o3-mini",
@@ -504,7 +541,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort="high",
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT4O_MINI",
         LLMConfig(
             "gpt-4o-mini",
@@ -514,7 +551,7 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=16384,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_GPT-4O-2024-08-06",
         LLMConfig(
             "gpt-4o-2024-08-06",
@@ -524,7 +561,7 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=16384,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_O4_MINI",
         LLMConfig(
             "o4-mini",
@@ -536,7 +573,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort="high",
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENAI_O3",
         LLMConfig(
             "o3",
@@ -552,13 +589,13 @@ if settings.ENABLE_OPENAI:
 if settings.ENABLE_XAI:
     _register_model_cost_overrides()
 
-    LLMConfigRegistry.register_config("XAI_GROK_4_5", _build_xai_grok_4_5_config())
+    _register_builtin_config("XAI_GROK_4_5", _build_xai_grok_4_5_config())
 
 if settings.ENABLE_ANTHROPIC:
     # All Claude 4+ models require temperature=1 when extended thinking is enabled.
     # The runtime applies thinking optimization to all Anthropic models, so temperature=1
     # must be set here to avoid "temperature must be 1" errors from the Anthropic API.
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4_OPUS",
         LLMConfig(
             "anthropic/claude-opus-4-20250514",
@@ -569,7 +606,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4_SONNET",
         LLMConfig(
             "anthropic/claude-sonnet-4-20250514",
@@ -580,7 +617,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.5_SONNET",
         LLMConfig(
             "anthropic/claude-sonnet-4-5-20250929",
@@ -591,7 +628,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.5_HAIKU",
         LLMConfig(
             "anthropic/claude-haiku-4-5-20251001",
@@ -602,7 +639,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.5_OPUS",
         LLMConfig(
             "anthropic/claude-opus-4-5-20251101",
@@ -613,7 +650,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.6_OPUS",
         LLMConfig(
             "anthropic/claude-opus-4-6",
@@ -624,7 +661,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.6_SONNET",
         LLMConfig(
             "anthropic/claude-sonnet-4-6",
@@ -635,7 +672,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.7_OPUS",
         LLMConfig(
             "anthropic/claude-opus-4-7",
@@ -646,7 +683,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE4.8_OPUS",
         LLMConfig(
             "anthropic/claude-opus-4-8",
@@ -657,7 +694,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE5_FABLE",
         LLMConfig(
             "anthropic/claude-fable-5",
@@ -668,7 +705,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE5.1_FABLE",
         LLMConfig(
             "anthropic/claude-fable-5-1",
@@ -679,7 +716,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE5_OPUS",
         LLMConfig(
             "anthropic/claude-opus-5",
@@ -690,7 +727,7 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "ANTHROPIC_CLAUDE5.5_OPUS",
         LLMConfig(
             "anthropic/claude-opus-5-5",
@@ -701,9 +738,20 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    _register_builtin_config(
+        "ANTHROPIC_CLAUDE5.5_SONNET",
+        LLMConfig(
+            "anthropic/claude-sonnet-5-5",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_AMAZON_NOVA_PRO",
         LLMConfig(
             "bedrock/us.amazon.nova-pro-v1:0",
@@ -712,7 +760,7 @@ if settings.ENABLE_BEDROCK:
             add_assistant_prefix=True,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_AMAZON_NOVA_LITE",
         LLMConfig(
             "bedrock/us.amazon.nova-lite-v1:0",
@@ -721,7 +769,7 @@ if settings.ENABLE_BEDROCK:
             add_assistant_prefix=True,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0",
@@ -732,7 +780,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-20250514-v1:0",
@@ -743,7 +791,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -754,7 +802,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0",
@@ -765,7 +813,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-6-v1",
@@ -776,7 +824,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,  # Claude 4.6 only supports temperature=1
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-sonnet-4-6",
@@ -787,7 +835,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-7",
@@ -798,7 +846,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE4.8_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-8",
@@ -809,7 +857,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-fable-5",
@@ -820,7 +868,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE5.1_FABLE_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-fable-5-1",
@@ -831,7 +879,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE5_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-5",
@@ -842,7 +890,7 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "BEDROCK_ANTHROPIC_CLAUDE5.5_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-5-5",
@@ -853,10 +901,21 @@ if settings.ENABLE_BEDROCK:
             temperature=1,
         ),
     )
+    _register_builtin_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5.5_SONNET_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/global.anthropic.claude-sonnet-5-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 
 
 if settings.ENABLE_AZURE:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI",
         LLMConfig(
             f"azure/{settings.AZURE_DEPLOYMENT}",
@@ -872,7 +931,7 @@ if settings.ENABLE_AZURE:
     )
 
 if settings.ENABLE_AZURE_GPT4O_MINI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT4O_MINI",
         LLMConfig(
             f"azure/{settings.AZURE_GPT4O_MINI_DEPLOYMENT}",
@@ -894,7 +953,7 @@ if settings.ENABLE_AZURE_GPT4O_MINI:
     )
 
 if settings.ENABLE_AZURE_O3_MINI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_O3_MINI",
         LLMConfig(
             f"azure/{settings.AZURE_O3_MINI_DEPLOYMENT}",
@@ -919,7 +978,7 @@ if settings.ENABLE_AZURE_O3_MINI:
     )
 
 if settings.ENABLE_AZURE_GPT4_1:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT4_1",
         LLMConfig(
             f"azure/{settings.AZURE_GPT4_1_DEPLOYMENT}",
@@ -942,7 +1001,7 @@ if settings.ENABLE_AZURE_GPT4_1:
     )
 
 if settings.ENABLE_AZURE_GPT4_1_MINI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT4_1_MINI",
         LLMConfig(
             f"azure/{settings.AZURE_GPT4_1_MINI_DEPLOYMENT}",
@@ -965,7 +1024,7 @@ if settings.ENABLE_AZURE_GPT4_1_MINI:
     )
 
 if settings.ENABLE_AZURE_GPT4_1_NANO:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT4_1_NANO",
         LLMConfig(
             f"azure/{settings.AZURE_GPT4_1_NANO_DEPLOYMENT}",
@@ -988,7 +1047,7 @@ if settings.ENABLE_AZURE_GPT4_1_NANO:
     )
 
 if settings.ENABLE_AZURE_GPT5:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_DEPLOYMENT}",
@@ -1013,7 +1072,7 @@ if settings.ENABLE_AZURE_GPT5:
     )
 
 if settings.ENABLE_AZURE_GPT5_MINI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_MINI",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_MINI_DEPLOYMENT}",
@@ -1038,7 +1097,7 @@ if settings.ENABLE_AZURE_GPT5_MINI:
     )
 
 if settings.ENABLE_AZURE_GPT5_NANO:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_NANO",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_NANO_DEPLOYMENT}",
@@ -1063,7 +1122,7 @@ if settings.ENABLE_AZURE_GPT5_NANO:
     )
 
 if settings.ENABLE_AZURE_GPT5_1:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_1",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_1_DEPLOYMENT}",
@@ -1088,7 +1147,7 @@ if settings.ENABLE_AZURE_GPT5_1:
     )
 
 if settings.ENABLE_AZURE_GPT5_2:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_2",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_2_DEPLOYMENT}",
@@ -1113,7 +1172,7 @@ if settings.ENABLE_AZURE_GPT5_2:
     )
 
 if settings.ENABLE_AZURE_GPT5_4:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_4",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_4_DEPLOYMENT}",
@@ -1140,7 +1199,7 @@ if settings.ENABLE_AZURE_GPT5_4:
 for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
     prefix = f"AZURE_GPT6_{variant.upper()}"
     if getattr(settings, f"ENABLE_{prefix}"):
-        LLMConfigRegistry.register_config(
+        _register_builtin_config(
             f"AZURE_OPENAI_GPT6_{variant.upper()}",
             LLMConfig(
                 f"azure/responses/{getattr(settings, f'{prefix}_DEPLOYMENT')}",
@@ -1149,7 +1208,7 @@ for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
                     api_base=getattr(settings, f"{prefix}_API_BASE"),
                     api_key=getattr(settings, f"{prefix}_API_KEY"),
                     api_version=getattr(settings, f"{prefix}_API_VERSION"),
-                    model_info={"model_name": f"azure/gpt-6-{variant}"},
+                    model_info={"model_name": f"azure/{GPT6_MODEL_NAMES[variant]}"},
                 ),
                 supports_vision=True,
                 add_assistant_prefix=False,
@@ -1161,7 +1220,7 @@ for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
         )
 
 if settings.ENABLE_AZURE_GPT5_6_SOL:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_6_SOL",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_6_SOL_DEPLOYMENT}",
@@ -1186,7 +1245,7 @@ if settings.ENABLE_AZURE_GPT5_6_SOL:
     )
 
 if settings.ENABLE_AZURE_GPT5_6_TERRA:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_6_TERRA",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_6_TERRA_DEPLOYMENT}",
@@ -1211,7 +1270,7 @@ if settings.ENABLE_AZURE_GPT5_6_TERRA:
     )
 
 if settings.ENABLE_AZURE_GPT5_6_LUNA:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_GPT5_6_LUNA",
         LLMConfig(
             f"azure/{settings.AZURE_GPT5_6_LUNA_DEPLOYMENT}",
@@ -1236,7 +1295,7 @@ if settings.ENABLE_AZURE_GPT5_6_LUNA:
     )
 
 if settings.ENABLE_AZURE_O4_MINI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_O4_MINI",
         LLMConfig(
             f"azure/{settings.AZURE_O4_MINI_DEPLOYMENT}",
@@ -1261,7 +1320,7 @@ if settings.ENABLE_AZURE_O4_MINI:
 
 
 if settings.ENABLE_AZURE_O3:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "AZURE_OPENAI_O3",
         LLMConfig(
             f"azure/{settings.AZURE_O3_DEPLOYMENT}",
@@ -1284,7 +1343,7 @@ if settings.ENABLE_AZURE_O3:
         ),
     )
 if settings.ENABLE_VOLCENGINE:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VOLCENGINE_DOUBAO_SEED_1_6",
         LLMConfig(
             "volcengine/doubao-seed-1.6-250615",
@@ -1298,7 +1357,7 @@ if settings.ENABLE_VOLCENGINE:
         ),
     )
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VOLCENGINE_DOUBAO_SEED_1_6_FLASH",
         LLMConfig(
             "volcengine/doubao-seed-1.6-flash-250615",
@@ -1312,7 +1371,7 @@ if settings.ENABLE_VOLCENGINE:
         ),
     )
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO",
         LLMConfig(
             "volcengine/doubao-1-5-thinking-vision-pro-250428",
@@ -1327,7 +1386,7 @@ if settings.ENABLE_VOLCENGINE:
     )
 
 if settings.ENABLE_YUTORI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "YUTORI_NAVIGATOR",
         LLMConfig(
             settings.YUTORI_MODEL,
@@ -1339,7 +1398,7 @@ if settings.ENABLE_YUTORI:
     )
 
 if settings.ENABLE_GEMINI:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_FLASH_2_0",
         LLMConfig(
             "gemini/gemini-2.0-flash-001",
@@ -1349,7 +1408,7 @@ if settings.ENABLE_GEMINI:
             max_completion_tokens=8192,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_FLASH_2_0_LITE",
         LLMConfig(
             "gemini/gemini-2.0-flash-lite-preview-02-05",
@@ -1359,7 +1418,7 @@ if settings.ENABLE_GEMINI:
             max_completion_tokens=8192,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_PRO",
         LLMConfig(
             "gemini/gemini-1.5-pro",
@@ -1369,7 +1428,7 @@ if settings.ENABLE_GEMINI:
             max_completion_tokens=8192,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_FLASH",
         LLMConfig(
             "gemini/gemini-1.5-flash",
@@ -1379,7 +1438,7 @@ if settings.ENABLE_GEMINI:
             max_completion_tokens=8192,
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_PRO",
         LLMConfig(
             "gemini/gemini-2.5-pro",
@@ -1395,7 +1454,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_PRO_PREVIEW",
         LLMConfig(
             "gemini/gemini-2.5-pro-preview-05-06",
@@ -1411,7 +1470,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_PRO_EXP_03_25",
         LLMConfig(
             "gemini/gemini-2.5-pro-exp-03-25",
@@ -1427,7 +1486,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_FLASH",
         LLMConfig(
             "gemini/gemini-2.5-flash",
@@ -1443,7 +1502,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_FLASH_PREVIEW",
         LLMConfig(
             "gemini/gemini-2.5-flash-preview-05-20",
@@ -1461,7 +1520,7 @@ if settings.ENABLE_GEMINI:
     )
     # Gemini API (Google AI Studio) flex tier variants — 50% cheaper, best-effort latency.
     # Docs: https://ai.google.dev/gemini-api/docs/flex-inference
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_PRO_FLEX",
         LLMConfig(
             "gemini/gemini-2.5-pro",
@@ -1479,7 +1538,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_FLASH_FLEX",
         LLMConfig(
             "gemini/gemini-2.5-flash",
@@ -1497,7 +1556,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_FLASH_LITE",
         LLMConfig(
             "gemini/gemini-2.5-flash-lite",
@@ -1513,7 +1572,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_2.5_FLASH_LITE_FLEX",
         LLMConfig(
             "gemini/gemini-2.5-flash-lite",
@@ -1531,7 +1590,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3.0_FLASH",
         LLMConfig(
             "gemini/gemini-3-flash-preview",
@@ -1544,7 +1603,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3.5_FLASH",
         LLMConfig(
             "gemini/gemini-3.5-flash",
@@ -1557,7 +1616,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3.6_FLASH",
         LLMConfig(
             "gemini/gemini-3.6-flash",
@@ -1570,7 +1629,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3_PRO",
         LLMConfig(
             "gemini/gemini-3.1-pro-preview",
@@ -1583,7 +1642,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3.1_FLASH_LITE",
         LLMConfig(
             "gemini/gemini-3.1-flash-lite",
@@ -1598,7 +1657,7 @@ if settings.ENABLE_GEMINI:
     )
     # litellm prices the gemini/ flex tier itself (50% of standard), unlike the Vertex flex
     # configs whose discount is applied at the cost site in api_handler_factory.
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
             "gemini/gemini-3.1-flash-lite",
@@ -1613,7 +1672,7 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "GEMINI_3.5_FLASH_LITE",
         LLMConfig(
             "gemini/gemini-3.5-flash-lite",
@@ -1631,7 +1690,7 @@ if settings.ENABLE_GEMINI:
 
 
 if settings.ENABLE_NOVITA:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_DEEPSEEK_R1",
         LLMConfig(
             "openai/deepseek/deepseek-r1",
@@ -1646,7 +1705,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_DEEPSEEK_V3",
         LLMConfig(
             "openai/deepseek/deepseek_v3",
@@ -1661,7 +1720,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_3_70B",
         LLMConfig(
             "openai/meta-llama/llama-3.3-70b-instruct",
@@ -1676,7 +1735,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_2_1B",
         LLMConfig(
             "openai/meta-llama/llama-3.2-1b-instruct",
@@ -1691,7 +1750,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_2_3B",
         LLMConfig(
             "openai/meta-llama/llama-3.2-3b-instruct",
@@ -1706,7 +1765,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_2_11B_VISION",
         LLMConfig(
             "openai/meta-llama/llama-3.2-11b-vision-instruct",
@@ -1721,7 +1780,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_1_8B",
         LLMConfig(
             "openai/meta-llama/llama-3.1-8b-instruct",
@@ -1736,7 +1795,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_1_70B",
         LLMConfig(
             "openai/meta-llama/llama-3.1-70b-instruct",
@@ -1751,7 +1810,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_1_405B",
         LLMConfig(
             "openai/meta-llama/llama-3.1-405b-instruct",
@@ -1766,7 +1825,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_8B",
         LLMConfig(
             "openai/meta-llama/llama-3-8b-instruct",
@@ -1781,7 +1840,7 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "NOVITA_LLAMA_3_70B",
         LLMConfig(
             "openai/meta-llama/llama-3-70b-instruct",
@@ -1810,7 +1869,7 @@ if settings.ENABLE_VERTEX_AI:
     if settings.VERTEX_LOCATION == "global" and settings.VERTEX_PROJECT_ID:
         api_base = f"https://aiplatform.googleapis.com/v1/projects/{settings.VERTEX_PROJECT_ID}/locations/global/publishers/google/models"
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_PRO",
         LLMConfig(
             "vertex_ai/gemini-2.5-pro",
@@ -1829,7 +1888,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_PRO_PREVIEW",
         LLMConfig(
             "vertex_ai/gemini-2.5-pro-preview-05-06",
@@ -1848,7 +1907,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_DEPRECATED",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash",
@@ -1867,7 +1926,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE_DEPRECATED",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
@@ -1886,7 +1945,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-05-20",
@@ -1905,7 +1964,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_04_17",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-04-17",
@@ -1924,7 +1983,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-05-20",
@@ -1943,7 +2002,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash",
@@ -1962,7 +2021,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3_PRO",
         LLMConfig(
             "vertex_ai/gemini-3.1-pro-preview",
@@ -1978,7 +2037,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.0_FLASH",
         LLMConfig(
             "vertex_ai/gemini-3-flash-preview",
@@ -1994,7 +2053,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.5_FLASH",
         LLMConfig(
             "vertex_ai/gemini-3.5-flash",
@@ -2010,7 +2069,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.6_FLASH",
         LLMConfig(
             "vertex_ai/gemini-3.6-flash",
@@ -2026,7 +2085,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE",
         LLMConfig(
             "vertex_ai/gemini-3.1-flash-lite",
@@ -2042,7 +2101,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.5_FLASH_LITE",
         LLMConfig(
             "vertex_ai/gemini-3.5-flash-lite",
@@ -2062,7 +2121,7 @@ if settings.ENABLE_VERTEX_AI:
     # Bump VERTEX_GEMINI_3_PRO above when Google ships a newer version.
     LLMConfigRegistry.register_config_alias("VERTEX_GEMINI_3.0_PRO", "VERTEX_GEMINI_3_PRO")
     LLMConfigRegistry.register_config_alias("VERTEX_GEMINI_3.1_PRO", "VERTEX_GEMINI_3_PRO")
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
@@ -2088,7 +2147,7 @@ if settings.ENABLE_VERTEX_AI:
     # Without it, drop_params=True silently strips service_tier and requests go through at standard pricing.
     # TODO: If adding "priority" tier support, pass service_tier="priority" directly —
     # litellm maps "auto" to "priority", which may cause confusion.
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_FLEX",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash",
@@ -2110,7 +2169,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE_FLEX",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
@@ -2132,7 +2191,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_PRO_FLEX",
         LLMConfig(
             "vertex_ai/gemini-2.5-pro",
@@ -2155,7 +2214,7 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3.1-flash-lite",
@@ -2174,7 +2233,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.5_FLASH_LITE_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3.5-flash-lite",
@@ -2193,7 +2252,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.1_PRO_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3.1-pro-preview",
@@ -2212,7 +2271,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.0_FLASH_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3-flash-preview",
@@ -2231,7 +2290,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.5_FLASH_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3.5-flash",
@@ -2250,7 +2309,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_3.6_FLASH_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3.6-flash",
@@ -2270,7 +2329,7 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     # Register old keys as aliases to prevent breaking existing tasks
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_09_2025",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-preview-09-2025",
@@ -2289,7 +2348,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE_PREVIEW_09_2025",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite-preview-09-2025",
@@ -2308,7 +2367,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_FLASH_2_0",
         LLMConfig(
             "vertex_ai/gemini-2.0-flash-001",
@@ -2323,7 +2382,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_PRO",
         LLMConfig(
             "vertex_ai/gemini-1.5-pro",
@@ -2337,7 +2396,7 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "VERTEX_GEMINI_FLASH",
         LLMConfig(
             "vertex_ai/gemini-1.5-flash",
@@ -2356,7 +2415,7 @@ if settings.ENABLE_OLLAMA:
     # Register Ollama model configured in settings
     if settings.OLLAMA_MODEL:
         ollama_model_name = settings.OLLAMA_MODEL
-        LLMConfigRegistry.register_config(
+        _register_builtin_config(
             "OLLAMA",
             LLMConfig(
                 f"ollama/{ollama_model_name}",
@@ -2376,7 +2435,7 @@ if settings.ENABLE_OPENROUTER:
     # Register OpenRouter model configured in settings
     if settings.OPENROUTER_MODEL:
         openrouter_model_name = settings.OPENROUTER_MODEL
-        LLMConfigRegistry.register_config(
+        _register_builtin_config(
             "OPENROUTER",
             LLMConfig(
                 f"openrouter/{openrouter_model_name}",
@@ -2393,7 +2452,7 @@ if settings.ENABLE_OPENROUTER:
             ),
         )
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENROUTER_DEEPSEEK_V4_FLASH",
         LLMConfig(
             "openrouter/deepseek/deepseek-v4-flash",
@@ -2411,7 +2470,7 @@ if settings.ENABLE_OPENROUTER:
         ),
     )
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENROUTER_DEEPSEEK_V4_FLASH_0731",
         LLMConfig(
             "openrouter/deepseek/deepseek-v4-flash-0731",
@@ -2436,7 +2495,7 @@ if settings.ENABLE_OPENROUTER:
         ),
     )
 
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "OPENROUTER_XIAOMI_MIMO_V2_5",
         LLMConfig(
             "openrouter/xiaomi/mimo-v2.5",
@@ -2459,7 +2518,7 @@ if settings.ENABLE_GROQ:
     # Register Groq model configured in settings
     if settings.GROQ_MODEL:
         groq_model_name = settings.GROQ_MODEL
-        LLMConfigRegistry.register_config(
+        _register_builtin_config(
             "GROQ",
             LLMConfig(
                 f"groq/{groq_model_name}",
@@ -2477,7 +2536,7 @@ if settings.ENABLE_GROQ:
         )
 
 if settings.ENABLE_MOONSHOT:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "MOONSHOT_KIMI_K2",
         LLMConfig(
             "moonshot/kimi-k2",
@@ -2495,7 +2554,7 @@ if settings.ENABLE_MOONSHOT:
     )
 
 if settings.ENABLE_INCEPTION:
-    LLMConfigRegistry.register_config(
+    _register_builtin_config(
         "INCEPTION_MERCURY_2",
         LLMConfig(
             "openai/mercury-2",
@@ -2542,7 +2601,7 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
         )
 
         # Configure LLMConfig
-        LLMConfigRegistry.register_config(
+        _register_builtin_config(
             openai_compatible_model_key,
             LLMConfig(
                 f"openai/{openai_compatible_model_name}",  # Add openai/ prefix for liteLLM

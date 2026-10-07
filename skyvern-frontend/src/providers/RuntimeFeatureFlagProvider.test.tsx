@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useRuntimeConfig } from "@/hooks/useRuntimeConfig";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { RuntimeFeatureFlagProvider } from "./RuntimeFeatureFlagProvider";
 
 vi.mock("@/hooks/useRuntimeConfig", () => ({
@@ -54,6 +55,27 @@ describe("RuntimeFeatureFlagProvider", () => {
     );
 
     expect(result.current).toEqual({ codeMode: true, codeAccess: false });
+  });
+
+  it("reports the Discover Copilot handoff as off so the home toolbar does not wait on it", () => {
+    const { result } = renderHook(
+      () => useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF"),
+      { wrapper },
+    );
+
+    expect(result.current).toBe(false);
+  });
+
+  it("keeps workflow tagging on, since the OSS backend never gates it", () => {
+    useRuntimeConfigMock.mockReturnValue({
+      data: undefined,
+    } as ReturnType<typeof useRuntimeConfig>);
+
+    const { result } = renderHook(() => useWorkflowTaggingEnabled(), {
+      wrapper,
+    });
+
+    expect(result.current).toBe(true);
   });
 
   it("leaves unrelated cloud feature flags unresolved", () => {

@@ -140,6 +140,34 @@ type BranchOutcome = {
   notTakenTargets: Array<SkippedBranchMetadata>;
 };
 
+type ConditionalEvaluationError = {
+  summary: string;
+  message: string;
+};
+
+// The block still reports completed when this is set: the backend routed
+// despite a branch it could not evaluate. Absent on cached-code and older runs.
+function getConditionalEvaluationError(
+  block: WorkflowRunBlock,
+): ConditionalEvaluationError | null {
+  if (block.block_type !== "conditional" || !hasEvaluations(block.output)) {
+    return null;
+  }
+  const { evaluation_error: message, evaluations = [] } = block.output;
+  if (!message) {
+    return null;
+  }
+  const tookDefaultBranch = evaluations.some(
+    (evaluation) => evaluation.is_matched && evaluation.is_default,
+  );
+  return {
+    summary: tookDefaultBranch
+      ? "A condition could not be evaluated, so the default branch was taken."
+      : "A condition could not be evaluated. The branch that ran was chosen without it.",
+    message,
+  };
+}
+
 function collectExecutedConditionals(
   timelineItems: Array<WorkflowRunTimelineItem>,
 ): Array<WorkflowRunBlock> {
@@ -711,6 +739,31 @@ function findRunningBlock(
 }
 
 /**
+ * The human-interaction block the run is currently paused on, wherever it sits
+ * in the tree. Only a running one counts: a resolved block's prompt would act
+ * on a later pause.
+ */
+function findAwaitingHumanInteractionBlock(
+  timeline: Array<WorkflowRunTimelineItem>,
+): WorkflowRunBlock | null {
+  const stack = [...timeline].reverse();
+
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    if (
+      isBlockItem(item) &&
+      item.block.block_type === "human_interaction" &&
+      item.block.status === Status.Running
+    ) {
+      return item.block;
+    }
+    stack.push(...[...item.children].reverse());
+  }
+
+  return null;
+}
+
+/**
  * Most-recent leaf in a terminal state. Filter to leaves: containers
  * always close last, so modified_at alone would pick the outer block.
  */
@@ -848,6 +901,7 @@ export {
   aggregateIterationStatus,
   classifyUnexecutedDefinedBlocks,
   findActiveItem,
+  findAwaitingHumanInteractionBlock,
   findBlockSurroundingAction,
   findBlockSurroundingThought,
   findLastExecutedBlock,
@@ -855,10 +909,12 @@ export {
   findThoughtsForBlock,
   findTimelineBlock,
   flattenTimelineChronologically,
+  getConditionalEvaluationError,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
 };
 export type {
+  ConditionalEvaluationError,
   SkippedBranchMetadata,
   UnexecutedBlockReason,
   UnexecutedDefinedBlock,

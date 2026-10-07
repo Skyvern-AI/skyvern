@@ -40,6 +40,12 @@ export function collectKnownErrorCodes(
 ): Array<string> {
   const codes = new Set<string>();
   for (const node of nodes) {
+    const errorCode =
+      typeof node.data.errorCode === "string" ? node.data.errorCode.trim() : "";
+    // Retry rules match literals; Jinja tags are rendered only at run time.
+    if (errorCode && !/\{[{%#]/.test(errorCode)) {
+      codes.add(errorCode);
+    }
     let mapping: unknown = node.data.errorCodeMapping;
     if (typeof mapping === "string") {
       try {

@@ -24,6 +24,11 @@ const FAILURE_CATEGORY_DISPLAY = {
     description:
       "The browser crashed or the page closed unexpectedly. Retrying usually helps.",
   },
+  BROWSER_SESSION_EXPIRED: {
+    label: "Browser session expired",
+    description:
+      "The browser session this run was sent to had already reached its time limit, so the run never started. Running it again with the same browser session will fail the same way. Create a new browser session and run again, or leave the browser session empty to start a fresh browser.",
+  },
   NAVIGATION_FAILURE: {
     label: "Couldn't open the page",
     description:
@@ -88,6 +93,11 @@ const FAILURE_CATEGORY_DISPLAY = {
     label: "Temporary system issue",
     description:
       "Something went wrong on Skyvern's side, such as a network or capacity problem. Retrying usually helps.",
+  },
+  WEBSITE_ERROR: {
+    label: "Website error",
+    description:
+      "The website had a problem on its side, such as a 502 Bad Gateway, an outage, or maintenance. Nothing is wrong with your workflow. Retrying later usually helps.",
   },
   PARAMETER_BINDING_ERROR: {
     label: "Parameter setup failed",

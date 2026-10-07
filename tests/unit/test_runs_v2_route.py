@@ -453,6 +453,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         reuse_browser_session=None,
         browser_profile_id="bprof_123",
         browser_seed_source=None,
+        browser_settings_receipt=None,
         run_with="code",
         ai_fallback=True,
     )
@@ -652,6 +653,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
+        browser_settings_receipt=None,
         run_with=None,
         ai_fallback=None,
     )
@@ -1030,7 +1032,24 @@ async def creator_harness(
                 workflow_permanent_id="wpid_creator",
                 organization_id=organization.organization_id,
                 title="Creator Workflow",
-                workflow_definition={"blocks": [], "parameters": []},
+                workflow_definition={
+                    "blocks": [
+                        {
+                            "block_type": "goto_url",
+                            "label": "navigate",
+                            "url": "https://example.com",
+                            "output_parameter": {
+                                "parameter_type": "output",
+                                "key": "navigate_output",
+                                "output_parameter_id": "op_creator",
+                                "workflow_id": "w_creator",
+                                "created_at": "2026-01-01T00:00:00",
+                                "modified_at": "2026-01-01T00:00:00",
+                            },
+                        }
+                    ],
+                    "parameters": [],
+                },
                 status="published",
                 version=1,
             )

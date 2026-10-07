@@ -1,6 +1,7 @@
 import {
   SaveRefusedError,
   SaveStaleError,
+  useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
 import {
@@ -25,6 +26,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import {
@@ -81,6 +83,7 @@ import {
   RUN_APPEND_PANES,
   withPanesOpen,
 } from "@/routes/workflows/studio/panes";
+import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
@@ -108,7 +111,7 @@ import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
 import type { AppNode } from "..";
 import {
-  getWorkflowErrors,
+  blockRunErrors,
   isMissingRequiredStartUrl,
 } from "../../workflowEditorUtils";
 import { getNodeBrowserUrlError } from "../../browserBlockUrl";
@@ -269,6 +272,7 @@ function NodeHeader({
   type,
 }: Props) {
   const log = useLogging();
+  const postHog = usePostHog();
   const mode = useWorkflowEditorMode();
   const workflowPermanentId = useWorkflowPermanentId();
   const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
@@ -399,6 +403,7 @@ function NodeHeader({
   });
 
   const runBlock = useMutation({
+    mutationKey: ["runBlock"],
     mutationFn: async (opts?: {
       codeGen: boolean;
       parameterOverrides?: Record<string, unknown>;
@@ -412,9 +417,7 @@ function NodeHeader({
       // one. Filter relies on the implicit contract that every validator
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
-      const allErrors = getWorkflowErrors(reactFlow.getNodes());
-      const labelPrefix = `${blockLabel}:`;
-      const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      const blockErrors = blockRunErrors(reactFlow.getNodes(), blockLabel);
       if (
         isMissingRequiredStartUrl(
           reactFlow.getNodes(),
@@ -549,7 +552,12 @@ function NodeHeader({
         "/run/workflows/blocks",
         body,
       );
-      return { response, mergedParameters };
+      return {
+        response,
+        mergedParameters,
+        organizationId: workflow.organization_id,
+        blockType: type,
+      };
     },
     onSuccess: (result) => {
       if (!result?.response) {
@@ -567,7 +575,13 @@ function NodeHeader({
         return;
       }
 
-      const { response, mergedParameters } = result;
+      const { response, mergedParameters, organizationId, blockType } = result;
+
+      postHog.capture("builder.block.run", {
+        org_id: organizationId,
+        workflow_permanent_id: workflowPermanentId,
+        block_type: blockType,
+      });
 
       if (workflowPermanentId) {
         useDebuggerLastRunValuesStore
@@ -646,6 +660,7 @@ function NodeHeader({
   });
 
   const cancelBlock = useMutation({
+    mutationKey: ["cancelBlock"],
     mutationFn: async () => {
       if (!debugSession) {
         log.error("Cancel block: missing debug session", {
@@ -930,11 +945,16 @@ function NodeHeader({
       isCanvasLocked,
     });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
+  const saveBlockedReason = useWorkflowHasChangesStore(
+    (state) => state.saveBlockedReason,
+  );
+  // Running a block saves the workflow first.
   const playInert =
     workflowRunIsRunningOrQueued ||
     !workflowPermanentId ||
     debugSession === undefined ||
-    isRecording;
+    isRecording ||
+    Boolean(saveBlockedReason);
 
   const collapseToggleButton =
     isCollapsible &&
@@ -1124,48 +1144,55 @@ function NodeHeader({
           {(debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
             isDebuggable && (
               <TooltipProvider delayDuration={300}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      aria-label="Run this block"
-                      // Must match the click guard below: any inert state the
-                      // attribute misses is a control that still takes focus
-                      // and announces as enabled while doing nothing. isPending
-                      // adds the in-flight case, where the spinner branch used
-                      // to carry no handler and a second click would re-enter.
-                      disabled={playInert || runBlock.isPending}
-                      onClick={() => {
-                        // Same inert set the icon used to express with
-                        // pointer-events-none; the click now lands on the
-                        // button (its padding was a dead zone before).
-                        if (playInert) {
-                          return;
-                        }
-                        void handleOnPlay();
-                      }}
-                      className={cn(
-                        "nodrag nopan rounded p-1 disabled:opacity-50",
-                        {
-                          "hover:bg-muted": workflowRunIsRunningOrQueued,
-                        },
-                      )}
-                    >
-                      {runBlock.isPending ? (
-                        <ReloadIcon className="size-6 animate-spin" />
-                      ) : (
-                        <PlayIcon
-                          aria-hidden
-                          className={cn("size-6", {
-                            "fill-gray-500 text-muted-foreground dark:text-gray-500":
-                              playInert,
-                          })}
-                        />
-                      )}
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>Run this block</TooltipContent>
-                </Tooltip>
+                <ControlTooltip
+                  content="Run this block"
+                  reason={
+                    saveBlockedReason
+                      ? `Save is paused: ${saveBlockedReason}`
+                      : null
+                  }
+                  blocked={Boolean(saveBlockedReason)}
+                  side="top"
+                  wrapperClassName="nodrag nopan"
+                >
+                  <button
+                    type="button"
+                    aria-label="Run this block"
+                    // Must match the click guard below: any inert state the
+                    // attribute misses is a control that still takes focus
+                    // and announces as enabled while doing nothing. isPending
+                    // adds the in-flight case, where the spinner branch used
+                    // to carry no handler and a second click would re-enter.
+                    disabled={playInert || runBlock.isPending}
+                    onClick={() => {
+                      // Same inert set the icon used to express with
+                      // pointer-events-none; the click now lands on the
+                      // button (its padding was a dead zone before).
+                      if (playInert) {
+                        return;
+                      }
+                      void handleOnPlay();
+                    }}
+                    className={cn(
+                      "nodrag nopan rounded p-1 disabled:pointer-events-none disabled:opacity-50",
+                      {
+                        "hover:bg-muted": workflowRunIsRunningOrQueued,
+                      },
+                    )}
+                  >
+                    {runBlock.isPending ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : (
+                      <PlayIcon
+                        aria-hidden
+                        className={cn("size-6", {
+                          "fill-gray-500 text-muted-foreground dark:text-gray-500":
+                            playInert,
+                        })}
+                      />
+                    )}
+                  </button>
+                </ControlTooltip>
               </TooltipProvider>
             )}
           {collapseToggleButton}

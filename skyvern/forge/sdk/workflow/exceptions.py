@@ -192,6 +192,14 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
 
 
+class BlockEngineNotEnabledError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, engine: str) -> None:
+        super().__init__(
+            f"Block '{block_label}' uses the {engine} engine, which is not enabled on this server",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
     def __init__(self, block_label: str, original: BaseException) -> None:
         self.block_label = block_label

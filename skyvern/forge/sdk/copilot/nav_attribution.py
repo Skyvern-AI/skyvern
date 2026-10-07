@@ -29,7 +29,20 @@ TERMINAL_NAV_ERROR_CODES = tuple(code for code in SKIP_INNER_NAV_RETRY_ERRORS if
 # itself reports (contrast PROXY_TRANSPORT_NAV_ERRORS, which are). It stands in for a
 # resolver-corroborated dead host -- the driver's own code for that case is a borrowed proxy
 # transport code -- so it belongs on the target side of the split even though it is not one.
-_TARGET_OWNED_NAV_ERROR_CODES = (*TERMINAL_NAV_ERROR_CODES, NO_ADDRESS_RECORD_NAV_ERROR_CODE)
+_NOT_PROXY_OWNED_NAV_ERROR_CODES = (*TERMINAL_NAV_ERROR_CODES, NO_ADDRESS_RECORD_NAV_ERROR_CODE)
+
+# Of the ERR_SSL_ family only these name the server's certificate or identity. The rest (a failed
+# handshake, an alert, a client-certificate problem) do not say which TLS peer broke, so they name no owner.
+_TARGET_OWNED_SSL_NAV_ERROR_CODES = (
+    "net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN",
+    "net::ERR_SSL_SERVER_CERT_CHANGED",
+    "net::ERR_SSL_SERVER_CERT_BAD_FORMAT",
+    "net::ERR_SSL_KEY_USAGE_INCOMPATIBLE",
+)
+_TARGET_OWNED_NAV_ERROR_CODES = (
+    *(code for code in _NOT_PROXY_OWNED_NAV_ERROR_CODES if code != "net::ERR_SSL_"),
+    *_TARGET_OWNED_SSL_NAV_ERROR_CODES,
+)
 
 
 def proxy_owns_nav_codes(codes: Iterable[str | None]) -> bool:
@@ -41,20 +54,17 @@ def proxy_owns_nav_codes(codes: Iterable[str | None]) -> bool:
     reported = [code for code in codes if isinstance(code, str) and code]
     if not reported:
         return False
-    # constants.py lists ERR_CERT_ and ERR_SSL_ as prefixes, not whole codes, so a target-owned
-    # code has to be matched by prefix or every certificate failure reads as unclaimed.
-    if any(code.startswith(terminal) for code in reported for terminal in _TARGET_OWNED_NAV_ERROR_CODES):
+    # constants.py lists ERR_CERT_ and ERR_SSL_ as prefixes, not whole codes, so a vetoing code has to
+    # be matched by prefix or every certificate or TLS failure reads as the proxy's.
+    if any(code.startswith(terminal) for code in reported for terminal in _NOT_PROXY_OWNED_NAV_ERROR_CODES):
         return False
     return any(code in PROXY_TRANSPORT_NAV_ERRORS for code in reported)
 
 
 def target_owns_nav_codes(codes: Iterable[str | None]) -> bool:
-    """True when the driver's own codes name the target: DNS, certificate, SSL, a refused URL, or a
-    resolver-corroborated dead host.
-
-    Same contract as :func:`proxy_owns_nav_codes` -- the codes must be ones the driver produced,
-    never tokens recovered from a failure sentence.
-    """
+    """True when the driver's own codes name the target: DNS, a server certificate, a refused URL, or a
+    resolver-corroborated dead host. The codes must be ones the driver produced, never tokens recovered
+    from a failure sentence."""
     reported = [code for code in codes if isinstance(code, str) and code]
     return any(code.startswith(terminal) for code in reported for terminal in _TARGET_OWNED_NAV_ERROR_CODES)
 

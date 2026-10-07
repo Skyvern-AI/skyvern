@@ -39,8 +39,10 @@ SENSITIVE_HEADERS = {
     "cookie",
     "set-cookie",
     "x-api-key",
+    "x-marketplace-api-key",
     "x-posthog-attribution",
     "x-copilot-credential-recovery-token",
+    "stripe-signature",
 }
 
 # Exact field names that are always redacted.  Use a set for O(1) lookup
@@ -75,6 +77,14 @@ SENSITIVE_FIELDS: set[str] = {
     "totp_identifier",
     "totp_url",
     "totp_secret",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    # Masks only billing_details, payment_method_details and receipt_email, wherever they nest. Card blocks and
+    # invoice or checkout customer fields are not covered; the webhook handler's identifier-only log lines protect them.
+    "billing_details",
+    "payment_method_details",
+    "receipt_email",
 } | SENSITIVE_HEADERS
 
 _PROXY_OBSERVABILITY_FIELDS = {field.value: field for field in ProxyObservabilityField}

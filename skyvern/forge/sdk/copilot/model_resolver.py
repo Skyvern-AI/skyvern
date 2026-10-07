@@ -32,6 +32,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.copilot.cache_envelope import ROUTER_HOP_FIELDS
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
@@ -85,19 +86,6 @@ _DROP_FIELDS = frozenset({"thinking_level"})
 _WARNED_DROP_KEYS: set[str] = set()
 
 
-# LiteLLM runs each fallback with the primary's kwargs, so a hop that does not reset these would
-# send the primary's credentials, endpoint and service tier to its own provider.
-_PER_HOP_FIELDS = (
-    "api_key",
-    "api_version",
-    "model_info",
-    "vertex_credentials",
-    "vertex_location",
-    "thinking",
-    "service_tier",
-)
-
-
 def _fallback_groups(config: LLMRouterConfig) -> list[str]:
     if not config.fallback_model_group:
         return []
@@ -111,7 +99,9 @@ def _router_fallback_models(config: LLMRouterConfig) -> list[dict[str, Any]]:
     for group in _fallback_groups(config):
         entry = next((m for m in config.model_list if m.model_name == group), None)
         params = entry.litellm_params if entry is not None else {}
-        hop = {field: params.get(field) for field in _PER_HOP_FIELDS}
+        hop = {field: params.get(field) for field in ROUTER_HOP_FIELDS}
+        # LiteLLM's Responses route calls .get on model_info, so None crashes the hop.
+        hop["model_info"] = params.get("model_info") or {}
         hop["model"] = str(params.get("model") or group)
         hop["base_url"] = params.get("api_base")
         hop["timeout"] = params.get("timeout", settings.LLM_CONFIG_TIMEOUT)
@@ -239,6 +229,9 @@ def resolve_model_config(
 
     if config.reasoning_effort:
         extra_args["reasoning_effort"] = config.reasoning_effort
+        # LiteLLM's chat parameter check rejects reasoning_effort for GPT-6 even on an explicit Responses route.
+        if config.model_name.startswith(("openai/responses/", "azure/responses/")):
+            extra_args["allowed_openai_params"] = ["reasoning_effort", "service_tier"]
 
     if isinstance(config, LLMConfig) and config.litellm_params:
         lp = config.litellm_params

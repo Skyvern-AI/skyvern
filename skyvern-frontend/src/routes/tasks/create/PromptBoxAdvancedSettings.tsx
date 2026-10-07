@@ -22,6 +22,7 @@ import {
 } from "@/util/geoData";
 import { Cross2Icon, GearIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
+import { cn } from "@/util/utils";
 import {
   DEFAULT_TASK_RUN_SETTINGS,
   type SettingsTab,
@@ -264,6 +265,7 @@ type AdvancedSettingsPopoverProps = SettingsChangeProps & {
   onOpenChange: (open: boolean) => void;
   tab: SettingsTab;
   onTabChange: (tab: SettingsTab) => void;
+  triggerClassName?: string;
 };
 
 function AdvancedSettingsPopover({
@@ -273,6 +275,7 @@ function AdvancedSettingsPopover({
   onOpenChange,
   tab,
   onTabChange,
+  triggerClassName,
 }: AdvancedSettingsPopoverProps) {
   const changedCount = changedKeys(settings).length;
   // KeyValueInput keeps its own rows after mount, so Reset remounts the fields.
@@ -295,7 +298,10 @@ function AdvancedSettingsPopover({
               ? `Advanced settings, ${changedCount} changed`
               : "Advanced settings"
           }
-          className="relative flex items-center justify-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground"
+          className={cn(
+            "relative flex items-center justify-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground",
+            triggerClassName,
+          )}
         >
           <GearIcon aria-hidden="true" className="size-5 shrink-0" />
           {changedCount > 0 ? (

@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
 
+import {
+  callRollup,
+  deriveActivityLog,
+  failedRowBlocks,
+  passedBlockCount,
+  summarizeFinishedTurn,
+} from "./copilotActivityLog";
 import capture from "./narrativeState.hydrationParity.fixture.json";
 import {
   ActivityEntry,
@@ -36,6 +43,48 @@ function replayLive(): TurnNarrativeState {
     { ...EMPTY_NARRATIVE },
   );
 }
+
+// Everything a collapsed step line and the folded turn show.
+function logLines(
+  turn: TurnNarrativeState,
+  facts: TurnNarrativeState["turnFacts"],
+) {
+  const { rows } = deriveActivityLog(turn);
+  const fold = summarizeFinishedTurn(rows, facts);
+  return {
+    rows: rows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      reason: row.reason,
+      rollup: callRollup(row.entries),
+      failed: failedRowBlocks(row).map((b) => b.workflowRunBlockId),
+      passed: passedBlockCount(row),
+      diff: row.codeDiffs.map((d) => [d.label, d.added, d.removed]),
+    })),
+    fold: {
+      ...fold,
+      stillFailing: fold.stillFailing.map((b) => b.workflowRunBlockId),
+    },
+  };
+}
+
+describe("activity log parity across hydration", () => {
+  it("renders the same step lines, failure pins and reasons live and after a reload", () => {
+    const hydrated = hydrateNarrativeFromPayload(persistedPayload)!;
+    const live = logLines(replayLive(), hydrated.turnFacts);
+
+    expect(logLines(hydrated, hydrated.turnFacts)).toEqual(live);
+    // The capture exercises each piece, so equality is not vacuous.
+    expect(live.rows.some((row) => row.failed.includes("wrb_first"))).toBe(
+      true,
+    );
+    // The capture's retried block ran but was not evaluated, so no row claims it passed.
+    expect(live.rows.some((row) => row.kind === "run")).toBe(true);
+    expect(live.rows.every((row) => row.passed === null)).toBe(true);
+    expect(live.rows.some((row) => row.reason !== null)).toBe(true);
+    expect(live.fold.failedTests).toBe(1);
+  });
+});
 
 describe("activity timestamp parity across hydration", () => {
   it("preserves observed fail-edit-retry attempts across terminal replacement and hydration", () => {

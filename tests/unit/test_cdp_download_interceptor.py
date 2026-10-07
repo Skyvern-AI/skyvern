@@ -720,6 +720,35 @@ async def test_response_stage_missing_or_wrong_marker_intercepts_download(tmp_pa
         handle.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+async def test_response_stage_download_mime_redirect_is_followed_not_captured(tmp_path: Path, status_code: int) -> None:
+    """A redirect to a download must be continued so the browser follows it.
+
+    Chromium refuses Fetch.takeResponseBodyAsStream while an interception sits in its redirect
+    stage, so capturing one failed the request and the download never happened (SKY-17892).
+    """
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    session = MagicMock()
+    session.send = AsyncMock()
+    event = {
+        "requestId": "r",
+        "responseStatusCode": status_code,
+        "request": {"url": "https://x/export", "headers": {}},
+        "responseHeaders": [
+            {"name": "Content-Type", "value": "application/octet-stream"},
+            {"name": "Content-Length", "value": "0"},
+        ],
+        "resourceType": "Document",
+    }
+
+    with patch.object(interceptor, "_handle_download", new=AsyncMock()) as handle:
+        await interceptor._handle_request_paused(event, session)
+
+    handle.assert_not_awaited()
+    assert session.send.await_args_list == [call("Fetch.continueResponse", {"requestId": "r"})]
+
+
 class TestIsDownloadResponse:
     """Tests for is_download_response()."""
 
@@ -966,6 +995,27 @@ class TestIsDownloadResponse:
                 "",
                 False,
                 id="server_error_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream", "content-length": "0"},
+                302,
+                "Document",
+                False,
+                id="redirect_to_download_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": 'attachment; filename="report.csv"', "content-type": "text/csv"},
+                307,
+                "Document",
+                False,
+                id="redirect_with_attachment_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/pdf"},
+                304,
+                "",
+                False,
+                id="not_modified_not_download",
             ),
         ],
     )
@@ -5272,6 +5322,25 @@ class TestTwoPathDownloadStreaming:
         assert cdp.count("Fetch.getResponseBody") == 0  # whole-body fallback removed
         assert cdp.count("Fetch.failRequest") == 1
         assert cdp.count("Fetch.fulfillRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_start_failure_logs_redacted_cdp_cause(self, tmp_path: Path) -> None:
+        # The cause's class name alone is "Error" for every playwright protocol error, which left
+        # these undiagnosable. The message names the failure, but must never carry the download URL.
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        cdp = _StreamCDP(
+            take_error=RuntimeError(
+                "Protocol error (Fetch.takeResponseBodyAsStream): Can only get response body on "
+                "HeadersReceived pattern matched requests. loading https://x/d?sig=url-secret"
+            )
+        )
+        with _stream_limits(threshold=1024, cap=4096), capture_logs() as logs:
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=300), status=302)
+
+        entry = next(e for e in logs if str(e["event"]).startswith("takeResponseBodyAsStream failed"))
+        assert "Can only get response body" in entry["error_detail"]
+        assert entry["status_code"] == 302
+        assert "url-secret" not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_stream_start_fail_with_content_encoding_no_direct_fallback(self, tmp_path: Path) -> None:

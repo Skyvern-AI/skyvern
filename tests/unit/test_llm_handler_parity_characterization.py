@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import litellm  # type: ignore[import-not-found]
 import pytest  # type: ignore[import-not-found]
+import structlog
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -196,6 +197,9 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
         if _event == "LLM API handler duration metrics":
             outcome.metrics_events.append(fields)
 
+    # Patching `info` on the shared lazy proxy leaves a stale bound method behind on undo, which detaches the
+    # module's logger from later `capture_logs()` calls; a throwaway proxy keeps the shared one untouched.
+    mp.setattr(api_handler_factory, "LOG", structlog.get_logger())
     mp.setattr(api_handler_factory.LOG, "info", capture_info)
 
     artifact_manager = MagicMock()

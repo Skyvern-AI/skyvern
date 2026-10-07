@@ -6,7 +6,7 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Literal, cast, overload
 from urllib.parse import urlparse
@@ -27,6 +27,7 @@ from agents.tool import Tool
 from agents.tracing.span_data import GenerationSpanData
 from agents.tracing.spans import Span
 from litellm.completion_extras import responses_api_bridge
+from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import Usage as LiteLLMUsage
@@ -40,14 +41,18 @@ from openai.types.responses.response_function_call_output_item_list_param import
 
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_copilot_model_usage,
+    _emit_copilot_model_usage,
     normalize_gen_ai_provider,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
+    anthropic_cached_system_blocks,
     build_explicit_cache_envelope,
+    model_chain,
+    responses_route_model,
 )
+from skyvern.forge.sdk.copilot.enforcement import stable_prefix_anchors
 from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
@@ -138,6 +143,8 @@ class CopilotModelCallTelemetry:
             cache_write = _usage_field(details, "cache_write_tokens")
             if cache_write is None:
                 cache_write = (getattr(details, "model_extra", None) or {}).get("cache_write_tokens")
+            if cache_write is None:
+                cache_write = _usage_field(details, "cache_creation_tokens")
             if isinstance(cache_write, int) and not isinstance(cache_write, bool):
                 self.cache_write_tokens = cache_write
 
@@ -233,7 +240,7 @@ def _log_model_call_usage(
         if telemetry.served_provider
         else _otel_provider_name(billing_model, base_url)
     )
-    emit_copilot_model_usage(
+    _emit_copilot_model_usage(
         CopilotModelUsageEvent(
             request_model=model,
             response_model=telemetry.response_model,
@@ -254,7 +261,7 @@ def _log_model_call_usage(
 
 
 @contextlib.contextmanager
-def model_call_telemetry_scope(
+def _model_call_telemetry_scope(
     model_call_index: int,
     *,
     model: str | None = None,
@@ -388,6 +395,17 @@ class _ResponsesUsageCapturingStream:
         return event
 
 
+async def _typed_stream_errors(stream: AsyncIterator[Any], model: str, provider: str) -> AsyncIterator[Any]:
+    # LiteLLM's Responses stream raises mid-stream errors raw, which the retry check does not recognise.
+    # Its chat stream wrapper maps them with exception_type, so do the same here.
+    try:
+        async for event in stream:
+            yield event
+    except Exception as exc:
+        litellm.exception_type(model=model, original_exception=exc, custom_llm_provider=provider)
+        raise
+
+
 def _capture_usage(
     telemetry: CopilotModelCallTelemetry,
     usage: Any | None,
@@ -409,9 +427,7 @@ def _is_gemini_model(model: str) -> bool:
 
 
 def _gemini_on_model_chain(model: str, model_settings: ModelSettings) -> bool:
-    fallbacks: list[str | dict[str, Any]] = (model_settings.extra_args or {}).get("fallbacks") or []
-    models = [hop["model"] if isinstance(hop, dict) else hop for hop in fallbacks]
-    return any(_is_gemini_model(candidate) for candidate in [model, *models])
+    return any(_is_gemini_model(candidate) for candidate in model_chain(model, model_settings))
 
 
 def _has_ref_key(value: object) -> bool:
@@ -506,7 +522,7 @@ class CopilotLitellmModel(LitellmModel):
         prompt: Any | None = None,
     ) -> ModelResponse:
         attach_tool_surface_to_pending_capture(tools)
-        with model_call_telemetry_scope(
+        with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
@@ -538,7 +554,7 @@ class CopilotLitellmModel(LitellmModel):
         prompt: Any | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         attach_tool_surface_to_pending_capture(tools)
-        with model_call_telemetry_scope(
+        with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
@@ -601,6 +617,8 @@ class CopilotLitellmModel(LitellmModel):
         prompt: Any | None = None,
     ) -> LiteLLMModelResponse | tuple[Response, AsyncStream[ChatCompletionChunk]]:
         input = _escape_ref_tool_outputs_for_gemini(input, self.model, model_settings)
+        anchors = stable_prefix_anchors(input) if isinstance(input, list) else []
+        anchor = anchors[-1] if anchors else None
         explicit_cache_envelope = build_explicit_cache_envelope(
             model=self.model,
             base_url=self.base_url,
@@ -609,13 +627,15 @@ class CopilotLitellmModel(LitellmModel):
             model_settings=model_settings,
             tools=tools,
             handoffs=handoffs,
+            reasoning_effort=self._get_reasoning_effort(model_settings),
+            anchors=anchors,
             should_replay_reasoning_content=self.should_replay_reasoning_content,
         )
         if explicit_cache_envelope is not None:
             telemetry = current_model_call_telemetry()
             if telemetry is not None:
                 telemetry.cache_mode = "explicit"
-                telemetry.cache_breakpoint_count = 1
+                telemetry.cache_breakpoint_count = explicit_cache_envelope.breakpoint_count
                 if isinstance(system_instructions, CacheableSystemInstructions):
                     telemetry.cache_stable_prefix_chars = len(system_instructions.stable_prefix)
             result = await self._fetch_explicit_responses(
@@ -629,8 +649,44 @@ class CopilotLitellmModel(LitellmModel):
                 stream,
             )
         else:
+            sent_instructions = str(system_instructions) if system_instructions is not None else None
+            anthropic_system_blocks = anthropic_cached_system_blocks(
+                model=self.model,
+                model_settings=model_settings,
+                system_instructions=system_instructions,
+            )
+            if anthropic_system_blocks is not None:
+                breakpoint_count = 1
+                if anchor is not None and isinstance(input, list):
+                    anchor_messages = Converter.items_to_messages(
+                        input[: anchor + 1],
+                        base_url=self.base_url,
+                        preserve_thinking_blocks=model_settings.reasoning is not None
+                        and model_settings.reasoning.effort is not None,
+                        preserve_tool_output_all_content=True,
+                        model=self.model,
+                        should_replay_reasoning_content=self.should_replay_reasoning_content,
+                    )
+                    # The recent tool window is rewritten and frames are later replaced by a placeholder, so the marker
+                    # sits on the anchor before them; the count mirrors the SDK's tool-call split, with system at 0.
+                    rolling_index = len(self._fix_tool_message_ordering(anchor_messages))
+                    model_settings = replace(
+                        model_settings,
+                        extra_args={
+                            **(model_settings.extra_args or {}),
+                            "cache_control_injection_points": [{"location": "message", "index": rolling_index}],
+                        },
+                    )
+                    breakpoint_count += 1
+                # The SDK inserts system content verbatim, so a block list reaches LiteLLM as list-form system content.
+                sent_instructions = cast(str, anthropic_system_blocks)
+                telemetry = current_model_call_telemetry()
+                if telemetry is not None:
+                    telemetry.cache_mode = "explicit"
+                    telemetry.cache_breakpoint_count = breakpoint_count
+                    telemetry.cache_stable_prefix_chars = len(anthropic_system_blocks[0]["text"])
             result = await super()._fetch_response(
-                system_instructions,
+                sent_instructions,
                 input,
                 model_settings,
                 tools,
@@ -740,12 +796,51 @@ class CopilotLitellmModel(LitellmModel):
         request_kwargs["prompt_cache_key"] = envelope.prompt_cache_key
         request_kwargs["extra_body"] = envelope.extra_body
         request_kwargs.pop("reasoning_effort", None)
+        fallbacks: list[str | dict[str, Any]] = request_kwargs.pop("fallbacks", None) or []
 
-        raw_response = await litellm.aresponses(**request_kwargs)
+        # LiteLLM runs fallbacks only inside acompletion, so the Responses call walks the chain the same way.
+        hops: list[str | dict[str, Any]] = [{}, *fallbacks]
+        for hop_index, hop in enumerate(hops):
+            hop_override = {"model": hop} if isinstance(hop, str) else dict(hop)
+            # safe_deep_copy returns its argument in LiteLLM's safe_memory_mode, so each hop builds a new dict.
+            hop_kwargs = (
+                {**safe_deep_copy(request_kwargs), **safe_deep_copy(hop_override)}
+                if fallbacks
+                else {**request_kwargs, **hop_override}
+            )
+            # aresponses reads only api_base; a base_url kwarg is silently ignored and the call goes to the default host.
+            hop_base_url = hop_kwargs.pop("base_url", None)
+            if hop_base_url and not hop_kwargs.get("api_base"):
+                hop_kwargs["api_base"] = hop_base_url
+            hop_kwargs["model"] = responses_route_model(hop_kwargs["model"])
+            try:
+                raw_response = await litellm.aresponses(**hop_kwargs)
+                break
+            except Exception as exc:
+                LOG.warning(
+                    "Copilot Responses hop failed",
+                    hop_index=hop_index,
+                    model=hop_kwargs["model"],
+                    error_type=type(exc).__name__,
+                    status_code=getattr(exc, "status_code", None),
+                    error=str(exc)[:300],
+                )
+                if not fallbacks:
+                    raise
+                if hop_index == len(hops) - 1:
+                    # Matches LiteLLM's fallback error: an untyped Exception with no __cause__, so not retriable.
+                    raise Exception(
+                        f"{exc}. All fallback attempts failed. "
+                        "Enable verbose logging with `litellm.set_verbose=True` for details."
+                    )
+        served_model = hop_kwargs["model"]
+        served_provider = litellm.get_llm_provider(served_model)[1]
         telemetry = current_model_call_telemetry()
+        if telemetry is not None:
+            telemetry.served_provider = served_provider
 
         if stream:
-            raw_stream = cast(AsyncIterator[Any], raw_response)
+            raw_stream = _typed_stream_errors(cast(AsyncIterator[Any], raw_response), served_model, served_provider)
             if telemetry is not None:
                 raw_stream = _ResponsesUsageCapturingStream(raw_stream, telemetry)
             response_stream = responses_api_bridge.transformation_handler.get_model_response_iterator(
@@ -756,7 +851,7 @@ class CopilotLitellmModel(LitellmModel):
             response = Response(
                 id=FAKE_RESPONSES_ID,
                 created_at=time.time(),
-                model=self.model,
+                model=served_model,
                 object="response",
                 output=[],
                 tool_choice=response_tool_choice,  # type: ignore[arg-type]
@@ -776,7 +871,7 @@ class CopilotLitellmModel(LitellmModel):
             _capture_usage(telemetry, raw_response.usage)
             _capture_responses_stop_metadata(telemetry, raw_response)
         model_response = responses_api_bridge.transformation_handler.transform_response(
-            model=self.model,
+            model=served_model,
             raw_response=raw_response,
             model_response=LiteLLMModelResponse(),
             logging_obj=SimpleNamespace(),  # type: ignore[arg-type]

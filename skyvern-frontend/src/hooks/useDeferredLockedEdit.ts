@@ -25,6 +25,17 @@ export function registerBufferedEditorFlusher(flush: () => void): () => void {
   };
 }
 
+const bufferedEditListeners = new Set<() => void>();
+
+// A buffered edit lands a debounce after the keystroke that caused it; listeners
+// hear it just before it is applied, so the canvas can still read it as the user's.
+export function subscribeToBufferedEdits(listener: () => void): () => void {
+  bufferedEditListeners.add(listener);
+  return () => {
+    bufferedEditListeners.delete(listener);
+  };
+}
+
 export function flushBufferedEditorEdits() {
   if (isEditorMutationLocked()) return;
   // Save-data callbacks are registered by effects after the graph renders.
@@ -115,6 +126,7 @@ export function useDeferredLockedEdit({
     if (isMutationLocked()) return;
     pendingRef.current = null;
     if (deferKey !== undefined) deferredEdits.delete(deferKey);
+    for (const listener of bufferedEditListeners) listener();
     onChangeRef.current?.(newValue);
   }, debounceMs);
 

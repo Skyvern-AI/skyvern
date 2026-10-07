@@ -145,8 +145,7 @@ def test_mcp_to_copilot_error() -> None:
     }
     result = mcp_to_copilot(mcp_result)
     assert result["ok"] is False
-    assert "No browser" in result["error"]
-    assert "Create one" in result["error"]
+    assert result["error"] == "No browser"
 
 
 class TestMcpBrowserContextBridge:

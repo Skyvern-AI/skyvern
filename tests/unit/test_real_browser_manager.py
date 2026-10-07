@@ -22,7 +22,8 @@ from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepa
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.streaming import registries
-from skyvern.webeye import dialog_handler, real_browser_manager
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsSource, build_timezone_receipt
+from skyvern.webeye import browser_settings_receipts, dialog_handler, real_browser_manager
 from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.browser_acquisition_sample import note_browser_runtime
 from skyvern.webeye.browser_artifacts import (
@@ -59,6 +60,8 @@ def make_workflow_run(
     wfr.proxy_location = None
     wfr.extra_http_headers = None
     wfr.browser_address = None
+    wfr.browser_settings = None
+    wfr.browser_settings_receipt = None
     return wfr
 
 
@@ -1018,6 +1021,7 @@ def make_session(proxy_location: object = None, proxy_session_id: str | None = N
     session = MagicMock()
     session.proxy_location = proxy_location
     session.proxy_session_id = proxy_session_id
+    session.browser_settings = None
     return session
 
 
@@ -1031,8 +1035,8 @@ def _merge_cloud_proxy_session_headers(
 
 
 @pytest.mark.asyncio
-async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> None:
-    """When a task has a browser_session_id and no in-memory browser state, the session's proxy_location is used."""
+async def test_task_browser_inherits_session_proxy_and_timezone_when_no_browser_state() -> None:
+    """When a task has a browser_session_id and no in-memory browser state, the session's launch settings are used."""
     manager = RealBrowserManager()
     task = make_task("tsk_1", proxy_location="RESIDENTIAL")
     new_browser_state = MagicMock()
@@ -1040,6 +1044,7 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
 
     session_proxy = "RESIDENTIAL_DE"
     session = make_session(proxy_location=session_proxy)
+    session.browser_settings = BrowserSettings(timezone_id="Africa/Kampala")
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
         configure_browser_context_acquired_hook(mock_app)
@@ -1057,6 +1062,38 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
         mock_create.assert_awaited_once()
         _, kwargs = mock_create.call_args
         assert kwargs["proxy_location"] == session_proxy
+        assert kwargs["timezone_id"] == "Africa/Kampala"
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_task_on_an_attached_session_records_the_run_receipt_as_unapplied() -> None:
+    manager = RealBrowserManager()
+    task = make_task("tsk_tz", workflow_run_id="wr_tz")
+    run = make_workflow_run("wr_tz")
+    run.browser_settings = BrowserSettings(timezone_id="Africa/Kampala")
+    run.reuse_bound_key = None
+    attached_session = make_session()
+    attached_session.created_for_workflow_run_id = None
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+    new_browser_state.get_working_page = AsyncMock(return_value=_page_reporting("America/New_York", "Africa/Kampala"))
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=attached_session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
+        record = mock_app.DATABASE.workflow_runs.record_workflow_run_browser_settings_receipt = AsyncMock()
+        with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)):
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_attached")
+
+    assert record.await_args.args == (
+        "wr_tz",
+        "org_test",
+        build_timezone_receipt("Africa/Kampala", "America/New_York", BrowserSettingsSource.existing_session),
+    )
 
 
 @pytest.mark.asyncio
@@ -3897,3 +3934,103 @@ async def test_a_browser_replaced_mid_run_reports_the_runtime_of_its_replacement
                 await state.take_post_action_screenshot(scrolling_number=0)
     [failure] = [entry for entry in logs if entry.get("browser_runtime_event") == "screenshot_failure"]
     assert (failure["browser_runtime"], failure.get("browser_vendor")) == ("local", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "browser_session_id",
+        "created_for_workflow_run_id",
+        "bound_key",
+        "browser_address",
+        "inherited",
+        "expected_source",
+    ),
+    [
+        ("pbs_caller", None, None, None, False, BrowserSettingsSource.existing_session),
+        ("pbs_other_run", "wr_other", None, None, False, BrowserSettingsSource.existing_session),
+        ("pbs_other_key", None, "tz:sha256:other", None, False, BrowserSettingsSource.existing_session),
+        (None, None, None, "http://127.0.0.1:9222", False, BrowserSettingsSource.existing_session),
+        (None, None, None, None, True, BrowserSettingsSource.existing_session),
+        ("pbs_own", "wr_tz", None, None, False, BrowserSettingsSource.workflow_version),
+        ("pbs_reused", "wr_first", "tz:sha256:run", None, False, BrowserSettingsSource.workflow_version),
+        (None, None, None, None, False, BrowserSettingsSource.workflow_version),
+    ],
+    ids=[
+        "caller-session",
+        "other-runs-session",
+        "bound-to-another-key",
+        "browser-address",
+        "parent-inherited",
+        "own-session",
+        "reused-same-version-and-timezone",
+        "own-launch",
+    ],
+)
+async def test_run_timezone_receipt_claims_the_workflow_version_only_for_a_browser_launched_for_it(
+    browser_session_id: str | None,
+    created_for_workflow_run_id: str | None,
+    bound_key: str | None,
+    browser_address: str | None,
+    inherited: bool,
+    expected_source: BrowserSettingsSource,
+) -> None:
+    zone = "America/New_York"
+    run = make_workflow_run("wr_tz")
+    run.browser_settings = BrowserSettings(timezone_id=zone)
+    run.browser_address = browser_address
+    run.workflow_permanent_id = "wpid_tz"
+    run.reuse_bound_key = "tz:sha256:run"
+    state = MagicMock()
+    state.get_working_page = AsyncMock(return_value=_page_reporting(zone, zone))
+    session = SimpleNamespace(
+        browser_settings=BrowserSettings(timezone_id=zone),
+        created_for_workflow_run_id=created_for_workflow_run_id,
+        bound_workflow_permanent_id="wpid_tz" if bound_key else None,
+        bound_key=bound_key,
+    )
+    with patch.object(real_browser_manager, "app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        record = mock_app.DATABASE.workflow_runs.record_workflow_run_browser_settings_receipt = AsyncMock()
+        await real_browser_manager._record_run_timezone_receipt(
+            run, state, browser_session_id=browser_session_id, inherited=inherited
+        )
+
+    assert record.await_args.args == ("wr_tz", run.organization_id, build_timezone_receipt(zone, zone, expected_source))
+
+
+def _page_reporting(reported: object, browser_name_for_requested: object) -> MagicMock:
+    """A page whose isolated-world probe returns these values."""
+    cdp_session = MagicMock()
+    cdp_session.send = AsyncMock(
+        side_effect=[
+            {"frameTree": {"frame": {"id": "frame-1"}}},
+            {"executionContextId": 7},
+            {"result": {"value": [reported, browser_name_for_requested]}},
+        ]
+    )
+    cdp_session.detach = AsyncMock()
+    page = MagicMock()
+    page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+    return page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "reported", "browser_name_for_requested", "expected_status"),
+    [
+        ("Asia/Kolkata", "Asia/Calcutta", "Asia/Calcutta", "verified"),
+        ("Europe/Kyiv", "Europe/Kiev", "Europe/Kiev", "verified"),
+        ("America/New_York", "America/Toronto", "America/New_York", "mismatch"),
+        ("Asia/Kolkata", "Etc/Unknown", "Asia/Calcutta", "unknown"),
+    ],
+    ids=["alias-kolkata", "alias-kyiv", "same-offset-other-zone", "not-a-zone"],
+)
+async def test_the_receipt_accepts_the_browser_name_for_the_requested_zone_and_nothing_else(
+    requested: str, reported: str, browser_name_for_requested: str, expected_status: str
+) -> None:
+    receipt = await browser_settings_receipts.measure_timezone_receipt(
+        _page_reporting(reported, browser_name_for_requested), requested, BrowserSettingsSource.workflow_version
+    )
+
+    assert receipt.status == expected_status

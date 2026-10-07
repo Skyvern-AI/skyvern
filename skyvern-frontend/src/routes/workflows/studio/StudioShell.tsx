@@ -9,13 +9,15 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
+import { usePostHog } from "posthog-js/react";
 import {
   Cross2Icon,
   EnterFullScreenIcon,
   ExitFullScreenIcon,
 } from "@radix-ui/react-icons";
 
-import { CopyButton } from "@/components/CopyButton";
+import { PaneErrorBoundary } from "@/components/PaneErrorBoundary";
+import { useLogging } from "@/hooks/useLogging";
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
 import {
   Tooltip,
@@ -35,7 +37,7 @@ import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
 import {
   CopilotActiveDot,
   CopilotPaneControls,
-  CopilotRecordingStatus,
+  CopilotPaneStatus,
 } from "./CopilotPaneHeader";
 import {
   EditorPaneBlockSearch,
@@ -46,7 +48,6 @@ import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
 import { RunPaneActions, RunPaneViewToggles } from "./runview/RunPaneHeader";
 import { StudioBrowserStream } from "./StudioBrowserStream";
-import { StudioCoachMark } from "./StudioCoachMark";
 import {
   PANE_HEADER_ICON_BUTTON_CLASS,
   studioPanelId,
@@ -81,6 +82,7 @@ import {
   StudioWorkflowDeletedContext,
 } from "./StudioShellContext";
 import { StudioStageLauncher } from "./StudioStageLauncher";
+import { useStudioOnboardingTour } from "./useStudioOnboardingTour";
 import { StudioTopBar } from "./StudioTopBar";
 import { StudioWorkflowPanels } from "./StudioWorkflowPanels";
 import { useStudioPanes } from "./useStudioPanes";
@@ -107,50 +109,8 @@ type PaneReorder = {
   onMove: (direction: -1 | 1) => void;
 };
 
-function RunPaneLabel({
-  label,
-  runId,
-  dragHint,
-}: {
-  label: string;
-  runId: string;
-  dragHint: string;
-}) {
-  return (
-    <span className="group/runlabel inline-flex min-w-0 items-center text-xs font-medium text-foreground">
-      {/* Must not wrap: the header is a fixed h-11 row, so a second line of
-          "Run: wr_…" overflows it and squeezes the control cluster. */}
-      <span
-        className="inline-block min-w-0 truncate group-focus-within/runlabel:hidden group-hover/runlabel:hidden"
-        title={dragHint}
-      >
-        {label}
-      </span>
-      <span
-        className="hidden min-w-0 truncate group-focus-within/runlabel:inline-block group-hover/runlabel:inline-block"
-        title={`Run: ${runId}`}
-      >
-        Run: {runId}
-      </span>
-      <span
-        className={cn(
-          "inline-flex w-0 overflow-hidden opacity-0 transition-all",
-          "group-hover/runlabel:ml-1 group-hover/runlabel:w-5 group-hover/runlabel:opacity-100",
-          "group-focus-within/runlabel:ml-1 group-focus-within/runlabel:w-5 group-focus-within/runlabel:opacity-100",
-        )}
-      >
-        <CopyButton
-          value={runId}
-          className="h-5 w-5 shrink-0 p-0.5 text-muted-foreground hover:text-foreground"
-        />
-      </span>
-    </span>
-  );
-}
-
 export function StudioPane({
   id,
-  runId,
   open,
   order,
   flex,
@@ -168,8 +128,6 @@ export function StudioPane({
   children,
 }: {
   id: StudioPaneId;
-  // The inspected run id, so the run pane's label can read "Run: wr_…".
-  runId?: string | null;
   open: boolean;
   order: number | undefined;
   flex: string | undefined;
@@ -190,10 +148,7 @@ export function StudioPane({
   children: ReactNode;
 }) {
   const { icon: Icon } = STUDIO_PANE_META[id];
-  const label = paneLabel(id, runId);
-  // The run id shows in the visible header label only; the region, header,
-  // drag hint, and close control take the stable accessible name so a run
-  // switch never renames them for screen readers.
+  const label = paneLabel(id);
   const accessibleLabel = paneAccessibleName(id);
   const paneRef = useRef<HTMLElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
@@ -361,20 +316,12 @@ export function StudioPane({
           <Icon className="size-3.5 text-muted-foreground" aria-hidden />
           {iconBadge}
         </span>
-        {id === "overview" && runId ? (
-          <RunPaneLabel
-            label={label}
-            runId={runId}
-            dragHint={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
-          />
-        ) : (
-          <span
-            className="min-w-0 truncate text-xs font-medium text-foreground"
-            title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
-          >
-            {label}
-          </span>
-        )}
+        <span
+          className="min-w-0 truncate text-xs font-medium text-foreground"
+          title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
+        >
+          {label}
+        </span>
         <StudioPaneCompactContext.Provider value={compact}>
           {headerExtras}
           <span className="min-w-0 flex-1" />
@@ -681,6 +628,26 @@ function StudioPaneDivider({
  * (?panes=). The Copilot chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
+  const [searchParams] = useSearchParams();
+  const postHog = usePostHog();
+  const openedWorkflowIds = useRef(new Set<string>());
+  const workflowPermanentId = props.workflow.workflow_permanent_id;
+
+  useEffect(() => {
+    if (openedWorkflowIds.current.has(workflowPermanentId)) return;
+    openedWorkflowIds.current.add(workflowPermanentId);
+    postHog.capture("studio.opened", {
+      org_id: props.workflow.organization_id,
+      workflow_permanent_id: workflowPermanentId,
+      via: searchParams.get("via"),
+    });
+  }, [
+    postHog,
+    props.workflow.organization_id,
+    searchParams,
+    workflowPermanentId,
+  ]);
+
   return (
     <StudioWorkflowDeletedContext.Provider
       value={props.workflow.deleted_at ?? null}
@@ -743,7 +710,10 @@ export function EmbeddedBrowserOverlays({
 
 function StudioStage(props: StudioWorkspaceProps) {
   const [searchParams] = useSearchParams();
+  const postHog = usePostHog();
+  const logging = useLogging();
   const embedded = searchParams.get("embed") === "true";
+  useStudioOnboardingTour(!embedded, props.workflow.workflow_permanent_id);
   const { panes, closePane, openPane, setOpenPanes, setPanesOrder } =
     useStudioPanes();
   const {
@@ -755,6 +725,22 @@ function StudioStage(props: StudioWorkspaceProps) {
   } = useStudioPaneDefaults();
   const runId = useStudioRunId();
   const workflowDeleted = Boolean(props.workflow.deleted_at);
+  const reportPaneCrash = (
+    pane: string,
+    error: unknown,
+    componentStack?: string | null,
+  ) => {
+    logging.error("Studio pane crashed", {
+      error_source: "studio_pane",
+      pane,
+      component_stack: componentStack,
+      workflow_permanent_id: props.workflow.workflow_permanent_id,
+      error,
+    });
+    if (typeof postHog?.captureException === "function") {
+      postHog.captureException(error, { error_source: "studio_pane", pane });
+    }
+  };
   const isRecording = useRecordingStore((s) => s.isRecording);
   // The title store is normally seeded by the embedded Workspace's canvas,
   // which never mounts for a deleted agent — seed it here instead.
@@ -874,6 +860,7 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   const shellContextValue = useMemo(
     () => ({
+      organizationId: props.workflow.organization_id,
       copilotPortalEl,
       panelPortalEl,
       setEditorStreamSlot,
@@ -881,7 +868,12 @@ function StudioStage(props: StudioWorkspaceProps) {
       setRunStreamSlot,
       restoreExpandedPane,
     }),
-    [copilotPortalEl, panelPortalEl, restoreExpandedPane],
+    [
+      copilotPortalEl,
+      panelPortalEl,
+      props.workflow.organization_id,
+      restoreExpandedPane,
+    ],
   );
 
   // The ✕ unmounts with its pane, so hand focus back to the pane's toggle.
@@ -971,7 +963,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     const index = panes.indexOf(id);
     return {
       id,
-      runId,
       chromeless: embedded,
       open: index >= 0 && visiblePanes.includes(id),
       // Panes take even slots and the dividers between them take odd slots.
@@ -1035,7 +1026,7 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <StudioPane
                 {...paneProps("copilot")}
-                headerExtras={<CopilotRecordingStatus />}
+                headerExtras={<CopilotPaneStatus />}
                 headerActions={<CopilotPaneControls />}
                 iconBadge={<CopilotActiveDot />}
               >
@@ -1070,22 +1061,38 @@ function StudioStage(props: StudioWorkspaceProps) {
                 headerExtras={<BrowserPaneViewPills />}
                 headerActions={<BrowserPaneActions />}
               >
-                <BrowserTab />
-                {embedded ? (
-                  <EmbeddedBrowserOverlays
-                    runId={runId}
-                    showArchivedRecording={
-                      searchParams.get("view") === "recording"
-                    }
-                  />
-                ) : null}
+                <PaneErrorBoundary
+                  key={`${props.workflow.workflow_permanent_id}:browser`}
+                  pane="browser"
+                  onError={(error, componentStack) =>
+                    reportPaneCrash("browser", error, componentStack)
+                  }
+                >
+                  <BrowserTab />
+                  {embedded ? (
+                    <EmbeddedBrowserOverlays
+                      runId={runId}
+                      showArchivedRecording={
+                        searchParams.get("view") === "recording"
+                      }
+                    />
+                  ) : null}
+                </PaneErrorBoundary>
               </StudioPane>
               <StudioPane
                 {...paneProps("overview")}
                 headerExtras={<RunPaneViewToggles />}
                 headerActions={<RunPaneActions />}
               >
-                <RunTab />
+                <PaneErrorBoundary
+                  key={`${props.workflow.workflow_permanent_id}:run`}
+                  pane="run"
+                  onError={(error, componentStack) =>
+                    reportPaneCrash("run", error, componentStack)
+                  }
+                >
+                  <RunTab />
+                </PaneErrorBoundary>
               </StudioPane>
               {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
@@ -1105,7 +1112,6 @@ function StudioStage(props: StudioWorkspaceProps) {
                     ))
                 : null}
               {!embedded && panes.length === 0 ? <StudioStageLauncher /> : null}
-              {embedded ? null : <StudioCoachMark />}
               {embedded ? null : <StudioWorkflowPanels />}
               {/* Overlay target for Workspace-wired panels (pointer-events off
                   while empty so the stage stays clickable). */}
@@ -1129,7 +1135,15 @@ function StudioStage(props: StudioWorkspaceProps) {
             className="h-0 w-0 overflow-hidden"
           />
           {createPortal(
-            <StudioBrowserStream visiblePanes={visiblePanes} />,
+            <PaneErrorBoundary
+              key={`${props.workflow.workflow_permanent_id}:browser_stream`}
+              pane="browser_stream"
+              onError={(error, componentStack) =>
+                reportPaneCrash("browser_stream", error, componentStack)
+              }
+            >
+              <StudioBrowserStream visiblePanes={visiblePanes} />
+            </PaneErrorBoundary>,
             streamHostEl,
           )}
         </div>

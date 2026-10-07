@@ -444,7 +444,7 @@ class SMSRepository(BaseRepository):
             return int(count or 0)
 
     @db_operation("delete_sms_config")
-    async def delete_sms_config(self, sms_config_id: str, organization_id: str) -> None:
+    async def delete_sms_config(self, sms_config_id: str, organization_id: str) -> bool:
         async with self.Session() as session:
             row = await session.scalar(
                 select(OrganizationSMSConfigModel)
@@ -456,7 +456,7 @@ class SMSRepository(BaseRepository):
                 .with_for_update()
             )
             if row is None:
-                return
+                return False
             active_phone_id = await session.scalar(
                 select(OrganizationPhoneNumberModel.phone_number_id)
                 .where(
@@ -472,6 +472,7 @@ class SMSRepository(BaseRepository):
             row.deleted_at = naive_utc_now()
             row.modified_at = row.deleted_at
             await session.commit()
+            return True
 
     @db_operation("create_phone_number")
     async def create_phone_number(

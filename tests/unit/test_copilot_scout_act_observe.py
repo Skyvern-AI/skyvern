@@ -397,7 +397,7 @@ async def test_failed_click_wrapper_carries_attempt_and_current_page_without_suc
 
     assert wrapped.isError is True
     assert projected["ok"] is False
-    assert projected["error"] == "element not interactable. Target remained covered"
+    assert projected["error"] == "element not interactable"
     assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
     assert projected[MCP_RESULT_PROVENANCE_KEY] == MCP_RESULT_PROVENANCE_VALUE
     assert projected["data"]["attempted_control"] == {
@@ -453,7 +453,7 @@ async def test_failed_click_without_page_evidence_sheds_oversized_candidates_but
 
     assert wrapped.isError is True
     assert projected["ok"] is False
-    assert projected["error"] == "element not interactable. Target remained covered"
+    assert projected["error"] == "element not interactable"
     assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
     assert projected["data"]["attempted_control"]["selector"] == "#continue"
     assert projected["data"]["attempted_control"]["effective_target"] == "button Continue"
@@ -498,7 +498,7 @@ async def test_failed_click_wrapper_reuses_registered_and_codeblock_redaction_bo
     page_payload["page_title"] = f"Account for {credential_secret}"
     page_payload["forms"][0]["submit_controls"][0]["text"] = f"Continue with {credential_secret} and {parameter_secret}"
 
-    def redact_codeblock_parameters(value: Any, parameters: dict[str, Any]) -> Any:
+    def redact_codeblock_parameters(value: Any, parameters: dict[str, Any], **_budget: object) -> Any:
         assert parameters == {"account": parameter_secret}
         return value.replace(parameter_secret, "[REDACTED_PARAMETER]") if isinstance(value, str) else value
 

@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal, NamedTuple, cast
 import structlog
 import yaml
 from jinja2 import TemplateSyntaxError
-from pydantic import AliasChoices, BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, TypeAdapter, ValidationError
 
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import SkyvernHTTPException
@@ -47,7 +47,11 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     scanner_advisory_diagnostics,
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
-from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    user_owned_goal_carry_disclosure,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
@@ -110,6 +114,8 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    _canonicalize_copilot_proxy_location,
     _normalize_copilot_yaml,
     _process_workflow_yaml,
     dump_workflow_yaml,
@@ -136,7 +142,7 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, Ins
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
-from skyvern.schemas.proxy_location import runtime_proxy_location
+from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.workflows import (
     BLOCK_YAML_SUBCLASSES,
     BlockType,
@@ -1708,8 +1714,7 @@ def _metadata_output_repair_context(
         metadata_contract_reason_code=coverage_reason_code,
         repair_instruction=(
             "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths "
-            f"{path_text}, make the code return those paths, then rerun update_and_run_blocks."
-            + _declaration_repair_sentence(declaration)
+            f"{path_text}, and make the code return those paths." + _declaration_repair_sentence(declaration)
         ),
     )
 
@@ -1783,6 +1788,20 @@ def _path_segments(path: str) -> list[tuple[str, bool]]:
         if name:
             segments.append((name, is_array))
     return segments
+
+
+def code_artifact_metadata_block_labels(raw_metadata: object) -> set[str]:
+    """Block labels the submission claims to have authored a code artifact for, read from the raw rows:
+    a row normalization later drops for an unrelated field still names the block the model rebuilt."""
+    labels: set[str] = set()
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if label:
+            labels.add(label)
+    return labels
 
 
 def _metadata_item_for_block_label(raw_metadata: object, block_label: str) -> Mapping[str, Any] | None:
@@ -3878,6 +3897,11 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_code_rewritten",
             "dropped_prior_blocks",
             "block_type_changes",
+            "stored_goal_kept",
+            "stored_goal_kept_message",
+            "stored_goal_dropped",
+            "stored_goal_dropped_message",
+            "google_connection_resolution",
             "persistence",
             "persistence_message",
             "google_sheet_tab_resolution",
@@ -3967,7 +3991,9 @@ def strip_copilot_yaml_headers(workflow_yaml: str | None) -> str | None:
         return None
 
 
-def copilot_workflow_yaml_matches(submitted_yaml: str | None, *known_sources: str | None) -> bool:
+def copilot_workflow_yaml_matches(
+    submitted_yaml: str | None, *known_sources: str | None, inherited_proxy_location: ProxyLocationInput = None
+) -> bool:
     submitted_yaml = strip_copilot_yaml_headers(submitted_yaml)
     if not submitted_yaml:
         return False
@@ -3976,10 +4002,14 @@ def copilot_workflow_yaml_matches(submitted_yaml: str | None, *known_sources: st
             sanitized_source = strip_copilot_yaml_headers(source)
             if not sanitized_source:
                 continue
-            source_canvas = _normalized_canvas_for_proposal_restore(sanitized_source)
+            source_canvas = _normalized_canvas_for_proposal_restore(
+                sanitized_source, inherited_proxy_location=inherited_proxy_location
+            )
             if (
                 _normalized_canvas_for_proposal_restore(
-                    submitted_yaml, inherited_code_version=source_canvas.code_version
+                    submitted_yaml,
+                    inherited_code_version=source_canvas.code_version,
+                    inherited_proxy_location=inherited_proxy_location,
                 )
                 == source_canvas
             ):
@@ -3993,6 +4023,7 @@ def _normalized_canvas_for_proposal_restore(
     workflow_yaml: str,
     *,
     inherited_code_version: int | None = None,
+    inherited_proxy_location: ProxyLocationInput = None,
 ) -> WorkflowCreateYAMLRequest:
     """Normalize editor-only empty code outlines before comparing canvas custody.
 
@@ -4002,6 +4033,7 @@ def _normalized_canvas_for_proposal_restore(
     """
     normalized = _normalize_copilot_yaml(workflow_yaml)
     normalized.webhook_callback_url = normalized.webhook_callback_url or None
+    normalized.proxy_location = resolve_proxy_location(normalized, inherited_proxy_location)
     normalized.extra_http_headers = None
     normalized.cdp_connect_headers = None
     normalized.mask_secrets = bool(normalized.mask_secrets)
@@ -4090,6 +4122,7 @@ async def _validated_pending_workflow_proposal(
             proposal_workflow_run_id=metadata.workflow_run_id if metadata is not None else None,
         )
         return None
+    canonical: Workflow | None = None
     if metadata is not None:
         canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id=ctx.workflow_permanent_id,
@@ -4115,7 +4148,10 @@ async def _validated_pending_workflow_proposal(
     # An explicit canvas edit remains the model's input to the normal update tool.
     # Only restore over the persisted canvas or the same pending proposal.
     if ctx.workflow_yaml and not copilot_workflow_yaml_matches(
-        ctx.workflow_yaml, sanitized_yaml, ctx.persisted_workflow_yaml
+        ctx.workflow_yaml,
+        sanitized_yaml,
+        ctx.persisted_workflow_yaml,
+        inherited_proxy_location=canonical.proxy_location if canonical is not None else None,
     ):
         LOG.info(
             "copilot_pending_proposal_restore_rejected",
@@ -4124,6 +4160,42 @@ async def _validated_pending_workflow_proposal(
         )
         return None
     return proposal, sanitized_yaml
+
+
+_PROXY_LOCATION_ADAPTER = TypeAdapter(WorkflowCreateYAMLRequest.model_fields["proxy_location"].annotation)
+
+
+def _effective_private_setting(name: str, value: object) -> object:
+    # Accept reads a null header map as {} and an empty string as unset, and validates proxy spellings the way
+    # canvas custody does.
+    if name in ("extra_http_headers", "cdp_connect_headers"):
+        return value or {}
+    if name != "proxy_location":
+        return value or None
+    if value is None:
+        return None
+    canonical = {"proxy_location": value}
+    _canonicalize_copilot_proxy_location(canonical)
+    try:
+        return _PROXY_LOCATION_ADAPTER.validate_python(canonical["proxy_location"])
+    except ValidationError:
+        return value
+
+
+def _written_private_setting(name: str, value: object) -> object:
+    # Equal effective headers can still differ in written keys: an unbound mask is an explicit entry Accept resolves.
+    value = _effective_private_setting(name, value)
+    if isinstance(value, dict) and name in ("extra_http_headers", "cdp_connect_headers"):
+        return dict.fromkeys(value, SECRET_HEADER_MASK)
+    return value
+
+
+def _effective_private_settings(*sources: Mapping[str, object]) -> dict[str, object]:
+    # The first source that names a setting wins; Accept fills settings the proposal omits from the saved workflow.
+    return {
+        name: _effective_private_setting(name, next((source[name] for source in sources if name in source), None))
+        for name in _PRIVATE_WORKFLOW_SETTINGS_FIELDS
+    }
 
 
 async def restore_pending_workflow_proposal(
@@ -4159,21 +4231,18 @@ async def restore_pending_workflow_proposal(
         saved = await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
         )
+    inherited_settings = inherited_header_settings(saved) if saved is not None else None
     private_settings = merge_private_workflow_settings(
-        proposal_settings,
-        request_settings,
-        inherited_settings=inherited_header_settings(saved) if saved is not None else None,
+        proposal_settings, request_settings, inherited_settings=inherited_settings
     )
     ctx.private_workflow_settings = private_settings
     if pending is None:
         return
     _, sanitized_yaml = pending
     metadata = copilot_proposal_metadata(proposal)
-    restored_yaml = sanitized_yaml
-    if private_settings:
-        restored_document = safe_load_no_dates(sanitized_yaml)
-        restored_document.update(private_settings)
-        restored_yaml = dump_workflow_yaml(restored_document)
+    stored_document = safe_load_no_dates(sanitized_yaml)
+    restored_document = {**stored_document, **private_settings}
+    restored_yaml = dump_workflow_yaml(restored_document) if private_settings else sanitized_yaml
     if "workflow_definition" in proposal:
         workflow = Workflow.model_validate(proposal)
         # A proposal froze its title in an earlier turn, so a rename saved between the two outranks
@@ -4215,7 +4284,39 @@ async def restore_pending_workflow_proposal(
             settings_fallback_yaml=ctx.persisted_workflow_yaml,
             prefer_live_title=True,
         )
-    workflow_yaml = strip_copilot_yaml_headers(restored_yaml)
+    # Serialization masks CDP headers, so the saved side takes its real header maps from the row itself.
+    saved_settings = (
+        {**submitted_private_workflow_settings(saved.model_dump(mode="json")), **inherited_header_settings(saved)}
+        if saved is not None
+        else {}
+    )
+    own_settings = merge_private_workflow_settings(proposal_settings, inherited_settings=inherited_settings)
+    own_effective = _effective_private_settings(own_settings, stored_document, saved_settings)
+    effective = _effective_private_settings(private_settings, stored_document, saved_settings)
+    if effective == own_effective:
+        # The turn-end publish compares settings as written, so a request value that only echoes the proposal's
+        # effective value is recorded as the proposal wrote it.
+        for name, value in request_settings.items():
+            if _written_private_setting(name, value) != _written_private_setting(name, own_effective.get(name)):
+                continue
+            if name in proposal_settings:
+                ctx.authored_private_workflow_settings[name] = copy.deepcopy(proposal_settings[name])
+            else:
+                ctx.authored_private_workflow_settings.pop(name, None)
+    elif metadata is not None:
+        ctx.settings_diverged_proposal_token = (metadata.owner_turn_id, metadata.revision)
+        LOG.info(
+            "copilot_pending_proposal_settings_diverged",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            proposal_owner_turn_id=metadata.owner_turn_id,
+            proposal_revision=metadata.revision,
+            setting_names=sorted(name for name in own_effective if effective[name] != own_effective[name]),
+        )
+    strip_private_workflow_settings(own_effective)
+    strip_private_workflow_settings(effective)
+    # Run bind compares staged bytes to stored ones, and the model's next edit re-saves what it sees, so re-dump
+    # only when a visible setting changed.
+    workflow_yaml = sanitized_yaml if own_effective == effective else strip_copilot_yaml_headers(restored_yaml)
     ctx.staged_workflow = workflow
     ctx.staged_workflow_yaml = workflow_yaml
     ctx.workflow_yaml = workflow_yaml
@@ -4331,6 +4432,7 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
     originating_call_id: str | None = None,
+    block_scoped_authoring_prior_yaml: str | None = None,
 ) -> dict[str, Any]:
     def _blocked(block: AuthorTimeBlock) -> dict[str, Any]:
         _clear_code_authoring_repair_context(ctx)
@@ -4362,7 +4464,6 @@ async def _update_workflow(
     raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
     if raw_conflict_marker_error is not None:
         return _tool_error(raw_conflict_marker_error, user_facing_summary=_compiled_authoring_user_summary())
-    ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(params.get("code_artifact_metadata"))
@@ -4489,7 +4590,12 @@ async def _update_workflow(
 
     # Runs on every emission path, not only when the LLM consults the schema, and validates only the
     # blocks this turn introduces or changes.
-    authoring_validation = reject_authoring_violations(ctx, workflow_yaml, "_update_workflow")
+    authoring_validation = reject_authoring_violations(
+        ctx,
+        workflow_yaml,
+        "_update_workflow",
+        prior_workflow_yaml=block_scoped_authoring_prior_yaml,
+    )
     if authoring_validation.reject is not None:
         return _blocked(authoring_validation.reject)
     workflow_yaml = authoring_validation.workflow_yaml
@@ -4499,6 +4605,16 @@ async def _update_workflow(
         # reach the resolver already replaced by the placeholder.
         workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
         workflow_yaml, google_sheet_tab_resolution = await resolve_google_sheet_tabs_from_gid(workflow_yaml, ctx)
+        # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
+        # pass the scrub seam like any other submitted text.
+        goal_rewritten_labels = code_artifact_metadata_block_labels(ctx.submitted_code_artifact_metadata_snapshot)
+        goal_carry = carry_user_owned_goals_in_yaml(
+            workflow_yaml,
+            prior_yaml=prior_yaml,
+            rebuilt_labels=goal_rewritten_labels | set(params.get("_rebuilt_block_labels") or ()),
+            goal_rewritten_labels=goal_rewritten_labels,
+        )
+        workflow_yaml = goal_carry.workflow_yaml
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4741,6 +4857,7 @@ async def _update_workflow(
             data["dropped_prior_blocks"] = dropped_prior_blocks
         if block_type_changes:
             data["block_type_changes"] = block_type_changes
+        data.update(user_owned_goal_carry_disclosure(goal_carry))
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",

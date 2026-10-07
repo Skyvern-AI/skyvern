@@ -23,6 +23,7 @@ import {
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -454,24 +455,31 @@ describe("SaveButton confirmation gating", () => {
     },
   );
 
-  test("saves directly with no confirmation when the draft matches the baseline", () => {
-    const clean = saveData([block("a", { url: "x" })]);
-    useWorkflowHasChangesStore.setState({
-      getSaveData: () => clean,
-      saveIsPending: false,
-    });
-    useWorkflowSnapshotStore.setState({
-      snapshot: snapshotOf(clean),
-      contentDirty: false,
-      userHasEdited: false,
-    });
+  test.each([
+    [true, 1],
+    [false, 0],
+  ])(
+    "a draft matching the baseline saves with no confirmation only when the editor has changes (hasChanges %s)",
+    (hasChanges, saves) => {
+      const clean = saveData([block("a", { url: "x" })]);
+      useWorkflowHasChangesStore.setState({
+        getSaveData: () => clean,
+        saveIsPending: false,
+        hasChanges,
+      });
+      useWorkflowSnapshotStore.setState({
+        snapshot: snapshotOf(clean),
+        contentDirty: false,
+        userHasEdited: false,
+      });
 
-    renderSaveButton();
-    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+      renderSaveButton();
+      fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
 
-    expect(screen.queryByText("Saving Changes")).toBeNull();
-    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
-  });
+      expect(screen.queryByText("Saving Changes")).toBeNull();
+      expect(saveWorkflowSpy).toHaveBeenCalledTimes(saves);
+    },
+  );
 
   test("confirms an uncommitted YAML-draft edit the canvas hasn't caught up to", () => {
     const canvas = saveData([block("a", { block_type: "code", code: "# a" })]);
@@ -522,17 +530,18 @@ describe("SaveButton confirmation gating", () => {
 
     renderSaveButton();
     const save = screen.getByRole("button", {
-      name: "Save workflow (paused): This workflow changed after Copilot staged its proposal.",
+      name: "Save workflow (paused)",
+      description: "This workflow changed after Copilot staged its proposal.",
     });
     expect(save.matches(":disabled")).toBe(false);
     fireEvent.click(save);
 
-    expect(screen.queryByText("Save is paused")).not.toBeNull();
     expect(
-      screen.queryByText(
-        "This workflow changed after Copilot staged its proposal.",
-      ),
-    ).not.toBeNull();
+      screen.getByRole("dialog", {
+        name: "Save is paused",
+        description: "This workflow changed after Copilot staged its proposal.",
+      }),
+    ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: "Reload and discard my edits" }),
     ).not.toBeNull();
@@ -540,6 +549,99 @@ describe("SaveButton confirmation gating", () => {
     expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Save anyway" })).toBeNull();
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("SaveButton with a new Goal that isn't applied yet", () => {
+  const clean = () => saveData([block("a", { url: "x" })]);
+
+  beforeEach(() => {
+    const data = clean();
+    // A pending Goal change is an unsaved edit.
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => data,
+      saveIsPending: false,
+      hasChanges: true,
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(data),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+  });
+
+  afterEach(() => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => null,
+      saveIsPending: false,
+    });
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [],
+      pendingBuild: null,
+      generatingBlockLabel: null,
+      queuedBuilds: [],
+      undoGoalChange: () => {},
+    });
+  });
+
+  test("asks instead of saving, and Apply asks the copilot to follow the new Goal", () => {
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.getByText("New Goal not applied")).toBeTruthy();
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
+
+    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+      blockLabel: "a",
+      prompt: "New",
+      applyingGoalChange: true,
+    });
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+
+  test("Undo and save saves the draft as the undo left it", () => {
+    const afterUndo = useWorkflowHasChangesStore.getState().getSaveData;
+    const edited = saveData([block("a", { url: "edited" })]);
+    useWorkflowHasChangesStore.setState({ getSaveData: () => edited });
+    const undoGoalChange = vi.fn(() => {
+      useWorkflowHasChangesStore.setState({ getSaveData: afterUndo });
+      useCopilotActionStore.getState().setPendingGoalChanges([]);
+    });
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
+      undoGoalChange,
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Undo Goal change and save" }),
+    );
+
+    expect(undoGoalChange).toHaveBeenCalledWith("a");
+    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Saving Changes")).toBeNull();
+  });
+
+  test("offers no undo when the old Goal is unknown", () => {
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: null }],
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.getByRole("button", { name: "Apply new Goal" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Undo Goal change and save" }),
+    ).toBeNull();
   });
 });
 

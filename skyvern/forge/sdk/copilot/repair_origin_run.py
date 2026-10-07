@@ -19,17 +19,31 @@ logs, though a test run's own output can echo one like any run input.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRun,
+    WorkflowRunOutputParameter,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
+from skyvern.schemas.proxy_location import ResolvedProxyLocationInput, runtime_proxy_location
 from skyvern.services.uploaded_file_service import resolve_file_reference
 
 LOG = structlog.get_logger()
@@ -55,6 +69,213 @@ _REFUSAL_SENTENCES: dict[RepairOriginRefusal, str] = {
 }
 
 
+class OriginOutputRefusal(StrEnum):
+    FOREIGN_OR_MISMATCHED_ORIGIN = "foreign_or_mismatched_origin"
+    ORIGIN_UNSETTLED = "origin_unsettled"
+    ORDER_UNPROVABLE = "order_unprovable"
+    UPSTREAM_ABSENT = "upstream_absent"
+    UPSTREAM_FAILED = "upstream_failed"
+    CHANGED_PRODUCER = "changed_producer"
+    CHANGED_INPUT = "changed_input"
+    CHANGED_EXECUTION_SETTINGS = "changed_execution_settings"
+    OUTPUT_UNAVAILABLE = "output_unavailable"
+
+
+OriginInputValue = bool | int | float | str | dict | list
+
+
+_BINDING_REFUSAL_TO_OUTPUT_REFUSAL: dict[RepairOriginRefusal, OriginOutputRefusal] = {
+    RepairOriginRefusal.RUN_NOT_FOUND: OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN,
+    RepairOriginRefusal.FOREIGN_ORGANIZATION: OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN,
+    RepairOriginRefusal.WORKFLOW_MISMATCH: OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class OriginBlockOutput:
+    status: str | None
+    has_value: bool
+    created_at: datetime
+    value: dict | list | str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OriginExecutionSettings:
+    """The workflow-level settings a run executes under: the run's own override where it set one, else its version's."""
+
+    proxy_location: ResolvedProxyLocationInput
+    browser_profile_id: str | None
+    browser_profile_key: str | None
+    model: dict[str, Any] | None
+    extra_http_headers: dict[str, str] | None = field(repr=False)
+
+    @classmethod
+    def of(cls, workflow: Workflow, run: WorkflowRun | None = None) -> OriginExecutionSettings:
+        run_proxy = run.proxy_location if run is not None else None
+        run_profile_id = run.browser_profile_id if run is not None else None
+        run_headers = run.extra_http_headers if run is not None else None
+        # Saving through Copilot turns absent headers into {}, which sends the same request.
+        headers = (run_headers if run_headers is not None else workflow.extra_http_headers) or None
+        return cls(
+            proxy_location=runtime_proxy_location(run_proxy if run_proxy is not None else workflow.proxy_location),
+            browser_profile_id=run_profile_id if run_profile_id is not None else workflow.browser_profile_id,
+            browser_profile_key=workflow.browser_profile_key,
+            model=workflow.model,
+            extra_http_headers=headers,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OriginOutputSnapshot:
+    """Bank-owned recorded facts, shared by producer receipts and never mutated by consumers.
+
+    Capture detaches mutable native values once. Execution copies seeds at its boundary; a
+    later observation replaces the snapshot rather than editing a retained receipt in place.
+    """
+
+    definition: WorkflowDefinition = field(repr=False)
+    outputs: dict[str, OriginBlockOutput] = field(repr=False)
+    # None when the run's settings were not read, which no test run's settings can be proven equal to.
+    settings: OriginExecutionSettings | None = None
+    # Every input value the run recorded, unfiltered: an output is only reusable with the inputs it was computed from.
+    input_values: dict[str, OriginInputValue] = field(default_factory=dict, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedOutputSource:
+    workflow_run_id: str
+    created_at: datetime
+    snapshot: OriginOutputSnapshot = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedOutputSource:
+    block_label: str
+    workflow_run_id: str
+    source: Literal["verified", "banked", "origin"]
+    snapshot: OriginOutputSnapshot = field(repr=False)
+
+    @property
+    def value(self) -> dict | list | str | None:
+        return self.snapshot.outputs[self.block_label].value
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "block_label": self.block_label,
+            "source_workflow_run_id": self.workflow_run_id,
+            "source": self.source,
+        }
+
+
+@dataclass(slots=True)
+class RunOutputCarrier:
+    origin: OriginOutputSnapshot | OriginOutputRefusal | None = field(default=None, repr=False)
+    sources: dict[str, CompletedOutputSource] = field(default_factory=dict, repr=False)
+    verified_sources: dict[str, SelectedOutputSource] = field(default_factory=dict, repr=False)
+
+
+OutputCarrier = RunOutputCarrier | OriginOutputSnapshot | OriginOutputRefusal | None
+
+
+def origin_snapshot(carrier: OutputCarrier) -> OriginOutputSnapshot | OriginOutputRefusal | None:
+    return carrier.origin if isinstance(carrier, RunOutputCarrier) else carrier
+
+
+def bank_completed_outputs(
+    carrier: OutputCarrier,
+    *,
+    workflow_run_id: str,
+    created_at: datetime,
+    definition: WorkflowDefinition,
+    run_blocks: Iterable[WorkflowRunBlock],
+    output_parameter_rows: Iterable[WorkflowRunOutputParameter],
+    seeded_only_labels: frozenset[str],
+    input_values: dict[str, OriginInputValue] | None = None,
+    settings: OriginExecutionSettings | None = None,
+) -> RunOutputCarrier:
+    state = carrier if isinstance(carrier, RunOutputCarrier) else RunOutputCarrier(origin=deepcopy(carrier))
+    rows = [row for row in run_blocks if row.workflow_run_id == workflow_run_id and row.label not in seeded_only_labels]
+    snapshot = origin_block_outputs_from_rows(
+        definition,
+        rows,
+        [row for row in output_parameter_rows if row.workflow_run_id == workflow_run_id],
+        input_values=input_values,
+        settings=settings,
+    )
+    previous = state.sources.get(workflow_run_id)
+    if previous is not None:
+        snapshot = replace(snapshot, outputs={**previous.snapshot.outputs, **snapshot.outputs})
+    # The receipt retains failed/absent facts for refusal reporting; only completed value-bearing
+    # producers are selected. Copies keep late callbacks and later edits out of recorded facts.
+    state.sources[workflow_run_id] = CompletedOutputSource(workflow_run_id, _as_utc(created_at), snapshot)
+    return state
+
+
+@dataclass(frozen=True, slots=True)
+class OriginOutputRefusalDetail:
+    reason: OriginOutputRefusal
+    block_label: str
+    origin_workflow_run_id: str | None
+    parameter_key: str | None = None
+    changed_label: str | None = None
+    changed_settings: tuple[str, ...] = ()
+
+    @property
+    def output_key(self) -> str:
+        return f"{self.block_label}_output"
+
+    def as_payload(self) -> dict[str, str | list[str]]:
+        payload: dict[str, str | list[str]] = {
+            "reason": self.reason.value,
+            "block_label": self.block_label,
+            "output_key": self.output_key,
+        }
+        optional = {
+            "origin_workflow_run_id": self.origin_workflow_run_id,
+            "parameter_key": self.parameter_key,
+            "changed_label": self.changed_label,
+        }
+        payload.update({key: value for key, value in optional.items() if value is not None})
+        if self.changed_settings:
+            payload["changed_settings"] = list(self.changed_settings)
+        return payload
+
+
+def origin_block_outputs_from_rows(
+    definition: WorkflowDefinition,
+    run_blocks: Iterable[WorkflowRunBlock],
+    output_parameter_rows: Iterable[WorkflowRunOutputParameter],
+    input_values: dict[str, OriginInputValue] | None = None,
+    settings: OriginExecutionSettings | None = None,
+) -> OriginOutputSnapshot:
+    """Values each block the way verified recording does: its registered output parameter first, even
+    when that value is None, else the row's own output."""
+    output_parameter_ids = {block.label: block.output_parameter.output_parameter_id for block in definition.blocks}
+    registered_by_parameter_id = {
+        row.output_parameter_id: row for row in sorted(output_parameter_rows, key=lambda row: row.created_at)
+    }
+    latest_rows: dict[str, WorkflowRunBlock] = {}
+    for run_block in sorted(run_blocks, key=lambda run_block: run_block.created_at):
+        label = run_block.label
+        if run_block.parent_workflow_run_block_id is None and label is not None and label in output_parameter_ids:
+            latest_rows[label] = run_block
+    outputs: dict[str, OriginBlockOutput] = {}
+    for label, run_block in latest_rows.items():
+        registered = registered_by_parameter_id.get(output_parameter_ids[label])
+        row = OriginBlockOutput(status=run_block.status, has_value=False, created_at=run_block.created_at)
+        if registered is not None:
+            row = replace(row, has_value=True, value=without_output_only_labels(registered.value))
+        elif run_block.output is not None:
+            row = replace(row, has_value=True, value=without_output_only_labels(run_block.output))
+        outputs[label] = row
+    return OriginOutputSnapshot(
+        definition=definition.model_copy(deep=True),
+        outputs=deepcopy(outputs),
+        settings=deepcopy(settings),
+        input_values=deepcopy(input_values or {}),
+    )
+
+
 class RepairTurnContext(Protocol):
     """The part of a turn's context this binding reads and writes.
 
@@ -73,6 +294,8 @@ class RepairTurnContext(Protocol):
     last_run_binding_unavailable_reason: str | None
     repair_origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...]
     repair_origin_is_copilot_run: bool
+    repair_origin_outputs: OutputCarrier
+    repair_origin_outputs_run_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +305,8 @@ class RepairOriginBinding:
     refusal: RepairOriginRefusal | None
     status: WorkflowRunStatus | None = None
     copilot_run: bool = False
+    debug_run: bool = False
+    run: WorkflowRun | None = field(default=None, repr=False)
 
     @property
     def usable(self) -> bool:
@@ -95,10 +320,21 @@ class RepairOriginBinding:
 
 
 def _refused(
-    reason: RepairOriginRefusal, status: WorkflowRunStatus | None = None, *, copilot_run: bool = False
+    reason: RepairOriginRefusal,
+    status: WorkflowRunStatus | None = None,
+    *,
+    copilot_run: bool = False,
+    debug_run: bool = False,
+    run: WorkflowRun | None = None,
 ) -> RepairOriginBinding:
     return RepairOriginBinding(
-        workflow_run_id=None, browser_session_id=None, refusal=reason, status=status, copilot_run=copilot_run
+        workflow_run_id=None,
+        browser_session_id=None,
+        refusal=reason,
+        status=status,
+        copilot_run=copilot_run,
+        debug_run=debug_run,
+        run=run,
     )
 
 
@@ -127,8 +363,15 @@ async def resolve_repair_origin_binding(
     if run.workflow_permanent_id != workflow_permanent_id:
         return _refused(RepairOriginRefusal.WORKFLOW_MISMATCH)
     copilot_run = run.copilot_session_id is not None
+    debug_run = run.is_debug_session
     if not run.browser_session_id:
-        return _refused(RepairOriginRefusal.NO_RECORDED_BROWSER, status=run.status, copilot_run=copilot_run)
+        return _refused(
+            RepairOriginRefusal.NO_RECORDED_BROWSER,
+            status=run.status,
+            copilot_run=copilot_run,
+            debug_run=debug_run,
+            run=run,
+        )
 
     return RepairOriginBinding(
         workflow_run_id=run.workflow_run_id,
@@ -136,6 +379,8 @@ async def resolve_repair_origin_binding(
         refusal=None,
         status=run.status,
         copilot_run=copilot_run,
+        debug_run=debug_run,
+        run=run,
     )
 
 
@@ -152,6 +397,69 @@ async def _file_id_is_reusable(run_parameter: WorkflowRunParameter, organization
     if uploaded_file is None or uploaded_file.run_id is not None:
         return False
     return await resolve_file_reference(file_id=file_id, organization_id=organization_id) is not None
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+async def _load_origin_outputs(
+    binding: RepairOriginBinding,
+    *,
+    workflow_run_id: str,
+    organization_id: str,
+    run_parameters: list[tuple[WorkflowParameter, WorkflowRunParameter]] | None,
+) -> OriginOutputSnapshot | OriginOutputRefusal:
+    if binding.refusal is not None and binding.refusal is not RepairOriginRefusal.NO_RECORDED_BROWSER:
+        return _BINDING_REFUSAL_TO_OUTPUT_REFUSAL.get(binding.refusal, OriginOutputRefusal.OUTPUT_UNAVAILABLE)
+    if not binding.finished:
+        return OriginOutputRefusal.ORIGIN_UNSETTLED
+    if binding.run is None or run_parameters is None:
+        return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+    # The retention scrubber nulls output values in place and marks the run's failure reason and inputs,
+    # so a scrubbed run's null outputs are not the values its blocks produced.
+    if binding.run.failure_reason == SCRUBBED_VALUE or any(
+        run_parameter.value == SCRUBBED_VALUE for _, run_parameter in run_parameters
+    ):
+        return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+    try:
+        origin_workflow = await app.DATABASE.workflows.get_workflow(
+            workflow_id=binding.run.workflow_id, organization_id=organization_id
+        )
+        # Auto-accept overwrites a version in place, so a row changed after the run started may no
+        # longer be the definition the run executed.
+        if origin_workflow is None or _as_utc(origin_workflow.modified_at) > _as_utc(binding.run.created_at):
+            return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+        # A test of selected blocks never loads a cached script, so an output a script produced is not
+        # what the test's agent run of the same block would produce. `script_run` records that a script
+        # actually loaded, including runs a rollout upgraded to code without declaring run_with.
+        if binding.run.script_run is not None:
+            return OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS
+        # A child run's LLM blocks also render every ancestor's workflow_system_prompt, which a
+        # standalone repair test never inherits.
+        if binding.run.parent_workflow_run_id is not None:
+            return OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS
+        run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        output_parameter_rows = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
+            workflow_run_id=workflow_run_id
+        )
+        return origin_block_outputs_from_rows(
+            origin_workflow.workflow_definition,
+            run_blocks,
+            output_parameter_rows,
+            input_values={parameter.key: run_parameter.value for parameter, run_parameter in run_parameters},
+            settings=OriginExecutionSettings.of(origin_workflow, binding.run),
+        )
+    except Exception as exc:
+        # No exc_info: a row that fails to parse is quoted in its own exception message.
+        LOG.warning(
+            "copilot_repair_origin_outputs_unavailable",
+            workflow_run_id=workflow_run_id,
+            error_type=type(exc).__name__,
+        )
+        return OriginOutputRefusal.OUTPUT_UNAVAILABLE
 
 
 async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str | None) -> RepairOriginBinding:
@@ -178,7 +486,9 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
         _REFUSAL_SENTENCES.get(binding.refusal) if binding.refusal is not None else None
     )
     origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...] = ()
-    if workflow_run_id and binding.refusal in (None, RepairOriginRefusal.NO_RECORDED_BROWSER):
+    owned_run = bool(workflow_run_id) and binding.refusal in (None, RepairOriginRefusal.NO_RECORDED_BROWSER)
+    loaded: list[tuple[WorkflowParameter, WorkflowRunParameter]] | None = None
+    if workflow_run_id and owned_run:
         try:
             loaded = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
             origin_input_values = tuple(
@@ -193,6 +503,21 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
             )
     ctx.repair_origin_input_values = origin_input_values
     ctx.repair_origin_is_copilot_run = binding.copilot_run
+    # A Copilot test run or a debugger block run may itself have been seeded, so neither is ever an
+    # output origin and the turn plans exactly as with no origin.
+    seeded_run = binding.copilot_run or binding.debug_run
+    ctx.repair_origin_outputs_run_id = workflow_run_id if owned_run and not seeded_run else None
+    ctx.repair_origin_outputs = (
+        await _load_origin_outputs(
+            binding,
+            workflow_run_id=workflow_run_id,
+            organization_id=ctx.organization_id,
+            run_parameters=loaded,
+        )
+        if workflow_run_id and not seeded_run
+        else None
+    )
+    origin_outputs = ctx.repair_origin_outputs
     LOG.info(
         "copilot_repair_origin_binding",
         requested_workflow_run_id=workflow_run_id,
@@ -201,5 +526,7 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
         workflow_run_id=binding.workflow_run_id,
         origin_input_keys=[parameter.key for parameter, _ in origin_input_values],
         origin_is_copilot_run=binding.copilot_run,
+        origin_output_labels=sorted(origin_outputs.outputs) if isinstance(origin_outputs, OriginOutputSnapshot) else [],
+        origin_output_refusal=origin_outputs if isinstance(origin_outputs, OriginOutputRefusal) else None,
     )
     return binding

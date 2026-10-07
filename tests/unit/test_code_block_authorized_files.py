@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import Download
+from playwright.async_api import Error as PlaywrightError
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
@@ -23,17 +24,26 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage import base as storage_base_module
 from skyvern.forge.sdk.artifact.storage import local as local_storage_module
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import code_block_authorized_files
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+    AUTHORIZED_FILE_CHOOSER_UNAVAILABLE_ERROR,
     AuthorizedFileAccessError,
+    AuthorizedFileChooserError,
     AuthorizedFileMaterializationFailure,
     BlockDownloadLog,
+    FileChooserHandle,
+    InlineAttach,
+    MaterializedAuthorizedFile,
     RegisteredDownloadIdentity,
     RegisteredDownloadSource,
+    authorized_file_attach_modes,
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     capture_claimed_download,
+    pin_file_chooser,
     read_authorized_file,
 )
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, _registered_download_source
@@ -42,6 +52,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit._file_chooser_fakes import FakeChooserPage, FakeRawCDPChooserPage
 from tests.unit.conftest import SESSION_DOWNLOAD_BYTES as _SESSION_BYTES
 from tests.unit.conftest import make_claimed_download_mock
 from tests.unit.conftest import registered_download_row as _registered_row
@@ -1606,3 +1617,377 @@ async def test_only_a_signed_remote_binding_snapshots_the_registered_downloads(m
         ("certificate.pdf", hashlib.sha256(_SESSION_BYTES).hexdigest()): "certificate.pdf"
     }
     assert probe.await_count == 1
+
+
+def _bind_chooser_attach(
+    raw_page: FakeChooserPage,
+    path: Path,
+    materialized: MaterializedAuthorizedFile,
+    *,
+    workflow_run_id: str = "wr_authorized",
+    organization_id: str = "org_authorized",
+    max_bytes: int = 1024,
+    deadline: float | None = None,
+) -> tuple[RecordingPage, InlineAttach]:
+    recording_page = RecordingPage(raw_page)  # type: ignore[arg-type]
+    attach = bind_inline_attach_authorized_file(
+        recording_page,  # type: ignore[arg-type]
+        {"resume": materialized, "cover_letter": AuthorizedFileMaterializationFailure()},
+        {"resume": str(path), "cover_letter": "https://invalid.example/cover.pdf"},
+        download_root=path.parents[1],
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        max_bytes=max_bytes,
+        locate=recording_page._pinned_locator(),
+        file_chooser=pin_file_chooser(raw_page),
+        deadline=deadline,
+    )
+    return recording_page, attach
+
+
+def _recorded_types(recording_page: RecordingPage) -> list[ActionType]:
+    return [action.action_type for action in recording_page.recorded_actions()]
+
+
+@pytest.mark.asyncio
+async def test_chooser_mode_clicks_the_trigger_once_and_hands_the_verified_bytes_to_the_chooser(
+    authorized_file,
+) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage()
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    receipt = await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert receipt == {"filename": "resume.pdf", "size": len(b"retained authorized bytes")}
+    assert raw_page.clicks == [("#choose-file", True), ("#choose-file", False)]
+    assert [files["buffer"] for files in raw_page.chosen] == [b"retained authorized bytes"]
+    assert raw_page.input_files == []
+    # The trial click goes through the unrecorded raw locator, so the timeline shows the one real click.
+    assert _recorded_types(recording_page) == [ActionType.CLICK]
+    assert raw_page.live_listeners == 0
+
+
+@pytest.mark.asyncio
+async def test_a_chooser_the_page_opens_before_the_real_click_never_receives_the_bytes(authorized_file) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(trial_opens_chooser=True)
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert raw_page.stray_chosen == []
+    assert [files["buffer"] for files in raw_page.chosen] == [b"retained authorized bytes"]
+    assert raw_page.dispatched_clicks == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_options", "phase", "trigger_state", "dispatched", "recorded"),
+    [
+        ({"trial_error": PlaywrightError("strict mode violation: 2 elements")}, "trigger", "not_attempted", 0, []),
+        ({"click_error": PlaywrightError("element was detached")}, "trigger", "unknown", 1, [ActionType.CLICK]),
+        ({"opens_chooser": False}, "chooser", "confirmed", 1, [ActionType.CLICK]),
+        ({"set_files_error": PlaywrightError("chooser closed")}, "attachment", "confirmed", 1, [ActionType.CLICK]),
+    ],
+    ids=["trial-fails", "click-raises", "no-chooser", "set-files-fails"],
+)
+async def test_a_chooser_failure_names_its_phase_and_never_clicks_twice(
+    authorized_file,
+    monkeypatch: pytest.MonkeyPatch,
+    page_options: dict[str, Exception | bool],
+    phase: str,
+    trigger_state: str,
+    dispatched: int,
+    recorded: list[ActionType],
+) -> None:
+    monkeypatch.setattr(code_block_authorized_files, "_CHOOSER_WAIT_SECONDS", 0.2)
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(**page_options)
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    started = time.monotonic()
+    with pytest.raises(AuthorizedFileChooserError) as failure:
+        await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert time.monotonic() - started < 2
+    assert (failure.value.phase, failure.value.trigger_state) == (phase, trigger_state)
+    assert failure.value.__cause__ is None
+    assert "retained authorized bytes" not in str(failure.value)
+    assert raw_page.dispatched_clicks == dispatched
+    assert _recorded_types(recording_page) == recorded
+    assert raw_page.chosen == [] and raw_page.input_files == []
+    assert raw_page.live_listeners == 0
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_chooser_leaves_nothing_for_the_next_attach_to_collect(
+    authorized_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(code_block_authorized_files, "_CHOOSER_WAIT_SECONDS", 0.2)
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(opens_chooser=False)
+    first_page, first_attach = _bind_chooser_attach(raw_page, path, materialized)
+    with pytest.raises(AuthorizedFileChooserError):
+        await first_attach(first_page, str(path), "#choose-file", mode="file_chooser")
+    assert raw_page.live_listeners == 0
+
+    raw_page.opens_chooser = True
+    second_page, second_attach = _bind_chooser_attach(raw_page, path, materialized)
+    await second_attach(second_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert len(raw_page.chosen) == 1
+    assert raw_page.dispatched_clicks == 2
+    assert raw_page.live_listeners == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_chooser_attach_propagates_and_removes_its_listener(authorized_file) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(click_blocks=True)
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    task = asyncio.create_task(attach(recording_page, str(path), "#choose-file", mode="file_chooser"))
+    while raw_page.dispatched_clicks == 0:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert raw_page.live_listeners == 0
+    assert raw_page.dispatched_clicks == 1
+    assert raw_page.chosen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("set_files_stalls", "phase", "trigger_state", "set_files_calls"),
+    [(False, "trigger", "unknown", 0), (True, "attachment", "confirmed", 1)],
+    ids=["click", "set-files"],
+)
+async def test_a_chooser_call_cut_off_by_the_bound_stops_in_the_driver_too(
+    authorized_file,
+    monkeypatch: pytest.MonkeyPatch,
+    set_files_stalls: bool,
+    phase: str,
+    trigger_state: str,
+    set_files_calls: int,
+) -> None:
+    """A call whose caller is cancelled keeps running, so only its own timeout keeps it inside the bound."""
+    monkeypatch.setattr(code_block_authorized_files, "_CHOOSER_WAIT_SECONDS", 0.2)
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(click_outlives_cancel=not set_files_stalls, set_files_outlives_cancel=set_files_stalls)
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    with pytest.raises(AuthorizedFileChooserError) as failure:
+        await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert (failure.value.phase, failure.value.trigger_state) == (phase, trigger_state)
+    assert [trial for _, trial in raw_page.clicks] == [True, False]
+    assert len(raw_page.set_files_timeouts) == set_files_calls
+    timeouts = raw_page.click_timeouts + raw_page.set_files_timeouts
+    assert all(timeout is not None and 1 <= timeout <= 200 for timeout in timeouts)
+    _, still_running = await asyncio.wait(raw_page.driver_calls, timeout=1)
+    assert still_running == set()
+
+
+@pytest.mark.asyncio
+async def test_a_chooser_attach_leaves_an_agent_upload_listener_on_another_page_alone(authorized_file) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage()
+    other_page = FakeChooserPage()
+    other_chosen: list[FileChooserHandle] = []
+    other_handler = other_chosen.append
+    other_page.on("filechooser", other_handler)
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    with skyvern_context.scoped(SkyvernContext()) as context:
+        pending = PendingFileChooserListener(
+            page=other_page,  # type: ignore[arg-type]
+            file_paths=["/tmp/agent-upload.pdf"],
+            handler=other_handler,
+        )
+        context.pending_file_chooser = pending
+        await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+        assert context.pending_file_chooser is pending
+        assert other_page.listeners["filechooser"] == [other_handler]
+
+    assert [files["buffer"] for files in raw_page.chosen] == [b"retained authorized bytes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file", "selector", "mode", "bind_overrides", "tamper"),
+    [
+        ("resume", "#choose-file", "chooser", {}, False),
+        ("resume", "#choose-file", "File_Chooser", {}, False),
+        ("raw-path", "#choose-file", "file_chooser", {}, False),
+        ("https://invalid.example/cover.pdf", "#choose-file", "file_chooser", {}, False),
+        ("resume", "", "file_chooser", {}, False),
+        ("resume", "#choose-file", "file_chooser", {"workflow_run_id": "wr_other"}, False),
+        ("resume", "#choose-file", "file_chooser", {"organization_id": "org_other"}, False),
+        ("resume", "#choose-file", "file_chooser", {"max_bytes": 4}, False),
+        ("resume", "#choose-file", "file_chooser", {}, True),
+    ],
+    ids=[
+        "unknown-mode",
+        "mode-is-exact",
+        "raw-path",
+        "unmaterialized",
+        "empty-selector",
+        "wrong-run",
+        "wrong-org",
+        "oversized",
+        "tampered",
+    ],
+)
+async def test_a_refused_chooser_attach_never_clicks_or_hands_over_bytes(
+    authorized_file,
+    tmp_path: Path,
+    file: str,
+    selector: str,
+    mode: str,
+    bind_overrides: dict[str, str | int],
+    tamper: bool,
+) -> None:
+    path, materialized = authorized_file
+    if tamper:
+        path.write_bytes(b"x" * materialized.size)
+    raw_path = tmp_path / "guessed.pdf"
+    raw_path.write_bytes(b"not authorized")
+    target = {"resume": str(path), "raw-path": str(raw_path)}.get(file, file)
+    raw_page = FakeChooserPage()
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized, **bind_overrides)
+
+    with pytest.raises(AuthorizedFileAccessError) as refusal:
+        await attach(recording_page, target, selector, mode=mode)
+
+    assert "retained authorized bytes" not in str(refusal.value)
+    assert raw_page.clicks == []
+    assert raw_page.chosen == [] and raw_page.input_files == []
+    assert raw_page.live_listeners == 0
+    assert _recorded_types(recording_page) == []
+
+
+@pytest.mark.asyncio
+async def test_a_chooser_attach_on_another_page_is_refused_before_any_click(authorized_file) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage()
+    _, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    with pytest.raises(AuthorizedFileAccessError, match="current CodeBlock page"):
+        await attach(RecordingPage(FakeChooserPage()), str(path), "#choose-file", mode="file_chooser")  # type: ignore[arg-type]
+
+    assert raw_page.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_a_chooser_attach_clears_an_agent_upload_listener_left_on_its_page(authorized_file) -> None:
+    """An agent UPLOAD_FILE whose click opened no chooser leaves its listener armed; it must not fill this chooser."""
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage()
+    foreign: list[FileChooserHandle] = []
+    foreign_handler = foreign.append
+    raw_page.on("filechooser", foreign_handler)
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    with skyvern_context.scoped(SkyvernContext()) as context:
+        context.pending_file_chooser = PendingFileChooserListener(
+            page=raw_page,  # type: ignore[arg-type]
+            file_paths=["/tmp/agent-upload.pdf"],
+            handler=foreign_handler,
+        )
+        receipt = await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+        assert context.pending_file_chooser is None
+
+    assert foreign == []
+    assert receipt == {"filename": "resume.pdf", "size": len(b"retained authorized bytes")}
+    assert [files["buffer"] for files in raw_page.chosen] == [b"retained authorized bytes"]
+    assert raw_page.live_listeners == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remaining", "phase", "trigger_state", "dispatched"),
+    [(1.4, "chooser", "confirmed", 1), (0.5, "trigger", "not_attempted", 0)],
+    ids=["bound-clamped-to-the-deadline", "no-time-left-to-click"],
+)
+async def test_a_chooser_attach_returns_its_typed_failure_before_the_block_deadline(
+    authorized_file, remaining: float, phase: str, trigger_state: str, dispatched: int
+) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(opens_chooser=False)
+    deadline = time.monotonic() + remaining
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized, deadline=deadline)
+
+    with pytest.raises(AuthorizedFileChooserError) as failure:
+        await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert time.monotonic() < deadline
+    assert (failure.value.phase, failure.value.trigger_state) == (phase, trigger_state)
+    assert raw_page.dispatched_clicks == dispatched
+    assert raw_page.live_listeners == 0
+
+
+def test_only_a_playwright_family_page_offers_chooser_mode() -> None:
+    assert authorized_file_attach_modes(FakeChooserPage()) == {"input", "file_chooser"}
+    assert authorized_file_attach_modes(FakeRawCDPChooserPage()) == {"input"}
+    assert authorized_file_attach_modes(_RawPage()) == {"input"}
+    assert pin_file_chooser(FakeRawCDPChooserPage()) is None
+
+
+@pytest.mark.asyncio
+async def test_a_page_without_chooser_mode_reports_it_unavailable_instead_of_filling_an_input(authorized_file) -> None:
+    path, materialized = authorized_file
+    raw_page = FakeRawCDPChooserPage()
+    recording_page, attach = _bind_chooser_attach(raw_page, path, materialized)
+
+    with pytest.raises(AuthorizedFileChooserError) as failure:
+        await attach(recording_page, str(path), "#choose-file", mode="file_chooser")
+
+    assert str(failure.value) == AUTHORIZED_FILE_CHOOSER_UNAVAILABLE_ERROR
+    assert (failure.value.phase, failure.value.trigger_state) == ("chooser", "not_attempted")
+    assert raw_page.clicks == [] and raw_page.input_files == []
+    assert await attach(recording_page, str(path), "#direct-file") == {
+        "filename": "resume.pdf",
+        "size": len(b"retained authorized bytes"),
+    }
+    assert len(raw_page.input_files) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_inline_chooser_failure_after_the_click_is_not_healable(authorized_file) -> None:
+    """The click may have fired, so self-heal must not re-run the block and click the trigger a second time."""
+    path, materialized = authorized_file
+    raw_page = FakeChooserPage(click_error=PlaywrightError("element was detached"))
+    recording_page = RecordingPage(raw_page)  # type: ignore[arg-type]
+    now = datetime.now(UTC)
+    block = CodeBlock(
+        label="chooser_block",
+        code='await attach_authorized_file(page, resume, "#choose-file", mode="file_chooser")',
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="chooser_output",
+            description="test output",
+            output_parameter_id="op_chooser",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        ),
+    )
+    run = block.generate_async_user_function(
+        block.code,
+        recording_page,  # type: ignore[arg-type]
+        {"resume": str(path)},
+        workflow_run_id="wr_authorized",
+        organization_id="org_authorized",
+        authorized_file_materializations={"resume": materialized},
+    )
+
+    with pytest.raises(AuthorizedFileChooserError) as failure:
+        await run()
+
+    assert (failure.value.phase, failure.value.trigger_state) == ("trigger", "unknown")
+    assert block._is_healable_page_failure(failure.value, recording_page) is False
+    assert raw_page.dispatched_clicks == 1
+    assert _recorded_types(recording_page) == [ActionType.CLICK]

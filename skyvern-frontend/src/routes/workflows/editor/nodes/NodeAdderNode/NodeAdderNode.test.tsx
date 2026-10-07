@@ -33,6 +33,8 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { DebugStoreContext } from "@/store/DebugStoreContext";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { usePendingRecordingStartGate } from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
+import { PendingRecordingStartDialog } from "@/routes/workflows/editor/recording/PendingRecordingStartDialog";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
@@ -230,6 +232,39 @@ describe("NodeAdderNode", () => {
       finishCopilotAcceptance(reservation!);
     },
   );
+
+  it("asks to save or discard pending generated changes before recording", async () => {
+    useEdgesMock.mockReturnValue([
+      { id: "edge", source: "start", target: "adder" },
+    ]);
+    useNodesMock.mockReturnValue([{ id: "start", type: "start", data: {} }]);
+    useSettingsStore.getState().setIsUsingABrowser(true);
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    useWorkflowHasChangesStore
+      .getState()
+      .setPendingRecording("br-pending", "wpid_test");
+    const { unmount } = renderNodeAdder({}, { debug: true });
+    await act(async () => fireEvent.click(screen.getByText("Record Task")));
+    expect(useRecordingStore.getState().isRecording).toBe(false);
+    const blockedStart = usePendingRecordingStartGate.getState().blockedStart;
+    expect(blockedStart).not.toBeNull();
+    // Discard regenerates canvas ids, so this entry point must not record after it.
+    render(
+      <PendingRecordingStartDialog
+        onSave={async () => {}}
+        onDiscard={() => {}}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Discard changes" }),
+    ).toBeTruthy();
+    // Discard reloads the graph with new ids, which unmounts this location.
+    unmount();
+    act(() => {
+      expect(blockedStart!()).toBe(false);
+    });
+    expect(useRecordingStore.getState().isRecording).toBe(false);
+  });
 
   it.each(["copilot", "yaml"])(
     "refuses a canvas upload while %s owns the editor",

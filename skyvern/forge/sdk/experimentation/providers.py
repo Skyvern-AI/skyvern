@@ -178,6 +178,10 @@ class BaseExperimentationProvider(ABC):
     async def _prepare_feature_flag_resolution(self, feature_name: str, *, cached: bool) -> None:
         return None
 
+    async def warm_up(self) -> None:
+        """Load whatever flag data evaluations read, ahead of the first one; a no-op when there is none."""
+        return None
+
     def invalidate_resolution_caches(self) -> int:
         """Drop all cached resolutions; returns how many entries were dropped."""
         dropped = (

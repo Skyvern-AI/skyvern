@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -152,6 +152,17 @@ class CredentialRepository(BaseRepository):
                 )
             ).all()
             return [Credential.model_validate(credential) for credential in credentials]
+
+    @db_operation("count_credentials")
+    async def count_credentials(self, organization_id: str) -> int:
+        async with self.Session() as session:
+            query = (
+                select(func.count())
+                .select_from(CredentialModel)
+                .filter_by(organization_id=organization_id)
+                .filter(CredentialModel.deleted_at.is_(None))
+            )
+            return int(await session.scalar(query) or 0)
 
     @db_operation("get_credentials")
     async def get_credentials(

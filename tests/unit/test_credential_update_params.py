@@ -1636,6 +1636,7 @@ async def test_oss_route_allows_disabling_sequential_credential(monkeypatch: pyt
         SimpleNamespace(
             supports_sequential_credentials=lambda: False,
             should_lock_credential_write=AsyncMock(return_value=False),
+            record_audit_event=AsyncMock(),
         ),
     )
 

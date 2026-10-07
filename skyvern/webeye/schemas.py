@@ -13,10 +13,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    API_BROWSER_SESSION_CREATED_BY,
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 
 LOG = structlog.get_logger()
 
@@ -73,6 +75,14 @@ class BrowserSessionResponse(BaseModel):
         default=False,
         description="Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None, description="Browser settings requested when the session was created."
+    )
+    browser_settings_receipt: BrowserSettingsReceipt | None = Field(
+        default=None,
+        description="What the browser reported after launch for the requested settings. Null until it is measured, "
+        "and always null when no settings were requested.",
+    )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     stream_transport: str | None = Field(
         None,
@@ -112,6 +122,9 @@ class BrowserSessionResponse(BaseModel):
         # endpoints serialize an unpaginated set concurrently. Only the single-session fetch —
         # the one live view actually reads — pays for it.
         include_stream_transport: bool = False,
+        # The fan-out endpoints already gather across sessions, so overlapping one session's two
+        # listings there only doubles the request's peak pool checkouts; the polled GET opts in.
+        concurrent_listings: bool = False,
     ) -> BrowserSessionResponse:
         """
         Creates a BrowserSessionResponse from a PersistentBrowserSession object.
@@ -132,40 +145,60 @@ class BrowserSessionResponse(BaseModel):
         downloaded_files: list[FileInfo] = []
         recordings: list[FileInfo] = []
         if storage:
-            try:
-                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    downloaded_files = await storage.get_shared_downloaded_files_in_browser_session(
-                        organization_id=browser_session.organization_id,
-                        browser_session_id=browser_session.persistent_browser_session_id,
-                    )
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "Timeout getting downloaded files", browser_session_id=browser_session.persistent_browser_session_id
-                )
-                if fail_download_lookup:
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail={"code": "downloaded_files_unavailable", "retryable": True},
-                    ) from None
 
-            try:
-                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    recordings = await storage.get_shared_recordings_in_browser_session(
-                        organization_id=browser_session.organization_id,
-                        browser_session_id=browser_session.persistent_browser_session_id,
-                    )
-                    if recordings:
-                        recordings = await app.AGENT_FUNCTION.select_browser_session_recordings(
+            async def list_downloads() -> list[FileInfo]:
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        return await storage.get_shared_downloaded_files_in_browser_session(
                             organization_id=browser_session.organization_id,
                             browser_session_id=browser_session.persistent_browser_session_id,
-                            recordings=recordings,
-                            browser_vendor=browser_session.browser_vendor,
                         )
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "Timeout getting recordings", browser_session_id=browser_session.persistent_browser_session_id
-                )
-                recordings = []
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout getting downloaded files",
+                        browser_session_id=browser_session.persistent_browser_session_id,
+                    )
+                    if fail_download_lookup:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail={"code": "downloaded_files_unavailable", "retryable": True},
+                        ) from None
+                    return []
+
+            async def list_recordings() -> list[FileInfo]:
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        listed = await storage.get_shared_recordings_in_browser_session(
+                            organization_id=browser_session.organization_id,
+                            browser_session_id=browser_session.persistent_browser_session_id,
+                        )
+                        if listed:
+                            listed = await app.AGENT_FUNCTION.select_browser_session_recordings(
+                                organization_id=browser_session.organization_id,
+                                browser_session_id=browser_session.persistent_browser_session_id,
+                                recordings=listed,
+                                browser_vendor=browser_session.browser_vendor,
+                            )
+                        return listed
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout getting recordings", browser_session_id=browser_session.persistent_browser_session_id
+                    )
+                    return []
+
+            if concurrent_listings:
+                # Downloads is awaited first so its outcome still decides the response before recordings can.
+                recordings_task = asyncio.create_task(list_recordings())
+                try:
+                    downloaded_files = await list_downloads()
+                    recordings = await recordings_task
+                finally:
+                    # A downloads failure or a cancelled request must not leave the recordings listing running.
+                    recordings_task.cancel()
+                    await asyncio.gather(recordings_task, return_exceptions=True)
+            else:
+                downloaded_files = await list_downloads()
+                recordings = await list_recordings()
 
             # Sort downloaded files by modified_at in descending order (newest first)
             # Treat None as "oldest".
@@ -220,5 +253,9 @@ class BrowserSessionResponse(BaseModel):
             browser_type=browser_session.browser_type,
             browser_profile_id=browser_session.browser_profile_id,
             generate_browser_profile=browser_session.generate_browser_profile,
-            created_by=browser_session.created_by,
+            browser_settings=browser_session.browser_settings,
+            browser_settings_receipt=browser_session.browser_settings_receipt,
+            created_by=(
+                None if browser_session.created_by == API_BROWSER_SESSION_CREATED_BY else browser_session.created_by
+            ),
         )

@@ -5,6 +5,7 @@ import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
 import type { StreamState } from "@/routes/streaming/streamState";
+import { usePageSlots } from "@/store/PageSlots";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { HeroRecording } from "./runview/HeroRecording";
@@ -31,6 +32,7 @@ export function BrowserTab() {
     liveSurface,
   } = useBrowserPaneView();
   const postHog = usePostHog();
+  const { firstRunWaitCard: FirstRunWaitCard } = usePageSlots();
   const setRunStreamState = useStudioBrowserStore((s) => s.setRunStreamState);
 
   const {
@@ -49,6 +51,7 @@ export function BrowserTab() {
       }
       postHog.capture("run.recording.viewed", {
         org_id: workflowRun.workflow?.organization_id,
+        workflow_permanent_id: workflowRun.workflow?.workflow_permanent_id,
         run_id: workflowRun.workflow_run_id,
         recording_index: index,
         recording_count: recordingUrls.length,
@@ -92,6 +95,11 @@ export function BrowserTab() {
                 detail: "Getting your run's browser ready…",
                 pending: true,
               }}
+              footer={
+                FirstRunWaitCard ? (
+                  <FirstRunWaitCard phase="run_provisioning" />
+                ) : undefined
+              }
             />
           ) : (
             <RunLiveStream
@@ -127,6 +135,11 @@ export function BrowserTab() {
                 "Spinning up the debug browser — this only takes a moment.",
               pending: true,
             }}
+            footer={
+              FirstRunWaitCard ? (
+                <FirstRunWaitCard phase="debug_browser_warming" />
+              ) : undefined
+            }
           />
         )
       ) : view === "recording" ? (
@@ -135,19 +148,12 @@ export function BrowserTab() {
             recordingUrls={recordingUrls}
             onPlay={onRecordingPlay}
           />
-        ) : visuals.recordingArchived ? (
+        ) : (
+          // The Recording view is only offered with URLs or an archived recording.
           <StreamStatusPanel
             diagnostic={{
               title: "Recording archived",
               detail: "To request restoration, contact support@skyvern.com.",
-            }}
-          />
-        ) : (
-          <StreamStatusPanel
-            diagnostic={{
-              title: "No recording for this run",
-              detail:
-                "Screenshots keep a frame for each action the run took — try that view instead.",
             }}
           />
         )

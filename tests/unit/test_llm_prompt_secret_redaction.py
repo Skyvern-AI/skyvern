@@ -13,13 +13,16 @@ from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER, redact_s
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret
 
 
-def _context_with_secret(workflow_run_id: str, token: str, value: str) -> WorkflowRunContext:
+def _context_with_secret(
+    workflow_run_id: str, token: str, value: str, *, mask_secrets: bool = False
+) -> WorkflowRunContext:
     context = WorkflowRunContext(
         workflow_title="t",
         workflow_id="w",
         workflow_permanent_id="wp",
         workflow_run_id=workflow_run_id,
         aws_client=MagicMock(),
+        mask_secrets=mask_secrets,
     )
     context.secrets[token] = value
     return context
@@ -29,9 +32,38 @@ def test_redact_prompt_text_removes_real_secret_and_keeps_placeholder(monkeypatc
     redacted = api_handler_factory._redact_prompt_text(
         "password real-password id placeholder_ab12_password",
         {"real-password"},
+        {"placeholder_ab12_password"},
     )
 
     assert redacted == f"password {REDACTED_SECRET_PLACEHOLDER} id placeholder_ab12_password"
+
+
+def test_prompt_exempts_the_runs_own_token_but_not_a_lookalike(monkeypatch) -> None:
+    """SKY-17864: the exemption is by registered id, not by the ``placeholder_`` shape. A credential
+    whose value is literally "password" must keep the field name in the token the model types back,
+    and the same text behind an unregistered prefix must still be scrubbed.
+    """
+    workflow_run_id = "wr_suffix"
+    token = "placeholder_cd34_password"
+    monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts[workflow_run_id] = _context_with_secret(
+        workflow_run_id, token, "password", mask_secrets=True
+    )
+    monkeypatch.setattr(forge_app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=workflow_run_id)):
+        secret_values = api_handler_factory._current_secret_values_for_redaction()
+        placeholder_ids = api_handler_factory._current_placeholder_ids_for_redaction()
+        redacted = api_handler_factory._redact_prompt_text(
+            f"type {token}, never placeholder_password", secret_values, placeholder_ids
+        )
+
+    assert secret_values == {"password"}
+    assert placeholder_ids == frozenset({token})
+    assert redacted == f"type {token}, never placeholder_{REDACTED_SECRET_PLACEHOLDER}"
+    # The surviving token is still the resolvable one, which is the whole point of exempting it.
+    assert get_actual_value_of_parameter_if_secret(workflow_run_id, token) == "password"
 
 
 def test_current_secret_values_for_redaction_respects_workflow_opt_out(

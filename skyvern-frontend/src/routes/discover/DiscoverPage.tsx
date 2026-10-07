@@ -1,8 +1,5 @@
 import { useEffect, useRef } from "react";
 import { HomeTelemetry } from "@/util/homeTelemetry";
-import { GetStartedModal } from "@/components/onboarding/GetStartedModal";
-import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingErrorBoundary";
-import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import {
@@ -13,8 +10,8 @@ import {
 import { WorkflowTemplates } from "./WorkflowTemplates";
 import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
-import { useSearchParams } from "react-router-dom";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { useLocation, useSearchParams } from "react-router-dom";
+import { FilePlusIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
 
 function getIntentExampleKey(
@@ -22,9 +19,11 @@ function getIntentExampleKey(
 ): ExamplePromptKey {
   switch (intent) {
     case "fill_forms":
-      return "contact_us_forms";
+      return "add_employee";
+    case "job_applications":
+      return "job_application";
     case "extract_data":
-      return "hackernews";
+      return "extractIntegrationsFromSkyvern";
     case "monitor_website":
       return "AAPLStockPrice";
     default:
@@ -40,8 +39,8 @@ type Props = {
 };
 
 function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
-  const enableCopilotHandoff =
-    useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
+  const copilotHandoffFlag = useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF");
+  const enableCopilotHandoff = copilotHandoffFlag === true;
   const createWorkflowMutation = useCreateWorkflowMutation({
     onCreated: revamp ? onRevampComplete : undefined,
   });
@@ -84,6 +83,16 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   // `/discover?focus=prompt` is the sidebar card's first-agent link: focus + prefill once, then drop the param.
   const [searchParams, setSearchParams] = useSearchParams();
   const focusPrompt = searchParams.get("focus") === "prompt";
+  const requestedExample = searchParams.get("example");
+  // Free text arrives in router state rather than the URL, so it never lands in history or logs.
+  const locationState: unknown = useLocation().state;
+  const prefillPrompt =
+    locationState &&
+    typeof locationState === "object" &&
+    "prefillPrompt" in locationState &&
+    typeof locationState.prefillPrompt === "string"
+      ? locationState.prefillPrompt
+      : null;
   useEffect(() => {
     if (!focusPrompt) {
       handledFocus.current = false;
@@ -94,14 +103,20 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
       const promptBox = promptBoxRef.current;
       if (!promptBox) return;
       handledFocus.current = true;
-      promptBox.focusAndPrefillExample(
-        getIntentExampleKey(onboarding?.state?.user_intent),
-      );
+      if (prefillPrompt) {
+        promptBox.focusAndPrefillPrompt(prefillPrompt);
+      } else {
+        promptBox.focusAndPrefillExample(
+          requestedExample,
+          getIntentExampleKey(onboarding?.state?.user_intent),
+        );
+      }
     }
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current);
         next.delete("focus");
+        next.delete("example");
         return next;
       },
       { replace: true },
@@ -110,16 +125,10 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
     focusPrompt,
     onboarding?.isLoading,
     onboarding?.state?.user_intent,
+    prefillPrompt,
+    requestedExample,
     setSearchParams,
   ]);
-
-  const onboardingModal = onboarding ? (
-    <OnboardingErrorBoundary
-      onError={() => OnboardingTelemetry.modalRenderError("discover")}
-    >
-      <GetStartedModal />
-    </OnboardingErrorBoundary>
-  ) : null;
 
   if (revamp) {
     return (
@@ -153,7 +162,6 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
             Skip — start from a blank agent
           </Button>
         </div>
-        {onboardingModal}
       </div>
     );
   }
@@ -161,16 +169,15 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   return (
     <div className="space-y-10">
       <h1 className="sr-only">Create an agent</h1>
-      <div className="space-y-3">
-        <PromptBox
-          ref={promptBoxRef}
-          enableCopilotHandoff={enableCopilotHandoff}
-        />
-        <div className="flex justify-end">
+      <PromptBox
+        ref={promptBoxRef}
+        enableCopilotHandoff={enableCopilotHandoff}
+        handoffFlagLoading={copilotHandoffFlag === undefined}
+        secondaryAction={
           <Button
             variant="ghost"
             size="sm"
-            className="h-11 touch-manipulation text-muted-foreground hover:text-foreground"
+            className="h-11 w-full touch-manipulation gap-2 border border-border/70 text-muted-foreground hover:text-foreground md:h-10 md:w-auto md:border-0"
             disabled={createWorkflowMutation.isPending}
             onClick={() => {
               createWorkflow({
@@ -179,18 +186,21 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
               });
             }}
           >
-            {createWorkflowMutation.isPending && (
+            {createWorkflowMutation.isPending ? (
               <ReloadIcon
                 aria-hidden="true"
-                className="mr-2 h-3 w-3 motion-safe:animate-spin motion-reduce:animate-none"
+                className="h-3 w-3 motion-safe:animate-spin motion-reduce:animate-none"
               />
+            ) : (
+              <FilePlusIcon aria-hidden="true" className="size-4" />
             )}
-            Skip — start with blank canvas →
+            Start with a blank canvas
           </Button>
-        </div>
+        }
+      />
+      <div className="mx-auto w-full max-w-[60rem] pb-8">
+        <WorkflowTemplates />
       </div>
-      <WorkflowTemplates />
-      {onboardingModal}
     </div>
   );
 }

@@ -7,7 +7,11 @@ import {
   commitYamlDraft,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
-import { discardRestoredWorkflowSave } from "@/store/WorkflowHasChangesStore";
+import {
+  discardRestoredWorkflowSave,
+  reloadConflictedWorkflow,
+  useWorkflowHasChangesStore,
+} from "@/store/WorkflowHasChangesStore";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
 import { getClient } from "@/api/AxiosClient";
@@ -92,6 +96,65 @@ function WorkflowSavePendingNotice() {
           </Button>
         </>
       ) : null}
+    </div>
+  );
+}
+
+function WorkflowSaveConflictNotice({
+  onViewHistory,
+}: {
+  onViewHistory?: () => void;
+}) {
+  const credentialGetter = useCredentialGetter();
+  const [reloading, setReloading] = useState(false);
+  const workflowPermanentId = useWorkflowYamlEditorStore(
+    (state) => state.editorOwner?.workflowPermanentId,
+  );
+  const conflicted = useWorkflowHasChangesStore(
+    (state) =>
+      workflowPermanentId !== undefined &&
+      state.saveConflict === workflowPermanentId,
+  );
+  if (!conflicted || !workflowPermanentId) return null;
+  return (
+    <div
+      role="alert"
+      className="flex items-center gap-3 border-b border-border bg-slate-elevation2 px-4 py-2 text-sm"
+    >
+      <span>
+        This workflow was changed elsewhere, so your changes were not saved.
+        Reloading discards them.
+      </span>
+      {onViewHistory ? (
+        <Button variant="outline" size="sm" onClick={onViewHistory}>
+          View history
+        </Button>
+      ) : null}
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={reloading}
+        onClick={async () => {
+          setReloading(true);
+          try {
+            const client = await getClient(credentialGetter);
+            const { data } = await client.get<WorkflowApiResponse>(
+              `/workflows/${workflowPermanentId}`,
+            );
+            reloadConflictedWorkflow(data);
+          } catch {
+            toast({
+              title: "Could not load the latest version",
+              description: "Your changes are still on the canvas. Try again.",
+              variant: "destructive",
+            });
+          } finally {
+            setReloading(false);
+          }
+        }}
+      >
+        Reload latest
+      </Button>
     </div>
   );
 }
@@ -198,6 +261,7 @@ function WorkflowYamlEditor({ workflowId, variant = "fullscreen" }: Props) {
         ) : null}
       </div>
       <WorkflowSavePendingNotice />
+      <WorkflowSaveConflictNotice />
       {error ? (
         <div
           role="alert"
@@ -260,4 +324,8 @@ function WorkflowYamlEditor({ workflowId, variant = "fullscreen" }: Props) {
   );
 }
 
-export { WorkflowYamlEditor, WorkflowSavePendingNotice };
+export {
+  WorkflowYamlEditor,
+  WorkflowSaveConflictNotice,
+  WorkflowSavePendingNotice,
+};

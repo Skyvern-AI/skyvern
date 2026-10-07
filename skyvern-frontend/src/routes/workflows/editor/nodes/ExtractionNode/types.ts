@@ -46,7 +46,7 @@ export const extractionNodeDefaultData: ExtractionNodeData = {
   parameterKeys: [],
   continueOnFailure: false,
   disableCache: false,
-  engine: RunEngine.SkyvernV1,
+  engine: null,
   model: null,
   ignoreWorkflowSystemPrompt: false,
   exportEnabled: false,

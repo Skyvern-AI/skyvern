@@ -731,15 +731,15 @@ class ForLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
     smtp_password: AwsSecretParameter
-    custom_smtp_host: typing.Optional[str] = None
-    custom_smtp_port: typing.Optional[int] = None
-    custom_smtp_username: typing.Optional[str] = None
-    custom_smtp_password: typing.Optional[str] = None
     sender: str
     recipients: typing.List[str]
     subject: str
     body: str
     file_attachments: typing.Optional[typing.List[str]] = None
+    custom_smtp_host: typing.Optional[str] = None
+    custom_smtp_port: typing.Optional[int] = None
+    custom_smtp_username: typing.Optional[str] = None
+    custom_smtp_password: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

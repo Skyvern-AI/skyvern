@@ -31,7 +31,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import ClarificationReason, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.credentials import (
@@ -379,12 +379,21 @@ def test_output_policy_specific_branches_bypass_recorded_terminal_fallback() -> 
     assert "latest run" not in raw_secret.user_response.lower()
 
 
-def test_output_policy_raw_secret_hard_block_uses_safety_reply() -> None:
+@pytest.mark.parametrize(
+    ("clarification_reason", "expected_card_reason"),
+    [("none", "assistant_directed"), ("raw_secret", "raw_secret")],
+)
+def test_output_policy_raw_secret_hard_block_uses_safety_reply(
+    clarification_reason: ClarificationReason, expected_card_reason: str
+) -> None:
     ctx = _ctx()
+    ctx.request_policy = RequestPolicy(clarification_reason=clarification_reason)
 
     result = _blocked_result(ctx, OutputPolicyReason.RAW_SECRET_LEAK)
 
     assert result.user_response == _RAW_SECRET_LEAK_REFUSAL
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialPrompt"] == {"reason": expected_card_reason}
     assert result.turn_outcome is not None
     assert result.turn_outcome.reason_code == "output_policy_block"
     assert result.turn_outcome.terminal_reason == "output_policy_block"

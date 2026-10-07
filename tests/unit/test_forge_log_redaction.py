@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import enum
 import io
@@ -14,7 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 from logging.handlers import BufferingHandler
 from types import MappingProxyType, ModuleType
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote
 
 import pytest
@@ -34,11 +35,18 @@ from skyvern.forge.log_redaction import (
 from skyvern.forge.sdk import forge_log, log_artifacts
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    clear_session_scrub_values,
+    register_secret_scrub_value,
+    scrub_secrets_from_text,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import (
     CODEBLOCK_LOG_REDACTED,
+    _generated_log_value,
     _GeneratedLogValue,
     add_filename_section,
     add_log_context,
@@ -165,12 +173,38 @@ def test_proxy_field_families_render_by_semantics() -> None:
 @pytest.fixture(autouse=True)
 def _isolate_session_scrub_registry() -> Iterator[None]:
     secret_scrub._SESSION_SCRUB_VALUES.clear()
+    secret_scrub._SESSION_SCRUB_CHAT_IDS.clear()
     yield
     secret_scrub._SESSION_SCRUB_VALUES.clear()
+    secret_scrub._SESSION_SCRUB_CHAT_IDS.clear()
 
 
 def _register_credential(value: str) -> None:
     secret_scrub._SESSION_SCRUB_VALUES.setdefault("pbs_1", []).append(value)
+
+
+def _copilot_turn(browser_session_id: str = "pbs_1") -> AgentContext:
+    return AgentContext(
+        organization_id="o_1",
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        workflow_yaml="",
+        browser_session_id=browser_session_id,
+        stream=MagicMock(),
+    )
+
+
+def _register_in_copilot_turn(*values: str) -> SkyvernContext:
+    """Register values the way a Copilot tool does, inside its own request; returns that request."""
+    request = SkyvernContext(request_id="req_copilot", copilot_session_id="wcc_1")
+    with skyvern_context.scoped(request):
+        for value in values:
+            register_secret_scrub_value(_copilot_turn(), value)
+    return request
+
+
+def _request_log_line() -> dict[str, object]:
+    return {"event": "request", "path": "/v1/credentials", "status_code": 401, "duration_seconds": 0.0123, "attempt": 1}
 
 
 def test_redacts_url_encoded_bearer_token() -> None:
@@ -272,6 +306,105 @@ def test_redacts_a_credential_inside_a_tuple_value() -> None:
     out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
 
     assert out["pair"] == ("user", REDACTED_SECRET_PLACEHOLDER)
+
+
+def test_a_short_value_from_another_session_leaves_unrelated_request_lines_alone() -> None:
+    _register_in_copilot_turn("1")
+    line = _request_log_line()
+
+    with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated", browser_session_id="pbs_2")):
+        out = redact_registered_secrets(None, "info", dict(line))  # type: ignore[arg-type]
+
+    assert out == line
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "registering_request",
+        "registering_request_after_close",
+        "same_browser_session",
+        "same_chat",
+        "reader",
+        "reader_after_context_replaced",
+    ],
+)
+def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -> None:
+    request = _register_in_copilot_turn("1")
+    if scope == "registering_request_after_close":
+        clear_session_scrub_values("pbs_1")
+    line_context = {
+        "registering_request": request,
+        "registering_request_after_close": request,
+        "same_browser_session": SkyvernContext(request_id="req_run", browser_session_id="pbs_1"),
+        "same_chat": SkyvernContext(request_id="req_next_turn", copilot_session_id="wcc_1"),
+        "reader": SkyvernContext(request_id="req_other_chat", copilot_session_id="wcc_2"),
+        "reader_after_context_replaced": SkyvernContext(request_id="req_other_chat", copilot_session_id="wcc_2"),
+    }[scope]
+
+    with skyvern_context.scoped(line_context):
+        if scope.startswith("reader"):
+            # Another chat's turn on the same browser scrubs a readback with the session's values.
+            scrub_secrets_from_text(_copilot_turn(), "readback")
+        if scope == "reader":
+            clear_session_scrub_values("pbs_1")
+        if scope == "reader_after_context_replaced":
+            # prepare_workflow swaps in a context that keeps only the request's chat id.
+            skyvern_context.replace(SkyvernContext(request_id="req_other_chat", copilot_session_id="wcc_2"))
+        out = redact_registered_secrets(None, "info", _request_log_line())  # type: ignore[arg-type]
+
+    assert out["path"] == f"/v{REDACTED_SECRET_PLACEHOLDER}/credentials"
+    assert out["attempt"] == REDACTED_SECRET_PLACEHOLDER
+    assert out["status_code"] == 401
+
+
+def test_a_value_from_another_session_applies_from_four_characters() -> None:
+    _register_in_copilot_turn(_FAKE_CREDENTIAL, "q7x", "z9k4", "48392017")
+    event = {"event": f"login failed for {_FAKE_CREDENTIAL}", "codes": "aq7xb xz9k4x", "code": 48392017}
+
+    with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated")):
+        out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
+
+    assert out["event"] == f"login failed for {REDACTED_SECRET_PLACEHOLDER}"
+    assert out["codes"] == f"aq7xb x{REDACTED_SECRET_PLACEHOLDER}x"
+    assert out["code"] == REDACTED_SECRET_PLACEHOLDER
+
+
+@pytest.mark.parametrize("request_context", [None, SkyvernContext(request_id="req_unrelated")])
+def test_a_short_value_from_another_session_is_still_scrubbed_as_a_whole_token(
+    request_context: SkyvernContext | None,
+) -> None:
+    _register_in_copilot_turn("123", "401", "1", "10", "45", "#7")
+    masked = REDACTED_SECRET_PLACEHOLDER
+    scrubbed = {
+        '{"value":"123","cvv": 123,"status":"401"}': f'{{"value":"{masked}","cvv": {masked},"status":"{masked}"}}',
+        "%22123%22": f"%22{masked}%22",
+        "line\\n123": f"line\\n{masked}",
+        "\\u0022123\\u0022": f"\\u0022{masked}\\u0022",
+        "code=x#7": f"code=x{masked}",
+    }
+    kept = ["a123", "0.123", "123.45", "10.0.0.1", "/v1/credentials", "block_1", "2026-10-04T00:45:48.123Z"]
+    event = {"event": "api.raw_request", "scrubbed": list(scrubbed), "kept": kept, "status_code": 401}
+
+    with skyvern_context.scoped(request_context) if request_context else contextlib.nullcontext():
+        out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
+
+    assert out["scrubbed"] == list(scrubbed.values())
+    assert out["kept"] == kept
+    assert out["status_code"] == 401
+
+
+def test_a_copilot_value_replaces_only_its_own_number_and_a_run_secret_any_number_containing_it() -> None:
+    _register_in_copilot_turn("483920")
+    copilot_numbers = [483920, 483920.0, Decimal("483920"), 1483920, 4839201, 0.48392, 48392, 401]
+    run_numbers = [15551234567, 0.5551234567, Decimal("5551234567.25")]
+    event = {"event": "numbers", "copilot": copilot_numbers, "run": run_numbers}
+
+    with skyvern_context.scoped(SkyvernContext(request_id="req_run", runtime_secret_values={"5551234567"})):
+        out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
+
+    assert out["copilot"] == [REDACTED_SECRET_PLACEHOLDER] * 3 + copilot_numbers[3:]
+    assert out["run"] == [REDACTED_SECRET_PLACEHOLDER] * 3
 
 
 @pytest.fixture
@@ -665,6 +798,93 @@ def test_export_payload_scrubs_copied_provenance_and_preserves_sliced_generated_
     assert attributes == original and message.startswith("caller 123")
 
 
+@pytest.mark.parametrize("value", [128, 0.128])
+def test_numeric_provenance_survives_copies_only_at_its_source_field(value: int | float) -> None:
+    generated = _generated_log_value("usage", value)
+    with pytest.raises(AttributeError):
+        generated.field = "copied"
+    with pytest.raises(AttributeError):
+        delattr(generated, "field")
+    attributes = {"usage": copy.deepcopy(generated), "copied": generated, "payload": {"usage": generated}}
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"12"})):
+        first = redact_registered_secrets(logging.getLogger(), "info", attributes)
+        _, exported = redact_registered_log_payload("diagnostic", first)
+    assert exported["usage"] == value and type(exported["usage"]) is type(value)
+    assert exported["copied"] == REDACTED_SECRET_PLACEHOLDER
+    assert exported["payload"]["usage"] == REDACTED_SECRET_PLACEHOLDER
+    assert json.loads(json.dumps(exported))["usage"] == value
+    assert attributes["copied"] == value
+
+
+def test_generated_string_subclasses_cannot_bypass_caller_text_scrubbing() -> None:
+    class CallerValue(_GeneratedLogValue):
+        pass
+
+    credential = "fake-registered-credential"
+    value = CallerValue("diagnostic", ((credential, False),))
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={credential})):
+        _, exported = redact_registered_log_payload("diagnostic", {"diagnostic": value})
+    assert exported["diagnostic"] == REDACTED_SECRET_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "from skyvern.forge.sdk.forge_log import _generated_log_value\n",
+        "from skyvern.forge.sdk import forge_log\nforge_log._generated_log_value('diagnostic', 'fake-credential')\n",
+        "from skyvern.forge.sdk.forge_log import _GeneratedLogInt\n",
+        "from skyvern.forge.sdk.forge_log import _GeneratedLogValue\n",
+        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_copilot_model_usage\n",
+        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_direct_copilot_model_usage\n",
+        "from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id\n",
+        "from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope\n",
+        "from skyvern.forge.sdk.api.llm.config_registry import _register_builtin_config\n",
+        "from skyvern.forge.sdk.forge_log import _model_log_value\n",
+    ],
+)
+def test_uploaded_scripts_reject_direct_private_log_provenance_access(code: str) -> None:
+    from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+    from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
+
+    with pytest.raises(InsecureCodeDetected):
+        is_safe_script_code(code)
+    assert not hasattr(forge_log, "generated_log_value")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "marker.parts = (('fake-registered-credential', True),)",
+        "marker.field = 'diagnostic'",
+        "del marker.parts",
+        "del marker.field",
+    ],
+)
+def test_validated_script_cannot_mutate_registered_model_provenance(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry, _register_builtin_config
+    from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+    from skyvern.schemas.llm import LLMConfig
+
+    monkeypatch.setattr(LLMConfigRegistry, "_configs", {})
+    _register_builtin_config("TEST_IMMUTABLE", LLMConfig("gpt-5.6-terra", [], False, False))
+    code = (
+        "from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry\n"
+        "marker = LLMConfigRegistry.get_config('TEST_IMMUTABLE').model_name\n"
+        f"{mutation}\n"
+    )
+    is_safe_script_code(code)
+    with pytest.raises(AttributeError):
+        exec(code, {})
+    marker = LLMConfigRegistry.get_config("TEST_IMMUTABLE").model_name
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5.6", "fake-registered-credential"})):
+        _, values = redact_registered_log_payload("diagnostic", {"model_name": marker, "copied": marker})
+    assert values["model_name"] == "gpt-5.6-terra"
+    assert values["copied"] == f"gpt-{REDACTED_SECRET_PLACEHOLDER}-terra"
+    assert "fake-registered-credential" not in repr(values)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("registered_log_stream", [True, False], indirect=True)
 async def test_generated_metadata_survives_short_secrets_and_actual_artifact_selection(
@@ -814,6 +1034,8 @@ async def test_generated_metadata_survives_short_secrets_and_actual_artifact_sel
 def test_plain_metadata_names_and_copied_generated_values_are_still_caller_data(
     monkeypatch: pytest.MonkeyPatch, registered_log_stream: io.StringIO, with_context: bool
 ) -> None:
+    # Provenance, not the cross-session floor, is under test: let these short values apply anywhere.
+    monkeypatch.setattr(secret_scrub, "MIN_CROSS_SESSION_LOG_REDACTION_LENGTH", 1)
     _register_credential("123")
     _register_credential("id")
     context = SkyvernContext(workflow_run_id="wr_123", task_id="tsk_123") if with_context else None

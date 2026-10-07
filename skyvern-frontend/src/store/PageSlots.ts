@@ -8,10 +8,15 @@ export type WorkflowRunMilestoneCardProps = Readonly<{
   rerun?: Readonly<{ to: string; state?: unknown }>;
 }>;
 
+export type FirstRunWaitCardProps = Readonly<{
+  phase: "run_provisioning" | "debug_browser_warming";
+}>;
+
 export type PageSlots = {
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowRunsFilterControls?: React.ComponentType;
   workflowRunMilestoneCard?: React.ComponentType<WorkflowRunMilestoneCardProps>;
+  firstRunWaitCard?: React.ComponentType<FirstRunWaitCardProps>;
   workflowCreatorDirectory?: React.ComponentType<{
     children: React.ReactNode;
   }>;
