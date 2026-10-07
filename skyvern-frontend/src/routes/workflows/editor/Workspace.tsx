@@ -211,6 +211,16 @@ import {
 } from "./workflowEditorUtils";
 import { replayPersistedCollapseVisibility } from "./collapse/applyDescendantCollapseVisibility";
 import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
+import { useSyncRunValidationStore } from "./runValidation/useSyncRunValidationStore";
+import {
+  RUN_BLOCKING_SURFACE_TOP,
+  RUN_BLOCKING_SURFACE_TOP_VAR,
+  RunBlockingSurface,
+  WORKFLOW_EDITOR_HEADER_HEIGHT,
+  WORKFLOW_EDITOR_HEADER_HEIGHT_VAR,
+  WORKFLOW_EDITOR_HEADER_TOP,
+  WORKFLOW_EDITOR_HEADER_TOP_VAR,
+} from "./runValidation/RunBlockingSurface";
 import {
   BLOCK_SIDEBAR_WIDTH_VAR,
   HEADER_RIGHT_INSET_CLOSED,
@@ -686,6 +696,7 @@ function Workspace({
     updateEdges,
     highlightBlock,
   } = useWorkflowGraphState(initialNodes, initialEdges);
+  useSyncRunValidationStore(nodes);
   const {
     undo: applyUndo,
     redo: applyRedo,
@@ -2606,6 +2617,9 @@ function Workspace({
           [BLOCK_SIDEBAR_WIDTH_VAR]: embedded
             ? "0px"
             : `${renderedBlockSidebarWidth}px`,
+          [WORKFLOW_EDITOR_HEADER_TOP_VAR]: WORKFLOW_EDITOR_HEADER_TOP,
+          [WORKFLOW_EDITOR_HEADER_HEIGHT_VAR]: WORKFLOW_EDITOR_HEADER_HEIGHT,
+          [RUN_BLOCKING_SURFACE_TOP_VAR]: RUN_BLOCKING_SURFACE_TOP,
         } as React.CSSProperties
       }
     >
@@ -2710,21 +2724,30 @@ function Workspace({
       {/* header panel */}
       {!embedded && (
         <div
+          data-workflow-editor-header=""
+          // Geometry comes from the vars this component publishes above, so the
+          // run-blocking panel's resting offset tracks a header resize.
           className={cn(
-            "absolute left-6 top-8 z-40 h-20 transition-all duration-300 ease-out",
+            "absolute left-6 z-40 transition-all duration-300 ease-out",
+            "top-[var(--workflow-editor-header-top)] h-[var(--workflow-editor-header-height)]",
             headerEffectiveSidebarOpen
               ? HEADER_RIGHT_INSET_OPEN
               : HEADER_RIGHT_INSET_CLOSED,
           )}
           style={{
             transform: headerCollapsed
-              ? "translateY(calc(-100% - 2rem))"
+              ? `translateY(calc(-100% - var(${WORKFLOW_EDITOR_HEADER_TOP_VAR})))`
               : "translateY(0)",
           }}
         >
           <WorkflowHeader />
         </div>
       )}
+
+      {/* Embedded Studio renders this surface in EditorTab; /build keeps it here. */}
+      {!embedded && !workflowPanelState.data?.showComparison ? (
+        <RunBlockingSurface />
+      ) : null}
 
       {/* comparison view (takes precedence over both browser and non-browser modes) */}
       {workflowPanelState.data?.showComparison &&

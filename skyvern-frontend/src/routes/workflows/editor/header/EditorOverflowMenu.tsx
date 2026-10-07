@@ -6,6 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
+import { useId } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
@@ -63,6 +64,7 @@ export function EditorOverflowMenu({
   const saveBlockedReason = useWorkflowHasChangesStore(
     (s) => s.saveBlockedReason,
   );
+  const templateReasonId = useId();
   const isRecording = useRecordingStore((s) => s.isRecording);
   const requestTour = useProductTourStore((s) => s.requestTour);
   const onSave = useSaveWorkflow();
@@ -173,11 +175,9 @@ export function EditorOverflowMenu({
         <DropdownMenuItem
           disabled={disabled}
           aria-disabled={disabled || templateSaveHeld || undefined}
-          aria-label={
-            templateSaveHeld
-              ? `Save as Template (paused): ${saveBlockedReason}`
-              : undefined
-          }
+          // The name stays the action; the visible reason line below is its description.
+          aria-label={templateSaveHeld ? "Save as Template" : undefined}
+          aria-describedby={templateSaveHeld ? templateReasonId : undefined}
           className={cn(templateSaveHeld && "flex-col items-start gap-1")}
           onSelect={(event) => {
             if (disabled || templateSaveHeld) {
@@ -200,7 +200,10 @@ export function EditorOverflowMenu({
           ) : templateSaveHeld ? (
             <>
               <span className="text-muted-foreground">Save as Template</span>
-              <span className="max-w-xs whitespace-normal text-xs text-muted-foreground">
+              <span
+                id={templateReasonId}
+                className="max-w-xs whitespace-normal text-xs text-muted-foreground"
+              >
                 {saveBlockedReason}
               </span>
             </>

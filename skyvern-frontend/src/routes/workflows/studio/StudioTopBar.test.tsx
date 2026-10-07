@@ -530,17 +530,18 @@ describe("SaveButton confirmation gating", () => {
 
     renderSaveButton();
     const save = screen.getByRole("button", {
-      name: "Save workflow (paused): This workflow changed after Copilot staged its proposal.",
+      name: "Save workflow (paused)",
+      description: "This workflow changed after Copilot staged its proposal.",
     });
     expect(save.matches(":disabled")).toBe(false);
     fireEvent.click(save);
 
-    expect(screen.queryByText("Save is paused")).not.toBeNull();
     expect(
-      screen.queryByText(
-        "This workflow changed after Copilot staged its proposal.",
-      ),
-    ).not.toBeNull();
+      screen.getByRole("dialog", {
+        name: "Save is paused",
+        description: "This workflow changed after Copilot staged its proposal.",
+      }),
+    ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: "Reload and discard my edits" }),
     ).not.toBeNull();

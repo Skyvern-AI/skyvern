@@ -122,11 +122,7 @@ function TemplateInputsCard() {
         hasInvalidEdit ||
         Boolean(saveBlockedReason)
       }
-      aria-label={
-        saveBlockedReason
-          ? `Save inputs (paused): ${saveBlockedReason}`
-          : undefined
-      }
+      aria-label={saveBlockedReason ? "Save inputs (paused)" : undefined}
       onClick={save}
     >
       Save inputs
@@ -207,20 +203,14 @@ function TemplateInputsCard() {
             </div>
           );
         })}
-        {saveBlockedReason ? (
-          <TooltipProvider>
-            <ControlTooltip
-              content={
-                <span className="block max-w-xs">{saveBlockedReason}</span>
-              }
-              blocked
-            >
-              {saveButton}
-            </ControlTooltip>
-          </TooltipProvider>
-        ) : (
-          saveButton
-        )}
+        <TooltipProvider>
+          <ControlTooltip
+            reason={saveBlockedReason}
+            blocked={saveBlockedReason !== null}
+          >
+            {saveButton}
+          </ControlTooltip>
+        </TooltipProvider>
       </div>
       <CredentialsModal
         isOpen={creatingFor !== null}
