@@ -16,7 +16,6 @@ import asyncio
 import calendar
 import contextlib
 import dataclasses
-import decimal
 import functools
 import io
 import json
@@ -27,13 +26,11 @@ import re
 import secrets
 import sys
 import time
-import unicodedata
 import weakref
 from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from contextvars import ContextVar
 from datetime import datetime
-from enum import Enum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 from urllib.parse import urlparse
@@ -62,6 +59,18 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     release_target_url,
 )
 from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3.field_commit import (
+    _ZERO_WIDTH_RE,
+    CommitStatus,
+    EntryMatch,
+    _canon_label,
+    _classify_commit,
+    _same_cell_value,
+    _typed_text_landed,
+    compare_text,
+    entry_outcome,
+    unconfirmed_ok,
+)
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
@@ -82,6 +91,8 @@ from skyvern.forge.taskv3.loop import (
     mark_is_filler,
     record_click_dispatched,
     record_covered_layer,
+    record_entry_enter_withheld,
+    record_entry_variant,
     record_hit_class,
     record_resolve_seconds,
     record_text_delta,
@@ -95,6 +106,7 @@ from skyvern.forge.taskv3.run_arms import (
 )
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
@@ -518,21 +530,6 @@ def _with_selector_guard(handler: ToolHandler, diagnose_inert: InertTargetDiagno
     return wrapped
 
 
-# The observable-state vocabulary a readback compares — the same fields observe reports per element.
-# None means "not read"; the classifier treats absence as no-committable-state, never as a value.
-_COMMIT_STATE_KEYS = ("value", "checked", "selected", "pressed")
-
-
-class CommitStatus(str, Enum):
-    OK = "ok"  # state moved in the committing direction, read off exactly one element
-    DID_NOT_COMMIT = "did_not_commit"  # target readable, and it did NOT commit
-    UNVERIFIED = "unverified"  # no readable committable state, or committed but re-resolved to n != 1
-
-
-def _has_committable_state(state: dict[str, Any] | None) -> bool:
-    return isinstance(state, dict) and any(state.get(k) is not None for k in _COMMIT_STATE_KEYS)
-
-
 def _option_str_list(raw: Any) -> list[str] | None:
     """The string options of a declared array, or None when the caller declared no usable array.
 
@@ -552,6 +549,15 @@ SELECTION_REPORT_MAX_OPTIONS = 20
 SELECTION_REPORT_OPTION_WIDTH = 80
 
 
+def _selected_answers(readback: dict[str, Any], asked: str, by_label: bool) -> bool:
+    """Whether a selected option is the one asked for, matched the way the driver selected it: a label
+    whitespace-collapsed, and a `value=` request against an option's value OR its label (Playwright's valueOrLabel)."""
+    asked_label = " ".join(asked.split())
+    values = [v for v in (readback.get("selectedValues") or []) if isinstance(v, str)]
+    labels = [" ".join(lb.split()) for lb in (readback.get("selectedLabels") or []) if isinstance(lb, str)]
+    return asked_label in labels or (not by_label and asked in values)
+
+
 def _selection_report(options: list[str]) -> str:
     shown = [
         m[:SELECTION_REPORT_OPTION_WIDTH] + "…" if len(m) > SELECTION_REPORT_OPTION_WIDTH else m
@@ -560,30 +566,6 @@ def _selection_report(options: list[str]) -> str:
     if len(shown) < len(options):
         return f"{shown!r} (showing {len(shown)} of {len(options)})"
     return repr(shown)
-
-
-def _classify_commit(
-    pre: dict[str, Any] | None, post_matches: int, post: dict[str, Any] | None, *, committed_value: bool | None = None
-) -> CommitStatus:
-    """Classify a value-must-change action from a before/after observable-state readback.
-
-    Ranked fail-closed: a readable did-not-commit is reported whatever the target re-resolved to, because
-    an error halts the rest of a batched turn only when it moved the page -- otherwise the field is
-    reported unfilled and only its same-selector dependents and any later click or Enter are skipped
-    (INV-1 guards the confident ok, not the refusal). A commit read off
-    a target that re-resolved to n != 1 is `unverified` (INV-1); no readable committable state is
-    `unverified` (INV-2). `committed_value` hands in a caller's own value-dimension truth in place of the
-    generic any-field-changed rule.
-    """
-    if post is None or not _has_committable_state(post):
-        return CommitStatus.UNVERIFIED
-    if committed_value is None:
-        if pre is None or not _has_committable_state(pre):
-            return CommitStatus.UNVERIFIED
-        committed_value = any(pre.get(k) != post.get(k) for k in _COMMIT_STATE_KEYS)
-    if not committed_value:
-        return CommitStatus.DID_NOT_COMMIT
-    return CommitStatus.OK if post_matches == 1 else CommitStatus.UNVERIFIED
 
 
 _SURFACE_PUNCT_RE = re.compile(r"[()\[\]{},;\"'\u2018\u2019]")
@@ -618,16 +600,6 @@ def _short_surface_verdict(
     if " ".join(_surface_tokens(chosen)) not in hits:
         return None
     return CommitStatus.OK if len(hits) == 1 and pre is not None else CommitStatus.UNVERIFIED
-
-
-_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
-
-
-def _canon_label(text: str) -> str:
-    """One canonical form for option text: two labels that render alike compare equal (NFKC, zero-width
-    characters dropped, NBSP and runs of whitespace collapsed, casefolded)."""
-    folded = unicodedata.normalize("NFKC", _ZERO_WIDTH_RE.sub("", str(text or "")))
-    return " ".join(folded.replace("\u00a0", " ").split()).casefold()
 
 
 class _TypeaheadPick(NamedTuple):
@@ -6361,18 +6333,23 @@ _Reach = Literal["click", "focus", "press"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
+_ISO_DATE_TEXT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_runtime_secret(text: str) -> bool:
+    ctx = skyvern_context.current()
+    return ctx is not None and text.strip() in ctx.runtime_secret_values
+
+
+# The input types a field-entry record names; any other page-chosen `type` value is logged as one bucket.
+_ENTRY_VARIANT_TYPES = frozenset(
+    {"text", "textarea", "email", "tel", "number", "url", "password", "date", "datetime-local", "month", "time", "week"}
+)
 
 # Same rule observe applies before it shows a field's value.
 _FIELD_VALUE_IS_SECRET_JS = (
     "(el) => {" + OTP_INPUT_PRIVACY_JS + "return el.type === 'password' || isOtpInputValueSecret(el);}"
 )
-
-
-def _typed_text_landed(read: str | None, typed: str) -> bool:
-    # Exact, whitespace included: a field that reformatted or trimmed the text ("3" -> "03", "abc " ->
-    # "abc") is refused rather than judged equivalent; a refusal costs one retry, a wrong equivalence is
-    # a false success.
-    return read is not None and read == typed
 
 
 # The element focus actually went to -- followed into shadow roots -- when it takes typed text and sits at
@@ -6453,28 +6430,6 @@ _GRID_CELL_AT_JS = r"""(grid, [rowAt, col, key, want]) => {
   if (want === 'mounted') return cell.querySelector('input,textarea,[contenteditable]:not([contenteditable="false" i])');
   return editable && cell.contains(a) ? a : null;
 }"""
-
-_PLAIN_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?", re.ASCII)
-# The only renderings a cell may show for a typed number, around whitespace: an optional leading minus, at most one
-# currency sign (Unicode Sc) before or after, comma grouping and decimal places. An allow-list: any other affix differs.
-_RENDERED_NUMBER_RE = re.compile(r"(-?)(\D?)\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(\D?)", re.ASCII)
-# A leading plus sign or zero belongs to an identifier (a phone number, a postal code), so only the exact text matches.
-_IDENTIFIER_NUMBER_RE = re.compile(r"\+|-?0\d")
-
-
-def _same_cell_value(shown: str, typed: str) -> bool:
-    typed = typed.strip()
-    if shown == typed:
-        return True
-    rendered = _RENDERED_NUMBER_RE.fullmatch(shown.strip())
-    if rendered is None or not _PLAIN_NUMBER_RE.fullmatch(typed) or _IDENTIFIER_NUMBER_RE.match(typed):
-        return False
-    sign, before, number, after = rendered.groups()
-    if (before and after) or any(c and unicodedata.category(c) != "Sc" for c in (before, after)):
-        return False
-    # Decimal, not float: long identifiers would round to the same binary value.
-    return decimal.Decimal(sign + number.replace(",", "")) == decimal.Decimal(typed)
-
 
 _APPEND_SETTLE_S = 0.3
 # The only cell editors this path commits: a numeric <input> declaring no list. Any other editor (text, a typeahead,
@@ -15001,20 +14956,20 @@ def build_browser_tools(
                 verdict = _classify_commit({"checked": checked_before}, matches, post_state)
             if verdict is CommitStatus.UNVERIFIED:
                 if post_state is None and not skinned and not verify_toggle:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"{base} — its toggle could not be read back after the click (the control left the page "
                         "or is no longer the only one), so its state could not be verified; re-observe before "
                         "relying on it",
                         data=transition_data,
                     )
                 if post_state is None:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"{base} — the control left the page after the click, so its state could not be "
                         "verified; re-observe before relying on it",
                         data=transition_data,
                     )
                 if matches != 1:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"{base} — it re-resolved to {matches} elements after the click, so its state could "
                         "not be verified; re-observe before relying on it",
                         data=transition_data,
@@ -16003,6 +15958,23 @@ def build_browser_tools(
             shared_surface=shared_surface,
         )
 
+    async def _is_native_date_input(page: Any, selector: str) -> bool:
+        # Any element can carry type="date"; only an <input> the browser treats as a date stores year-month-day.
+        try:
+            return bool(
+                await page.locator(selector).first.evaluate(
+                    "el => el.tagName === 'INPUT' && el.type === 'date'", timeout=2000
+                )
+            )
+        except Exception:
+            return False
+
+    async def _field_placeholder(page: Any, selector: str) -> str | None:
+        try:
+            return await page.locator(selector).first.get_attribute("placeholder", timeout=2000)
+        except Exception:
+            return None
+
     async def _read_field_value(page: Any, selector: str) -> str | None:
         try:
             return str(await page.locator(selector).first.input_value(timeout=2000))
@@ -16928,7 +16900,7 @@ def build_browser_tools(
             await asyncio.sleep(0.15)
 
     async def _settle_date_group(
-        page: Any, selector: str, digits: str, group: dict[str, Any] | None
+        page: Any, selector: str, digits: str, group: dict[str, Any] | None, *, echo: bool
     ) -> tuple[ToolResult | None, dict[str, Any] | None, int]:
         # (error, settled values, segments the page set) after a write into the group's `label` segment. The keys land
         # in earlier segments and a segment written alone is clean, so the group is re-read before each restore and the
@@ -16949,6 +16921,25 @@ def build_browser_tools(
             )
             if ref is None:
                 return unverified, None, 0
+
+            def moved(segments: list[str], held: dict[str, Any]) -> ToolResult:
+                # The group was just read, so the date is known wrong, not unreadable: name each moved segment, with its
+                # value unless the typed text was a secret. A restore's keys can also land in the segment just written.
+                segments = [*segments, *([label] if held[label] != want[label] and label not in segments else [])]
+                shown = "; ".join(
+                    f"the {o} holds {'nothing' if held[o] is None else held[o]}, not "
+                    f"{'empty' if want[o] is None else want[o]}"
+                    if echo
+                    else f"the {o} does not hold its value"
+                    for o in segments
+                )
+                return ToolResult.error(
+                    f"typed into {selector}, but the write moved a segment of the same date and it could not be put "
+                    f"back: {shown}. The date is NOT correct: re-type the {', then the '.join(segments)} one segment "
+                    "per call.",
+                    error_class="date_sibling_moved",
+                )
+
             labels = [*ref, label]
             want: dict[str, int | None] = {**ref, label: int(digits)}
             # Recorded while the segments are still tagged, so an exit that cannot read them leaves the retry a
@@ -16992,7 +16983,7 @@ def build_browser_tools(
                 with contextlib.suppress(Exception):
                     await locator.evaluate(_CARET_TO_END_JS, timeout=2000)
                 if not await _segment_focused(locator):
-                    return unverified, None, 0
+                    return moved(wrong, now), now, 0
                 await _clear_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
                 cleared = ((await _date_segment_state(page, [other])) or {}).get(other, (1, None))[0] is None
                 if want[other] is not None:
@@ -17027,12 +17018,7 @@ def build_browser_tools(
                 return ToolResult.ok(f"typed into {selector}; the write moved and the tool {put_back}"), now, noted
             if not wrong:
                 return None, now, noted
-            error = ToolResult.error(
-                f"typed into {selector}, but the {' and '.join(wrong)} of the same date moved and could not be put "
-                f"back. The date is NOT correct: re-type the {', then the '.join(wrong)} one segment per call.",
-                error_class="date_sibling_moved",
-            )
-            return error, now, noted
+            return moved(wrong, now), now, noted
         finally:
             with contained_effect("date siblings settled log"):
                 LOG.info("taskv3 date siblings settled", segment=label, tool_call_seq=current_tool_call_seq(), **stats)
@@ -17498,7 +17484,7 @@ def build_browser_tools(
         if (navigated := await _commit_with_tab(page, selector)) is not None:
             return navigated
         date_error, now, noted = await _settle_date_group(
-            page, selector, digits, {"label": label, "ref": ref, "write": write}
+            page, selector, digits, {"label": label, "ref": ref, "write": write}, echo=not text_is_secret
         )
         if date_error is not None and committed and date_error.status != "ok":
             return date_error
@@ -17738,12 +17724,14 @@ def build_browser_tools(
         await _require_single_target(page, selector)
         selector = await _resolve_mirrored_host_control(page, selector)
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
+        # A secret source resolved the text, or it is a value a tool delivered as secret (a one-time code typed as is).
+        typed_secret = text != args.get("text", "") or _is_runtime_secret(text)
         press_enter = args.get("press_enter")
         # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
         url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
         if clear and not press_enter:
-            cell_result = await _type_into_grid_cell(page, selector, text, echo=text == args.get("text", ""))
+            cell_result = await _type_into_grid_cell(page, selector, text, echo=not typed_secret)
             if cell_result is not None:
                 return cell_result
         date_group: dict[str, Any] | None = None
@@ -17792,7 +17780,7 @@ def build_browser_tools(
                             target_label,
                             segment_digits,
                             labels,
-                            text_is_secret=text != args.get("text", ""),
+                            text_is_secret=typed_secret,
                             write=write,
                         )
                 # The plain path types a month/year or year-only segment, so its group is tagged here only to read
@@ -17871,7 +17859,7 @@ def build_browser_tools(
                 return await _open_observe_pick(page, selector, text)
             opened_by_typing = await _list_opened_on_an_empty_field(page, selector)
             result = await _type_typeahead_commit(
-                page, selector, text, text_is_secret=text != args.get("text", ""), date_group=date_group
+                page, selector, text, text_is_secret=typed_secret, date_group=date_group
             )
             return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
         # The types that skip the typeahead probe still must not be typed into through an overlay.
@@ -17883,8 +17871,24 @@ def build_browser_tools(
             return _not_editable_error(exc)
         if not reachable:
             return _covered_error(selector, occluder)
+        written = text
         if clear:
-            await input_dispatch.fill(page, selector, text, timeout=_ACTION_TIMEOUT_MS)
+            if (
+                field_type == "date"
+                and text
+                and not _ISO_DATE_TEXT_RE.fullmatch(text.strip())
+                and await _is_native_date_input(page, selector)
+            ):
+                # A date input takes only YYYY-MM-DD; the order comes from its own mask or an unambiguous reading.
+                written = canonical_iso_date(text, await _field_placeholder(page, selector)) or ""
+                if not written:
+                    shown = "the text" if typed_secret else repr(_mask_refs(text))
+                    return ToolResult.error(
+                        f"{selector} is a date field that stores year-month-day, and {shown} is not a date or could "
+                        "be read as more than one date, so nothing was typed. Type it as YYYY-MM-DD.",
+                        error_class="date_format_refused",
+                    )
+            await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
             if box_text and await _read_field_value(page, selector) != text:
                 return ToolResult.error(
                     f"typed into {selector}, but it takes one character and does not hold the typed text "
@@ -17921,9 +17925,7 @@ def build_browser_tools(
                     # page.type() would focus the field again, and a fresh focus puts the caret back at the start.
                     sent = await _type_keys_before_deadline(text, press_end=at_end == "end_key")
                     if sent < len(text):
-                        progress = (
-                            "partway" if text != args.get("text", "") else f"after {sent} of {len(text)} characters"
-                        )
+                        progress = "partway" if typed_secret else f"after {sent} of {len(text)} characters"
                         return ToolResult.error(
                             f"typing into {selector} stopped {progress} because the field took keys too slowly, "
                             "so the text is NOT confirmed. Check what the page shows before typing again, and "
@@ -17932,20 +17934,36 @@ def build_browser_tools(
                         )
                 else:
                     await input_dispatch.type_keys(page, selector, text, timeout=_typing_timeout_ms(text))
-                not_held = await _appended_text_not_held(
-                    field, selector, text, before, text_is_secret=text != args.get("text", "")
-                )
+                not_held = await _appended_text_not_held(field, selector, text, before, text_is_secret=typed_secret)
             finally:
                 if not hasattr(field, "first"):
                     await field.dispose()
             if not_held is not None:
                 return not_held
+        entry = (
+            await _entry_read_back(
+                page,
+                selector,
+                written,
+                variant=f"native_{field_type}" if field_type in _ENTRY_VARIANT_TYPES else "native_other",
+                echo=not typed_secret,
+            )
+            if clear and text and not box_text
+            else ToolResult.ok(f"typed into {selector}")
+        )
+        if entry.status == "error":
+            return entry
         if password_anchor is not None:
             input_dispatch.note_secret_fill(page, password_anchor)
-        if press_enter:
+        if press_enter and entry.ok_class == "held_differs":
+            # Enter would submit a value the field shows is not the one typed, before the batch rule could hold it back;
+            # an unreadable field is no such evidence, so Enter still goes there, as before.
+            entry.content += " Enter was not pressed: check the field, then press Enter once it holds the value."
+            record_entry_enter_withheld()
+        elif press_enter:
             await input_dispatch.press(page, selector, "Enter")
-            return ToolResult.ok(f"typed into {selector}", data={"url_before": url_before})
-        return ToolResult.ok(f"typed into {selector}")
+            entry.data = {**(entry.data or {}), "url_before": url_before}
+        return entry
 
     async def _field_evaluate(field: Any, js: str) -> Any:
         # `field` is a locator or an element handle; only a locator's evaluate takes a timeout.
@@ -18321,6 +18339,29 @@ def build_browser_tools(
             error_class="text_not_held",
         )
 
+    async def _entry_read_back(
+        page: Any, selector: str, text: str, *, variant: str, echo: bool, before: str | None = None
+    ) -> ToolResult:
+        # The one exit for a write no other check read: a single read, and one re-read only on a mismatch, since a
+        # page may finish formatting a beat after the write.
+        record_entry_variant(variant)
+        held = await _read_field_value(page, selector)
+        if held == text:
+            return entry_outcome(selector, EntryMatch.SAME, shown=None)
+        try:
+            secret_field = bool(await page.locator(selector).first.evaluate(_FIELD_VALUE_IS_SECRET_JS, timeout=2000))
+        except Exception:
+            secret_field = True
+        # A secret is opaque: a changed case or a dropped space is a different value, never a reformat.
+        exact = secret_field or not echo
+        match = compare_text(text, held, before, exact=exact)
+        if match is not None and match not in (EntryMatch.SAME, EntryMatch.REFORMATTED):
+            await asyncio.sleep(0.15)
+            held = await _read_field_value(page, selector)
+            match = compare_text(text, held, before, exact=exact)
+        shown = _masked_echo(held) if held is not None and not exact else None
+        return entry_outcome(selector, match, shown=shown)
+
     async def _value_changed_by_page_error(
         page: Any, selector: str, typed: str, held: str, *, echo: bool
     ) -> ToolResult:
@@ -18385,9 +18426,18 @@ def build_browser_tools(
             if not reacted:
                 if (navigated := await _commit_with_tab(page, selector)) is not None:
                     return navigated
-                date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+                date_error, settled, _ = await _settle_date_group(
+                    page, selector, text.strip(), date_group, echo=not text_is_secret
+                )
                 held = await _read_field_value(page, selector)
-                landed = _typed_text_landed(held, text)
+                # A segment shows its value padded ("9" as "09"); the settle already compared the group by integer,
+                # and a confirmed segment there is the write landing.
+                landed = _typed_text_landed(held, text) or (
+                    date_group is not None
+                    and (date_error is None or date_error.status == "ok")
+                    and settled is not None
+                    and settled.get(date_group["label"]) == int(text.strip())
+                )
                 siblings_moved = len(collateral)
                 LOG.info(
                     "taskv3 type focus fallback",
@@ -18502,7 +18552,7 @@ def build_browser_tools(
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"typed into {selector}; it is a typeahead — selected {suggestion!r}, and the "
                     f"field now shows {pick.shared_surface!r}, which cannot be tied to this pick alone, "
                     "so the commit could not be verified — re-observe to confirm the value before "
@@ -18511,7 +18561,7 @@ def build_browser_tools(
             if verdict is CommitStatus.UNVERIFIED and matches != 1:
                 # INV-1: the field re-resolved to n≠1 after the click (remounted or now ambiguous), so
                 # there is no stable element to read the commit off — soft, not a false did-not-commit.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"clicked suggestion {suggestion!r} for {selector}, but it re-resolved to {matches} "
                     "elements so the commit could not be verified — re-observe to confirm the value "
                     "before relying on it"
@@ -18524,7 +18574,7 @@ def build_browser_tools(
                 # follows the read.
                 why = await _unverifiable_because(page, selector)
                 if why:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"clicked suggestion {suggestion!r} for {selector}; {why}, so the commit could not "
                         "be verified — re-observe to confirm the value before relying on it"
                     )
@@ -18544,7 +18594,7 @@ def build_browser_tools(
             # A segment the click reached is not exempt: its keys can still land in an earlier segment.
             if (navigated := await _commit_with_tab(page, selector)) is not None:
                 return navigated
-            date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+            date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group, echo=not text_is_secret)
             if date_error is not None:
                 return date_error
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
@@ -18554,7 +18604,7 @@ def build_browser_tools(
         # raw text it turns an honest failure into a confident wrong answer on a form we submit.
         why = await _unverifiable_because(page, selector)
         if why:
-            return ToolResult.ok(
+            return unconfirmed_ok(
                 f"typed into {selector} — {why}, so the typeahead check could not see it and no "
                 "commit was verified; re-observe to confirm the value before relying on it"
             )
@@ -18563,7 +18613,12 @@ def build_browser_tools(
             refused := await _held_value_no_match(page, selector, text, pre_value, echo=not text_is_secret)
         ):
             return refused
-        return ToolResult.ok(f"typed into {selector}")
+        if date_group:
+            # The settle above already read the group back against its own segment values.
+            return ToolResult.ok(f"typed into {selector}")
+        return await _entry_read_back(
+            page, selector, text, variant="text", echo=not text_is_secret, before=pre_value or None
+        )
 
     async def _anchor_typeable(page: Any, selector: str) -> bool:
         # Fail-open on a probe error: a transient evaluate failure must not flip a valid typeahead into
@@ -19525,14 +19580,14 @@ def build_browser_tools(
         if verdict is CommitStatus.OK:
             return ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})")
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
-            return ToolResult.ok(
+            return unconfirmed_ok(
                 f"selected {matched!r} for {selector}, but it re-resolved to {matches} elements so the "
                 "commit could not be verified — re-observe to confirm the value before relying on it"
             )
         if verdict is CommitStatus.UNVERIFIED:
             why = await _unverifiable_because(page, selector)
             if why:
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"selected {matched!r} for {selector}; {why}, so the commit could not be verified — "
                     "re-observe to confirm the value before relying on it"
                 )
@@ -19642,14 +19697,14 @@ def build_browser_tools(
             if not committed and shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"selected {opt_txt!r} for {selector}; the field now shows {shared_surface!r}, which "
                     "cannot be tied to this pick alone, so the commit could not be verified — re-observe "
                     "to confirm the value before relying on it"
                 )
             if verdict is CommitStatus.UNVERIFIED and matches != 1:
                 # INV-1: re-resolved to n≠1 after the click — no stable element to read the commit off.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"selected {opt_txt!r} for {selector}, but it re-resolved to {matches} elements so the "
                     "commit could not be verified — re-observe to confirm the value before relying on it"
                 )
@@ -19658,7 +19713,7 @@ def build_browser_tools(
                 # beyond the verifier, so the read returning nothing is not evidence the value did not commit.
                 why = await _unverifiable_because(page, selector)
                 if why:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
                         "re-observe to confirm the value before relying on it"
                     )
@@ -19889,7 +19944,7 @@ def build_browser_tools(
                 # note for that reach case first.
                 why = await _unverifiable_because(page, selector)
                 if why:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"typed {query or value!r} into {selector}; {why}, so the suggestion list could not be seen "
                         "and no selection was verified — re-observe to confirm the value committed before "
                         "relying on it"
@@ -20086,12 +20141,11 @@ def build_browser_tools(
             by_label, asked = True, [label]
             await input_dispatch.select_option(page, selector, label=label, timeout=_ACTION_TIMEOUT_MS, force=force)
         else:
-            by_label, asked = False, ([value] if isinstance(value, str) else [])
+            by_label, asked = False, ([str(value)] if value is not None else [])
             await input_dispatch.select_option(page, selector, value=value, timeout=_ACTION_TIMEOUT_MS, force=force)
-        # A set-valued control is read back whether or not it was forced: without it a call that
-        # discarded every prior selection reports the same bare success as one that added to them.
-        if not force and not is_multi:
-            return ToolResult.ok(f"selected on {selector}")
+        # Every select is read back: a page handler can refuse or reset a choice, and a set-valued control's call
+        # that discarded every prior selection otherwise reports the same bare success as one that added to them.
+        record_entry_variant("select_native_multiple" if is_multi else "select_native")
         try:
             readback = await page.evaluate(_SELECT_READBACK_JS, await _probe_arg(page, selector))
         except Exception:
@@ -20114,10 +20168,12 @@ def build_browser_tools(
                 # selects a duplicate-valued sibling leaves the control holding two options the form
                 # will submit twice, and comparing two sets reports that exact. Asking for the same
                 # option twice is still one request, so the ask is deduped rather than both sides.
-                committed_value = sorted(held) == sorted(set(expected))
+                committed_value = len(held) == len(set(expected)) and all(
+                    _selected_answers(readback, e, by_label) for e in set(expected)
+                )
             else:
                 post = {"value": value_read}
-                committed_value = readback.get("selectedLabel") == label if label is not None else value_read == value
+                committed_value = bool(asked) and _selected_answers(readback, asked[0], by_label)
         matches = await _post_match_count(page, selector)
         verdict = _classify_commit(None, matches, post, committed_value=committed_value)
         if verdict is CommitStatus.DID_NOT_COMMIT:
@@ -20126,11 +20182,19 @@ def build_browser_tools(
                     f"select on {selector} did NOT commit the requested set: asked for "
                     f"{_selection_report(expected)}, it now holds {_selection_report(held)} — one call "
                     "REPLACES the whole selection, so pass every option "
-                    "you want held in a single call via `values` or `labels`"
+                    "you want held in a single call via `values` or `labels`",
+                    error_class="did_not_commit",
+                )
+            if force:
+                return ToolResult.error(
+                    f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
+                    "widget may not sync from its hidden control; re-observe and act on the visible proxy instead",
+                    error_class="did_not_commit",
                 )
             return ToolResult.error(
-                f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
-                "widget may not sync from its hidden control; re-observe and act on the visible proxy instead"
+                f"select on {selector} did NOT commit: it reads {value_read!r} afterwards, not the option asked "
+                "for — the page may have refused or reset the choice; re-observe before retrying",
+                error_class="did_not_commit",
             )
         if verdict is CommitStatus.UNVERIFIED:
             reason = (
@@ -20138,7 +20202,7 @@ def build_browser_tools(
                 if post is None
                 else f"it re-resolved to {matches} elements afterwards"
             )
-            return ToolResult.ok(
+            return unconfirmed_ok(
                 f"selected on {selector} — {reason}, so the selection could not be verified; re-observe "
                 "before relying on it"
             )
@@ -20146,7 +20210,9 @@ def build_browser_tools(
             return ToolResult.ok(
                 f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}"
             )
-        return ToolResult.ok(f"selected on {selector} (hidden native select, set directly)")
+        return ToolResult.ok(
+            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}"
+        )
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()

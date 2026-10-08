@@ -282,6 +282,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("organizations", "slug", "VARCHAR"),
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
+    ("google_oauth_credentials", "google_subject", "VARCHAR"),
 )
 
 

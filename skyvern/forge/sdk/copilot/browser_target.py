@@ -13,6 +13,7 @@ from enum import StrEnum
 from typing import Any
 
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.utils.strings import join_phrases
 
 BROWSER_TARGET_PARAM_NAME = "target"
 
@@ -95,7 +96,10 @@ def resolve_browser_session_binding(copilot_ctx: AgentContext, arguments: dict[s
             session_id_override=None,
             workflow_run_id=None,
             source_matches_target=False,
-            unavailable_reason=f"Unknown browser target {requested!r}. Name 'debug' or 'last_run'.",
+            unavailable_reason=(
+                f"Unknown browser target {requested!r}. "
+                f"Name {join_phrases([repr(target.value) for target in BrowserTarget], 'or')}."
+            ),
         )
     if target is BrowserTarget.DEBUG:
         return BrowserSessionBinding(

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from urllib.parse import urlparse
 
@@ -191,17 +192,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     RegisteredArtifactEvidence,
     _build_test_connect_failure_result,
     acquire_fresh_exit_browser_session,
-    browser_page_custody_lock,
+    browser_session_lock,
     browser_session_recovery,
     close_browser_session_quietly,
     ensure_build_test_browser_session,
     record_attached_browser_driver,
-    record_sensitive_origin_run_taint,
-    register_sensitive_origin_run_lease,
-    release_sensitive_origin_run_lease,
     resolve_persistent_browser_state,
-    sensitive_origin_page_is_tainted,
-    sensitive_origin_runs_for_session,
     verify_build_test_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -221,7 +217,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_totp_runtime_values
 from skyvern.forge.sdk.copilot.secret_scrub import (
     is_registered_scrub_value,
-    register_matching_origin_run_redaction_values,
     register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
     scrub_secrets_from_text,
@@ -1001,12 +996,8 @@ async def _resolve_post_run_page_info(
     *,
     run_block_rows: list[WorkflowRunBlock],
     dispatch_to_worker: bool,
-    sensitive_origin_run: bool,
     run_session_id: str | None,
 ) -> tuple[str, str, str | None]:
-    """Return model-visible terminal page facts without reading or retaining a sensitive origin."""
-    if sensitive_origin_run:
-        return "", "", None
     if dispatch_to_worker:
         dispatched_end_url = _dispatched_end_url(run_block_rows)
         return dispatched_end_url or "", "", dispatched_end_url
@@ -1075,15 +1066,15 @@ def _attach_block_fact_projection(
     per_block_action_observations: dict[str, list[str]],
     *,
     unreported_predecessor_labels: list[str],
-    sensitive_origin_run: bool,
+    withhold_end_urls: bool = False,
 ) -> None:
     """Every run outcome carries the per-block page facts, so a failure exit that skips them reads
     downstream as a run that recorded nothing rather than one whose facts were dropped."""
     notices: list[str] = []
-    observed_block_end_urls = {} if sensitive_origin_run else _model_visible_block_end_urls(run_block_rows, notices)
+    observed_block_end_urls = {} if withhold_end_urls else _model_visible_block_end_urls(run_block_rows, notices)
     if observed_block_end_urls:
         data["observed_block_end_urls"] = observed_block_end_urls
-    if sensitive_origin_run:
+    if withhold_end_urls:
         notices = [OBSERVED_BLOCK_END_URLS_WITHHELD]
     if unreported_predecessor_labels:
         append_omission_notice(
@@ -1315,6 +1306,7 @@ async def _watchdog_error_message(
     run: WorkflowRun | None,
     budget_seconds: int,
     dispatch_to_worker: bool = False,
+    origin_registry: OriginRunRedactionRegistry | None = None,
 ) -> str:
     """LLM-facing error string for a non-success watchdog exit. No variant uses
     "timed out" or other retry-inviting phrasing — those are SKY-9163 traps.
@@ -1322,10 +1314,7 @@ async def _watchdog_error_message(
     ``dispatch_to_worker`` runs skip the ``_fallback_page_info`` CDP read: the worker
     owns the run's persistent browser session, so the API must not attach to it.
     """
-    suppress_live_page = dispatch_to_worker or _origin_registry_contains_sensitive_values(
-        ctx.origin_run_redaction_registry,
-        workflow_run_id,
-    )
+    suppress_live_page = dispatch_to_worker or _origin_run_secrets_unregistered(origin_registry, workflow_run_id)
     if exit_reason == "paused":
         # A pause is a healthy waiting state rather than an uncertain outcome, so it returns here
         # instead of picking up the shared "outcome is uncertain" tail below.
@@ -2694,34 +2683,16 @@ async def _capture_and_store_post_run_page(
     run_session_id: str,
     run_id: str,
     current_url: str,
-    origin_redaction_registry: OriginRunRedactionRegistry | None = None,
 ) -> BuildTestPacketPageCapture:
     """A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
-    registry = origin_redaction_registry or ctx.origin_run_redaction_registry
-    sensitive_origin_run = _origin_registry_contains_sensitive_values(registry, run_id)
-    if sensitive_origin_run and registry is not None and registry.contains_all_sensitive_values:
-        register_secret_scrub_values_from_structure(ctx, registry.parameters)
-        ctx.origin_runs_bound_to_scrubber.add(run_id)
-    if (
-        registry is not None
-        and registry.workflow_run_id == run_id
-        and registry.contains_sensitive_values
-        and not registry.contains_all_sensitive_values
-    ):
-        ctx.composition_page_evidence = None
-        return BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
     evidence, observed_session_id, _, captured_frame = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
     if evidence is not None and repair_page_evidence_is_admissible(evidence):
         # Scrubbing is keyed to the values themselves, not to who ran: a run that fills no
-        # credential can still read a page an earlier run filled one into. It is a no-op when
-        # nothing is registered, so it is unconditional. A frame's pixels cannot be scrubbed, so it
-        # goes whenever the browser carries a sign-in — this run's or one it resumed.
+        # credential can still read a page an earlier run filled one into.
         evidence = scrub_secrets_from_structure(ctx, evidence)
-        if sensitive_origin_run or _run_browser_carries_a_sign_in(ctx, run_session_id):
-            captured_frame = None
         _, preserved_stored_evidence = store_post_run_page_evidence(
             ctx,
             evidence,
@@ -2731,12 +2702,7 @@ async def _capture_and_store_post_run_page(
             run_browser_session_id=run_session_id,
         )
         same_run_stored_evidence = _same_run_page_evidence_for_result(ctx, run_id)
-        if (
-            captured_frame is not None
-            and not preserved_stored_evidence
-            and same_run_stored_evidence is not None
-            and not sensitive_origin_run
-        ):
+        if captured_frame is not None and not preserved_stored_evidence and same_run_stored_evidence is not None:
             enqueue_screenshot(
                 ctx,
                 captured_frame.b64,
@@ -2793,6 +2759,17 @@ def _origin_registry_contains_sensitive_values(
     workflow_run_id: str,
 ) -> bool:
     return registry is not None and registry.workflow_run_id == workflow_run_id and registry.contains_sensitive_values
+
+
+def _origin_run_secrets_unregistered(registry: OriginRunRedactionRegistry | None, workflow_run_id: str) -> bool:
+    """Whether the run carried secrets the scrubber has not been given, which is the case until the
+    worker's terminal handoff arrives."""
+    return (
+        registry is not None
+        and registry.workflow_run_id == workflow_run_id
+        and registry.contains_sensitive_values
+        and not registry.contains_all_sensitive_values
+    )
 
 
 def _sensitive_parameter_keys_requiring_resolved_values(workflow: Workflow) -> list[str]:
@@ -2921,17 +2898,10 @@ async def _capture_dispatched_terminal_page_evidence(
     its presence never proved the run had reached its terminal page."""
     if _pre_run_baseline_is_provenance_valid(ctx.composition_page_evidence):
         _pin_pre_run_page_reference(ctx, run_id)
-    matching_sensitive_registry = _origin_registry_contains_sensitive_values(origin_redaction_registry, run_id)
-    source = "worker_artifact" if matching_sensitive_registry else "cdp_run_session"
-    source_session_id: str | None
-    if matching_sensitive_registry:
-        evidence = None
-        source_session_id = run_session_id
-        captured_frame = None
-    else:
-        evidence, source_session_id, _, captured_frame = await _read_run_session_page_evidence(
-            ctx, run_session_id=run_session_id, current_url=current_url
-        )
+    source = "cdp_run_session"
+    evidence, source_session_id, _, captured_frame = await _read_run_session_page_evidence(
+        ctx, run_session_id=run_session_id, current_url=current_url
+    )
     # A capture that landed on a substituted session can still look usable (a blank replacement page
     # satisfies the schema check), and stamping it honestly would then refuse it, leaving the run with
     # nothing. The worker artifact is the run's own page, so prefer it over any foreign-session read.
@@ -2952,11 +2922,7 @@ async def _capture_dispatched_terminal_page_evidence(
         )
     if evidence is None or not _dispatched_terminal_page_evidence_is_usable(evidence):
         return
-    # Same rule as the inline capture: values are scrubbed whoever ran, and a frame whose pixels
-    # cannot be scrubbed goes whenever the browser carries a sign-in, including one this run resumed.
     evidence = scrub_secrets_from_structure(ctx, evidence)
-    if _run_browser_carries_a_sign_in(ctx, run_session_id):
-        captured_frame = None
     _, preserved_stored_evidence = store_post_run_page_evidence(
         ctx,
         evidence,
@@ -2965,15 +2931,7 @@ async def _capture_dispatched_terminal_page_evidence(
         source_browser_session_id=source_session_id,
         run_browser_session_id=run_session_id,
     )
-    if (
-        captured_frame is not None
-        and not preserved_stored_evidence
-        and not (
-            origin_redaction_registry is not None
-            and origin_redaction_registry.workflow_run_id == run_id
-            and origin_redaction_registry.contains_sensitive_values
-        )
-    ):
+    if captured_frame is not None and not preserved_stored_evidence:
         enqueue_screenshot(
             ctx,
             captured_frame.b64,
@@ -3195,17 +3153,19 @@ async def _bind_origin_run_redaction_registry(
             sensitive_values_complete = False
         serialized.update(serialized_credentials)
         serialized_artifact_parameters.update(serialized_credentials)
+    # Secrets the worker resolves itself (an aws_secret, a vault credential) are never in the dispatch
+    # data; the terminal handoff carries them, so an incomplete registry waits for it.
+    awaiting_runtime_secret_values = awaiting_runtime_secret_values or not sensitive_values_complete
     registry = OriginRunRedactionRegistry(
         workflow_run_id=workflow_run_id,
         parameters=dict(serialized),
         contains_sensitive_values=bool(sensitive_parameter_keys or credential_ids),
-        contains_all_sensitive_values=sensitive_values_complete and not awaiting_runtime_secret_values,
-        contains_all_static_sensitive_values=sensitive_values_complete,
+        contains_all_sensitive_values=not awaiting_runtime_secret_values,
         awaiting_runtime_secret_values=awaiting_runtime_secret_values,
         artifact_parameters=dict(serialized_artifact_parameters),
     )
     ctx.origin_run_redaction_registry = registry
-    if registry.contains_sensitive_values and not register_matching_origin_run_redaction_values(ctx, workflow_run_id):
+    if registry.contains_sensitive_values:
         register_secret_scrub_values_from_structure(ctx, registry.parameters)
     return registry
 
@@ -3225,6 +3185,8 @@ async def _complete_origin_run_redaction_registry_from_runtime(
         workflow_run_id=workflow_run_id,
     )
     if runtime_secret_values is None:
+        # The run still owes these values, so tool calls on its browser stay withheld.
+        LOG.warning("Copilot origin-run runtime secret handoff missing", workflow_run_id=workflow_run_id)
         return registry
 
     parameters = dict(registry.parameters)
@@ -3236,17 +3198,39 @@ async def _complete_origin_run_redaction_registry_from_runtime(
         workflow_run_id=registry.workflow_run_id,
         parameters=parameters,
         contains_sensitive_values=registry.contains_sensitive_values,
-        contains_all_sensitive_values=registry.contains_all_static_sensitive_values,
-        contains_all_static_sensitive_values=registry.contains_all_static_sensitive_values,
+        contains_all_sensitive_values=True,
         awaiting_runtime_secret_values=False,
         artifact_parameters=artifact_parameters,
     )
     if getattr(ctx, "origin_run_redaction_registry", None) is registry:
         ctx.origin_run_redaction_registry = completed
     register_secret_scrub_values_from_structure(ctx, completed.parameters)
-    if completed.contains_sensitive_values and completed.contains_all_sensitive_values:
-        ctx.origin_runs_bound_to_scrubber.add(workflow_run_id)
+    # The handoff can be consumed once, so a retry bound to an older copy of this registry would never settle.
+    for owed in [owed for owed in ctx.awaited_run_secret_handoffs if owed[1] == workflow_run_id]:
+        del ctx.awaited_run_secret_handoffs[owed]
     return completed
+
+
+async def _settle_awaited_run_secrets(
+    ctx: CopilotContext, registry: OriginRunRedactionRegistry, session_id: str
+) -> None:
+    workflow_run_id = registry.workflow_run_id
+    # The handoff can be consumed once, and get_run_results may already have completed the context's copy.
+    current = ctx.origin_run_redaction_registry
+    if current is not None and current.workflow_run_id == workflow_run_id:
+        registry = current
+    completed = await _complete_origin_run_redaction_registry_from_runtime(ctx, workflow_run_id, registry)
+    if not _origin_run_secrets_unregistered(completed, workflow_run_id):
+        ctx.awaited_run_secret_handoffs.pop((session_id, workflow_run_id), None)
+
+
+def _withhold_browser_until_run_secrets_arrive(
+    ctx: CopilotContext, registry: OriginRunRedactionRegistry, session_id: str | None
+) -> None:
+    if session_id and _origin_run_secrets_unregistered(registry, registry.workflow_run_id):
+        ctx.awaited_run_secret_handoffs[(session_id, registry.workflow_run_id)] = partial(
+            _settle_awaited_run_secrets, ctx, registry, session_id
+        )
 
 
 def terminal_ready_for_latch(
@@ -3278,16 +3262,6 @@ def terminal_ready_for_latch(
         and artifact_reason is None
         and structured_blocker is None
     )
-
-
-def _run_browser_carries_a_sign_in(ctx: AgentContext, run_session_id: str | None) -> bool:
-    """Whether the browser a run executed in was signed in by any run, this one or an earlier one."""
-    # Only the run's own browser counts. The chat's browser is usually signed in after scouting, so
-    # asking about it would strip screenshots and locators from every clean run in a separate one.
-    # Taint is recorded and cleared for a session and its runs together, so this loses no coverage.
-    if run_session_id is None:
-        return sensitive_origin_page_is_tainted(ctx)
-    return bool(sensitive_origin_runs_for_session(ctx, run_session_id))
 
 
 def _credit_composition_verified_labels(
@@ -3507,7 +3481,6 @@ async def _attach_post_run_browser_enrichment(
     failed_block_code: str | None,
     run_session_id: str | None,
     dispatch_to_worker: bool,
-    sensitive_origin_run: bool,
     run_ok: bool,
     used_fresh_run_session: bool,
     run_detached_from_chat: bool,
@@ -3517,15 +3490,20 @@ async def _attach_post_run_browser_enrichment(
     The outcome is what is protected, not these awaits: it is committed before this runs, so a probe
     the deadline cancels costs enrichment and never the record. Only the screenshot capture is
     guarded here; every other await propagates and fails the tool call."""
+    # A run still owed its handoff has secrets the scrubber cannot catch, so none of these read its page.
+    secrets_unregistered = _origin_run_secrets_unregistered(origin_registry, workflow_run_id)
     # Dispatched runs: the worker owns the run session; do not touch it over CDP from the API.
     # The frontier's anchors and the page the run ended on both come from the rows the worker
     # persisted instead. A dispatched run has no page title to report.
-    current_url, page_title, dispatched_end_url = await _resolve_post_run_page_info(
-        ctx,
-        run_block_rows=run_block_rows,
-        dispatch_to_worker=dispatch_to_worker,
-        sensitive_origin_run=sensitive_origin_run,
-        run_session_id=run_session_id,
+    current_url, page_title, dispatched_end_url = (
+        ("", "", None)
+        if secrets_unregistered
+        else await _resolve_post_run_page_info(
+            ctx,
+            run_block_rows=run_block_rows,
+            dispatch_to_worker=dispatch_to_worker,
+            run_session_id=run_session_id,
+        )
     )
 
     screenshot_b64: str | None = None
@@ -3565,22 +3543,19 @@ async def _attach_post_run_browser_enrichment(
         and _copilot_authoring_capability(ctx).code_blocks
         and not ctx.copilot_total_timeout_exceeded
     ):
-        # Structured evidence is admitted through the origin registry scrubber. Locator probes
-        # remain withheld for sensitive runs because they have no equivalent exact-value disclosure
-        # boundary; a failed run's own at-failure frame is admitted by owner ruling (SKY-15899),
-        # since scouting already shows the model these same credentialed pages ungated.
         _pin_pre_run_page_reference(ctx, workflow_run_id)
-        post_run_page_capture = await _capture_and_store_post_run_page(
-            ctx,
-            run_session_id=run_session_id,
-            run_id=workflow_run_id,
-            current_url=current_url,
-            origin_redaction_registry=origin_registry,
+        post_run_page_capture = (
+            BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
+            if secrets_unregistered
+            else await _capture_and_store_post_run_page(
+                ctx,
+                run_session_id=run_session_id,
+                run_id=workflow_run_id,
+                current_url=current_url,
+            )
         )
 
-    # Ask about the browser this run executed in, not the one the chat holds: a continuation
-    # resuming a detached sign-in browser leaves the chat's session untainted and this one not.
-    if not sensitive_origin_run and not _run_browser_carries_a_sign_in(ctx, run_session_id):
+    if not secrets_unregistered:
         locator_observations = await _observe_authored_locators(
             ctx,
             run_session_id=run_session_id,
@@ -3603,7 +3578,7 @@ async def _attach_post_run_browser_enrichment(
 
     # Dispatched runs are worker-owned, so the API cannot CDP-capture the terminal page; read the
     # worker-persisted terminal HTML artifact instead and route it through the same post-run sink.
-    if dispatch_to_worker and run_session_id and not ctx.copilot_total_timeout_exceeded:
+    if dispatch_to_worker and run_session_id and not ctx.copilot_total_timeout_exceeded and not secrets_unregistered:
         await _capture_dispatched_terminal_page_evidence(
             ctx,
             workflow=workflow,
@@ -3620,7 +3595,7 @@ async def _attach_post_run_browser_enrichment(
         result_data["authored_locator_observations"] = locator_observations
     if not dispatch_to_worker and current_url:
         result_data["current_url_live_observed"] = True
-    if dispatch_to_worker and dispatched_end_url is None:
+    if dispatch_to_worker and dispatched_end_url is None and not secrets_unregistered:
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run_id)
     if post_run_page_evidence is not None:
@@ -4219,8 +4194,7 @@ async def _run_blocks_and_collect_debug(
     # For dispatched runs it stays None: the worker owns execution and the watchdog observes purely
     # via DB polling.
     run_task: asyncio.Task | None = None
-    sensitive_run_custody_lock: asyncio.Lock | None = None
-    sensitive_run_session_id: str | None = None
+    secret_run_session_lock: asyncio.Lock | None = None
     interim_run_id: str | None = None
     # Set only where the run may already be executing, so an unwind before either executor call
     # can still retract the run-start record.
@@ -4533,15 +4507,11 @@ async def _run_blocks_and_collect_debug(
             sensitive_parameter_keys=_sensitive_parameter_keys_requiring_resolved_values(snapshot.workflow),
         )
         if origin_registry.contains_sensitive_values and run_session_id:
-            sensitive_run_custody_lock = browser_page_custody_lock(ctx, session_id=run_session_id)
-            await sensitive_run_custody_lock.acquire()
-            sensitive_run_session_id = run_session_id
-            record_sensitive_origin_run_taint(
-                ctx, workflow_run_id=workflow_run.workflow_run_id, session_id=run_session_id
-            )
-            register_sensitive_origin_run_lease(
-                ctx, workflow_run_id=workflow_run.workflow_run_id, session_id=run_session_id
-            )
+            # A parallel tool call on this browser waits for the run: its one-time codes and
+            # worker-resolved secrets reach the scrubber only when it ends.
+            run_session_lock = browser_session_lock(ctx, session_id=run_session_id)
+            await run_session_lock.acquire()
+            secret_run_session_lock = run_session_lock
 
         # From here blocks execute and the browser moves, so the pages recorded before this run no
         # longer say where it is. Dropped now rather than on the way out, because the watchdog and
@@ -4562,6 +4532,8 @@ async def _run_blocks_and_collect_debug(
             # snapshot version, so the worker resolves the exact wrapped definition via
             # run.workflow_id — no workflow_override crosses the wire. block_labels/block_outputs
             # and the shared browser session reproduce the frontier re-run on the worker.
+            if secret_run_session_lock is not None and run_session_id:
+                ctx.secret_run_browser_session_ids.add(run_session_id)
             run_submission_attempted = True
             await AsyncExecutorFactory.get_executor().execute_workflow(
                 request=None,
@@ -4613,6 +4585,8 @@ async def _run_blocks_and_collect_debug(
                 organization_id=ctx.organization_id,
             )
 
+            if secret_run_session_lock is not None and run_session_id:
+                ctx.secret_run_browser_session_ids.add(run_session_id)
             run_submission_attempted = True
             run_task = asyncio.create_task(
                 app.WORKFLOW_SERVICE.execute_workflow(
@@ -4638,14 +4612,19 @@ async def _run_blocks_and_collect_debug(
         if dispatch_draft_workflow_id is not None:
             await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
             dispatch_draft_workflow_id = None
-        if sensitive_run_custody_lock is not None and sensitive_run_custody_lock.locked():
-            if sensitive_run_session_id is not None:
-                release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run.workflow_run_id)
-            sensitive_run_custody_lock.release()
+        if secret_run_session_lock is not None:
+            if run_submission_attempted:
+                # The start may have landed before this raised, so the run can still be filling secrets.
+                _withhold_browser_until_run_secrets_arrive(ctx, origin_registry, run_session_id)
+            secret_run_session_lock.release()
+            secret_run_session_lock = None
         if interim_run_id is not None and not run_submission_attempted:
             _forget_interim_run_start(ctx, interim_run_id)
         raise
     finally:
+        if secret_run_session_lock is not None and not run_submission_attempted:
+            secret_run_session_lock.release()
+            secret_run_session_lock = None
         # Every exit before submission, cancellation included, releases the minted browser; once submission was
         # attempted the run may already hold it.
         if used_fresh_run_session and run_session_id and not run_submission_attempted and not keep_run_session:
@@ -4653,28 +4632,29 @@ async def _run_blocks_and_collect_debug(
 
     active_run_association: ActiveRunSessionAssociation | None = None
     run_paused = False
-    if run_detached_from_chat and debug_session_id and run_session_id:
-        try:
-            active_run_association = await publish_active_run_session(
-                organization_id=ctx.organization_id,
-                workflow_permanent_id=ctx.workflow_permanent_id,
-                debug_browser_session_id=debug_session_id,
-                run_browser_session_id=run_session_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                turn_id=ctx.turn_id,
-            )
-        except Exception:
-            LOG.warning(
-                "Failed to publish active Copilot run session",
-                organization_id=ctx.organization_id,
-                workflow_permanent_id=ctx.workflow_permanent_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                debug_browser_session_id=debug_session_id,
-                run_browser_session_id=run_session_id,
-                exc_info=True,
-            )
-
     try:
+        # Inside this try so a cancellation while publishing still reaches the browser lock release below.
+        if run_detached_from_chat and debug_session_id and run_session_id:
+            try:
+                active_run_association = await publish_active_run_session(
+                    organization_id=ctx.organization_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                    debug_browser_session_id=debug_session_id,
+                    run_browser_session_id=run_session_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    turn_id=ctx.turn_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to publish active Copilot run session",
+                    organization_id=ctx.organization_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    debug_browser_session_id=debug_session_id,
+                    run_browser_session_id=run_session_id,
+                    exc_info=True,
+                )
+
         # The OpenAI Agents SDK wraps this tool in
         # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``, so
         # the poll loop leaves 10 s of headroom for the cancel-drain and
@@ -4795,17 +4775,22 @@ async def _run_blocks_and_collect_debug(
                         or origin_registry
                     )
                 error_msg = await _watchdog_error_message(
-                    exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds, dispatch_to_worker
+                    exit_reason,
+                    ctx,
+                    workflow_run.workflow_run_id,
+                    run,
+                    budget_seconds,
+                    dispatch_to_worker,
+                    origin_registry,
                 )
                 user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
+                # This exit is not terminal, so a run still owed its handoff has one-time codes or
+                # worker-resolved secrets the scrubber cannot catch yet: live page facts stay out.
+                secrets_unregistered = _origin_run_secrets_unregistered(origin_registry, workflow_run.workflow_run_id)
                 # Dispatched runs: the worker owns the run session, so do not attach to it over CDP.
-                sensitive_origin_run = _origin_registry_contains_sensitive_values(
-                    origin_registry,
-                    workflow_run.workflow_run_id,
-                )
                 current_url, page_title = (
                     ("", "")
-                    if dispatch_to_worker or sensitive_origin_run
+                    if dispatch_to_worker or secrets_unregistered
                     else await _fallback_page_info(ctx, session_id_override=run_session_id)
                 )
                 watchdog_block_rows, watchdog_blocks = await _recorded_watchdog_block_receipts(
@@ -4847,7 +4832,7 @@ async def _run_blocks_and_collect_debug(
                     watchdog_block_rows,
                     _retained_action_observations_by_label(watchdog_blocks),
                     unreported_predecessor_labels=_unreported_predecessor_labels(watchdog_blocks),
-                    sensitive_origin_run=sensitive_origin_run,
+                    withhold_end_urls=secrets_unregistered,
                 )
                 for watchdog_block in watchdog_blocks:
                     watchdog_block.pop("action_trace", None)
@@ -4866,7 +4851,7 @@ async def _run_blocks_and_collect_debug(
                 failed_result = _newest_failed_result(result["data"]["blocks"])
                 watchdog_locator_observations = (
                     None
-                    if sensitive_origin_run
+                    if secrets_unregistered
                     else await _observe_authored_locators(
                         ctx,
                         run_session_id=run_session_id,
@@ -4970,13 +4955,15 @@ async def _run_blocks_and_collect_debug(
         ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
 
         await _attach_action_traces(blocks, results, ctx.organization_id, include_completed=True)
-        recorded_origin_registry = await _complete_origin_run_redaction_registry_from_runtime(
-            ctx, workflow_run.workflow_run_id, origin_registry
+        origin_registry = (
+            await _complete_origin_run_redaction_registry_from_runtime(
+                ctx, workflow_run.workflow_run_id, origin_registry
+            )
+            or origin_registry
         )
-        sensitive_origin_run = _origin_registry_contains_sensitive_values(
-            recorded_origin_registry,
-            workflow_run.workflow_run_id,
-        )
+        run_carried_secrets = _origin_registry_contains_sensitive_values(origin_registry, workflow_run.workflow_run_id)
+        # A final status does not mean the handoff arrived: the worker's publish can fail or land late.
+        secrets_unregistered = _origin_run_secrets_unregistered(origin_registry, workflow_run.workflow_run_id)
         await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
 
         # final_status is guaranteed set here: every non-success exit returns
@@ -5014,9 +5001,7 @@ async def _run_blocks_and_collect_debug(
             "failing_code_line": failing_code_line,
             "action_observations": action_observations,
         }
-        # Reported for a plain run, withheld after a credential-bearing one for the same reason
-        # observed_block_end_urls is: a post-login address can carry a token or an account path.
-        if runtime_frontier_anchor_url is not None and not sensitive_origin_run:
+        if runtime_frontier_anchor_url is not None:
             result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
         if runtime_frontier_starter_url_seeded:
             result_data["runtime_frontier_starter_url_seeded"] = True
@@ -5035,7 +5020,7 @@ async def _run_blocks_and_collect_debug(
             run_block_rows,
             per_block_action_observations,
             unreported_predecessor_labels=unreported_predecessor_labels,
-            sensitive_origin_run=sensitive_origin_run,
+            withhold_end_urls=secrets_unregistered,
         )
 
         output_identity_workflow = snapshot.workflow
@@ -5106,11 +5091,10 @@ async def _run_blocks_and_collect_debug(
             failed_block_code=failed_block_code,
             run_session_id=run_session_id,
             dispatch_to_worker=dispatch_to_worker,
-            sensitive_origin_run=sensitive_origin_run,
             run_ok=run_ok,
             used_fresh_run_session=used_fresh_run_session,
             run_detached_from_chat=run_detached_from_chat,
-            origin_registry=recorded_origin_registry,
+            origin_registry=origin_registry,
         )
         settle_terminal_challenge_after_enrichment(ctx, response)
         settled_page_evidence = post_run_page_evidence or ctx.composition_page_evidence
@@ -5160,7 +5144,7 @@ async def _run_blocks_and_collect_debug(
             ctx.verified_prefix_terminal_label = None if finally_ran or not run_block_rows else run_block_rows[-1].label
             # The planner compares that position in place and never shows it; only the continuation
             # URL is seeded into a later run's workflow, so that alone is withheld after a credential run.
-            if sensitive_origin_run:
+            if run_carried_secrets:
                 ctx.verified_prefix_current_url = None
             else:
                 verified_current_url = _valid_runtime_anchor_url(current_url)
@@ -5187,10 +5171,9 @@ async def _run_blocks_and_collect_debug(
                     generation=active_run_association.generation,
                     exc_info=True,
                 )
-        if sensitive_run_custody_lock is not None and sensitive_run_custody_lock.locked():
-            if sensitive_run_session_id is not None and not run_paused:
-                release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run.workflow_run_id)
-            sensitive_run_custody_lock.release()
+        _withhold_browser_until_run_secrets_arrive(ctx, origin_registry, run_session_id)
+        if secret_run_session_lock is not None:
+            secret_run_session_lock.release()
 
 
 RunSelectedBy = Literal["explicit", "carried_from_chat", "latest_for_workflow"]
@@ -5298,10 +5281,6 @@ async def _get_run_results(
         return {"ok": False, "error": f"Workflow run not found for this workflow: {workflow_run_id}"}
     if WorkflowRunStatus(run.status).is_final():
         await _complete_origin_run_redaction_registry_from_runtime(ctx, workflow_run_id)
-    run_browser_session_id = getattr(run, "browser_session_id", None)
-    if isinstance(run_browser_session_id, str) and run_browser_session_id and WorkflowRunStatus(run.status).is_final():
-        async with browser_page_custody_lock(ctx, session_id=run_browser_session_id):
-            release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run_id)
 
     try:
         run_workflow = await app.DATABASE.workflows.get_workflow_for_workflow_run(
@@ -5334,13 +5313,12 @@ async def _get_run_results(
     matching_origin_registry = (
         origin_registry if origin_registry is not None and origin_registry.workflow_run_id == workflow_run_id else None
     )
-    # Unknown provenance is not evidence that a cold run was nonsensitive. Use the same
-    # fail-closed classification for every direct page producer and for terminal artifacts.
+    # The scrubber holds a run's secrets only if this chat executed it and its handoff has arrived.
+    # Otherwise page facts stay out: unknown provenance is not evidence that a run was nonsensitive.
     workflow_has_sensitive_parameters = _workflow_requires_terminal_artifact_redaction(executed_workflow)
-    sensitive_origin_run = (
-        _origin_registry_contains_sensitive_values(matching_origin_registry, workflow_run_id)
-        or workflow_has_sensitive_parameters
-    )
+    secrets_unscrubbable = (
+        matching_origin_registry is None and workflow_has_sensitive_parameters
+    ) or _origin_run_secrets_unregistered(matching_origin_registry, workflow_run_id)
 
     blocks = await _chronological_run_block_rows(workflow_run_id, ctx.organization_id)
 
@@ -5408,7 +5386,7 @@ async def _get_run_results(
         blocks,
         _retained_action_observations_by_label(results),
         unreported_predecessor_labels=_unreported_predecessor_labels(results),
-        sensitive_origin_run=sensitive_origin_run,
+        withhold_end_urls=secrets_unscrubbable,
     )
     # When worker-dispatch is enabled for this copilot session the run's persistent browser
     # session is worker-owned (for a non-fresh run ctx.browser_session_id == run_session_id), so
@@ -5418,11 +5396,7 @@ async def _get_run_results(
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
     locator_observations: list[AuthoredLocatorObservationRow] | None = None
-    if (
-        not skip_page_evidence
-        and not sensitive_origin_run
-        and not _run_browser_carries_a_sign_in(ctx, run.browser_session_id)
-    ):
+    if not skip_page_evidence and not secrets_unscrubbable:
         failed_block_code = (
             _failed_block_code(executed_workflow, newest_failed) if executed_workflow is not None else None
         )
@@ -5435,8 +5409,8 @@ async def _get_run_results(
         )
     if locator_observations is not None:
         result_data["authored_locator_observations"] = locator_observations
-    dispatched_end_url = _dispatched_end_url(blocks) if dispatch_to_worker and not sensitive_origin_run else None
-    if sensitive_origin_run:
+    dispatched_end_url = _dispatched_end_url(blocks) if dispatch_to_worker and not secrets_unscrubbable else None
+    if secrets_unscrubbable:
         current_url, page_title = "", ""
     elif dispatch_to_worker:
         current_url, page_title = dispatched_end_url or "", ""
@@ -5452,7 +5426,7 @@ async def _get_run_results(
             result_data["current_url_live_observed"] = True
         if page_title:
             result_data["page_title"] = scrub_secrets_from_text(ctx, page_title)
-    if dispatch_to_worker and dispatched_end_url is None:
+    if dispatch_to_worker and dispatched_end_url is None and not secrets_unscrubbable:
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     if getattr(run, "failure_reason", None):
         result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
@@ -5485,12 +5459,14 @@ async def _get_run_results(
         excluded_block_labels=ctx.seeded_only_labels_by_run_id.get(workflow_run_id, frozenset()),
     )
 
-    cold_artifact_requires_redaction_context = _workflow_requires_terminal_artifact_redaction(executed_workflow)
     # Cold ordinary-turn hydration did not perform a sensitive run and cannot use mutable context
     # alone to vouch for its raw artifact custody. The direct same-turn tool route may use its exact
     # immutable registry; cold sensitive hydration receives a typed omission instead.
+    artifact_requires_redaction = workflow_has_sensitive_parameters or _origin_registry_contains_sensitive_values(
+        matching_origin_registry, workflow_run_id
+    )
     artifact_redaction_registry = (
-        matching_origin_registry if sensitive_origin_run and admit_sensitive_origin_artifact else None
+        matching_origin_registry if artifact_requires_redaction and admit_sensitive_origin_artifact else None
     )
     artifact_has_redaction_context = (
         artifact_redaction_registry is not None and artifact_redaction_registry.contains_all_sensitive_values
@@ -5499,7 +5475,7 @@ async def _get_run_results(
         return {"ok": True, "data": result_data}
     terminal_page_evidence = (
         None
-        if (cold_artifact_requires_redaction_context or sensitive_origin_run) and not artifact_has_redaction_context
+        if artifact_requires_redaction and not artifact_has_redaction_context
         else await _fetch_dispatched_terminal_page_evidence(
             run_id=workflow_run_id,
             organization_id=ctx.organization_id,
@@ -5511,7 +5487,7 @@ async def _get_run_results(
     if terminal_page_evidence is None:
         result_data["terminal_page_evidence_omission"] = (
             "persisted terminal page artifact was not admitted without origin-run credential redaction context"
-            if cold_artifact_requires_redaction_context or sensitive_origin_run
+            if artifact_requires_redaction
             else "no persisted terminal page artifact was available"
         )
     else:

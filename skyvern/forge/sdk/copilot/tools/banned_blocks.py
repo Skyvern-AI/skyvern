@@ -9,6 +9,7 @@ from typing import Any, NamedTuple
 
 import yaml
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.author_time_block import BANNED_BLOCKS_BLOCK_ID, AuthorTimeBlock
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.code_block_security import DENIED_PAGE_MEMBERS
@@ -25,8 +26,9 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 from skyvern.schemas.runs import RunEngine
+from skyvern.utils.strings import join_phrases
 from skyvern.utils.yaml_loader import safe_load_no_dates
-from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS
+from skyvern.webeye.utils.captcha_solver import CAPTCHA_IMAGE_TAGS, MAX_IMAGE_CAPTCHA_READS
 
 from ._shared import _parse_workflow_blocks
 
@@ -47,7 +49,14 @@ CREDENTIAL_CODE_ACCESSORS: Mapping[CredentialType, CredentialCodeAccessors] = {
     ),
     CredentialType.SECRET: CredentialCodeAccessors(fields=("<key>.secret_value",)),
 }
-ONE_TIME_CODE_TOTP_TYPES = frozenset({TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT})
+_ONE_TIME_CODE_TOTP_TYPE_NAMES: dict[TotpType, str] = {
+    TotpType.AUTHENTICATOR: "authenticator",
+    TotpType.EMAIL: "email",
+    TotpType.TEXT: "SMS",
+}
+ONE_TIME_CODE_TOTP_TYPES = tuple(_ONE_TIME_CODE_TOTP_TYPE_NAMES)
+CAPTCHA_IMAGE_ELEMENTS = join_phrases([f"<{tag}>" for tag in CAPTCHA_IMAGE_TAGS], "or", serial_comma=False)
+_TASK_V3_ENGINE = "skyvern-3.0"
 
 
 def credential_code_accessors(credential_type: CredentialType, totp_type: TotpType) -> tuple[str, ...]:
@@ -120,7 +129,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
         _BANNED,
         _WITHOUT_CODE_BLOCKS,
         "code-block authoring access",
-        "Use engine-less deterministic blocks or a supported task block pinned to `skyvern-3.0`.",
+        f"Use engine-less deterministic blocks or a supported task block pinned to `{_TASK_V3_ENGINE}`.",
     ),
     **{
         block_type: _P(
@@ -197,12 +206,12 @@ CODE_BLOCK_SUMMARY = (
     "and transforms data it already holds"
 )
 _AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
-_TASK_V3_ENGINE = "skyvern-3.0"
+_AGENT_FAMILY_BLOCK_LIST = join_phrases([f"`{block_type}`" for block_type in AGENT_FAMILY_BLOCK_SUMMARIES], "and")
 
 # Reaches the model on the three authoring tool descriptions, the block-type list and the
 # choosing_a_block knowledge topic, and only when both families may be authored.
 AUTHORING_FAMILY_GUIDANCE = (
-    "Write a `code` block for browser work: that is the default. Write an agent block (engine `skyvern-3.0`) "
+    f"Write a `code` block for browser work: that is the default. Write an agent block (engine `{_TASK_V3_ENGINE}`) "
     "only when the user asks for one, when the site or page is only known at run time, or when the page has "
     "been shown to change so much between visits that fixed code is not practical. An unclear item in the "
     "request is settled by scouting the site or by asking, not by an agent block. "
@@ -347,8 +356,9 @@ def _saved_credential_guidance() -> str:
     return (
         "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type "
         "credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential "
-        f"object. For a `password` credential, read {username} and {password}, use {otp} for authenticator, email, "
-        f"or SMS one-time codes, and use {magic_link} when the scouted page offers an emailed sign-in link; that "
+        f"object. For a `password` credential, read {username} and {password}, use {otp} for "
+        f"{join_phrases(list(_ONE_TIME_CODE_TOTP_TYPE_NAMES.values()), 'or')} "
+        f"one-time codes, and use {magic_link} when the scouted page offers an emailed sign-in link; that "
         "broker navigates the page without exposing the sign-in link to authored code. Never put literal secret "
         "values in code."
     )
@@ -361,7 +371,7 @@ def _secret_credential_guidance() -> str:
 
 _IMAGE_CAPTCHA_GUIDANCE = (
     "For a distorted-text image CAPTCHA, the Code runtime provides await solve_captcha(page, image=<observed image "
-    "selector>, input=<observed answer field selector>): it reads the text in that <img>, <svg> or <canvas> (or a "
+    f"selector>, input=<observed answer field selector>): it reads the text in that {CAPTCHA_IMAGE_ELEMENTS} (or a "
     "container holding exactly one) and types it into the answer field. It requires image OCR enabled for the "
     "organization; otherwise it raises. It raises with nothing typed when the image yields no text, and raises on "
     f"any call after the block's {MAX_IMAGE_CAPTCHA_READS}th call. A typed answer is unconfirmed until the page "
@@ -397,7 +407,7 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
         "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting.",
         *([_IMAGE_CAPTCHA_GUIDANCE] if image_ocr else []),
         "The Code runtime provides await clear_browser_data(page) when a site needs a clean session before it will sign in: it drops every cookie in the run's browser and all stored data for every origin it has a page or frame open on, and returns nothing. Read page.url first and navigate back to it afterwards.",
-        "For file attachment: bind the file as a workflow parameter with workflow_parameter_type file_url, then call await attach_authorized_file(page, <file_parameter>, <observed_selector>). The parameter is a handle, not a path: pass it only to that helper. Attaching puts the file's contents in the page, where page scripts and page.evaluate can read them, so attach it only to the page that should receive it. It accepts only that run's materialized file, uploads at most 10 MB, and returns filename and size. To upload a file this block downloads, claim it with async with page.expect_download() as info: and pass await info.value to the same helper, never its path.",
+        f"For file attachment: bind the file as a workflow parameter with workflow_parameter_type file_url, then call await attach_authorized_file(page, <file_parameter>, <observed_selector>). The parameter is a handle, not a path: pass it only to that helper. Attaching puts the file's contents in the page, where page scripts and page.evaluate can read them, so attach it only to the page that should receive it. It accepts only that run's materialized file, uploads at most {settings.MAX_UPLOAD_FILE_SIZE // (1024 * 1024)} MB, and returns filename and size. To upload a file this block downloads, claim it with async with page.expect_download() as info: and pass await info.value to the same helper, never its path.",
     ]
 
 
@@ -415,13 +425,12 @@ def _copilot_banned_block_alternatives(ctx: AgentContext | None) -> str:
     if capability.agent_blocks and not capability.code_blocks:
         return (
             "Use engine-less workflow blocks for deterministic orchestration and integrations, or one of "
-            "`task`, `navigation`, `login`, `action`, `validation`, `extraction`, and `file_download` with "
-            "`engine: skyvern-3.0`."
+            f"{_AGENT_FAMILY_BLOCK_LIST} with `engine: {_TASK_V3_ENGINE}`."
         )
     return (
-        "Use a `code` block for deterministic work on a page you have scouted, or one of `task`, "
-        "`navigation`, `login`, `action`, `validation`, `extraction`, and `file_download` with "
-        "`engine: skyvern-3.0` when the page or the judgement only arrives at run time."
+        "Use a `code` block for deterministic work on a page you have scouted, or one of "
+        f"{_AGENT_FAMILY_BLOCK_LIST} with `engine: {_TASK_V3_ENGINE}` when the page or the judgement only "
+        "arrives at run time."
     )
 
 
@@ -457,7 +466,7 @@ def _block_authoring_violations(
                     label=label,
                     block_type=block_type,
                     code=AuthoringViolationCode.ENGINE_NOT_SKYVERN_V3,
-                    guidance="Set the submitted block engine exactly to `skyvern-3.0`.",
+                    guidance=f"Set the submitted block engine exactly to `{_TASK_V3_ENGINE}`.",
                 )
             )
         if block_type == "validation" and block.get("complete_on_download") is True:

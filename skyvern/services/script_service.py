@@ -104,7 +104,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
-from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
     CreateScriptResponse,
@@ -3798,11 +3798,42 @@ async def upload_file(
     )
 
 
+async def _send_email_via_gmail(block_validation_output: BlockValidationOutput, credential_id: str | None) -> None:
+    # The message comes from the workflow definition, never from the generated call, so recipients, subject
+    # and body stay out of the cached script and the logs that print it.
+    definition = _find_block_definition(
+        block_validation_output.workflow.workflow_definition.blocks, block_validation_output.label
+    )
+    if not isinstance(definition, SendEmailBlock) or definition.transport != EmailTransport.GMAIL:
+        raise Exception("No Gmail send_email block with this label exists in the workflow")
+    if (credential_id or "") != (definition.credential_id or ""):
+        raise Exception("The cached script names a different Gmail connection than the workflow block")
+    context = block_validation_output.context
+    loop_metadata = context.loop_metadata or {}
+    current_value = loop_metadata.get("current_value")
+    send_email_block = definition.model_copy(deep=True)
+    result = await send_email_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+        current_value=str(current_value) if current_value is not None else None,
+        current_index=loop_metadata.get("current_index"),
+    )
+    _append_to_loop_output(
+        result.output_parameter_value,
+        block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+    )
+    if not result.success and not send_email_block.continue_on_failure:
+        raise Exception(result.failure_reason or "Gmail send failed")
+
+
 async def send_email(
-    sender: str,
-    recipients: list[str] | str,
-    subject: str,
-    body: str,
+    sender: str = "",
+    recipients: list[str] | str | None = None,
+    subject: str = "",
+    body: str = "",
     file_attachments: list[str] = [],
     label: str | None = None,
     parameters: list[str] | None = None,
@@ -3811,9 +3842,21 @@ async def send_email(
     custom_smtp_username: str | None = None,
     custom_smtp_password: str | None = None,
     body_format: EmailBodyFormat = EmailBodyFormat.TEXT,
+    transport: EmailTransport | None = None,
+    credential_id: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
+    if transport == EmailTransport.GMAIL:
+        await _send_email_via_gmail(block_validation_output, credential_id)
+        return
+    definition = _find_block_definition(
+        block_validation_output.workflow.workflow_definition.blocks, block_validation_output.label
+    )
+    if isinstance(definition, SendEmailBlock) and definition.transport == EmailTransport.GMAIL:
+        # A script cached before the block switched to Gmail must not send its old message over SMTP.
+        raise Exception("The cached script predates this block's Gmail transport")
     sender = _render_template_with_label(sender, label)
+    recipients = recipients or []
     if isinstance(recipients, str):
         recipients = render_list(_render_template_with_label(recipients, label))
     subject = _render_template_with_label(subject, label)
@@ -4074,6 +4117,40 @@ async def prompt(
     return result.output_parameter_value
 
 
+_LoopState = tuple[str | None, dict[str, Any] | None, dict[str, Any] | None, list[list[dict[str, Any]]] | None]
+
+
+def _capture_loop_state(context: skyvern_context.SkyvernContext) -> _LoopState:
+    return (
+        context.parent_workflow_run_block_id,
+        context.loop_metadata,
+        context.loop_internal_state,
+        context.loop_output_values,
+    )
+
+
+def _restore_loop_state(
+    context: skyvern_context.SkyvernContext,
+    loop_workflow_run_block_id: str | None,
+    previous: _LoopState,
+    label: str,
+    output_parameter: OutputParameter,
+) -> None:
+    # A loop the script abandoned is finalized late by the garbage collector, after the context may have
+    # moved on, so the enclosing loop's state is put back only while this loop still owns the context.
+    if context.parent_workflow_run_block_id != loop_workflow_run_block_id:
+        return
+    finished_loop_output = context.loop_output_values
+    (
+        context.parent_workflow_run_block_id,
+        context.loop_metadata,
+        context.loop_internal_state,
+        context.loop_output_values,
+    ) = previous
+    # A nested loop's output is one entry of the enclosing iteration, as ForLoopBlock.execute records it.
+    _append_to_loop_output(finished_loop_output, label, output_parameter=output_parameter)
+
+
 async def loop(
     values: Sequence[Any] | str,
     complete_if_empty: bool = False,
@@ -4143,9 +4220,14 @@ async def loop(
         loop_block.record_result_outcome(workflow_run_id, empty_result)
         if not complete_if_empty:
             raise Exception("No iterable value found for the loop block")
+        # An empty nested loop is still one entry of the enclosing iteration, as ForLoopBlock.execute records it.
+        _append_to_loop_output(
+            [], block_validation_output.label, output_parameter=block_validation_output.output_parameter
+        )
         return
 
     # register the loop in the global context
+    previous_loop_state = _capture_loop_state(block_validation_output.context)
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
     block_validation_output.context.loop_output_values = []
 
@@ -4222,10 +4304,13 @@ async def loop(
             )
         raise
     finally:
-        block_validation_output.context.parent_workflow_run_block_id = None
-        block_validation_output.context.loop_metadata = None
-        block_validation_output.context.loop_internal_state = None
-        block_validation_output.context.loop_output_values = None
+        _restore_loop_state(
+            block_validation_output.context,
+            workflow_run_block_id,
+            previous_loop_state,
+            block_validation_output.label,
+            block_validation_output.output_parameter,
+        )
 
 
 def _while_loop_branch_criteria(
@@ -4264,6 +4349,7 @@ async def while_loop(
         loop_blocks=[],
     )
 
+    previous_loop_state = _capture_loop_state(block_validation_output.context)
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
     block_validation_output.context.loop_output_values = []
 
@@ -4375,7 +4461,10 @@ async def while_loop(
             )
         raise
     finally:
-        block_validation_output.context.parent_workflow_run_block_id = None
-        block_validation_output.context.loop_metadata = None
-        block_validation_output.context.loop_internal_state = None
-        block_validation_output.context.loop_output_values = None
+        _restore_loop_state(
+            block_validation_output.context,
+            workflow_run_block_id,
+            previous_loop_state,
+            block_validation_output.label,
+            block_validation_output.output_parameter,
+        )

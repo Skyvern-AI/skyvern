@@ -117,10 +117,12 @@ from skyvern.forge.sdk.copilot.context import (
     clear_proposed_credential,
     coerce_ask_subject,
     finalize_observation_context,
+    model_written_context_fields,
     parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
     record_proposed_credential_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
+    tool_recorded_context_fields,
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, credential_recovery_token_digest
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
@@ -278,6 +280,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_copilot_code_mode_diagnostics,
 )
 from skyvern.forge.sdk.copilot.video_attachment import (
+    VIDEO_ATTACHMENT_FORMAT_NAMES,
     VideoAttachmentArtifact,
     VideoAttachmentEvidence,
     build_video_attachment_message,
@@ -910,6 +913,8 @@ def _build_system_prompt(
         current_datetime=datetime_boundary,
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
+        model_written_context_fields=model_written_context_fields(),
+        tool_recorded_context_fields=tool_recorded_context_fields(),
     )
     prompt_with_boundary = f"{_MCP_RESULT_SECURITY_BOUNDARY}\n\n{prompt_with_boundary}"
     stable_prefix, boundary, dynamic_suffix = prompt_with_boundary.partition(datetime_boundary)
@@ -1513,6 +1518,7 @@ def _build_user_context(
         user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
         untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
+        video_attachment_formats="/".join(VIDEO_ATTACHMENT_FORMAT_NAMES.values()),
         scope_check=scope_check,
     )
 

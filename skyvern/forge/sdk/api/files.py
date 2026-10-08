@@ -616,6 +616,8 @@ async def download_file(
     authorize_redirect: Callable[[str], bool] | None = None,
     preserve_existing_files: bool = False,
     staging_dir: str | None = None,
+    *,
+    limit_managed_file_size: bool = False,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
@@ -649,6 +651,12 @@ async def download_file(
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
             app.STORAGE.assert_managed_file_access(url, organization_id)
+            managed_limit_mb = max_size_mb if limit_managed_file_size else None
+            if managed_limit_mb:
+                # Checked from storage metadata so an oversized object is refused before its bytes are loaded.
+                managed_size = await app.STORAGE.managed_file_size(url, organization_id)
+                if managed_size is not None and managed_size > managed_limit_mb * 1024 * 1024:
+                    raise DownloadFileMaxSizeExceeded(managed_limit_mb)
 
             LOG.info(
                 "Downloading managed storage file",
@@ -659,6 +667,8 @@ async def download_file(
             data = await app.STORAGE.download_managed_file(url, organization_id)
             if data is None:
                 raise Exception(f"Failed to download managed storage file: {url}")
+            if managed_limit_mb and len(data) > managed_limit_mb * 1024 * 1024:
+                raise DownloadFileMaxSizeExceeded(managed_limit_mb)
             # A local upload's URI percent-encodes its name, which can triple a non-ASCII name's
             # length past the filesystem limit; the decoded name is the one storage already wrote.
             filename = unquote(parsed.path.rsplit("/", 1)[-1]) if parsed.scheme == "file" else url.split("/")[-1]

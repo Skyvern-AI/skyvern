@@ -438,6 +438,7 @@ _T3 = TypeVar("_T3")
 _T4 = TypeVar("_T4")
 _T5 = TypeVar("_T5")
 _T6 = TypeVar("_T6")
+_VersionWrite = TypeVar("_VersionWrite")
 
 
 _USER_DEFINED_ERROR_KEYS = {"error_code", "reasoning", "confidence_float", "error_type"}
@@ -10924,9 +10925,9 @@ class WorkflowService:
         *,
         workflow_permanent_id: str,
         version: int,
-        insert: Callable[[int], Awaitable[Workflow]],
+        insert: Callable[[int], Awaitable[_VersionWrite]],
         next_version_after_conflict: Callable[[], Awaitable[int]],
-    ) -> Workflow:
+    ) -> _VersionWrite:
         """Postgres raises the unique violation only after the competing insert commits, so a fresh read
         without a pause sees the winner's version."""
         for attempt in range(1, WORKFLOW_VERSION_ALLOCATION_ATTEMPTS):
@@ -16951,6 +16952,55 @@ class WorkflowService:
                 request.webhook_callback_url, field_name="webhook_callback_url"
             )
 
+        async def persist_version_with_definition(
+            insert_version_row: Callable[[], Awaitable[Workflow]],
+        ) -> tuple[Workflow, WorkflowDefinition]:
+            """Allocate the new version row and fill in its definition as one transaction.
+
+            The definition can only be built once the row's ``workflow_id`` exists, so the row is
+            inserted empty first. Committing it on its own would publish an empty workflow as the
+            latest version: readers would resolve it, a concurrent save would inherit its settings,
+            and a save precondition checked against it would reject a valid draft over a version
+            that validation is about to discard.
+            """
+            async with app.DATABASE.workflows.version_write_transaction():
+                allocated_workflow = await insert_version_row()
+                built_definition = await self.make_workflow_definition(
+                    allocated_workflow.workflow_id,
+                    request.workflow_definition,
+                )
+
+                # Validate the block graph before persisting (detects orphans, cycles, dangling references)
+                self.validate_workflow_block_graph(built_definition)
+                built_definition.validate()
+
+                # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
+                self._validate_payload_templates(built_definition)
+
+                saved_workflow = await self.update_workflow_definition(
+                    workflow_id=allocated_workflow.workflow_id,
+                    organization_id=organization_id,
+                    title=title,
+                    description=request.description,
+                    workflow_definition=built_definition,
+                    edited_by=edited_by,
+                    created_via=created_via,
+                    notify_workflow_saved=False,
+                    validate_code_block_templates=validate_code_block_templates,
+                )
+
+            self._schedule_workflow_saved_hook_best_effort(
+                organization_id=saved_workflow.organization_id,
+                edited_by=edited_by,
+                workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                workflow=saved_workflow,
+                version=saved_workflow.version,
+                status=saved_workflow.status,
+                actor_user_id=edited_by,
+                created_via=created_via,
+            )
+            return saved_workflow, built_definition
+
         try:
             if existing_latest_workflow:
                 # Public CDP headers are masked during serialization; public extra HTTP headers are literal.
@@ -17037,11 +17087,13 @@ class WorkflowService:
                         raise WorkflowVersionConflict(existing_latest_workflow.workflow_permanent_id)
                     return latest_version + 1
 
-                # NOTE: it's only potential, as it may be immediately deleted!
-                potential_workflow = await self._insert_next_workflow_version(
+                async def insert_version_with_definition(version: int) -> tuple[Workflow, WorkflowDefinition]:
+                    return await persist_version_with_definition(lambda: insert_version(version))
+
+                updated_workflow, workflow_definition = await self._insert_next_workflow_version(
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
-                    insert=insert_version,
+                    insert=insert_version_with_definition,
                     next_version_after_conflict=next_version_from_same_settings,
                 )
             else:
@@ -17049,40 +17101,20 @@ class WorkflowService:
                 # any keys whose value is the mask sentinel so we never persist the
                 # literal "***" placeholder from a misbehaving client.
                 new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
-                # NOTE: it's only potential, as it may be immediately deleted!
-                potential_workflow = await self._create_initial_workflow_from_request(
-                    organization_id=organization_id,
-                    request=request,
-                    title=title,
-                    workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
-                    cdp_connect_headers=new_cdp_connect_headers,
-                    created_by=created_by,
-                    edited_by=edited_by,
+                updated_workflow, workflow_definition = await persist_version_with_definition(
+                    lambda: self._create_initial_workflow_from_request(
+                        organization_id=organization_id,
+                        request=request,
+                        title=title,
+                        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+                        cdp_connect_headers=new_cdp_connect_headers,
+                        created_by=created_by,
+                        edited_by=edited_by,
+                    )
                 )
-            # Keeping track of the new workflow id to delete it if an error occurs during the creation process
-            new_workflow_id = potential_workflow.workflow_id
-
-            workflow_definition = await self.make_workflow_definition(
-                potential_workflow.workflow_id,
-                request.workflow_definition,
-            )
-
-            # Validate the block graph before persisting (detects orphans, cycles, dangling references)
-            self.validate_workflow_block_graph(workflow_definition)
-
-            # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
-            self._validate_payload_templates(workflow_definition)
-
-            updated_workflow = await self.update_workflow_definition(
-                workflow_id=potential_workflow.workflow_id,
-                organization_id=organization_id,
-                title=title,
-                description=request.description,
-                workflow_definition=workflow_definition,
-                edited_by=edited_by,
-                created_via=created_via,
-                validate_code_block_templates=validate_code_block_templates,
-            )
+            # Only the steps below still need the version cleaned up by hand; a failure inside the
+            # transaction above already rolled it back.
+            new_workflow_id = updated_workflow.workflow_id
 
             if recording_id_to_attach is not None:
                 try:

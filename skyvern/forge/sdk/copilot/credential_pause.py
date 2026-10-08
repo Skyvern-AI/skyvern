@@ -1032,6 +1032,14 @@ async def _run_credential_pause(
             # Bind an answer to the URLs on this card, never an earlier unanswered ask.
             policy.credential_ask_login_page_urls = list(login_page_urls)
         credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
+    # The same record the missing-origin fill refusal reads, so the card offers what that refusal promised.
+    named = policy.current_turn_named_credential_ids if isinstance(policy, RequestPolicy) else set()
+    plain_pick_ask = update_credential_id is None and registration is None and admit_connected is None
+    # One origin, as `_bind_connected_credential_origin` requires: the card names the site the click binds.
+    # Every URL must parse: the card reads the site from the first one with a more lenient parser.
+    ask_origins = [parts[-1] if (parts := url_parts(url)) is not None else None for url in login_page_urls]
+    one_site = None not in ask_origins and len(set(ask_origins)) == 1
+    named_credential_id = next(iter(named)) if len(named) == 1 and plain_pick_ask and one_site else None
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 
@@ -1058,6 +1066,7 @@ async def _run_credential_pause(
         message=message,
         login_page_urls=login_page_urls,
         credential_refs=credential_refs,
+        named_credential_id=named_credential_id,
         timeout_seconds=timeout_seconds,
         expires_at=expires_at,
         anchor_tool_call_id=anchor_tool_call_id,

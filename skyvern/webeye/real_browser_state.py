@@ -16,6 +16,7 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_CLOSE_TIMEOUT,
+    BROWSER_CONTEXT_CLOSE_TIMEOUT,
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
     CRASHED_PAGE_CLOSE_ATTEMPTS,
@@ -1752,7 +1753,7 @@ class RealBrowserState(BrowserState):
         # cleanup (Browser Use / Anchor / remote-CDP stop/delete) always gets its own attempt,
         # even when interceptor disable, cookie persistence, or context close hangs or fails.
         # Worst-case wall time is the sum of the per-phase budgets:
-        # BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT.
+        # BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + BROWSER_CONTEXT_CLOSE_TIMEOUT + 2 * BROWSER_CLOSE_TIMEOUT.
         recording_finalized = False
         if close_browser_on_completion or release_driver:
             if self.browser_context is not None:
@@ -1796,7 +1797,7 @@ class RealBrowserState(BrowserState):
             try:
                 recording_finalized = await self._run_bounded_detachable(
                     teardown_context(),
-                    BROWSER_CLOSE_TIMEOUT,
+                    BROWSER_CONTEXT_CLOSE_TIMEOUT,
                     "browser context teardown",
                 )
                 # The display recorder is stopped/finalized on its own, decoupled from context teardown:
