@@ -15,6 +15,7 @@ ENTERPRISE_GATED_MODEL_NAMES: dict[str, str] = {
     "claude-fable-5": "Anthropic Claude Fable 5",
     "claude-fable-5-1": "Anthropic Claude Fable 5.1",
     "claude-opus-5": "Anthropic Claude Opus 5",
+    "claude-opus-5-5": "Anthropic Claude Opus 5.5",
 }
 
 

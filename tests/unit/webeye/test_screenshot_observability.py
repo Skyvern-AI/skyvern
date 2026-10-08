@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,12 @@ from skyvern.webeye.utils.page import (
     _current_viewpoint_screenshot_helper,
     _screenshot_observation_fields,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+# Read before the autouse fixture shrinks it, so a test can run detach under its real budget.
+_PRODUCTION_DETACH_TIMEOUT_SECONDS = page_module.CDP_RESCUE_DETACH_TIMEOUT_SECONDS
+# Long enough that no runner pause expires it, and distinct from the other stages' test budgets.
+_TEST_DETACH_TIMEOUT_SECONDS = 45
 
 
 def _page() -> MagicMock:
@@ -199,6 +206,19 @@ async def test_detach_failure_is_observable_without_changing_capture_or_cancella
 ) -> None:
     log = MagicMock()
     monkeypatch.setattr(page_module, "LOG", log)
+    # Budgets long enough that no runner pause expires them; the test expires the detach budget itself.
+    # Detach gets its own value so a detach bounded by another stage's constant is caught.
+    for name in ("SESSION", "CAPTURE"):
+        monkeypatch.setattr(page_module, f"CDP_RESCUE_{name}_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(page_module, "CDP_RESCUE_DETACH_TIMEOUT_SECONDS", _TEST_DETACH_TIMEOUT_SECONDS)
+    wait_budgets: list[tuple[float | None, asyncio.Timeout]] = []
+
+    async def wait_for(awaitable: Any, timeout: float | None) -> Any:
+        async with asyncio.timeout(timeout) as budget:
+            wait_budgets.append((timeout, budget))
+            return await awaitable
+
+    monkeypatch.setattr(page_module, "asyncio", ScopedAsyncio(wait_for=wait_for))
     page = _page()
     session = page.context.new_cdp_session.return_value
     capture_entered = asyncio.Event()
@@ -228,18 +248,23 @@ async def test_detach_failure_is_observable_without_changing_capture_or_cancella
     task = asyncio.create_task(_current_viewpoint_screenshot_helper(page))
     try:
         if cancel_stage == "capture":
-            await asyncio.wait_for(capture_entered.wait(), timeout=0.5)
+            await asyncio.wait_for(capture_entered.wait(), timeout=5)
             task.cancel()
-        await asyncio.wait_for(detach_entered.wait(), timeout=0.5)
+        await asyncio.wait_for(detach_entered.wait(), timeout=5)
         if cancel_stage == "detach":
             task.cancel()
         release_detach.set()
+        detach_delay, detach_budget = wait_budgets[-1]
+        assert detach_delay == _TEST_DETACH_TIMEOUT_SECONDS
+        if failure == "timeout":
+            detach_budget.reschedule(asyncio.get_running_loop().time())
         if cancel_stage is not None:
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=0.5)
+                await asyncio.wait_for(task, timeout=5)
         else:
-            assert (await asyncio.wait_for(task, timeout=0.5)).startswith(page_module._PNG_SIGNATURE)
+            assert (await asyncio.wait_for(task, timeout=5)).startswith(page_module._PNG_SIGNATURE)
         assert detach_finished.is_set()
+        assert detach_budget.expired() == (failure == "timeout")
         assert not (asyncio.all_tasks() - existing_tasks)
         detach_observations = [o for o in _observations(log) if o.get("screenshot.stage") == "detach"]
         assert len(detach_observations) == 1
@@ -247,13 +272,35 @@ async def test_detach_failure_is_observable_without_changing_capture_or_cancella
         assert observation["screenshot.arm"] == "control"
         assert observation["screenshot.primitive"] == "cdp_rescue"
         assert observation["screenshot.outcome"] == failure
-        assert observation["screenshot.timeout_budget_ms"] == 50
+        assert observation["screenshot.timeout_budget_ms"] == _TEST_DETACH_TIMEOUT_SECONDS * 1000
         assert observation["screenshot.elapsed_ms"] >= 0
     finally:
+        # Expire any budget still running and bound the drain, so a failed assertion or an unbounded
+        # detach fails fast instead of waiting out (or hanging on) the stalled detach.
         release_detach.set()
+        for _, budget in wait_budgets:
+            with contextlib.suppress(RuntimeError):  # Only a budget still entered can be expired.
+                budget.reschedule(asyncio.get_running_loop().time())
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_detach_runs_under_its_production_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(page_module, "CDP_RESCUE_DETACH_TIMEOUT_SECONDS", _PRODUCTION_DETACH_TIMEOUT_SECONDS)
+    wait_timeouts: list[float | None] = []
+
+    async def wait_for(awaitable: Any, timeout: float | None) -> Any:
+        wait_timeouts.append(timeout)
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(page_module, "asyncio", ScopedAsyncio(wait_for=wait_for))
+    page = _page()
+    assert (await _current_viewpoint_screenshot_helper(page)).startswith(page_module._PNG_SIGNATURE)
+    page.context.new_cdp_session.return_value.detach.assert_awaited_once_with()
+    # Attach, then detach; the literal pins the production detach budget, not just the constant's name.
+    assert wait_timeouts == [page_module.CDP_RESCUE_SESSION_TIMEOUT_SECONDS, 2]
 
 
 @pytest.mark.asyncio
@@ -279,7 +326,6 @@ async def test_scaled_viewport_decline_emits_declined_outcome(monkeypatch: pytes
     [
         ("full_page", "ineligible_full_page"),
         ("firefox", "ineligible_browser"),
-        ("unknown_browser", "ineligible_browser"),
         ("skycdp", "ineligible_engine"),
     ],
 )
@@ -289,8 +335,6 @@ async def test_ineligible_paths_emit_decline_reason(kind: str, reason: str, monk
     page = _page()
     if kind == "firefox":
         page.context.browser.browser_type.name = "firefox"
-    elif kind == "unknown_browser":
-        page.context.browser = None
     selection = None
     if kind == "skycdp":
         selection = SimpleNamespace(

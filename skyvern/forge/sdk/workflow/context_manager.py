@@ -1,24 +1,33 @@
 import asyncio
 import copy
+import difflib
+import json
+import os
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+import string
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import structlog
+from jinja2 import Template
+from jinja2 import meta as jinja2_meta
 from jinja2.sandbox import SandboxedEnvironment
 from onepassword import ItemFieldType
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, SCRUBBED_VALUE
 from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
+    CredentialItemNotFoundError,
     CredentialParameterNotFoundError,
+    CredentialSourceNotConfiguredError,
     CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
     InvalidCredentialId,
@@ -32,6 +41,7 @@ from skyvern.exceptions import (
     sanitize_credential_for_error,
 )
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.core import skyvern_context
@@ -47,8 +57,10 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -66,7 +78,15 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
+from skyvern.forge.sdk.workflow.page_derived_templates import RootClass, classify_roots
+from skyvern.schemas.workflows import BlockStatus
+from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
+from skyvern.utils.secret_redaction import (
+    MIN_NUMERIC_SECRET_LENGTH,
+    MIN_UNANCHORED_SECRET_LENGTH,
+    collect_redactable_secret_values,
+    is_redactable_secret_value,
+)
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 
@@ -75,8 +95,33 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+
+def _normalize_credential_totp_identifier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = normalize_identifier(value)
+    if normalized.startswith("+") or not looks_like_phone_identifier(normalized):
+        return normalized
+    digits = re.sub(r"\D", "", normalized)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    return normalized
+
+
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
+
+BLOCK_OUTCOME_FAILURE_REASON_MAX_CHARS = 2000
+
+
+@dataclass(frozen=True)
+class BlockOutcome:
+    """How a block ended, in one shape for every block type. A block that never ran has no record."""
+
+    status: BlockStatus
+    error_codes: list[str]
+    failure_reason: str | None
+
 
 jinja_sandbox_env = SandboxedEnvironment()
 
@@ -100,7 +145,7 @@ NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
 
 # Secrets shorter than this mask only on exact whole-string match: substring-replacing a short
 # value (a CVV, a 2-digit expiry) corrupts unrelated scalars such as timestamp milliseconds.
-_SECRET_SUBSTRING_MIN_LENGTH = 5
+SECRET_SUBSTRING_MIN_LENGTH = 5
 
 
 @dataclass
@@ -125,6 +170,256 @@ def resolve_credential_parameter_binding(
     if not credential_id:
         raise InvalidCredentialId(credential_id)
     return credential_id
+
+
+_BROAD_DERIVED_SPAN_CHARS = 1024
+_RESYNC_ANCHOR_CHARS = 8
+# A derived value is a transform of one secret; four times its length covers urlencode-style growth.
+_RESYNC_WINDOW_PER_SECRET_CHAR = 4
+
+
+def _canaries(secret: str) -> list[str]:
+    """Two same-length canaries sharing no character with the secret, so a transform of one cannot match a
+    transform of the other; digits for an all-digit secret so `| int` still renders."""
+    folded = secret.casefold()
+    pool = string.digits + string.ascii_lowercase if secret.isdigit() else string.ascii_lowercase + string.digits
+    return [char * len(secret) for char in ([char for char in pool if char not in folded] + ["~", "#"])[:2]]
+
+
+def _shaped_canary(secret: str) -> str:
+    folded = secret.casefold()
+    letter = next((char for char in string.ascii_lowercase if char not in folded), "q")
+    digit = next((char for char in string.digits if char not in secret), "0")
+
+    def shape(char: str) -> str:
+        if char.isdigit():
+            return digit
+        if char.isalpha():
+            return letter.upper() if char.isupper() else letter
+        return char
+
+    return "".join(map(shape, secret))
+
+
+def _render_swapped(
+    template: Template, template_data: Mapping[str, Any], referenced: set[str], secret: str, canary: str
+) -> str:
+    swapped = {name: _swap_secret(template_data[name], secret, canary) for name in referenced}
+    return template.render({**template_data, **swapped})
+
+
+def _diff_spans(rendered: str, alternate: str, window: int) -> tuple[tuple[int, int], list[tuple[int, int]]] | None:
+    """The covering span where `alternate` departs from `rendered`, and the changed segments inside it."""
+    if alternate == rendered:
+        return None
+    prefix = len(os.path.commonprefix([rendered, alternate]))
+    suffix = len(os.path.commonprefix([rendered[prefix:][::-1], alternate[prefix:][::-1]]))
+    end = len(rendered) - suffix
+    return (prefix, end), _changed_segments(
+        rendered[prefix:end], alternate[prefix : len(alternate) - suffix], prefix, window
+    )
+
+
+def _swap_secret(value: Any, secret: str, canary: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(secret, canary)
+    if isinstance(value, Mapping):
+        return {_swap_secret(key, secret, canary): _swap_secret(item, secret, canary) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_swap_secret(item, secret, canary) for item in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and str(value) == secret:
+        return canary
+    return value
+
+
+def register_secret_derived_output(
+    secrets: dict[str, Any],
+    template: Template,
+    source: str,
+    template_data: Mapping[str, Any],
+    rendered: str,
+) -> None:
+    """Register the span of `rendered` that changes when each secret is swapped for a canary, so redactors
+    fed from the `secrets` registry also match a secret a Jinja filter transformed (`{{ token|reverse }}`)."""
+    present = collect_redactable_secret_values(secrets)
+    if not present or not rendered:
+        return
+    parsed = template.environment.parse(source)
+    referenced = jinja2_meta.find_undeclared_variables(parsed) & template_data.keys()
+    if not referenced:
+        return
+    try:
+        # One serialization pass; JSON escapes per character, so a secret's escaped form is in the blob
+        # exactly when the secret is in the data.
+        blob = json.dumps([template_data[name] for name in referenced], default=str, ensure_ascii=False)
+        present = {secret for secret in present if json.dumps(secret, ensure_ascii=False)[1:-1] in blob}
+    except (TypeError, ValueError):
+        pass  # Unserializable data: check every secret.
+    if not present:
+        return
+    for secret in present:
+        canaries = _canaries(secret)
+        coverings: list[tuple[int, int]] = []
+        segments: list[tuple[int, int]] = []
+        alternates: list[str] = []
+        canary_error: str | None = None
+        window = _RESYNC_WINDOW_PER_SECRET_CHAR * len(secret) + _RESYNC_ANCHOR_CHARS
+        for canary in canaries:
+            try:
+                alternate = _render_swapped(template, template_data, referenced, secret, canary)
+            except Exception as exc:
+                canary_error = type(exc).__name__
+                continue
+            alternates.append(alternate)
+            if diff := _diff_spans(rendered, alternate, window):
+                coverings.append(diff[0])
+                segments += diff[1]
+        canary_render_failed = False
+        if canary_error is not None:
+            # A uniform canary loses the secret's punctuation (`split(':')` then raises); one that keeps it still
+            # observes which parts of the output the secret's letters and digits produced.
+            try:
+                shaped = _render_swapped(template, template_data, referenced, secret, _shaped_canary(secret))
+            except Exception:
+                # Nothing rendered without the real secret: fail closed.
+                canary_render_failed = True
+            else:
+                alternates.append(shaped)
+                if diff := _diff_spans(rendered, shaped, window):
+                    coverings.append(diff[0])
+                    segments += diff[1]
+        # A `| json` value reaches its consumer decoded, so its leaves are registered as whole values.
+        real_leaves = _json_leaves(rendered)
+        if real_leaves:
+            # Counted, not set membership: a derived leaf can equal an unrelated literal leaf.
+            derived_leaves = (
+                set(real_leaves)
+                if canary_render_failed
+                else {
+                    leaf
+                    for alternate in alternates
+                    for leaf in Counter(real_leaves) - Counter(_json_leaves(alternate) or ())
+                }
+            )
+            for leaf in derived_leaves:
+                _register_secret_value(secrets, leaf)
+        if canary_render_failed:
+            coverings = [(0, len(rendered))]
+        if not coverings:
+            continue
+        start, end = min(span[0] for span in coverings), max(span[1] for span in coverings)
+        if canary_render_failed or end - start > _BROAD_DERIVED_SPAN_CHARS:
+            # Every redactor re-encodes registered values per call, so a broad span costs the rest of the run.
+            LOG.warning(
+                "Registering a broad secret-derived template span",
+                span_length=end - start,
+                canary_render_failed=canary_render_failed,
+                canary_error=canary_error,
+            )
+        # Each changed segment protects the pieces a consumer may split out (a decoded `| json` list). The covering
+        # span is registered too when failing closed or a segment is too short to register (`token|list|join('-')`).
+        protected = [_register_derived_span(secrets, rendered, *segment) for segment in set(segments)]
+        if canary_render_failed or not segments or not all(protected):
+            _register_derived_span(secrets, rendered, start, end)
+
+
+def _changed_segments(region: str, other: str, offset: int, window: int) -> list[tuple[int, int]]:
+    if len(region) == len(other):
+        runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for index, (left, right) in enumerate(zip(region, other)):
+            if left != right and run_start is None:
+                run_start = index
+            elif left == right and run_start is not None:
+                runs.append((offset + run_start, offset + index))
+                run_start = None
+        if run_start is not None:
+            runs.append((offset + run_start, offset + len(region)))
+        return runs
+    # Lengths differ: walk both renders together and, at each divergence, find the nearest point where they agree
+    # again on a stretch of static text. Derived text is short, so each search stays within `window` and the walk
+    # is linear.
+    segments: list[tuple[int, int]] = []
+    i = j = 0
+    while i < len(region):
+        if j < len(other) and region[i] == other[j]:
+            i += 1
+            j += 1
+            continue
+        resync: tuple[int, int] | None = None
+        for skip in range(window + 1):
+            if resync is not None and skip >= resync[0] - i + resync[1] - j:
+                break
+            anchor = region[i + skip : i + skip + _RESYNC_ANCHOR_CHARS]
+            if len(anchor) < _RESYNC_ANCHOR_CHARS:
+                break
+            found = other.find(anchor, j, j + window + _RESYNC_ANCHOR_CHARS)
+            if found >= 0 and (resync is None or skip + found - j < resync[0] - i + resync[1] - j):
+                resync = (i + skip, found)
+        if resync is None:
+            if len(region) - i > window:
+                # ponytail: a derived stretch longer than the window keeps only the covering span.
+                return []
+            resync = (len(region), len(other))
+        # The chunk between divergence and re-sync is bounded by the window, so a character diff inside it is cheap and
+        # still splits copies joined by static text shorter than the anchor (`{{ a|upper }} or {{ a|reverse }}`).
+        matcher = difflib.SequenceMatcher(None, region[i : resync[0]], other[j : resync[1]], False)
+        segments += [
+            (offset + i + i1, offset + i + i2)
+            for tag, i1, i2, _, _ in matcher.get_opcodes()
+            if tag != "equal" and i1 < i2
+        ]
+        i, j = resync
+    return segments
+
+
+def _register_derived_span(secrets: dict[str, Any], rendered: str, start: int, end: int) -> bool:
+    """Register `rendered[start:end]`; False when it is too short to register."""
+    if start >= end:
+        return True
+    if end - start < MIN_UNANCHORED_SECRET_LENGTH:
+        # A short fragment inside a word (`AUTH{{ token[:4] }}CODE`) would never match on its own.
+        while start > 0 and rendered[start - 1].isalnum():
+            start -= 1
+        while end < len(rendered) and rendered[end].isalnum():
+            end += 1
+    return _register_secret_value(secrets, rendered[start:end])
+
+
+def _register_secret_value(secrets: dict[str, Any], value: str) -> bool:
+    """Register `value`; False when it is too short to register."""
+    if not is_redactable_secret_value(value, secrets):
+        return False
+    if value not in secrets.values():
+        secret_id = WorkflowRunContext.generate_random_secret_id()
+        while secret_id in secrets:
+            secret_id = WorkflowRunContext.generate_random_secret_id()
+        secrets[secret_id] = value
+    return True
+
+
+def _json_leaves(rendered: str) -> list[str] | None:
+    if not (rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER)):
+        return None
+    try:
+        value = json.loads(rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)])
+    except ValueError:
+        return None
+    leaves: list[str] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                leaves.append(key)
+                collect(item)
+        elif isinstance(node, list):
+            for item in node:
+                collect(item)
+        elif node is not None and not isinstance(node, bool):
+            leaves.append(str(node))
+
+    collect(value)
+    return leaves
 
 
 class WorkflowRunContext:
@@ -156,6 +451,7 @@ class WorkflowRunContext:
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
         attempt_number: int = 1,
+        parent_workflow_run_id: str | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -168,11 +464,15 @@ class WorkflowRunContext:
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
             attempt_number=attempt_number,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
 
         workflow_run_context.organization_id = organization.organization_id
 
         for parameter, run_parameter in workflow_parameter_tuples:
+            # The read path returns SCRUBBED_VALUE unconverted for display; execution must still reject it by type.
+            if run_parameter.value == SCRUBBED_VALUE:
+                parameter.workflow_parameter_type.convert_value(run_parameter.value)
             if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                 await workflow_run_context.register_secret_workflow_parameter_value(
                     parameter, run_parameter.value, organization
@@ -220,25 +520,30 @@ class WorkflowRunContext:
             elif isinstance(secret_parameter, CredentialParameter):
                 await workflow_run_context.register_credential_parameter_value(secret_parameter, organization)
             elif isinstance(secret_parameter, OnePasswordCredentialParameter):
-                await workflow_run_context.register_onepassword_credential_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, "onepassword"):
+                    await workflow_run_context.register_onepassword_credential_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, AzureVaultCredentialParameter):
-                await workflow_run_context.register_azure_vault_credential_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.AZURE_VAULT):
+                    await workflow_run_context.register_azure_vault_credential_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, BitwardenLoginCredentialParameter):
-                await workflow_run_context.register_bitwarden_login_credential_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.BITWARDEN):
+                    await workflow_run_context.register_bitwarden_login_credential_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, BitwardenCreditCardDataParameter):
-                await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.BITWARDEN):
+                    await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, BitwardenSensitiveInformationParameter):
-                await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.BITWARDEN):
+                    await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
+                        secret_parameter, organization
+                    )
 
         for context_parameter in context_parameters:
             # All context parameters will be registered with the context manager during initialization but the values
@@ -264,11 +569,13 @@ class WorkflowRunContext:
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
         attempt_number: int = 1,
+        parent_workflow_run_id: str | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
+        self.parent_workflow_run_id = parent_workflow_run_id
         self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
@@ -294,16 +601,26 @@ class WorkflowRunContext:
         # workflow definition in two places (SKY-9147).
         self._block_workflow_system_prompts: dict[str, str | None] = {}
         self.blocks_metadata: dict[str, BlockMetadata] = {}
+        # Kept apart from values and blocks_metadata so no template or branch-evaluation snapshot can see it.
+        self.block_outcomes: dict[str, BlockOutcome] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
         self.workflow_run_outputs: dict[str, Any] = {}
         self.carried_block_labels: set[str] = set()
+        # Blocks whose loop iterates page-derived values: their current_value/current_item came from a page.
+        self.page_derived_loop_labels: set[str] = set()
+        # ContextParameter keys a page-derived loop wrote. Never cleared: the value outlives the loop.
+        self.page_derived_context_keys: set[str] = set()
+        # Page-derived roots the effective workflow_system_prompt reads, set when it is resolved.
+        self.workflow_system_prompt_page_roots: dict[str, RootClass] = {}
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.browser_session_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
+        # Secret ids minted for the username slot of a login credential; never derived from a field name.
+        self.login_identifier_secret_ids: set[str] = set()
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
@@ -467,6 +784,19 @@ class WorkflowRunContext:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
 
+    def record_block_outcome(
+        self, label: str, status: BlockStatus, error_codes: Sequence[str], failure_reason: str | None
+    ) -> None:
+        if failure_reason is not None:
+            # Mask before cutting: a cut can leave the head of a secret in the stored reason.
+            failure_reason = str(self.mask_secrets_in_data(failure_reason))[:BLOCK_OUTCOME_FAILURE_REASON_MAX_CHARS]
+        self.block_outcomes[label] = BlockOutcome(
+            status=status, error_codes=list(error_codes), failure_reason=failure_reason
+        )
+
+    def get_block_outcome(self, label: str) -> BlockOutcome | None:
+        return self.block_outcomes.get(label)
+
     def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
         """Record the effective ``workflow_system_prompt`` a block resolved to.
 
@@ -526,6 +856,17 @@ class WorkflowRunContext:
         )
         inherited_resolved = self.render_workflow_level_template(inherited) if inherited else None
         own_resolved = self.render_workflow_level_template(own_raw) if own_raw else None
+        self.workflow_system_prompt_page_roots = {}
+        for raw in (inherited, own_raw):
+            if raw:
+                self.workflow_system_prompt_page_roots.update(
+                    classify_roots(
+                        jinja2_meta.find_undeclared_variables(jinja_sandbox_env.parse(raw)),
+                        self,
+                        None,
+                        jinja_sandbox_env,
+                    )
+                )
         parts = [p for p in (inherited_resolved, own_resolved) if p]
         resolved = "\n\n".join(parts) if parts else None
         self._effective_workflow_system_prompt_cache = resolved
@@ -567,7 +908,10 @@ class WorkflowRunContext:
                 workflow_permanent_id=self.workflow_permanent_id,
             )
 
-        return jinja_sandbox_env.from_string(raw_template).render(template_data)
+        template = jinja_sandbox_env.from_string(raw_template)
+        rendered = template.render(template_data)
+        register_secret_derived_output(self.secrets, template, raw_template, template_data, rendered)
+        return rendered
 
     async def _should_include_secrets_in_templates(self) -> bool:
         """
@@ -760,7 +1104,7 @@ class WorkflowRunContext:
         masking regardless of the workflow toggle. The gated stack lives behind
         secret_redaction_enabled_for_run.
 
-        Values shorter than _SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
+        Values shorter than SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
         string; a short secret embedded inside a longer scalar is knowingly left unmasked.
         """
         if not self.secrets:
@@ -776,8 +1120,9 @@ class WorkflowRunContext:
             if data in secret_values:
                 return mask
             result = data
-            for secret in secret_values:
-                if len(secret) >= _SECRET_SUBSTRING_MIN_LENGTH:
+            # Longest first: a registered slice of a secret masked before it would leave the rest behind.
+            for secret in sorted(secret_values, key=len, reverse=True):
+                if len(secret) >= SECRET_SUBSTRING_MIN_LENGTH:
                     result = result.replace(secret, mask)
             return result
         elif isinstance(data, dict):
@@ -787,6 +1132,12 @@ class WorkflowRunContext:
             return {self.mask_secrets_in_data(k, mask): self.mask_secrets_in_data(v, mask) for k, v in data.items()}
         elif isinstance(data, list):
             return [self.mask_secrets_in_data(item, mask) for item in data]
+        elif isinstance(data, (int, float)) and not isinstance(data, bool):
+            # A numeric secret decoded from `| json` arrives as a number; the redactor's floor keeps counts and years.
+            text = str(data)
+            digits = text.lstrip("-").replace(".", "")
+            if text in secret_values and len(digits) >= MIN_NUMERIC_SECRET_LENGTH:
+                return mask
         return data
 
     def build_workflow_run_summary(self) -> dict[str, Any]:
@@ -924,11 +1275,22 @@ class WorkflowRunContext:
         parameter: Parameter,
         organization: Organization,
     ) -> None:
+        async with record_credential_fetch(parameter) as fetch:
+            await self._load_credential_parameter_value(credential_id, parameter, organization, fetch)
+
+    async def _load_credential_parameter_value(
+        self,
+        credential_id: str,
+        parameter: Parameter,
+        organization: Organization,
+        fetch: CredentialFetch,
+    ) -> None:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=organization.organization_id
         )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
+        fetch.credential_id = credential_id
         if db_credential.run_sequentially is True:
             workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 self.workflow_run_id,
@@ -942,6 +1304,7 @@ class WorkflowRunContext:
             self.credential_tested_urls[parameter.key] = db_credential.tested_url
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+        fetch.provider = vault_type
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
         if credential_service is None:
             raise CredentialVaultNotConfiguredError(vault_type=vault_type.value, credential_id=credential_id)
@@ -954,9 +1317,13 @@ class WorkflowRunContext:
         )
         credential = credential_item.credential
 
-        credential_totp_identifier = db_credential.totp_identifier or getattr(credential, "totp_identifier", None)
+        credential_totp_identifier = db_credential.totp_identifier
+        if not credential_totp_identifier and isinstance(credential, PasswordCredential):
+            credential_totp_identifier = credential.totp_identifier
         if credential_totp_identifier:
-            self.credential_totp_identifiers[parameter.key] = credential_totp_identifier
+            normalized_totp_identifier = _normalize_credential_totp_identifier(credential_totp_identifier)
+            if normalized_totp_identifier is not None:
+                self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -985,6 +1352,8 @@ class WorkflowRunContext:
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = field_value
                 self.values[parameter.key][field_key] = secret_id
+                if isinstance(credential, PasswordCredential) and key == "username" and credential.password:
+                    self.login_identifier_secret_ids.add(secret_id)
 
         if isinstance(credential, PasswordCredential) and credential.totp:
             random_secret_id = self.generate_random_secret_id()
@@ -1013,8 +1382,6 @@ class WorkflowRunContext:
                 f"Trying to register workflow parameter as a secret but it is not a string. Parameter key: {parameter.key}"
             )
 
-        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
-
         # Handle regular credentials from the database
         try:
             await self._register_credential_parameter_value(credential_id, parameter, organization)
@@ -1027,16 +1394,27 @@ class WorkflowRunContext:
         parameter: CredentialParameter,
         organization: Organization,
     ) -> None:
-        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
-
         credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
         await self._register_credential_parameter_value(credential_id, parameter, organization)
+
+    @overload
+    async def resolve_credential_parameter_id(
+        self, parameter: CredentialParameter, organization_id: str, *, read_only: Literal[False] = False
+    ) -> str: ...
+
+    @overload
+    async def resolve_credential_parameter_id(
+        self, parameter: CredentialParameter, organization_id: str, *, read_only: bool
+    ) -> str | None: ...
 
     async def resolve_credential_parameter_id(
         self,
         parameter: CredentialParameter,
         organization_id: str,
-    ) -> str:
+        *,
+        read_only: bool = False,
+    ) -> str | None:
+        """read_only never selects from a pool or caches; an unselected pool resolves to None."""
         cached = self.resolved_credential_parameter_ids.get(parameter.key)
         if cached:
             return cached
@@ -1045,6 +1423,8 @@ class WorkflowRunContext:
             parameter_key=parameter.key,
         )
         if selected_credential_id is None and parameter.credential_ids:
+            if read_only:
+                return None
             selected_credential_id = await select_credential_for_run(
                 workflow_run_id=self.workflow_run_id,
                 organization_id=organization_id,
@@ -1063,7 +1443,8 @@ class WorkflowRunContext:
             registered_parameter_values,
             selected_credential_id,
         )
-        self.resolved_credential_parameter_ids[parameter.key] = credential_id
+        if not read_only:
+            self.resolved_credential_parameter_ids[parameter.key] = credential_id
         return credential_id
 
     async def register_aws_secret_parameter_value(
@@ -1115,7 +1496,7 @@ class WorkflowRunContext:
         )
 
         if resolution.token is None:
-            raise ValueError(
+            raise CredentialSourceNotConfiguredError(
                 "1Password is not configured for this organization. Add a 1Password service account token in Settings."
             )
         token = resolution.token
@@ -1147,7 +1528,11 @@ class WorkflowRunContext:
         # Check if item is None
         if item is None:
             LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
-            raise ValueError(f"1Password item not found. {lookup_context}")
+            raise CredentialItemNotFoundError(f"1Password item not found. {lookup_context}")
+        if parameter.totp_identifier:
+            normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
+            if normalized_totp_identifier is not None:
+                self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -1399,15 +1784,20 @@ class WorkflowRunContext:
                 # username secret
                 username_secret_id = f"{random_secret_id}_username"
                 self.secrets[username_secret_id] = secret_credentials[BitwardenConstants.USERNAME]
-                # password secret
                 password_secret_id = f"{random_secret_id}_password"
                 self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
+                if secret_credentials[BitwardenConstants.PASSWORD]:
+                    self.login_identifier_secret_ids.add(username_secret_id)
                 self.values[parameter.key] = {
                     "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
                     "username": username_secret_id,
                     "password": password_secret_id,
                 }
                 self.parameters[parameter.key] = parameter
+                if parameter.totp_identifier:
+                    normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
+                    if normalized_totp_identifier is not None:
+                        self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
                 if BitwardenConstants.TOTP in secret_credentials and secret_credentials[BitwardenConstants.TOTP]:
                     totp_secret_id = f"{random_secret_id}_totp"
@@ -1438,16 +1828,16 @@ class WorkflowRunContext:
         async with await self._get_azure_vault_client_for_organization(organization) as azure_vault_client:
             secret_username = await azure_vault_client.get_secret(username_key, vault_name)
             if not secret_username:
-                raise ValueError(f"Azure Vault username not found by key: {username_key}")
+                raise CredentialItemNotFoundError(f"Azure Vault username not found by key: {username_key}")
 
             secret_password = await azure_vault_client.get_secret(password_key, vault_name)
             if not secret_password:
-                raise ValueError(f"Azure Vault password not found by key: {password_key}")
+                raise CredentialItemNotFoundError(f"Azure Vault password not found by key: {password_key}")
 
             if totp_secret_key:
                 totp_secret = await azure_vault_client.get_secret(totp_secret_key, vault_name)
                 if not totp_secret:
-                    raise ValueError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
+                    raise CredentialItemNotFoundError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
             else:
                 totp_secret = None
 
@@ -1456,6 +1846,7 @@ class WorkflowRunContext:
             # login secret
             username_secret_id = f"{random_secret_id}_username"
             self.secrets[username_secret_id] = secret_username
+            self.login_identifier_secret_ids.add(username_secret_id)
             # password secret
             password_secret_id = f"{random_secret_id}_password"
             self.secrets[password_secret_id] = secret_password
@@ -1587,7 +1978,7 @@ class WorkflowRunContext:
             )
             client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
-                raise ValueError(f"Credit card data not found in Bitwarden. {lookup_context}")
+                raise CredentialItemNotFoundError(f"Credit card data not found in Bitwarden. {lookup_context}")
 
             self.secrets[BitwardenConstants.CLIENT_ID] = client_id
             self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
@@ -1700,6 +2091,8 @@ class WorkflowRunContext:
         if parameter.key in self.values:
             LOG.debug(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
 
+        # Later blocks template from this value; the persisted output keeps the full label.
+        value = without_output_only_labels(value)
         self.values[parameter.key] = value
         self.register_block_reference_variable_from_output_parameter(parameter, value)
 
@@ -1923,7 +2316,7 @@ class WorkflowRunContext:
     def _resolve_required_parameter_value(self, parameter_value: str | None, name: str) -> str:
         result = self._resolve_parameter_value(parameter_value)
         if not result:
-            raise ValueError(f"{name} is missing")
+            raise CredentialSourceNotConfiguredError(f"{name} is missing")
         return result
 
     def _resolve_parameter_value(self, parameter_value: str | None) -> str | None:
@@ -2032,6 +2425,7 @@ class WorkflowContextManager:
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
         attempt_number: int = 1,
+        parent_workflow_run_id: str | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -2049,6 +2443,7 @@ class WorkflowContextManager:
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
             attempt_number=attempt_number,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
@@ -2147,6 +2542,26 @@ class WorkflowContextManager:
         if current_context is None:
             return set()
         return collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+
+    def registered_placeholder_ids_for_run(self, workflow_run_id: str | None) -> frozenset[str]:
+        """The run's resolvable placeholder ids, so redaction can exempt them by exact value.
+
+        Redaction only ever receives secret values, so without this it has to guess from shape, and
+        anything shaped like an id survives — including a secret rendered right after the literal
+        prefix (SKY-17864).
+        """
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return frozenset()
+        return frozenset(
+            secret_id
+            for secret_id in self.workflow_run_contexts[workflow_run_id].secrets
+            if isinstance(secret_id, str) and secret_id.startswith(RANDOM_SECRET_ID_PREFIX)
+        )
+
+    def login_identifier_secret_ids_for_run(self, workflow_run_id: str | None) -> frozenset[str]:
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return frozenset()
+        return frozenset(self.workflow_run_contexts[workflow_run_id].login_identifier_secret_ids)
 
     def secret_values_for_drop_check(self, workflow_run_id: str | None) -> set[str]:
         """Every configured secret value, with no numeric floor and no masking opt-in, for a check that only

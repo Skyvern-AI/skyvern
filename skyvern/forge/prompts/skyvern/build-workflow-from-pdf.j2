@@ -65,13 +65,13 @@ AVAILABLE BLOCK TYPES (use these exact names):
 
 BLOCK STRUCTURE REQUIREMENTS:
 1. Each block MUST have: label, block_type, continue_on_failure
-2. Navigation blocks need: url (can be empty string ""), navigation_goal, engine (set to "skyvern-1.0")
-3. Login blocks need: url, navigation_goal, parameter_keys (empty array if no credentials), engine (set to "skyvern-1.0")
-4. Extraction blocks need: url (can be empty string ""), data_extraction_goal, data_schema (use snake_case for all field names, e.g., product_name, order_date), engine (set to "skyvern-1.0")
-5. Action blocks need: url (can be empty string ""), navigation_goal, engine (set to "skyvern-1.0")
+2. Navigation blocks need: url (can be empty string ""), navigation_goal
+3. Login blocks need: url, navigation_goal, parameter_keys (empty array if no credentials)
+4. Extraction blocks need: url (can be empty string ""), data_extraction_goal, data_schema (use snake_case for all field names, e.g., product_name, order_date)
+5. Action blocks need: url (can be empty string ""), navigation_goal
 6. Validation blocks need: complete_criterion OR terminate_criterion (at least one must be set), parameter_keys (empty array if none)
 7. For_loop blocks need: loop_blocks, loop_variable_reference
-8. File_download blocks need: url (can be empty string ""), navigation_goal, engine (set to "skyvern-1.0")
+8. File_download blocks need: url (can be empty string ""), navigation_goal
 
 CRITICAL INSTRUCTIONS - READ CAREFULLY:
 1. **BE THOROUGH**: Convert EVERY automatable step from the SOP into a block. Do not skip or combine steps.
@@ -84,8 +84,7 @@ CRITICAL INSTRUCTIONS - READ CAREFULLY:
 8. **URL FIELD**: Most blocks need a "url" field. Use empty string "" if no specific URL is needed (browser stays on current page).
 9. **AVOID VALIDATION BLOCKS**: Use "extraction" blocks for data extraction. Only use "validation" if explicitly validating previous extracted data, and always include complete_criterion.
 10. Set continue_on_failure to false for critical steps, true for optional ones
-11. Set engine to "skyvern-1.0" for all blocks that need it
-12. Use SHORT descriptive labels (1-5 words, snake_case): e.g., "login", "extract_date_data", "submit_google_login_form". Avoid long labels.
+11. Use SHORT descriptive labels (1-5 words, snake_case): e.g., "login", "extract_date_data", "submit_google_login_form". Avoid long labels.
 
 EXAMPLES OF THOROUGHNESS:
 - If SOP says "Navigate to page X, then click button Y, then fill form Z" → Create 3 separate blocks

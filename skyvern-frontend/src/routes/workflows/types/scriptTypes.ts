@@ -1,8 +1,5 @@
-import type { CodeBlockStep } from "./workflowTypes";
-
 export type CodeBlockTitleSource = {
   prompt?: string | null;
-  steps?: Array<Pick<CodeBlockStep, "title">> | null;
 };
 
 export type ScriptBlocksResponse = {

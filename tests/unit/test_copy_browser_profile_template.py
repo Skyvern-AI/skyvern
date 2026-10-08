@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from skyvern.forge.sdk.routes.browser_profiles import _copy_browser_profile_template
-from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
+from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME, SIGNIN_COOKIES_FILENAME
 from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
 
 
@@ -14,6 +14,7 @@ def test_copy_browser_profile_template_excludes_cookie_sidecars(tmp_path: Path) 
     (source / "Local State").write_text("{}")
     (source / SESSION_COOKIES_FILENAME).write_text("[]")
     (source / BANKED_COOKIES_FILENAME).write_text("[]")
+    (source / SIGNIN_COOKIES_FILENAME).write_text("[]")
 
     dest = tmp_path / "profile"
     dest.mkdir()
@@ -22,5 +23,6 @@ def test_copy_browser_profile_template_excludes_cookie_sidecars(tmp_path: Path) 
     copied = {p.name for p in dest.iterdir()}
     assert SESSION_COOKIES_FILENAME not in copied
     assert BANKED_COOKIES_FILENAME not in copied
+    assert SIGNIN_COOKIES_FILENAME not in copied
     assert "Local State" in copied  # a normal file still copies, so the exclusion is targeted
     assert (dest / "Default" / "Preferences").exists()

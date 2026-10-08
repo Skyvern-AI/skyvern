@@ -25,12 +25,12 @@ describe("resolveSendAction", () => {
   });
 
   // A parked turn (awaiting the user) never ends, so a swallowed second send
-  // left the composer permanently dead. Rewriting the parked prompt keeps the
+  // left the composer permanently dead. Adding to the parked prompt keeps the
   // one-queued-prompt invariant without the dead end.
-  it("rewrites the parked prompt when a second send arrives", () => {
+  it("adds to the parked prompt when a second send arrives", () => {
     expect(
       resolveSendAction(sendInput({ hasQueuedPrompt: true, isDrain: false })),
-    ).toBe("replace_queued");
+    ).toBe("append_queued");
   });
 
   it("still returns noop for an empty candidate while a prompt is queued", () => {

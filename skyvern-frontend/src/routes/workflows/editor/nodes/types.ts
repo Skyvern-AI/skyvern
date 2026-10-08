@@ -3,6 +3,10 @@ import {
   type WorkflowModel,
 } from "../../types/workflowTypes";
 import type { CodeBlockTitleSource } from "../../types/scriptTypes";
+import type {
+  BlockReviewAnnotation,
+  FoldReviewAnnotation,
+} from "../review/reviewAnnotation";
 
 export type NodeBaseData = {
   debuggable: boolean;
@@ -11,8 +15,10 @@ export type NodeBaseData = {
   nextLoopOnFailure?: boolean;
   editable: boolean;
   model: WorkflowModel | null;
+  // A person picked the block's engine; only task-like blocks read it.
+  enginePinned?: boolean;
   showCode?: boolean;
-  comparisonColor?: string;
+  review?: BlockReviewAnnotation | FoldReviewAnnotation;
   ignoreWorkflowSystemPrompt?: boolean;
   /**
    * Optional metadata used for conditional branches.
@@ -62,9 +68,7 @@ function truncateTitle(value: string): string {
 
 export function getCodeBlockTitle(source: CodeBlockTitleSource): string {
   return truncateTitle(
-    normalizeTitle(source.prompt) ??
-      normalizeTitle(source.steps?.[0]?.title) ??
-      CODE_BLOCK_FALLBACK_TITLE,
+    normalizeTitle(source.prompt) ?? CODE_BLOCK_FALLBACK_TITLE,
   );
 }
 
@@ -90,10 +94,12 @@ export const workflowBlockTitle: {
   validation: "AI Validation",
   human_interaction: "Human Interaction",
   wait: "Wait",
+  terminate: "Terminate",
   pdf_parser: "PDF Parser",
   task_v2: "Browser Task v2",
   goto_url: "Go to URL",
   http_request: "HTTP Request",
+  web_search: "Web Search",
   print_page: "Print Page",
   workflow_trigger: "Agent Trigger",
   email_inbox: "Email Inbox",

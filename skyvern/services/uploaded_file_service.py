@@ -302,6 +302,13 @@ async def _delete_files_attached_to_run(*, run_id: str) -> int:
     return deleted
 
 
+async def file_id_for_storage_uri(*, storage_uri: str, organization_id: str) -> str | None:
+    uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file_by_storage_uri(
+        storage_uri=storage_uri, organization_id=organization_id
+    )
+    return uploaded_file.file_id if uploaded_file else None
+
+
 async def resolve_file_reference(*, file_id: str, organization_id: str) -> str | None:
     """Return the storage URI behind a file id, or None when the org has no such live file.
 

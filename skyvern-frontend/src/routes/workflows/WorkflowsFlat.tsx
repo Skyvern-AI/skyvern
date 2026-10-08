@@ -30,8 +30,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import {
   BULK_CONCURRENCY_LIMIT,
@@ -73,6 +75,8 @@ import {
 import { NarrativeCard } from "./components/header/NarrativeCard";
 import { BulkActionBar } from "./components/BulkActionBar";
 import { WorkflowRowActions } from "./components/WorkflowRowActions";
+import { WorkflowCreatorLabel } from "./components/WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
@@ -96,7 +100,7 @@ import {
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { useNodeCollapseStore } from "./editor/collapse/useNodeCollapseStore";
 import { convert } from "./editor/workflowEditorUtils";
-import { WorkflowApiResponse } from "./types/workflowTypes";
+import { WorkflowApiResponse, workflowCreatedAt } from "./types/workflowTypes";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TableSearchInput } from "@/components/TableSearchInput";
@@ -182,12 +186,10 @@ function WorkflowsFlat() {
     () => parseTagFilter(tagFilterParam),
     [tagFilterParam],
   );
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
-  // While tagging is hidden, ignore stale `?tags=` so the backend list isn't tag-filtered.
-  const serializedTagFilter = taggingEnabled
-    ? serializeTagFilter(tagFilters)
-    : "";
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // While tagging is off, ignore stale `?tags=` so the backend list isn't tag-filtered.
+  const { tags: serializedTagFilter, hold: holdForTaggingFlag } =
+    useUrlTagFilter(serializeTagFilter(tagFilters));
 
   const setTagFilters = useCallback(
     (terms: TagFilterTerm[]) => {
@@ -340,7 +342,10 @@ function WorkflowsFlat() {
         })
         .then((response) => response.data);
     },
-    placeholderData: (previousData) => previousData,
+    enabled: !holdForTaggingFlag,
+    // A held tag-filtered list must not carry over the previous unfiltered rows.
+    placeholderData: (previousData) =>
+      holdForTaggingFlag ? undefined : previousData,
   });
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
@@ -373,7 +378,7 @@ function WorkflowsFlat() {
         })
         .then((response) => response.data);
     },
-    enabled: workflows.length === itemsPerPage,
+    enabled: !holdForTaggingFlag && workflows.length === itemsPerPage,
   });
 
   const isNextDisabled =
@@ -514,7 +519,8 @@ function WorkflowsFlat() {
   );
 
   const showCheckbox = selectableWorkflows.length > 0;
-  const columnCount = showCheckbox ? 6 : 5;
+  const showCreator = useCreatorColumnEnabled();
+  const columnCount = 5 + (showCheckbox ? 1 : 0) + (showCreator ? 1 : 0);
 
   const {
     selected,
@@ -838,19 +844,32 @@ function WorkflowsFlat() {
                     ariaLabel="Select all agents"
                   />
                 )}
-                <TableHead className={showCheckbox ? "w-[22%]" : "w-[25%]"}>
+                <TableHead className={showCheckbox ? "w-[19%]" : "w-[21%]"}>
                   ID
                 </TableHead>
-                <TableHead className={showCheckbox ? "w-[27%]" : "w-[30%]"}>
+                <TableHead
+                  className={
+                    showCreator
+                      ? showCheckbox
+                        ? "w-[25%]"
+                        : "w-[26%]"
+                      : showCheckbox
+                        ? "w-[37%]"
+                        : "w-[38%]"
+                  }
+                >
                   Title
                 </TableHead>
-                <TableHead className="w-[15%]">Folder</TableHead>
-                <TableHead className="w-[15%]">Created At</TableHead>
+                <TableHead className="w-[13%]">Folder</TableHead>
+                {showCreator && (
+                  <TableHead className="w-[12%]">Created By</TableHead>
+                )}
+                <TableHead className="w-[13%]">Created At</TableHead>
                 <TableHead className="w-[15%] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {isFetching &&
+              {(isFetching || holdForTaggingFlag) &&
               !isPlaceholderData &&
               displayWorkflows.length === 0 ? (
                 // Show skeleton rows only on initial load (not during search refinement)
@@ -870,6 +889,11 @@ function WorkflowsFlat() {
                     <TableCell>
                       <Skeleton className="h-5 w-20" />
                     </TableCell>
+                    {showCreator && (
+                      <TableCell>
+                        <Skeleton className="h-5 w-20" />
+                      </TableCell>
+                    )}
                     <TableCell>
                       <Skeleton className="h-5 w-32" />
                     </TableCell>
@@ -933,8 +957,15 @@ function WorkflowsFlat() {
                           <TableCell>
                             <span className="text-muted-foreground">-</span>
                           </TableCell>
+                          {showCreator && (
+                            <TableCell>
+                              <WorkflowCreatorLabel
+                                createdBy={workflow.original_created_by}
+                              />
+                            </TableCell>
+                          )}
                           <TableCell className="text-muted-foreground">
-                            {compactLocalDateTime(workflow.created_at)}
+                            {compactLocalDateTime(workflowCreatedAt(workflow))}
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-0.5">
@@ -1093,6 +1124,20 @@ function WorkflowsFlat() {
                                   </span>
                                 )}
                               </TableCell>
+                              {showCreator && (
+                                <TableCell
+                                  onClick={(event) => {
+                                    handleRowClick(
+                                      event,
+                                      workflow.workflow_permanent_id,
+                                    );
+                                  }}
+                                >
+                                  <WorkflowCreatorLabel
+                                    createdBy={workflow.original_created_by}
+                                  />
+                                </TableCell>
+                              )}
                               <TableCell
                                 onClick={(event) => {
                                   handleRowClick(
@@ -1101,9 +1146,13 @@ function WorkflowsFlat() {
                                   );
                                 }}
                                 className="text-muted-foreground"
-                                title={basicTimeFormat(workflow.created_at)}
+                                title={basicTimeFormat(
+                                  workflowCreatedAt(workflow),
+                                )}
                               >
-                                {compactLocalDateTime(workflow.created_at)}
+                                {compactLocalDateTime(
+                                  workflowCreatedAt(workflow),
+                                )}
                               </TableCell>
                               <TableCell>
                                 <div className="flex justify-end gap-0.5">
@@ -1326,10 +1375,10 @@ function WorkflowsFlat() {
           open={isTemplateDialogOpen}
           onOpenChange={setIsTemplateDialogOpen}
           onSelectTemplate={(template) => {
-            const clonedWorkflow = convert({
-              ...template,
-              title: `${template.title} (copy)`,
-            });
+            const clonedWorkflow = convert(
+              { ...template, title: `${template.title} (copy)` },
+              { asNewWorkflow: true },
+            );
             createWorkflowMutation.mutate({
               ...clonedWorkflow,
               folder_id: selectedFolderId,
@@ -1337,9 +1386,7 @@ function WorkflowsFlat() {
           }}
         />
 
-        <div data-hint="start-template">
-          <WorkflowTemplates />
-        </div>
+        <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
   );

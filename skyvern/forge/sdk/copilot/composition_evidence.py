@@ -11,9 +11,10 @@ import structlog
 import yaml
 
 try:
-    from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+    from bs4 import BeautifulSoup, NavigableString  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection degrades gracefully.
     BeautifulSoup = None  # type: ignore[assignment, misc]
+    NavigableString = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.challenge_evidence import (
@@ -27,6 +28,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
+from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -47,9 +49,10 @@ _INTERACTION_NO_URL_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "acti
 # blocks, so only no-url action/download/upload blocks force post-interaction refs.
 _POST_INTERACTION_OBS_REQ_BLOCK_TYPES: frozenset[str] = frozenset({"action", "file_download", "file_upload"})
 _GOTO_URL_BLOCK_TYPE = "goto_url"
-_SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
-_STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({"evaluate"})
-_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition", "evaluate"})
+_STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({EVALUATE_TOOL_NAME})
+_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset(
+    {COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME}
+)
 SCOUT_INTERACTION_EVIDENCE_TOOL = "scout_interaction"
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
@@ -134,6 +137,7 @@ _NON_ENTRY_FIELD_TYPES: frozenset[str] = frozenset(
 
 
 class _PostRunCompositionContext(Protocol):
+    workflow_yaml: str | None
     composition_page_evidence: dict[str, Any] | None
     workflow_verification_evidence: WorkflowVerificationEvidence
     post_run_page_observation_after_failed_test: bool
@@ -672,10 +676,6 @@ def _changed_goto_url_blocks(workflow_yaml: str | None, previous_workflow_yaml: 
     return blocks
 
 
-def _format_page_block_findings(blocks: list[dict[str, str]]) -> str:
-    return ", ".join(f"{block['label']} ({block['block_type']})" for block in blocks[:5])
-
-
 def _same_page(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
@@ -721,37 +721,24 @@ def _post_run_recovery_state(ctx: _PostRunCompositionContext) -> bool:
     return ctx.post_run_page_observation_after_failed_test is True
 
 
-def _post_run_observed_url_goto_error(
+def _persists_post_run_observed_url_goto(
     ctx: _PostRunCompositionContext,
     workflow_yaml: str | None,
     previous_workflow_yaml: str | None,
-) -> str | None:
+) -> bool:
     if not previous_workflow_yaml or not _post_run_recovery_state(ctx):
-        return None
+        return False
 
     evidence = ctx.composition_page_evidence
     if not isinstance(evidence, dict) or evidence.get("observed_after_workflow_run") is not True:
-        return None
+        return False
     observed_url = evidence.get("current_url")
     if not isinstance(observed_url, str) or not observed_url.strip():
-        return None
+        return False
 
-    offending = [
-        block
+    return any(
+        _same_url_ignoring_fragment(block.get("url"), observed_url)
         for block in _changed_goto_url_blocks(workflow_yaml, previous_workflow_yaml)
-        if _same_url_ignoring_fragment(block.get("url"), observed_url)
-    ]
-    if not offending:
-        return None
-
-    labels = ", ".join(block["label"] for block in offending[:5])
-    return (
-        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}the draft is trying to persist a post-run browser URL as a new goto_url "
-        "block after an incomplete or budgeted run. That URL may encode record-specific, result-page, or "
-        "session state. Keep the reusable entrypoint and verified upstream blocks, then either extract from "
-        "the observed current page, split or replace the budgeted frontier into smaller reusable UI actions, "
-        "or report partial verification. "
-        f"Offending goto_url block(s): {labels}."
     )
 
 
@@ -947,7 +934,7 @@ def _evidence_matches_target(
     # empty schema when the page had not rendered at capture time, so URL match
     # alone must not satisfy the gate. Require a bounded page schema for every
     # evidence source, the inspector included.
-    if source_tool == _SCHEMA_EVIDENCE_TOOL and has_bounded_page_schema(evidence):
+    if source_tool == COMPOSITION_INSPECTION_TOOL_NAME and has_bounded_page_schema(evidence):
         if page_record_matches_url(evidence, target_url):
             return True
     if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and has_bounded_page_schema(evidence):
@@ -1023,7 +1010,7 @@ def _flow_evidence_by_step(ctx: Any) -> dict[int, tuple[dict[str, Any], str]]:
     return by_step
 
 
-def _iter_block_observation_ref_items(value: Any, *, warn_malformed: bool) -> Iterable[tuple[Any, Any]] | None:
+def _iter_block_observation_ref_items(value: Any) -> Iterable[tuple[Any, Any]] | None:
     if isinstance(value, dict):
         return value.items()
     if isinstance(value, list):
@@ -1035,7 +1022,7 @@ def _iter_block_observation_ref_items(value: Any, *, warn_malformed: bool) -> It
                 # Accept the typed ref shape without coupling the composition gate
                 # to a concrete pydantic model.
                 items.append((item.label, item.observation_step))
-            elif warn_malformed:
+            else:
                 LOG.warning(
                     "copilot_block_observation_ref_malformed_item_ignored",
                     item_type=type(item).__name__,
@@ -1045,7 +1032,7 @@ def _iter_block_observation_ref_items(value: Any, *, warn_malformed: bool) -> It
 
 
 def normalize_block_observation_refs(value: Any) -> dict[str, int]:
-    items = _iter_block_observation_ref_items(value, warn_malformed=True)
+    items = _iter_block_observation_ref_items(value)
     if items is None:
         LOG.warning(
             "copilot_block_observation_refs_unexpected_type_ignored",
@@ -1213,179 +1200,32 @@ def _block_has_observed_page(
     return _page_observed(ctx, block.get("target_url"), allow_post_run=allow_post_run)
 
 
-def _missing_observation_ref_step(
-    block: dict[str, Any],
-    *,
-    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
-    block_observation_refs: dict[str, int],
-) -> int | None:
-    label = str(block.get("label") or "")
-    if not label or label not in block_observation_refs:
-        return None
-    step = block_observation_refs[label]
-    return None if step in flow_evidence_by_step else step
-
-
-def _raw_block_observation_ref_step(value: Any, label: str) -> object | None:
-    if not label:
-        return None
-    items = _iter_block_observation_ref_items(value, warn_malformed=False)
-    if items is None:
-        return None
-    for item_label, item_step in items:
-        if isinstance(item_label, str) and item_label.strip() == label:
-            return item_step
-    return None
-
-
-def _string_observation_ref_step(block: dict[str, Any], raw_block_observation_refs: Any) -> str | None:
-    label = str(block.get("label") or "")
-    raw_step = _raw_block_observation_ref_step(raw_block_observation_refs, label)
-    return raw_step if isinstance(raw_step, str) else None
-
-
-def _required_observation_ref_missing(block: dict[str, Any], block_observation_refs: dict[str, int]) -> bool:
-    if block.get("requires_observation_ref") is not True:
-        return False
-    label = str(block.get("label") or "")
-    return bool(label and label not in block_observation_refs)
-
-
-def _wrong_reached_via_observation_ref(
-    block: dict[str, Any],
-    *,
-    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
-    block_observation_refs: dict[str, int],
-) -> tuple[int, str] | None:
-    if block.get("requires_observation_ref") is not True:
-        return None
-    label = str(block.get("label") or "")
-    if not label or label not in block_observation_refs:
-        return None
-    step = block_observation_refs[label]
-    evidence_entry = flow_evidence_by_step.get(step)
-    if evidence_entry is None:
-        return None
-    evidence, reached_via = evidence_entry
-    if reached_via in {"interaction", "post_run"}:
-        return None
-    if (
-        _current_page_evidence_has_reached_page_credit(
-            evidence,
-            reached_via,
-            step=step,
-            flow_evidence_by_step=flow_evidence_by_step,
-        )
-        is not None
-    ):
-        return None
-    return step, reached_via or "<missing>"
-
-
-def composition_page_evidence_error(
-    ctx: Any,
+def composition_page_evidence_missing(
+    ctx: _PostRunCompositionContext,
     workflow_yaml: str | None,
     *,
     block_observation_refs: dict[str, int] | None = None,
-    raw_block_observation_refs: Any | None = None,
-) -> str | None:
-    """Return a non-blocking authoring finding when page-acting blocks lack observation.
-
-    Deliberately structural rather than semantic: every block that acts on a page
-    — block-type-agnostic, including goto_url/code blocks that carry a url, and
-    each page across a multi-page flow — needs observed evidence of that page
-    first. Whether the agent observed the *right* live state (e.g. a control that
-    only appears after a click) is driven by the agent's live scouting and measured
-    by evals, not enforced by a classifier in the mutation path.
-    """
-
-    previous_workflow_yaml = getattr(ctx, "workflow_yaml", None)
-    post_run_url_error = _post_run_observed_url_goto_error(ctx, workflow_yaml, previous_workflow_yaml)
-    if post_run_url_error:
-        return post_run_url_error
-
+) -> bool:
+    # Structural, not semantic: whether the agent observed the right live state is left to scouting and evals.
+    previous_workflow_yaml = ctx.workflow_yaml
+    if _persists_post_run_observed_url_goto(ctx, workflow_yaml, previous_workflow_yaml):
+        return True
     gated_blocks = _gated_page_acting_blocks(workflow_yaml, previous_workflow_yaml)
     if not gated_blocks:
-        return None
-
-    allow_post_run = bool(previous_workflow_yaml)
+        return False
     flow_evidence_by_step = _flow_evidence_by_step(ctx)
-    if raw_block_observation_refs is None:
-        raw_block_observation_refs = getattr(
-            ctx,
-            "raw_block_observation_refs",
-            getattr(ctx, "block_observation_refs", None),
-        )
     if block_observation_refs is None:
         block_observation_refs = _block_observation_refs(ctx)
-    for block in gated_blocks:
-        target_url = block["target_url"]
-        if not _block_has_observed_page(
+    return any(
+        not _block_has_observed_page(
             ctx,
             block,
-            allow_post_run=allow_post_run,
+            allow_post_run=bool(previous_workflow_yaml),
             flow_evidence_by_step=flow_evidence_by_step,
             block_observation_refs=block_observation_refs,
-        ):
-            missing_step = _missing_observation_ref_step(
-                block,
-                flow_evidence_by_step=flow_evidence_by_step,
-                block_observation_refs=block_observation_refs,
-            )
-            string_step = _string_observation_ref_step(block, raw_block_observation_refs)
-            wrong_reached_via = _wrong_reached_via_observation_ref(
-                block,
-                flow_evidence_by_step=flow_evidence_by_step,
-                block_observation_refs=block_observation_refs,
-            )
-            if string_step is not None:
-                return (
-                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block_observation_refs entry uses observation_step "
-                    f"{string_step!r} as a string. Pass the integer observation_step returned by "
-                    "inspect_page_for_composition or evaluate for click-reached blocks. "
-                    f"Offending blocks: {_format_page_block_findings([block])}"
-                )
-            if _required_observation_ref_missing(block, block_observation_refs):
-                return (
-                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a click-reached block requires a block_observation_refs entry. "
-                    "Pass an interaction- or post_run-reached observation_step for click-reached blocks before "
-                    "composing them. "
-                    f"Offending blocks: {_format_page_block_findings([block])}"
-                )
-            if wrong_reached_via is not None:
-                step, reached_via = wrong_reached_via
-                return (
-                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
-                    f"{step}, but that observed page was reached via {reached_via!r}. "
-                    "Pass an interaction- or post_run-reached observation_step for click-reached blocks. "
-                    f"Offending blocks: {_format_page_block_findings([block])}"
-                )
-            if missing_step is not None:
-                min_available_step = min(flow_evidence_by_step) if flow_evidence_by_step else None
-                missing_reason = (
-                    "that observed page evidence is no longer available in the flow-evidence window"
-                    if min_available_step is not None and missing_step < min_available_step
-                    else "that observation step was not found in flow evidence"
-                )
-                return (
-                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
-                    f"{missing_step}, but {missing_reason}. "
-                    "Inspect or evaluate the reached page again and pass the new observation_step in "
-                    "block_observation_refs before composing page-dependent blocks. "
-                    f"Offending blocks: {_format_page_block_findings([block])}"
-                )
-            return (
-                f"{INTERNAL_VALIDATION_FAILURE_PREFIX}page-dependent build blocks need observed page evidence before they are "
-                f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
-                "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
-                f"Offending blocks: {_format_page_block_findings([block])}"
-            )
-
-    # Matched page evidence may ground a multi-block mutation. This gate enforces
-    # observation before page-dependent composition; it does not prescribe a
-    # one-block-per-observation workflow construction style.
-
-    return None
+        )
+        for block in gated_blocks
+    )
 
 
 def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
@@ -2012,55 +1852,61 @@ def _clickable_controls_html(
     controls: list[dict[str, Any]] = []
     seen_selectors = set(used_selectors)
     seen_text: set[str] = set()
+    seen_textless_selectors: set[str] = set()
 
     def factual_entry(node: Any, entry: dict[str, Any]) -> dict[str, Any]:
         return _attach_node_evidence(entry, _element_address_evidence(node))
+
+    def collect(node: Any) -> None:
+        tag_name = str(node.name or "").lower()
+        if tag_name in {"script", "style", "noscript"}:
+            return
+        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
+            return
+        text = _schema_text(_clickable_control_text(node), 120)
+        selector = _clickable_control_selector(node)
+        state = {
+            **({"disabled": True} if _control_disabled(node) else {}),
+            **_html_disclosure_facts(node, controlled_region_visibility),
+        }
+        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
+            controls.append(
+                factual_entry(node, {"text": text, "selector": _bounded_selector(selector), "tag": tag_name, **state})
+            )
+            seen_selectors.add(selector)
+            if text:
+                seen_text.add(text)
+            return
+        if not text:
+            if not selector or selector in seen_textless_selectors:
+                return
+            controls.append(factual_entry(node, {"text": "", "tag": tag_name, **state}))
+            seen_textless_selectors.add(selector)
+            return
+        if text in seen_text:
+            return
+        controls.append(factual_entry(node, {"text": text, "tag": tag_name, **state}))
+        seen_text.add(text)
 
     try:
         candidates = soup.select('button, [role="button"], [data-action]')
     except Exception:
         candidates = soup.find_all("button")
+    role_matched = {id(node) for node in candidates}
     for node in candidates:
         if len(controls) >= _MAX_CLICKABLE_CONTROLS:
             break
-        tag_name = str(node.name or "").lower()
-        if tag_name in {"script", "style", "noscript"}:
+        collect(node)
+    try:
+        focusable = soup.select('[tabindex]:not([tabindex^="-"])')
+    except Exception:
+        focusable = []
+    for node in focusable:
+        if len(controls) >= _MAX_CLICKABLE_CONTROLS:
+            break
+        if id(node) in role_matched or _schema_text(_clickable_control_text(node), 120):
             continue
-        if hasattr(node, "find_parent") and node.find_parent("form") is not None:
-            continue
-        text = _schema_text(_clickable_control_text(node), 120)
-        selector = _clickable_control_selector(node)
-        if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
-            controls.append(
-                factual_entry(
-                    node,
-                    {
-                        "text": text,
-                        "selector": _bounded_selector(selector),
-                        "tag": tag_name,
-                        **({"disabled": True} if _control_disabled(node) else {}),
-                        **_html_disclosure_facts(node, controlled_region_visibility),
-                    },
-                )
-            )
-            seen_selectors.add(selector)
-            if text:
-                seen_text.add(text)
-            continue
-        if not text or text in seen_text:
-            continue
-        controls.append(
-            factual_entry(
-                node,
-                {
-                    "text": text,
-                    "tag": tag_name,
-                    **({"disabled": True} if _control_disabled(node) else {}),
-                    **_html_disclosure_facts(node, controlled_region_visibility),
-                },
-            )
-        )
-        seen_text.add(text)
+        collect(node)
     return controls
 
 
@@ -2224,6 +2070,7 @@ def _append_metric_card_relations(
         leaves: list[tuple[int, str]] = []
         # Where each leaf sits when it is a grandchild: the child holding it, and its index within.
         leaf_anchors: dict[tuple[int, str], tuple[Any, int, int]] = {}
+        leaf_nodes: dict[tuple[int, str], Any] = {}
         nested_ok = True
         for index, child in enumerate(children):
             grandchildren = [grand for grand in child.find_all(recursive=False) if grand.name]
@@ -2231,6 +2078,7 @@ def _append_metric_card_relations(
                 text = _schema_text(_node_text(child), 240)
                 if text:
                     leaves.append((index, text))
+                    leaf_nodes.setdefault((index, text), child)
                 continue
             if any(not _reads_as_one_leaf(grand) for grand in grandchildren):
                 nested_ok = False
@@ -2240,6 +2088,7 @@ def _append_metric_card_relations(
                 if text:
                     leaves.append((index, text))
                     leaf_anchors.setdefault((index, text), (child, grand_index, len(grandchildren)))
+                    leaf_nodes.setdefault((index, text), grand)
         if not nested_ok or not leaves or len(leaves) > 8:
             continue
         magnitudes = [(index, text) for index, text in leaves if _BARE_MAGNITUDE_RE.fullmatch(text)]
@@ -2286,6 +2135,9 @@ def _append_metric_card_relations(
             {
                 "key_text": headings[0][:120],
                 "value_text": value_text,
+                "selector_candidates": _relation_selector_candidates(
+                    value_carrier, headings[0][:120], leaf_nodes.get(heading_leaves[0])
+                ),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2316,6 +2168,96 @@ def _within(node: Any, ancestor: Any) -> bool:
             return True
         current = getattr(current, "parent", None)
     return False
+
+
+_TEXT_ANCHOR_MAX_HOPS = 4
+_TEXT_ANCHOR_MAX_LABEL_CHARS = 60
+_HIDDEN_TEXT_KEY = "_skyvern_hidden_text"
+
+
+def _shape_selector(node: Any) -> str:
+    return str(node.name or "*").lower() + _class_selector(_classes_for(node))
+
+
+def _own_text_runs(node: Any) -> list[str]:
+    """Mirror of ``ownTextRuns``: the runs of an element's own text nodes that Playwright's :text-is() compares."""
+    runs: list[str] = []
+    run = ""
+    for child in node.children:
+        if type(child) is NavigableString:
+            run += str(child)
+            continue
+        if run:
+            runs.append(run)
+        run = ""
+    if run:
+        runs.append(run)
+    return [" ".join(text.replace("​", "").split()) for text in runs]
+
+
+def _label_anchor_candidate(carrier: Any, label_node: Any, label: str) -> ScoutedSelectorCandidate | None:
+    """Mirror of the page-side relation key anchor, verified with the semantics Playwright runs it with."""
+    if not _label_like(label) or len(label) > _TEXT_ANCHOR_MAX_LABEL_CHARS:
+        return None
+    root = carrier
+    while root.parent is not None:
+        root = root.parent
+    folded = label.lower()
+    # Playwright's text engines also match hidden elements, which this parse has already removed.
+    if folded in str(vars(root).get(_HIDDEN_TEXT_KEY, "")).lower():
+        return None
+    base = _shape_selector(carrier)
+    containing = [
+        node for node in _selector_matches(carrier, base) or [] if folded in " ".join(node.get_text().split()).lower()
+    ]
+    has_text = f'{base}:has-text("{_css_attr(label)}")'
+    if len(containing) == 1 and containing[0] is carrier and len(has_text) <= _MAX_SELECTOR_CHARS:
+        return {"selector": has_text, "source": "text_anchor", "match_count": 1}
+    if label_node is None or label_node is carrier or _value_like(label) or label not in _own_text_runs(label_node):
+        return None
+    anchor = carrier
+    for _hop in range(_TEXT_ANCHOR_MAX_HOPS + 1):
+        if _within(label_node, anchor):
+            break
+        parent = anchor.parent
+        if parent is None or str(parent.name or "") in {"", "body", "html", "[document]"}:
+            return None
+        anchor = parent
+    else:
+        return None
+    base = _shape_selector(anchor)
+    label_shape = _shape_selector(label_node)
+    inner = "" if anchor is carrier else _shape_selector(carrier)
+    selector = f'{base}:has({label_shape}:text-is("{_css_attr(label)}"))' + (f" {inner}" if inner else "")
+    if len(selector) > _MAX_SELECTOR_CHARS:
+        return None
+    base_ids = {id(node) for node in _selector_matches(carrier, base) or []}
+    anchor_ids = {
+        id(parent)
+        for node in _selector_matches(carrier, label_shape) or []
+        if label in _own_text_runs(node)
+        for parent in node.parents
+        if id(parent) in base_ids
+    }
+    if inner:
+        matched = [
+            node
+            for node in _selector_matches(carrier, inner) or []
+            if any(id(parent) in anchor_ids for parent in node.parents)
+        ]
+    else:
+        matched = [node for node in _selector_matches(carrier, base) or [] if id(node) in anchor_ids]
+    if len(matched) != 1 or matched[0] is not carrier:
+        return None
+    return {"selector": selector, "source": "text_anchor", "match_count": 1}
+
+
+def _relation_selector_candidates(carrier: Any, key_text: str, label_node: Any) -> list[ScoutedSelectorCandidate]:
+    candidates = _carried_selector_candidates(carrier)
+    keyed = _label_anchor_candidate(carrier, label_node, key_text.strip()) if key_text.strip() else None
+    if keyed is not None and all(candidate["selector"] != keyed["selector"] for candidate in candidates):
+        candidates.append(keyed)
+    return candidates
 
 
 def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str, Any], Any] | None:
@@ -2364,6 +2306,7 @@ def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str,
             return (
                 {
                     "key_text": label_text,
+                    "selector_candidates": _relation_selector_candidates(carrier, label_text, label_node),
                     "label_selector": label_selector,
                     "value_text": _schema_text(_node_text(value_leaf), 240),
                     "container_selector": selector,
@@ -2470,6 +2413,7 @@ def _key_value_relations(soup: Any, requested_targets: tuple[str, ...] = ()) -> 
             {
                 "key_text": key_text,
                 "value_text": value_text,
+                "selector_candidates": _relation_selector_candidates(node, key_text, children[0]),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2596,6 +2540,9 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]], c
                 {
                     "key_text": key_text if index == designated_index else "",
                     "value_text": value_text,
+                    "selector_candidates": _relation_selector_candidates(
+                        node, key_text if index == designated_index else "", heading
+                    ),
                     "container_selector": selector,
                     "container_match_count": match_count,
                     "container_position": position,
@@ -3213,11 +3160,14 @@ def parse_composition_html(
 
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
+    hidden_texts: list[str] = []
     for node in soup.find_all(True):
         if node.decomposed:
             continue
         if _is_css_hidden_node(node):
+            hidden_texts.append(node.get_text(" "))
             node.decompose()
+    vars(soup)[_HIDDEN_TEXT_KEY] = " ".join(" ".join(hidden_texts).split())
     # Challenge capture runs against the original document, while the remaining channels report
     # the cleaned visible DOM. Do not reuse selector matches that still contain decomposed nodes.
     vars(soup).pop("_skyvern_selector_match_cache", None)
@@ -3849,8 +3799,9 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
             entry["disabled"] = True
         if isinstance(item.get("visible"), bool):
             entry["visible"] = item["visible"]
-        if entry.get("selector") or entry.get("text"):
-            controls.append(_attach_structured_disclosure_facts(_attach_node_evidence(entry, item), item))
+        entry = _attach_node_evidence(entry, item)
+        if entry.get("selector") or entry.get("text") or entry.get("selector_candidates"):
+            controls.append(_attach_structured_disclosure_facts(entry, item))
     return controls
 
 

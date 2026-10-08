@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy import select, update
 
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason, derive_failure_attribution
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.models import BrowserProfileModel, CredentialModel, WorkflowModel, WorkflowRunModel
+from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow import service as service_module
+from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile_key_digest
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -17,10 +25,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.services.workflow_service import workflow_request_body_from_existing_run
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from tests.unit.conftest import RUN_GROUP_ORG, RUN_GROUP_WPID, GroupEnv, run_group_task_block
 
 
 def _workflow(*, persist: bool = False, pick: str | None = None, key: str | None = None) -> SimpleNamespace:
@@ -86,6 +96,383 @@ async def _resolve(
         start_fresh=start_fresh,
         engine_enabled=engine_enabled,
     )
+
+
+def _install_run_context(monkeypatch: pytest.MonkeyPatch) -> WorkflowRunContext:
+    context = WorkflowRunContext(
+        workflow_title="Workflow",
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    # The stub app auto-mocks WORKFLOW_CONTEXT_MANAGER attributes as AsyncMocks, so a real manager is
+    # installed to exercise the actual context lookup.
+    context_manager = WorkflowContextManager()
+    context_manager.workflow_run_contexts["wr_test"] = context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", context_manager)
+    return context
+
+
+def _stub_seed_writes_and_reads(monkeypatch: pytest.MonkeyPatch, *, managed_rows: dict[str, str]) -> SimpleNamespace:
+    def existing(browser_profile_key_digest: str) -> SimpleNamespace | None:
+        row = managed_rows.get(browser_profile_key_digest)
+        return SimpleNamespace(browser_profile_id=row) if row else None
+
+    async def get_managed(
+        *, organization_id: str, workflow_permanent_id: str, browser_profile_key_digest: str
+    ) -> SimpleNamespace | None:
+        return existing(browser_profile_key_digest)
+
+    async def get_or_create(
+        *, organization_id: str, workflow_permanent_id: str, browser_profile_key_digest: str, name: str
+    ) -> tuple[SimpleNamespace, bool]:
+        row = existing(browser_profile_key_digest)
+        return (row, False) if row else (SimpleNamespace(browser_profile_id="bp_created"), True)
+
+    mocks = SimpleNamespace(
+        get_or_create=AsyncMock(side_effect=get_or_create),
+        hard_delete=AsyncMock(),
+        update_run=AsyncMock(),
+        select=AsyncMock(return_value="cred_selected"),
+    )
+    browser_sessions = app.DATABASE.browser_sessions
+    monkeypatch.setattr(browser_sessions, "get_managed_browser_profile", get_managed)
+    monkeypatch.setattr(browser_sessions, "get_or_create_managed_browser_profile", mocks.get_or_create)
+    monkeypatch.setattr(browser_sessions, "hard_delete_browser_profile", mocks.hard_delete)
+    monkeypatch.setattr(
+        browser_sessions,
+        "get_browser_profile",
+        AsyncMock(
+            side_effect=lambda profile_id, organization_id: SimpleNamespace(
+                browser_profile_id=profile_id, is_managed=False, workflow_permanent_id=None
+            )
+        ),
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(
+            side_effect=lambda credential_id, organization_id: SimpleNamespace(
+                browser_profile_id=f"bp_{credential_id}", auto_profile_disabled=False
+            )
+        ),
+    )
+    monkeypatch.setattr(app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", mocks.update_run)
+    monkeypatch.setattr(service_module, "select_credential_for_run", mocks.select)
+    monkeypatch.setattr(context_manager_module, "select_credential_for_run", mocks.select)
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    return mocks
+
+
+def _preview_svc(monkeypatch: pytest.MonkeyPatch, *, has_content: bool) -> tuple[WorkflowService, AsyncMock, AsyncMock]:
+    svc = WorkflowService()
+    legacy_seed = AsyncMock()
+    reconcile = AsyncMock()
+    monkeypatch.setattr(svc, "_seed_managed_browser_profile_from_legacy_session", legacy_seed)
+    monkeypatch.setattr(svc, "_reconcile_managed_browser_profile_proxy_pin", reconcile)
+    monkeypatch.setattr(app.STORAGE, "browser_profile_exists", AsyncMock(return_value=has_content))
+    return svc, legacy_seed, reconcile
+
+
+def _seed_workflow(
+    *,
+    persist: bool = False,
+    pick: str | None = None,
+    key: str | None = None,
+    login: CredentialParameter | None = None,
+) -> SimpleNamespace:
+    workflow = _workflow(persist=persist, pick=pick, key=key)
+    workflow.workflow_definition = SimpleNamespace(
+        blocks=[_login_block("login", login)] if login else [],
+        parameters=[login] if login else [],
+    )
+    return workflow
+
+
+def _static_login() -> CredentialParameter:
+    return _credential_parameter("login", "cred_1")
+
+
+def _pool_login() -> CredentialParameter:
+    return _credential_parameter("login", "cred_a", credential_ids=["cred_a", "cred_b"])
+
+
+async def _preview(
+    svc: WorkflowService,
+    workflow: SimpleNamespace,
+    parameter_values: dict[str, str] | None = None,
+    *,
+    engine_enabled: bool = True,
+) -> tuple[str, BrowserSeedSource] | None:
+    return await svc.preview_run_seed(
+        workflow=cast(Workflow, workflow),
+        workflow_run=cast(WorkflowRun, _run()),
+        parameter_values=parameter_values or {},
+        explicit_request_browser_profile_id=None,
+        engine_enabled=engine_enabled,
+    )
+
+
+async def _preview_and_run_seed(
+    svc: WorkflowService,
+    workflow: SimpleNamespace,
+    parameter_values: dict[str, str] | None = None,
+    *,
+    engine_enabled: bool = True,
+) -> tuple[tuple[str, BrowserSeedSource] | None, tuple[str | None, BrowserSeedSource, str | None]]:
+    preview = await _preview(svc, workflow, parameter_values, engine_enabled=engine_enabled)
+    run_seed = await svc._resolve_run_seed(
+        workflow=cast(Workflow, workflow),
+        workflow_run=cast(WorkflowRun, _run()),
+        parameter_values=parameter_values or {},
+        explicit_request_browser_profile_id=None,
+        engine_enabled=engine_enabled,
+    )
+    return preview, run_seed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "build_workflow",
+        "parameter_values",
+        "managed_rows",
+        "has_content",
+        "engine_enabled",
+        "expected_preview",
+        "expected_run",
+    ),
+    [
+        (
+            lambda: _seed_workflow(pick="bp_pick"),
+            {},
+            {},
+            False,
+            True,
+            ("bp_pick", BrowserSeedSource.picked),
+            ("bp_pick", BrowserSeedSource.picked),
+        ),
+        (
+            lambda: _seed_workflow(persist=True, key="{{ acct }}"),
+            {"acct": "a1"},
+            {build_browser_profile_key_digest("a1"): "bp_own"},
+            True,
+            True,
+            ("bp_own", BrowserSeedSource.own_memory),
+            ("bp_own", BrowserSeedSource.own_memory),
+        ),
+        (
+            lambda: _seed_workflow(persist=True, login=_pool_login()),
+            {"login": "cred_b"},
+            {build_browser_profile_key_digest("cred_b"): "bp_own_b"},
+            True,
+            True,
+            ("bp_own_b", BrowserSeedSource.own_memory),
+            ("bp_own_b", BrowserSeedSource.own_memory),
+        ),
+        (
+            lambda: _seed_workflow(persist=True, login=_static_login()),
+            {},
+            {"": "bp_own"},
+            False,
+            True,
+            ("bp_cred_1", BrowserSeedSource.credential),
+            ("bp_cred_1", BrowserSeedSource.credential),
+        ),
+        (
+            lambda: _seed_workflow(persist=True, login=_static_login()),
+            {},
+            {},
+            False,
+            True,
+            ("bp_cred_1", BrowserSeedSource.credential),
+            ("bp_cred_1", BrowserSeedSource.credential),
+        ),
+        (
+            lambda: _seed_workflow(persist=True),
+            {},
+            {"": "bp_own"},
+            False,
+            False,
+            ("bp_own", BrowserSeedSource.own_memory),
+            ("bp_own", BrowserSeedSource.own_memory),
+        ),
+        (
+            lambda: _seed_workflow(persist=True),
+            {},
+            {},
+            False,
+            False,
+            None,
+            ("bp_created", BrowserSeedSource.own_memory),
+        ),
+        (lambda: _seed_workflow(), {}, {}, False, True, None, (None, BrowserSeedSource.fresh)),
+    ],
+    ids=[
+        "living_pick",
+        "keyed_own_with_content",
+        "selected_pool_own_with_content",
+        "credential_empty_own_row",
+        "credential_no_own_row",
+        "flag_off_empty_own_row",
+        "flag_off_no_row_preview_none",
+        "nothing",
+    ],
+)
+async def test_preview_matches_run_seed(
+    monkeypatch: pytest.MonkeyPatch,
+    build_workflow: Callable[[], SimpleNamespace],
+    parameter_values: dict[str, str],
+    managed_rows: dict[str, str],
+    has_content: bool,
+    engine_enabled: bool,
+    expected_preview: tuple[str, BrowserSeedSource] | None,
+    expected_run: tuple[str | None, BrowserSeedSource],
+) -> None:
+    _stub_seed_writes_and_reads(monkeypatch, managed_rows=managed_rows)
+    svc, _, _ = _preview_svc(monkeypatch, has_content=has_content)
+
+    preview, (run_seed, run_source, _) = await _preview_and_run_seed(
+        svc, build_workflow(), parameter_values, engine_enabled=engine_enabled
+    )
+
+    assert preview == expected_preview
+    assert (run_seed, run_source) == expected_run
+
+
+@pytest.mark.asyncio
+async def test_preview_skips_the_managed_lookup_for_an_unselected_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_seed_writes_and_reads(monkeypatch, managed_rows={"": "bp_unsegmented"})
+    svc, _, _ = _preview_svc(monkeypatch, has_content=True)
+
+    assert await _preview(svc, _seed_workflow(persist=True, login=_pool_login())) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_pool", "preview_values", "saved_selection", "override", "expected_preview", "expected_run"),
+    [
+        (
+            False,
+            {},
+            "cred_a",
+            None,
+            ("bp_own_a", BrowserSeedSource.own_memory),
+            ("bp_own_a", BrowserSeedSource.own_memory),
+        ),
+        (True, {"login": "cred_a"}, None, None, None, ("bp_own_a", BrowserSeedSource.own_memory)),
+        (
+            False,
+            {"login": "cred_a"},
+            None,
+            "bp_override",
+            ("bp_override", BrowserSeedSource.override),
+            ("bp_override", BrowserSeedSource.override),
+        ),
+    ],
+    ids=["saved_selection_empty_values", "two_pools_one_selected", "override"],
+)
+async def test_preview_reads_pool_selections_like_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    second_pool: bool,
+    preview_values: dict[str, str],
+    saved_selection: str | None,
+    override: str | None,
+    expected_preview: tuple[str, BrowserSeedSource] | None,
+    expected_run: tuple[str, BrowserSeedSource],
+) -> None:
+    _stub_seed_writes_and_reads(monkeypatch, managed_rows={build_browser_profile_key_digest("cred_a"): "bp_own_a"})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=saved_selection)
+    )
+    svc, _, _ = _preview_svc(monkeypatch, has_content=True)
+    workflow = _seed_workflow(persist=True, login=_pool_login())
+    if second_pool:
+        workflow.workflow_definition.parameters.append(
+            _credential_parameter("login2", "cred_c", credential_ids=["cred_c", "cred_d"])
+        )
+
+    preview = await svc.preview_run_seed(
+        workflow=cast(Workflow, workflow),
+        workflow_run=cast(WorkflowRun, _run()),
+        parameter_values=preview_values,
+        explicit_request_browser_profile_id=override,
+        engine_enabled=True,
+    )
+    run_seed, run_source, _ = await svc._resolve_run_seed(
+        workflow=cast(Workflow, workflow),
+        workflow_run=cast(WorkflowRun, _run()),
+        parameter_values={"login": "cred_a"},
+        explicit_request_browser_profile_id=override,
+        engine_enabled=True,
+    )
+
+    assert preview == expected_preview
+    assert (run_seed, run_source) == expected_run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_run_context", [False, True])
+async def test_preview_writes_nothing_where_the_run_creates_and_selects(
+    monkeypatch: pytest.MonkeyPatch, with_run_context: bool
+) -> None:
+    mocks = _stub_seed_writes_and_reads(monkeypatch, managed_rows={})
+    svc, legacy_seed, reconcile = _preview_svc(monkeypatch, has_content=False)
+    context = _install_run_context(monkeypatch) if with_run_context else None
+    workflow = _seed_workflow(persist=True, login=_pool_login())
+
+    assert await _preview(svc, workflow) is None
+
+    for write in (mocks.get_or_create, legacy_seed, reconcile, mocks.hard_delete, mocks.update_run, mocks.select):
+        write.assert_not_awaited()
+    if context:
+        assert context.resolved_credential_parameter_ids == {}
+
+    _, run_seed = await _preview_and_run_seed(svc, workflow)
+    assert run_seed == ("bp_cred_selected", BrowserSeedSource.credential, "bp_created")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_enabled", [True, False], ids=["engine_on", "engine_off"])
+@pytest.mark.parametrize("login", [_static_login, None], ids=["static_login", "no_login"])
+async def test_preview_writes_nothing_where_the_run_creates_the_managed_profile(
+    monkeypatch: pytest.MonkeyPatch, login: Callable[[], CredentialParameter] | None, engine_enabled: bool
+) -> None:
+    mocks = _stub_seed_writes_and_reads(monkeypatch, managed_rows={})
+    svc, legacy_seed, reconcile = _preview_svc(monkeypatch, has_content=False)
+    context = _install_run_context(monkeypatch)
+    workflow = _seed_workflow(persist=True, login=login() if login else None)
+
+    preview = await _preview(svc, workflow, engine_enabled=engine_enabled)
+
+    for write in (mocks.get_or_create, legacy_seed, reconcile, mocks.hard_delete, mocks.update_run, mocks.select):
+        write.assert_not_awaited()
+    assert context.resolved_credential_parameter_ids == {}
+    assert preview == (("bp_cred_1", BrowserSeedSource.credential) if login and engine_enabled else None)
+
+    await _preview_and_run_seed(svc, workflow, engine_enabled=engine_enabled)
+    mocks.get_or_create.assert_awaited_once()
+    legacy_seed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preview_resolves_indirect_credential_binding_like_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_seed_writes_and_reads(monkeypatch, managed_rows={})
+    svc, _, _ = _preview_svc(monkeypatch, has_content=False)
+    context = _install_run_context(monkeypatch)
+    context.parameters["login_ref"] = _string_parameter("login_ref")
+    context.values["login_ref"] = "cred_bound"
+    workflow = _seed_workflow(login=_credential_parameter("login", "login_ref"))
+
+    preview = await _preview(svc, workflow)
+    assert context.resolved_credential_parameter_ids == {}
+    _, (run_seed, run_source, _) = await _preview_and_run_seed(svc, workflow)
+
+    assert preview == ("bp_cred_bound", BrowserSeedSource.credential)
+    assert (run_seed, run_source) == preview
 
 
 # --- C behavior table: (toggle, pick, role) -> (seed, source, sink) ----------
@@ -1158,6 +1545,46 @@ async def test_setup_pin_resolves_pool_credential(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("saved_selection", "expected_pin"), [(None, None), ("cred_pool", "ps_pool")])
+async def test_pin_preview_reads_a_pool_selection_but_never_makes_one(
+    monkeypatch: pytest.MonkeyPatch, saved_selection: str | None, expected_pin: str | None
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=saved_selection)
+    )
+    select = AsyncMock(return_value="cred_a")
+    monkeypatch.setattr(service_module, "select_credential_for_run", select)
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                credential_id="cred_pool", pin_saved_session_ip=True, proxy_session_id="ps_pool"
+            )
+        ),
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_proxy_session_extra_http_headers", lambda headers: False)
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", credential_ids=["cred_a", "cred_pool"]))
+    )
+    run = SimpleNamespace(
+        workflow_run_id="copilot_build_test_seed_preview", organization_id="o_test", extra_http_headers=None
+    )
+
+    pin = await WorkflowService().preview_run_proxy_pin(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run=run,  # type: ignore[arg-type]
+        parameter_values={},
+        seed_profile_id=None,
+    )
+
+    assert pin == expected_pin
+    select.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_setup_credential_prefers_request_value_over_default_for_workflow_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1673,3 +2100,194 @@ async def test_login_block_profile_boot_unresolved_url_degrades_without_raising(
         if call.args[0] == "Saved browser profile failed to load, falling back to normal login"
     )
     assert unexpected_log.kwargs["exc_info"] is True
+
+
+# --- a failed run from a saved profile no credential backs -------------------
+
+
+_CODE_BLOCK_SIGN_IN = {"category": "WRONG_PAGE_STATE", "confidence_float": 0.9, "reason_code": "sign_in_form_visible"}
+_MODEL_AUTH_FAILURE = {"category": "AUTH_FAILURE", "confidence_float": 0.9, "reasoning": "login failed"}
+_UNEXPECTED_PAGE = {"category": "WRONG_PAGE_STATE", "confidence_float": 0.9, "reasoning": "Keywords matched"}
+_VAULT_LOOKUP_FAILURE = {"category": "CREDENTIAL_ERROR", "confidence_float": 0.8, "reasoning": "Exception: Bitwarden"}
+_ELEMENT_TIMEOUT = {"category": "ELEMENT_STATE_TIMEOUT", "confidence_float": 0.85}
+# A send-email block's own error, classified as it is in production.
+[_SMTP_PASSWORD_FAILURE] = classify_from_failure_reason("Missing SMTP password")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "seed_source",
+        "applied_profile_id",
+        "credential_owns_profile",
+        "credential_parameter",
+        "version_deleted",
+        "first_entry",
+        "tagged",
+    ),
+    [
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _CODE_BLOCK_SIGN_IN, True),
+        (BrowserSeedSource.override, "bp_1", False, False, False, _CODE_BLOCK_SIGN_IN, True),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _MODEL_AUTH_FAILURE, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, True, _CODE_BLOCK_SIGN_IN, True),
+        (BrowserSeedSource.picked, None, False, False, False, _CODE_BLOCK_SIGN_IN, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _UNEXPECTED_PAGE, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _VAULT_LOOKUP_FAILURE, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _SMTP_PASSWORD_FAILURE, False),
+        (BrowserSeedSource.picked, "bp_1", True, False, False, _CODE_BLOCK_SIGN_IN, False),
+        (BrowserSeedSource.picked, "bp_1", False, True, False, _CODE_BLOCK_SIGN_IN, False),
+        (BrowserSeedSource.own_memory, "bp_1", False, False, False, _CODE_BLOCK_SIGN_IN, False),
+    ],
+)
+async def test_sign_in_failure_from_a_saved_profile_with_no_credential_is_tagged_signed_out(
+    run_group_env: GroupEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_source: BrowserSeedSource,
+    applied_profile_id: str | None,
+    credential_owns_profile: bool,
+    credential_parameter: bool,
+    version_deleted: bool,
+    first_entry: dict,
+    tagged: bool,
+) -> None:
+    open_state = SimpleNamespace(browser_artifacts=BrowserArtifacts(applied_browser_profile_id=applied_profile_id))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: open_state)
+    monkeypatch.setattr(service_module, "_SAVED_PROFILE_WITHOUT_CREDENTIAL", {})
+    parameters = [_credential_parameter("login", "cred_1")] if credential_parameter else []
+    async with run_group_env.database.Session() as session:
+        session.add(BrowserProfileModel(browser_profile_id="bp_1", organization_id=RUN_GROUP_ORG, name="Sign-in"))
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_profile",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                title="Workflow",
+                version=2,
+                workflow_definition=WorkflowDefinition(
+                    parameters=parameters, blocks=[run_group_task_block()]
+                ).model_dump(mode="json"),
+                deleted_at=datetime.now(timezone.utc) if version_deleted else None,
+            )
+        )
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_profile",
+                workflow_id="wf_profile",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                status=WorkflowRunStatus.running.value,
+                browser_profile_id="bp_1",
+                browser_seed_source=seed_source.value,
+            )
+        )
+        if credential_owns_profile:
+            await session.execute(
+                update(CredentialModel)
+                .where(CredentialModel.credential_id == "cred_1")
+                .values(browser_profile_id="bp_1")
+            )
+        await session.commit()
+
+    # execute_workflow records this from the run's own version, before its elapsed-time guard.
+    started_run = await run_group_env.database.workflow_runs.get_workflow_run("wr_profile")
+    assert started_run is not None
+    await WorkflowService._record_saved_profile_without_credential(
+        await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id("wr_profile", filter_deleted=False),
+        started_run,
+        object(),
+    )
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+        workflow_run_id="wr_profile",
+        failure_reason="code block failed",
+        # The sign-in entry is appended after the run's own classification, as the code block path writes it.
+        failure_category=[_ELEMENT_TIMEOUT, first_entry],
+    )
+
+    run = await run_group_env.database.workflow_runs.get_workflow_run("wr_profile")
+    assert run is not None and run.status == WorkflowRunStatus.failed
+    assert run.failure_category is not None
+    assert [entry["category"] for entry in run.failure_category] == ["ELEMENT_STATE_TIMEOUT", first_entry["category"]]
+    assert (run.failure_category[1].get("reason_code") == "saved_profile_signed_out") is tagged
+    # Attribution follows the primary entry, which the tag never touches.
+    async with run_group_env.database.Session() as session:
+        attribution = await session.scalar(
+            select(WorkflowRunModel.failure_attribution).where(WorkflowRunModel.workflow_run_id == "wr_profile")
+        )
+    assert attribution == derive_failure_attribution([_ELEMENT_TIMEOUT])
+
+
+@pytest.mark.asyncio
+async def test_an_older_execution_ending_keeps_a_reset_runs_saved_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "_SAVED_PROFILE_WITHOUT_CREDENTIAL", {})
+    older_looking_up, release_older = asyncio.Event(), asyncio.Event()
+
+    async def credentials_for_profile(**_kwargs: object) -> list[object]:
+        if not older_looking_up.is_set():
+            older_looking_up.set()
+            await release_older.wait()
+        return []
+
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", credentials_for_profile)
+    workflow = cast(Workflow, SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[])))
+    run = cast(
+        WorkflowRun,
+        SimpleNamespace(
+            workflow_run_id="wr_reset",
+            organization_id=RUN_GROUP_ORG,
+            browser_profile_id="bp_1",
+            browser_seed_source=BrowserSeedSource.picked,
+            parent_workflow_run_id=None,
+        ),
+    )
+
+    # The older execution is still looking up credentials when the reset's execution records and finishes.
+    older, newer = object(), object()
+    older_recording = asyncio.create_task(
+        WorkflowService._record_saved_profile_without_credential(workflow, run, older)
+    )
+    await older_looking_up.wait()
+    await WorkflowService._record_saved_profile_without_credential(workflow, run, newer)
+    release_older.set()
+    await older_recording
+
+    assert service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL["wr_reset"].owner is newer
+    WorkflowService._forget_saved_profile_without_credential("wr_reset", older)
+    assert service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL["wr_reset"].profile_id == "bp_1"
+    WorkflowService._forget_saved_profile_without_credential("wr_reset", newer)
+    assert "wr_reset" not in service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL
+
+
+@pytest.mark.asyncio
+async def test_an_execution_cancelled_while_recording_leaves_no_saved_profile_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service_module, "_SAVED_PROFILE_WITHOUT_CREDENTIAL", {})
+    looking_up = asyncio.Event()
+
+    async def credentials_for_profile(**_kwargs: object) -> list[object]:
+        looking_up.set()
+        await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", credentials_for_profile)
+    workflow = cast(Workflow, SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[])))
+    run = cast(
+        WorkflowRun,
+        SimpleNamespace(
+            workflow_run_id="wr_cancelled",
+            organization_id=RUN_GROUP_ORG,
+            browser_profile_id="bp_1",
+            browser_seed_source=BrowserSeedSource.picked,
+            parent_workflow_run_id=None,
+        ),
+    )
+    owner = object()
+
+    recording = asyncio.create_task(WorkflowService._record_saved_profile_without_credential(workflow, run, owner))
+    await looking_up.wait()
+    recording.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recording
+    WorkflowService._forget_saved_profile_without_credential("wr_cancelled", owner)
+
+    assert service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL == {}

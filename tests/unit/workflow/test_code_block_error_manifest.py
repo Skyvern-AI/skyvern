@@ -164,8 +164,7 @@ async def test_error_code_raise_with_no_manifest_fails_closed(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_declared_error_code_skips_self_heal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC5: a declared typed raise records a non-healable skip without attempting repair."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    """A declared typed raise records a non-healable skip without attempting repair."""
 
     async def resolve_failure_with_heal(**kwargs: object):
         return await kwargs["build_failure_result"]()  # type: ignore[operator]
@@ -192,8 +191,7 @@ async def test_declared_error_code_skips_self_heal(monkeypatch: pytest.MonkeyPat
 
 @pytest.mark.asyncio
 async def test_ordinary_exception_still_eligible_for_self_heal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC5 counterpart: an ordinary exception (or an undeclared ErrorCode) still reaches self-heal resolution."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    """An ordinary exception (or an undeclared ErrorCode) still reaches self-heal resolution."""
     heal_mock = AsyncMock(return_value=None)
     block = CodeBlock(
         label="ordinary_failure_block",

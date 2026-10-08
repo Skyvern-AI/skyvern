@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.client.core import RequestOptions
 from skyvern.client.types.extensions import Extensions
+from skyvern.client.types.persistent_browser_type import PersistentBrowserType
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
@@ -24,7 +25,7 @@ LOG = structlog.get_logger()
 _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 2.0
 
 if TYPE_CHECKING:
-    from playwright.async_api import Playwright
+    from playwright.async_api import Browser, Playwright
 
     from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -45,6 +46,21 @@ async def _read_devtools_active_port(user_data_dir: pathlib.Path) -> int:
             last_error = exc
             await asyncio.sleep(0.01)
     raise RuntimeError(f"Chromium did not publish a valid CDP port in {active_port_file}") from last_error
+
+
+async def _hand_downloads_back_to_browser(browser: Browser, browser_session_id: str) -> None:
+    # connect_over_cdp points every download in the session at this client's temp dir, where the session never sees
+    # them; "default" hands them back to the browser's own download directory. Never detached: Chromium reverts the
+    # binding when the CDP session that set it detaches.
+    try:
+        cdp_session = await browser.new_browser_cdp_session()
+        await cdp_session.send("Browser.setDownloadBehavior", {"behavior": "default", "eventsEnabled": True})
+    except Exception:
+        LOG.warning(
+            "Could not hand downloads back to the browser session; files downloaded in it may not be captured",
+            browser_session_id=browser_session_id,
+            exc_info=True,
+        )
 
 
 def _get_browser_session_url(browser_session: BrowserSessionResponse) -> str:
@@ -627,6 +643,7 @@ class Skyvern(AsyncSkyvern):
         proxy_location: ProxyLocationInput = None,
         extensions: list[Extensions] | None = None,
         browser_profile_id: str | None = None,
+        browser_type: PersistentBrowserType | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -639,6 +656,7 @@ class Skyvern(AsyncSkyvern):
                 This is only available in Skyvern Cloud.
             extensions: Browser extensions to install in the session.
             browser_profile_id: Browser profile ID to load into the session.
+            browser_type: Browser engine for the session (msedge, chrome, or stealth-chromium).
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
@@ -652,6 +670,8 @@ class Skyvern(AsyncSkyvern):
             create_kwargs["extensions"] = extensions
         if browser_profile_id is not None:
             create_kwargs["browser_profile_id"] = browser_profile_id
+        if browser_type is not None:
+            create_kwargs["browser_type"] = browser_type
         browser_session = await self.create_browser_session(**create_kwargs)
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(
@@ -731,6 +751,7 @@ class Skyvern(AsyncSkyvern):
         browser = await playwright.chromium.connect_over_cdp(
             browser_session.browser_address, headers={"x-api-key": self._api_key}
         )
+        await _hand_downloads_back_to_browser(browser, browser_session.browser_session_id)
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(
             self,

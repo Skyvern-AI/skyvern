@@ -66,6 +66,15 @@ def _page() -> MagicMock:
     return page
 
 
+def _persistent_page() -> MagicMock:
+    """Production-shaped launch_persistent_context page: a Chromium context whose owning Browser handle
+    is None (Playwright/Patchright expose none for persistent contexts), CDP still reachable through
+    context.new_cdp_session."""
+    page = _page()
+    page.context.browser = None
+    return page
+
+
 def _provider(variant: Any) -> MagicMock:
     provider = MagicMock()
     if isinstance(variant, Exception):
@@ -788,15 +797,15 @@ async def test_detach_elapsed_is_charged_to_remaining_budget(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "kind",
-    ["full_page", "firefox", "unknown_browser", "skycdp"],
+    ["full_page", "firefox", "skycdp"],
 )
 async def test_treatment_flag_ignored_on_ineligible_path(kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
     provider = _use_provider(monkeypatch, "treatment")
     page = _page()
     if kind == "firefox":
+        # A present, non-Chromium Browser (connect_over_cdp shape) stays ineligible — the Chromium gate
+        # survives the persistent-context null-safety fix.
         page.context.browser.browser_type.name = "firefox"
-    elif kind == "unknown_browser":
-        page.context.browser = None
     selection = None
     if kind == "skycdp":
         selection = SimpleNamespace(
@@ -813,6 +822,40 @@ async def test_treatment_flag_ignored_on_ineligible_path(kind: str, monkeypatch:
     # Ineligible: arm resolves to control without ever consulting the provider.
     provider.get_value_cached.assert_not_awaited()
     page.context.new_cdp_session.assert_not_awaited()
+
+
+# --- persistent-context (no owning Browser) eligibility -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persistent_context_treatment_reaches_cdp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A launch_persistent_context page (context.browser is None) is raw-CDP eligible: forced treatment
+    resolves the flag and attempts raw CDP first, exactly like the connect_over_cdp path. This is the
+    production-dominant stealth-Chromium shape that the browser-None gate silently excluded."""
+    provider = _use_provider(monkeypatch, "treatment")
+    page = _persistent_page()
+    page.screenshot.side_effect = None
+    page.screenshot.return_value = b"pw-should-not-run"
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_1")):
+        result = await _current_viewpoint_screenshot_helper(page)
+    assert base64.b64encode(result).decode() == _png_bytes()  # raw CDP produced the bytes
+    provider.get_value_cached.assert_awaited_once()  # eligible -> flag resolved
+    page.context.new_cdp_session.assert_awaited_once()  # raw CDP attempted first
+    page.screenshot.assert_not_awaited()  # CDP produced bytes; Playwright never ran
+
+
+@pytest.mark.asyncio
+async def test_persistent_context_control_uses_cdp_rescue_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The legacy control-arm CDP rescue also applies to persistent contexts: after the Playwright
+    capture times out, the raw-CDP rescue runs through the context (no owning Browser needed) instead of
+    falling through to the animation retry."""
+    _use_provider(monkeypatch, None)  # control
+    page = _persistent_page()
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_1")):
+        result = await _current_viewpoint_screenshot_helper(page)
+    assert base64.b64encode(result).decode() == _png_bytes()  # rescued over raw CDP
+    page.screenshot.assert_awaited_once()  # Playwright first (timed out)
+    page.context.new_cdp_session.assert_awaited_once()  # then CDP rescue via the context
 
 
 # --- arm observability & assignment ---------------------------------------------------------------

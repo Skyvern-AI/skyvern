@@ -3,7 +3,6 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
-from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
@@ -22,7 +21,6 @@ from skyvern.forge.sdk.db.id import (
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
-    InvalidCodeBlockStep,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateBlockLabels,
@@ -90,6 +88,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
+from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
+from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -189,6 +189,7 @@ def convert_workflow_definition(
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
                 totp_field_name=parameter.totp_field_name,
+                totp_identifier=parameter.totp_identifier,
                 created_at=now,
                 modified_at=now,
             )
@@ -233,6 +234,7 @@ def convert_workflow_definition(
                 description=parameter.description,
                 bitwarden_collection_id=parameter.bitwarden_collection_id,
                 bitwarden_item_id=parameter.bitwarden_item_id,
+                totp_identifier=parameter.totp_identifier,
                 created_at=now,
                 modified_at=now,
             )
@@ -349,6 +351,11 @@ def convert_workflow_definition(
         retry_policy=workflow_definition_yaml.retry_policy,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
         completion_contract=workflow_definition_yaml.completion_contract,
+        **(
+            {"browser_settings": workflow_definition_yaml.browser_settings}
+            if "browser_settings" in workflow_definition_yaml.model_fields_set
+            else {}
+        ),
     )
 
     LOG.info(
@@ -409,64 +416,6 @@ def _build_block_kwargs(
     }
 
 
-def _code_block_step_span_issue(step: CodeBlockStep, code_line_count: int) -> str | None:
-    """Return why a step's line span is malformed, or None when it is well-formed: a well-formed span
-    is empty, a lone 1-based line_start, or a 1-based line_start <= line_end with both bounds within
-    the code's line count (a lone line_end has no anchor for the editor to render from)."""
-    line_start = step.line_start
-    line_end = step.line_end
-    if line_end is not None and line_start is None:
-        return "line_end is set without line_start"
-    for bound_name, bound in (("line_start", line_start), ("line_end", line_end)):
-        if bound is None:
-            continue
-        if bound < 1:
-            return f"{bound_name} must be >= 1, got {bound}"
-        if bound > code_line_count:
-            return f"{bound_name} ({bound}) exceeds the code length ({code_line_count} line(s))"
-    if line_start is not None and line_end is not None and line_start > line_end:
-        return f"line_start ({line_start}) must be <= line_end ({line_end})"
-    return None
-
-
-def _reconcile_code_block_step_spans(
-    *,
-    block_label: str,
-    steps: list[CodeBlockStep],
-    code: str,
-) -> list[CodeBlockStep]:
-    """Repair malformed step spans against the code-derived spans instead of rejecting the save.
-
-    Step spans are display-only line references the editor and run timeline render. A non-copilot
-    save path (the copilot re-derives) can persist a stale or model-mangled span, e.g. a code edit
-    that shortens the block below a step's line_end. Snap an invalid span to the synthesized span at
-    the same position, or drop it to null when the code yields no step there; well-formed spans and
-    all other fields are kept untouched."""
-    code_line_count = len(code.splitlines())
-    issues = [_code_block_step_span_issue(step, code_line_count) for step in steps]
-    if not any(issues):
-        return steps
-    derived = derive_code_block_steps(code)
-    reconciled: list[CodeBlockStep] = []
-    for step_index, (step, issue) in enumerate(zip(steps, issues)):
-        if issue is None:
-            reconciled.append(step)
-            continue
-        derived_step = derived[step_index] if step_index < len(derived) else None
-        repaired_start = derived_step["line_start"] if derived_step else None
-        repaired_end = derived_step["line_end"] if derived_step else None
-        LOG.info(
-            "Reconciled malformed code-block step span",
-            block_label=block_label,
-            step_index=step_index,
-            issue=issue,
-            line_start=repaired_start,
-            line_end=repaired_end,
-        )
-        reconciled.append(step.model_copy(update={"line_start": repaired_start, "line_end": repaired_end}))
-    return reconciled
-
-
 def block_yaml_to_block(
     block_yaml: BLOCK_YAML_TYPES,
     parameters: dict[str, PARAMETER_TYPE],
@@ -481,6 +430,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=task_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
             data_extraction_goal=block_yaml.data_extraction_goal,
@@ -594,33 +544,17 @@ def block_yaml_to_block(
             branch_conditions=branch_conditions,
         )
     elif block_yaml.block_type == BlockType.CODE:
-        code_block_steps: list[CodeBlockStep] | None = None
-        if block_yaml.steps:
-            code_block_steps = []
-            for step_index, step_yaml in enumerate(block_yaml.steps):
-                try:
-                    step = CodeBlockStep(**step_yaml.model_dump())
-                except ValidationError as exc:
-                    first_error = exc.errors()[0]
-                    field = ".".join(str(part) for part in first_error["loc"])
-                    raise InvalidCodeBlockStep(
-                        block_label=block_yaml.label,
-                        step_index=step_index,
-                        detail=f"{field}: {first_error['msg']}",
-                    ) from exc
-                code_block_steps.append(step)
-            code_block_steps = _reconcile_code_block_step_spans(
-                block_label=block_yaml.label,
-                steps=code_block_steps,
-                code=block_yaml.code,
-            )
         return CodeBlock(
             **base_kwargs,
             code=block_yaml.code,
             parameters=_resolve_block_parameters(block_yaml, parameters),
             error_code_mapping=block_yaml.error_code_mapping,
             prompt=block_yaml.prompt,
-            steps=code_block_steps,
+            steps=[CodeBlockStep(**step) for step in derive_code_block_steps(block_yaml.code)] or None,
+            data_schema=block_yaml.data_schema,
+            user_owned_goal=block_yaml.user_owned_goal,
+            goal_needs_regeneration=block_yaml.goal_needs_regeneration,
+            code_edited_by_hand=block_yaml.code_edited_by_hand,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(
@@ -744,6 +678,7 @@ def block_yaml_to_block(
             file_url=block_yaml.file_url,
             file_type=block_yaml.file_type,
             json_schema=block_yaml.json_schema,
+            worksheet=block_yaml.worksheet,
         )
     elif block_yaml.block_type == BlockType.PDF_PARSER:
         return PDFParserBlock(
@@ -763,6 +698,7 @@ def block_yaml_to_block(
             **base_kwargs,
             task_type=TaskType.validation,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=validation_block_parameters,
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
@@ -783,6 +719,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             task_type=TaskType.action,
             parameters=action_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
@@ -808,6 +745,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=navigation_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
@@ -852,6 +790,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=extraction_block_parameters,
             data_extraction_goal=block_yaml.data_extraction_goal,
             data_schema=block_yaml.data_schema,
@@ -879,6 +818,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=login_block_parameters,
             navigation_goal=login_navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
@@ -916,6 +856,9 @@ def block_yaml_to_block(
             parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
+    elif block_yaml.block_type == BlockType.TERMINATE:
+        return TerminateBlock(**base_kwargs, reason=block_yaml.reason, error_code=block_yaml.error_code)
+
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
         file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return FileDownloadBlock(
@@ -945,6 +888,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=file_download_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
@@ -968,6 +912,19 @@ def block_yaml_to_block(
             totp_identifier=block_yaml.totp_identifier,
             max_iterations=block_yaml.max_iterations,
             max_steps=block_yaml.max_steps,
+        )
+    elif block_yaml.block_type == BlockType.WEB_SEARCH:
+        return WebSearchBlock(
+            **base_kwargs,
+            query=block_yaml.query,
+            provider=block_yaml.provider,
+            num_results=block_yaml.num_results,
+            error_code_mapping=block_yaml.error_code_mapping,
+            no_results_error_code=block_yaml.no_results_error_code,
+            no_match_error_code=block_yaml.no_match_error_code,
+            prompt=block_yaml.prompt,
+            json_schema=block_yaml.json_schema,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
     elif block_yaml.block_type == BlockType.HTTP_REQUEST:
         http_request_block_parameters = _resolve_block_parameters(block_yaml, parameters)

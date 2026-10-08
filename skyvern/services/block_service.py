@@ -51,6 +51,7 @@ async def ensure_workflow_run(
     block_run_request: BlockRunRequest,
     x_max_steps_override: int | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    created_by: str | None = None,
 ) -> WorkflowRun:
     context = skyvern_context.ensure_context()
 
@@ -93,6 +94,7 @@ async def ensure_workflow_run(
         code_gen=block_run_request.code_gen,
         trigger_type=trigger_type,
         block_scoped=True,
+        created_by=created_by,
     )
 
     return workflow_run
@@ -109,6 +111,7 @@ async def execute_blocks(
     organization: Organization,
     user_id: str,
     browser_session_id: str | None = None,
+    debug_session_id: str | None = None,
     block_outputs: dict[str, t.Any] | None = None,
 ) -> None:
     """
@@ -146,8 +149,10 @@ async def execute_blocks(
         "Executing block(s)",
         organization_id=organization.organization_id,
         workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        debug_session_id=debug_session_id,
         block_labels=block_labels,
-        block_outputs=block_outputs,
+        block_output_count=len(block_outputs or {}),
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(

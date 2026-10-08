@@ -3,14 +3,17 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import logging
+import os
 import shutil
 import sys
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -23,20 +26,37 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from playwright.async_api import Download
 from playwright.async_api import Error as PlaywrightError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+import skyvern._cli_bootstrap as cli_bootstrap
+from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
+from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
+from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
+from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
@@ -180,6 +200,7 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
             runtime._ATTACHED_TURNS_PER_SESSION.clear()
             runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
             runtime._DRIVER_RELEASE_EPOCHS.clear()
+            runtime._SCRUB_VALUES_CLEARED_ON_RELEASE.clear()
 
     _clear()
     yield
@@ -196,6 +217,25 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
     hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
     yield
     sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+
+
+@pytest.fixture(autouse=True)
+def reset_cli_runtime_entry() -> Iterator[None]:
+    """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
+
+    Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
+    against the default production URL in any later test that builds a cloud client. The env
+    load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
+    """
+    entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
+    yield
+    cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    for name, value in loaded.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)
@@ -221,6 +261,13 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
 def render_agent_prompt(**overrides: str) -> str:
     """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:
+    now = datetime.now(UTC)
+    return OutputParameter(
+        output_parameter_id=f"{key}_id", key=key, workflow_id=workflow_id, created_at=now, modified_at=now
+    )
 
 
 def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
@@ -294,6 +341,12 @@ def span_exporter() -> InMemorySpanExporter:
     exporter.clear()
     yield exporter
     exporter.clear()
+
+
+@pytest.fixture(scope="module")
+def gpt56_litellm_models() -> Iterator[None]:
+    with registered_gpt56_litellm_models():
+        yield
 
 
 # -- shared in-memory SQLite engine for repository/route unit tests --
@@ -383,6 +436,51 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
 
         el.get_attr = AsyncMock(side_effect=_get_attr)
     return el
+
+
+def make_claimed_download_mock(
+    *,
+    path: Path | str | None,
+    suggested_filename: str,
+    path_error: BaseException | None = None,
+    failure: str | None = None,
+    failure_error: BaseException | None = None,
+    context: object | None = None,
+) -> Download:
+    """A Playwright ``Download`` double for the value a ``page.expect_download`` claim resolves to.
+    ``spec`` is the real class so the attach guard's ``isinstance`` check sees what it does live."""
+    download = MagicMock(spec=Download)
+    if path_error is not None:
+        download.path.side_effect = path_error
+    else:
+        download.path.return_value = None if path is None else str(path)
+    if failure_error is not None:
+        download.failure.side_effect = failure_error
+    else:
+        download.failure.return_value = failure
+    download.suggested_filename = suggested_filename
+    download.page = SimpleNamespace(context=context)
+    return download
+
+
+SESSION_DOWNLOAD_BYTES = b"session-delivered certificate"
+
+
+def registered_download_row(
+    filename: str = "certificate.pdf",
+    content: bytes = SESSION_DOWNLOAD_BYTES,
+    artifact_id: str | None = "a_session",
+    checksum: str | None = None,
+    file_size: int | None = None,
+) -> FileInfo:
+    """A DOWNLOAD row as the run's registration lists it for a file a remote browser session delivered."""
+    return FileInfo(
+        url=f"https://storage.test/{filename}",
+        filename=filename,
+        checksum=hashlib.sha256(content).hexdigest() if checksum is None else checksum,
+        file_size=len(content) if file_size is None else file_size,
+        artifact_id=artifact_id,
+    )
 
 
 @dataclass
@@ -544,41 +642,103 @@ def fake_api_request_context() -> Callable[[], object]:
     return _build
 
 
-class FakeSearchPage:
-    """Temporary tab a `search_web` call opens on the run's browser context."""
+def serpapi_page(*links: str, next_start: int | None = None) -> dict[str, Any]:
+    page: dict[str, Any] = {
+        "search_metadata": {"status": "Success"},
+        "organic_results": [{"title": f"Title {link}", "link": link, "snippet": f"About {link}"} for link in links],
+    }
+    if next_start is not None:
+        page["serpapi_pagination"] = {"next": f"https://serpapi.com/search.json?start={next_start}"}
+    return page
 
-    def __init__(self, html: str, page_title: str, goto_error: Exception | None, http_status: int = 200) -> None:
-        self._html = html
-        self._page_title = page_title
-        self._goto_error = goto_error
-        self.http_status = http_status
+
+SearchApiReply = tuple[int, object] | BaseException
+
+
+class FakeSearchApi:
+    """Stands in for `aiohttp_request` under the search client: answers each call with the next queued
+    (status, body) reply or raises it, repeating the last reply once the queue runs out."""
+
+    def __init__(self, *replies: SearchApiReply) -> None:
+        self._replies = list(replies)
+        self.urls: list[str] = []
+
+    async def __call__(self, *, url: str, **_kwargs: object) -> tuple[int, dict[str, str], object]:
+        self.urls.append(url)
+        reply = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        status, body = reply
+        return status, {}, body
+
+
+def arm_search_api(
+    monkeypatch: pytest.MonkeyPatch,
+    *replies: SearchApiReply,
+    serpapi_key: str | None = "serp-test-key",
+    exa_key: str | None = None,
+) -> FakeSearchApi:
+    """Configures the search keys, answers the vendor calls from `replies`, and admits every result
+    destination; a test that screens destinations patches `web_search.classify_url_async` after this."""
+
+    async def allow(_url: str) -> str | None:
+        return None
+
+    api = FakeSearchApi(*replies)
+    monkeypatch.setattr(web_search_client, "aiohttp_request", api)
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", serpapi_key)
+    monkeypatch.setattr(web_search_client.settings, "EXA_API_KEY", exa_key)
+    monkeypatch.setattr(SettingsManager.get_settings(), "ENABLE_SEARCH_WEB", True)
+    monkeypatch.setattr(web_search, "classify_url_async", allow)
+    return api
+
+
+class FakeSearchPage:
+    """A tab the block's browser context opens for an `open_page` call. A URL ending in ``/refused``
+    fails to load; the title is derived from the URL."""
+
+    def __init__(self, context: "FakeSearchBrowserContext | None" = None) -> None:
+        self.context = context
+        self.url = "about:blank"
         self.closed = False
         self.requested_url: str | None = None
 
-    async def goto(self, url: str, timeout: float | None = None) -> SimpleNamespace:
+    async def goto(self, url: str, timeout: float | None = None, **_kwargs: object) -> SimpleNamespace:
         self.requested_url = url
-        if self._goto_error is not None:
-            raise self._goto_error
-        return SimpleNamespace(status=self.http_status)
+        if url.endswith("/refused"):
+            raise PlaywrightError("net::ERR_FAILED")
+        self.url = url
+        return SimpleNamespace(status=200)
 
     async def title(self) -> str:
-        return self._page_title
+        return f"title of {self.url}"
 
     async def content(self) -> str:
-        return self._html
+        return ""
 
-    async def close(self) -> None:
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self, **_kwargs: object) -> None:
         self.closed = True
 
 
 class FakeSearchBrowserContext:
-    def __init__(
-        self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
-    ) -> None:
-        self.page = FakeSearchPage(html, page_title, goto_error, http_status)
+    def __init__(self) -> None:
+        self.opened: list[FakeSearchPage] = []
+
+    @property
+    def page(self) -> FakeSearchPage:
+        return self.opened[0]
+
+    @property
+    def pages(self) -> list[FakeSearchPage]:
+        return list(self.opened)
 
     async def new_page(self) -> FakeSearchPage:
-        return self.page
+        page = FakeSearchPage(context=self)
+        self.opened.append(page)
+        return page
 
 
 class FakeCdpSession:
@@ -653,17 +813,26 @@ class FakeClearingBrowserContext:
         # Storage key the browser reports for a tab whose URL names no origin, as it does for a
         # window opened on about:blank. A tab absent from this list has an opaque origin and none.
         self.inherited_storage_keys: list[tuple[object, str]] = []
+        # (frame, page) pairs whose frame session is attached to the page's target, as raw-CDP attaches
+        # a same-process frame, so protocol calls on it answer for the page's document.
+        self.frames_attached_to_page_target: list[tuple[object, object]] = []
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
         if self.clear_cookies_error is not None:
             raise self.clear_cookies_error
 
+    async def _probe_storage(self, document: object) -> str:
+        return "unreachable" if document in self.frames_without_storage else "reachable"
+
     async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        if not hasattr(page, "evaluate"):
+            page.evaluate = lambda expression, document=page: self._probe_storage(document)  # type: ignore[attr-defined]
         if page in self.frames_without_own_session:
             raise PlaywrightError("This frame does not have a separate CDP session")
+        answering = next((held for frame, held in self.frames_attached_to_page_target if frame is page), page)
         session = FakeCdpSession(
-            storage_reachable=page not in self.frames_without_storage,
+            storage_reachable=answering not in self.frames_without_storage,
             origins_refusing_clear=tuple(self.origins_refusing_clear),
             origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
             refuses_clear=page in self.frames_refusing_clear,
@@ -724,6 +893,26 @@ class ScopeRecordingAgentFunction(AgentFunction):
         return False
 
 
+class OcrRecordingAgentFunction(ScopeRecordingAgentFunction):
+    def __init__(self, text: str | None, *, enabled: bool = True) -> None:
+        super().__init__(record_arms=False)
+        self.text = text
+        self.enabled = enabled
+        self.images: list[bytes] = []
+
+    def supports_image_captcha_ocr(self) -> bool:
+        return True
+
+    async def image_captcha_ocr_enabled(self, organization_id: str | None = None, url: str | None = None) -> bool:
+        return self.enabled
+
+    async def read_image_captcha_text(
+        self, image_png: bytes, *, organization_id: str | None = None, url: str | None = None
+    ) -> str | None:
+        self.images.append(image_png)
+        return self.text
+
+
 _T = TypeVar("_T")
 
 
@@ -774,3 +963,108 @@ def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> Asyn
             )
 
     return AsyncMock(side_effect=_capture)
+
+
+RUN_GROUP_ORG = "o_test"
+RUN_GROUP_OTHER_ORG = "o_other"
+RUN_GROUP_WPID = "wpid_test"
+
+
+@dataclass
+class FakeExecutor:
+    database: AgentDB
+    executed: list[str] = field(default_factory=list)
+    submitted: list[str] = field(default_factory=list)
+    before_queue: Callable[[str], Awaitable[None]] | None = None
+
+    async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
+        self.executed.append(workflow_run_id)
+        if self.before_queue is not None:
+            await self.before_queue(workflow_run_id)
+        if await self.database.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id, WorkflowRunStatus.queued
+        ):
+            self.submitted.append(workflow_run_id)
+
+
+@dataclass
+class RecordingRateLimiter:
+    calls: list[str] = field(default_factory=list)
+
+    async def rate_limit_submit_run(self, organization_id: str) -> None:
+        self.calls.append(organization_id)
+
+
+@dataclass
+class GroupEnv:
+    database: AgentDB
+    executor: FakeExecutor
+    organization: Organization
+    spawned: list[Coroutine[Any, Any, None]]
+    limiter: RecordingRateLimiter
+
+
+def run_group_definition(*blocks: BlockTypeVar) -> dict[str, Any]:
+    return WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json")
+
+
+def run_group_task_block() -> TaskBlock:
+    return TaskBlock(label="login", url="https://example.com", output_parameter=make_block_output_parameter("login"))
+
+
+async def count_rows(env: GroupEnv, model: type[Base]) -> int:
+    async with env.database.Session() as session:
+        return int(await session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+@pytest_asyncio.fixture
+async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> AsyncIterator[GroupEnv]:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    organization = await database.organizations.create_organization("Test", organization_id=RUN_GROUP_ORG)
+    await database.organizations.create_organization("Other", organization_id=RUN_GROUP_OTHER_ORG)
+    async with database.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_1",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                title="Workflow",
+                version=1,
+                workflow_definition=run_group_definition(run_group_task_block()),
+            )
+        )
+        session.add_all(
+            CredentialModel(
+                credential_id=credential_id,
+                organization_id=org_id,
+                name="Login",
+                credential_type="password",
+                item_id=f"item_{credential_id}",
+            )
+            for credential_id, org_id in (
+                ("cred_1", RUN_GROUP_ORG),
+                ("cred_2", RUN_GROUP_ORG),
+                ("cred_foreign", RUN_GROUP_OTHER_ORG),
+            )
+        )
+        await session.commit()
+    await database.workflow_params.create_workflow_parameter(
+        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID, key="login", default_value=None
+    )
+    service = WorkflowService()
+    executor = FakeExecutor(database)
+    spawned: list[Coroutine[Any, Any, None]] = []
+    limiter = RecordingRateLimiter()
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "RATE_LIMITER", limiter, raising=False)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
+    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
+    monkeypatch.setattr(group_service, "_spawn", spawned.append)
+    monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
+    yield GroupEnv(database, executor, organization, spawned, limiter)
+    for coroutine in spawned:
+        coroutine.close()
+    await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks, return_exceptions=True)

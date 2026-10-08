@@ -63,7 +63,7 @@ describe("BlockHealPanel", () => {
     render(<BlockHealPanel workflowRunId="wr_1" workflowRunBlockId="wrb_1" />);
 
     expect(screen.getByText("Runtime healing")).toBeDefined();
-    expect(screen.getByText("Self-healed")).toBeDefined();
+    expect(screen.getByText("AI fallback recovered")).toBeDefined();
     expect(screen.getByText("primary")).toBeDefined();
     expect(screen.getByText("820 ms")).toBeDefined();
     expect(screen.getByText("2 actions")).toBeDefined();
@@ -92,7 +92,7 @@ describe("BlockHealPanel", () => {
 
     render(<BlockHealPanel workflowRunId="wr_1" workflowRunBlockId="wrb_1" />);
 
-    expect(screen.getByText("Heal failed")).toBeDefined();
+    expect(screen.getByText("AI fallback failed")).toBeDefined();
     expect(
       screen.getByText("Your workflow version is unchanged."),
     ).toBeDefined();

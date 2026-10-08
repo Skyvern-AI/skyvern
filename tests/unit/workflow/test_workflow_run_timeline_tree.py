@@ -8,11 +8,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockType
-from skyvern.webeye.actions.actions import ExtractAction
+from skyvern.utils.action_redaction import REDACTED_OTP_VALUE
+from skyvern.webeye.actions.actions import ActionType, ExtractAction
+from tests.unit.helpers import make_action_row, make_session_factory_yielding
 
 
 def _block(
@@ -148,6 +151,45 @@ async def test_timeline_attaches_actions_to_code_blocks(mock_db: AsyncMock) -> N
 
     assert timeline[0].block is not None
     assert timeline[0].block.actions == [action]
+
+
+@pytest.mark.asyncio
+async def test_timeline_serves_the_typed_value_and_the_one_time_code(
+    mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Driven through the real repository read, because the typed value is resolved in hydration."""
+    base = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    mock_db.return_value = [_block("wrb_task", created_at=base, task_id="tsk_test")]
+    otp_row = make_action_row(
+        action_id="act_otp",
+        action_type=ActionType.INPUT_TEXT,
+        element_id="otp",
+        response=REDACTED_OTP_VALUE,
+        action_json={
+            "element_id": "otp",
+            "text": "314159",
+            "response": "314159",
+            "totp_identifier": "inbox@example.test",
+        },
+    )
+    typed_row = make_action_row(
+        action_id="act_typed",
+        action_type=ActionType.INPUT_TEXT,
+        element_id="street",
+        action_json={"element_id": "street", "text": "Meridian Ave"},
+    )
+    monkeypatch.setattr(TasksRepository, "Session", make_session_factory_yielding([otp_row, typed_row]), raising=False)
+    monkeypatch.setattr(app.DATABASE, "tasks", TasksRepository.__new__(TasksRepository))
+
+    timeline = await WorkflowService().get_workflow_run_timeline(
+        workflow_run_id="wr_test", organization_id="o_test", cap_output_values=True
+    )
+
+    assert timeline[0].block is not None
+    otp_action, typed_action = timeline[0].block.actions
+    assert otp_action.text == "314159"
+    assert otp_action.response == "314159"
+    assert typed_action.text == "Meridian Ave"
 
 
 @pytest.mark.asyncio

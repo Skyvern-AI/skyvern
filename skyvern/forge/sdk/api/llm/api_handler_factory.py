@@ -7,12 +7,16 @@ import re
 import time
 import warnings
 from asyncio import CancelledError
+from collections.abc import Collection
 from json import JSONDecodeError
-from typing import Any, AsyncIterator, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
 
 import litellm
 import structlog
 from anthropic import NOT_GIVEN
+from anthropic import APIConnectionError as AnthropicAPIConnectionError
+from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
@@ -20,7 +24,7 @@ from litellm.types.router import AllowedFailsPolicy
 # supports_tool_choice is not re-exported on the litellm module, whose __getattr__ raises for
 # un-exported names — reading it as litellm.supports_tool_choice would AttributeError.
 from litellm.utils import CustomStreamWrapper, ModelResponse, supports_tool_choice
-from openai import APIError, AsyncOpenAI, RateLimitError
+from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI, RateLimitError
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from opentelemetry import trace as otel_trace
 from pydantic import BaseModel
@@ -33,7 +37,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_h
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_direct_copilot_model_usage,
+    _emit_direct_copilot_model_usage,
 )
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
@@ -45,6 +49,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     BaseLLMError,
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
+    InvalidLLMResponseFormat,
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
@@ -66,6 +71,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
+from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value, is_generated_log_field
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -75,6 +81,7 @@ from skyvern.schemas.llm import (
     LLMAllowedFailsPolicy,
     LLMConfig,
     LLMRouterConfig,
+    LLMRouterModelConfig,
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
@@ -103,6 +110,114 @@ _TRANSIENT_LLM_DEPENDENCY_ERRORS: tuple[type[Exception], ...] = (
     litellm.exceptions.ServiceUnavailableError,
     litellm.exceptions.InternalServerError,
 )
+
+
+# Counted by a log-based metric grouped by llm_key and outcome, so outcome must stay a closed set.
+# Emitted once per call intent by the layer that owns its last retry: the handler seam, unless the
+# caller re-issues the same request and emits it itself when it gives up.
+LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE = "LLM retry chain exhausted"
+LLMExhaustionOutcome = Literal["provider_error", "rate_limited", "rejected", "unexpected"]
+
+# A stopped run, or an input no retry can fix; neither is the provider giving out.
+_NOT_LLM_EXHAUSTION: tuple[type[BaseException], ...] = (
+    CancelledError,
+    SkyvernContextWindowExceededError,
+    litellm.exceptions.ContextWindowExceededError,
+    InvalidLLMResponseFormat,
+    InvalidLLMConfigError,
+)
+_STATUS_CODED_LLM_ERRORS = (APIStatusError, AnthropicAPIStatusError, litellm.exceptions.APIError)
+# A dead upstream can answer HTTP 200 with an empty body, which surfaces as a JSONDecodeError.
+_LLM_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    APIConnectionError,
+    AnthropicAPIConnectionError,
+    TimeoutError,
+    JSONDecodeError,
+)
+
+
+def llm_exhaustion_outcome(error: BaseException) -> LLMExhaustionOutcome | None:
+    """None when the failure is not retry-chain exhaustion; otherwise the bounded outcome tag."""
+    cause: BaseException | None = error
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, _NOT_LLM_EXHAUSTION):
+            return None
+        if isinstance(cause, _STATUS_CODED_LLM_ERRORS):
+            # Runs inside the caller's except block, so a provider error mapped without a status
+            # must not raise here and replace the error being handled.
+            status_code = cause.status_code
+            if status_code == 429:
+                return "rate_limited"
+            if isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 408:
+                return "rejected"
+            return "provider_error"
+        if isinstance(cause, _LLM_TRANSPORT_ERRORS):
+            return "provider_error"
+        cause = cause.__cause__
+    return "unexpected"
+
+
+# Counted by a log-based metric over the duration receipt and the exhaustion receipt, grouped by
+# fallback_outcome and the initial/final model groups, so every value comes from a closed set or the
+# router config. Each fallback-eligible call intent lands in exactly one outcome.
+LLM_CALL_DURATION_MESSAGE = "LLM API handler duration metrics"
+LLMFallbackOutcome = Literal["primary", "same_model_backup", "recovered", "exhausted"]
+
+
+def _group_provider_models(llm_config: LLMRouterConfig, group: str) -> set[str]:
+    return {
+        model
+        for deployment in llm_config.model_list
+        if deployment.model_name == group and (model := deployment.litellm_params.get("model"))
+    }
+
+
+def llm_served_fallback_outcome(
+    llm_config: LLMConfig | LLMRouterConfig, served_model_group: str | None
+) -> LLMFallbackOutcome | None:
+    """How a served router call ended up; None when the serving group is unknown."""
+    if not isinstance(llm_config, LLMRouterConfig) or served_model_group is None:
+        return None
+    if served_model_group == llm_config.main_model_group:
+        return "primary"
+    # A backup group that runs the primary's provider model (flex -> standard tier) is a retry on the
+    # same model/provider, not a model/provider fallback.
+    served_models = _group_provider_models(llm_config, served_model_group)
+    if served_models and served_models <= _group_provider_models(llm_config, llm_config.main_model_group):
+        return "same_model_backup"
+    return "recovered"
+
+
+def llm_fallback_log_fields(
+    llm_config: LLMConfig | LLMRouterConfig | None, outcome: LLMFallbackOutcome | None
+) -> dict[str, str]:
+    # Only a config with a backup group is fallback-eligible; every other call stays out of the rate.
+    if outcome is None or not isinstance(llm_config, LLMRouterConfig) or not llm_config.fallback_model_group:
+        return {}
+    return {"fallback_outcome": outcome, "initial_model_group": llm_config.main_model_group}
+
+
+def emit_llm_retry_chain_exhausted(
+    *,
+    llm_key: str,
+    error: BaseException,
+    model: str | None,
+    prompt_name: str | None,
+    llm_config: LLMConfig | LLMRouterConfig | None = None,
+) -> None:
+    outcome = llm_exhaustion_outcome(error)
+    if outcome is None:
+        return
+    LOG.warning(
+        LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE,
+        llm_key=llm_key,
+        outcome=outcome,
+        model=model,
+        prompt_name=prompt_name,
+        **llm_fallback_log_fields(llm_config, "exhausted"),
+    )
 
 
 class _NoRedirectAsyncHTTPHandler(AsyncHTTPHandler):
@@ -177,6 +292,29 @@ def _json_error_body_length(error: JSONDecodeError) -> int | None:
     return len(doc) if isinstance(doc, str) else None
 
 
+def _dispatchable_deployments(llm_config: LLMRouterConfig) -> list[LLMRouterModelConfig]:
+    """The deployments a router can actually serve a call from: the main group plus any fallback
+    group. A deployment outside both is unreachable, so judging a call by it would be wrong.
+    """
+    groups = {llm_config.main_model_group}
+    fallback_group = llm_config.fallback_model_group
+    if isinstance(fallback_group, str):
+        groups.add(fallback_group)
+    elif fallback_group:
+        groups.update(fallback_group)
+    return [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+
+
+def _endpoint_cannot_serve_responses_api(model: str | None, api_base: str | None) -> bool:
+    """Whether an endpoint is one litellm's chat->responses bridge must not be used against.
+
+    An explicit api_base points litellm at somewhere that is not guaranteed to implement
+    /v1/responses, whatever the model is named; only Azure is known to serve it. Shared so the
+    single-config and router-deployment checks cannot drift apart.
+    """
+    return bool(api_base) and not str(model or "").startswith("azure/")
+
+
 async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> None:
     if not is_custom_llm_key(llm_key) or SettingsManager.get_settings().ALLOW_CUSTOM_LLM_LOCAL_API_BASES:
         return
@@ -197,8 +335,22 @@ _VERTEX_FLEX_COST_MULTIPLIER = 0.5
 # threshold, so get_model_info() drops our *_above_272k_tokens_flex keys and prices a
 # flex-tagged, long-context OpenAI-direct GPT-5.6 call at the untiered standard rate.
 _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
+_OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
+# litellm 1.89.1 drops `*_above_100k_tokens` price keys, so a long Haiku 5.5 prompt prices at the base rate.
+# Every Haiku 5.5 rate above 100k prompt tokens is 5x its base rate.
+_CLAUDE_HAIKU_5_5_MODEL_SUFFIX = "claude-haiku-5-5"
+_CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD = 100_000
+_CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER = 5.0
+
+
+def _long_prompt_cost_multiplier(model_name: str | None, prompt_tokens: int | None) -> float:
+    if model_name and model_name.endswith(_CLAUDE_HAIKU_5_5_MODEL_SUFFIX):
+        if prompt_tokens and prompt_tokens > _CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD:
+            return _CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER
+    return 1.0
+
 
 # Kept in `_hidden_params` rather than on the response: `_hidden_params` is excluded from the
 # model dump persisted as the LLM_RESPONSE artifact, so a tier we derived can never be read back
@@ -223,6 +375,10 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+VISION_REQUIRED_PROMPT_NAMES = {
+    "workflow-copilot-video-perception",
+    "workflow-copilot-video-secret-safety",
+}
 VISION_FALLBACK_PROMPT_NAMES = {
     "anthropic-cua",
     "css-shape-convert",
@@ -230,6 +386,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "solve-arithmetic-captcha",
     "solve-dice-captcha",
     "ui-tars-system-prompt",
+    *VISION_REQUIRED_PROMPT_NAMES,
 }
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
@@ -273,36 +430,58 @@ def _current_secret_values_for_redaction() -> set[str]:
     return secret_values
 
 
-def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
+def _current_placeholder_ids_for_redaction() -> frozenset[str]:
+    """The run's registered placeholder ids, exempted from the scrub below.
+
+    Both directions of the model boundary carry these tokens: the prompt offers them in place of
+    credential values, and the model types them back for the run to resolve. Redacting one would
+    break that round trip, so they are named here rather than matched by shape.
+    """
+    try:
+        context = skyvern_context.current()
+        return app.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run(
+            context.workflow_run_id if context else None
+        )
+    except Exception:
+        return frozenset()
+
+
+def _redact_prompt_text(text: str | None, secret_values: set[str], placeholder_ids: Collection[str] = ()) -> str | None:
     if text is None:
         return None
 
     if not secret_values:
         return text
 
-    return redact_secrets_from_text(text, secret_values)
+    return redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
 
 
-def _redact_content_blocks(blocks: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_content_blocks(
+    blocks: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_blocks: list[Any] = []
     changed = False
     for block in blocks:
-        redacted_block, block_changed = _redact_content_block(block, secret_values)
+        redacted_block, block_changed = _redact_content_block(block, secret_values, placeholder_ids)
         redacted_blocks.append(redacted_block)
         changed = changed or block_changed
     return (redacted_blocks, True) if changed else (blocks, False)
 
 
-def _redact_content_value(content: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_value(
+    content: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if isinstance(content, str):
-        redacted_content = redact_secrets_from_text(content, secret_values)
+        redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
         return redacted_content, redacted_content != content
     if isinstance(content, list):
-        return _redact_content_blocks(content, secret_values)
+        return _redact_content_blocks(content, secret_values, placeholder_ids)
     return content, False
 
 
-def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_block(
+    block: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if not isinstance(block, dict):
         return block, False
 
@@ -311,14 +490,14 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
         text = block.get("text")
         if not isinstance(text, str):
             return block, False
-        redacted_text = redact_secrets_from_text(text, secret_values)
+        redacted_text = redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
         if redacted_text == text:
             return block, False
         return {**block, "text": redacted_text}, True
 
     if block_type == "tool_result":
         content = block.get("content")
-        redacted_content, content_changed = _redact_content_value(content, secret_values)
+        redacted_content, content_changed = _redact_content_value(content, secret_values, placeholder_ids)
         if not content_changed:
             return block, False
         return {**block, "content": redacted_content}, True
@@ -326,7 +505,9 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
     return block, False
 
 
-def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_tool_calls(
+    tool_calls: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_tool_calls: list[Any] = []
     changed = False
     for tool_call in tool_calls:
@@ -341,7 +522,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
         if not isinstance(arguments, str):
             redacted_tool_calls.append(tool_call)
             continue
-        redacted_arguments = redact_secrets_from_text(arguments, secret_values)
+        redacted_arguments = redact_secrets_from_text(arguments, secret_values, placeholder_ids=placeholder_ids)
         if redacted_arguments == arguments:
             redacted_tool_calls.append(tool_call)
             continue
@@ -354,6 +535,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
 def _redact_message_text_content(
     messages: list[dict[str, Any]] | None,
     secret_values: set[str],
+    placeholder_ids: Collection[str] = (),
 ) -> list[dict[str, Any]] | None:
     if messages is None or not secret_values:
         return messages
@@ -364,18 +546,18 @@ def _redact_message_text_content(
         redacted_message = message
         content = message.get("content")
         if isinstance(content, str):
-            redacted_content = redact_secrets_from_text(content, secret_values)
+            redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
             if redacted_content != content:
                 redacted_message = {**redacted_message, "content": redacted_content}
                 changed = True
         elif isinstance(content, list):
-            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values)
+            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values, placeholder_ids)
             if content_changed:
                 redacted_message = {**redacted_message, "content": redacted_content_blocks}
                 changed = True
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
-            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values)
+            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values, placeholder_ids)
             if tool_calls_changed:
                 redacted_message = {**redacted_message, "tool_calls": redacted_tool_calls}
                 changed = True
@@ -467,6 +649,11 @@ def _enrich_llm_span(
     )
 
 
+def _effective_reasoning_effort(parameters: dict[str, Any]) -> str | None:
+    effort = parameters.get("reasoning_effort")
+    return effort.get("effort") if isinstance(effort, dict) else effort
+
+
 def _safe_model_dump_json(response: ModelResponse, indent: int = 2) -> str:
     """
     Call model_dump_json() while suppressing Pydantic serialization warnings.
@@ -505,6 +692,8 @@ def _llm_screenshots_for_call(
     prompt_name: str | None = None,
     step: Step | None = None,
 ) -> list[bytes] | None:
+    if screenshots and prompt_name in VISION_REQUIRED_PROMPT_NAMES and not llm_config.supports_vision:
+        raise ValueError(f"Prompt {prompt_name!r} requires a vision-capable model")
     if not llm_config.supports_vision:
         return None
     if context and not context.llm_screenshots_enabled_for_prompt(
@@ -605,6 +794,22 @@ def _effective_service_tier(response: object) -> str | None:
     return reported if isinstance(reported, str) else _recovered_service_tier(response)
 
 
+# litellm stamps "chatcmpl-<uuid4>" on a response whose provider sent no id; logging it would
+# invent a correlation key that matches nothing on the provider side.
+_LITELLM_SYNTHESIZED_RESPONSE_ID = re.compile(
+    r"chatcmpl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+
+
+def _response_id_log_fields(response: object) -> dict[str, str]:
+    response_id = getattr(response, "id", None)
+    if not isinstance(response_id, str) or not response_id:
+        return {}
+    if _LITELLM_SYNTHESIZED_RESPONSE_ID.fullmatch(response_id):
+        return {}
+    return {"response_id": response_id}
+
+
 def _response_provider(response: object) -> str | None:
     provider = getattr(response, "provider", None)
     if provider is None:
@@ -681,7 +886,7 @@ def _emit_copilot_model_usage_for_response(
 ) -> None:
     try:
         provider_name = _response_provider(response)
-        emit_direct_copilot_model_usage(
+        _emit_direct_copilot_model_usage(
             _copilot_model_usage_event(
                 response,
                 request_model=request_model,
@@ -901,7 +1106,7 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
     chain = [llm_config.main_model_group, *fallback_groups]
     fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
 
-    return litellm.Router(
+    router = litellm.Router(
         model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
         redis_host=llm_config.redis_host,
         redis_port=llm_config.redis_port,
@@ -923,6 +1128,16 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
         set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
         enable_pre_call_checks=True,
     )
+    # LiteLLM's Deployment validation removes str subclasses. Keep source identities
+    # on the router that owns these deployments, including across cached-config changes.
+    router._skyvern_model_group_provenance = MappingProxyType(
+        {
+            str(model.model_name): model.model_name
+            for model in llm_config.model_list
+            if is_generated_log_field("model_name", model.model_name)
+        }
+    )
+    return router
 
 
 # Cache routers by llm_key so concurrent LLMCaller instances (v3 builds one per run) share a single
@@ -1035,7 +1250,11 @@ class LLMAPIHandlerFactory:
     def _served_model_group(router: Any, response: Any) -> str | None:
         """Resolve the litellm deployment group that served a router response, or None
         when unavailable (direct litellm.acompletion paths, test doubles)."""
-        return getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+        group = getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+        provenance = getattr(router, "_skyvern_model_group_provenance", None)
+        if isinstance(group, str) and isinstance(provenance, MappingProxyType):
+            return provenance.get(group, group)
+        return group
 
     @staticmethod
     def _deployment_service_tier(deployment: Any) -> str | None:
@@ -1172,33 +1391,58 @@ class LLMAPIHandlerFactory:
         return None
 
     @staticmethod
-    def completion_cost_or_none(response: ModelResponse | CustomStreamWrapper) -> float | None:
-        """litellm completion cost, with two known litellm gaps corrected here: the Vertex
-        Gemini flex tier, and long-context OpenAI-direct GPT-5.6 flex calls. Both bill at
-        the standard rate in litellm and are halved post hoc. Internal cost tracking only
-        — never customer-facing.
+    def _get_cost_model_override(requested_model: str | None) -> tuple[str, str] | None:
+        # Bedrock returns the bare Claude name, which otherwise selects direct Anthropic prices.
+        if requested_model in {"bedrock/us.anthropic.claude-opus-5-5", "bedrock/us.anthropic.claude-haiku-5-5"}:
+            return requested_model, "bedrock"
+        return None
+
+    @staticmethod
+    def billed_cost_or_none(response: ModelResponse | CustomStreamWrapper) -> float | None:
+        """OpenRouter's billed usage.cost for an OpenRouter-served response, else the litellm cost.
+
+        The billed amount already reflects the served tier and cache-write charges, and needs no
+        price table for models litellm cannot price.
         """
+        hidden_params = getattr(response, "_hidden_params", None)
+        if isinstance(hidden_params, dict) and hidden_params.get("custom_llm_provider") == "openrouter":
+            reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
+            if reported_cost is not None:
+                return reported_cost
+        return LLMAPIHandlerFactory.completion_cost_or_none(response)
+
+    @staticmethod
+    def completion_cost_or_none(response: ModelResponse | CustomStreamWrapper) -> float | None:
+        """Correct LiteLLM tier and model-resolution gaps for internal cost tracking."""
         # litellm resolves an explicit service_tier kwarg ahead of the response attribute, so a
         # tier recovered out of band selects the *_flex price keys without us pricing anything
         # ourselves. Passed only when recovered, leaving the reported-tier path on litellm's own
         # resolution rather than routing every call through our short-circuit.
         recovered_tier = _recovered_service_tier(response)
+        hidden_params = getattr(response, "_hidden_params", None)
+        requested_model = hidden_params.get("litellm_model_name", "") if isinstance(hidden_params, dict) else ""
         try:
-            cost = (
-                litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
-                if recovered_tier is not None
-                else litellm.completion_cost(completion_response=response)
-            )
+            if cost_model_override := LLMAPIHandlerFactory._get_cost_model_override(requested_model):
+                model, provider = cost_model_override
+                cost = litellm.completion_cost(
+                    completion_response=response, base_model=model, custom_llm_provider=provider
+                )
+            elif recovered_tier is not None:
+                cost = litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
+            else:
+                cost = litellm.completion_cost(completion_response=response)
         except Exception as e:
             LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
             return None
-        hidden_params = getattr(response, "_hidden_params", None)
         provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
         if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
             return cost * _VERTEX_FLEX_COST_MULTIPLIER
         if LLMAPIHandlerFactory._is_openai_direct_gpt5_6_long_context_flex(response, hidden_params):
             return cost * _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER
-        return cost
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        model_name = requested_model if isinstance(requested_model, str) else None
+        return cost * _long_prompt_cost_multiplier(model_name, prompt_tokens)
 
     @staticmethod
     def _is_openai_direct_gpt5_6_long_context_flex(
@@ -1209,7 +1453,10 @@ class LLMAPIHandlerFactory:
         # litellm_model_name keeps the pre-request model string (unlike response.model,
         # which litellm strips to the bare provider label), so "azure/" still excludes Azure.
         requested_model = hidden_params.get("litellm_model_name") if isinstance(hidden_params, dict) else None
-        if not isinstance(requested_model, str) or not requested_model.startswith(_OPENAI_GPT5_6_MODEL_PREFIX):
+        if not isinstance(requested_model, str):
+            return False
+        direct_model = requested_model.removeprefix("openai/").removeprefix("responses/")
+        if not direct_model.startswith((_OPENAI_GPT5_6_MODEL_PREFIX, *_OPENAI_GPT6_MODEL_PREFIXES)):
             return False
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
@@ -1271,9 +1518,7 @@ class LLMAPIHandlerFactory:
                     parameters, new_budget, llm_config, prompt_name
                 )
             elif llm_config.pin_reasoning_effort:
-                # setdefault, not a bare return: a caller that supplies its own parameters
-                # skips get_api_parameters, so the pinned effort would otherwise be absent.
-                parameters.setdefault("reasoning_effort", llm_config.reasoning_effort)
+                LLMAPIHandlerFactory._apply_pinned_parameters(parameters, llm_config)
                 LOG.debug(
                     "Thinking budget optimization left reasoning_effort pinned by config",
                     prompt_name=prompt_name,
@@ -1309,19 +1554,26 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def requires_adaptive_thinking(model_name: str | None) -> bool:
-        # Newer direct Anthropic models reject `thinking.type=enabled` and require
-        # `thinking.type=adaptive` + `output_config.effort`. Bedrock's translator
-        # does not yet accept the new shape, so gate to direct Anthropic.
+        # These models reject manual thinking budgets. LiteLLM 1.89.1 also passes
+        # adaptive thinking through for the Bedrock Opus 5.5 deployment.
         return model_name in {
             "anthropic/claude-opus-4-7",
             "anthropic/claude-opus-4-8",
             "anthropic/claude-fable-5",
             "anthropic/claude-fable-5-1",
             "anthropic/claude-opus-5",
+            "anthropic/claude-opus-5-5",
+            "bedrock/us.anthropic.claude-opus-5-5",
+            "anthropic/claude-sonnet-5-5",
+            "bedrock/global.anthropic.claude-sonnet-5-5",
+            "anthropic/claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
             "anthropic-claude-fable-5-1",
             "anthropic-claude-opus-5",
+            "anthropic-claude-opus-5-5",
+            "anthropic-claude-sonnet-5-5",
         }
 
     @staticmethod
@@ -1477,37 +1729,22 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def uses_openai_responses_bridge(llm_config: LLMConfig | LLMRouterConfig) -> bool:
-        """Whether calls built from this config land on an OpenAI gpt-5.6 model, which litellm
-        silently bridges from /v1/chat/completions to /v1/responses when tools are present (see
-        _record_served_service_tier's docstring). Only the responses bridge accepts the dict form
-        of reasoning_effort (mapped to Reasoning(**dict)); a plain chat-completions model 400s on
-        it ("Unknown parameter: 'reasoning'" observed).
-
-        A router deployment can hide the model behind an opaque alias (e.g. an Azure deployment
-        name) in its dispatched litellm model string, so this also checks the deployment's
-        declared model_info label -- router configs set that to the real model name for exactly
-        this kind of identification.
-        """
+        """GPT-5.6 bridges implicitly; GPT-6 opts in via the explicit Responses route."""
 
         def _is_bridge_model(candidate: Any) -> bool:
-            return isinstance(candidate, str) and candidate.rsplit("/", 1)[-1].lower().startswith(
-                _OPENAI_GPT5_6_MODEL_PREFIX
-            )
+            if not isinstance(candidate, str):
+                return False
+            return candidate.startswith(("openai/responses/", "azure/responses/")) or candidate.rsplit("/", 1)[
+                -1
+            ].lower().startswith(_OPENAI_GPT5_6_MODEL_PREFIX)
 
         # litellm decides the bridge from the DISPATCHED model string alone, so this check reads
         # exactly that and nothing else (a model_info label saying gpt-5.6 would answer True where
         # litellm will not bridge, sending the dict to a chat-completions endpoint).
         if isinstance(llm_config, LLMRouterConfig):
-            # EVERY deployment that can serve the call (main + fallback groups, same filter as
-            # _resolve_tool_choice_support) must be a bridge model: a mixed router could hand the
-            # dict reasoning_effort to a non-bridge fallback, which rejects it.
-            groups = {llm_config.main_model_group}
-            fallback_group = llm_config.fallback_model_group
-            if isinstance(fallback_group, str):
-                groups.add(fallback_group)
-            elif fallback_group:
-                groups.update(fallback_group)
-            deployments = [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+            # EVERY deployment that can serve the call must be a bridge model: a mixed router
+            # could hand the dict reasoning_effort to a non-bridge fallback, which rejects it.
+            deployments = _dispatchable_deployments(llm_config)
             if not deployments:
                 return False
             return all(_is_bridge_model(deployment.litellm_params.get("model")) for deployment in deployments)
@@ -1756,12 +1993,15 @@ class LLMAPIHandlerFactory:
                     parameters, DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
+            LLMAPIHandlerFactory._apply_pinned_parameters(parameters, llm_config)
+
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -1984,6 +2224,7 @@ class LLMAPIHandlerFactory:
                 try:
                     response: ModelResponse | None = None
                     primary_served = False
+                    vertex_cache_response: ModelResponse | None = None
                     if should_attach_vertex_cache and cache_resource_name:
                         try:
                             response, direct_model_used, llm_request_json = await _call_primary_with_vertex_cache(
@@ -1994,12 +2235,13 @@ class LLMAPIHandlerFactory:
                                 response,
                                 request_model=direct_model_used,
                                 prompt_name=prompt_name,
-                                cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
+                                cost=LLMAPIHandlerFactory.billed_cost_or_none(response),
                             )
                             model_used = response.model or direct_model_used
                             # This path invokes the primary deployment directly, so a
                             # successful response is primary-served by construction.
                             primary_served = True
+                            vertex_cache_response = response
                         except CancelledError:
                             raise
                         except Exception as cache_error:
@@ -2018,7 +2260,7 @@ class LLMAPIHandlerFactory:
                             response,
                             request_model=main_model_group,
                             prompt_name=prompt_name,
-                            cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
+                            cost=LLMAPIHandlerFactory.billed_cost_or_none(response),
                         )
                         response_model = response.model or main_model_group
                         model_used = response_model
@@ -2077,7 +2319,7 @@ class LLMAPIHandlerFactory:
                                 response,
                                 request_model=fallback_model,
                                 prompt_name=prompt_name,
-                                cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
+                                cost=LLMAPIHandlerFactory.billed_cost_or_none(response),
                             )
                         finally:
                             llm_duration_seconds += time.perf_counter() - _llm_call_start
@@ -2129,7 +2371,7 @@ class LLMAPIHandlerFactory:
                                     response,
                                     request_model=fallback_model,
                                     prompt_name=prompt_name,
-                                    cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
+                                    cost=LLMAPIHandlerFactory.billed_cost_or_none(response),
                                 )
                             finally:
                                 llm_duration_seconds += time.perf_counter() - _llm_call_start
@@ -2139,6 +2381,13 @@ class LLMAPIHandlerFactory:
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
                     _llm_span.set_attribute("status", "error")
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        llm_config=llm_config,
+                    )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.perf_counter() - start_time
@@ -2164,6 +2413,13 @@ class LLMAPIHandlerFactory:
                         body_length=_json_error_body_length(e),
                         duration_seconds=duration_seconds,
                     )
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        llm_config=llm_config,
+                    )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except ValueError as e:
                     duration_seconds = time.perf_counter() - start_time
@@ -2175,6 +2431,7 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
+                    # A token-limit rejection is deterministic, so it leaves no exhaustion receipt.
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except CancelledError:
                     # A cancellation here means the run is being stopped (elapsed-time timeout / user
@@ -2209,6 +2466,13 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        llm_config=llm_config,
+                    )
                     raise LLMProviderError(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
@@ -2219,6 +2483,13 @@ class LLMAPIHandlerFactory:
                         model=main_model_group,
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
+                    )
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        llm_config=llm_config,
                     )
                     raise LLMProviderError(llm_key, cause=e) from e
 
@@ -2242,7 +2513,7 @@ class LLMAPIHandlerFactory:
                 completion_token_detail = None
                 cached_token_detail = None
                 # FIXME: volcengine doesn't support litellm cost calculation.
-                llm_cost = LLMAPIHandlerFactory.completion_cost_or_none(response) or 0.0
+                llm_cost = LLMAPIHandlerFactory.billed_cost_or_none(response) or 0.0
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2275,7 +2546,7 @@ class LLMAPIHandlerFactory:
                 # secondary LLM) the attribution is lossy — resolved in Phase 2 by a
                 # per-call tracking table.
                 actual_model = _normalize_llm_model(getattr(response, "model", None) or model_used)
-                if step and not is_speculative_step:
+                if step:
                     await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
@@ -2314,35 +2585,48 @@ class LLMAPIHandlerFactory:
                 )
                 resolved_provider = _response_provider(response)
                 service_tier, service_tier_source = _service_tier_with_provenance(response)
+                # The cached call bypasses the router, which therefore cannot name the group that served it.
+                served_model_group = (
+                    main_model_group
+                    if response is vertex_cache_response
+                    else LLMAPIHandlerFactory._served_model_group(router, response)
+                )
                 LOG.info(
-                    "LLM API handler duration metrics",
+                    LLM_CALL_DURATION_MESSAGE,
+                    reasoning_effort=_effective_reasoning_effort(parameters),
                     llm_key=llm_key,
-                    model=model_used,
+                    model=_model_log_value("model", model_used),
                     # `model_used` is the router group, identical for the flex and fallback legs;
                     # without the served deployment the split between them is invisible.
-                    served_model_group=LLMAPIHandlerFactory._served_model_group(router, response),
+                    served_model_group=_model_log_value("served_model_group", served_model_group),
+                    **llm_fallback_log_fields(llm_config, llm_served_fallback_outcome(llm_config, served_model_group)),
                     service_tier_source=service_tier_source,
                     prompt_name=prompt_name,
-                    duration_seconds=duration_seconds,
-                    llm_duration_seconds=llm_duration_seconds,
+                    duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                    llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
                     workflow_run_id=context.workflow_run_id if context else None,
                     task_id=context.task_id if context else None,
-                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    llm_cost=llm_cost if llm_cost > 0 else None,
-                    image_count=image_count if image_count > 0 else None,
-                    image_tokens=image_tokens if image_tokens > 0 else None,
-                    image_cost=image_cost if image_cost > 0 else None,
+                    input_tokens=_generated_log_value("input_tokens", prompt_tokens if prompt_tokens > 0 else None),
+                    output_tokens=_generated_log_value(
+                        "output_tokens", completion_tokens if completion_tokens > 0 else None
+                    ),
+                    reasoning_tokens=_generated_log_value(
+                        "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
+                    ),
+                    cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
+                    image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                    image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                    image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                     **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -2418,14 +2702,6 @@ class LLMAPIHandlerFactory:
                         llm_response_json=llm_response_json,
                         parsed_response_json=parsed_response_json,
                         rendered_response_json=rendered_response_json,
-                        llm_key=llm_key,
-                        model=model_used,
-                        duration_seconds=duration_seconds,
-                        input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                        output_tokens=completion_tokens if completion_tokens > 0 else None,
-                        reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                        cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                        llm_cost=llm_cost if llm_cost > 0 else None,
                     )
 
                 return parsed_response
@@ -2572,12 +2848,15 @@ class LLMAPIHandlerFactory:
                     active_parameters, DEFAULT_THINKING_BUDGET, llm_config, prompt_name
                 )
 
+            LLMAPIHandlerFactory._apply_pinned_parameters(active_parameters, llm_config)
+
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -2778,12 +3057,18 @@ class LLMAPIHandlerFactory:
                         response,
                         request_model=model_name,
                         prompt_name=prompt_name,
-                        cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
+                        cost=LLMAPIHandlerFactory.billed_cost_or_none(response),
                     )
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
                     _llm_span.set_attribute("status", "error")
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                    )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except litellm.exceptions.ContextWindowExceededError as e:
                     duration_seconds = time.perf_counter() - start_time
@@ -2829,6 +3114,12 @@ class LLMAPIHandlerFactory:
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
                     )
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                    )
                     raise LLMProviderError(llm_key, cause=e) from e
                 except JSONDecodeError as e:
                     # A dead upstream can answer HTTP 200 with an empty or truncated body, which fails
@@ -2843,6 +3134,12 @@ class LLMAPIHandlerFactory:
                         body_length=_json_error_body_length(e),
                         duration_seconds=duration_seconds,
                     )
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                    )
                     raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
@@ -2853,6 +3150,12 @@ class LLMAPIHandlerFactory:
                         model=model_name,
                         prompt_name=prompt_name,
                         duration_seconds=duration_seconds,
+                    )
+                    emit_llm_retry_chain_exhausted(
+                        llm_key=llm_key,
+                        error=e,
+                        model=model_name,
+                        prompt_name=prompt_name,
                     )
                     raise LLMProviderError(llm_key, cause=e) from e
 
@@ -2876,7 +3179,7 @@ class LLMAPIHandlerFactory:
                 completion_token_detail = None
                 cached_token_detail = None
                 # FIXME: volcengine doesn't support litellm cost calculation.
-                llm_cost = LLMAPIHandlerFactory.completion_cost_or_none(response) or 0.0
+                llm_cost = LLMAPIHandlerFactory.billed_cost_or_none(response) or 0.0
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2903,7 +3206,7 @@ class LLMAPIHandlerFactory:
                 _log_vertex_cache_hit_if_needed(context, prompt_name, model_name, cached_tokens)
 
                 actual_model = _normalize_llm_model(getattr(response, "model", None) or model_name)
-                if step and not is_speculative_step:
+                if step:
                     await app.DATABASE.tasks.update_step(
                         task_id=step.task_id,
                         step_id=step.step_id,
@@ -2941,25 +3244,30 @@ class LLMAPIHandlerFactory:
                 resolved_provider = _response_provider(response)
                 service_tier, service_tier_source = _service_tier_with_provenance(response)
                 LOG.info(
-                    "LLM API handler duration metrics",
+                    LLM_CALL_DURATION_MESSAGE,
+                    reasoning_effort=_effective_reasoning_effort(active_parameters),
                     llm_key=llm_key,
                     prompt_name=prompt_name,
-                    model=llm_config.model_name,
-                    duration_seconds=duration_seconds,
-                    llm_duration_seconds=llm_duration_seconds,
+                    model=_model_log_value("model", llm_config.model_name),
+                    duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                    llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
                     workflow_run_id=context.workflow_run_id if context else None,
                     task_id=context.task_id if context else None,
-                    input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                    cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    llm_cost=llm_cost if llm_cost > 0 else None,
-                    image_count=image_count if image_count > 0 else None,
-                    image_tokens=image_tokens if image_tokens > 0 else None,
-                    image_cost=image_cost if image_cost > 0 else None,
+                    input_tokens=_generated_log_value("input_tokens", prompt_tokens if prompt_tokens > 0 else None),
+                    output_tokens=_generated_log_value(
+                        "output_tokens", completion_tokens if completion_tokens > 0 else None
+                    ),
+                    reasoning_tokens=_generated_log_value(
+                        "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
+                    ),
+                    cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
+                    image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                    image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                    image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
@@ -2968,6 +3276,7 @@ class LLMAPIHandlerFactory:
                     service_tier_source=service_tier_source,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                     **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -3047,14 +3356,6 @@ class LLMAPIHandlerFactory:
                         llm_response_json=llm_response_json,
                         parsed_response_json=parsed_response_json,
                         rendered_response_json=rendered_response_json,
-                        llm_key=llm_key,
-                        model=llm_config.model_name,
-                        duration_seconds=duration_seconds,
-                        input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                        output_tokens=completion_tokens if completion_tokens > 0 else None,
-                        reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                        cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                        llm_cost=llm_cost if llm_cost > 0 else None,
                     )
 
                 return parsed_response
@@ -3100,6 +3401,24 @@ class LLMAPIHandlerFactory:
         return llm_api_handler
 
     @staticmethod
+    def _apply_pinned_parameters(parameters: dict[str, Any], llm_config: LLMConfig | LLMRouterConfig) -> None:
+        if not llm_config.pin_reasoning_effort:
+            return
+        effort = parameters.get("reasoning_effort")
+        parameters["reasoning_effort"] = (
+            {**effort, "effort": llm_config.reasoning_effort}
+            if isinstance(effort, dict)
+            else llm_config.reasoning_effort
+        )
+        required = LLMAPIHandlerFactory.get_api_parameters(llm_config).get("allowed_openai_params", [])
+        if required:
+            if llm_config.temperature is None:
+                parameters.pop("temperature", None)
+            parameters["allowed_openai_params"] = list(
+                dict.fromkeys([*(parameters.get("allowed_openai_params") or []), *required])
+            )
+
+    @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if not llm_config.model_name.startswith(("ollama/", "ollama_chat/")):
@@ -3114,6 +3433,16 @@ class LLMAPIHandlerFactory:
 
         if llm_config.reasoning_effort is not None:
             params["reasoning_effort"] = llm_config.reasoning_effort
+
+            # LiteLLM's chat parameter filters omit GPT-6 reasoning_effort and Azure
+            # service_tier, even when the model explicitly opts into Responses.
+            models = (
+                [deployment.litellm_params.get("model", "") for deployment in _dispatchable_deployments(llm_config)]
+                if isinstance(llm_config, LLMRouterConfig)
+                else [llm_config.model_name]
+            )
+            if models and all(model.startswith(("openai/responses/", "azure/responses/")) for model in models):
+                params["allowed_openai_params"] = ["reasoning_effort", "service_tier"]
 
         # Direct (non-router) Gemini configs carry safety_settings at the request level.
         # Router configs inject per-deployment at build time (see _inject_gemini_safety_settings)
@@ -3264,7 +3593,9 @@ class LLMCaller:
         self._warned_unsupported_tool_choice = False
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         self._custom_openrouter = bool(openrouter_model_name and is_custom_llm_key(self.original_llm_key))
-        # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
+        # _openrouter_model_name only recognises the LLMConfig shape, so only that shape has its
+        # llm_key rewritten to the bare model id. A router config whose deployments are
+        # openrouter/ models keeps its group name here, and so logs under a different key.
         if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
             self.llm_key = openrouter_model_name.replace("openrouter/", "")
             if not self._custom_openrouter:
@@ -3312,11 +3643,17 @@ class LLMCaller:
         # OPENAI_COMPATIBLE registration, whose key name is configurable): only real OpenAI and
         # Azure endpoints are known to serve the bridge, and real OpenAI needs no api_base.
         litellm_params = getattr(self.llm_config, "litellm_params", None)
-        if (
-            isinstance(self.llm_config, LLMConfig)
-            and litellm_params is not None
-            and litellm_params.get("api_base")
-            and not self.llm_config.model_name.startswith("azure/")
+        if isinstance(self.llm_config, LLMConfig) and litellm_params is not None:
+            if _endpoint_cannot_serve_responses_api(self.llm_config.model_name, litellm_params.get("api_base")):
+                return False
+        # A router config carries its api_base per deployment rather than on the config, so the
+        # same test has to run over the deployments it can dispatch to. One that cannot serve the
+        # bridge is enough to deny: the router picks the deployment, this call cannot.
+        if isinstance(self.llm_config, LLMRouterConfig) and any(
+            _endpoint_cannot_serve_responses_api(
+                deployment.litellm_params.get("model"), deployment.litellm_params.get("api_base")
+            )
+            for deployment in _dispatchable_deployments(self.llm_config)
         ):
             return False
         return LLMAPIHandlerFactory.uses_openai_responses_bridge(self.llm_config)
@@ -3341,15 +3678,7 @@ class LLMCaller:
             return False
         try:
             if isinstance(self.llm_config, LLMRouterConfig):
-                groups = {self.llm_config.main_model_group}
-                fallback_group = self.llm_config.fallback_model_group
-                if isinstance(fallback_group, str):
-                    groups.add(fallback_group)
-                elif fallback_group:
-                    groups.update(fallback_group)
-                deployments = [
-                    deployment for deployment in self.llm_config.model_list if deployment.model_name in groups
-                ]
+                deployments = _dispatchable_deployments(self.llm_config)
                 if not deployments:
                     return False
                 return all(
@@ -3364,6 +3693,15 @@ class LLMCaller:
         except Exception:
             LOG.debug("Failed to resolve tool_choice support", llm_key=self.llm_key, exc_info=True)
             return False
+
+    def emit_retry_chain_exhausted(self, error: BaseException, prompt_name: str | None) -> None:
+        emit_llm_retry_chain_exhausted(
+            llm_key=self.llm_key,
+            error=error,
+            model=self.llm_config.model_name,
+            prompt_name=prompt_name,
+            llm_config=self.llm_config,
+        )
 
     @traced(name=LLM_REQUEST_SPAN_NAME)
     async def call(
@@ -3386,6 +3724,9 @@ class LLMCaller:
         system_prompt: str | None = None,
         recording_attempt_id: str | None = None,
         interpretation_session_id: str | None = None,
+        # True when the caller re-issues this same request on failure; it then emits the
+        # exhaustion receipt itself (emit_retry_chain_exhausted) once it gives up.
+        caller_owns_exhaustion_receipt: bool = False,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
         _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
@@ -3408,6 +3749,7 @@ class LLMCaller:
         # Router configs carry per-deployment litellm_params inside the Router, not on the config.
         if not isinstance(self.llm_config, LLMRouterConfig) and self.llm_config.litellm_params:
             active_parameters.update(self.llm_config.litellm_params)
+        LLMAPIHandlerFactory._apply_pinned_parameters(active_parameters, self.llm_config)
         if "tool_choice" in active_parameters and not self.supports_tool_choice():
             # Forwarding it to a provider that rejects it is the one way this parameter breaks a
             # call rather than merely failing to help, so drop it here instead of at each caller.
@@ -3423,8 +3765,9 @@ class LLMCaller:
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()
+        placeholder_ids = _current_placeholder_ids_for_redaction()
         original_prompt = prompt
-        prompt = _redact_prompt_text(prompt, secret_values)
+        prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -3511,11 +3854,15 @@ class LLMCaller:
             _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
-            if "ANTHROPIC" in self.llm_key:
+            # Only the raw Anthropic SDK branch of _dispatch takes Anthropic-native image blocks; router
+            # keys reach litellm, which rejects them, whatever the key's name.
+            if self._router is None and "ANTHROPIC" in self.llm_key:
                 message_pattern = "anthropic"
 
             if use_message_history:
-                redacted_message_history = _redact_message_text_content(self.message_history, secret_values)
+                redacted_message_history = _redact_message_text_content(
+                    self.message_history, secret_values, placeholder_ids
+                )
                 messages = await llm_messages_builder_with_history(
                     prompt,
                     screenshots,
@@ -3583,9 +3930,13 @@ class LLMCaller:
                 # the step-level retry (bounded by max_retries_per_step) is what absorbs them.
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
+                if not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.APIError as e:
                 _llm_span.set_attribute("status", "error")
+                if not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except CancelledError:
                 # A cancellation here means the run is being stopped (elapsed-time timeout / user
@@ -3611,9 +3962,13 @@ class LLMCaller:
             except RateLimitError as e:
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
+                if not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except APIError as e:
                 _llm_span.set_attribute("status", "error")
+                if not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except JSONDecodeError as e:
                 # A dead upstream can answer HTTP 200 with an empty or truncated body, which fails
@@ -3626,15 +3981,23 @@ class LLMCaller:
                     body_length=_json_error_body_length(e),
                     error=str(e),
                 )
+                if not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
-            except LLMProviderError:
+            except LLMProviderError as e:
                 # Already classified (retryable or not) by the dispatch path; re-wrapping it below
                 # would erase that and log it as an unexpected failure.
                 _llm_span.set_attribute("status", "error")
+                # Only a retryable classification (e.g. the hard-deadline timeout) is provider/router
+                # exhaustion; a non-retryable LLMProviderError is a deterministic reject, not exhaustion.
+                if isinstance(e, LLMProviderErrorRetryableTask) and not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
+                if not caller_owns_exhaustion_receipt:
+                    self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderError(self.llm_key, cause=e) from e
 
             served_model_group: str | None = None
@@ -3667,7 +4030,7 @@ class LLMCaller:
                     )
 
             actual_model = _normalize_llm_model(getattr(response, "model", None) or self.llm_config.model_name)
-            if step and not is_speculative_step:
+            if step:
                 await app.DATABASE.tasks.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
@@ -3708,36 +4071,41 @@ class LLMCaller:
             resolved_provider = _response_provider(response)
             service_tier, service_tier_source = _service_tier_with_provenance(response)
             LOG.info(
-                "LLM API handler duration metrics",
+                LLM_CALL_DURATION_MESSAGE,
+                reasoning_effort=_effective_reasoning_effort(active_parameters),
                 llm_key=self.llm_key,
                 prompt_name=prompt_name,
-                model=self.llm_config.model_name,
-                duration_seconds=duration_seconds,
-                llm_duration_seconds=llm_duration_seconds,
+                model=_model_log_value("model", self.llm_config.model_name),
+                duration_seconds=_generated_log_value("duration_seconds", duration_seconds),
+                llm_duration_seconds=_generated_log_value("llm_duration_seconds", llm_duration_seconds),
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=organization_id,
                 workflow_run_id=context.workflow_run_id if context else None,
                 task_id=context.task_id if context else None,
-                input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
-                output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
-                reasoning_tokens=call_stats.reasoning_tokens
-                if call_stats and call_stats.reasoning_tokens is not None
-                else None,
-                cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
-                llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
-                image_count=image_count if image_count > 0 else None,
-                image_tokens=image_tokens if image_tokens > 0 else None,
-                image_cost=image_cost if image_cost > 0 else None,
+                input_tokens=_generated_log_value("input_tokens", call_stats.input_tokens if call_stats else None),
+                output_tokens=_generated_log_value("output_tokens", call_stats.output_tokens if call_stats else None),
+                reasoning_tokens=_generated_log_value(
+                    "reasoning_tokens", call_stats.reasoning_tokens if call_stats else None
+                ),
+                cached_tokens=_generated_log_value("cached_tokens", call_stats.cached_tokens if call_stats else None),
+                llm_cost=_generated_log_value("llm_cost", call_stats.llm_cost if call_stats else None),
+                image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
+                image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
+                image_cost=_generated_log_value("image_cost", image_cost if image_cost > 0 else None),
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
                 # `model` above is the router group, identical for the flex and standard legs;
                 # without the served deployment the split between them is invisible.
-                served_model_group=served_model_group,
+                served_model_group=_model_log_value("served_model_group", served_model_group),
+                **llm_fallback_log_fields(
+                    self.llm_config, llm_served_fallback_outcome(self.llm_config, served_model_group)
+                ),
                 service_tier_source=service_tier_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
+                **_response_id_log_fields(response),
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
                 **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
@@ -3814,14 +4182,6 @@ class LLMCaller:
                     llm_response_json=llm_response_json,
                     parsed_response_json=parsed_response_json,
                     rendered_response_json=rendered_response_json,
-                    llm_key=self.llm_key,
-                    model=self.llm_config.model_name,
-                    duration_seconds=duration_seconds,
-                    input_tokens=call_stats.input_tokens,
-                    output_tokens=call_stats.output_tokens,
-                    reasoning_tokens=call_stats.reasoning_tokens,
-                    cached_tokens=call_stats.cached_tokens,
-                    llm_cost=call_stats.llm_cost,
                 )
 
             return parsed_response
@@ -4186,13 +4546,43 @@ class LLMCaller:
         if isinstance(response, AnthropicMessage):
             usage = response.usage
             cached_tokens = usage.cache_read_input_tokens or 0
-            input_token_cost = (3.0 / 1000000) * usage.input_tokens
-            output_token_cost = (15.0 / 1000000) * usage.output_tokens
-            cached_token_cost = (0.3 / 1000000) * cached_tokens
-            llm_cost = input_token_cost + output_token_cost + cached_token_cost
+            requested_model = self.llm_config.model_name if isinstance(self.llm_config, LLMConfig) else None
+            model, provider = LLMAPIHandlerFactory._get_cost_model_override(requested_model) or (
+                response.model,
+                "bedrock" if "anthropic." in response.model else "anthropic",
+            )
+            llm_cost = (3.0 * usage.input_tokens + 15.0 * usage.output_tokens + 0.3 * cached_tokens) / 1000000
+            llm_cost_available = True
+            try:
+                model_info = litellm.get_model_info(model=model, custom_llm_provider=provider)
+                # get_model_info defaults absent prices to zero, including capability-only entries.
+                pricing = litellm.model_cost.get(model_info.get("key"), {})
+                if pricing.get("input_cost_per_token") is not None and pricing.get("output_cost_per_token") is not None:
+                    cache_creation_tokens = usage.cache_creation_input_tokens or 0
+                    # LiteLLM's prompt total includes both cache reads and writes.
+                    prompt_tokens = usage.input_tokens + cached_tokens + cache_creation_tokens
+                    input_cost, output_cost = litellm.cost_per_token(
+                        model=model,
+                        custom_llm_provider=provider,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=usage.output_tokens,
+                        cache_read_input_tokens=cached_tokens,
+                        cache_creation_input_tokens=cache_creation_tokens,
+                    )
+                    llm_cost = (input_cost + output_cost) * _long_prompt_cost_multiplier(model, prompt_tokens)
+            except Exception as exc:
+                # LiteLLM 1.89.1 wraps its missing-model ValueError in a plain Exception.
+                if isinstance(exc.__context__, ValueError) and str(exc.__context__).startswith(
+                    "This model isn't mapped yet."
+                ):
+                    LOG.debug(
+                        "Anthropic model has no LiteLLM pricing entry", model=model, provider=provider, error=str(exc)
+                    )
+                else:
+                    LOG.warning("Failed to calculate Anthropic LLM cost", model=model, provider=provider, exc_info=True)
             return LLMCallStats(
                 llm_cost=llm_cost,
-                llm_cost_available=True,
+                llm_cost_available=llm_cost_available,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=cached_tokens,
@@ -4213,10 +4603,10 @@ class LLMCaller:
                     LOG.warning(
                         "OpenRouter response missing usage.cost; cost will be reported as 0",
                         llm_key=self.original_llm_key,
-                        response_id=getattr(response, "id", None),
+                        **_response_id_log_fields(response),
                     )
             else:
-                computed_cost = LLMAPIHandlerFactory.completion_cost_or_none(response)
+                computed_cost = LLMAPIHandlerFactory.billed_cost_or_none(response)
                 if computed_cost is not None:
                     llm_cost = computed_cost
                     llm_cost_available = True

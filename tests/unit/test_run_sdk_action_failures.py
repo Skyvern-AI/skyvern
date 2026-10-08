@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +18,9 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     SkyvernActionFailed,
 )
+from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
@@ -59,6 +66,55 @@ def mock_app() -> Any:
     app.DATABASE.observer.create_workflow_run_block = AsyncMock()
     app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context = AsyncMock()
     return app
+
+
+# An hour of margin keeps the derived age at 10 whole days however long the suite takes to reach the test.
+_CREATED_TEN_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=10, hours=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_age", "created_at", "expected"),
+    [
+        (3, _CREATED_TEN_DAYS_AGO, 3),
+        (0, _CREATED_TEN_DAYS_AGO, 0),
+        (None, _CREATED_TEN_DAYS_AGO, 10),
+        (None, None, None),
+    ],
+    ids=["preserve-parent", "preserve-same-day-parent", "derive-age", "none-timestamp"],
+)
+async def test_sdk_action_keeps_org_age_in_execution_context(
+    mock_request: Any, mock_app: Any, parent_age: int | None, created_at: datetime | None, expected: int | None
+) -> None:
+    organization = SimpleNamespace(organization_id="o_test", created_at=created_at)
+    observed: list[int | None] = []
+
+    async def capture_context(**_kwargs: object) -> dict[str, bool]:
+        context = skyvern_context.current()
+        observed.append(context.org_age if context else None)
+        return {"clicked": True}
+
+    scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock(return_value=MagicMock())))
+    page_ai = MagicMock(ai_click=AsyncMock(side_effect=capture_context))
+    mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+    skyvern_context.reset()
+    skyvern_context.set(skyvern_context.SkyvernContext(org_age=parent_age))
+    try:
+        with (
+            patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+                new_callable=AsyncMock,
+                return_value=scraped_page,
+            ),
+            patch("skyvern.forge.sdk.routes.sdk.RealSkyvernPageAi", return_value=page_ai),
+        ):
+            response = await run_sdk_action(mock_request, organization=organization)
+    finally:
+        skyvern_context.reset()
+
+    assert response.result == {"clicked": True}
+    assert observed == [expected]
 
 
 @pytest.mark.asyncio
@@ -595,6 +651,34 @@ async def test_ai_upload_file_route_rejects_legacy_file_url_escape(
     assert rejection is not None
     assert rejection.status_code == 400
     page_ai.ai_upload_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ai_upload_file_route_accepts_a_local_storage_upload_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """upload_file hands a local-storage client its file:// URI; the gate must honor it as that upload."""
+    storage = LocalStorage(artifact_path=str(tmp_path / "artifacts"))
+    upload_uri, _ = await storage.save_legacy_file(
+        organization_id="o_test", filename="file_1_resume.pdf", fileObj=io.BytesIO(b"%PDF")
+    )
+    rows = {("o_test", upload_uri): SimpleNamespace(file_id="file_1")}
+
+    async def by_uri(storage_uri: str, organization_id: str) -> SimpleNamespace | None:
+        return rows.get((organization_id, storage_uri))
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(uploaded_files=SimpleNamespace(get_uploaded_file_by_storage_uri=by_uri)),
+    )
+
+    page_ai, rejection = await _run_upload_action(mock_request, mock_organization, mock_app, upload_uri)
+
+    assert rejection is None
+    # The upload handler only accepts a file URL that appears in the task payload, which holds the URI.
+    assert page_ai.ai_upload_file.await_args.kwargs["files"] == upload_uri
 
 
 class _RejectingSlot:

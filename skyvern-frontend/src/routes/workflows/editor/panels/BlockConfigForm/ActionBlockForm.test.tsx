@@ -44,6 +44,8 @@ vi.mock("../../workflowEditorUtils", () => ({
   getAvailableOutputParameterKeys: () => [],
   isNodeInsideForLoop: () => false,
   getParentLoopSkipsOnFail: () => false,
+  isFirstBrowserTaskBlock: () => false,
+  isMissingRequiredStartUrl: () => false,
 }));
 
 // Stub heavy child components so the test stays focused on the form

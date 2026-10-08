@@ -1,10 +1,14 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.schemas.runs import RunStatus, RunType
+from skyvern.services import task_v2_service
 from skyvern.services.task_v2_service import DEFAULT_WORKFLOW_TITLE, initialize_task_v2
 
 
@@ -41,6 +45,8 @@ async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known(
         user_prompt="Open the page",
         user_url=user_url,
         create_task_run=True,
+        extra_http_headers={"X-Request": "synthetic-run-value"},
+        cdp_connect_headers={"X-Request-CDP": "synthetic-cdp-value"},
     )
 
     app.DATABASE.tasks.create_task_run.assert_awaited_once_with(
@@ -52,3 +58,57 @@ async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known(
         url_hash=generate_url_hash(user_url),
         status=RunStatus.queued,
     )
+
+    workflow_settings = app.WORKFLOW_SERVICE.create_empty_workflow.await_args.kwargs
+    assert workflow_settings["extra_http_headers"] == {"X-Request": "synthetic-run-value"}
+    assert workflow_settings["cdp_connect_headers"] == {"X-Request-CDP": "synthetic-cdp-value"}
+    run_request = app.WORKFLOW_SERVICE.setup_workflow_run.await_args.kwargs["workflow_request"]
+    assert run_request.extra_http_headers == {"X-Request": "synthetic-run-value"}
+    assert run_request.cdp_connect_headers == {"X-Request-CDP": "synthetic-cdp-value"}
+
+
+# An hour of margin keeps the derived age at 10 whole days however long the suite takes to reach the test.
+_CREATED_TEN_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=10, hours=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_age", "created_at", "expected"),
+    [
+        (3, _CREATED_TEN_DAYS_AGO, 3),
+        (0, _CREATED_TEN_DAYS_AGO, 0),
+        (None, _CREATED_TEN_DAYS_AGO, 10),
+        (None, None, None),
+    ],
+    ids=["preserve-parent", "preserve-same-day-parent", "derive-age", "none-timestamp"],
+)
+async def test_run_task_v2_keeps_org_age_in_execution_context(
+    monkeypatch: pytest.MonkeyPatch, parent_age: int | None, created_at: datetime | None, expected: int | None
+) -> None:
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+        created_at=created_at,
+    )
+    task_v2 = SimpleNamespace(model=None, workflow_id=None, workflow_run_id=None)
+    observed: list[int | None] = []
+
+    async def capture_context(**_kwargs: object) -> tuple[None, None, SimpleNamespace]:
+        context = skyvern_context.current()
+        observed.append(context.org_age if context else None)
+        return None, None, task_v2
+
+    monkeypatch.setattr(app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=task_v2))
+    monkeypatch.setattr(task_v2_service, "run_task_v2_helper", capture_context)
+    skyvern_context.reset()
+    if parent_age is not None:
+        skyvern_context.set(skyvern_context.SkyvernContext(org_age=parent_age))
+    try:
+        result = await task_v2_service.run_task_v2(organization=organization, task_v2_id="tsk_test")
+    finally:
+        skyvern_context.reset()
+
+    assert result is task_v2
+    assert observed == [expected]

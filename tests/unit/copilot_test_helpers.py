@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from functools import cache
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol, TypeVar
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlparse
 
 import pytest
+from playwright.async_api import Page, Route, async_playwright
+from playwright.sync_api import sync_playwright
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
@@ -35,17 +41,35 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, _mark_copilot_total_timeout
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
-from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint, register_sensitive_origin_run_lease
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    record_sensitive_origin_run_taint,
+    register_sensitive_origin_run_lease,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRun,
+    WorkflowRunOutputParameter,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.self_heal import HealEpisode
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
@@ -78,6 +102,48 @@ DISPATCHED_NAV_ONLY_HTML = (
 )
 
 
+def wire_credential_vault(
+    monkeypatch: pytest.MonkeyPatch,
+    secrets: PasswordCredential,
+    *,
+    credential_id: str = "cred_1",
+    name: str = "authtest simple",
+) -> Credential:
+    """Serve one saved credential from the org database and ``secrets`` from its vault."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    credential = Credential(
+        credential_id=credential_id,
+        organization_id="org-1",
+        name=name,
+        vault_type=CredentialVaultType.SKYVERN,
+        item_id="item_1",
+        credential_type=CredentialType.PASSWORD,
+        username=secrets.username,
+        card_last4=None,
+        card_brand=None,
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE,
+        "credentials",
+        SimpleNamespace(
+            get_credential=AsyncMock(return_value=credential),
+            get_credentials_by_ids=AsyncMock(return_value=[credential]),
+        ),
+        raising=False,
+    )
+    vault = SimpleNamespace(get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets)))
+    # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
+    monkeypatch.setattr(
+        object.__getattribute__(forge_app, "_inst"),
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.SKYVERN: vault},
+        raising=False,
+    )
+    return credential
+
+
 def make_stub_artifact(
     artifact_id: str,
     file_name: str,
@@ -99,7 +165,7 @@ def make_stub_html_artifact(
     created_at: datetime | None = None,
 ) -> SimpleNamespace:
     artifact = make_stub_artifact(artifact_id, f"{artifact_id}.html", file_size, artifact_type=artifact_type)
-    artifact.created_at = created_at or datetime(2026, 7, 9, tzinfo=timezone.utc)
+    artifact.created_at = created_at or datetime(2026, 7, 9, tzinfo=UTC)
     return artifact
 
 
@@ -145,12 +211,49 @@ _CHAT_SESSION_ID = "pbs_chat"
 _CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
 
 
-def _fake_workflow_run(status: str) -> SimpleNamespace:
-    return SimpleNamespace(
+def _fake_workflow_run(status: str, failure_category: list[dict[str, Any]] | None = None) -> WorkflowRun:
+    return WorkflowRun(
+        workflow_run_id="wr_paused",
+        workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
         status=WorkflowRunStatus(status),
-        modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
+        created_at=datetime(2026, 4, 21, 11, 0, 0),
+        modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC),
+        trigger_type=None,
         browser_session_id=None,
         failure_reason=None,
+        failure_category=failure_category,
+    )
+
+
+HARNESS_RUN_CREATED_AT = datetime(2026, 4, 21, 12, 0, 0)
+
+
+def harness_run(
+    workflow_run_id: str,
+    *,
+    created_at: datetime = HARNESS_RUN_CREATED_AT,
+    status: str = "completed",
+    trigger_type: WorkflowRunTriggerType | None = None,
+    copilot_session_id: str | None = None,
+    workflow_permanent_id: str = "wpid-1",
+    organization_id: str = "org-1",
+    workflow_definition_sha256: str | None = None,
+) -> SimpleNamespace:
+    """Naive-UTC created_at, as the database returns it."""
+    return SimpleNamespace(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id="wf-1",
+        status=status,
+        created_at=created_at,
+        trigger_type=trigger_type,
+        copilot_session_id=copilot_session_id,
+        failure_reason=None,
+        browser_session_id="pbs-1",
+        workflow_definition_sha256=workflow_definition_sha256,
     )
 
 
@@ -164,21 +267,62 @@ def install_get_run_results_harness(
     attach_action_traces: Callable[..., Awaitable[None]] | None = None,
     recent_actions: list[MagicMock] | None = None,
     attach_failed_block_screenshots: Callable[..., Awaitable[None]] | None = None,
+    other_runs: list[SimpleNamespace] | None = None,
+    carried_successful_run_id: str | None = None,
+    carried_run_id: str | None = None,
+    heal_episodes: list[HealEpisode] | None = None,
+    run_definition_sha256: str | None = None,
 ) -> SimpleNamespace:
-    """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with."""
-    run = SimpleNamespace(
-        status=run_status,
-        workflow_permanent_id="wpid-1",
+    """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
+    ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
+    pool = [
+        harness_run("wr-1", status=run_status, workflow_definition_sha256=run_definition_sha256),
+        *(other_runs or []),
+    ]
+    workflow = SimpleNamespace(
         workflow_id="wf-1",
-        failure_reason=None,
-        browser_session_id="pbs-1",
+        workflow_permanent_id="wpid-1",
+        version=1,
+        created_by=None,
+        modified_at=HARNESS_RUN_CREATED_AT,
+        workflow_definition=SimpleNamespace(
+            parameters=[SimpleNamespace(**parameter) for parameter in workflow_parameters or []], blocks=[]
+        ),
     )
-    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=workflow_parameters or []))
+
+    async def get_workflow_run(workflow_run_id: str, organization_id: str | None = None) -> SimpleNamespace | None:
+        return next(
+            (r for r in pool if r.workflow_run_id == workflow_run_id and r.organization_id == organization_id),
+            None,
+        )
+
+    async def list_runs(
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
+        created_at_start: datetime | None = None,
+    ) -> list[SimpleNamespace]:
+        matching = [
+            r
+            for r in pool
+            if r.workflow_permanent_id == workflow_permanent_id
+            and r.organization_id == organization_id
+            and r.copilot_session_id is None
+            and (not status or r.status in status)
+            and (created_at_start is None or r.created_at >= created_at_start)
+        ]
+        matching.sort(key=lambda r: r.created_at, reverse=True)
+        return matching[(page - 1) * page_size : page * page_size]
 
     class _AppStub:
         class DATABASE:
-            class workflow_runs:
-                get_workflow_run = AsyncMock(return_value=run)
+            workflow_runs = SimpleNamespace(
+                get_workflow_run=get_workflow_run,
+                get_workflow_runs_for_workflow_permanent_id=list_runs,
+            )
 
             class workflows:
                 get_workflow = AsyncMock(return_value=None)
@@ -190,8 +334,13 @@ def install_get_run_results_harness(
             class tasks:
                 get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
 
+            class self_heal:
+                get_heal_episodes_for_run = AsyncMock(return_value=list(heal_episodes or []))
+
         class AGENT_FUNCTION:
             should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=dispatch_to_worker)
+
+        WORKFLOW_SERVICE = SimpleNamespace(get_workflow_runs_for_workflow_permanent_id=list_runs)
 
     monkeypatch.setattr(run_execution_module, "app", _AppStub())
     if attach_action_traces is not None:
@@ -209,10 +358,91 @@ def install_get_run_results_harness(
         organization_id="org-1",
         workflow_permanent_id="wpid-1",
         copilot_total_timeout_exceeded=False,
-        last_run_blocks_workflow_run_id=None,
+        last_successful_run_blocks_workflow_run_id=carried_successful_run_id,
+        last_run_blocks_workflow_run_id=carried_run_id,
         proposal_workflow_run_id=None,
         dispatched_run_ids_this_turn=set(),
+        seeded_only_labels_by_run_id={},
+        workflow_yaml=None,
+        staged_workflow_yaml=None,
     )
+
+
+def historical_code_version(
+    blocks: Mapping[str, str],
+    *,
+    parameter_keys: Sequence[str] = ("applicant_name",),
+    default_value: str = "Fixture default",
+    workflow_id: str = "wf-1",
+    modified_at: datetime = HARNESS_RUN_CREATED_AT,
+) -> SimpleNamespace:
+    """A saved version of ``wpid-1`` holding one CodeBlock per ``blocks`` label, as a finished harness run read it."""
+    return SimpleNamespace(
+        workflow_id=workflow_id,
+        workflow_permanent_id="wpid-1",
+        version=3,
+        created_by=None,
+        modified_at=modified_at,
+        workflow_definition=WorkflowDefinition(
+            parameters=[
+                WorkflowParameter(
+                    workflow_parameter_id=f"wp_{key}",
+                    workflow_parameter_type=WorkflowParameterType.STRING,
+                    key=key,
+                    default_value=default_value,
+                    workflow_id=workflow_id,
+                    created_at=HARNESS_RUN_CREATED_AT,
+                    modified_at=HARNESS_RUN_CREATED_AT,
+                )
+                for key in parameter_keys
+            ],
+            blocks=[
+                CodeBlock(
+                    label=label,
+                    code=code,
+                    output_parameter=OutputParameter(
+                        output_parameter_id=f"op_{label}",
+                        key=f"{label}_output",
+                        workflow_id=workflow_id,
+                        created_at=HARNESS_RUN_CREATED_AT,
+                        modified_at=HARNESS_RUN_CREATED_AT,
+                    ),
+                )
+                for label, code in blocks.items()
+            ],
+        ),
+    )
+
+
+def install_historical_run(
+    monkeypatch: pytest.MonkeyPatch,
+    version: SimpleNamespace | None,
+    *,
+    failed_label: str,
+    failing_line: int = 1,
+    run_definition_sha256: str | None = None,
+) -> None:
+    """Harness run ``wr-1`` failed at ``failing_line`` of ``failed_label`` while executing ``version``."""
+
+    async def stamp_failing_line(
+        _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+    ) -> None:
+        results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": failing_line}]
+
+    block = run_result_block_row(
+        failed_label, "failed", failure_reason="NameError: a name is not defined", error_codes=["user_code_error"]
+    )
+    block.created_at = HARNESS_RUN_CREATED_AT
+    block.parent_workflow_run_block_id = None
+    block.current_index = None
+    block.current_value = None
+    install_get_run_results_harness(
+        monkeypatch,
+        blocks=[block],
+        attach_action_traces=stamp_failing_line,
+        run_definition_sha256=run_definition_sha256,
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run.return_value = version
 
 
 def run_result_action_row(
@@ -266,6 +496,7 @@ async def install_run_blocks_harness(
     recent_actions: list[MagicMock] | None = None,
     run_proxy_location: ProxyLocationInput = None,
     run_session_proxy_location: ProxyLocationInput = None,
+    polled_failure_category: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
@@ -277,7 +508,7 @@ async def install_run_blocks_harness(
         organization_id="org-1",
         workflow_yaml=workflow_yaml,
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     organization = Organization(
         organization_id="org-1",
         organization_name="Test Org",
@@ -296,6 +527,8 @@ async def install_run_blocks_harness(
     database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
     database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
+    database.workflow_runs.get_workflow_run_output_parameters = AsyncMock(return_value=[])
+    database.workflow_runs.get_workflow_runs_for_workflow_permanent_id = AsyncMock(return_value=[])
     monkeypatch.setattr(forge_app, "DATABASE", database)
 
     async def _execute_workflow(**_kwargs: Any) -> None:
@@ -321,25 +554,38 @@ async def install_run_blocks_harness(
         MagicMock(return_value=False),
     )
 
-    workflow_run = SimpleNamespace(
+    workflow_run = WorkflowRun(
         workflow_run_id="wr_paused",
         workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        status=WorkflowRunStatus.running,
+        created_at=now,
+        modified_at=now,
         sequential_credential_id=None,
         proxy_location=run_proxy_location,
         runnable_id=None,
     )
     monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=workflow_run))
 
-    async def _get_session(session_id: str, _organization_id: str | None = None) -> SimpleNamespace:
+    async def _get_session(session_id: str, _organization_id: str | None = None) -> PersistentBrowserSession:
         proxy_location = run_session_proxy_location if session_id == _RUN_SESSION_ID else _CHAT_SESSION_PROXY_LOCATION
-        return SimpleNamespace(proxy_location=proxy_location, runnable_id=None)
+        return PersistentBrowserSession(
+            persistent_browser_session_id=session_id,
+            organization_id="org-1",
+            created_at=now,
+            modified_at=now,
+            proxy_location=proxy_location,
+            browser_profile_id=None,
+            browser_profile_loaded=True,
+        )
 
     monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", _get_session)
 
-    polled_run = _fake_workflow_run(status=polled_status)
+    polled_run = _fake_workflow_run(status=polled_status, failure_category=polled_failure_category)
 
-    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any, Any]:
-        return polled_run, now, now
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any]:
+        return polled_run, now
 
     monkeypatch.setattr(run_execution_module, "_read_progress_sources", _read_progress)
     monkeypatch.setattr(run_execution_module, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
@@ -495,6 +741,371 @@ async def handback_ctx(
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
     return ctx
+
+
+class FakeTab:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+class BrowserTab(Protocol):
+    @property
+    def url(self) -> str: ...
+
+    @property
+    def frames(self) -> Sequence[Any]: ...
+
+    async def title(self) -> str: ...
+
+    def is_closed(self) -> bool: ...
+
+
+FakeBrowserTab = FakeTab | BrowserTab
+
+
+class FakeTabbedBrowserState:
+    """A browser whose tab list and selected tab the test moves between calls: navigate by assigning a
+    tab's ``url``, close one with ``close``, select one by assigning ``active``. A URL becomes a ``FakeTab``;
+    a page (a real one, or a stand-in) is used as it is."""
+
+    def __init__(self, *tabs: str | BrowserTab, active: int = 0) -> None:
+        self.tabs: list[FakeBrowserTab] = [FakeTab(tab) if isinstance(tab, str) else tab for tab in tabs]
+        self.active: FakeBrowserTab | None = self.tabs[active] if self.tabs else None
+        self.browser_context = SimpleNamespace(pages=self.tabs)
+
+    def close(self, tab: FakeBrowserTab) -> None:
+        assert isinstance(tab, FakeTab), "only a tab opened from a URL can be closed here"
+        tab.closed = True
+        if self.active is tab:
+            self.active = next((open_tab for open_tab in self.tabs if not open_tab.is_closed()), None)
+
+    async def get_working_page(self, *, prune_excess_pages: bool = True) -> FakeBrowserTab | None:
+        return self.active
+
+    async def get_or_create_page(self) -> FakeBrowserTab | None:
+        return self.active
+
+    async def list_valid_pages(self, max_pages: int = 0) -> list[FakeBrowserTab]:
+        return [tab for tab in self.tabs if not tab.is_closed()]
+
+
+def patch_browser_tabs(
+    monkeypatch: pytest.MonkeyPatch, states: FakeTabbedBrowserState | dict[str, FakeTabbedBrowserState] | None
+) -> list[str | None]:
+    """Resolve browser sessions to the given tabbed state (one for every session, or one per session id);
+    None resolves to no browser at all, which the taint guard treats as unreadable. Returns the session ids
+    resolved, in order."""
+    resolved: list[str | None] = []
+
+    async def resolve(_ctx: AgentContext, *, session_id: str | None = None) -> FakeTabbedBrowserState | None:
+        resolved.append(session_id)
+        if isinstance(states, dict):
+            return states.get(session_id or "")
+        return states
+
+    monkeypatch.setattr(copilot_runtime, "resolve_browser_state_for_context", resolve)
+    monkeypatch.setattr(scouting_module, "resolve_browser_state_for_context", resolve)
+    return resolved
+
+
+T = TypeVar("T")
+
+CHALLENGE_URL = (
+    "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2/av0/fake?sitekey=0xTESTKEY"
+)
+AUTO_RENDER_TURNSTILE_HTML = f"""<!DOCTYPE html>
+<html><body>
+  <form><input id="email" type="email" /><button type="submit">Submit</button></form>
+  <div class="cf-turnstile" data-sitekey="0xTESTKEY">
+    <iframe src="{CHALLENGE_URL}" style="width:300px;height:65px"></iframe>
+  </div>
+</body></html>
+"""
+CATALOG_PAGE_HTML = "<!DOCTYPE html><html><head><title>Catalog</title></head><body><p>ZX-4471</p></body></html>"
+HIDDEN_TURNSTILE_HELPER_HTML = f"""<!DOCTYPE html>
+<html><head><title>Catalog</title></head><body>
+  <p>ZX-4471</p>
+  <iframe src="{CHALLENGE_URL}" style="width:300px;height:65px;visibility:hidden"></iframe>
+</body></html>
+"""
+_RECAPTCHA_URL = "https://www.google.com/recaptcha/api2"
+INVISIBLE_RECAPTCHA_BADGE_HTML = f"""<!DOCTYPE html>
+<html><head><title>Catalog</title></head><body>
+  <p>ZX-4471</p>
+  <div class="grecaptcha-badge" style="width:256px;height:60px;position:fixed;right:0;bottom:14px">
+    <iframe title="reCAPTCHA" src="{_RECAPTCHA_URL}/anchor?ar=1&k=6LeTEST&size=invisible" width="256" height="60"></iframe>
+  </div>
+</body></html>
+"""
+OPENED_INVISIBLE_RECAPTCHA_HTML = INVISIBLE_RECAPTCHA_BADGE_HTML.replace(
+    "</body>",
+    f'<iframe title="recaptcha challenge" src="{_RECAPTCHA_URL}/bframe?k=6LeTEST" width="400" height="580"></iframe></body>',
+)
+FIXTURE_SITE_ORIGIN = "https://captcha-fixture.test"
+
+
+def page_with_unprobeable_vendor_embedder() -> SimpleNamespace:
+    """A rendered-size vendor frame inside an embedding frame whose own element cannot be read."""
+    top = SimpleNamespace(parent_frame=None, url="https://orders.example.test/")
+    embedder = SimpleNamespace(
+        parent_frame=top,
+        url="https://embedder.example.test/",
+        frame_element=AsyncMock(side_effect=RuntimeError("frame detached")),
+    )
+    vendor = SimpleNamespace(
+        parent_frame=embedder,
+        url=CHALLENGE_URL,
+        frame_element=AsyncMock(return_value=SimpleNamespace(evaluate=AsyncMock(return_value=19500.0))),
+    )
+    return SimpleNamespace(
+        url="https://orders.example.test/",
+        title=AsyncMock(return_value="Orders"),
+        frames=[top, embedder, vendor],
+        is_closed=lambda: False,
+    )
+
+
+@cache
+def _has_playwright_browser() -> bool:
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+def skip_no_browser(test: T) -> T:
+    return pytest.mark.skipif(
+        not _has_playwright_browser(),
+        reason="Requires Playwright browsers installed (run: playwright install chromium)",
+    )(test)
+
+
+async def _fulfill_challenge(route: Route) -> None:
+    await route.fulfill(status=200, content_type="text/html", body="<html><body>Verify you are human</body></html>")
+
+
+def _serve_fixture_site(pages: Mapping[str, str]) -> Callable[[Route], Awaitable[None]]:
+    async def serve(route: Route) -> None:
+        path = urlparse(route.request.url).path
+        body = pages.get(path)
+        if body is None:
+            await route.fulfill(status=404, body="")
+            return
+        content_type = "application/javascript" if path.endswith(".js") else "text/html"
+        await route.fulfill(status=200, content_type=content_type, body=body)
+
+    return serve
+
+
+@asynccontextmanager
+async def challenge_browser_page(
+    html: str | None = None,
+    *,
+    site: Mapping[str, str] | None = None,
+    path: str = "/",
+    expect_challenge_frame: bool = True,
+) -> AsyncIterator[Page]:
+    """Load ``html`` directly, or ``path`` on a routed fixture origin that serves ``site`` by path, so a fixture
+    spanning several documents (form, widget frames, results page) lives in the test rather than on disk."""
+    async with async_playwright() as playwright:
+        # Production runs headful chromium, where a cross-origin widget frame is an out-of-process iframe;
+        # without site isolation a headless probe would never exercise that path.
+        browser = await playwright.chromium.launch(headless=True, args=["--site-per-process"])
+        try:
+            context = await browser.new_context()
+            await context.route("https://challenges.cloudflare.com/**", _fulfill_challenge)
+            await context.route(f"{_RECAPTCHA_URL}/**", _fulfill_challenge)
+            if site is not None:
+                await context.route(f"{FIXTURE_SITE_ORIGIN}/**", _serve_fixture_site(site))
+            page = await context.new_page()
+            if site is not None:
+                await page.goto(f"{FIXTURE_SITE_ORIGIN}{path}", wait_until="load")
+            else:
+                assert html is not None
+                await page.set_content(html, wait_until="load")
+            if expect_challenge_frame:
+                assert any(urlparse(frame.url).hostname == "challenges.cloudflare.com" for frame in page.frames), (
+                    "challenge frame did not commit"
+                )
+            yield page
+        finally:
+            await browser.close()
+
+
+def redact_parameter_values(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, parameters: dict[str, str]) -> None:
+    """Give ``ctx`` code-block parameters and a redactor that replaces each of their values with ``[redacted]``."""
+    ctx.codeblock_redaction_parameters = parameters
+
+    def redact(value: Any, active: dict[str, Any], **_budget: object) -> Any:
+        if isinstance(value, str):
+            for secret in active.values():
+                value = value.replace(secret, "[redacted]")
+            return value
+        if isinstance(value, dict):
+            return {key: redact(item, active) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item, active) for item in value]
+        return value
+
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact)
+
+
+def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | None) -> None:
+    patch_browser_tabs(
+        monkeypatch,
+        None if open_tabs is None else FakeTabbedBrowserState(*(["https://tab.example.test/"] * open_tabs)),
+    )
+
+
+def origin_run_input(
+    key: str,
+    value: bool | float | str | dict | list,
+    ptype: WorkflowParameterType = WorkflowParameterType.FILE_URL,
+    *,
+    default_value: str | None = None,
+) -> tuple[WorkflowParameter, WorkflowRunParameter]:
+    now = datetime.now(UTC)
+    parameter = WorkflowParameter(
+        workflow_parameter_id=f"wp_origin_{key}",
+        workflow_parameter_type=ptype,
+        key=key,
+        description=None,
+        workflow_id="wf_origin",
+        default_value=default_value,
+        created_at=now,
+        modified_at=now,
+    )
+    return parameter, WorkflowRunParameter(
+        workflow_run_id="wr_origin",
+        workflow_parameter_id=parameter.workflow_parameter_id,
+        value=value,
+        created_at=now,
+    )
+
+
+INERT_APPROVAL_WORKFLOW_YAML = """
+title: inert approval
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: request_id
+  blocks:
+    - block_type: extraction
+      label: approval
+      url: https://example.test/approval
+      data_extraction_goal: "Extract whether request {{ request_id }} is authorized."
+      parameter_keys:
+        - request_id
+    - block_type: extraction
+      label: source_status
+      data_extraction_goal: "Report the source status for authorization {{ approval.output.authorized }}."
+"""
+
+REPAIRED_APPROVAL_WORKFLOW_YAML = INERT_APPROVAL_WORKFLOW_YAML.replace(
+    "Report the source status for authorization {{ approval.output.authorized }}.",
+    "Report the repaired source status for authorization {{ approval.output.authorized }} "
+    "and {{ approval_output.extracted_information.authorized }}.",
+)
+
+ORIGIN_RUN_ID = "wr_origin"
+
+
+async def inert_approval_workflow(workflow_yaml: str, *, workflow_id: str) -> Workflow:
+    """A converted version mints its own parameter ids, as each persisted version does."""
+    return await process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_id=workflow_id,
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=workflow_yaml,
+    )
+
+
+ORIGIN_OUTPUT_SENTINEL = "origin-output-sentinel-7f3a"
+
+
+def origin_block_rows(
+    workflow: Workflow,
+    label: str,
+    *,
+    status: str = "completed",
+    registered: bool = True,
+    value: dict | list | str | None = None,
+    row_output: dict | list | str | None = None,
+    minute: int = 0,
+    parent: str | None = None,
+) -> tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]:
+    now = datetime(2026, 9, 1, 12, minute, tzinfo=UTC)
+    run_block = WorkflowRunBlock(
+        workflow_run_block_id=f"wrb_origin_{label}_{minute}",
+        workflow_run_id=ORIGIN_RUN_ID,
+        organization_id="org-1",
+        parent_workflow_run_block_id=parent,
+        block_type="extraction",
+        label=label,
+        status=status,
+        output=row_output,
+        created_at=now,
+        modified_at=now,
+    )
+    output_parameter = workflow.get_output_parameter(label)
+    if not registered or output_parameter is None:
+        return [run_block], []
+    return [run_block], [
+        WorkflowRunOutputParameter(
+            workflow_run_id=ORIGIN_RUN_ID,
+            output_parameter_id=output_parameter.output_parameter_id,
+            value=value,
+            created_at=now,
+        )
+    ]
+
+
+def merge_origin_rows(
+    *rows: tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]],
+) -> tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]:
+    return [block for blocks, _ in rows for block in blocks], [row for _, registered in rows for row in registered]
+
+
+ORIGIN_RUN_CREATED_AT = datetime.now(UTC) + timedelta(days=1)
+
+
+def origin_run_row(**overrides: object) -> WorkflowRun:
+    fields: dict[str, object] = {
+        "workflow_run_id": ORIGIN_RUN_ID,
+        "workflow_id": "w_origin",
+        "organization_id": "org-1",
+        "workflow_permanent_id": "wfp-1",
+        "browser_session_id": "pbs_origin",
+        "status": WorkflowRunStatus.completed,
+        # Later than any workflow version a test builds, as a real run starts after its version was saved.
+        "created_at": ORIGIN_RUN_CREATED_AT,
+        "modified_at": ORIGIN_RUN_CREATED_AT,
+    }
+    return WorkflowRun.model_validate({**fields, **overrides})
+
+
+def install_origin_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    origin_workflow: Workflow,
+    rows: tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]],
+    **run_overrides: object,
+) -> None:
+    run = origin_run_row(**{"workflow_id": origin_workflow.workflow_id, **run_overrides})
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(forge_app.DATABASE.workflow_runs, "get_workflow_run_parameters", AsyncMock(return_value=[]))
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=origin_workflow))
+    monkeypatch.setattr(forge_app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=rows[0]))
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs, "get_workflow_run_output_parameters", AsyncMock(return_value=rows[1])
+    )
 
 
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
@@ -683,6 +1294,7 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
+    monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
 
 
 SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS = [
@@ -753,7 +1365,7 @@ async def run_turn_to_exit(
     """Drive one real ``run_copilot_agent`` turn to ``exit_path`` against ``manager``, attaching
     through the real resolve funnel so the finalizer releases only what that funnel recorded."""
     manager.get_browser_state = get_browser_state or AsyncMock(return_value=browser_state)
-    if turn_origin == TurnOrigin.runtime_self_heal and browser_state is not None:
+    if turn_origin == TurnOrigin.code_block_ai_fallback and browser_state is not None:
         browser_state.get_working_page = AsyncMock(return_value=MagicMock())
 
     async def _exit(ctx: CopilotContext) -> None:
@@ -953,3 +1565,33 @@ async def run_turn_cancelled_during_cleanup(
     await asyncio.wait_for(evicting.wait(), 5)
     turn.cancel()
     return await turn
+
+
+def install_org_secondary_llm_override(monkeypatch: pytest.MonkeyPatch, handler: object) -> None:
+    """Make ``get_org_aware_secondary_llm_api_handler`` resolve an org's routed secondary model."""
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(organization_id="o_test", org_default_secondary_llm_key="CUSTOM_LLM_oat_fast"),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: True)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", lambda _key: True)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", lambda _key: handler)
+
+
+class FakeCopilotStream:
+    """EventSourceStream stand-in recording what was sent and whether the send was accepted."""
+
+    def __init__(self, send_ok: bool = True) -> None:
+        self.send_ok = send_ok
+        self.sent: list[Any] = []
+
+    async def send(self, payload: Any) -> bool:
+        self.sent.append(payload)
+        return self.send_ok
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+    def titles(self) -> list[str]:
+        return [event.title for event in self.sent if isinstance(event, WorkflowCopilotTitleUpdate)]

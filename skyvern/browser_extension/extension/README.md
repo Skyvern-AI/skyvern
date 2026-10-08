@@ -18,26 +18,44 @@ To set it up manually:
 
 2. Open `chrome://extensions`, enable **Developer mode**, and click **Load unpacked**.
 3. Select the directory printed by the command.
-4. Open the extension's **Details** page and enable **Allow User Scripts**.
-5. Start the local MCP server in extension mode:
+4. Start the local MCP server in extension mode:
 
    ```bash
    skyvern run mcp --browser-extension
    ```
 
-6. Start explicit pairing:
+5. Start explicit pairing:
 
    ```bash
    skyvern browser extension-pair
    ```
 
-7. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
+6. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
    (the single approval step).
 
 The local pairing page checks that the extension is available before it claims the single-use offer. If pairing starts
 before the extension is loaded, keep the page open. It retains the offer and continues automatically after the
 extension becomes available.
-8. Add controllable tabs to the **Skyvern Controlled** group.
+
+7. Add controllable tabs to the **Skyvern Controlled** group.
+
+Skyvern moves popups from controlled tabs into tabs in the opener's **Skyvern Controlled** group.
+The new tab becomes active only if the opener was active.
+If Chrome rejects the move, Skyvern keeps control of the separate popup.
+
+Every controlled HTTP(S) tab shows a glowing frame and the label "Skyvern is controlling this tab" while the agent is connected.
+To stop control of a tab, select **Remove from Skyvern Controlled** in the extension popup.
+You can also drag the tab out of the group.
+Tabs open before an extension update show the frame after their next reload or navigation.
+A fullscreen video or element covers the frame.
+
+Direct JavaScript evaluation is unavailable in extension mode. The `dom.evaluate` operation returns `OP_NOT_ALLOWED`:
+
+> Direct JavaScript evaluation is unavailable in extension mode. Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. Use skyvern_click or skyvern_type to interact.
+
+This restriction also applies to `skyvern_evaluate` and tools that call it.
+Use the inspection and interaction tools. Do not reroute the expression through CDP or another injection API.
+Fixed value fills with `skyvern_type(input_method="value")` remain available. A debugger disconnect is a separate connection problem.
 
 On POSIX, extension mode uses the persistent broker by default. The first broker start automatically validates or
 initializes its journal and copies an existing legacy credential into the owner-only broker run directory, or creates
@@ -54,9 +72,10 @@ short reconnect window before session creation opens the one-click pairing page 
 `skyvern browser extension-broker-status` to inspect sanitized state and `skyvern browser extension-broker-stop` to
 drain the daemon and release the configured port.
 
-The extension records broker-created root tabs and popups in Chrome session storage until those tabs close. This lets
-the broker close one of its tabs after an external debugger detach removes it from extension scope. The extension still
-rejects `tabs.remove` for every unscoped tab that it did not create.
+The extension records broker-created root tabs and popups in Chrome session storage while it owns them. When a tab
+leaves scope, including after an external debugger detach, the extension gives up that ownership and leaves the tab
+open. Later reset cleanup cannot close a handed-back tab. Controlling it again requires the operator to share it again.
+Explicit removal of an actively scoped tab and cleanup of incomplete tab creation still close those tabs.
 
 To opt into the legacy embedded relay on POSIX, set exactly:
 
@@ -74,7 +93,7 @@ The extension connects outbound to `ws://127.0.0.1:19777/extension/v1` by defaul
 In broker mode, `extension.secret` is daemon-owned and `skyvern browser extension-token` intentionally refuses to copy
 it. Use the explicit pairing command instead. The popup token-paste flow remains available only with the legacy opt-out.
 
-Debugger-backed tools display Chrome's debugger infobar; direct `skyvern_evaluate` calls do not. Clicking **Cancel** in
+Debugger-backed tools display Chrome's debugger infobar. Clicking **Cancel** in
 the infobar revokes debugger access. Removing a tab with the popup or dragging it out of **Skyvern Controlled** revokes
 all extension access to that tab.
 

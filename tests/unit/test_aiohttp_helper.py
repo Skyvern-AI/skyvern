@@ -3,12 +3,19 @@ import socket
 import tempfile
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 
 import aiohttp
 import pytest
 
 from skyvern.exceptions import BlockedHost, HttpException
-from skyvern.forge.sdk.core.aiohttp_helper import SSRFGuardedResolver, aiohttp_delete, aiohttp_request
+from skyvern.forge.sdk.core.aiohttp_helper import (
+    SSRFGuardedResolver,
+    aiohttp_delete,
+    aiohttp_get_json,
+    aiohttp_post,
+    aiohttp_request,
+)
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, validate_fetch_url
 
 
@@ -42,6 +49,29 @@ async def test_aiohttp_delete_propagates_http_exception_after_retries() -> None:
     assert exc_info.value.status_code == 404
     assert exc_info.value.url == url
     assert mock_session.delete.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("helper", "method"), [(aiohttp_get_json, "get"), (aiohttp_post, "post")])
+async def test_exhausted_retries_keep_the_last_http_status_as_the_cause(helper: Any, method: str) -> None:
+    mock_response = AsyncMock()
+    mock_response.status = 404
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    setattr(mock_session, method, MagicMock(return_value=mock_response))
+
+    with (
+        patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session),
+        pytest.raises(Exception) as exc_info,
+    ):
+        await helper("https://example.com/object/item/item_test", retry=1)
+
+    assert isinstance(exc_info.value.__cause__, HttpException)
+    assert exc_info.value.__cause__.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -722,6 +752,37 @@ async def test_aiohttp_request_follows_safe_redirect() -> None:
     assert status == 200
     assert body == {"success": True}
     assert requested_urls == ["https://example.com/start", "https://example.com/final"]
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_refuses_a_redirect_the_caller_does_not_authorize() -> None:
+    redirect_response = AsyncMock()
+    redirect_response.status = 307
+    redirect_response.headers = {"Location": "https://collector.example.net/ingest"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+    requested_urls: list[str] = []
+
+    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
+        requested_urls.append(kwargs["url"])
+        return redirect_response
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(side_effect=capture_request)
+
+    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
+        with pytest.raises(HttpException, match="Redirect blocked"):
+            await aiohttp_request(
+                method="POST",
+                url="https://example.com/start",
+                headers={"X-Api-Key": "hunter2-secret"},
+                follow_redirects=True,
+                authorize_redirect=lambda next_url: urlparse(next_url).hostname == "example.com",
+            )
+
+    assert requested_urls == ["https://example.com/start"]
 
 
 @pytest.mark.asyncio

@@ -2,12 +2,7 @@ import { Navigate, useLocation, useParams } from "react-router-dom";
 
 import { LegacyBuildRedirect } from "./LegacyBuildRedirect";
 import { WorkflowEditor } from "./editor/WorkflowEditor";
-import {
-  parsePanesParam,
-  RUN_APPEND_PANES,
-  STUDIO_PANES_PARAM,
-  toReadableSearch,
-} from "./studio/panes";
+import { toReadableSearch } from "./studio/panes";
 
 export function BuildRoute() {
   return <LegacyBuildRedirect />;
@@ -65,22 +60,6 @@ export function WorkflowRunRoute() {
       : studioView;
   if (routedStudioView) {
     searchParams.set("view", routedStudioView);
-    const embedded = searchParams.get("embed") === "true";
-    const requiredPane =
-      routedStudioView === "recording" ? "browser" : "overview";
-    const panes = embedded
-      ? [requiredPane]
-      : (parsePanesParam(searchParams.get(STUDIO_PANES_PARAM)) ?? [
-          ...RUN_APPEND_PANES,
-        ]);
-    searchParams.set(
-      STUDIO_PANES_PARAM,
-      embedded
-        ? requiredPane
-        : [requiredPane, ...panes.filter((pane) => pane !== requiredPane)].join(
-            ",",
-          ),
-    );
   }
 
   return (

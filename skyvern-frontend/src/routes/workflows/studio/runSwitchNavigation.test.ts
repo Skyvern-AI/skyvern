@@ -4,9 +4,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  searchWithRunCleared,
+  searchWithoutRun,
   searchWithRunSwitched,
-  useReleaseStudioRun,
   useSwitchStudioRun,
 } from "./runSwitchNavigation";
 
@@ -44,13 +43,11 @@ beforeEach(() => {
   navigate.mockClear();
 });
 
-describe("searchWithRunCleared", () => {
-  it("drops the run scope and keeps the layout", () => {
+describe("searchWithoutRun", () => {
+  it("drops the inspected run and its selection but keeps the pane layout", () => {
     expect(
-      searchWithRunCleared(
-        "?panes=copilot,browser&wr=wr_1&wrs=copilot&active=s_1&bl=bl_1",
-      ),
-    ).toBe("?panes=copilot,browser");
+      searchWithoutRun("?panes=browser&wr=wr_1&wrs=copilot&active=b1&bl=x"),
+    ).toBe("?panes=browser");
   });
 });
 
@@ -60,9 +57,7 @@ describe("searchWithRunSwitched system focus", () => {
       systemFocus: true,
     });
     expect(focused).toBe("?panes=browser&wr=wr_1&wrs=copilot");
-    expect(searchWithRunSwitched(focused, "wr_2")).toBe(
-      "?panes=browser&wr=wr_2",
-    );
+    expect(searchWithRunSwitched(focused, "wr_2")).toBe("?wr=wr_2");
   });
 
   it("keeps the marker when the copilot hands off between its own runs", () => {
@@ -92,7 +87,7 @@ describe("useSwitchStudioRun", () => {
     });
     result.current("wr_1");
     expect(navigate).toHaveBeenCalledWith(
-      { search: "?panes=copilot,browser&wr=wr_1" },
+      { search: "?wr=wr_1" },
       { replace: false },
     );
   });
@@ -119,39 +114,5 @@ describe("useSwitchStudioRun", () => {
       { search: "?panes=copilot,browser&wr=wr_1&wrs=copilot" },
       { replace: true },
     );
-  });
-});
-
-describe("useReleaseStudioRun", () => {
-  it("clears the run scope when the URL still names the released run", () => {
-    const { result } = renderHook(() => useReleaseStudioRun(), {
-      wrapper: wrapperFor("/studio?panes=copilot,browser&wr=wr_1&active=s_1"),
-    });
-    result.current("wr_1");
-    expect(navigate).toHaveBeenCalledWith(
-      { search: "?panes=copilot,browser" },
-      { replace: true },
-    );
-  });
-
-  it("leaves a run the user switched to mid-turn alone", () => {
-    const { result } = renderHook(() => useReleaseStudioRun(), {
-      wrapper: wrapperFor("/studio?panes=copilot,browser&wr=wr_user_picked"),
-    });
-    result.current("wr_1");
-    expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("still releases a run the copilot focused over one the user opened", () => {
-    // That focus is deliberately unmarked so the layout keeps its run class,
-    // but the copilot must still clean up after itself at turn end.
-    const focused = searchWithRunSwitched("?wr=wr_user", "wr_test", {
-      systemFocus: true,
-    });
-    const { result } = renderHook(() => useReleaseStudioRun(), {
-      wrapper: wrapperFor(`/studio${focused}`),
-    });
-    result.current("wr_test");
-    expect(navigate).toHaveBeenCalledWith({ search: "" }, { replace: true });
   });
 });

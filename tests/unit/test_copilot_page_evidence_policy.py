@@ -35,7 +35,6 @@ def test_agent_prompt_keeps_page_evidence_in_the_build_and_repair_loop() -> None
     assert "inspect the resulting page and run evidence before deciding what to change" in rendered
     assert "preserve known-good blocks" in rendered
     assert "retry unchanged only when fresh evidence shows the action did not land" in rendered
-    assert "A page challenge (CAPTCHA, anti-bot wall) is an observation, not a verdict" in rendered
     assert "PAGE EVIDENCE POLICY" not in rendered
     assert "GOTO_URL STATE SHORTCUT POLICY" not in rendered
     assert "Before extraction on stateful search/result tasks" not in rendered

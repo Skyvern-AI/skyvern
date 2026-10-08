@@ -102,6 +102,47 @@ def _click_streaming_event(
 
 
 @pytest.mark.asyncio
+async def test_dialog_and_drag_drop_flow_through_live_interpretation() -> None:
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+    )
+    dragstart = _click_streaming_event(timestamp=1000.0, capture_seq=0, target_id="card")
+    dragstart.params["type"] = "dragstart"
+    dragstart.params["target"]["selector"] = "#card"
+    drop = _click_streaming_event(timestamp=1200.0, capture_seq=1, target_id="column")
+    drop.params["type"] = "drop"
+    drop.params["target"]["selector"] = "#column"
+    session.ingest_events(
+        [
+            dragstart,
+            drop,
+            StreamingExfiltratedEvent(
+                event_name="dialog:opening",
+                source=StreamingExfiltratedEventSource.CDP,
+                timestamp=1.3,
+                capture_seq=2,
+                params={"type": "confirm", "message": "Continue?", "url": "https://example.com"},
+            ),
+            StreamingExfiltratedEvent(
+                event_name="dialog:closed",
+                source=StreamingExfiltratedEventSource.CDP,
+                timestamp=1.4,
+                capture_seq=3,
+                params={"result": True, "userInput": ""},
+            ),
+        ]
+    )
+
+    steps = await session.flush()
+
+    assert [step.action_kind for step in steps] == [ActionKind.DRAG_DROP, ActionKind.DIALOG]
+    assert all(step.status == RecordingDraftStepStatus.READY for step in steps)
+
+
+@pytest.mark.asyncio
 async def test_live_interpretation_drops_inferred_waits() -> None:
     session = RecordingInterpretationSession(
         browser_session_id=PBS_ID,

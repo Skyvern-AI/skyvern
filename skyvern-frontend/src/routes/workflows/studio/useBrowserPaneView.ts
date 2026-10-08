@@ -12,15 +12,11 @@ import {
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import {
   resolveBrowserPaneView,
+  resolveReplayAvailability,
   resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
-import {
-  parsePanesParam,
-  STUDIO_PANES_PARAM,
-  SYSTEM_RUN_FOCUS_PARAM,
-  toReadableSearch,
-} from "./panes";
+import { SYSTEM_RUN_FOCUS_PARAM, toReadableSearch } from "./panes";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
@@ -40,6 +36,9 @@ type BrowserPaneViewState = {
   // What the Live view shows: the shared debug-session singleton, or the
   // inspected run's own per-run stream (running outside the debug session).
   liveSurface: "debug" | "run";
+  recordingAvailable: boolean;
+  screenshotsAvailable: boolean;
+  liveAvailable: boolean;
 };
 
 /**
@@ -51,7 +50,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
   const workflowPermanentId = useWorkflowPermanentId();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { resolveLivePanes } = useStudioPanes();
+  const { openPane, resolveLivePanes } = useStudioPanes();
   const { runId, explicit } = useStudioInspectedRun();
   const visuals = useRunVisuals(runId);
   const { data: debugSession } = useDebugSessionQuery({
@@ -114,24 +113,22 @@ export function useBrowserPaneView(): BrowserPaneViewState {
       const next = new URLSearchParams(searchParams);
       if (nextView === "recording") {
         next.set("view", "recording");
-        const panes =
-          parsePanesParam(next.get(STUDIO_PANES_PARAM)) ?? resolveLivePanes();
-        next.set(
-          STUDIO_PANES_PARAM,
-          ["browser", ...panes.filter((pane) => pane !== "browser")].join(","),
-        );
+        if (!resolveLivePanes().includes("browser")) openPane("browser");
       } else if (next.get("view") === "recording") {
         next.delete("view");
       }
       navigate({ search: toReadableSearch(next) }, { replace: true });
     },
-    [navigate, resolveLivePanes, searchParams, setViewIntent],
+    [navigate, openPane, resolveLivePanes, searchParams, setViewIntent],
   );
 
   const runInDebugSession =
     visuals.workflowRun?.browser_session_id != null &&
     visuals.workflowRun.browser_session_id === debugBrowserSessionId;
   const blockRunInDebugSession = searchParams.has("bl") && runInDebugSession;
+
+  const { recordingAvailable, screenshotsAvailable } =
+    resolveReplayAvailability(visuals);
 
   const view = resolveBrowserPaneView({
     intent,
@@ -140,8 +137,14 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     inspectingRun: explicit,
     blockRunInDebugSession,
     systemFocused: searchParams.has(SYSTEM_RUN_FOCUS_PARAM),
+    runInDebugSession,
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
+    recordingAvailable,
+    // Until it is known whether screenshots exist, route as if they do, so the
+    // view doesn't flip away and back; the pill itself waits for the answer.
+    screenshotsAvailable: screenshotsAvailable || visuals.screenshotsPending,
+    hasDebugSession: debugBrowserSessionId != null,
     failed: visuals.failed,
   });
 
@@ -161,5 +164,8 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     debugBrowserSessionId,
     runInDebugSession,
     liveSurface,
+    recordingAvailable,
+    screenshotsAvailable,
+    liveAvailable: visuals.running || debugBrowserSessionId != null,
   };
 }

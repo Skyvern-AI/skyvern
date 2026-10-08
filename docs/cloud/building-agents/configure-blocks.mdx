@@ -31,7 +31,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 | Category | Blocks |
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
-| [Data and Extraction](#data-and-extraction) | Text Prompt, File Parser |
+| [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser |
 | [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
 | [Files](#files) | File Download, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction |
@@ -201,6 +201,64 @@ Additional fields in **Advanced Settings:**
 ---
 
 ## Data and Extraction
+
+### Web Search
+
+Search Google or Exa over an API. Add `site:example.com` to the query to search within a site. This block does not open a browser or read linked pages.
+
+Google supports site restrictions. With a single `site:domain` or `site:domain/path` filter, the block removes results outside the filter. It repeats the search up to twice when Google returns only results outside that filter. It does not filter queries with quotation marks, parentheses, `|`, `OR`, or multiple `site:` filters. Exa supports one positive `site:domain` filter. Unsupported Exa expressions fail instead of expanding the search.
+
+| Field               | Type     | Description                                                              |
+| ------------------- | -------- | ------------------------------------------------------------------------ |
+| **Search Query**    | text     | Required query. Supports input and output parameter references.          |
+| **Search Provider** | selector | Automatic (default), Google, or Exa. Google uses SerpAPI.                |
+| **Maximum Results** | integer  | Between 1 and 100; default 10. The provider may return fewer results.    |
+| **Prompt**          | text     | Optional instructions to summarize, rank, extract, or transform results. |
+| **Model**           | selector | Model for Prompt, Data Schema, and error detection.                      |
+| **Data Schema**     | JSON     | Optional output shape. Works with or without a Prompt.                   |
+| **Error Messages**  | mapping  | Error codes and descriptions that the model checks against the outcome.  |
+
+Automatic starts with Google. It tries Exa only if Google fails before returning results and the server has an Exa key. Empty results do not trigger fallback. Selecting Google or Exa uses only that provider.
+
+A Prompt receives the normalized results, including an empty list. Without a Data Schema, its answer is text. A Data Schema alone asks the model to return the results in that shape. The answer is stored in `prompt_output`. Invalid schemas are rejected when you save. Schemas with parameter references are checked after those references are filled in. A response that fails validation retries once before the block fails.
+
+Leave Prompt and Data Schema blank to skip result processing. Error Messages still make an LLM call when configured on the block or workflow. Block entries override workflow entries with the same code. The model checks results, processed answers, and block failures against those descriptions, including failures before the search starts.
+
+A successful search completes when no error code matches, including when it returns zero results. A matching code terminates a successful search. If the search or Prompt fails or times out, a matching code attaches to that failure without changing its status or system failure reason. If error detection fails, the block keeps the search outcome without a code.
+
+The old `no_results_error_code` and `no_match_error_code` fields are deprecated. Saved values are read as Error Messages. They describe empty results and results that do not satisfy the Prompt. An explicit Error Messages entry with the same code takes precedence.
+
+The output always includes:
+
+- `query`: the rendered query, or the configured query if rendering fails.
+- `provider`: `google` or `exa`.
+- `results`: objects with `title`, `link`, `snippet`, `display_link`, and one-based `position`.
+- `total_count`: the number of returned results.
+- `prompt_output`: null, text, or the JSON value defined by Data Schema.
+- `raw_response.pages`: provider responses, with credentials removed.
+
+With Exa, a result's `snippet` is empty when Exa has no cached copy of the page or when the request for page highlights fails.
+
+For example, use `{{ web_search_1_output.results }}` in a downstream block. A later page failure keeps validated partial results and completes the search. A Prompt failure keeps those results but fails the block.
+
+Failed and terminated outputs also include `status`, `failure_reason`, and `errors`. They carry a `failure_category`. For execution denials, such as insufficient credits, its value is `null`. Detected codes appear in the run's `errors` list with their explanations. Enable **Continue on Failure** to let the next block inspect the output. The Search failure category applies to the run only when the block ends it.
+
+A terminated Search block shows its failure reason in the timeline instead of the result count.
+
+```yaml
+block_type: web_search
+label: web_search_1
+query: "site:example.com annual report"
+provider: auto
+num_results: 10
+prompt: null
+json_schema: null
+error_code_mapping: null
+```
+
+Skyvern Cloud supplies provider credentials. Self-hosted installations configure `SERPAPI_API_KEY` and `EXA_API_KEY` in the server environment. Google pagination can use multiple API searches for a single block run.
+
+---
 
 ### Text Prompt
 

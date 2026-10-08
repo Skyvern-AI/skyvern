@@ -164,9 +164,11 @@ class ArtifactsRepository(BaseRepository):
                 browser_session_id=browser_session_id,
             )
             session.add(new_artifact)
+            # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
+            await session.flush()
+            artifact = convert_to_artifact(new_artifact, self.debug_enabled)
             await session.commit()
-            await session.refresh(new_artifact)
-            return convert_to_artifact(new_artifact, self.debug_enabled)
+            return artifact
 
     @db_operation("refresh_download_artifact_content")
     async def refresh_download_artifact_content(
@@ -230,6 +232,8 @@ class ArtifactsRepository(BaseRepository):
         """
         Bulk create multiple artifacts in a single database transaction.
 
+        The commit expires the passed-in models, so read the returned Artifacts, not the models.
+
         Args:
             artifact_models: List of ArtifactModel instances to insert
 
@@ -241,13 +245,10 @@ class ArtifactsRepository(BaseRepository):
 
         async with self.Session() as session:
             session.add_all(artifact_models)
+            await session.flush()
+            artifacts = [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
             await session.commit()
-
-            # Refresh all artifacts to get their created_at and modified_at values
-            for artifact in artifact_models:
-                await session.refresh(artifact)
-
-            return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
+            return artifacts
 
     @db_operation("get_artifacts_for_task_v2")
     async def get_artifacts_for_task_v2(
@@ -421,6 +422,7 @@ class ArtifactsRepository(BaseRepository):
         *,
         organization_id: str | None,
         artifact_type: ArtifactType | None = None,
+        artifact_types: list[ArtifactType] | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -436,6 +438,8 @@ class ArtifactsRepository(BaseRepository):
 
             if artifact_type is not None:
                 query = query.filter_by(artifact_type=artifact_type)
+            if artifact_types is not None:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
             if task_id is not None:
                 query = query.filter_by(task_id=task_id)
             if step_id is not None:
@@ -912,6 +916,8 @@ class ArtifactsRepository(BaseRepository):
     async def update_action_screenshot_artifact_id(
         self, *, organization_id: str, action_id: str, screenshot_artifact_id: str
     ) -> None:
+        # Column-only: hydrate_action lets a non-null action_json value win, so this is visible to a
+        # hydrated read only because the row is created before its screenshot id exists.
         async with self.Session() as session:
             await session.execute(
                 update(ActionModel)

@@ -774,6 +774,8 @@ class TestStampingHappensAtTheParsePoint:
         otp=None,
         primary_default: object | None = None,
         captured_defaults: list[object] | None = None,
+        llm_response: dict | None = None,
+        error_code_mapping: dict[str, str] | None = None,
     ) -> list:
         async def fake_extract(*_a, **_k):
             return parsed
@@ -796,7 +798,8 @@ class TestStampingHappensAtTheParsePoint:
         task.organization_id = "o"
         task.workflow_run_id = "wr"
         task.task_id = "tsk"
-        llm = AsyncMock(return_value={"actions": []})
+        task.error_code_mapping = error_code_mapping
+        llm = AsyncMock(return_value=llm_response or {"actions": []})
         resolved_primary_default = primary_default or object()
 
         def resolve_override(_llm_key: str | None, *, default: object) -> AsyncMock:
@@ -818,7 +821,7 @@ class TestStampingHappensAtTheParsePoint:
             actions, _, _ = await ForgeAgent._generate_step_actions(
                 agent,
                 task=task,
-                step=MagicMock(),
+                step=MagicMock(step_id="stp", order=0),
                 browser_state=MagicMock(),
                 engine=MagicMock(),
                 scraped_page=scraped,
@@ -838,6 +841,21 @@ class TestStampingHappensAtTheParsePoint:
                 context=None,
             )
         return actions
+
+    @pytest.mark.asyncio
+    async def test_an_empty_plan_naming_a_mapped_code_becomes_a_terminate_with_that_code(self) -> None:
+        response = {"actions": [], "error": {"code": "WEBSITE_DOWN", "reasoning": "Maintenance page"}}
+
+        actions = await self._generate(
+            None,
+            None,
+            extraction=False,
+            llm_response=response,
+            error_code_mapping={"website_down": "The site is down"},
+        )
+
+        assert [action.action_type for action in actions] == [ActionType.TERMINATE]
+        assert [error.error_code for error in actions[0].errors] == ["website_down"]
 
     @pytest.mark.asyncio
     async def test_planner_uses_org_aware_primary_handler_as_default(self) -> None:

@@ -13,7 +13,6 @@ describe("useRecordingElapsedSeconds", () => {
     vi.setSystemTime(BASE_MS);
     useRecordingStore.setState({
       recordingStartedAtMs: BASE_MS,
-      manualCapturePaused: false,
       finishRequested: false,
     });
   });
@@ -27,26 +26,5 @@ describe("useRecordingElapsedSeconds", () => {
     expect(result.current).toBe(0);
     act(() => vi.advanceTimersByTime(3000));
     expect(Math.floor(result.current)).toBe(3);
-  });
-
-  it("freezes while paused and resumes without jumping the clock", () => {
-    const { result } = renderHook(() => useRecordingElapsedSeconds());
-    act(() => vi.advanceTimersByTime(3000));
-    expect(Math.floor(result.current)).toBe(3);
-
-    act(() => {
-      useRecordingStore.setState({ manualCapturePaused: true });
-    });
-    act(() => vi.advanceTimersByTime(5000));
-    // Frozen: the 5s spent paused must not count.
-    expect(Math.floor(result.current)).toBe(3);
-
-    act(() => {
-      useRecordingStore.setState({ manualCapturePaused: false });
-    });
-    // Resume must not jump forward by the paused span.
-    expect(Math.floor(result.current)).toBe(3);
-    act(() => vi.advanceTimersByTime(2000));
-    expect(Math.floor(result.current)).toBe(5);
   });
 });

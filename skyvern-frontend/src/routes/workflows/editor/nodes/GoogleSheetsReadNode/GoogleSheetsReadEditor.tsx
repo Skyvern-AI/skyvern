@@ -247,6 +247,7 @@ function GoogleSheetsReadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="range"
                   nodeId={blockId}
                   onChange={(next) => update({ range: next })}
                   value={data.range}

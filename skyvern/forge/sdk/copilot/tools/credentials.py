@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Collection, Sequence
 from typing import Any
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
+    declared_non_credential_keys,
     saved_credential_ids,
     workflow_blocks,
 )
@@ -32,8 +34,9 @@ from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.schemas.google_sheets import extract_sheet_gid, extract_spreadsheet_id, is_plain_cell_range
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _iter_yaml_blocks, _workflow_definition_as_dict
@@ -274,6 +277,17 @@ def _connection_row_facts(credential: GoogleOAuthCredentialBase) -> dict[str, An
     }
 
 
+def _eligible_sheets_connections(
+    connections: Sequence[GoogleOAuthCredentialBase],
+) -> list[GoogleOAuthCredentialBase]:
+    return [
+        credential
+        for credential in connections
+        if credential.state == google_oauth_service.STATE_ACTIVE
+        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in credential.scopes_granted
+    ]
+
+
 async def canonicalize_named_google_sheet_bindings(
     workflow_yaml: str,
     ctx: AgentContext,
@@ -306,12 +320,7 @@ async def canonicalize_named_google_sheet_bindings(
         )
         visible = None
 
-    eligible = [
-        credential
-        for credential in (visible or [])
-        if credential.state == google_oauth_service.STATE_ACTIVE
-        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in credential.scopes_granted
-    ]
+    eligible = _eligible_sheets_connections(visible or [])
     eligible_ids = {credential.id for credential in eligible}
 
     facts: list[dict[str, Any]] = []
@@ -359,6 +368,132 @@ async def canonicalize_named_google_sheet_bindings(
     return workflow_yaml, scrubbed
 
 
+_GID_TAB_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
+async def _fetch_sheet_tabs(organization_id: str, credential_id: str, url: str) -> list[google_sheets_service.SheetTab]:
+    token = await app.AGENT_FUNCTION.get_google_sheets_credentials(organization_id, credential_id)
+    if token is None:
+        raise RuntimeError("no Google Sheets access token")
+    return await google_sheets_service.get_spreadsheet_tabs(token, url)
+
+
+async def resolve_google_sheet_tabs_from_gid(
+    workflow_yaml: str,
+    ctx: AgentContext,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Fill an empty Sheets `sheet_name` with the title of the tab whose id is the `gid` in the block's
+    literal `spreadsheet_url`, read through the block's bound connection. Never falls back to another tab."""
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return workflow_yaml, []
+    if not isinstance(parsed, dict):
+        return workflow_yaml, []
+    candidates = [
+        (block, url, gid)
+        for block in workflow_blocks(parsed)
+        if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
+        and not str(block.get("sheet_name") or "").strip()
+        and isinstance((url := block.get("spreadsheet_url")), str)
+        and not _is_templated_credential_value(url)
+        and (gid := extract_sheet_gid(url)) is not None
+    ]
+    if not candidates:
+        return workflow_yaml, []
+
+    try:
+        eligible_ids: set[str] | None = {
+            credential.id
+            for credential in _eligible_sheets_connections(
+                await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
+            )
+        }
+    except Exception:
+        LOG.warning("copilot_google_sheet_tab_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
+        eligible_ids = None
+
+    # Reading tab titles discloses spreadsheet metadata, so it needs the same turn approval dispatch requires.
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    approved_ids = set(policy.run_approved_google_connection_ids) if policy is not None else set()
+    approved_ids.update(
+        await _approve_server_verified_google_sheet_bindings(
+            [(str(block.get("label")), str(block.get("credential_id"))) for block, _, _ in candidates],
+            tool_activity=ctx.tool_activity,
+            organization_id=ctx.organization_id,
+            request_policy=policy,
+        )
+    )
+
+    # A slow Sheets API must not stall the save: one bounded lookup per spreadsheet, failures included.
+    tabs_by_spreadsheet: dict[tuple[str, str], list[google_sheets_service.SheetTab] | None] = {}
+    facts: list[dict[str, Any]] = []
+    changed = False
+    for block, url, gid in candidates:
+        label = block.get("label")
+        credential_id = block.get("credential_id")
+        cell_range = block.get("range")
+        fact: dict[str, Any] = {"label": label if isinstance(label, str) else None, "gid": gid, "resolved": False}
+        facts.append(fact)
+        has_range = cell_range is not None and str(cell_range).strip() != ""
+        if has_range and not (isinstance(cell_range, str) and is_plain_cell_range(cell_range)):
+            fact.update(status="ineligible", reason="range_not_plain_cells")
+            continue
+        if not isinstance(credential_id, str) or not credential_id.strip():
+            fact["status"] = "no_connection"
+            continue
+        if _is_templated_credential_value(credential_id):
+            fact.update(status="ineligible", reason="templated_credential")
+            continue
+        if eligible_ids is None:
+            fact["status"] = "lookup_failed"
+            continue
+        if credential_id not in eligible_ids:
+            fact.update(status="ineligible", reason="not_eligible_connection")
+            continue
+        if credential_id not in approved_ids:
+            fact.update(status="ineligible", reason="connection_not_approved")
+            continue
+        try:
+            lookup_key = (credential_id, extract_spreadsheet_id(url))
+            if lookup_key not in tabs_by_spreadsheet:
+                tabs_by_spreadsheet[lookup_key] = None
+                tabs_by_spreadsheet[lookup_key] = await asyncio.wait_for(
+                    _fetch_sheet_tabs(ctx.organization_id, credential_id, url),
+                    timeout=_GID_TAB_LOOKUP_TIMEOUT_SECONDS,
+                )
+            tabs = tabs_by_spreadsheet[lookup_key]
+            if tabs is None:
+                raise RuntimeError("tab lookup already failed for this spreadsheet")
+        except Exception:
+            LOG.warning(
+                "copilot_google_sheet_tab_lookup_failed",
+                organization_id=ctx.organization_id,
+                connection_id=credential_id,
+                exc_info=True,
+            )
+            fact["status"] = "lookup_failed"
+            continue
+        fact["available_tabs"] = [tab.title for tab in tabs]
+        match = next((tab for tab in tabs if tab.sheet_id == gid), None)
+        if match is None:
+            fact["status"] = "gid_not_found"
+            continue
+        block["sheet_name"] = match.title
+        fact.update(status="resolved", resolved=True, sheet_name=match.title)
+        changed = True
+
+    if changed:
+        workflow_yaml = dump_workflow_yaml(parsed)
+        LOG.info(
+            "copilot_google_sheet_tab_resolved_from_gid",
+            organization_id=ctx.organization_id,
+            labels=[fact["label"] for fact in facts if fact["resolved"]],
+        )
+    scrubbed: list[dict[str, Any]] = scrub_secrets_from_structure(ctx, facts)
+    return workflow_yaml, scrubbed
+
+
 def _parsed_workflow_definition(workflow_yaml: str | None) -> dict[str, Any] | None:
     if not workflow_yaml:
         return None
@@ -390,10 +525,13 @@ def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[s
         return []
 
     findings: list[dict[str, str]] = []
+    declared_keys = declared_non_credential_keys({"workflow_definition": workflow_definition})
 
     def _scan_value(value: Any, location: str, field: str) -> None:
         if isinstance(value, str):
             for credential_id in _CREDENTIAL_ID_RE.findall(value):
+                if credential_id in declared_keys:
+                    continue
                 findings.append({"location": location, "field": field, "credential_id": credential_id})
         elif isinstance(value, list):
             for item in value:
@@ -510,12 +648,7 @@ async def _approve_server_verified_google_sheet_bindings(
 
     # Citation is judged against every visible row, the same set author time sees, so a longer
     # sibling name in the error state still shadows the shorter one; only active rows are eligible.
-    eligible = [
-        connection
-        for connection in visible_connections
-        if connection.state == google_oauth_service.STATE_ACTIVE
-        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
-    ]
+    eligible = _eligible_sheets_connections(visible_connections)
     eligible_ids = {connection.id for connection in eligible}
     return [
         connection_id
@@ -529,6 +662,18 @@ async def _approve_server_verified_google_sheet_bindings(
 
 
 def _same_turn_listed_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
+    # A connection the server just used to open the sheet is one it would have listed, so it counts as listed.
+    opened = {
+        connection_id
+        for activity in tool_activity
+        if activity.get("tool") == "read_google_sheet" and isinstance(activity.get("opened_connection_ids"), list)
+        for connection_id in activity["opened_connection_ids"]
+        if isinstance(connection_id, str)
+    }
+    return _latest_listing_google_sheet_ids(tool_activity) | opened
+
+
+def _latest_listing_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
     for activity in reversed(tool_activity):
         if activity.get("tool") != "list_integrations":
             continue
@@ -591,6 +736,8 @@ def _credential_run_approval_blocker_signal(
     *,
     additional_approved_ids: Collection[str] = (),
     google_reference_ids: Collection[str] = (),
+    action: str = "run the workflow",
+    blocked_tool: str = "update_and_run_blocks",
 ) -> CopilotToolBlockerSignal | None:
     approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
     references = [
@@ -604,13 +751,13 @@ def _credential_run_approval_blocker_signal(
         blocker_kind="authority_denied",
         agent_steering_text="Ask the user to choose one of the server-provided connected Google accounts.",
         user_facing_reason=(
-            "Choose one of the connected Google accounts below so I can run the workflow. "
+            f"Choose one of the connected Google accounts below so I can {action}. "
             "Reconnect any unavailable account on the Integrations page first."
         ),
         recovery_hint="ask_user_clarifying",
         preserves_workflow_draft=True,
         internal_reason_code=_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE,
-        blocked_tool="update_and_run_blocks",
+        blocked_tool=blocked_tool,
         # The id list is the opaque subset; the count covers every reference, including named
         # connections and template expressions the trace deliberately does not carry.
         extra={

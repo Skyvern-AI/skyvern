@@ -14,6 +14,7 @@ import {
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: vi.fn(),
+  setRecordBrowserContext: vi.fn(),
 }));
 
 let seq = 0;
@@ -89,7 +90,7 @@ describe("addOptimisticStep", () => {
 
   it("no-ops when capture is paused", () => {
     store().setIsRecording(true);
-    store().setManualCapturePaused(true);
+    store().beginDraftEdit();
     store().addOptimisticStep(opt());
     expect(store().optimisticSteps).toHaveLength(0);
   });

@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   EMPTY_NARRATIVE,
@@ -9,7 +15,6 @@ import {
   type TurnNarrativeState,
 } from "../narrativeState";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { derivePhases } from "../copilotPhases";
 import { ReviewGateCard, getReviewGateVerdict } from "./ReviewGateCard";
 
 const failedBlock = {
@@ -32,7 +37,16 @@ const completedBlock = {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
+
+// Radix menus open on pointerdown, not click.
+function openMenu(name: string) {
+  fireEvent.pointerDown(screen.getByRole("button", { name }), {
+    button: 0,
+    ctrlKey: false,
+  });
+}
 
 const turn = (
   overrides: Partial<TurnNarrativeState> = {},
@@ -149,15 +163,13 @@ describe("getReviewGateVerdict", () => {
     expect(getReviewGateVerdict(undefined, proposal)).toBe(null);
   });
 
-  it("never reports tested while the turn's own rail computes a failed test phase", () => {
+  it("never reports tested for a turn with a failed test block", () => {
     const failedTurn = turn({
       proposalDisposition: "review_tested",
+      turnFacts: coveredFacts,
       blocks: [failedBlock],
     });
 
-    expect(
-      derivePhases(failedTurn).find((row) => row.id === "test")?.status,
-    ).toBe("fail");
     expect(getReviewGateVerdict(failedTurn, null)).not.toBe("tested");
   });
 });
@@ -172,6 +184,7 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -180,9 +193,12 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
     );
 
     const accept = screen.getByRole("button", { name: /^Accept$/ });
-    const alwaysAccept = screen.getByRole("button", { name: /Always accept/ });
     expect(accept.hasAttribute("disabled")).toBe(false);
-    expect(alwaysAccept.hasAttribute("disabled")).toBe(false);
+    openMenu("More accept options");
+    const alwaysAccept = screen.getByRole("menuitem", {
+      name: /Always accept/,
+    });
+    expect(alwaysAccept.hasAttribute("data-disabled")).toBe(false);
   });
 });
 
@@ -209,6 +225,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -243,6 +260,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -266,6 +284,8 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     expect(
       screen.queryByRole("button", { name: /Test end-to-end/i }),
     ).toBeNull();
+    // Test end-to-end otherwise lives in this menu, so its absence is what proves no run is offered.
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
     expect(testRuns).toBe(0);
   });
 
@@ -277,6 +297,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={() => {
           accepted += 1;
         }}
@@ -306,6 +327,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -317,28 +339,126 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
   });
 
-  it("says only that the run acts for real when no step has been tested yet", () => {
+  it("warns that the run acts for real and starts it only once confirmed", () => {
+    let testRuns = 0;
     render(
       <ReviewGateCard
         turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={() => {
+          testRuns += 1;
+        }}
+      />,
+    );
+
+    expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
+    openMenu("More actions");
+    fireEvent.click(screen.getByRole("menuitem", { name: /Test end-to-end/ }));
+    expect(
+      screen.getByText(/performs real actions on the site/).textContent,
+    ).toContain("place orders");
+    expect(testRuns).toBe(0);
+    // The confirmation replaces the row that held focus, so it takes focus itself.
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Run test" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText(/performs real actions on the site/)).toBeNull();
+    expect(testRuns).toBe(0);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "More actions" }),
+    );
+
+    openMenu("More actions");
+    fireEvent.click(screen.getByRole("menuitem", { name: /Test end-to-end/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Run test" }));
+    expect(testRuns).toBe(1);
+  });
+
+  it("moves Reject into More actions when the row is too narrow to hold both", () => {
+    let reportWidth: (width: number) => void = () => {};
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          reportWidth = (width) =>
+            callback(
+              [{ contentRect: { width } } as ResizeObserverEntry],
+              this as unknown as ResizeObserver,
+            );
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    let rejects = 0;
+    render(
+      <ReviewGateCard
+        turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={() => {
+          rejects += 1;
+        }}
         onReview={noop}
         onTestEndToEnd={noop}
       />,
     );
 
-    expect(
-      screen.getByRole("button", { name: /Test end-to-end/ }),
-    ).not.toBeNull();
-    expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
-    expect(
-      screen.getByText(/performs real actions on the site/).textContent,
-    ).toContain("place orders");
+    act(() => reportWidth(279));
+    expect(screen.queryByRole("button", { name: "Reject" })).not.toBeNull();
+
+    act(() => reportWidth(190));
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    openMenu("More actions");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reject" }));
+    expect(rejects).toBe(1);
+  });
+
+  it("drops an open confirmation and locks More actions when the gate locks", () => {
+    const gate = (failure: "reload" | null) => (
+      <ReviewGateCard
+        turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={noop}
+        failure={failure}
+        onRetry={noop}
+      />
+    );
+    const { rerender } = render(gate(null));
+    openMenu("More actions");
+    fireEvent.click(screen.getByRole("menuitem", { name: /Test end-to-end/ }));
+    expect(screen.queryByRole("button", { name: "Run test" })).not.toBeNull();
+
+    rerender(gate("reload"));
+    expect(screen.queryByRole("button", { name: "Run test" })).toBeNull();
+    // The row that opened it is locked now, so focus lands on the one live control.
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Try again" }),
+    );
+    const more = screen.getByRole("button", { name: "More actions" });
+    expect(more.hasAttribute("disabled")).toBe(true);
+    openMenu("More actions");
+    expect(screen.queryByRole("menuitem")).toBeNull();
   });
 
   it("withholds the every-step claim when the proposal could not be projected", () => {
@@ -348,6 +468,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -357,8 +478,9 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     );
 
     expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
+    openMenu("More actions");
     expect(
-      screen.getByText(/performs real actions on the site/),
+      screen.getByRole("menuitem", { name: /Test end-to-end/ }),
     ).not.toBeNull();
   });
 
@@ -383,6 +505,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -392,8 +515,9 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     );
 
     expect(screen.queryByText(/Each step was tested on its own/)).toBeNull();
+    openMenu("More actions");
     expect(
-      screen.getByText(/performs real actions on the site/),
+      screen.getByRole("menuitem", { name: /Test end-to-end/ }),
     ).not.toBeNull();
   });
 
@@ -418,6 +542,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -426,14 +551,14 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
       />,
     );
 
-    expect(
-      screen.getByRole("button", { name: /Test end-to-end/ }),
-    ).not.toBeNull();
     const explainer = screen.getByText(/Each step was tested on its own/);
-    expect(explainer.textContent).toContain("have not been run together");
-    expect(explainer.textContent).toContain(
-      "performs real actions on the site",
-    );
+    expect(explainer.textContent).toContain("not together");
+    // The claim offers the test in place, so the overflow menu does not repeat it.
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Test end-to-end" }));
+    expect(
+      screen.getByText(/performs real actions on the site/),
+    ).not.toBeNull();
   });
 });
 
@@ -465,6 +590,7 @@ describe("ReviewGateCard — block label humanization", () => {
         pending={false}
         verdict={null}
         actionsEnabled={false}
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -472,11 +598,14 @@ describe("ReviewGateCard — block label humanization", () => {
       />,
     );
 
-    expect(screen.getByText("Proposed blocks")).not.toBeNull();
-    const proposed = screen.getByText("Extract Titles");
-    expect(proposed.getAttribute("title")).toBe("extract_titles_v2");
-    expect(screen.queryByText("Added")).toBeNull();
-    expect(screen.queryByText("Removed")).toBeNull();
+    // Never applied and never decided, so it must not wear the applied check.
+    expect(screen.queryByText("✓")).toBeNull();
+    expect(screen.queryByText(/Accepted and saved/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    const proposed = screen.getByTitle("extract_titles_v2");
+    expect(proposed.textContent).toBe("Extract Titles");
+    // A legacy draft has no change classes, so its row announces no change label.
+    expect(proposed.parentElement?.textContent).toBe("Extract Titles");
     expect(screen.queryByText("Old Extract Step")).toBeNull();
   });
 });
@@ -525,6 +654,7 @@ describe("ReviewGateCard — recorded review projection", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -532,14 +662,18 @@ describe("ReviewGateCard — recorded review projection", () => {
       />,
     );
 
-    expect(screen.getByText("Added")).not.toBeNull();
-    expect(screen.getByText("+ Added Export")).not.toBeNull();
-    expect(screen.getByText("Changed")).not.toBeNull();
-    expect(screen.getByText("~ Changed Query")).not.toBeNull();
-    expect(screen.getByText("Unchanged")).not.toBeNull();
-    expect(screen.getByText("Unchanged Login")).not.toBeNull();
-    expect(screen.getByText("Removed")).not.toBeNull();
-    expect(screen.getByText("- Removed Cleanup")).not.toBeNull();
+    // The +/~/− glyphs are decoration; the change class a reader gets is the announced label.
+    const announced = (text: string) =>
+      screen.queryAllByText(
+        (_, el) => el?.textContent?.startsWith(text) ?? false,
+      ).length > 0;
+    expect(announced("Added: Added Export")).toBe(true);
+    expect(announced("Changed: Changed Query")).toBe(true);
+    expect(announced("Unchanged: Unchanged Login")).toBe(true);
+    expect(announced("Removed: Removed Cleanup")).toBe(true);
+    expect(screen.getByTitle("removed_cleanup").className).toContain(
+      "line-through",
+    );
     expect(screen.getAllByText("Never tested")).toHaveLength(2);
     expect(
       screen.getByText(
@@ -549,11 +683,44 @@ describe("ReviewGateCard — recorded review projection", () => {
     expect(
       screen.getByRole("button", { name: "Accept" }).hasAttribute("disabled"),
     ).toBe(false);
+    openMenu("More accept options");
     expect(
       screen
-        .getByRole("button", { name: "Always accept" })
-        .hasAttribute("disabled"),
+        .getByRole("menuitem", { name: /Always accept/ })
+        .hasAttribute("data-disabled"),
     ).toBe(false);
+  });
+
+  it("never folds a removed block behind Show more, so a deletion is not accepted unseen", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          review: {
+            blocks: [
+              ...["one", "two", "three", "four", "five"].map((name) => ({
+                label: `add_${name}`,
+                blockType: "task",
+                change: "added" as const,
+              })),
+              { label: "drop_invite", blockType: "task", change: "removed" },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.queryByTitle("drop_invite")).not.toBeNull();
+    expect(screen.queryByTitle("add_five")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show 1 more" })).not.toBeNull();
   });
 
   it("hydrates the optional projection and ignores malformed review payloads", () => {
@@ -587,6 +754,64 @@ describe("ReviewGateCard — recorded review projection", () => {
   });
 });
 
+describe("ReviewGateCard — answered proposals collapse", () => {
+  const noop = () => {};
+
+  it("shrinks an accepted proposal to one line whose pill leads with the worst note", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          blocks: [failedBlock],
+          review: {
+            blocks: [
+              { label: "add_to_cart", blockType: "task", change: "added" },
+              {
+                label: "send_receipt",
+                blockType: "task",
+                change: "added",
+                neverTested: true,
+              },
+              { label: "open_page", blockType: "task", change: "changed" },
+            ],
+            duplicateWrites: [
+              {
+                blockType: "task",
+                blockLabels: ["add_to_cart", "send_receipt"],
+              },
+            ],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("Accepted and saved to the workflow")).toBeTruthy();
+    // Test failed outranks the warning and the untested block, which the count stands for.
+    expect(screen.getByText(/^Test failed/).textContent).toBe(
+      "Test failed +2 and 2 more notes",
+    );
+    expect(screen.queryByTitle("add_to_cart")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByTitle("add_to_cart")).toBeTruthy();
+    expect(screen.getByTitle("send_receipt")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Add To Cart and Send Receipt write to the same destination.",
+      ),
+    ).toBeTruthy();
+  });
+});
+
 describe("ReviewGateCard — source coverage", () => {
   const noop = () => {};
 
@@ -617,6 +842,7 @@ describe("ReviewGateCard — source coverage", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -655,6 +881,7 @@ describe("ReviewGateCard — source coverage", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}

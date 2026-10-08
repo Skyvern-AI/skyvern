@@ -13,9 +13,9 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.agent import _build_turn_halt_exit_result as _build_turn_halt_exit_result
 from skyvern.forge.sdk.copilot.agent import (
+    _code_block_ai_fallback_success_reply,
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
-    _runtime_self_heal_success_reply,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
@@ -31,7 +31,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
 )
-from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import ClarificationReason, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.credentials import (
@@ -379,12 +379,21 @@ def test_output_policy_specific_branches_bypass_recorded_terminal_fallback() -> 
     assert "latest run" not in raw_secret.user_response.lower()
 
 
-def test_output_policy_raw_secret_hard_block_uses_safety_reply() -> None:
+@pytest.mark.parametrize(
+    ("clarification_reason", "expected_card_reason"),
+    [("none", "assistant_directed"), ("raw_secret", "raw_secret")],
+)
+def test_output_policy_raw_secret_hard_block_uses_safety_reply(
+    clarification_reason: ClarificationReason, expected_card_reason: str
+) -> None:
     ctx = _ctx()
+    ctx.request_policy = RequestPolicy(clarification_reason=clarification_reason)
 
     result = _blocked_result(ctx, OutputPolicyReason.RAW_SECRET_LEAK)
 
     assert result.user_response == _RAW_SECRET_LEAK_REFUSAL
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialPrompt"] == {"reason": expected_card_reason}
     assert result.turn_outcome is not None
     assert result.turn_outcome.reason_code == "output_policy_block"
     assert result.turn_outcome.terminal_reason == "output_policy_block"
@@ -461,7 +470,7 @@ def test_output_policy_blocked_result_surfaces_workflow_when_no_blocker() -> Non
     verdict = OutputPolicyVerdict(
         allowed=False,
         output_kind=CopilotOutputKind.REFUSAL,
-        reason_codes=[OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE],
+        reason_codes=[OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED],
     )
     result = _build_output_policy_blocked_result(
         ctx,
@@ -520,11 +529,11 @@ def _seed_verified_outcome(ctx: CopilotContext) -> None:
     ctx.last_workflow_yaml = "title: built\nblocks: []\n"
 
 
-def test_runtime_self_heal_reply_never_echoes_run_output() -> None:
+def test_code_block_ai_fallback_reply_never_echoes_run_output() -> None:
     ctx = _ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
 
-    response = _runtime_self_heal_success_reply(ctx)
+    response = _code_block_ai_fallback_success_reply(ctx)
 
     assert response == "The unattended recovery check completed."
     assert "secret-value" not in response
@@ -533,7 +542,7 @@ def test_runtime_self_heal_reply_never_echoes_run_output() -> None:
 def test_interactive_authoring_cannot_request_a_server_authored_success_reply() -> None:
     ctx = _ctx()
     with pytest.raises(RuntimeError, match="interactive authoring"):
-        _runtime_self_heal_success_reply(ctx)
+        _code_block_ai_fallback_success_reply(ctx)
 
 
 def _scouted_obligation_ctx() -> CopilotContext:
@@ -573,72 +582,10 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
     assert overridden.proposal_disposition != "review_tested"
 
 
-def test_unapproved_credential_reference_asks_without_naming_the_credential_inventory() -> None:
-    """`discovered_credentials` holds everything `list_credentials` returned, not page matches,
-    so the reply must not present it as a match set."""
-    ctx = _ctx()
-    ctx.request_policy = RequestPolicy(
-        discovered_credentials=[SimpleNamespace(credential_id="cred_unrelated", name="hr portal", tested_url=None)]
-    )
-
-    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
-
-    assert "I need an approved credential to continue" in result.user_response
-    # Only the observation seam records a verdict, so no-verdict must not be rendered as "no match":
-    # a fill-seam ambiguity reaches this branch with a real match behind it.
-    assert "could not match" not in result.user_response
-    assert "Credentials UI" in result.user_response
-    assert "cred_unrelated" not in result.user_response
-    assert "hr portal" not in result.user_response
-
-
-def test_unapproved_credential_reference_ambiguous_does_not_enumerate_candidates() -> None:
-    ctx = _ctx()
-    ctx.request_policy = RequestPolicy(
-        live_page_resolution=LivePageResolutionRecord(
-            verdict="ambiguous",
-            tier="url_path",
-            candidates=(
-                SimpleNamespace(credential_id="cred_first", name="first login"),
-                SimpleNamespace(credential_id="cred_second", name="second login"),
-            ),
-        )
-    )
-
-    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
-
-    # The ambiguous branch used to list candidate ids; the FE now renders the full org selector, so the
-    # reply is one sentence with the Credentials UI marker and no prose dump.
-    assert "I need an approved credential to continue" in result.user_response
-    assert "Credentials UI" in result.user_response
-    assert "cred_first" not in result.user_response
-    assert "cred_second" not in result.user_response
-
-
-def test_unapproved_credential_reference_points_at_credentials_ui_when_nothing_matched() -> None:
-    """A no-match verdict must not borrow the ambiguous reply's candidate list."""
-    ctx = _ctx()
-    ctx.request_policy = RequestPolicy(
-        live_page_resolution=LivePageResolutionRecord(
-            verdict="no_match",
-            page_url="https://analytics.example.com/login",
-            candidates=(SimpleNamespace(credential_id="cred_unmatched", name="unmatched login"),),
-        )
-    )
-
-    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
-
-    assert "Credentials UI" in result.user_response
-    # Candidates ride on the record whatever the verdict; only an ambiguous one may name them.
-    assert "cred_unmatched" not in result.user_response
-    assert "More than one saved credential" not in result.user_response
-
-
-def test_unapproved_google_connection_preserves_verified_clickable_choices() -> None:
-    choices = [
-        ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active"),
-        ConnectedAccountChoice(connection_id="goac_inactive", name="Sheets", state="error"),
-    ]
+def test_output_policy_block_does_not_answer_with_the_google_account_picker() -> None:
+    """The picker belongs to the run gate, which knows the turn stopped on a connection. An
+    output-policy block knows only that the reply was unsafe, so claiming otherwise misreports it."""
+    choices = [ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active")]
     ctx = _ctx()
     ctx.prior_turn_outcome = TurnOutcome(
         response_kind=ResponseKind.CLARIFY,
@@ -646,14 +593,10 @@ def test_unapproved_google_connection_preserves_verified_clickable_choices() -> 
     )
     ctx.request_policy = RequestPolicy(existing_workflow_credential_ids=["goac_active"])
 
-    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+    result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
-    assert "connected Google account" in result.user_response
-    assert "Credentials UI" not in result.user_response
-    assert "unapproved_credential_reference" not in result.user_response
+    assert "connected Google account" not in result.user_response
     assert "goac_" not in result.user_response
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.connected_account_choices == choices
 
 
 def test_retired_google_denial_lets_the_completed_run_reply_stand() -> None:
@@ -711,9 +654,8 @@ def test_password_blocker_does_not_reuse_prior_google_choices() -> None:
         run_approved_google_connection_ids=["goac_active"],
     )
 
-    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+    result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
-    assert "Credentials UI" in result.user_response
     assert "connected Google account" not in result.user_response
     assert result.turn_outcome is not None
     assert result.turn_outcome.connected_account_choices is None

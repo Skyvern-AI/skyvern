@@ -29,6 +29,7 @@ from skyvern.config import settings
 from skyvern.webeye import attach_only
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.display_capture_bridge import build_bridge_command
+from skyvern.webeye.video_utils import remux_mp4_faststart
 
 try:
     import fcntl
@@ -429,6 +430,10 @@ class DisplayRecorder:
         self._reserved = False
         # Latched once the arm signal is successfully delivered to the bridge (parent-side exactly-once).
         self._armed = False
+        # Latched only after a terminal faststart remux COMPLETES. Tracked separately from ``_stop_result``
+        # so a cancellation during the remux (which propagates) leaves this False and a later cleanup retry
+        # re-attempts the remux, without ever re-escalating the already-stopped recorder.
+        self._faststart_done = False
 
     def arm_capture(self) -> bool:
         """Signal the bridge to begin its timeline at the current ready page (SIGUSR1). Parent-side
@@ -471,28 +476,73 @@ class DisplayRecorder:
 
     async def stop(self, release_lock: bool = True) -> bool:
         async with self._stop_lock:
-            if self._stop_result is not None:
-                return self._stop_result
-            graceful = self.process.returncode == 0
-            pending_cancel = False
-            try:
-                graceful = await self._escalate_shutdown(graceful)
-            except asyncio.CancelledError:
-                pending_cancel = True
-            finally:
-                # Reap the child and (unless reserved) release the lock even under repeated cancellation, so a
-                # cancelled stop never leaks the bridge/ffmpeg or blocks the next run.
-                if self.process.returncode is None:
-                    _kill_process_group(self.process)
-                    if await _reap_surviving_cancellation(self.process):
-                        pending_cancel = True
-                    graceful = False
-                if release_lock:
-                    self._release_lock()
-                self._stop_result = graceful
-            if pending_cancel:
-                raise asyncio.CancelledError()
-            return graceful
+            # Exactly-once recorder stop: the escalate + reap + latch runs only on the first call, so a
+            # later cleanup retry never re-signals or re-reaps the already-stopped bridge.
+            if self._stop_result is None:
+                graceful = self.process.returncode == 0
+                pending_cancel = False
+                try:
+                    graceful = await self._escalate_shutdown(graceful)
+                except asyncio.CancelledError:
+                    pending_cancel = True
+                finally:
+                    # Reap the child even under repeated cancellation, so a cancelled stop never leaks the
+                    # bridge/ffmpeg or blocks the next run.
+                    if self.process.returncode is None:
+                        _kill_process_group(self.process)
+                        if await _reap_surviving_cancellation(self.process):
+                            pending_cancel = True
+                        graceful = False
+                    self._stop_result = graceful
+                if pending_cancel:
+                    if release_lock:
+                        self._release_lock()
+                    raise asyncio.CancelledError()
+            # Release the lock (unless reserved) on this and every retry; _release_lock is idempotent, so a
+            # retry after a cancelled faststart still frees it exactly once.
+            if release_lock:
+                self._release_lock()
+            # Terminal faststart, retriable across cancellation: only a graceful stop has a complete MP4 to
+            # remux (a forced/failed stop keeps the fragmented crash-salvage file). _faststart_done is latched
+            # only AFTER the remux returns, so a cancellation here propagates and a later retry re-attempts it;
+            # ordinary remux failures are fail-open inside the helper and are not retried.
+            if self._stop_result and not self._faststart_done:
+                await self._faststart_finalized_recording()
+                self._faststart_done = True
+            return self._stop_result
+
+    async def _faststart_finalized_recording(self) -> None:
+        """Rewrite the finalized recording to a seekable faststart layout in place.
+
+        The bridge writes a fragmented MP4 so an abrupt kill still leaves a decodable file; once a
+        graceful stop finalizes it, a native ``<video>`` still can't seek it (``empty_moov``, no
+        ``sidx``). Best-effort: any failure keeps the original recording so it is never lost and
+        recording cleanup never turns into task failure.
+        """
+        path = self.video_artifact.video_path
+        if not path:
+            return
+        try:
+            remuxed = await remux_mp4_faststart(path)
+        except Exception:  # noqa: BLE001 - playback optimization must never fail recording cleanup
+            LOG.warning(
+                "Display recording faststart remux errored; keeping raw file", owner_id=self.owner_id, exc_info=True
+            )
+            return
+        if remuxed is None:
+            return
+        # ``remux_mp4_faststart`` wrote the temp beside ``path`` (same mount), so this is an atomic
+        # rename: it either fully swaps in the faststart file or leaves the original byte-identical.
+        try:
+            os.replace(remuxed, path)
+        except OSError:
+            LOG.warning(
+                "Failed to swap in faststart display recording; keeping raw file",
+                owner_id=self.owner_id,
+                exc_info=True,
+            )
+            with suppress(OSError):
+                os.unlink(remuxed)
 
     async def _escalate_shutdown(self, graceful: bool) -> bool:
         if self.process.returncode is not None:

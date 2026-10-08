@@ -3,15 +3,28 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from skyvern.forge.sdk.copilot.build_test_outcome import SOLVER_ATTEMPT_KEY, ChallengeEffects, Lever
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    ACTION_TRACE_PER_TASK_LIMIT,
+    SOLVER_ATTEMPT_KEY,
+    SOLVER_RESULTS,
+    ChallengeEffects,
+    Lever,
+    SolverFacts,
+    SolverReceipt,
+    failed_block_bound_credential_ids,
+    governing_solver_receipt,
+    solver_receipt,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES,
     carrier_backed_anti_bot_categories,
+    stamped_challenge_frame_hosts,
     typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
@@ -26,12 +39,16 @@ from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prom
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    post_run_inspection_cleanly_matches,
     run_challenge_is_runtime_clearable,
     run_id_from_result_data,
+    same_run_typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
+from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -142,6 +159,7 @@ class DiagnosisRepairContract(StrictModel):
             "user_goal_satisfied": self.verification_result.user_goal_satisfied,
             "completion_contract_satisfied": self.verification_result.completion_contract_satisfied,
             "challenge_solver_result": self.challenge.solver_result if self.challenge else None,
+            "challenge_basis": self.challenge.basis if self.challenge else None,
             "levers": [lever.mechanism for lever in self.levers],
         }
 
@@ -152,6 +170,8 @@ def build_diagnosis_repair_contract(
     result: dict[str, Any],
     ctx: CopilotContext,
     workflow_updated: bool = False,
+    executed_workflow_yaml: str | None = None,
+    executed_parameter_values: Mapping[str, object] | None = None,
 ) -> DiagnosisRepairContract:
     data = _dict(result.get("data")) if isinstance(result, dict) else {}
     raw_blocks = data.get("blocks")
@@ -160,7 +180,7 @@ def build_diagnosis_repair_contract(
     blocks: list[Any] = _capped_blocks(raw_blocks) if isinstance(raw_blocks, list) else []
 
     run_ok = bool(result.get("ok", False))
-    suspicious = run_ok and bool(getattr(ctx, "last_test_suspicious_success", False))
+    suspicious = run_ok and ctx.last_test_suspicious_success
     failed_blocks = _failed_block_labels(blocks)
     carrier_categories = carrier_backed_anti_bot_categories(data.get("failure_categories"))
     categories = _failure_categories(carrier_categories)
@@ -169,12 +189,17 @@ def build_diagnosis_repair_contract(
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     summary = _failure_summary(result, data, blocks)
     repair_context = _current_code_authoring_repair_context(data)
+    bound_credential_ids = (
+        failed_block_bound_credential_ids(executed_workflow_yaml or ctx.workflow_yaml, data, executed_parameter_values)
+        if failed_blocks
+        else set()
+    )
     root_cause_identity = _repair_context_root_cause_identity(repair_context) or compute_repair_root_cause_signature(
         failure_categories=categories,
         failure_reason=_safe_str(data.get("failure_reason")),
         error_texts=[_safe_str(result.get("error"))],
         blocks=[block for block in blocks if isinstance(block, dict)],
-        detected_challenge=bool(getattr(ctx, "last_test_anti_bot", None)),
+        detected_challenge=bool(ctx.last_test_anti_bot),
     )
     # Interactive authoring runs are classified from their run result. Completion
     # verification is retained only for unattended self-heal and cannot rewrite
@@ -194,11 +219,7 @@ def build_diagnosis_repair_contract(
         challenge_runtime_clearable=run_challenge_is_runtime_clearable(ctx, run_id_from_result_data(data)),
     )
     next_action = _next_action(failure_type, ctx, data, repair_context)
-    challenge = (
-        _challenge_effects(ctx, blocks, categories, data)
-        if categories or getattr(ctx, "last_test_anti_bot", None)
-        else None
-    )
+    challenge = _challenge_effects(ctx, blocks, categories, data, run_passed=run_ok and not suspicious)
     frontier = _safe_str(data.get("frontier_start_label"))
     target_blocks = failed_blocks or ([frontier] if frontier else []) if next_action == RepairNextAction.REPAIR else []
     if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
@@ -265,7 +286,7 @@ def build_diagnosis_repair_contract(
         )
     return DiagnosisRepairContract(
         diagnosis_input=DiagnosisInput(
-            user_goal=_safe_text(_ctx_user_goal(ctx)),
+            user_goal=_safe_text(ctx.user_message),
             source_tool=source_tool,
             workflow_updated=workflow_updated,
             workflow_run_id=workflow_run_id,
@@ -303,64 +324,120 @@ def build_diagnosis_repair_contract(
             remaining_blocker=remaining_blocker,
         ),
         challenge=challenge,
-        levers=_levers(ctx, challenge, failure_type, data, categories),
+        levers=_levers(ctx, challenge, failure_type, data, categories, bound_credential_ids=bound_credential_ids),
     )
 
 
-def _solver_facts(blocks: list[Any], data: dict[str, Any]) -> tuple[str, str | None]:
-    """Returns (result, failure_text) over failed / attempted / not_attempted / unresolved.
-
-    A completed row means the solve step ran, not that the challenge cleared: the runtime's
-    no-solver fallback also reports success. An absent action history means unresolved, not a
-    non-attempt: the optional lookup swallows its own failures, and a later tool result in the
-    same turn carries no run history at all."""
-    """Prefer the record captured before the traces were stripped; fall back to any trace still present."""
-    carried = data.get(SOLVER_ATTEMPT_KEY)
-    if isinstance(carried, dict):
-        result = str(carried.get("result") or "unresolved")
-        if result not in {"failed", "attempted", "not_attempted", "unresolved"}:
-            result = "unresolved"
-        return result, _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX)
-    attempted = False
-    failed = False
+def solver_facts_from_traces(blocks: Sequence[object], *, code_block_only: bool = False) -> SolverFacts:
+    """A completed row with no boolean means the step ran, not that the challenge cleared, since the no-solver
+    fallback also reports success. An absent history is unresolved, not a non-attempt, because the lookup
+    swallows its own failures."""
     saw_history = False
-    failure: str | None = None
+    truncated = False
+    rows: list[Mapping[str, Any]] = []
     for block in blocks:
-        trace = block.get("action_trace") if isinstance(block, dict) else None
+        if not isinstance(block, Mapping):
+            continue
+        if code_block_only and str(block.get("block_type") or "").upper() != BlockType.CODE.name:
+            continue
+        trace = block.get("action_trace")
         if not isinstance(trace, list):
             continue
         saw_history = True
-        for entry in trace:
-            if not isinstance(entry, dict) or entry.get("action") != ActionType.SOLVE_CAPTCHA.value:
-                continue
-            attempted = True
-            if entry.get("status") == "failed":
-                failed = True
-                if failure is None:
-                    failure = _safe_text(_safe_str(entry.get("response")), _SOLVER_FAILURE_MAX)
-    if failed:
-        return "failed", failure
-    if attempted:
-        return "attempted", failure
-    return ("not_attempted" if saw_history else "unresolved"), failure
+        block_rows = [
+            entry
+            for entry in trace
+            if isinstance(entry, Mapping) and entry.get("action") == ActionType.SOLVE_CAPTCHA.value
+        ]
+        if code_block_only and block_rows:
+            # Blocks are chronological and each trace is newest-first, so this is the newest call; a raise
+            # the code's own retry loop recovered from must not outrank it.
+            rows = block_rows[:1]
+            truncated = False
+        elif code_block_only and len(trace) >= ACTION_TRACE_PER_TASK_LIMIT:
+            # A full trace may have cut this block's own call, so an earlier block's row cannot stand in for it.
+            truncated = True
+        else:
+            rows.extend(block_rows)
+    if truncated:
+        return {"attempted": False, "result": "unresolved", "failure": None}
+    failed_row = next((row for row in rows if row.get("status") == ActionStatus.failed.value), None)
+    if failed_row is not None:
+        failure = _safe_text(_safe_str(failed_row.get("response")), _SOLVER_FAILURE_MAX) or None
+        return {"attempted": True, "result": "failed", "failure": failure}
+    if any(row.get("solver_cleared") is False for row in rows):
+        return {"attempted": True, "result": "not_solved", "failure": None}
+    if rows:
+        return {"attempted": True, "result": "attempted", "failure": None}
+    return {"attempted": False, "result": "not_attempted" if saw_history else "unresolved", "failure": None}
+
+
+def _solver_facts(blocks: list[Any], data: dict[str, Any], *, code_block_only: bool = False) -> tuple[str, str | None]:
+    record = data.get(SOLVER_ATTEMPT_KEY)
+    if not isinstance(record, dict):
+        facts = solver_facts_from_traces(blocks, code_block_only=code_block_only)
+        return facts["result"], facts["failure"]
+    carried = record.get("code_block") if code_block_only else record
+    if not isinstance(carried, dict) or str(carried.get("result")) not in SOLVER_RESULTS:
+        return "unresolved", None
+    return str(carried["result"]), _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX) or None
+
+
+def _governing_receipt(blocks: Sequence[Mapping[str, object]], data: dict[str, Any]) -> SolverReceipt | None:
+    record = data.get(SOLVER_ATTEMPT_KEY)
+    return solver_receipt(record.get("receipt")) if isinstance(record, dict) else governing_solver_receipt(blocks)
+
+
+def _same_run_challenge_frame_hosts(ctx: CopilotContext, data: dict[str, Any]) -> list[str]:
+    """Vendor frame hosts from a packet observed after this very run, so a stale or foreign packet
+    cannot report a wall this run did not reach."""
+    evidence = ctx.composition_page_evidence
+    if not post_run_inspection_cleanly_matches(evidence, run_id_from_result_data(data)):
+        return []
+    return stamped_challenge_frame_hosts(evidence)
 
 
 def _challenge_effects(
-    ctx: CopilotContext, blocks: list[Any], categories: list[str], data: dict[str, Any]
+    ctx: CopilotContext, blocks: list[Any], categories: list[str], data: dict[str, Any], *, run_passed: bool
 ) -> ChallengeEffects | None:
-    """Observed solver facts for a run that met a wall; None when nothing on the run says challenge."""
-    if not any(category in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES for category in categories) and not getattr(
-        ctx, "last_test_anti_bot", None
-    ):
-        return None
+    """Classify a run's challenge evidence as run_wall, solver_call, page_frames, or None."""
+    frame_hosts = _same_run_challenge_frame_hosts(ctx, data)
     result, failure = _solver_facts(blocks, data)
-    kind = typed_challenge_kind(getattr(ctx, "composition_page_evidence", None))
+    receipt = (
+        None if run_passed else _governing_receipt([block for block in blocks if isinstance(block, Mapping)], data)
+    )
+    walled = any(category in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES for category in categories) or bool(
+        ctx.last_test_anti_bot
+    )
+    if not walled and result == "not_solved":
+        # A solve call made before anything mounted returns false too, so the solver's own refusal is
+        # a wall only next to evidence from this same run that a challenge was there.
+        walled = bool(frame_hosts) or (
+            same_run_typed_challenge_kind(ctx.composition_page_evidence, run_id_from_result_data(data)) is not None
+        )
+    if not walled and not run_passed:
+        code_result, code_failure = _solver_facts(blocks, data, code_block_only=True)
+        if code_result in {"failed", "not_solved", "attempted"}:
+            return ChallengeEffects(
+                basis="solver_call",
+                solver_attempted=True,
+                solver_result=code_result,
+                solver_failure=code_failure,
+                solver_receipt=receipt,
+                frame_hosts=frame_hosts or None,
+            )
+    if not walled:
+        return ChallengeEffects(basis="page_frames", frame_hosts=frame_hosts) if frame_hosts else None
+    kind = typed_challenge_kind(ctx.composition_page_evidence)
     return ChallengeEffects(
+        basis="run_wall",
         kind=kind.value if kind is not None else None,
         solver_available=_solver_available_for_current_page(ctx, data),
-        solver_attempted=None if result == "unresolved" else result in {"failed", "attempted"},
+        solver_attempted=None if result == "unresolved" else result in {"failed", "not_solved", "attempted"},
         solver_result=result,
         solver_failure=failure,
+        solver_receipt=receipt,
+        frame_hosts=frame_hosts or None,
     )
 
 
@@ -370,13 +447,27 @@ def _levers(
     failure_type: DiagnosisFailureType,
     data: dict[str, Any],
     categories: list[str],
+    *,
+    bound_credential_ids: set[str] | None = None,
 ) -> list[Lever]:
     """Every product lever that exists for this wall, unordered, with availability read from existing state."""
     credential_shaped = failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT and (
         _safe_str(data.get("skip_reason")) in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS or "CREDENTIAL_ERROR" in categories
     )
-    if challenge is None and not credential_shaped:
-        return []
+    update_levers = [
+        Lever(
+            mechanism="credential_update",
+            knowledge_topic="login_block",
+            availability="already asked this turn" if ctx.credential_totp_update_asked else "available",
+            credential_id=credential_id,
+        )
+        for credential_id in sorted(bound_credential_ids or ())
+    ]
+    # A mounted vendor frame is not a wall, so it buys no recourse inventory; the levers come back
+    # the moment a carrier or an anti-bot category does.
+    wall = challenge if challenge is not None and challenge.basis == "run_wall" else None
+    if wall is None and not credential_shaped:
+        return update_levers
     policy = ctx.request_policy
     approved = bool(policy and (policy.resolved_credentials or policy.selected_connected_account_id))
     credential_lever = Lever(
@@ -385,9 +476,9 @@ def _levers(
         availability="credential approved this chat" if approved else "no credential approved this chat",
     )
     human_lever = Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")
-    if challenge is None:
-        return [credential_lever, human_lever]
-    solver_available = challenge.solver_available
+    if wall is None:
+        return [*update_levers, credential_lever, human_lever]
+    solver_available = wall.solver_available
     return [
         Lever(
             mechanism="captcha_solver",
@@ -400,6 +491,7 @@ def _levers(
             mechanism="proxy_location", knowledge_topic="proxy_location", availability=proxy_location_lever_label(ctx)
         ),
         Lever(mechanism="browser_profile", knowledge_topic="proxy_location"),
+        *update_levers,
         credential_lever,
         human_lever,
     ]
@@ -408,7 +500,8 @@ def _levers(
 def author_time_levers(ctx: CopilotContext) -> list[Lever]:
     """The same lever inventory for a challenge seen at author time, before any run exists."""
     challenge = ChallengeEffects(
-        kind=(kind.value if (kind := typed_challenge_kind(getattr(ctx, "composition_page_evidence", None))) else None),
+        basis="run_wall",
+        kind=(kind.value if (kind := typed_challenge_kind(ctx.composition_page_evidence)) else None),
         solver_available=_solver_available_for_current_page(ctx),
     )
     return _levers(ctx, challenge, DiagnosisFailureType.UNKNOWN, {}, [])
@@ -419,11 +512,11 @@ def _solver_available_for_current_page(ctx: CopilotContext, data: dict[str, Any]
 
     Post-run composition evidence is only stored under the code-only browser policy, so the run
     result's own URL stands in for it; without either URL the answer stays unresolved."""
-    available = getattr(ctx, "captcha_solver_available", None)
+    available = ctx.captcha_solver_available
     if available is None:
         return None
-    resolved_for = getattr(ctx, "captcha_solver_available_for_url", None)
-    evidence = getattr(ctx, "composition_page_evidence", None)
+    resolved_for = ctx.captcha_solver_available_for_url
+    evidence = ctx.composition_page_evidence
     current = (evidence.get("current_url") or evidence.get("inspected_url")) if isinstance(evidence, dict) else None
     if not current and isinstance(data, dict):
         current = _safe_str(data.get("current_url"))
@@ -580,11 +673,6 @@ def _str_list(value: Any) -> list[str]:
         if isinstance(value, list)
         else []
     )
-
-
-def _ctx_user_goal(ctx: Any) -> str:
-    user_message = getattr(ctx, "user_message", None)
-    return user_message if isinstance(user_message, str) else ""
 
 
 def _failure_categories(raw: list[Any]) -> list[str]:
@@ -761,11 +849,11 @@ def _current_code_authoring_repair_context(data: dict[str, Any]) -> CodeAuthorin
 
 
 def _last_test_anti_bot_is_terminal(ctx: CopilotContext) -> bool:
-    anti_bot_reason = getattr(ctx, "last_test_anti_bot", None)
+    anti_bot_reason = ctx.last_test_anti_bot
     if not isinstance(anti_bot_reason, str) or not anti_bot_reason.strip():
         return False
 
-    evidence = getattr(ctx, "composition_page_evidence", None)
+    evidence = ctx.composition_page_evidence
     if isinstance(evidence, dict) and evidence.get("observed_after_workflow_run") is True:
         challenge_state = evidence.get("challenge_state")
         if isinstance(challenge_state, dict) and (

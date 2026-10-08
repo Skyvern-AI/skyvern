@@ -1,8 +1,8 @@
 /**
  * Regression test for the getIncrementElements crash path in domUtils.js: a
  * mid-click context reset can wipe window.globalParsedElementCounter, and the
- * wait loop dereferenced `.get()` on undefined and threw a TypeError. The guard
- * must skip the wait when the counter is gone and return an empty result.
+ * wait loop dereferenced `.get()` on undefined and threw a TypeError. Waiting
+ * now tracks pending entries independently of the parsed counter.
  * Exit 0 = pass, exit 1 = failures on stderr.
  */
 
@@ -34,6 +34,13 @@ function extractFn(name) {
   return src.substring(fnStart, fnEnd);
 }
 
+const OBSERVER_VERSION_MATCH = src.match(
+  /const INCREMENTAL_OBSERVER_VERSION = (\d+);/,
+);
+if (!OBSERVER_VERSION_MATCH)
+  throw new Error("INCREMENTAL_OBSERVER_VERSION not found");
+const OBSERVER_VERSION = Number(OBSERVER_VERSION_MATCH[1]);
+
 const makeGetIncrementElements = new Function(
   "window",
   "asyncSleepFor",
@@ -42,8 +49,15 @@ const makeGetIncrementElements = new Function(
   "buildElementObject",
   "stampOtpInputBoxes",
   "otpContainerCounts",
-  `${extractFn("getIncrementElements")}\nreturn getIncrementElements;`,
+  // getIncrementElements now drains through the observer-aware helpers, so bind them (and the version
+  // const the exact-match check closes over) too.
+  `const INCREMENTAL_OBSERVER_VERSION = ${OBSERVER_VERSION};\n` +
+    `${extractFn("isCurrentIncrementalObserver")}\n${extractFn("hasSplicingObserverContract")}\n` +
+    `${extractFn("waitForIncrementalDrain")}\n` +
+    `${extractFn("getIncrementElements")}\nreturn getIncrementElements;`,
 );
+
+const CURRENT_OBSERVER = { skyvernObserverVersion: OBSERVER_VERSION };
 
 const immediateSleep = () => Promise.resolve();
 const throwingDocument = {
@@ -120,20 +134,97 @@ function assertEmptyResult(result) {
     assertEmptyResult(result);
   });
 
-  // --- guard must not break the normal wait path when the counter exists ---
-  await test("getIncrementElements: defined counter still waits until parsed catches up", async () => {
-    let getCalls = 0;
+  await test("getIncrementElements: undefined pending entries with waiting enabled is safe", async () => {
     const win = {
-      globalParsedElementCounter: {
-        get: async () => (getCalls++ === 0 ? 0 : 1),
-      },
+      globalOneTimeIncrementElements: undefined,
+      globalDomDepthMap: new Map(),
+    };
+    assertEmptyResult(await bind(win)(true));
+  });
+
+  await test("getIncrementElements: current observer waits for pending work without a parsed counter", async () => {
+    let waited = false;
+    const win = {
+      globalObserverForDOMIncrement: CURRENT_OBSERVER,
+      globalParsedElementCounter: undefined,
       globalOneTimeIncrementElements: [{}],
       globalDomDepthMap: new Map(),
     };
-    const result = await bind(win)(true);
+    const result = await bind(win, async () => {
+      waited = true;
+      win.globalOneTimeIncrementElements.pop();
+    })(true);
+    assert(waited, "read must wait for pending work to finish");
+    assertEmptyResult(result);
+  });
+
+  await test("getIncrementElements: legacy observer drains by parsed counter, not array length", async () => {
+    let sleeps = 0;
+    const win = {
+      globalObserverForDOMIncrement: {}, // unmarked -> legacy contract
+      globalParsedElementCounter: { get: async () => win._parsed },
+      _parsed: 0,
+      globalOneTimeIncrementElements: [{}, {}], // monotonic history the legacy callback never splices
+      globalDomDepthMap: new Map(),
+    };
+    const result = await bind(win, async () => {
+      sleeps += 1;
+      win._parsed = win.globalOneTimeIncrementElements.length;
+    })(true);
     assert(
-      getCalls >= 2,
-      "wait loop ran at least one iteration before exiting",
+      sleeps === 1,
+      "legacy drain must wait until the parsed counter catches the history length",
+    );
+    assertEmptyResult(result);
+  });
+
+  await test("getIncrementElements: unstamped splicing observer drains by pending length, not the parsed counter", async () => {
+    let sleeps = 0;
+    const win = {
+      globalObserverForDOMIncrement: {}, // unstamped, but a transitional splicing build
+      globalIncrementalJobCount: 3, // scalar already bumped -> splicing contract proven
+      globalParsedElementCounter: { get: async () => 9 }, // counter raced past the pending length
+      globalOneTimeIncrementElements: [{}], // one job still in flight, not yet spliced
+      globalDomDepthMap: new Map(),
+    };
+    const result = await bind(win, async () => {
+      sleeps += 1;
+      win.globalOneTimeIncrementElements.pop();
+    })(true);
+    // The pre-splice predicate (parsed 9 >= length 1) would exit immediately and abandon the pending
+    // entry; the splicing contract must wait for the array to drain instead.
+    assert(
+      sleeps === 1,
+      "splicing observer must wait for the pending entry to splice out, not exit on the parsed counter",
+    );
+    assertEmptyResult(result);
+  });
+
+  await test("getIncrementElements: drain reevaluates the contract once the scalar proves splicing", async () => {
+    let sleeps = 0;
+    const win = {
+      globalObserverForDOMIncrement: {}, // unstamped
+      globalIncrementalJobCount: 0, // idle at entry -> pre-splice contract
+      globalParsedElementCounter: { get: async () => win._parsed },
+      _parsed: 0,
+      globalOneTimeIncrementElements: [{}], // a pending entry from a job about to prove itself
+      globalDomDepthMap: new Map(),
+    };
+    const result = await bind(win, async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        // first job completes: bumps the scalar and races the parsed counter past the pending length
+        win.globalIncrementalJobCount = 1;
+        win._parsed = 5;
+      } else {
+        win.globalOneTimeIncrementElements.pop();
+      }
+    })(true);
+    // A contract captured once at entry would stay pre-splice and exit on the raced counter, leaking
+    // the pending entry; reevaluating each poll switches to pending-length draining after the bump.
+    assert(
+      sleeps === 2,
+      "drain must switch to pending-length semantics after the scalar proves splicing",
     );
     assertEmptyResult(result);
   });

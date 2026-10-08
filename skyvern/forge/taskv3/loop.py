@@ -24,18 +24,31 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
+from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, Sequence, TypeVar
+from urllib.parse import urlsplit
 
 import structlog
 
 from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
+from skyvern.forge.taskv3.goal_check import (
+    GoalVerdict,
+    NonCompletedStatus,
+    ToolTrail,
+    TrailEntry,
+    UnlistedReask,
+)
+from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
+from skyvern.forge.taskv3.target_label import describe_target
+from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
 LOG = structlog.get_logger()
 
 ToolStatus = Literal["ok", "error"]
 FinishStatus = Literal["completed", "failed", "terminated"]
+UnlistedReaskCheck = Callable[[NonCompletedStatus, str], Awaitable[UnlistedReask]]
 
 # Why a failing tool call failed, as one closed vocabulary. Spelled as a `Literal` rather than `str`
 # because the whole value of the facet is that it is closed: it is written at ~33 literal sites in
@@ -56,12 +69,30 @@ ToolErrorClass = Literal[
     "ref_not_in_latest",
     "stale_mark",
     "mark_not_in_latest",
+    # A guessed menu number on an open menu whose rows were withheld, so never numbered.
+    "rows_unlisted",
     # The target resolved, but the page will not let the act happen.
     "disabled",
     "not_editable",
+    # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
+    "value_changed_by_page",
+    # `type`: another segment of the same date moved and could not be put back, or could not be read back.
+    "date_sibling_moved",
+    "date_sibling_unverified",
+    # `type`: the date segment written did not hold its value afterwards.
+    "date_segment_not_committed",
+    # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
+    # one-character-per-box code field whose boxes did not all keep their character.
+    "text_not_held",
     "covered",
     "inert",
     "unreachable",
+    # `file_upload`: the target is not a file input, holds no single one, and opened no file picker;
+    # or it is one whose click would submit its form, so it was not clicked.
+    "no_file_input",
+    "submits_form",
+    # `file_upload`: the input could not be read back and no upload request was seen.
+    "attach_unconfirmed",
     # The field resolved and the page cooperated, but the requested VALUE named no single option.
     # Each of these names only what was READ: an absence claim holds solely over a list read in full,
     # which is why a declared-but-truncated list gets `rows_unread` rather than `no_matching_row`.
@@ -69,15 +100,60 @@ ToolErrorClass = Literal[
     "identical_rows",
     "no_matching_row",
     "rows_unread",
+    # The field opened, but no option list rendered to read at all.
+    "no_option_list",
     # A read asked to resume past the end of what it was reading. Not an address failure and not a
     # page refusal: the call was well-formed and the page cooperated, the offset simply named nothing.
     "offset_past_end",
     # The offset itself was unusable — negative, or not a whole number of characters.
     "invalid_offset",
+    # `navigate`: nothing committed — a net error, or the commit budget expired with no response.
+    "navigation_failed",
+    # `type` into a click-to-edit grid cell: opening or committing its editor navigated, opened a dialog, or left a
+    # page the edit could not be checked on.
+    "edit_interrupted",
+    # The value was a credential's one-time-code field, and no code could be produced for this call.
+    "no_one_time_code_source",
+    # A one-time-code placeholder was combined with other text, or named no credential field.
+    "unusable_one_time_code_value",
     # The handler raised instead of returning; classified by `_raised_error_class`.
     "driver_timeout",
     "timeout_other",
     "handler_raised",
+    # `select_combobox` and typeahead outcomes. Kept apart from the classes above that the Enter-search hint
+    # reads (`_ENTER_SEARCH_HINT_ERROR_CLASSES` in tools.py), so naming a site never changes what the model sees.
+    "unproven_row",
+    "option_disabled",
+    "blank_value",
+    "unsupported_argument",
+    "list_not_opened",
+    "rows_are_navigation",
+    "rows_under_categories",
+    "list_unread",
+    "list_ambiguous",
+    "list_no_match",
+    "filter_not_found",
+    "filter_changed_field",
+    "no_suggestion_offered",
+    "no_suggestion_matched",
+    "enter_not_pressed",
+    "enter_navigated",
+    "enter_results_unseen",
+    "enter_committed_other",
+    "click_failed",
+    # The pick was clicked: the field read back something else, or could not be read back at all.
+    "did_not_commit",
+    "commit_unread",
+    "commit_reverted",
+    "close_hid_field",
+    # `solve_captcha`: the page was unavailable, the solve timed out or raised, or a challenge stayed on the page.
+    # `challenge_not_attempted` is a challenge frame no solver arm ran on.
+    "page_unavailable",
+    "solve_timed_out",
+    "solve_raised",
+    "challenge_unsupported",
+    "challenge_not_attempted",
+    "challenge_unsolved",
     # An erroring call whose construction site named no class. Deliberately a value rather than an
     # absence, so "errored, unnamed" is countable and cannot be confused with "did not error".
     "other",
@@ -95,6 +171,63 @@ ToolOkClass = Literal[
     "solved",
     "absent",
     "attempts_exhausted",
+    # `solve_captcha` with `image_selector`: characters were read off the image. Not "solved" -- only the
+    # page can say whether they were right, after the model types them.
+    "image_text_read",
+    # `file_upload`. `attached_no_activity` is the file confirmed on the input with no upload request
+    # seen -- a form that sends the file with the submit lands here, and so does an unwired handler.
+    "upload_seen",
+    "consumed_shown",
+    "attached_no_activity",
+    # `navigate`, in descending order of how far the landed document got: `loaded` saw the load event
+    # fire, `document_ready` returned on domcontentloaded with load still outstanding, and
+    # `committed_not_loaded` got a document that never became ready inside the readiness budget.
+    "loaded",
+    "document_ready",
+    "committed_not_loaded",
+]
+
+# Which `covered` message the model actually got. They are one `tool_error_class`, so without this
+# the split is only recoverable by pulling step archives and classifying the prose.
+CoveredBranch = Literal[
+    # The layer was named and its controls enumerated into the message.
+    "named",
+    # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
+    "challenge",
+    # The walk qualified nothing, the hit was the field's OWN container, AND an ancestor was found
+    # clipping the point the click would land on. The message names that container and asks for it to
+    # be opened or scrolled, because there is no third party here to dismiss. Same real-world
+    # condition as `error_class="unreachable"` -- union them for a reachability census.
+    "clipped",
+    # No reading at all: the probe reported occlusion without naming anything and without locating a
+    # clip. Four producers, and for some of them "something is on top of it" is exactly right: an
+    # ancestor drawing its own ::before veil (a busy card), a scrim drawn as `body::before` (which
+    # hit-tests AS body and so never reaches the naming walk at all), a pinned cover the field
+    # collapsed under, and a skinned control whose own label covers it.
+    "unnamed",
+    # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
+    "invisible",
+    # The layer is the field's own container and a non-interactive element in it takes the pointer;
+    # the message names that stamped element to click, so no controls are listed.
+    "own_container",
+]
+
+# WHICH ELEMENT the probe named as the layer, which the branch cannot recover. `named` with zero
+# controls spans two different events: a real overlay whose controls the enumeration dropped, and a
+# walk that qualified nothing and named the raw hit element -- an option row or a value cell, which
+# has no actionable child and nothing to dismiss. Only the probe knows which, so it is on the record.
+CoveredLayerKind = Literal[
+    # The walk found an element that qualifies as a layer: pinned, a layer role, aria-modal, <dialog>,
+    # or view-sized.
+    "qualified",
+    # Nothing qualified, so the probe named the hit element itself.
+    "hit_fallback",
+    # `clipped` only: the probe named the ancestor it found clipping the click point. Not a layer --
+    # nothing is over the control -- but it is the one address the message can offer, so this is the
+    # split between a `clipped` the model can act on and one that can only say "that container".
+    "clipper",
+    # The probe named no element at all.
+    "unnamed",
 ]
 
 
@@ -115,6 +248,12 @@ class ToolResult:
     # OTHER one drops it silently; the classmethods below cannot express that pairing (neither
     # accepts the other's kwarg) and the raw constructor is the only route that could.
     ok_class: ToolOkClass | None = None
+    # The requested action was refused and never dispatched (a ToolRefusal). A field, not a raise, so
+    # every wrapper around the handler still post-processes the call.
+    refused: bool = False
+    # A refused call that still dispatched input to the page first, to release a previous field's
+    # suggestion list. It is charged and the page may have changed, though the requested action never ran.
+    touched_page: bool = False
 
     @classmethod
     def ok(
@@ -137,12 +276,38 @@ class ToolResult:
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 
 
+class ToolRefusal(Exception):
+    """Refuse the call before it acts on the page (no input dispatched; a marker attribute written to
+    address an element is not an action). The loop sends the message alone as a refused error, which
+    does not spend an action step within the grace, so it must carry nothing the model must not see."""
+
+    def __init__(self, message: str, *, error_class: ToolErrorClass, data: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.error_class: ToolErrorClass = error_class
+        self.data = data
+
+    @classmethod
+    def of(cls, result: ToolResult) -> ToolRefusal:
+        return cls(result.content, error_class=result.error_class or "other", data=result.data)
+
+    def as_result(self) -> ToolResult:
+        return ToolResult("error", str(self), self.data, error_class=self.error_class, refused=True)
+
+
 # The tool-result `data` keys the target-name/target-kind capture ride on (written by the browser
 # tools, read here). Internal to the loop: only `content` is ever shown to the model, so they cost no
 # tokens. The label composition itself -- the floor vocabulary, the shape filter, the secret matcher --
 # lives in target_label.py; this module only carries the two raw values from probe to `RoundAction`.
 TARGET_LABEL_DATA_KEY = "target_label"
 TARGET_KIND_DATA_KEY = "target_kind"
+# The tool-result `data` key a recorded action's outcome rides on: the machine facts about what the
+# call achieved (`requested_url`, `url`, `http_status`, `page_transitioned`, `navigation_dead_end`),
+# carried verbatim to `RoundAction.outcome` for the caller to persist on the action row. Internal to
+# the loop like the two keys above -- never shown to the model, which reads the tool's own content.
+ACTION_OUTCOME_DATA_KEY = "action_outcome"
+# An HTTP status at or above this reached no usable page, so the action row reads as failed even
+# though the tool honestly returned ok (the model still gets the status and decides what to do).
+ACTION_OUTCOME_FAILED_HTTP_STATUS = 400
 # How long a call spent turning an address into a target, before the act. A context variable rather
 # than a field on the result, because the cohort this exists to price is the one where the handler
 # RAISES -- a driver timeout on a resolved target -- and a result the handler never returned cannot
@@ -154,19 +319,28 @@ TARGET_KIND_DATA_KEY = "target_kind"
 #   absent          no address was supplied. Its only meaning -- never "measured, and it was zero".
 #   ref / mark      the server-side table lookup and the frame routing it implies: the persistent-ref
 #                   model's own addressing cost, which is what this field exists to price.
-#   css             the frame ROUTING only, and only with frame perception ON. With it off, a plain
-#                   selector is resolved later, INSIDE the handler, so the row is ~0 and that
-#                   resolution is counted in `duration_seconds` instead.
+#   css             the frame ROUTING only: which realm a typed selector resolves in.
 # Working-page acquisition is excluded on every branch: every design has to get the page, so it is
-# not a cost of the addressing model. Because the css meaning is the one that moves, every row that
-# carries this also carries `frame_perception` -- a dataset spanning the ramp otherwise mixes the two
-# definitions with nothing on the record to cut on.
+# not a cost of the addressing model.
 _RESOLVE_SECONDS: ContextVar[float | None] = ContextVar("taskv3_resolve_seconds", default=None)
-_FRAME_PERCEPTION: ContextVar[bool | None] = ContextVar("taskv3_frame_perception", default=None)
 # Which case behind the click reach-probe's boolean applied, for the one click call this context covers.
 # A context variable rather than a result field because `click` returns from many places, several of
 # them after the probe has already answered -- the same reason `_RESOLVE_SECONDS` lives here.
 _HIT_CLASS: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_hit_class", default=None)
+# Which `covered` message the refusal rendered, for the one tool call this context covers. A context
+# variable for the same reason `_HIT_CLASS` is one: the covered message is built in a shared helper
+# five call sites reach, several of them after the probe has already answered.
+_COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_layer", default=None)
+# Where a typing call's reach probe ran and whether it scrolled first; set only by that probe.
+_TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach", default=None)
+# A click that raised after the page received it (a slow submit whose navigation had not committed).
+_CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
+# The text-delta read's cost and yield for the one tool call this context covers.
+_TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | None] = ContextVar(
+    "taskv3_text_delta", default=None
+)
+# The ordinal of the tool call being dispatched, so a tool can say how many calls a report spans.
+_TOOL_CALL_SEQ: ContextVar[int | None] = ContextVar("taskv3_tool_call_seq", default=None)
 
 
 def record_resolve_seconds(elapsed: float) -> None:
@@ -186,9 +360,10 @@ def record_hit_class(
 
     `needed` is on the record because the class alone cannot recover it: a shadow-rooted target
     answers `unknown` with needed=TRUE, so `unknown` would otherwise pool the rows that bought the
-    second probe with the rows that answered nothing. Every `hit_class` value names what the hit test
-    RETURNED, never why — nothing in that probe tells a real occluder from a hit that fell through,
-    since a modal scrim drawn as `body::before` hit-tests as body and still blocks the click.
+    second probe with the rows that answered nothing. `disabled` is answered before any hit test runs;
+    every other `hit_class` value names what the hit test RETURNED, never why — nothing in that probe
+    tells a real occluder from a hit that fell through, since a modal scrim drawn as `body::before`
+    hit-tests as body and still blocks the click.
     `isolated` says which realm answered -- realms, not costs, since its `False` side spans both the
     cheapest fallback and the most expensive retry storm. `raised` marks a probe that threw, whose
     duration is a blow-up rather than a cost. The RECORDED copies are inert: the click path branches on
@@ -205,9 +380,61 @@ def record_hit_class(
     )
 
 
-def record_frame_perception(enabled: bool) -> None:
-    """Stamp which of the two definitions above produced this call's reading. Telemetry only."""
-    _FRAME_PERCEPTION.set(enabled)
+def record_text_delta(
+    seconds: float,
+    lines: int | None,
+    chars: int = 0,
+    *,
+    over_bound: bool = False,
+    skipped: str | None = None,
+    pending: int = 0,
+) -> None:
+    """Record the text-delta read. Telemetry only. `lines` is None when the read failed, timed out or
+    was past the char bound (`over_bound`), or when the tool errored after a read before it ran; else
+    how many lines rose, counted before the char budget cut them. `chars` is the section's length.
+    `skipped` names why a call did not read at all: "over_bound" (this document was already read past
+    the bound) or "unreadable" (its reads failed twice in a row).
+    `pending` is how many lines the result carries from before the call ran (a read before a repeated
+    call, or held lines, flushed or risen again), each counted once: part of `lines` when the call's own
+    read succeeded, and still reported when it did not (`lines` None). A call that does not report
+    records it too when it carries flushed lines."""
+    _TEXT_DELTA.set((seconds, lines, chars, over_bound, skipped, pending))
+
+
+def current_tool_call_seq() -> int | None:
+    """The loop's ordinal for the tool call being dispatched; None outside the loop."""
+    return _TOOL_CALL_SEQ.get()
+
+
+def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: CoveredLayerKind) -> None:
+    """Record which `covered` message this call rendered. Telemetry only, never a behaviour change.
+
+    `controls` is how many controls the MESSAGE named, not how many the probe found: a control with
+    neither a selector nor a label is dropped from the message, and the existing eight-slot
+    truncation caps what the model is handed. So this is the count the model acted on. WHAT A
+    DENOMINATOR MEANS HERE: zero is not one event. Under `unnamed` it means there was no layer to
+    enumerate; under `clipped` it is zero always, because a container is not a layer and its
+    controls are never the thing to act on; under `named` it means the layer had no control the
+    enumeration could name. Cut on `tool_error_class:covered`, then group by `covered_branch`, and
+    read the count within a branch.
+    """
+    _COVERED_LAYER.set({"branch": branch, "controls": int(controls), "layer_kind": layer_kind})
+
+
+def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_document_root: bool) -> None:
+    """Record where a typing call's reach probe ran. Telemetry only, never a behaviour change."""
+    # Sticky within the call: a second probe finds the field the first one already scrolled into view.
+    seen = _TYPE_REACH.get() or {}
+    new = {
+        "acted_in_frame": acted_in_frame,
+        "probe_scrolled": probe_scrolled,
+        "hit_on_document_root": hit_on_document_root,
+    }
+    _TYPE_REACH.set({key: value or seen.get(key, False) for key, value in new.items()})
+
+
+def record_click_dispatched() -> None:
+    _CLICK_DISPATCHED.set(True)
 
 
 # What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
@@ -262,17 +489,22 @@ def _raised_error_class(exc: BaseException) -> ToolErrorClass:
     return "handler_raised"
 
 
+def mark_is_filler(mark: Any) -> bool:
+    # look() numbers marks from 1, so 0 addresses nothing: it is an upstream filling the optional slot,
+    # not the model addressing by mark. `to_openai_tool` sets the `strict` key that provokes that, so
+    # this is the tolerance for an upstream that fills it anyway.
+    return mark == 0 and not isinstance(mark, str)
+
+
 def _selector_kind(args: dict[str, Any]) -> str:
     """How the model addressed its target on this call, read off the ARGS AS SENT.
 
     Must be taken before dispatch: the ref and act-by-mark wrappers rewrite `args["selector"]` in
     place, so the same read afterwards reports the resolved address rather than the one the model
     chose. It is the cut for `resolve_seconds`, but the two cohorts are NOT symmetric and the
-    contract above `_RESOLVE_SECONDS` says how: a `css` row bounds frame routing only, and only with
-    frame perception on -- a plain selector is otherwise resolved inside the handler and its row is
-    ~0. Read the two together with `frame_perception`, which rides the same record for that reason.
+    contract above `_RESOLVE_SECONDS` says how: a `css` row bounds frame routing only.
     """
-    if args.get("mark") is not None:
+    if args.get("mark") is not None and not mark_is_filler(args.get("mark")):
         return "mark"
     selector = args.get("selector")
     # `not selector`, matching what the wrappers themselves treat as absent. Note this does NOT make
@@ -301,6 +533,14 @@ class RoundAction(NamedTuple):
     # downstream: the loop already read it off the ToolSpec, and a second name list is a second place
     # for a new tool to be missing from.
     billable: bool = False
+    # What the action achieved, as the tool itself reported it (see ACTION_OUTCOME_DATA_KEY): machine
+    # facts only, for the caller to persist alongside the verb. None when the tool reported none --
+    # a call that errored before it reached a page has only its `error` below to offer.
+    outcome: dict[str, Any] | None = None
+    # The tool's own error text when the call failed, which is all a call that never reached a page
+    # can say about itself -- a refusal the engine issued on purpose reads as an unexplained failed
+    # row without it. Model-facing prose, so a caller that persists it must redact and cap it.
+    error: str | None = None
 
 
 # A probe consulted after a billable/download-signaling tool result; a truthy return ends the run as
@@ -315,6 +555,8 @@ CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
 # non-complete verdict given up with polling budget still unspent are the same concern seen from two
 # sides; splitting them into two hooks would scatter it.
 VerificationBlocker = Callable[[str], Awaitable[str | None]]
+# The status a re-ask conversion asks the verification gate about: a completion the model never claimed.
+CONVERSION_VERIFICATION_STATUS = "converted"
 
 
 @dataclass
@@ -327,6 +569,23 @@ class ToolSpec:
     billable: bool = False  # a page-mutating browser action that meters like a step-engine action
     recordable: bool = False  # persisted as an action row (with screenshot) but not billed/budgeted
     compactable: bool = False  # a large perception result safe to elide from the transcript once superseded
+    # Its result hands out handles (observe refs, look marks) that the tool's NEXT call disposes and renumbers,
+    # so an older result is not merely older but wrong to act on. Compaction keeps exactly one of these,
+    # whatever the page showed; a result without handles stays usable and is superseded only by the same content.
+    issues_handles: bool = False
+    # Drives the live page without being billed or recorded. Read ONLY as engagement ("did this run
+    # touch the page at all"), never as budget or artifact parity -- those are `billable` and
+    # `recordable`, and widening either to cover this would change action rows and the step budget.
+    # Exists because `open_verification_link` calls page.goto() while carrying neither flag, so an
+    # engagement predicate built on those two alone calls a run that navigated "never tried".
+    engages_page: bool = False
+    # Whether a call's target carries the toggle state observe prints (checked/pressed). Consulted only
+    # to exempt a click from the post-failure submit skip; set by the browser tools on click alone.
+    toggle_probe: Callable[[dict[str, Any]], Awaitable[bool]] | None = None
+
+    @property
+    def touches_page(self) -> bool:
+        return self.billable or self.recordable or self.engages_page
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -335,6 +594,11 @@ class ToolSpec:
                 "name": self.name,
                 "description": self.description,
                 "parameters": self.parameters,
+                # Stated rather than left unset because OpenRouter reads an unset `strict` as license
+                # to fill every declared property with a type default (`mark: 0`, `selector: ""`),
+                # which the act wrappers then refuse. `True` is not the alternative: these schemas
+                # are not strict-shaped and it 400s. See GOTCHAS.md "Loop" for the measured matrix.
+                "strict": False,
             },
         }
 
@@ -343,15 +607,11 @@ class ToolSpec:
 class LoopOutcome:
     status: Literal["completed", "failed", "terminated", "budget_exhausted", "loop_error", "canceled"]
     reason: str
+    # Which loop guard authored this verdict (`PERCEPTION_STALL_GUARD` and its siblings), or None for a
+    # terminal the model or a budget produced. This is the machine-readable class that used to be a
+    # prefix on `reason`; `reason` itself is customer-facing text (see `_guard_verdict`).
+    guard: str | None = None
     extracted_output: Any = None
-    # A user-defined error code the MODEL chose when finishing, drawn from the task's
-    # error_code_mapping. Only ever set on a deliberate finish; None means the model was offered codes
-    # and picked none, or was never offered any (the two are distinguished by error_codes_offered).
-    error_code: str | None = None
-    # Whether the finish tool exposed the customer's codes at all. Lets the caller tell "the model
-    # declined to name a code" from "the model was never asked", so a post-hoc detector can stay out
-    # of the way of a deliberate choice without also going silent on tasks that never had one.
-    error_codes_offered: bool = False
     # The raw budget-cap string (e.g. "max_turns (40) reached") that granted this run its one final
     # observed turn, carried on whatever outcome the final turn produces — a finish verdict or, if
     # the model didn't finish, the honest budget_exhausted exit. None for a run that never tripped a cap.
@@ -365,9 +625,6 @@ class LoopOutcome:
     # Turns where the model answered with prose instead of a tool call, costing a full round trip
     # plus the NO_TOOL_CALL_NUDGE recovery turn.
     no_tool_call_turns: int = 0
-    # Whether tool_choice was still being sent when the run ended. Distinguishes a run that was
-    # asked to force tool calls from one where the request was degraded away mid-run.
-    tool_choice_in_effect: bool = False
     billable_actions: list[str] = field(default_factory=list)
     # Perception snapshots are compacted in place during the run, so superseded observe/get_html
     # content is already elided here — treat as lossy if ever persisted for audit.
@@ -376,6 +633,11 @@ class LoopOutcome:
     # The None default only covers an outcome built by someone else; the caller still writes its
     # record and simply carries no progress fields on it.
     telemetry: TerminalTelemetry | None = None
+    # Set when the unlisted-outcome re-ask turned the model's failed/terminated finish into completed; a
+    # post-loop veto of that completion restores this status and reason instead of failing the task.
+    converted_from: NonCompletedStatus | None = None
+    converted_from_reason: str = ""
+    unlisted_reask: dict[str, Any] | None = None
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -451,24 +713,24 @@ NO_TOOL_CALL_NUDGE = (
 PERCEPTION_STALL_NUDGE_AFTER = 6
 PERCEPTION_STALL_TERMINATE_AFTER = 15
 
-# SKY-16330. How many DISTINCT reads of one compactable tool survive compaction. Supersession means a
-# snapshot went stale, and a read of region B does not make a read of region A stale — they answer
-# different questions — so eliding A on B's arrival leaves a document larger than one result
-# impossible to assemble: broad reads are cut at HTML_MAX_CHARS and narrow ones are erased.
-#
-# 2, and the ceiling is what sets it. `st.total_tokens` accumulates the re-sent transcript EVERY turn
-# against DEFAULT_MAX_TOKENS, which exists for exactly this spiral, and the measured failing runs are
-# dying on it — so every retained snapshot costs its size times the turns that follow it. At 2 this
-# holds ~2x HTML_MAX_CHARS of get_html; each further unit is another HTML_MAX_CHARS re-sent ~100
-# times. RAISE ONLY ON MEASURED EVIDENCE that two windows are not enough, not on the intuition that
-# more context helps. It cannot widen a tool whose reads do not differ: observe and look declare no
-# arguments, and the key is built from DECLARED arguments only, so all of their calls share one key
-# and exactly one of each survives, as before — whatever a non-strict provider adds to the call.
-PERCEPTION_SNAPSHOT_RETAIN = 2
+# SKY-17222. Read bodies (tools without handles) the model has already seen are retained by SIZE, not
+# count: once they sum past HIGH, the oldest are elided down to LOW in one rewrite (an epoch). HIGH is
+# the previous ceiling (two get_html windows, `tools.HTML_MAX_CHARS` each), so the worst case does not
+# move. Between epochs the transcript only grows at the end, which is what a provider prefix cache
+# needs: it hits only when the whole previous request is a byte prefix of the next one.
+PERCEPTION_RETAIN_CHARS_LOW = 20_000
+PERCEPTION_RETAIN_CHARS_HIGH = 2 * PERCEPTION_RETAIN_CHARS_LOW
+# However large they are, the newest reads the model has seen that an epoch keeps: two paged windows.
+PERCEPTION_RETAIN_MIN_READS = 2
+# A same-bytes marker replaces a body only when it saves most of it; on a short body it costs more.
+PERCEPTION_MARKER_MIN_RATIO = 4
 
-# Stable, facetable prefix for the stall verdict's reason — telemetry queries key on it to measure
-# how often the policy fires; change it only with the dashboards that read it.
-PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
+# The stall verdict's machine class. Stable and facetable — telemetry keys on it to measure how often
+# the policy fires — and it travels beside the verdict (`LoopOutcome.guard`, the guard's log line, the
+# engine's terminal record), never inside its text: a verdict's `reason` is persisted verbatim as the
+# customer-facing `task.failure_reason`, so a dashboard facet in it is a facet the customer reads
+# (SKY-16271). Change it only with the dashboards that read it.
+PERCEPTION_STALL_GUARD = "perception_stall"
 
 # Action-loop policy: N repeated executions of the same billable action (same tool + same args)
 # with no new evidence the page changed mean the run is re-trying against an unchanged outcome —
@@ -493,8 +755,8 @@ ACTION_LOOP_NUDGE_AFTER = 3
 # goal progress, only of page change.
 ACTION_LOOP_TERMINATE_AFTER = 8
 
-# Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
-ACTION_LOOP_REASON_PREFIX = "action_loop:"
+# Facetable sibling of PERCEPTION_STALL_GUARD; same dashboard contract.
+ACTION_LOOP_GUARD = "action_loop"
 
 # Progress-gated action-step budget extension (SKY-15264): a run that hits its action-step cap while
 # the page is still demonstrably changing (a repeated probe returned fresh content, a navigation or
@@ -511,10 +773,38 @@ ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
 # Total growth stops at this multiple of the original cap. The wall clock — the one cap that is not
 # a function of the action-step budget — is the outer runaway stop and is never re-derived.
 ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
+# Refusals left uncharged in a row before a refusal is charged like any failed call. The repeat guard cannot
+# bound them (a stale address resets it), so this does.
+UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
+# Rounds a single-action block may spend past its cap before its own action has landed. The step engine
+# completes such a block on one SUCCESSFUL step after retrying failed ones, and lets that step batch a
+# precursor; a v3 cap of 1 is spent by a hover, a precursor, or a click that failed without moving the page.
+ACTION_BLOCK_TARGET_ACTION_RESERVE = 2
+# Set on a click result once the driver's click returned, so a later verification error still reads as dispatched.
+CLICK_DISPATCHED_DATA_KEY = "click_dispatched"
+TARGET_ACTION_ROUND_EVENT = "taskv3 loop target action round"
 # Facetable event names — both the grant and the refusal are queryable so the gate's decision
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+# The token backstop trips first on long forms (each turn re-sends the transcript), so the gate may raise it alone.
+# What binds is page-change evidence after a never-made billable action, plus the 3x/pool/ceiling bound.
+TOKEN_BUDGET_EXTENDED_EVENT = "taskv3 loop token budget extended"
+TOKEN_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop token budget extension refused"
+TOKEN_EXTENSION_FUNDED_ROUNDS = 2
+BATCH_SKIP_TOGGLE_EXEMPT_EVENT = "taskv3 loop batch skip exempted toggle click"
+CREDENTIAL_RESUBMIT_REFUSED_EVENT = "taskv3 loop credential resubmit refused"
+EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
+# Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
+# this module; the extraction-block refusal and tools.py's frame-work ledger both read this one set.
+FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
+# The arguments that carry what a fill tool typed or chose, per the tool schemas in tools.py. Selectors and
+# refs are excluded: they name a field, and a field's label on the page is not a value the block entered.
+ENTERED_VALUE_ARGS: dict[str, tuple[str, ...]] = {
+    "type": ("text",),
+    "select_option": ("value", "label", "values", "labels"),
+    "select_combobox": ("value", "search"),
+}
 # A wrap-up turn granted by a guard that a later budget extension raised past its trip; facetable
 # so a released latch is distinguishable from one that never fired.
 FINAL_TURN_RELEASED_EVENT = "taskv3 loop final turn grant released by budget extension"
@@ -538,8 +828,9 @@ PAGE_STATE_STALL_TERMINATE_AFTER = 12
 # live (benign direction); the shadow event measures the would-terminate precision on the canary,
 # and promotion to a live verdict is a separate release decision on that data.
 PAGE_STATE_STALL_SHADOW_EVENT = "taskv3 loop page state stall would terminate"
-# Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; reserved for the future live verdict.
-PAGE_STATE_STALL_REASON_PREFIX = "page_state_stall:"
+# Facetable sibling of PERCEPTION_STALL_GUARD; reserved for the future live verdict, which owes a
+# customer-facing sentence of its own the day it stops being shadow-only.
+PAGE_STATE_STALL_GUARD = "page_state_stall"
 
 # Hard "the resource does not exist / is gone" HTTP statuses. A navigation landing on one of these is
 # a genuine non-capability dead-end (a dead or removed posting), which v1 routes to `terminated`. Both
@@ -548,6 +839,15 @@ PAGE_STATE_STALL_REASON_PREFIX = "page_state_stall:"
 # capability failures, not dead-ends, and are left to the model / stay `failed`.
 NAVIGATION_DEAD_END_STATUSES = frozenset({404, 410})
 
+
+class _NavDeadEnd(NamedTuple):
+    """A navigation that landed on a hard dead-end status, and the URL it landed on when the tool
+    reported one."""
+
+    status: int
+    url: str | None
+
+
 # Defined here (not tools.py) so the batch-dispatch poisoning check below can compare against it
 # without an import cycle -- tools.py already imports ToolResult/ToolSpec from this module.
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
@@ -555,11 +855,17 @@ PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 # A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
 # removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
 # verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
-# navigation. Facetable sibling of the prefixes above.
-NAV_DEAD_END_REASON_PREFIX = "navigation_dead_end:"
+# navigation. Facetable sibling of the classes above.
+NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
-PAGE_REFRESH_EXHAUSTED_REASON_PREFIX = "page_refresh_exhausted:"
+PAGE_REFRESH_EXHAUSTED_GUARD = "page_refresh_exhausted"
+
+# A URL long enough to be a payload rather than a place is DROPPED from a verdict, never cut: the
+# customer-facing reason is redacted by whole-value match, so a truncated URL would no longer match a
+# registered secret it was cut from (the rule `clean_target_label` applies to an element name). The cap
+# is the handoff one rather than a second number: both answer "how much URL may leave the run".
+VERDICT_URL_MAX_CHARS = MAX_HANDOFF_URL_CHARS
 
 # Emitted, never acted on, when the oscillation rule WOULD have terminated. The step engine's
 # tripwires (skyvern/forge/sdk/fail_fast/shadow.py) earn the right to act by publishing this event
@@ -589,13 +895,14 @@ def telemetry_hash(salt: str, *parts: str) -> str:
 # as is a page-authored data-tv3-ref: observe addresses by a server-held ref, never by an
 # attribute, so nothing in the markup with that name is a handle this engine minted.
 _TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"')
+_TV3_PICK_VALUE_RE = re.compile(r'data-tv3-pick="[^"]*"')
 
 # get_html truncates to a fixed budget before the loop ever sees the content, so a marker the cut
 # leaves open at the tail has no closing quote for the pattern above and its churning digits would
 # be the one leak that survives canonicalization. The lookahead assumes the truncation notice itself
 # carries no quote character, and this sub must run AFTER closed markers are rewritten to the
 # quote-bearing placeholder — either broken silently brings the leak back.
-_TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)')
+_TV3_MARKER_CUT_RE = re.compile(r'(?:data-tv3="t\d*(?:-\d*)?|data-tv3-pick="[a-f0-9]*)(?=[^"]*\Z)')
 
 # A read can now start at an offset, so a marker can be cut open at the HEAD of a window too. Same
 # leak, same canonicalization, opposite end — but the boundary can land at ANY of the sixteen
@@ -616,9 +923,42 @@ _TV3_REF_ADDRESS_RE = re.compile(r"^ref=\d+", re.MULTILINE)
 _PERCEPTION_URL_LINE_RE = re.compile(r"^url=\S+", flags=re.MULTILINE)
 
 
+def _fold_reported_spans(content: str, spans: Sequence[Sequence[int]] | None, placeholder: str) -> str:
+    # Spans the TOOL reported, as offsets into `content` as returned. Anything out of range or overlapping
+    # is not ours to trust and is kept.
+    pieces: list[str] = []
+    cursor = 0
+    for span in sorted(list(s) for s in spans or () if len(s) == 2 and all(type(i) is int for i in s)):
+        start, end = span
+        if cursor <= start < end <= len(content):
+            pieces.append(content[cursor:start])
+            pieces.append(placeholder)
+            cursor = end
+    pieces.append(content[cursor:])
+    return "".join(pieces)
+
+
 def _canonical_perception_content(
-    content: str, *, is_observe: bool = False, head_fragment_len: int = 0, notice_at: int | None = None
+    content: str,
+    *,
+    is_observe: bool = False,
+    head_fragment_len: int = 0,
+    notice_at: int | None = None,
+    clip_spans: Sequence[Sequence[int]] | None = None,
+    delta_at: int | None = None,
+    delta_end: int | None = None,
 ) -> str:
+    # The newly-shown-text section at [delta_at, delta_end) reports what changed since an earlier call,
+    # not the page's state, so it is cut first; every other reported span lies before it.
+    if type(delta_at) is int and 0 <= delta_at <= len(content):
+        end = delta_end if type(delta_end) is int and delta_at <= delta_end <= len(content) else len(content)
+        content = content[:delta_at] + content[end:]
+    # observe's clip counts ("…[+N chars]") annotate what the display cut; a page whose clipped tail
+    # changes has not changed what the model can see, so the count is folded at the offsets observe
+    # reported. That a field is clipped at all stays: one that now fits whole has changed. First, because
+    # every other pass here shifts offsets -- which holds only while no tool reports clip spans together
+    # with notice_at or head_fragment_len.
+    content = _fold_reported_spans(content, clip_spans, " …[+*]")
     # The ref pass is scoped to observe's own payload, not to every compactable result: get_html
     # returns page-authored bytes, and a page can write a line that opens `ref=<digits>` there. The
     # marker passes below are attribute-shaped and page-authored values in that shape stay significant.
@@ -646,11 +986,26 @@ def _canonical_perception_content(
             noticed = addressed[:notice_at] + "…[*]" + addressed[closing + 1 :]
     head_folded = '*"' + noticed[head_fragment_len:] if head_fragment_len else noticed
     closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', head_folded)
-    return _TV3_MARKER_CUT_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*', closed)
+    closed = _TV3_PICK_VALUE_RE.sub('data-tv3-pick="*"', closed)
+    return _TV3_MARKER_CUT_RE.sub(
+        lambda m: (
+            m.group(0)
+            if notice_at is None and m.group(0).startswith("data-tv3-pick=")
+            else m.group(0).partition("=")[0] + '="*'
+        ),
+        closed,
+    )
 
 
 def _content_only_perception(
-    content: str, *, is_observe: bool = False, head_fragment_len: int = 0, notice_at: int | None = None
+    content: str,
+    *,
+    is_observe: bool = False,
+    head_fragment_len: int = 0,
+    notice_at: int | None = None,
+    clip_spans: Sequence[Sequence[int]] | None = None,
+    delta_at: int | None = None,
+    delta_end: int | None = None,
 ) -> str:
     # The URL is a hint, not content: history.pushState moves it without changing the document. The
     # full canonicalization (URL included) keeps clearing the repeat guards — a wizard whose pages
@@ -659,7 +1014,13 @@ def _content_only_perception(
     return _PERCEPTION_URL_LINE_RE.sub(
         "url=*",
         _canonical_perception_content(
-            content, is_observe=is_observe, head_fragment_len=head_fragment_len, notice_at=notice_at
+            content,
+            is_observe=is_observe,
+            head_fragment_len=head_fragment_len,
+            notice_at=notice_at,
+            clip_spans=clip_spans,
+            delta_at=delta_at,
+            delta_end=delta_end,
         ),
     )
 
@@ -954,11 +1315,11 @@ class _ProgressLedger:
         self.peak_actions_since_progress = max(self.peak_actions_since_progress, self.actions_since_progress)
 
 
-# Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
-# solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
-# complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
-# look while the page went on to show the submission confirmation. Trigger tools are the ones whose
-# page effects can land after their tool result; the window is in loop turns so intervening
+# Failure-evidence gate: finish(failed) and finish(terminated) shortly after a submit-class action or a
+# solve_captcha attempt are held for ONE evidence turn per fresh trigger, because submissions and
+# captcha protocols complete asynchronously — the sampled false-negative verdicts fired 2-7s after
+# the model's last look while the page went on to show the submission confirmation. Trigger tools
+# are the ones whose page effects can land after their tool result; the window is in loop turns so intervening
 # perception does NOT disarm it (the state can flip after the last observe while a protocol is in
 # flight). The true verdict-to-flip latency is unmeasured in the sampled replays: the quiescence
 # wait exits on the first stable fingerprint pair (so honest gated failures pay ~one sample), the
@@ -984,7 +1345,7 @@ VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS = 180.0
 
 
 def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
-    """An Enter keypress or a type that pressed Enter: the submit shapes with no selector to key on."""
+    """An Enter keypress, or a type or select_combobox that pressed Enter: the submit shapes with no selector to key on."""
     if tool_name == "press_key":
         raw = str(args.get("key", ""))
         # Space on a focused button activates it exactly like a click; a literal " " would strip to "".
@@ -993,7 +1354,7 @@ def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
         # Playwright accepts Modifier+Key chords, and Control/Meta+Enter is a real submit.
         key = raw.strip().lower().rsplit("+", 1)[-1]
         return key in ("enter", "return", "numpadenter", "space")
-    if tool_name == "type":
+    if tool_name in ("type", "select_combobox"):
         return bool(args.get("press_enter"))
     return False
 
@@ -1047,7 +1408,7 @@ CODE_TOOL_NAME = "execute_python"
 
 
 def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
-    """A click, an Enter press, or a type that pressed Enter: the loop cannot tell a submit from any of them.
+    """A click, an Enter press, or a type or select_combobox that pressed Enter: the loop cannot tell a submit from any of them.
 
     The code tool counts too: its body is opaque to the loop, so it is treated as possibly having
     submitted rather than as certainly not having.
@@ -1055,8 +1416,105 @@ def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
     return tool_name in ("click", CODE_TOOL_NAME) or _is_enter_submit(tool_name, args)
 
 
+# Secret values reach the model only as `placeholder_...` tokens, so the guard below keys on the
+# token the model passed back and never on what it resolves to — it cannot handle a plaintext secret.
+# The prefix covers every registered secret, not only a login: AWS and Azure parameters and card
+# fields are minted the same way, which is why the refusal names a rejected value rather than a
+# failed sign-in. This matches greedily where the registry matches longest-known-key, so it shares
+# find_embedded_placeholder_tokens' boundary limitation and adds one: two tokens concatenated with no
+# separator merge into one, and a token the model reproduces with a different trailing fragment reads
+# as a different key and goes uncounted. Both fail toward under-counting. It cannot call the registry,
+# because loop.py must not import `app`; thread a token callable from agent.py if either is observed.
+_CREDENTIAL_PLACEHOLDER_RE = re.compile(re.escape(RANDOM_SECRET_ID_PREFIX) + r"[A-Za-z0-9_]+")
+# file_upload is excluded: its placeholder names a file, not a credential, and re-attaching a file
+# after a submit is ordinary recovery rather than a second authentication attempt. The code tool is
+# included for the reason _may_submit includes it — its body is opaque, so it is treated as possibly
+# having entered the credential rather than as certainly not.
+CREDENTIAL_ENTRY_TOOLS = (FILL_TOOLS | frozenset({CODE_TOOL_NAME})) - frozenset({"file_upload"})
+# How many times one credential may be submitted within a task, and the whole knob. Replaying the
+# rule over every v3 block in a 22h window: budget 1 refuses 38 blocks of which 23 COMPLETED, so it
+# would break more runs than it protects; budget 3 reaches the bottom of the range the observed
+# lockouts came from (3-5 submissions). 2 is the largest budget that stays under the observed harm
+# threshold. It is chosen against today's submit precision — _may_submit counts any click, so a
+# click that submits nothing still spends budget — and must be re-derived if that precision improves.
+CREDENTIAL_SUBMIT_BUDGET = 2
+# A login identifier spends no lockout allowance, but identifier-first flows can send a code or hit lookup
+# throttles on every submit, so it gets a higher budget rather than none — 5 is an unmeasured judgment
+# with no replay behind it, unlike CREDENTIAL_SUBMIT_BUDGET.
+LOGIN_IDENTIFIER_SUBMIT_BUDGET = 5
+
+
+def _credential_placeholders(args: dict[str, Any]) -> set[str]:
+    """Every credential placeholder token this call's arguments carry, across all of them.
+
+    Scanning the values rather than naming `text`/`value`/`chosen` keeps the guard from being a
+    list of argument conventions that a new fill tool can be added without. Nested because the
+    arguments are the model's JSON: `select_option` carries `values`/`labels` as arrays, so a
+    top-level-strings-only scan would let a credential through in a list.
+    """
+
+    def walk(value: Any) -> Iterator[str]:
+        if isinstance(value, str):
+            yield from _CREDENTIAL_PLACEHOLDER_RE.findall(value)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                yield from walk(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from walk(nested)
+
+    return set(walk(args))
+
+
+def _trail_url_before(result: ToolResult, ctx: SkyvernContext | None) -> str | None:
+    url_before = (result.data or {}).get("url_before")
+    if not isinstance(url_before, str) or not url_before:
+        return None
+    return ctx.hide_from_model(url_before) if ctx is not None else url_before
+
+
+def entered_values(tool_name: str, args: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ENTERED_VALUE_ARGS.get(tool_name, ()):
+        value = args.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, str))
+    return tuple(values)
+
+
+# Bounds the one probe a would-be-skipped click pays; a probe that overruns keeps the skip.
+TOGGLE_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+async def _is_toggle_click(tool_name: str, spec: ToolSpec | None, args: dict[str, Any]) -> bool:
+    """A click whose target exposes a toggle state chooses an answer rather than submitting. Fails closed."""
+    if tool_name != "click" or spec is None or spec.toggle_probe is None:
+        return False
+    try:
+        is_toggle = await asyncio.wait_for(spec.toggle_probe(args), timeout=TOGGLE_PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        LOG.info("taskv3 toggle probe failed; keeping the batch skip", exc_info=True)
+        return False
+    if is_toggle is True:
+        LOG.info(BATCH_SKIP_TOGGLE_EXEMPT_EVENT, tool=tool_name)
+        return True
+    return False
+
+
 def _is_finish(tool_name: str) -> bool:
     return tool_name == "finish"
+
+
+def _outcome_reports_failure(outcome: dict[str, Any] | None) -> bool:
+    """Whether a tool that returned ok nonetheless reported reaching no usable page. Read off the
+    machine facts the tool exposed (an HTTP status), so the tool never has to adjudicate its own
+    success -- and only the persisted row moves: the model still reads the tool's own ok result."""
+    if not outcome:
+        return False
+    status = outcome.get("http_status")
+    return isinstance(status, int) and status >= ACTION_OUTCOME_FAILED_HTTP_STATUS
 
 
 def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bool:
@@ -1072,7 +1530,11 @@ def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bo
 
 @dataclass
 class ActivityRecency:
-    """Written by the tool loop each turn/action, read by the finish tool's failure-evidence gate."""
+    """Written by the tool loop each turn/action, read by the finish tool's holds and the engine's summary line.
+
+    Most fields are recency/headroom signals sampled per turn. `action_attempts` and `perceptions`
+    are the exception: run-lifetime cumulative counters, never reset.
+    """
 
     turn: int = 0
     turns_remaining: int | None = None
@@ -1080,6 +1542,8 @@ class ActivityRecency:
     tokens_remaining: int | None = None
     last_turn_tokens: int = 0
     last_trigger_turn: int | None = None
+    # Trigger actions can occur more than once in a model turn.
+    failure_evidence_trigger_generation: int = 0
     # True while one more read of some probe, returning what it last returned, would trip the stall
     # terminator: a deferral-forced observe must never be the snapshot that trips it. KNOWN LIMIT: a
     # run that reaches the edge and then stops reading that tool altogether leaves this true for the
@@ -1089,6 +1553,17 @@ class ActivityRecency:
     # turn that no longer exists — honoring it would silently convert the model's verdict into
     # budget_exhausted, the exact conversion the hold headroom gates exist to prevent.
     final_turn_active: bool = False
+    # Attempts, not successes: every `touches_page` call (billable, recordable or `engages_page`) whatever
+    # its result, plus each pre-dispatch refusal (mark-stale, extraction entry, credential resubmit).
+    action_attempts: int = 0
+    # Successful perceptions (the compactable tools: observe / get_html / look).
+    perceptions: int = 0
+    # State at the FIRST failed/terminated finish past the failure-evidence gate, emitted once per run
+    # by the engine's summary line. Not the run's first verdict: a zero-action `completed` refused by a
+    # gate above reaches this point later as failed/terminated.
+    attempts_at_hold_gate: int | None = None
+    perceptions_at_hold_gate: int | None = None
+    status_at_hold_gate: str | None = None
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -1317,9 +1792,18 @@ class TerminalTelemetry:
     peak_page_state_stall_rounds: int | None = None
     peak_probe_revisits: int | None = None
     semantic_commit: SemanticCommitStats | None = None
+    perception_reads: dict[str, int] | None = None
+    prefix_tokens: int | None = None
+    raw_total_tokens: int = 0
 
     def log_fields(self) -> dict[str, Any]:
-        fields: dict[str, Any] = {"form_ever_armed": self.form_ever_armed, **self.survival}
+        fields: dict[str, Any] = {
+            "form_ever_armed": self.form_ever_armed,
+            **self.survival,
+            "raw_total_tokens": self.raw_total_tokens,
+        }
+        if self.prefix_tokens is not None:
+            fields["prefix_tokens"] = self.prefix_tokens
         if self.ledger is not None:
             fields.update(self.ledger.log_fields())
         if self.peak_page_state_stall_rounds is not None:
@@ -1328,6 +1812,8 @@ class TerminalTelemetry:
             fields["peak_probe_revisits"] = self.peak_probe_revisits
         if self.semantic_commit is not None:
             fields.update(self.semantic_commit.log_fields())
+        if self.perception_reads is not None:
+            fields.update(self.perception_reads)
         return fields
 
 
@@ -1349,7 +1835,7 @@ def _page_state_nudge_text(rounds: int) -> str:
         f"Your last {rounds} action rounds left the page's rendered content completely unchanged — "
         "whatever you are trying is not affecting this page. Stop repeating the current approach: "
         "re-plan from a fresh observe, try a genuinely different control or path, or finish honestly "
-        "(status=failed or terminated) naming what is blocking you."
+        "with a non-completed status, naming what is blocking you."
     )
 
 
@@ -1368,18 +1854,35 @@ def _action_target(args: dict[str, Any]) -> str:
     return str(args.get("selector") or args.get("url") or args.get("key") or "the same target")
 
 
-def _action_nudge_text(repeats: list[tuple[str, dict[str, Any], int]], available_tools: set[str]) -> str:
+def _action_nudge_text(
+    repeats: list[tuple[str, dict[str, Any], int]], available_tools: set[str], *, page_moved: bool | None
+) -> str:
     """The transcript cannot show the model its own repetition (superseded snapshots are compacted
-    away), so the warning carries that memory: which action, how many times, and that the observed
-    state did not change."""
+    away), so the warning carries that memory: which action, how many times, and whether the page
+    fingerprint moved since the streak began. page_moved is None when no pair of samples can answer
+    that — a missing reading is not evidence of a still page, so neither claim is made."""
     symptoms = "; ".join(
         f"you have called {name} on {_action_target(args)} {count} times" for name, args, count in repeats
     )
+    read_the_page = "Read the current page before deciding: what you need may already be shown there."
+    if page_moved:
+        state = (
+            f"You are repeating the same action: {symptoms}. The page has changed since before the streak "
+            f"began, and the repeat attempts land on that same state, so repeating it will not change it "
+            f"further. {read_the_page}"
+        )
+    elif page_moved is None:
+        state = f"You are repeating the same action: {symptoms}. {read_the_page}"
+    else:
+        state = (
+            f"You are repeating the same action without effect: {symptoms}, and the page state you "
+            "last observed is unchanged since before the first attempt."
+        )
     return (
-        f"You are repeating the same action without effect: {symptoms}, and the page state you "
-        "last observed is unchanged since before the first attempt. A message inviting you to "
-        "retry (e.g. 'please submit again') is not an instruction to loop — at most one retry, "
-        "then report the outcome honestly. Your options: " + "; ".join(_unblocker_options(available_tools)) + "."
+        f"{state} A message inviting you to retry (e.g. 'please submit again') is not an instruction to "
+        "loop — at most one retry, then report the outcome honestly. Your options: "
+        + "; ".join(_unblocker_options(available_tools))
+        + "."
     )
 
 
@@ -1404,7 +1907,7 @@ def _refresh_nudge_text() -> str:
 def _budget_extended_observation(cap: str, recency: ActivityRecency | None) -> str:
     """The retraction of a `_budget_exhausted_observation` whose cap has since been raised.
 
-    APPENDED, never popped: `snapshot_keys` is keyed by absolute message index, so deleting the
+    APPENDED, never popped: `LoopState.reads` is keyed by absolute message index, so deleting the
     stale message would silently re-anchor compaction onto the wrong ones. Without this the model
     keeps reading "this is the final turn" for the rest of the run and wraps up early — which spends
     the extension the release exists to preserve, through the prompt instead of through a counter."""
@@ -1439,12 +1942,94 @@ def _budget_exhausted_observation(cap: str, recency: ActivityRecency | None) -> 
     return f"{json_line}\nThe run's budget cap has tripped; this is the final turn before the run ends."
 
 
+def _guard_verdict(guard: str, reason: str) -> LoopOutcome:
+    """The one way a loop guard ends a run: the customer-facing sentence in `reason`, the machine class
+    in `guard`.
+
+    They are separate because `reason` leaves the system verbatim as the task's `failure_reason` — a
+    field on the customer webhook and the run view — so the facet a dashboard groups on, the counter
+    that tripped, the tool that reported it and the selector it compared all belong on the guard's own
+    log line instead (SKY-16271). `_budget_exhausted_reason` below holds the same standard for the
+    budget exits.
+    """
+    return LoopOutcome("terminated", reason, guard=guard)
+
+
+def _verdict_url(url: Any, caller_known_urls: Collection[str]) -> str | None:
+    """A URL fit to name in a customer-facing verdict, or None when nothing can be named.
+
+    `sanitize_published_url` owns the invariant this surface rests on -- a verdict publishes only what
+    the caller already gave us, plus the host -- so the scheme and host are always named and the path
+    only when the landed URL is one of `caller_known_urls`, elided to `/…` otherwise.
+    """
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")) or any(ch.isspace() for ch in url):
+        return None
+    published = sanitize_published_url(url, caller_known_urls)
+    # Only a caller URL can be this long once the path is elided, and the caller can read it in their
+    # own task config; cutting it would name a page that does not exist, so it is dropped whole.
+    if published is not None and len(published) > VERDICT_URL_MAX_CHARS:
+        return None
+    return published
+
+
+def _dead_end_reason(status: int, url: Any, *, page_noun: str, caller_known_urls: Collection[str]) -> str:
+    """The HTTP status stays in the sentence: `classify_from_failure_reason` derives NAVIGATION_FAILURE
+    from it, and it is the one fact separating a page that is gone from a page that is merely wrong."""
+    where = _verdict_url(url, caller_known_urls)
+    named = f"{page_noun} ({where})" if where else page_noun
+    return (
+        f"{named} returned HTTP {status}: it no longer exists or has been removed, so the task could "
+        "not be completed there."
+    )
+
+
+def _verdict_target(
+    tool: str,
+    name: Any,
+    kind: Any,
+    label_secret_values: Callable[[], Collection[str]] | None,
+    ctx: SkyvernContext | None,
+) -> str | None:
+    """The control a verdict names, or None when the acting call reported neither a name nor a kind.
+
+    A page-supplied name is only printable against the run's full drop-check secret set -- its
+    registered parameters included, unfloored, since a name is dropped whole rather than scrubbed --
+    and only the caller can see that registry, so it arrives as a resolver read at verdict time. Same
+    set the persisted timeline label is checked against: a credential-shaped label must not be dropped
+    from the row and printed here. With no resolver, no context, or a resolver that fails, the verdict
+    falls back to the kind floor rather than publishing page text it could not check -- a missing
+    context is a missing HALF of that set (the codes minted this turn), not a reason to skip it.
+    """
+    if not name and not kind:
+        return None
+    if label_secret_values is None or ctx is None:
+        return describe_target(tool, None, kind, ())
+    try:
+        secret_values = set(label_secret_values())
+    except Exception:
+        LOG.warning("taskv3 loop could not resolve a verdict's drop-check secrets", tool=tool)
+        return describe_target(tool, None, kind, ())
+    # Unfloored, and read live: a code minted this turn is not in the resolver's floored view.
+    secret_values |= set(ctx.runtime_secret_values)
+    return describe_target(tool, name, kind, secret_values)
+
+
+def _action_loop_reason(target: str | None) -> str:
+    """`target` is the control the run kept acting on, or None when the repeated call reported no name
+    (a failed call reports none) — then the verdict names no place rather than guessing one."""
+    where = f" on {target}" if target else ""
+    return (
+        f"The run repeated the same action{where} and the page did not change in response, so the task "
+        "could not make progress — commonly the site rejecting the action and showing the same page again."
+    )
+
+
 def _budget_exhausted_reason(cap_trip: str) -> str:
     """Human sentence for a no-finish budget exit. Never includes the raw cap literal (that lives
     only in `cap_trip` and the logs) so a status/reason readout doesn't leak an internal counter."""
     if "deadline" in cap_trip:
         axis = "time"
-    elif "max_tokens" in cap_trip:
+    elif "tokens" in cap_trip:
         axis = "token"
     elif "max_turns" in cap_trip:
         axis = "turn"
@@ -1468,11 +2053,11 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "tool_error_class",
         "tool_ok_class",
         "resolve_seconds",
-        "frame_perception",
         "billable",
         "turn",
         "batch_size",
         "batch_index",
+        "tool_call_seq",
         "action_key_hash",
         "snapshot_digest",
         "probe_first_time",
@@ -1481,8 +2066,93 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "hit_probe_seconds",
         "hit_probe_isolated",
         "hit_probe_raised",
+        "covered_branch",
+        "covered_controls",
+        "covered_layer_kind",
+        "requested_url",
+        "landed_url",
+        "nav_error_code",
+        "same_page",
+        "readiness_read_failed",
+        "menu_note",
+        "menu_rows",
+        "withhold_reason",
+        "text_delta_seconds",
+        "text_delta_lines",
+        "text_delta_chars",
+        "text_delta_over_bound",
+        "text_delta_skipped",
+        "text_delta_pending_lines",
+        "acted_in_frame",
+        "probe_scrolled",
+        "hit_on_document_root",
+        "page_state_stall_rounds",
+        "page_state_judged",
     }
 )
+
+# The counts observe's `summary` carries onto its record (see `_observe_summary_fields`).
+OBSERVE_SUMMARY_FIELDS = frozenset(
+    {
+        "text_dropped",
+        "hidden_listed",
+        "hidden_dropped",
+        "hidden_dropped_off_canvas",
+        "hidden_dropped_visibility",
+        "hidden_dropped_zero_rect",
+        "hidden_dropped_off_viewport",
+        "off_viewport_unreachable_unnamed",
+        "off_viewport_unnamed_host_exempt",
+        "phantom_dropped",
+        "iframes_in_component_roots",
+        "undiscovered_roots",
+        "omitted_unnameable",
+        "invalid_fields",
+        "markers_minted",
+        "markers_reused",
+        "group_texts_found",
+        "a11y_removed_listed",
+        "duplicate_digest_lines",
+        "frames_same_origin",
+        "frames_cross_origin",
+        "frames_same_origin_interactive",
+        "frames_peeked",
+        "frames_peek_failed",
+        "frame_scan_failed",
+        "frame_unreadable_regions",
+        "elements_listed",
+        "pointer_roots_listed",
+        "pointer_capped",
+        "pointer_truncated",
+        "pointer_dropped",
+        "pointer_scan_stopped",
+        "pointer_scan_failed",
+        "elements_truncated",
+        "elements_truncated_in_components",
+        "elements_dropped",
+        "elements_truncated_by_page_cap",
+        "modal_open",
+        "modal_listed",
+        "modal_truncated",
+        "ready_state_when_empty",
+    }
+)
+
+# Every field a "taskv3 tool call finished" record can carry. A grader filtering these records checks its keys
+# against this set, so a misspelled or renamed field fails loudly instead of matching nothing.
+TOOL_CALL_RECORD_FIELD_NAMES = _TOOL_CALL_RECORD_FIELDS | OBSERVE_SUMMARY_FIELDS | {"charged"}
+
+# A host is bounded in the DNS but not in a string `urlsplit` was handed, and a record field is
+# indexed: cap the scrubbed value rather than trust what it was reduced from.
+LOGGED_URL_MAX_CHARS = 500
+
+# A hostname is letters (any script, so an IDN still logs its host), digits, dots and hyphens, or an
+# IPv6 literal, which `hostname` hands back with the brackets stripped. Anything else in what
+# `urlsplit` called the host means it found no host at all, whatever it returned: `urlsplit` does not
+# treat a backslash as a path separator, so `https://host\signin\TOKEN` parses the whole run as the
+# authority while the browser normalizes it to `/` and navigates to a path — the token would survive
+# the scrub as part of the "host" and land in an indexed field.
+_LOGGABLE_HOST = re.compile(r"[\w.\-]+|[0-9A-Fa-f.:]+")
 
 
 class _ProgressEvidence(str, Enum):
@@ -1590,6 +2260,98 @@ class _CanonicalProgressTracker:
         )
 
 
+def _logged_url(url: str) -> str:
+    """A URL reduced to what an indexed field may carry: scheme and host, never path, query, userinfo
+    or fragment.
+
+    Unconditional, the model's own argument included. A signed or sign-in URL is a bearer secret
+    wherever it came from, and the model types back the one a page just showed it, so "the model typed
+    this" is no evidence the URL is safe to keep whole.
+
+    The exception is a payload ref, which is logged as the token it is: a name for the target that is
+    not the address. Membership in the run's minted refs, never shape — the same rule the model-facing
+    boundary masks by.
+
+    Never raises. The argument is model-typed, and this is evaluated to build the kwargs of the loop's
+    `taskv3 tool handler raised` line — inside that `except` block — so a raise here escapes the block,
+    the per-call try and the batch loop, aborting the run instead of producing a tool error.
+    """
+    ctx = skyvern_context.current()
+    if ctx is not None and url in ctx.opaque_url_refs:
+        return url[:LOGGED_URL_MAX_CHARS]
+    try:
+        host = urlsplit(url).hostname
+        if host is None or not _LOGGABLE_HOST.fullmatch(host):
+            return "<redacted>"
+        return redact_url_secrets(url)[:LOGGED_URL_MAX_CHARS]
+    except ValueError:
+        # urlsplit parses the port and the IPv6 brackets lazily, on attribute access: a non-numeric or
+        # out-of-range port and an unclosed bracket each raise here, not at the split.
+        return "<redacted>"
+
+
+def _navigate_record_fields(tool_name: str, args: dict[str, Any], result: ToolResult | None) -> dict[str, str | bool]:
+    """What a `navigate` record is about: the URL asked for, where it landed, the driver's code, and
+    whether the browser was already on the page it was sent to.
+
+    Empty for every other tool, so no facet is added fleet-wide. Both URLs are attribution only —
+    scheme and host — which is what a fleet read of navigate outcomes needs and all a log line may
+    hold. The requested one is the ARGUMENT, never the resolved one: an opaque payload ref or a
+    credential placeholder must stay unresolved here.
+    """
+    if tool_name != "navigate":
+        return {}
+    fields: dict[str, str | bool] = {}
+    requested = args.get("url")
+    if isinstance(requested, str) and requested:
+        fields["requested_url"] = _logged_url(requested)
+    data = (result.data if result is not None else None) or {}
+    landed = data.get("landed_url")
+    if isinstance(landed, str) and landed:
+        # Scrubbed again rather than trusted: the tool already reduced it, and the rule belongs to the
+        # field, not to whichever caller filled it.
+        fields["landed_url"] = _logged_url(landed)
+    # A driver's own net:: code, which is a closed vocabulary carrying no address.
+    nav_error_code = data.get("nav_error_code")
+    if isinstance(nav_error_code, str) and nav_error_code:
+        fields["nav_error_code"] = nav_error_code[:LOGGED_URL_MAX_CHARS]
+    # Whether the requested URL was the one the browser was already showing. Nothing reads it but a
+    # post-deploy rate: how often the model sends the browser back to the page it is already on.
+    same_page = data.get("same_page")
+    if isinstance(same_page, bool):
+        fields["same_page"] = same_page
+    # Whether the readyState read failed; on `committed_not_loaded` it separates a document that never
+    # became ready from a renderer too busy to answer, so a rate query must filter by class.
+    readiness_read_failed = data.get("readiness_read_failed")
+    if isinstance(readiness_read_failed, bool):
+        fields["readiness_read_failed"] = readiness_read_failed
+    return fields
+
+
+def _menu_note_record_fields(tool_name: str, result: ToolResult | None) -> dict[str, str | int]:
+    """Whether a click's menu-open note listed its rows or withheld them, and why, re-checked against the closed
+    vocabulary. Empty for every other tool and for clicks with no note."""
+    if tool_name != "click" or result is None:
+        return {}
+    data = result.data or {}
+    fields: dict[str, str | int] = {}
+    note = data.get("menu_note")
+    if note in ("listed", "withheld"):
+        fields["menu_note"] = note
+        rows = data.get("menu_rows")
+        if isinstance(rows, int) and not isinstance(rows, bool):
+            fields["menu_rows"] = rows
+        reason = data.get("withhold_reason")
+        if note == "withheld" and reason in (
+            "declared_row_over_caps",
+            "bare_text_beside",
+            "single_row_pieces",
+            "long_row_unread",
+        ):
+            fields["withhold_reason"] = reason
+    return fields
+
+
 def _observe_summary_fields(result: ToolResult) -> dict[str, int]:
     """Counts only: the summary is built by the tool, but an indexed field is re-checked here."""
     summary = (result.data or {}).get("summary")
@@ -1613,9 +2375,45 @@ def _append_skipped_tool_results(
         )
 
 
+# The `failed` / `terminated` line, stated once and read by every model-facing surface that mentions
+# the finish statuses. It is not a new policy: v1's planner and completion-check prompts never offer
+# the model `failed` at all -- `TERMINATE` is its only negative verdict, and every v1 `failed` is
+# written by the harness itself (an exception, a retry/step ceiling). `TaskStatus.can_update_to`
+# encodes the same split: `terminated` is reachable only from `running`, while `failed` can be set on
+# a run that never started. So `failed` is the engine's own breakdown and `terminated` is the verdict
+# a run reaches about the task -- which is what v3 never told the model (SKY-16648).
+# The closing override is v1's own contract: its validation prompt TERMINATEs when a terminate criterion
+# holds, so a criterion-bearing goal outranks the negative-answer-is-completed default.
+# Wording is load-bearing: two trims that kept the meaning moved 24/40 negative lookups to terminated.
+# Kept under ~1000 characters: no other tool this engine ships has a longer description, and the
+# OpenAI function schema has historically capped a description at 1024.
+FINISH_STATUS_TAXONOMY = (
+    "Call this only when the goal is met, or when you have established that it cannot be met. The "
+    "three statuses are not interchangeable:\n"
+    "- completed: the goal was achieved. A goal that asked you to find out or report something is "
+    "achieved once you have a definite answer, including a negative one -- report it in "
+    "extracted_output.\n"
+    "- terminated: the TASK cannot be achieved, and you can say why from what you saw -- a record "
+    "you needed does not exist, a lookup returned no match, a rule excludes it, a wall you cannot "
+    "pass, a site that is down.\n"
+    "- failed: YOU could not carry the task out, so you cannot say what the outcome is -- your "
+    "tools kept erroring, you lost track of the page, or you never got far enough to judge.\n"
+    "The test is whose side the reason is on, not whether you have one: the site or the task means "
+    "terminated, you or your tools means failed. The goal's own completion or termination criteria "
+    "override these defaults."
+)
+
+
+def _non_completed(status: object) -> NonCompletedStatus | None:
+    if status == "failed":
+        return "failed"
+    if status == "terminated":
+        return "terminated"
+    return None
+
+
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
-    error_code_mapping: dict[str, str] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     deadline_at: float | None = None,
@@ -1628,6 +2426,8 @@ def make_finish_tool(
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
+    unlisted_reask: UnlistedReaskCheck | None = None,
+    document_identity: Callable[[], Awaitable[str | None]] | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -1637,9 +2437,9 @@ def make_finish_tool(
     is capped at `deadline_at` (time.monotonic clock) and abandoned once `should_cancel` reports
     True, so probing cannot outlive the loop's own bounds.
 
-    The symmetric failure side: when `activity` reports recent submit-class/captcha activity, a
-    finish(failed) is held for ONE evidence turn (`max_failure_deferrals`, per run like the
-    completed-side cap, not per verdict attempt) — a quiescence wait
+    The symmetric non-completed side: when `activity` reports recent submit-class/captcha activity,
+    finish(failed) and finish(terminated) are held for ONE evidence turn (`max_failure_deferrals` per
+    fresh trigger, not per run or verdict attempt) — a quiescence wait
     bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
 
@@ -1648,8 +2448,8 @@ def make_finish_tool(
     run is still awaiting a code it has unspent polling budget for -- a give-up at one 120s slice of
     a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
     the callee (the budget shrinks under every productive hold) and refused here without the deadline
-    headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
-    ungated on both sides.
+    headroom to fund the blocking poll slice it asks for. Terminated verdicts otherwise follow the
+    same evidence gate as failed verdicts.
 
     `pending_marker` reports the text the page still shows the control in `submit_watch` as in
     flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
@@ -1658,9 +2458,17 @@ def make_finish_tool(
     the model insists a second time its verdict stands, so a run that declares completion on a
     still-pending control remains possible after this gate. Deliberately a POSITIVE observation -- a
     probe that fails reports nothing, and nothing is not evidence of pending, so it accepts rather
-    than holding a run on probe flakiness."""
+    than holding a run on probe flakiness.
+
+    `unlisted_reask` asks once per run whether a failed or terminated verdict that is about to stand only
+    missed a screen the site skipped. A grounded yes becomes completed unless a completed-side gate vetoes it;
+    it never gives a turn back, and a completed verdict cannot reach it. Its settle gate samples as many times as
+    the completed path would defer. When `document_identity` is wired, it is read before the judge and again after
+    the settle window, and a conversion whose identity changed or could not be read is refused, settled or not."""
     deferrals = 0
     failure_deferrals = 0
+    failure_deferral_trigger_generation: int | None = None
+    reask_asked = False
 
     async def _bounded_fingerprint() -> str | None:
         """page_fingerprint(), timed out against whatever is left of the run's deadline instead of
@@ -1717,13 +2525,120 @@ def make_finish_tool(
             return False  # defer: the loop's cancellation check ends the run before another turn
         return first == await _bounded_fingerprint()
 
+    async def _conversion_veto(result: UnlistedReask, identity_before: str | None) -> str | None:
+        """The completed-side gates, as vetoes only: the model never claimed completion, so none may hold."""
+        try:
+            if should_cancel is not None and await should_cancel():
+                return "canceled"
+        except Exception:
+            return "canceled"
+        if pending_marker is not None and submit_watch is not None and submit_watch.selector:
+            timeout = _PAGE_PROBE_TIMEOUT_SECONDS
+            if deadline_at is not None:
+                timeout = min(timeout, deadline_at - time.monotonic())
+            if timeout <= 0:
+                return "deadline"
+            try:
+                if await _bounded_probe(pending_marker(submit_watch.selector), timeout=timeout):
+                    return "pending_marker"
+            except Exception:
+                return "pending_marker"
+        if verification_blocker is not None:
+            try:
+                if await verification_blocker(CONVERSION_VERIFICATION_STATUS):
+                    return "verification_blocker"
+            except Exception:
+                return "verification_blocker"
+        if page_fingerprint is not None:
+            if document_identity is not None and identity_before is None:
+                return "identity_unreadable"
+            settled = False
+            for _ in range(max_settle_deferrals + 1):
+                result.settle_rounds += 1
+                try:
+                    settled = await _settled()
+                except Exception:
+                    pass  # as on the completed path: an unreadable sample is an unsettled one
+                result.settled = settled
+                if settled:
+                    break
+                try:
+                    if should_cancel is not None and await should_cancel():
+                        return "canceled"
+                except Exception:
+                    return "canceled"
+                if deadline_at is not None and deadline_at - time.monotonic() <= 0:
+                    return "deadline"
+            if deadline_at is not None and deadline_at - time.monotonic() <= 0:
+                return "deadline"
+            if document_identity is not None:
+                identity_after = await _sample_probe(document_identity, deadline_at=deadline_at)
+                if identity_after is None:
+                    return "identity_unreadable"
+                if identity_before != identity_after:
+                    return "navigating"
+            elif not settled:
+                return "unsettled"
+        return None
+
+    async def _reask(original: NonCompletedStatus, args: dict[str, Any]) -> ToolResult | None:
+        assert unlisted_reask is not None
+        reason = args.get("reason") or ""
+        # Before the judge: a navigation that commits while it runs must not become the baseline.
+        identity_before = (
+            await _sample_probe(document_identity, deadline_at=deadline_at)
+            if document_identity is not None and page_fingerprint is not None
+            else None
+        )
+        try:
+            result: UnlistedReask | None = await unlisted_reask(original, reason)
+        except Exception:
+            LOG.warning("taskv3 unlisted reask failed; keeping the verdict", exc_info=True)
+            result = None
+        if result is not None and result.converts:
+            result.veto = await _conversion_veto(result, identity_before)
+            result.converted = result.veto is None
+        LOG.info(
+            "taskv3 finish unlisted reask",
+            original_status=original,
+            verdict=result.verdict if result is not None else None,
+            terminate_criterion_holds=result.terminate_criterion_holds if result is not None else None,
+            converts=result.converts if result is not None else False,
+            converted=result.converted if result is not None else False,
+            veto=result.veto if result is not None else None,
+            settled=result.settled if result is not None else None,
+            settle_rounds=result.settle_rounds if result is not None else 0,
+            llm_key=result.llm_key if result is not None else None,
+            reask_llm_key=result.reask_llm_key if result is not None else None,
+            skipped_reason=result.skipped_reason if result is not None else "reask_error",
+            # Never the quote itself: it is page text, possibly customer data.
+            quote_chars=result.quote_chars if result is not None else 0,
+            latency_s=result.latency_s if result is not None else None,
+            turn=activity.turn if activity is not None else None,
+        )
+        if result is None or not result.converted:
+            return None
+        return ToolResult.ok(
+            content="Task attempt ended. No further actions are permitted.",
+            data={
+                "status": "completed",
+                "reason": result.reason,
+                "extracted_output": args.get("extracted_output"),
+                "converted_from": original,
+                "converted_from_reason": reason,
+            },
+        )
+
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals
+        nonlocal deferrals, failure_deferrals, failure_deferral_trigger_generation, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
                 f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
             )
+        if activity is not None and activity.failure_evidence_trigger_generation != failure_deferral_trigger_generation:
+            failure_deferrals = 0
+            failure_deferral_trigger_generation = activity.failure_evidence_trigger_generation
         if (
             status == "completed"
             and pending_marker is not None
@@ -1759,7 +2674,8 @@ def make_finish_tool(
                 LOG.warning("taskv3 completion_blocker failed; failing closed", exc_info=True)
                 return ToolResult.error(
                     "Could not verify that a file download has finished; retry finish(status=completed) "
-                    "once the download has landed, or finish with status=failed or status=terminated."
+                    "once the download has landed, or finish with the non-completed status the "
+                    "finish tool's own rule gives this outcome."
                 )
             if blocker_message:
                 return ToolResult.error(blocker_message)
@@ -1786,8 +2702,8 @@ def make_finish_tool(
                     LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
                     return ToolResult.error(
                         "Could not verify that the verification-code step completed cleanly; retry "
-                        "finish(status=completed) once verified, or finish with status=failed or "
-                        "status=terminated."
+                        "finish(status=completed) once verified, or finish with the non-completed "
+                        "status the finish tool's own rule gives this outcome."
                     )
                 # Fail open on the give-up side: the opposite verdict. A broken gate must not trap a
                 # run that wants to end.
@@ -1815,10 +2731,12 @@ def make_finish_tool(
                     "the page was still rendering, or could not be verified as settled, when you "
                     "called finish. Wait for it to settle, re-observe, confirm the goal's effect is "
                     "present in the loaded content (not a loading indicator or empty container), "
-                    "then finish again."
+                    f"then finish again. This check holds a finish at most {max_settle_deferrals} times, so a page "
+                    "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
+                    "report failure."
                 )
         if (
-            status == "failed"
+            status in ("failed", "terminated")
             and activity is not None
             and page_fingerprint is not None
             and failure_deferrals < max_failure_deferrals
@@ -1854,79 +2772,56 @@ def make_finish_tool(
                 pass  # unknown page state still defers: the model's re-observe is the evidence step
             if should_defer:
                 failure_deferrals += 1
-                LOG.info("taskv3 finish failure deferred for evidence", turn=activity.turn)
+                LOG.info("taskv3 finish failure deferred for evidence", status=status, turn=activity.turn)
                 return ToolResult.error(
-                    "failure verdict held for one evidence check: it follows recent page actions or "
+                    "non-completed verdict held for one evidence check: it follows recent page actions or "
                     "a captcha attempt whose effects can land after your last look — submissions and "
                     "captcha protocols often complete asynchronously, so the page may no longer show "
                     "the state this verdict was based on. Re-observe the page once (waiting briefly "
                     "first if it may still be processing): only a positive confirmation of the goal "
                     "(e.g. a submission confirmation banner) justifies finishing with "
                     "status=completed; if it still shows the blocked or failed state, or shows no "
-                    "positive confirmation at all, finish with status=failed again and the verdict "
-                    "will stand."
+                    "positive confirmation at all, finish again -- status=terminated if the page "
+                    "itself is what stopped you, status=failed if the breakdown was yours -- and "
+                    "the verdict will stand."
                 )
-        raw_code = args.get("error_code")
-        # isinstance first: a model can answer with a non-string (a list, a number), and `in` against
-        # a dict would raise TypeError on an unhashable one and take the whole finish down.
-        chosen_code = raw_code if isinstance(raw_code, str) and raw_code in (error_code_mapping or {}) else None
-        if error_code_mapping:
-            # The A/B and the ramp read need to split "was a code offered" from "did the model take
-            # one", and a dropped invented code must not vanish silently -- filter_to_user_defined_codes
-            # returns its dropped set for exactly this reason and every other caller logs it.
-            LOG.info(
-                "taskv3 finish user-defined error code",
-                status=status,
-                chosen_error_code=chosen_code,
-                declined=chosen_code is None and raw_code is None,
-                dropped_error_code=raw_code if chosen_code is None and raw_code is not None else None,
-            )
+        # Sampled here, after the failure-evidence gate, rather than at the run's first finish: a zero-action
+        # `finish(completed)` refused by a gate above and followed by `finish(failed)` records the failed verdict.
+        if activity is not None and status in ("failed", "terminated") and activity.status_at_hold_gate is None:
+            activity.attempts_at_hold_gate = activity.action_attempts
+            activity.perceptions_at_hold_gate = activity.perceptions
+            activity.status_at_hold_gate = status
+        original = _non_completed(status)
+        if original is not None and unlisted_reask is not None and not reask_asked:
+            reask_asked = True
+            converted = await _reask(original, args)
+            try:
+                canceled_during_reask = should_cancel is not None and await should_cancel()
+            except Exception:
+                canceled_during_reask = False
+            if canceled_during_reask:
+                # Defer: the loop's cancellation check persists `canceled` before another turn.
+                return ToolResult.error("the run was canceled while the verdict was being checked.")
+            if converted is not None:
+                return converted
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
                 "status": status,
                 "reason": args.get("reason") or "",
                 "extracted_output": args.get("extracted_output"),
-                "error_code": chosen_code,
-                "error_codes_offered": bool(error_code_mapping),
             },
         )
 
     return ToolSpec(
         name="finish",
-        description=(
-            "End the task and report whether the browser goal was completed. Call this only when "
-            "the goal is met (status=completed) or is impossible/blocked (failed/terminated)."
-        ),
+        description=("End the task and report whether the browser goal was completed. " + FINISH_STATUS_TAXONOMY),
         parameters={
             "type": "object",
             "properties": {
                 "status": {"type": "string", "enum": ["completed", "failed", "terminated"]},
                 "reason": {"type": "string", "maxLength": 2000},
                 "extracted_output": {"description": "Structured output requested by the goal, if any."},
-                # Offered ONLY when the task configured codes, and enum-bound to those keys: a task
-                # without a mapping keeps today's exact finish schema, and a model with a mapping
-                # cannot invent a code the customer never defined.
-                **(
-                    {
-                        "error_code": {
-                            "type": "string",
-                            "enum": sorted(error_code_mapping),
-                            "description": (
-                                "Set when one of these descriptions is what actually happened, on "
-                                "whatever finish status is honest — choose the status on its own "
-                                "merits, never to make a code fit. Never use a code to describe a "
-                                "failure of you or the browser: being stuck, losing track of which "
-                                "page you are on, running out of steps, or simply not managing the "
-                                "task are reported without a code. A problem with the SITE may take "
-                                "a code when the user defined one whose description names that "
-                                "problem."
-                            ),
-                        }
-                    }
-                    if error_code_mapping
-                    else {}
-                ),
             },
             "required": ["status", "reason"],
         },
@@ -1940,18 +2835,18 @@ _READ_LABEL_MAX_CHARS = 120
 
 
 def _declared_args_key(spec: ToolSpec, args: dict[str, Any]) -> str:
-    """The supersession identity of one read: only the arguments the tool DECLARES.
+    """The argument part of a read's key (`_PerceptionEntry.key`): only the arguments the tool DECLARES.
 
-    A tool's result can depend on an argument it declares and on nothing else, so an undeclared one
-    cannot make two calls different reads. The specs are not emitted strict, so a provider is free to
-    add one — and for an argumentless tool that would split the key and retain two snapshots where the
-    tool only ever describes the page as it is NOW.
+    An argument the tool does not declare cannot change what it reads, so it cannot make two calls different
+    reads (the page it reads can, which is the page part of the key). The specs are not emitted strict, so a
+    provider is free to add one — and for an argumentless tool that would split the key and retain two
+    snapshots where the tool only ever describes the page as it is NOW.
 
     For `look` that is not merely wasted context. Every call disposes the previous handles, clears
     `_look_manifest` and renumbers the marks (`tools.py`), so a retained older legend describes numbers
     that now address different controls, and `click(mark=N)` following it acts on the wrong one. It
-    fails open: the stale legend looks perfectly valid. Keyed on declared arguments, `look` and
-    `observe` declare none, so all their calls collapse to one key and exactly one survives.
+    fails open: the stale legend looks perfectly valid. `look` and `observe` declare none and carry no
+    page part (`issues_handles`), so all their calls collapse to one key and exactly one survives.
     """
     declared = (spec.parameters or {}).get("properties") or {}
     return json.dumps({k: v for k, v in args.items() if k in declared}, sort_keys=True, default=str)
@@ -1981,69 +2876,185 @@ def _read_label(tool_name: str, args_key: str) -> str:
 _COMPACTED_PREFIX = "[superseded "
 
 
-def _compact_transcript(
-    messages: list[dict[str, Any]],
-    snapshot_keys: dict[int, str],
-) -> None:
-    """Bound the persistent conversation by eliding stale perception snapshots.
+@dataclass(slots=True)
+class _PerceptionEntry:
+    tool: str
+    args: str  # `_declared_args_key`; the only part of the key a placeholder or marker may name
+    page: str  # the page probe sampled before the call; "" for a tool that issues handles
+    # sha256 of the model-facing bytes before `delta`, not the canonical digest: a re-minted marker is new bytes.
+    raw: str
+    turn: int
+    handles: bool
+    # The tool-reported tail at `delta_at` (a text delta of what an action changed). Outside `raw`, so it never
+    # makes an unchanged read look changed, and carried verbatim through every placeholder and marker.
+    delta: str = ""
+    shown: bool = True
 
-    The full transcript is re-sent every turn, so large perception outputs (an `observe` snapshot the
-    agent has already acted past, or a 20k-char `get_html` dump) otherwise pile up until the token
-    backstop trips on perception-heavy pages. `snapshot_keys` maps the message index of each
-    *successful* perception result (recorded as it is appended) to its supersession key; keep the
-    newest snapshot of each of the `PERCEPTION_SNAPSHOT_RETAIN` most recent distinct keys per tool,
-    and replace the rest with a short placeholder.
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.tool, self.page, self.args)
 
-    The key is the READ, not the tool. A second `observe` is a fresh view of the same thing and
-    genuinely supersedes the first; a `get_html` of one region does not supersede a read of another,
-    and eliding it there is what makes a document larger than one result impossible to assemble.
-    Re-reading the SAME region still supersedes, which is what keeps a run that hammers one read
-    bounded. Three things are deliberately protected:
 
-    - The most-recent round (results after the last assistant message) is never touched — a single turn
-      can batch several perception calls, and compaction runs *before* the model has seen that round's
-      results, so eliding any of them would drop data the model requested but never read.
-    - Only a successful snapshot is ever a candidate: a skip/error result is never recorded in
-      `snapshot_keys`, so it can neither be elided nor shadow the real snapshot and leave the agent
-      with no usable page view — regardless of content length (a verbose provider error included).
-    - The placeholder NAMES the read it dropped. An erasure the model cannot see is one it cannot
-      plan around: it re-reads by accident instead of by decision, which is the loop this bounds.
+@dataclass
+class _PerceptionStore:
+    """Every successful perception read, by message index, and the rewrites that bound them.
 
-    Only a `tool` message's content is shrunk, never removed, so every tool_call keeps a matching result
-    and the transcript stays valid. Eliding also drops the index, so re-running is a no-op and an elided
-    placeholder can never re-anchor as the live snapshot."""
-    if not snapshot_keys:
-        return
-    last_assistant_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "assistant":
-            last_assistant_idx = i
-            break
+    Read bodies are budgeted by size (`PERCEPTION_RETAIN_CHARS_HIGH`/`_LOW`) and rewritten only in
+    epochs, so between epochs each request is a byte prefix of the next. Tools that issue handles
+    (`observe`, `look`) keep exactly one body and elide the older one at once: the next call renumbers
+    refs/marks, so a stale legend addresses the wrong control and fails open.
 
-    # Per tool: the reads of the still-unread round, and the distinct keys the retention window has
-    # kept, newest first. A key seen newer — in the unread round or already in the window — is
-    # superseded, because a re-read of one region is a fresher view of the same bytes.
-    #
-    # The unread round is protected but does NOT spend retention slots. It cannot: one turn may batch
-    # several reads (the prompt asks for batching), and counting them against the window would let a
-    # single batched turn evict every earlier read and make accumulation a no-op on exactly the
-    # behaviour the prompt trains. Its size is bounded by the per-turn tool-call budget, and the old
-    # rule protected the whole round the same way, so nothing here widens that.
-    unread: dict[str, set[str]] = {}
-    kept: dict[str, list[str]] = {}
-    for i in sorted(snapshot_keys, reverse=True):
-        cls = messages[i]["name"]
-        key = snapshot_keys[i]
-        if i > last_assistant_idx:
-            unread.setdefault(cls, set()).add(key)
-            continue
-        window = kept.setdefault(cls, [])
-        seen_newer = key in unread.get(cls, frozenset()) or key in window
-        if not seen_newer and len(window) < PERCEPTION_SNAPSHOT_RETAIN:
-            window.append(key)
-            continue
-        messages[i]["content"] = f"{_COMPACTED_PREFIX}{_read_label(cls, key)} output elided to bound context]"
-        del snapshot_keys[i]
+    A re-read whose bytes equal a body still shown becomes a marker citing it. Nothing is predicted: the
+    read ran, and this compares what it returned. A marker is not an entry, and an epoch moves a cited
+    body into the newest citing marker's slot before it elides anything, so a marker never outlives its body.
+    """
+
+    entries: dict[int, _PerceptionEntry] = field(default_factory=dict)
+    # marker message index -> (cited body index, turn the marker's read was taken, the marker's own delta)
+    markers: dict[int, tuple[int, int, str]] = field(default_factory=dict)
+    unchanged_marks: int = 0
+    epoch_rewrites: int = 0
+    retained_chars_peak: int = 0
+
+    def admit(
+        self,
+        index: int,
+        *,
+        tool: str,
+        args: str,
+        page: str,
+        handles: bool,
+        content: str,
+        turn: int,
+        delta_at: int | None = None,
+    ) -> str:
+        """Record the read about to be appended at `index`; returns what the model is shown for it."""
+        cut = delta_at if delta_at is not None and 0 <= delta_at <= len(content) else len(content)
+        head, delta = content[:cut], content[cut:]
+        entry = _PerceptionEntry(
+            tool=tool,
+            args=args,
+            page="" if handles else page,
+            raw=hashlib.sha256(head.encode()).hexdigest(),
+            turn=turn,
+            handles=handles,
+            delta=delta,
+        )
+        if not handles:
+            prior_index = max((i for i, e in self.entries.items() if e.key == entry.key), default=None)
+            prior = None if prior_index is None else self.entries[prior_index]
+            if prior_index is not None and prior is not None and prior.shown:
+                label = _read_label(tool, args)
+                if prior.raw == entry.raw:
+                    # The marker locates its body only by label (the turn number is not in the transcript), so a
+                    # newer body with the same label from another page would be the one the model looks at.
+                    latest_same_label = max(
+                        i for i, e in self.entries.items() if e.shown and e.tool == tool and e.args == args
+                    )
+                    marker = (
+                        f"[{label} returned the same {len(head)} chars as your read at turn {prior.turn}, "
+                        "still shown above]"
+                    )
+                    if latest_same_label == prior_index and len(head) >= PERCEPTION_MARKER_MIN_RATIO * len(marker):
+                        self.markers[index] = (prior_index, turn, delta)
+                        self.unchanged_marks += 1
+                        return marker + delta
+                else:
+                    # On the NEW read: labelling the old one would rewrite a message the provider has cached.
+                    content = (
+                        f"[{label} returned different content from your read at turn {prior.turn}; that one "
+                        f"predates your later actions, this is the current one]\n{content}"
+                    )
+        self.entries[index] = entry
+        return content
+
+    def compact(self, messages: list[dict[str, Any]]) -> None:
+        """Run before every LLM call. The unread round (after the last assistant message) is never elided
+        and never charged: one batched turn must not evict every earlier read."""
+        last_assistant_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant_idx = i
+                break
+        newest: dict[tuple[str, str, str], int] = {}
+        for i in sorted(self.entries):
+            if self.entries[i].shown:
+                newest[self.entries[i].key] = i
+        for i, e in list(self.entries.items()):
+            if e.shown and e.handles and i < last_assistant_idx and newest[e.key] != i:
+                self._elide(messages, i)
+
+        read = self._read_bodies(last_assistant_idx)
+        charged = sum(len(messages[i]["content"]) for i in read)
+        # Two full-size reads (window plus its continuation notice) exceed HIGH, so without a floor an epoch
+        # would break paging, which the count window kept at two. The floor never triggers an epoch on its own.
+        if charged > PERCEPTION_RETAIN_CHARS_HIGH and len(read) > len(self._floor(read, newest)):
+            self.epoch_rewrites += 1
+            self._move_cited_bodies(messages)
+            newest = {}
+            for i in sorted(self.entries):
+                if self.entries[i].shown:
+                    newest[self.entries[i].key] = i
+            read = self._read_bodies(last_assistant_idx)
+            charged = sum(len(messages[i]["content"]) for i in read)
+            floor = self._floor(read, newest)
+            older = [i for i in read if newest[self.entries[i].key] != i]
+            current = [i for i in read if newest[self.entries[i].key] == i]
+            for i in older + current:
+                if charged <= PERCEPTION_RETAIN_CHARS_LOW:
+                    break
+                if i in floor:
+                    continue
+                charged -= len(messages[i]["content"])
+                self._elide(messages, i)
+        self.retained_chars_peak = max(self.retained_chars_peak, charged)
+
+    def _floor(self, read: list[int], newest: dict[tuple[str, str, str], int]) -> set[int]:
+        """The newest reads the model has seen, one per key, that an epoch never elides."""
+        return set([i for i in read if newest[self.entries[i].key] == i][-PERCEPTION_RETAIN_MIN_READS:])
+
+    def _read_bodies(self, last_assistant_idx: int) -> list[int]:
+        return sorted(i for i, e in self.entries.items() if e.shown and not e.handles and i < last_assistant_idx)
+
+    def _placeholder(self, entry: _PerceptionEntry) -> str:
+        return f"{_COMPACTED_PREFIX}{_read_label(entry.tool, entry.args)} output elided to bound context]"
+
+    def _elide(self, messages: list[dict[str, Any]], index: int) -> None:
+        entry = self.entries[index]
+        messages[index]["content"] = self._placeholder(entry) + entry.delta
+        entry.shown = False
+
+    def _move_cited_bodies(self, messages: list[dict[str, Any]]) -> None:
+        citing: dict[int, list[int]] = {}
+        for marker_index, (body_index, _, _) in self.markers.items():
+            citing.setdefault(body_index, []).append(marker_index)
+        for body_index, marker_indices in citing.items():
+            target = max(marker_indices)
+            body = self.entries[body_index]
+            shown = messages[body_index]["content"]
+            _, turn, target_delta = self.markers[target]
+            messages[target]["content"] = shown[: len(shown) - len(body.delta)] + target_delta
+            self._elide(messages, body_index)
+            for i in marker_indices:
+                if i != target:
+                    messages[i]["content"] = self._placeholder(body) + self.markers[i][2]
+            self.entries[target] = _PerceptionEntry(
+                tool=body.tool,
+                args=body.args,
+                page=body.page,
+                raw=body.raw,
+                turn=turn,
+                handles=False,
+                delta=target_delta,
+            )
+        self.markers.clear()
+
+    def log_fields(self) -> dict[str, int]:
+        return {
+            "perception_unchanged_marks": self.unchanged_marks,
+            "perception_epoch_rewrites": self.epoch_rewrites,
+            "perception_retained_chars_peak": self.retained_chars_peak,
+        }
 
 
 @dataclass(kw_only=True, slots=True)
@@ -2056,7 +3067,7 @@ class LoopState:
     """
 
     outcome: LoopOutcome | None = None
-    pending_nav_dead_end: int | None = None
+    pending_nav_dead_end: _NavDeadEnd | None = None
     stall_nudges_due: list[tuple[str, int]] = field(default_factory=list)
     # Page-state stall detector (SKY-15265): consecutive billable rounds on a byte-identical
     # fingerprint, whether the one re-plan nudge went out, and whether one is due this turn.
@@ -2083,7 +3094,7 @@ class LoopState:
     # The action round of the latest positive page-change evidence (SKY-15264, SKY-15666); the
     # budget-extension gate reads it, so what counts as evidence is load-bearing, not cosmetic.
     last_change_evidence_step: int | None = None
-    # Budget caps. The four are re-derived and applied ATOMICALLY on an extension grant: a partial
+    # Budget caps. The four are re-derived and applied ATOMICALLY on a step-budget grant: a partial
     # update converts a step-cap death into a token-cap death, so they move together or not at all.
     max_turns: int
     max_tool_calls: int
@@ -2093,14 +3104,37 @@ class LoopState:
     no_tool_call_turns: int = 0
     total_tool_calls: int = 0
     tool_seconds: float = 0.0
+    # What the token guards read: each call net of `prefix_excess`. raw_total_tokens is everything sent.
     total_tokens: int = 0
+    raw_total_tokens: int = 0
+    last_turn_raw_tokens: int = 0
+    # The first call's prompt tokens, and how far they exceed the caller's reference size. prefix_excess is None
+    # until the first call returns; a first call without usage leaves prefix_tokens None and the excess 0.
+    prefix_tokens: int | None = None
+    prefix_excess: int | None = None
     action_steps: int = 0
+    # Refused billable calls left uncharged since the last charged, non-refused one.
+    uncharged_refusals: int = 0
     budget_extended_notice: str | None = None
     # Progress-gated budget extension (SKY-15264, SKY-15666): how many extensions have been granted,
     # and the cap they are all sized and bounded against — captured before the first grant so growth
     # stays linear. The evidence input is last_change_evidence_step above.
     budget_extensions_granted: int = 0
     original_action_steps: int | None = None
+    # The step cap the token guard is currently sized for; a token-only grant moves it past max_action_steps.
+    token_extension_basis: int = 0
+    # Evidence recency is counted in action rounds, which a turn without an action does not advance, so a
+    # token grant instead spends the evidence it was granted on and the next grant needs new evidence.
+    token_extension_evidence_spent: bool = False
+    token_extensions_granted: int = 0
+    token_grant_action_steps: int | None = None
+    # Billable (tool, args) keys that have succeeded, and the dispatch of the first never-seen one since the last
+    # token grant: a repeated action (a hover, an identical submit retry) does not re-arm a token grant. Ordered
+    # against evidence by a per-event sequence, since a batch's action and its evidence share one step.
+    succeeded_action_keys: set[tuple[str, str]] = field(default_factory=set)
+    event_seq: int = 0
+    novel_action_seq: int | None = None
+    last_change_evidence_seq: int = 0
     token_clamp_reported: bool = False
     # Final-turn grant (budget-exhaustion final turn): mirrors budget_extension_granted's shape. A
     # budget-cap trip anywhere in the loop sets this and buys one more unconstrained model turn. One
@@ -2122,12 +3156,9 @@ class LoopState:
     # each call, passing prompt=None: LLMCaller.use_message_history never appends the
     # assistant reply or tool results itself, so multi-turn tool use must be threaded here.
     messages: list[dict[str, Any]] = field(default_factory=list)
-    # Indices into `messages` of successful perception results, recorded as they are appended so
-    # compaction can keep the newest without inferring "real snapshot" from content size. The value is
-    # the read's supersession key — the loop's own `action_key`, the (tool, args) identity the
-    # perception-stall policy already calls "the same probe". Keying on the tool name alone would make
-    # a read of one region supersede a read of another.
-    snapshot_keys: dict[int, str] = field(default_factory=dict)
+    # Successful perception results by index into `messages`, recorded as they are appended, so
+    # compaction never infers "real snapshot" from content size and a skip/error result is never one.
+    reads: _PerceptionStore = field(default_factory=_PerceptionStore)
     perception: _PerceptionLedger = field(default_factory=_PerceptionLedger)
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress: _ProgressLedger | None = None
@@ -2137,9 +3168,29 @@ class LoopState:
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
     # the warning (and a chance to self-correct) at least one turn before the verdict.
-    action_counts: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
+    # (repeats, first turn, page fingerprint before the first attempt, moved since then): the nudge
+    # may only claim the page is unchanged when no sample in the streak left that fingerprint.
+    action_counts: dict[tuple[str, str], tuple[int, int, str | None, bool]] = field(default_factory=dict)
     action_warned: set[tuple[str, str]] = field(default_factory=set)
     billable_actions: list[str] = field(default_factory=list)
+    # Credential re-submit guard (SKY-16594), keyed on the placeholder token rather than the field:
+    # the page re-renders between attempts, so an element-keyed rule is evaded by the very re-render
+    # that precedes the second submit. Tokens entered since the last submit, and how many times each
+    # has been submitted; entering one that has spent CREDENTIAL_SUBMIT_BUDGET is refused.
+    credentials_entered: set[str] = field(default_factory=set)
+    credential_submits: dict[str, int] = field(default_factory=dict)
+    # The subset of those submits whose call returned an error (a stale ref, an inert click): charged all the same.
+    credential_failed_submits: dict[str, int] = field(default_factory=dict)
+    # A single-action block's completion is offered through the finish tool at most once: a guard that
+    # holds a verdict only once would pass a second offer the model never saw it hold.
+    block_completion_offered: bool = False
+    # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
+    block_action_transitioned: bool = False
+    # A billable call that succeeded and did more than reveal state, as a hover or a menu-opening click does. One that
+    # may have submitted, or a failed call that may have moved the page, also sets the second flag: no round follows it.
+    block_action_committed: bool = False
+    block_action_may_have_landed: bool = False
+    target_action_rounds_granted: int = 0
 
 
 async def run_agent_tool_loop(
@@ -2159,10 +3210,18 @@ async def run_agent_tool_loop(
     on_action_round: Callable[[list[RoundAction], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
+    # The fixed input re-sent on every call is charged against max_tokens only up to this size, so a large task
+    # payload does not shrink the turn horizon. None charges every call in full.
+    prefix_ref_tokens: int | None = None,
+    # A hard spend ceiling on everything sent, prefix included; no budget extension raises it.
+    max_raw_tokens: int | None = None,
     deadline_seconds: float | None = None,
     retryable_call_exceptions: tuple[type[BaseException], ...] = (),
     max_call_retries: int = 0,
     call_retry_base_delay: float = 1.0,
+    # Makes this loop the owner of the LLM exhaustion receipt: calls are told not to emit one, and this
+    # fires once when the loop gives up, so a failure its own retry recovers is never counted.
+    on_llm_call_exhausted: Callable[[BaseException], None] | None = None,
     stall_nudge_after: int | None = PERCEPTION_STALL_NUDGE_AFTER,
     stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
     action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
@@ -2175,6 +3234,19 @@ async def run_agent_tool_loop(
     verification_blocker: VerificationBlocker | None = None,
     staged_downloads: set[str] | None = None,
     initial_navigation_status: int | None = None,
+    # Only ever named in the dead-end verdict's text, so a caller that has the status but not the URL
+    # (or whose URL is unfit to print) still gets the same verdict, minus the place.
+    initial_navigation_url: str | None = None,
+    # Every URL the CALLER gave this run, normalized by `caller_known_published_urls`. A guard verdict
+    # publishes a landed URL's path only when it is one of these; every other path is elided to its
+    # host. Computed once by the caller (it owns the task config) and never read by a tool.
+    caller_known_urls: frozenset[str] = frozenset(),
+    # Resolves the run's drop-check secret values when a verdict is about to name a page-supplied
+    # element. Read at verdict time, not loop start: the registry grows as a run resolves credentials.
+    label_secret_values: Callable[[], Collection[str]] | None = None,
+    # Placeholder tokens minted for a login credential's username slot, held to
+    # LOGIN_IDENTIFIER_SUBMIT_BUDGET instead of CREDENTIAL_SUBMIT_BUDGET. Read per refusal.
+    login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
@@ -2190,6 +3262,17 @@ async def run_agent_tool_loop(
     # step-cap death into a token-cap death. None keeps the guards fixed for the whole run.
     backstops_for_cap: Callable[[int], tuple[int, int, int]] | None = None,
     semantic_commit_stats: SemanticCommitStats | None = None,
+    # Set for an extraction block: it reads, and may click to reveal what it reads, but it does not
+    # author input, so every FILL_TOOLS call is refused at dispatch.
+    refuse_input_entry: bool = False,
+    tool_trail: ToolTrail | None = None,
+    # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
+    # finish(completed) instead of failing the block, as the step engine completes it after that step.
+    single_action_block: bool = False,
+    # Rounds such a block may add, one per cap trip, while its own action has not landed.
+    target_action_reserve: int = 0,
+    # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
+    block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -2215,8 +3298,22 @@ async def run_agent_tool_loop(
         st.action_counts.clear()
         st.action_warned.clear()
 
+    def _tokens_remaining() -> int | None:
+        """Charged headroom, clamped to the raw ceiling's turns left in charged units, so a hold or evidence gate
+        pricing N turns at `last_turn_tokens` does not defer into the raw trip. The raw trip itself is never extended."""
+        if st.max_tokens is None:
+            return None
+        remaining = st.max_tokens - st.total_tokens
+        if max_raw_tokens is not None and st.last_turn_raw_tokens > 0 and activity is not None:
+            raw_left = max_raw_tokens - st.raw_total_tokens
+            remaining = min(remaining, raw_left * activity.last_turn_tokens // st.last_turn_raw_tokens)
+        return remaining
+
     def _note_page_change_evidence() -> None:
         st.last_change_evidence_step = st.action_steps
+        st.token_extension_evidence_spent = False
+        st.event_seq += 1
+        st.last_change_evidence_seq = st.event_seq
 
     async def _consume_refresh_signal(
         ctx: SkyvernContext, tool_name: str, remaining: list[Any], round_actions: list[Any], *, drop: bool
@@ -2230,12 +3327,18 @@ async def run_agent_tool_loop(
         if st.refresh_cycles > max_refresh_cycles:
             # The queued calls were chosen on a page declared stale, so they are voided rather than
             # run; a page that keeps demanding a reload cannot be stabilized, and the run ends there.
-            LOG.warning("taskv3 loop refresh signal past cap", tool=tool_name, turn=st.turns)
+            LOG.warning(
+                "taskv3 loop refresh signal past cap",
+                tool=tool_name,
+                turn=st.turns,
+                guard=PAGE_REFRESH_EXHAUSTED_GUARD,
+                refresh_cycles=st.refresh_cycles,
+            )
             _append_skipped_tool_results(st.messages, remaining, "the page could not be stabilized")
-            st.outcome = LoopOutcome(
-                "terminated",
-                f"{PAGE_REFRESH_EXHAUSTED_REASON_PREFIX} a page-level handler requested a page reload "
-                f"{st.refresh_cycles} times — the page cannot be stabilized, so the goal cannot progress on it",
+            st.outcome = _guard_verdict(
+                PAGE_REFRESH_EXHAUSTED_GUARD,
+                "The page kept having to be reloaded and never settled into a state the run could act "
+                "on, so the task could not continue there.",
             )
             return True
         if reload_page is not None:
@@ -2461,15 +3564,16 @@ async def run_agent_tool_loop(
                 tool=tool_name,
                 identical_count=snap.live,
                 turn=st.turns,
+                guard=PERCEPTION_STALL_GUARD,
                 **attribution,
             )
             return (
-                LoopOutcome(
-                    "terminated",
-                    f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive identical snapshots from "
-                    f"one {tool_name} probe — the page stopped changing in response to actions, so the goal "
-                    "cannot progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
-                    "cross-origin frame)",
+                _guard_verdict(
+                    PERCEPTION_STALL_GUARD,
+                    "The page stopped changing in response to the run's actions — every fresh read of it "
+                    "came back with the same content — so the task could not make progress there, "
+                    "commonly because something on the page is in the way that the run cannot see or "
+                    "operate, such as a prompt inside an embedded frame.",
                 ),
                 stall_nudges,
             )
@@ -2505,13 +3609,14 @@ async def run_agent_tool_loop(
             stall_nudges.append((tool_name, snap.tool_identical))
         return None, stall_nudges
 
-    # Mutable for the run: a provider that rejects tool_choice rejects it every turn, so a drop
-    # made once must stick.
+    # Mutable for the run: a provider that rejects the reasoning-summary dict rejects it every turn, so a
+    # drop made once must stick.
     active_call_kwargs = dict(call_kwargs or {})
+    if on_llm_call_exhausted is not None:
+        active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
-    def _degrade_tool_choice(exc: BaseException) -> bool:
-        """Drop the optional call parameters (tool_choice, the reasoning-summary dict) and report
-        whether the turn is worth re-issuing.
+    def _degrade_call_params(exc: BaseException) -> bool:
+        """Drop the optional reasoning-summary dict and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
         on a run that was already failing. A context-window overflow is excluded because dropping a
@@ -2520,14 +3625,14 @@ async def run_agent_tool_loop(
         """
         if isinstance(exc, SkyvernContextWindowExceededError):
             return False
-        # One parameter per degrade, least-proven first: a provider that rejects only the summary
-        # dict keeps its independently supported tool_choice; a second rejection drops that too.
-        for key in ("reasoning_effort", "tool_choice"):
-            if active_call_kwargs.pop(key, None) is not None:
-                LOG.warning(
-                    "taskv3 loop retrying without optional call param", dropped=key, turn=st.turns, exc_info=True
-                )
-                return True
+        if active_call_kwargs.pop("reasoning_effort", None) is not None:
+            LOG.warning(
+                "taskv3 loop retrying without optional call param",
+                dropped="reasoning_effort",
+                turn=st.turns,
+                exc_info=True,
+            )
+            return True
         return False
 
     # Images produced by an on-demand `look` this turn, to show the model on the NEXT call only. Passed
@@ -2536,6 +3641,144 @@ async def run_agent_tool_loop(
     # gone the turn after).
     started_at = time.monotonic()
     deadline_at = started_at + deadline_seconds if deadline_seconds is not None else None
+
+    async def _reserve_target_action_round(tool_name: str) -> bool:
+        if (
+            not single_action_block
+            or st.target_action_rounds_granted >= target_action_reserve
+            or st.block_action_transitioned
+            or st.final_turn_granted
+        ):
+            return False
+        verdict: str | None = None
+        if st.block_action_may_have_landed:
+            # A click or Enter may have submitted without moving the URL, and a failed call that moved the page left
+            # it; another round could submit twice or act on the next page.
+            reason = "may_have_landed"
+        elif not st.block_action_committed:
+            reason = "nothing_committed"
+        elif block_completion_check is None:
+            reason = "no_judge"
+        else:
+            try:
+                judged = await block_completion_check()
+                verdict = judged.verdict if judged.skipped_reason is None else None
+                reason = f"judge_{judged.skipped_reason or judged.verdict}"
+            except Exception:
+                LOG.warning("taskv3 target action judge raised", exc_info=True)
+                reason = "judge_error"
+        granted = reason == "nothing_committed" or verdict == "not_achieved"
+        if granted:
+            st.target_action_rounds_granted += 1
+            st.max_action_steps = (st.max_action_steps or 0) + 1
+        LOG.info(
+            TARGET_ACTION_ROUND_EVENT,
+            granted=granted,
+            reason=reason,
+            rounds_granted=st.target_action_rounds_granted,
+            max_action_steps=st.max_action_steps,
+            action_steps=st.action_steps,
+            tool=tool_name,
+            turn=st.turns,
+        )
+        return granted
+
+    def _extension_gate(extension: int, headroom_gain: tuple[int, int, int]) -> tuple[bool, str]:
+        refresh_ctx = skyvern_context.current()
+        if refresh_ctx is not None and refresh_ctx.refresh_working_page:
+            # A pending refresh voids the next action and re-baselines the page: a grant must not race
+            # it and spend the extension on pre-reload evidence.
+            return False, "refresh_pending"
+        return _budget_extension_gate(
+            st.action_steps,
+            st.last_change_evidence_step,
+            st.action_warned,
+            # CURRENT confirmed stalled-ness by the ledger's own rules: form_armed (the latest look
+            # showed a form) plus a window of fruitless actions. Not the one-shot telemetry latch, and
+            # never a bare counter — a form-less page increments the counter but must not be judged
+            # stuck by it.
+            st.progress is not None
+            and st.progress.form_armed
+            and st.progress.actions_since_progress >= st.progress.window,
+            activity,
+            deadline_at,
+            extension,
+            seconds_per_step=(time.monotonic() - started_at) / max(st.action_steps, 1),
+            headroom_gain=headroom_gain,
+        )
+
+    def _token_budget_extended() -> bool:
+        if (
+            backstops_for_cap is None
+            or st.max_tokens is None
+            or st.max_action_steps is None
+            or st.action_steps >= st.max_action_steps
+        ):
+            return False
+        base_cap = st.original_action_steps or st.max_action_steps
+        basis = max(st.token_extension_basis, st.max_action_steps)
+        extension_limit = base_cap * ACTION_BUDGET_EXTENSION_MAX_FACTOR
+        if max_action_steps_ceiling is not None:
+            extension_limit = min(extension_limit, max_action_steps_ceiling)
+        extension = min(base_cap // 2, extension_limit - basis)
+        grant_max_tokens = st.max_tokens
+        if extension > 0:
+            grant_max_tokens = max(st.max_tokens, backstops_for_cap(basis + extension)[2])
+        if extension <= 0:
+            allowed, gate_reason = False, "extension_limit_reached"
+        elif st.total_tokens >= grant_max_tokens - final_turn_token_reserve:
+            allowed, gate_reason = False, "token_ceiling_reached"
+        elif st.token_extension_evidence_spent:
+            allowed, gate_reason = False, "no_recent_page_change_evidence"
+        elif st.token_grant_action_steps is not None and st.novel_action_seq is None:
+            # Perception alone re-earns evidence on a page whose content keeps changing (a clock, rotating
+            # text), so a renewal needs a new action, and page-change evidence stamped after it.
+            allowed, gate_reason = False, "no_new_action_since_last_token_grant"
+        elif st.token_grant_action_steps is not None and st.last_change_evidence_seq <= (st.novel_action_seq or 0):
+            allowed, gate_reason = False, "no_page_change_after_the_new_action"
+        else:
+            # Funding 2 rounds at the last turn's cost rarely binds here; the checks above and the gate's evidence
+            # check refuse a spiral, and its stall vetoes bind only on a form page or identical re-reads.
+            allowed, gate_reason = _extension_gate(
+                TOKEN_EXTENSION_FUNDED_ROUNDS, (0, 0, grant_max_tokens - st.max_tokens)
+            )
+        if not allowed:
+            LOG.info(
+                TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
+                guard="max_tokens",
+                gate_reason=gate_reason,
+                max_tokens=st.max_tokens,
+                total_tokens=st.total_tokens,
+                action_steps=st.action_steps,
+                max_action_steps=st.max_action_steps,
+                token_extensions_granted=st.token_extensions_granted,
+                base_cap=base_cap,
+                turn=st.turns,
+            )
+            return False
+        original_max_tokens = st.max_tokens
+        st.token_extensions_granted += 1
+        st.token_extension_basis = basis + extension
+        st.token_extension_evidence_spent = True
+        st.token_grant_action_steps = st.action_steps
+        st.novel_action_seq = None
+        st.max_tokens = grant_max_tokens
+        if activity is not None:
+            activity.tokens_remaining = _tokens_remaining()
+        LOG.info(
+            TOKEN_BUDGET_EXTENDED_EVENT,
+            guard="max_tokens",
+            original_max_tokens=original_max_tokens,
+            max_tokens=st.max_tokens,
+            token_extension_basis=st.token_extension_basis,
+            total_tokens=st.total_tokens,
+            action_steps=st.action_steps,
+            max_action_steps=st.max_action_steps,
+            token_extensions_granted=st.token_extensions_granted,
+            base_cap=base_cap,
+            turn=st.turns,
+        )
+        return True
 
     # The task's starting URL is navigated during browser setup, before this loop runs, so a dead/removed
     # starting posting never routes through the in-loop `navigate` tool — the model just observes the dead
@@ -2547,11 +3790,19 @@ async def run_agent_tool_loop(
         if should_cancel is not None and await should_cancel():
             st.outcome = LoopOutcome("canceled", "run canceled")
         else:
-            LOG.info("taskv3 loop initial navigation dead end", http_status=initial_navigation_status)
-            st.outcome = LoopOutcome(
-                "terminated",
-                f"{NAV_DEAD_END_REASON_PREFIX} the task's starting URL returned HTTP {initial_navigation_status} "
-                "— the target no longer exists or has been removed, so the goal cannot be completed there",
+            LOG.info(
+                "taskv3 loop initial navigation dead end",
+                http_status=initial_navigation_status,
+                guard=NAV_DEAD_END_GUARD,
+            )
+            st.outcome = _guard_verdict(
+                NAV_DEAD_END_GUARD,
+                _dead_end_reason(
+                    initial_navigation_status,
+                    initial_navigation_url,
+                    page_noun="The task's starting page",
+                    caller_known_urls=caller_known_urls,
+                ),
             )
 
     while st.outcome is None:
@@ -2581,7 +3832,14 @@ async def run_agent_tool_loop(
         if not st.final_turn_granted:
             if deadline_seconds is not None and time.monotonic() - started_at > deadline_seconds:
                 top_of_turn_trip = f"deadline ({deadline_seconds:.0f}s) reached"
-            elif st.max_tokens is not None and st.total_tokens >= max(0, st.max_tokens - final_turn_token_reserve):
+            # Before max_tokens: its check can grant an extension, which the raw ceiling must not be funding.
+            elif max_raw_tokens is not None and st.raw_total_tokens >= max_raw_tokens:
+                top_of_turn_trip = f"raw_tokens ({max_raw_tokens}) reached"
+            elif (
+                st.max_tokens is not None
+                and st.total_tokens >= max(0, st.max_tokens - final_turn_token_reserve)
+                and not _token_budget_extended()
+            ):
                 top_of_turn_trip = f"max_tokens ({st.max_tokens}) reached"
             elif st.turns >= st.max_turns:
                 top_of_turn_trip = f"max_turns ({st.max_turns}) reached"
@@ -2611,7 +3869,7 @@ async def run_agent_tool_loop(
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
-        _compact_transcript(st.messages, st.snapshot_keys)
+        st.reads.compact(st.messages)
         llm_caller.message_history = list(st.messages)
         # Consume any pending look image into THIS call only, then clear: the image rides one request
         # and is never appended to `messages`, so the turn after carries zero image blocks.
@@ -2643,7 +3901,7 @@ async def run_agent_tool_loop(
                     # below: litellm's 400s subclass openai.APIError, which the LLM layer maps to
                     # the retryable type. Degrading only after the transient budget is spent keeps
                     # a passing blip from disabling the lever for the rest of the run.
-                    if _degrade_tool_choice(exc):
+                    if _degrade_call_params(exc):
                         # Spend the transient budget once, not once per parameter set: the degraded
                         # turn gets a single shot, which is what "last resort" is worth.
                         call_attempt = max_call_retries
@@ -2651,14 +3909,18 @@ async def run_agent_tool_loop(
                     LOG.warning(
                         "taskv3 loop LLM call failed after retries", turn=st.turns, attempts=call_attempt, exc_info=True
                     )
+                    if on_llm_call_exhausted is not None:
+                        on_llm_call_exhausted(exc)
                     st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
                     break
                 LOG.info("taskv3 loop retrying transient LLM error", turn=st.turns, attempt=call_attempt)
                 await asyncio.sleep(call_retry_base_delay * (2 ** (call_attempt - 1)))
             except Exception as exc:
-                if _degrade_tool_choice(exc):
+                if _degrade_call_params(exc):
                     continue
                 LOG.warning("taskv3 loop LLM call failed", turn=st.turns, exc_info=True)
+                if on_llm_call_exhausted is not None:
+                    on_llm_call_exhausted(exc)
                 st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
                 break
         if st.outcome is not None:
@@ -2668,10 +3930,22 @@ async def run_agent_tool_loop(
         turn_tokens = _get(usage, "total_tokens")
         if not turn_tokens:
             turn_tokens = (_get(usage, "prompt_tokens") or 0) + (_get(usage, "completion_tokens") or 0)
-        st.total_tokens += int(turn_tokens or 0)
+        turn_tokens = int(turn_tokens or 0)
+        if st.prefix_excess is None:
+            st.prefix_tokens = int(_get(usage, "prompt_tokens") or 0) or None
+            st.prefix_excess = (
+                0
+                if prefix_ref_tokens is None or st.prefix_tokens is None
+                else max(0, st.prefix_tokens - prefix_ref_tokens)
+            )
+        charged_tokens = max(0, turn_tokens - st.prefix_excess)
+        st.raw_total_tokens += turn_tokens
+        st.last_turn_raw_tokens = turn_tokens
+        st.total_tokens += charged_tokens
         if activity is not None:
-            activity.last_turn_tokens = int(turn_tokens or 0)
-            activity.tokens_remaining = None if st.max_tokens is None else st.max_tokens - st.total_tokens
+            # The charged figure, so the extension gates that size a turn by it see what a turn costs the guard.
+            activity.last_turn_tokens = charged_tokens
+            activity.tokens_remaining = _tokens_remaining()
 
         text = _extract_text(response)
         reasoning_summary = _extract_reasoning_summary(response)
@@ -2691,7 +3965,10 @@ async def run_agent_tool_loop(
             st.messages.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
             continue
 
-        turn_did_action = False
+        # Dispatched feeds the page-state stall detector; charged feeds the action-step budget and the
+        # rows' billable flag. They differ only by calls the tool refused before acting on the page.
+        turn_dispatched_billable = False
+        turn_charged = False
         st.stall_nudges_due = []
         st.refresh_nudge_due = False
         st.budget_extended_notice = None
@@ -2707,6 +3984,8 @@ async def run_agent_tool_loop(
         # and a verdict written before the failure was seen may be wrong or mis-reasoned.
         failed_selectors: set[str] = set()
         batch_had_failure = False
+        # A refusal leaves its value in the field, so no click after it -- toggle or not -- may run.
+        batch_had_refusal = False
         marks_stale = False
         # Loop events minted this batch, emitted only after every progress signal the batch can
         # produce has been absorbed (see the end-of-batch emission below).
@@ -2714,7 +3993,7 @@ async def run_agent_tool_loop(
         batch_page_change_reason: str | None = None
         batch_fp_before: str | None = None
         # Sample only when the batch can actually land a billable action -- the end-of-batch check
-        # below gates on turn_did_action, so a finish-only or perception-only batch has no use for
+        # below gates on turn_dispatched_billable, so a finish-only or perception-only batch has no use for
         # this baseline and shouldn't pay its round-trip.
         batch_has_billable_call = any(
             tool_by_name.get(tool_name) is not None and tool_by_name[tool_name].billable
@@ -2736,7 +4015,7 @@ async def run_agent_tool_loop(
                 # The page moved BETWEEN batches (a delayed render landing after the prior
                 # after-sample): the touches the old samples described are stale, and this batch's
                 # dispatch and extension decisions must not read them. Canonical-only — the
-                # incumbent stall counters keep their end-of-batch turn_did_action gate.
+                # incumbent stall counters keep their end-of-batch turn_dispatched_billable gate.
                 st.canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
@@ -2768,6 +4047,11 @@ async def run_agent_tool_loop(
             spec = tool_by_name.get(tool_name)
             call_selector = _call_selector(args)
             if marks_stale and call_selector is not None and call_selector.startswith("mark="):
+                if activity is not None:
+                    # Same predicate as the extraction and credential refusals below: the model
+                    # emitted a well-formed action call and the harness declined to dispatch it over
+                    # its OWN bookkeeping.
+                    activity.action_attempts += 1
                 st.messages.append(
                     {
                         "role": "tool",
@@ -2805,7 +4089,82 @@ async def run_agent_tool_loop(
                     }
                 )
                 continue
-            if batch_had_failure and _may_submit(tool_name, args):
+            if refuse_input_entry and tool_name in FILL_TOOLS:
+                LOG.info(EXTRACTION_ENTRY_REFUSED_EVENT, tool=tool_name, turn=st.turns)
+                if activity is not None:
+                    # The model attempted; the harness declined. A refusal must not read as a run
+                    # that never tried.
+                    activity.action_attempts += 1
+                # A refused call did not do what the rest of the batch was planned around, so it marks the
+                # batch failed: a later click, Enter-shaped submit, or finish in the same batch is skipped.
+                batch_had_failure = True
+                batch_had_refusal = True
+                st.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "refused: an extraction block does not type, select, or upload input. Extract what the "
+                            "page shows now (clicking to reveal content is allowed), or finish with a status "
+                            "that reflects it"
+                        ),
+                    }
+                )
+                continue
+            spent_credentials = (
+                {
+                    token
+                    for token in _credential_placeholders(args)
+                    if st.credential_submits.get(token, 0) >= CREDENTIAL_SUBMIT_BUDGET
+                }
+                if tool_name in CREDENTIAL_ENTRY_TOOLS
+                else set()
+            )
+            if spent_credentials and login_identifier_tokens is not None:
+                try:
+                    identifiers = set(login_identifier_tokens())
+                except Exception:
+                    LOG.warning("taskv3 loop could not resolve the run's login identifier tokens", tool=tool_name)
+                    identifiers = set()
+                spent_credentials = {
+                    token
+                    for token in spent_credentials
+                    if token not in identifiers or st.credential_submits.get(token, 0) >= LOGIN_IDENTIFIER_SUBMIT_BUDGET
+                }
+            if spent_credentials:
+                LOG.info(
+                    CREDENTIAL_RESUBMIT_REFUSED_EVENT,
+                    tool=tool_name,
+                    turn=st.turns,
+                    charges_from_failed_calls=max(st.credential_failed_submits.get(t, 0) for t in spent_credentials),
+                )
+                if activity is not None:
+                    activity.action_attempts += 1
+                # Same reason the extraction refusal marks the batch: a click queued behind this call
+                # would submit the value still sitting in the field, which is the act being refused.
+                batch_had_failure = True
+                batch_had_refusal = True
+                st.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "refused: this secret value has already been entered and submitted in this task. The "
+                            "page asking for it again means it was not accepted, and every further attempt spends a "
+                            "real allowance on the account behind it — a sign-in lockout budget, a card's retry "
+                            "limit — so it will not be entered again: retyping it, rewording it or putting it in a "
+                            "different field will all be refused the same way. Finish with a status that reflects "
+                            "the rejected value, or continue with whatever does not need it"
+                        ),
+                    }
+                )
+                continue
+            toggle_exempted = False
+            if batch_had_failure and not batch_had_refusal and _may_submit(tool_name, args):
+                toggle_exempted = await _is_toggle_click(tool_name, spec, args)
+            if batch_had_failure and _may_submit(tool_name, args) and not toggle_exempted:
                 st.messages.append(
                     {
                         "role": "tool",
@@ -2833,6 +4192,7 @@ async def run_agent_tool_loop(
                 and spec.billable
                 and st.max_action_steps is not None
                 and st.action_steps >= st.max_action_steps
+                and not await _reserve_target_action_round(tool_name)
             ):
                 base_cap = st.original_action_steps if st.original_action_steps else st.max_action_steps
                 raw_extension = base_cap // 2
@@ -2868,36 +4228,21 @@ async def run_agent_tool_loop(
                     # Reported from the grant branch below, never here — a refused extension leaves
                     # the cap where it was, so reporting on it would name a cap never in effect and
                     # would spend the once-per-run latch on a non-event.
-                    token_clamped = st.max_tokens is not None and token_gain == 0 and grant_max_turns > st.max_turns
-                refresh_ctx = skyvern_context.current()
-                if st.max_action_steps >= extension_limit:
+                    # Judged on the sizing function, not the live guard: a token-only grant may already have
+                    # raised max_tokens to this cap's value, which is no ceiling.
+                    token_clamped = (
+                        st.max_tokens is not None
+                        and next_tokens <= backstops_for_cap(st.max_action_steps)[2]
+                        and grant_max_turns > st.max_turns
+                    )
+                if st.max_action_steps - st.target_action_rounds_granted >= extension_limit:
                     allowed, gate_reason = False, "extension_limit_reached"
                 elif raw_extension <= 0:
                     allowed, gate_reason = False, "cap_too_small"
                 elif extension <= 0:
                     allowed, gate_reason = False, "hard_step_ceiling"
-                elif refresh_ctx is not None and refresh_ctx.refresh_working_page:
-                    # A pending refresh voids this very action and re-baselines the page: the grant
-                    # must not race it and spend the extension on pre-reload evidence.
-                    allowed, gate_reason = False, "refresh_pending"
                 else:
-                    allowed, gate_reason = _budget_extension_gate(
-                        st.action_steps,
-                        st.last_change_evidence_step,
-                        st.action_warned,
-                        # CURRENT confirmed stalled-ness by the ledger's own rules: form_armed
-                        # (the latest look showed a form) plus a window of fruitless actions. Not
-                        # the one-shot telemetry latch, and never a bare counter — a form-less page
-                        # increments the counter but must not be judged stuck by it.
-                        st.progress is not None
-                        and st.progress.form_armed
-                        and st.progress.actions_since_progress >= st.progress.window,
-                        activity,
-                        deadline_at,
-                        extension,
-                        seconds_per_step=(time.monotonic() - started_at) / max(st.action_steps, 1),
-                        headroom_gain=headroom_gain,
-                    )
+                    allowed, gate_reason = _extension_gate(extension, headroom_gain)
                 # This read cannot see unabsorbed in-batch movement: action_steps is frozen during
                 # a batch, so the cap check trips on the batch's FIRST billable call — before any
                 # page action dispatches — and between-batch movement was absorbed when
@@ -2925,7 +4270,7 @@ async def run_agent_tool_loop(
                         # headroom it had before the grant.
                         activity.turns_remaining = st.max_turns - st.turns
                         activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
-                        activity.tokens_remaining = None if st.max_tokens is None else st.max_tokens - st.total_tokens
+                        activity.tokens_remaining = _tokens_remaining()
                     if token_clamped and not st.token_clamp_reported:
                         st.token_clamp_reported = True
                         LOG.info(
@@ -2995,6 +4340,57 @@ async def run_agent_tool_loop(
                     )
                     step_cap_trip = f"Reached the maximum steps ({st.max_action_steps})"
                     _append_skipped_tool_results(st.messages, tool_calls[idx:], "action-step budget reached")
+                    finish_spec = tool_by_name.get("finish")
+                    block_refusal: str | None = None
+                    if (
+                        single_action_block
+                        and st.billable_actions
+                        and finish_spec is not None
+                        and not st.block_completion_offered
+                    ):
+                        st.block_completion_offered = True
+                        # A successful action that moved nothing (a no-op click, a username typed before the
+                        # login submits) is no sign the block is done, and a URL change can land on the wrong page
+                        # or the next step of the same form. Every failure to reach a grounded "achieved" fails closed.
+                        block_verdict: GoalVerdict | None = None
+                        judge_skipped: str | None = None
+                        if st.block_action_transitioned:
+                            if block_completion_check is None:
+                                judge_skipped = "no_judge"
+                            else:
+                                try:
+                                    block_verdict = await block_completion_check()
+                                    judge_skipped = block_verdict.skipped_reason
+                                except Exception:
+                                    LOG.warning("taskv3 block completion judge raised", exc_info=True)
+                                    judge_skipped = "judge_error"
+                        judged = block_verdict if judge_skipped is None else None
+                        LOG.info(
+                            "taskv3 block completion evidence",
+                            url_changed=st.block_action_transitioned,
+                            billable_actions=st.billable_actions,
+                            judge_verdict=judged.verdict if judged is not None else None,
+                            judge_skipped_reason=judge_skipped,
+                            judge_latency_s=block_verdict.latency_s if block_verdict is not None else None,
+                        )
+                        if judged is not None and judged.verdict == "achieved":
+                            block_reason = (
+                                f"performed the block's action ({st.billable_actions[-1]}); "
+                                "a further action was past the block's step limit"
+                            )
+                            # Through the real handler, so every guard on a completed verdict still applies.
+                            try:
+                                block_finish = await finish_spec.handler(
+                                    {"status": "completed", "reason": block_reason}
+                                )
+                            except Exception:
+                                LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                                block_finish = ToolResult.error("")
+                            if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
+                                st.outcome = LoopOutcome("completed", block_reason)
+                                break
+                            if block_finish.status == "error":
+                                block_refusal = block_finish.content
                     # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
                     # away once the final turn is granted: a billable dispatch on the granted turn still
                     # hits it, which is the honest exit the grant exists to produce.
@@ -3029,9 +4425,10 @@ async def run_agent_tool_loop(
                             tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
                             tokens_remaining=None if activity is None else activity.tokens_remaining,
                         )
-                        st.messages.append(
-                            {"role": "user", "content": _budget_exhausted_observation(step_cap_trip, activity)}
-                        )
+                        observation = _budget_exhausted_observation(step_cap_trip, activity)
+                        if block_refusal:
+                            observation += f"\n\nThe block's completion was not accepted: {block_refusal}"
+                        st.messages.append({"role": "user", "content": observation})
                     break
             # Submit-shaped actions (the failure-evidence predicate, minus captcha) are reported BEFORE
             # dispatch, since after it the page may be the confirmation page. A failure here never fails
@@ -3077,28 +4474,83 @@ async def run_agent_tool_loop(
             selector_kind = _selector_kind(args)
             # Cleared per call, so a value can never carry over from the previous one in the batch.
             _RESOLVE_SECONDS.set(None)
-            _FRAME_PERCEPTION.set(None)
             _HIT_CLASS.set(None)
+            _COVERED_LAYER.set(None)
+            _TYPE_REACH.set(None)
+            _CLICK_DISPATCHED.set(False)
+            _TEXT_DELTA.set(None)
+            _TOOL_CALL_SEQ.set(st.total_tool_calls)
+            dispatch_ctx = skyvern_context.current()
+            runtime_secrets_before = len(dispatch_ctx.runtime_secret_values) if dispatch_ctx is not None else 0
+            # As in V1/V2, acting on the page again means an earlier navigation failure is no longer what the
+            # task ends on; reads and finish keep it, since a run that ends there ended on that navigation.
+            if spec is not None and spec.touches_page and dispatch_ctx is not None and dispatch_ctx.task_id:
+                clear_task_nav_error_code(dispatch_ctx.task_id)
             tool_started_at = time.monotonic()
+            st.event_seq += 1
+            dispatch_seq = st.event_seq
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             else:
                 if spec.billable:
-                    # A dispatched page action consumes a step even if it errors (it may mutate before
-                    # failing); billing below counts successes only.
-                    turn_did_action = True
+                    turn_dispatched_billable = True
                 try:
                     result = await spec.handler(args)
+                except ToolRefusal as refusal:
+                    result = refusal.as_result()
                 except Exception as exc:
-                    LOG.warning("taskv3 tool handler raised", tool=tool_name, exc_info=True)
+                    LOG.warning(
+                        "taskv3 tool handler raised",
+                        tool=tool_name,
+                        exc_info=True,
+                        **_navigate_record_fields(tool_name, args, None),
+                    )
                     raised_class = _raised_error_class(exc)
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
+            # A dispatched page action consumes a step even if it errors (it may mutate before failing),
+            # unless the tool refused it before acting on the page, within the grace. Billing counts
+            # successes only.
+            call_charged = spec is not None and spec.billable
+            if call_charged and result.status == "error" and result.refused and not result.touched_page:
+                call_charged = st.uncharged_refusals >= UNCHARGED_REFUSAL_GRACE
+                st.uncharged_refusals += 0 if call_charged else 1
+            elif call_charged:
+                st.uncharged_refusals = 0
+            turn_charged = turn_charged or call_charged
+            # Entry is recorded only when the tool succeeded (a stale-ref failure put nothing in the
+            # field), but the submit is recorded on DISPATCH whatever the verdict: the loop ran the
+            # click itself, so nothing here asks the page whether a submission completed. Entry first,
+            # so a type that pressed Enter submits the value it just entered.
+            if spec is not None:
+                if tool_name in CREDENTIAL_ENTRY_TOOLS and result.status == "ok":
+                    st.credentials_entered |= _credential_placeholders(args)
+                if _may_submit(tool_name, args):
+                    # Cleared, so a second click on an untouched form is not a second submission of
+                    # a credential that was only ever entered once.
+                    for token in st.credentials_entered:
+                        st.credential_submits[token] = st.credential_submits.get(token, 0) + 1
+                        if result.status == "error":
+                            st.credential_failed_submits[token] = st.credential_failed_submits.get(token, 0) + 1
+                    st.credentials_entered.clear()
             # Observe's summary counters are the only trace a perception change leaves on this
             # record; its content is deliberately never logged. Gated on the tool, not the payload,
             # so every other tool's record keeps exactly today's fields.
             observe_summary = _observe_summary_fields(result) if tool_name == "observe" else {}
+            # Which URL the call was about, so a navigate row is attributable to a target without the
+            # arguments themselves being logged.
+            navigate_fields = _navigate_record_fields(tool_name, args, result)
+            menu_note_fields = _menu_note_record_fields(tool_name, result)
+            reach_fields = _TYPE_REACH.get() or {}
+            # The stall counter is the zero-read signal for "solved, page unchanged, solved again", since a solve-only
+            # batch takes no fingerprint. Its 0 is unjudged until a batch is judged, flagged because a null is dropped.
+            stall_judged = st.page_state_ever_judged
+            solve_fields = (
+                {"page_state_stall_rounds": st.trailing_page_state_stall_rounds, "page_state_judged": stall_judged}
+                if tool_name == "solve_captcha"
+                else {}
+            )
             # Conditional for the same reason observe's counters are: a record only carries a field
             # the call actually produced, so an ok call's record keeps exactly the fields it has
             # today and `resolve_seconds` is absent (not null) on tools with no address to resolve.
@@ -3110,6 +4562,19 @@ async def run_agent_tool_loop(
                 # vocabulary with Python exception names under one facet, and taskv3 emits on every
                 # erroring tool call so it would dominate the values.
                 cost_fields["tool_error_class"] = result.error_class or "other"
+                # Only on the rows it describes, like the fields below: a billable call that did not
+                # spend an action step because the tool refused it before acting on the page.
+                if spec is not None and spec.billable and not call_charged:
+                    cost_fields["charged"] = False
+                # Only on the class they describe, so every other erroring row keeps exactly the
+                # fields it has today. Total over `covered` rows by construction: the helper that
+                # builds all three messages records before it returns any of them, so a covered row
+                # missing these means the class was emitted somewhere that is not that helper.
+                covered = _COVERED_LAYER.get()
+                if result.error_class == "covered" and covered is not None:
+                    cost_fields["covered_branch"] = covered["branch"]
+                    cost_fields["covered_controls"] = covered["controls"]
+                    cost_fields["covered_layer_kind"] = covered["layer_kind"]
             elif result.ok_class is not None:
                 # Prefixed for the same flat-index reason as `tool_error_class` above. NOT defaulted
                 # the way that field is: it is emitted only by tools whose `ok` spans distinct
@@ -3125,12 +4590,18 @@ async def run_agent_tool_loop(
             resolve_seconds = _RESOLVE_SECONDS.get()
             if resolve_seconds is not None:
                 cost_fields["resolve_seconds"] = resolve_seconds
-            # Rides every row that carries a reading, because the css reading's MEANING depends on it:
-            # a dataset spanning the frame-perception ramp otherwise mixes two definitions of the same
-            # field with nothing on the record to stratify on.
-            frame_perception = _FRAME_PERCEPTION.get()
-            if frame_perception is not None:
-                cost_fields["frame_perception"] = frame_perception
+            text_delta = _TEXT_DELTA.get()
+            if text_delta is not None:
+                cost_fields["text_delta_seconds"] = text_delta[0]
+                if text_delta[1] is not None:
+                    cost_fields["text_delta_lines"] = text_delta[1]
+                    cost_fields["text_delta_chars"] = text_delta[2]
+                if text_delta[3]:
+                    cost_fields["text_delta_over_bound"] = True
+                if text_delta[4]:
+                    cost_fields["text_delta_skipped"] = text_delta[4]
+                if text_delta[5]:
+                    cost_fields["text_delta_pending_lines"] = text_delta[5]
             # Every click row carries this, defaulting to `unknown`, because a groupBy DROPS rows
             # missing a facet -- a partial field would read as a clean result rather than a gap.
             # Gated on `spec is not None` for the same reason the `tool` field is: an unregistered
@@ -3169,6 +4640,11 @@ async def run_agent_tool_loop(
             reported = result.data or {}
             head_fragment_len = int(reported.get("head_fragment_len") or 0)
             notice_at = reported.get("notice_at")
+            clip_spans = reported.get("clip_spans")
+            # The text-delta section's span in `result.content`, read once for this result: the stall
+            # digest drops exactly that span, and the perception store below re-finds it after masking.
+            reported_delta_at = reported.get("delta_at")
+            reported_delta_end = reported.get("delta_end")
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(
                     _canonical_perception_content(
@@ -3176,6 +4652,9 @@ async def run_agent_tool_loop(
                         is_observe=tool_name == "observe",
                         head_fragment_len=head_fragment_len,
                         notice_at=notice_at,
+                        clip_spans=clip_spans,
+                        delta_at=reported_delta_at,
+                        delta_end=reported_delta_end,
                     ).encode()
                 ).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
@@ -3218,8 +4697,14 @@ async def run_agent_tool_loop(
                 turn=st.turns,
                 batch_size=len(tool_calls),
                 batch_index=idx,
+                # What current_tool_call_seq() returned inside this call, so a tool's own lines join here.
+                tool_call_seq=st.total_tool_calls,
                 **cost_fields,
                 **observe_summary,
+                **navigate_fields,
+                **menu_note_fields,
+                **reach_fields,
+                **solve_fields,
                 **attribution,
             )
             if spec is not None and spec.billable:
@@ -3243,20 +4728,61 @@ async def run_agent_tool_loop(
                         }
                     )
 
-            if spec is not None and spec.compactable and result.status == "ok":
-                # The index this successful snapshot will occupy, pre-append, against the read's
-                # identity — the tool half is `messages[i]["name"]`, which compaction reads there.
-                st.snapshot_keys[len(st.messages)] = _declared_args_key(spec, args)
             model_facing_content = result.content
             skyvern_ctx = skyvern_context.current()
             if skyvern_ctx is not None:
                 model_facing_content = skyvern_ctx.hide_from_model(model_facing_content)
+            # Masking can change lengths, so the tool's offset is re-found as the masked delta's suffix
+            # position; if masking broke the suffix, the whole result counts as the read.
+            delta_at: int | None = None
+            if type(reported_delta_at) is int and 0 <= reported_delta_at <= len(result.content):
+                delta = result.content[reported_delta_at:]
+                if skyvern_ctx is not None:
+                    delta = skyvern_ctx.hide_from_model(delta)
+                if model_facing_content.endswith(delta):
+                    delta_at = len(model_facing_content) - len(delta)
+            transcript_content = model_facing_content
+            if spec is not None and spec.compactable and result.status == "ok":
+                transcript_content = st.reads.admit(
+                    len(st.messages),
+                    tool=tool_name,
+                    args=_declared_args_key(spec, args),
+                    page=probe_before or "",
+                    handles=spec.issues_handles,
+                    content=model_facing_content,
+                    turn=st.turns,
+                    delta_at=delta_at,
+                )
             # A refresh raised by this call re-baselines the stall and repeat ledgers below, so neither
             # guard may end the run on it first.
             refresh_pending = skyvern_ctx is not None and skyvern_ctx.refresh_working_page
             st.messages.append(
-                {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
+                {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": transcript_content}
             )
+            # The two ways a secret reaches the page: a credential placeholder typed by an entry tool, and a value a
+            # tool registered as secret (a delivered verification code) for the model to type next. `navigate`
+            # resolves placeholders in a URL too.
+            call_entered_secret = (
+                (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
+                and bool(_credential_placeholders(args))
+            ) or (dispatch_ctx is not None and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before)
+            if call_entered_secret and (result.touched_page or not result.refused):
+                # A second round after a secret, ok or failed, could submit it again and spend a lockout attempt.
+                st.block_action_may_have_landed = True
+            if tool_trail is not None and spec is not None and not spec.terminal:
+                tool_trail.record(
+                    TrailEntry(
+                        tool=tool_name,
+                        status=result.status,
+                        content=model_facing_content,
+                        perception=spec.compactable,
+                        page_changing=spec.touches_page and (result.touched_page or not result.refused),
+                        secret_entered=call_entered_secret,
+                        entered=entered_values(tool_name, args),
+                        # Masked like the content, so an unchanged URL compares equal to the one observe prints.
+                        url_before=_trail_url_before(result, skyvern_ctx),
+                    )
+                )
             # A look's annotated screenshot is shown to the model on the next call only, never stored in
             # the transcript. Consumed and cleared at the top of the next turn. Only the LATEST snapshot
             # survives: a second look in the same turn supersedes the first (its marks replace the prior
@@ -3306,6 +4832,9 @@ async def run_agent_tool_loop(
                             is_observe=tool_name == "observe",
                             head_fragment_len=head_fragment_len,
                             notice_at=notice_at,
+                            clip_spans=clip_spans,
+                            delta_at=reported_delta_at,
+                            delta_end=reported_delta_end,
                         ).encode()
                     ).hexdigest(),
                     refresh_pending=refresh_pending,
@@ -3316,13 +4845,23 @@ async def run_agent_tool_loop(
                     _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "perception stalled")
                     break
             if spec is not None and spec.billable:
+                if result.status == "ok" and action_key not in st.succeeded_action_keys:
+                    st.succeeded_action_keys.add(action_key)
+                    if st.novel_action_seq is None:
+                        st.novel_action_seq = dispatch_seq
                 if st.progress is not None:
                     st.progress.on_billable()
-                # Errored dispatches count too: a failed attempt consumed a step (see the action-step
-                # accounting above) and a repeat-failing action is the same no-progress pathology.
-                repeat_count, first_turn = st.action_counts.get(action_key, (0, st.turns))
+                # Errored and refused dispatches count too: a repeat-failing action is the same
+                # no-progress pathology. It does not bound refusals (a stale one resets it);
+                # UNCHARGED_REFUSAL_GRACE does.
+                repeat_count, first_turn, streak_fp, streak_moved = st.action_counts.get(
+                    action_key, (0, st.turns, batch_fp_before, False)
+                )
                 repeat_count += 1
-                st.action_counts[action_key] = (repeat_count, first_turn)
+                streak_moved = streak_moved or (
+                    streak_fp is not None and batch_fp_before is not None and batch_fp_before != streak_fp
+                )
+                st.action_counts[action_key] = (repeat_count, first_turn, streak_fp, streak_moved)
                 # Terminate only when the streak spans more than one turn AND its warning was
                 # delivered: the system prompt commands batching identical clicks (steppers,
                 # arrows), so a single-batch streak has had no chance to see feedback yet, and a
@@ -3339,15 +4878,20 @@ async def run_agent_tool_loop(
                         tool=tool_name,
                         repeat_count=repeat_count,
                         turn=st.turns,
+                        guard=ACTION_LOOP_GUARD,
                         **attribution,
                     )
-                    st.outcome = LoopOutcome(
-                        "terminated",
-                        f"{ACTION_LOOP_REASON_PREFIX} {repeat_count} repeated {tool_name} attempts on "
-                        f"{_action_target(args)} with no observed page change between attempts — the same "
-                        "action against an unchanged outcome (commonly re-submitting into the same "
-                        "rejection banner) cannot progress the goal",
+                    # The customer-facing half names the control by the page's own accessible name, never
+                    # the selector the model's nudge uses: that selector is usually v3's own `data-tv3`
+                    # marker, which matches nothing in the customer's markup (SKY-16271).
+                    named_target = _verdict_target(
+                        tool_name,
+                        result_data.get(TARGET_LABEL_DATA_KEY),
+                        result_data.get(TARGET_KIND_DATA_KEY),
+                        label_secret_values,
+                        skyvern_ctx,
                     )
+                    st.outcome = _guard_verdict(ACTION_LOOP_GUARD, _action_loop_reason(named_target))
                     _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "action loop")
                     break
                 if (
@@ -3357,27 +4901,51 @@ async def run_agent_tool_loop(
                 ):
                     action_nudges_due.append((tool_name, args, repeat_count))
             if submit_watch is not None and tool_name == "navigate" and result.status == "ok":
-                # Outside the billable/recordable branch on purpose: navigate is neither, so a clear
-                # placed in there never runs. The run left the page; the control it clicked went too.
+                # Outside the billable/recordable branch on purpose: the run left the page and the
+                # control it clicked went too, whatever navigate's spec flags happen to say.
                 submit_watch.clear()
+            if activity is not None and spec is not None:
+                # The round_actions branch below is deliberately NARROWER: this one adds
+                # `engages_page`, which is engagement without billing or an action row. Perception is
+                # counted separately off `compactable`, the flag observe / get_html / look already
+                # share, rather than a tool name -- `look` does not even exist when vision is off.
+                if spec.touches_page:
+                    activity.action_attempts += 1
+                elif spec.compactable and result.status == "ok":
+                    activity.perceptions += 1
             if spec is not None and (spec.billable or spec.recordable):
-                # Dispatched page actions enter the round with their outcome: a failed billable round
+                # Dispatched page actions enter the round with their outcome: a failed charged round
                 # still consumed budget and must persist (else later blocks undercount the run
-                # budget); recordable tools persist for artifact parity without billing/budget.
+                # budget); refused calls and recordable tools persist without claiming a budget unit.
+                round_outcome = result_data.get(ACTION_OUTCOME_DATA_KEY)
+                round_outcome = round_outcome if isinstance(round_outcome, dict) else None
                 round_actions.append(
                     RoundAction(
                         tool_name,
                         args,
-                        result.status == "ok",
+                        result.status == "ok" and not _outcome_reports_failure(round_outcome),
                         result_data.get(TARGET_LABEL_DATA_KEY) or None,
                         result_data.get(TARGET_KIND_DATA_KEY) or None,
-                        spec.billable,
+                        call_charged,
+                        round_outcome,
+                        result.content if result.status == "error" else None,
                     )
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
+                    if not (tool_name == "hover" or (tool_name == "click" and result_data.get("menu_note"))):
+                        st.block_action_committed = True
+                        st.block_action_may_have_landed |= _may_submit(tool_name, args)
+                    # click reports it at the top level, navigate inside its action outcome. A navigation that
+                    # landed on an error page moved the URL without doing the block's action.
+                    if not _outcome_reports_failure(round_outcome) and (
+                        result_data.get("page_transitioned") is True
+                        or (round_outcome or {}).get("page_transitioned") is True
+                    ):
+                        st.block_action_transitioned = True
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
+                    activity.failure_evidence_trigger_generation += 1
                 if submit_watch is not None:
                     submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
                     if submit_selector is not None:
@@ -3417,7 +4985,7 @@ async def run_agent_tool_loop(
                 # A hard 404/410 landing is a non-capability dead-end (a dead/removed posting). Remember
                 # it but do NOT break the batch: a later navigate in the same turn can land the run on a
                 # live page and clear it below. Applied once the batch settles (after this for-loop).
-                st.pending_nav_dead_end = dead_end_status
+                st.pending_nav_dead_end = _NavDeadEnd(dead_end_status, result_data.get("navigation_dead_end_url"))
             elif result_data.get("page_state_changed"):
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
@@ -3428,18 +4996,39 @@ async def run_agent_tool_loop(
                     status=data.get("status", "completed"),
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
-                    error_code=data.get("error_code"),
-                    error_codes_offered=bool(data.get("error_codes_offered")),
+                    converted_from=_non_completed(data.get("converted_from")),
+                    converted_from_reason=data.get("converted_from_reason", ""),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,
                 )
                 break
 
+            if result.status == "ok" and result_data.get("readiness_incomplete"):
+                # A navigate whose document committed but did not finish loading. The rest of the batch
+                # was queued against a loaded page, and before SKY-16278 the tool raised here and the
+                # error branch below skipped it; keep that, so the readiness the tool reported reaches
+                # the model before it chooses its next action.
+                _append_skipped_tool_results(
+                    st.messages,
+                    tool_calls[idx + 1 :],
+                    "the page this batch navigated to had not finished loading — observe it before re-queuing these",
+                )
+                break
+
+            # A toggle can auto-advance a wizard, leaving the batch's failed field on the step behind it.
+            # Read off the click's own before/after URL comparison, so the check costs nothing extra.
+            if toggle_exempted and result.status == "ok" and result_data.get("page_transitioned") is True:
+                _append_skipped_tool_results(
+                    st.messages,
+                    tool_calls[idx + 1 :],
+                    "an earlier field in this batch failed and was left on the previous step; the page moved "
+                    "on — re-observe",
+                )
+                break
+
             if result.status == "error":
-                # The rest of the batch is skipped only when the failed call moved the page: the tool's
-                # own signal, or the probe sampled before dispatch (a missing reading counts as moved).
-                poisoned = (
+                call_moved_page = (
                     tool_name == "navigate"
                     or result.content == PAGE_UNAVAILABLE_ERROR
                     or bool(
@@ -3448,21 +5037,58 @@ async def run_agent_tool_loop(
                         or result_data.get("navigation_dead_end")
                     )
                 )
+                # A live refusal needs a new model choice, so stop_batch skips pending calls without claiming progress.
+                list_left_open = not call_moved_page and bool(result_data.get("stop_batch"))
+                poisoned = call_moved_page or list_left_open
+                probe_read = False
                 # Whether the page moved is independent of the tool's kind: a wait that timed out because
                 # the site navigated poisons the batch just as a failed click would.
                 if not poisoned and spec is not None and page_probe is not None:
                     probe_after = await _sample_probe(page_probe, deadline_at=deadline_at)
                     poisoned = probe_before is None or probe_after is None or probe_after != probe_before
+                    probe_read = probe_before is not None and probe_after is not None
                     if probe_before is not None and probe_after is not None and probe_after != probe_before:
                         # Two landed identity samples that differ: the failed call still moved the
                         # document, and the fingerprint may render identically on the new one (a
                         # same-template step) — absorb it here or the rung survives that blindness.
                         st.canonical.progress(_ProgressEvidence.PROBE_MISMATCH)
+                # Only a click reports whether the page received it; a failed Enter or code call may have submitted.
+                may_have_submitted = (
+                    _CLICK_DISPATCHED.get()
+                    or bool(result_data.get(CLICK_DISPATCHED_DATA_KEY))
+                    or (tool_name != "click" and _may_submit(tool_name, args))
+                )
+                if spec is not None and spec.billable and (poisoned or may_have_submitted) and not list_left_open:
+                    st.block_action_may_have_landed = True
+                elif tool_name in FILL_TOOLS and (result.touched_page or not result.refused):
+                    # A failed entry may still have written the field (a partial or other value); only the judge,
+                    # which also skips after a typed secret, can say another round is safe.
+                    st.block_action_committed = True
                 if poisoned:
+                    if tool_calls[idx + 1 :]:
+                        if list_left_open:
+                            skip_reason = "list_left_open"
+                        elif call_moved_page:
+                            skip_reason = "page_moved"
+                        elif probe_read:
+                            skip_reason = "probe_changed"
+                        else:
+                            skip_reason = "probe_unread"
+                        LOG.info(
+                            "taskv3 batch calls skipped",
+                            reason=skip_reason,
+                            skipped=len(tool_calls[idx + 1 :]),
+                            after_tool=tool_name,
+                            after_error_class=result.error_class or "other",
+                            tool_call_seq=st.total_tool_calls,
+                        )
                     _append_skipped_tool_results(
                         st.messages,
                         tool_calls[idx + 1 :],
-                        "earlier tool call in this batch failed and changed the page — re-observe before "
+                        "an earlier call in this batch left a list open and is waiting for a pick from it — make "
+                        "that pick or close the list, then re-issue these"
+                        if list_left_open
+                        else "earlier tool call in this batch failed and changed the page — re-observe before "
                         "re-queuing these",
                     )
                     break
@@ -3492,18 +5118,32 @@ async def run_agent_tool_loop(
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
         # failed/terminated choice to the model's finish tool (which does not converge on this class).
         if st.outcome is None and st.pending_nav_dead_end is not None:
-            LOG.info("taskv3 loop navigation dead end", http_status=st.pending_nav_dead_end, turn=st.turns)
-            st.outcome = LoopOutcome(
-                "terminated",
-                f"{NAV_DEAD_END_REASON_PREFIX} navigate landed on a dead page (HTTP {st.pending_nav_dead_end}) — "
-                "the target no longer exists or has been removed, so the goal cannot be completed there",
+            LOG.info(
+                "taskv3 loop navigation dead end",
+                http_status=st.pending_nav_dead_end.status,
+                turn=st.turns,
+                guard=NAV_DEAD_END_GUARD,
+            )
+            st.outcome = _guard_verdict(
+                NAV_DEAD_END_GUARD,
+                _dead_end_reason(
+                    st.pending_nav_dead_end.status,
+                    st.pending_nav_dead_end.url,
+                    page_noun="The page the run opened",
+                    caller_known_urls=caller_known_urls,
+                ),
             )
 
         # Page-state stall detector (SKY-15265): tool-independent — any batch of billable work that
         # leaves the rendered document byte-identical ticks the counter, whatever tools produced it.
         # A missing sample is no evidence either way; any page-change flag or fingerprint movement
         # re-baselines.
-        if st.outcome is None and turn_did_action and page_fingerprint is not None and batch_fp_before is not None:
+        if (
+            st.outcome is None
+            and turn_dispatched_billable
+            and page_fingerprint is not None
+            and batch_fp_before is not None
+        ):
             if st.page_state_prev_fp is not None and batch_fp_before != st.page_state_prev_fp:
                 # The page moved BETWEEN batches (a delayed render landing after the prior
                 # after-sample): the streak the old samples described is stale.
@@ -3517,6 +5157,10 @@ async def run_agent_tool_loop(
                     batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
                 page_state_changed = None if batch_fp_after is None else batch_fp_after != batch_fp_before
             st.page_state_prev_fp = batch_fp_after if batch_fp_after is not None else batch_fp_before
+            if batch_fp_after is not None:
+                for key, (count, first_turn, streak_fp, moved) in st.action_counts.items():
+                    if not moved and streak_fp is not None and streak_fp != batch_fp_after:
+                        st.action_counts[key] = (count, first_turn, streak_fp, True)
             st.page_state_ever_judged = st.page_state_ever_judged or page_state_changed is not None
             if page_state_changed is True:
                 st.trailing_page_state_stall_rounds = 0
@@ -3600,16 +5244,32 @@ async def run_agent_tool_loop(
             # actually seen it. Counts read live, not the threshold-crossing snapshot, and logged
             # here so the warn-then-recovered metric counts only warnings the model saw.
             still_stuck = []
+            movements: list[bool | None] = []
             for name, warn_args, _count in action_nudges_due:
                 key = (name, json.dumps(warn_args, sort_keys=True, default=str))
                 entry = st.action_counts.get(key)
                 if entry is not None and entry[1] < st.turns and key not in st.action_warned:
                     st.action_warned.add(key)
                     still_stuck.append((name, warn_args, entry[0]))
+                    streak_fp, latest_fp = entry[2], st.page_state_prev_fp
+                    comparable = streak_fp is not None and latest_fp is not None
+                    if entry[3] or (comparable and latest_fp != streak_fp):
+                        movements.append(True)
+                    else:
+                        # No pair to compare means no reading, which _sample_probe defines as
+                        # evidence of nothing — never a claim that the page held still.
+                        movements.append(False if comparable else None)
             if still_stuck:
+                page_moved = True if any(movements) else (None if None in movements else False)
                 for name, _warn_args, count in still_stuck:
-                    LOG.info("taskv3 loop action repeat nudged", tool=name, repeat_count=count, turn=st.turns)
-                nudge_parts.append(_action_nudge_text(still_stuck, set(tool_by_name)))
+                    LOG.info(
+                        "taskv3 loop action repeat nudged",
+                        tool=name,
+                        repeat_count=count,
+                        turn=st.turns,
+                        page_moved=page_moved,
+                    )
+                nudge_parts.append(_action_nudge_text(still_stuck, set(tool_by_name), page_moved=page_moved))
         if nudge_parts:
             st.messages.append({"role": "user", "content": "\n\n".join(nudge_parts)})
 
@@ -3617,7 +5277,7 @@ async def run_agent_tool_loop(
         # turns (observe/get_html) don't consume the caller's step budget — the step engine bundles
         # perception into each step, so counting v3's perception rounds against the same budget
         # under-counts equivalent work.
-        if turn_did_action:
+        if turn_charged:
             st.action_steps += 1
         # Hand the round's executed actions to the caller so it can persist per-action artifacts
         # (screenshot, DB rows) — kept out of this transport-agnostic core, like should_cancel. A
@@ -3675,11 +5335,14 @@ async def run_agent_tool_loop(
         # observable from logs today.
         peak_probe_revisits=st.perception.peak_probe_revisits if st.perception.revisit_chances else None,
         semantic_commit=semantic_commit_stats,
+        # Present only for a run that took a perception read, the population the counters describe.
+        perception_reads=st.reads.log_fields() if st.reads.entries else None,
+        prefix_tokens=st.prefix_tokens,
+        raw_total_tokens=st.raw_total_tokens,
     )
 
     st.outcome.turns = st.turns
     st.outcome.no_tool_call_turns = st.no_tool_call_turns
-    st.outcome.tool_choice_in_effect = "tool_choice" in active_call_kwargs
     st.outcome.tool_calls = st.total_tool_calls
     st.outcome.tool_seconds = st.tool_seconds
     st.outcome.action_steps = st.action_steps

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, cast
@@ -69,6 +70,10 @@ REGISTERED_DOWNLOAD_OUTPUT_KEYS: tuple[str, ...] = (
 REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS: frozenset[str] = frozenset(
     f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
 )
+
+# Written by the secure CodeBlock worker: DOWNLOAD artifacts the block generated itself. They are real
+# run downloads, but never proof that a site served a file.
+GENERATED_FILE_ARTIFACT_IDS_KEY = "generated_file_artifact_ids"
 
 # Nested mapping the completion grader also reads registration keys from; a strip that covered only
 # the root would leave `{"output": {"downloaded_files": [...]}}` gradeable as a real download.
@@ -185,10 +190,46 @@ def derive_from_navigation_targets(navigation_targets: Any) -> ReachedDownloadTa
     return candidates[0]
 
 
-def block_output_has_registered_download(block_output: Any) -> bool:
-    if not isinstance(block_output, dict):
+def generated_file_artifact_ids(outputs: Iterable[Any]) -> frozenset[str]:
+    """Worker-stamped ids over every raw block row; a label-keyed map drops a looped block's earlier iterations."""
+    return frozenset(
+        artifact_id
+        for output in outputs
+        if isinstance(output, dict) and isinstance(ids := output.get(GENERATED_FILE_ARTIFACT_IDS_KEY), list)
+        for artifact_id in ids
+        if isinstance(artifact_id, str)
+    )
+
+
+def registered_download_proof_view(output: Any, generated: frozenset[str]) -> Any:
+    """``output`` with the rows of ``generated`` removed from its registration keys."""
+    if not isinstance(output, dict) or not generated:
+        return output
+
+    def is_generated(value: Any) -> bool:
+        artifact_id = value.get("artifact_id") if isinstance(value, dict) else value
+        return isinstance(artifact_id, str) and artifact_id in generated
+
+    view = dict(output)
+    files = output.get("downloaded_files")
+    kept = [not is_generated(item) for item in files] if isinstance(files, list) else []
+    if isinstance(files, list):
+        view["downloaded_files"] = [item for item, keep in zip(files, kept) if keep]
+    urls = output.get("downloaded_file_urls")
+    if isinstance(urls, list):
+        # URLs carry no artifact id; binding writes them parallel to downloaded_files.
+        view["downloaded_file_urls"] = [url for url, keep in zip(urls, kept) if keep] if len(kept) == len(urls) else []
+    artifact_ids = output.get("downloaded_file_artifact_ids")
+    if isinstance(artifact_ids, list):
+        view["downloaded_file_artifact_ids"] = [item for item in artifact_ids if not is_generated(item)]
+    return view
+
+
+def block_output_has_registered_download(block_output: Any, generated: frozenset[str] = frozenset()) -> bool:
+    view = registered_download_proof_view(block_output, generated)
+    if not isinstance(view, dict):
         return False
-    return any(bool(block_output.get(key)) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+    return any(bool(view.get(key)) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
 
 def derive_from_observed_download(*, selector: str, affordance_text: str = "") -> ReachedDownloadTarget | None:
@@ -227,7 +268,9 @@ def derive_from_observed_render(
     )
 
 
-def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTarget | None:
+def derive_from_block_outputs(
+    block_outputs_by_label: Any, *, generated: frozenset[str]
+) -> ReachedDownloadTarget | None:
     """S1: confirm a reached download from a browser download already registered into a block output.
 
     This is hard proof a download fired; the typed field carries no selector because the affordance
@@ -235,7 +278,7 @@ def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTar
     if not isinstance(block_outputs_by_label, dict):
         return None
     for label, output in block_outputs_by_label.items():
-        if block_output_has_registered_download(output):
+        if block_output_has_registered_download(output, generated):
             return ReachedDownloadTarget(
                 selector="",
                 affordance_text="",
@@ -244,34 +287,6 @@ def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTar
                 already_registered=True,
             )
     return None
-
-
-_AUTHOR_DOWNLOAD_GUIDANCE = (
-    "A correct click reached a download affordance on the current page. Author ONE terminal "
-    "download code block as a single `await click_and_claim_download(page, selector)` call with the "
-    "captured affordance selector — not page.expect_download (the selector is already known, so the "
-    "one-call helper is the simpler form here), not a static-fetch request, and not "
-    "another page re-evaluation. The platform clicks the "
-    "affordance once, claims the fired browser download, and registers it to the workflow output "
-    "surface (downloaded_files); never place file bytes or URLs in the chat reply. The call returns "
-    "the sanitized file name as a plain string — bind it and return it as-is. It is not a Download "
-    "object, so reading `.suggested_filename` or any other attribute off it fails."
-)
-
-_CONFIRMED_DOWNLOAD_GUIDANCE = (
-    "A browser download already registered into the workflow output surface (downloaded_files). "
-    "The download flow is reached — finalize one terminal download code block rather than "
-    "re-evaluating the page or re-authoring static-fetch scout blocks. Never place file bytes or "
-    "URLs in the chat reply."
-)
-
-_OBSERVED_RENDER_GUIDANCE = (
-    "This click opens the document as an inline render in a new tab — no browser download event "
-    "fires here, so do NOT author page.expect_download for this affordance (it waits forever) and "
-    "do not return a downloaded_files entry the platform did not register. If the viewer offers a "
-    "real download/print/export control, exercise that instead; otherwise report plainly that the "
-    "document renders on screen but cannot be registered as a downloaded file yet."
-)
 
 
 def can_deliver_registered_download(target: ReachedDownloadTarget | None) -> bool:
@@ -283,12 +298,6 @@ def can_deliver_registered_download(target: ReachedDownloadTarget | None) -> boo
     if target is None:
         return False
     return target.download_kind != DOWNLOAD_KIND_OBSERVED_RENDER
-
-
-def guidance_for(target: ReachedDownloadTarget) -> str:
-    if target.download_kind == DOWNLOAD_KIND_OBSERVED_RENDER:
-        return _OBSERVED_RENDER_GUIDANCE
-    return _CONFIRMED_DOWNLOAD_GUIDANCE if target.already_registered else _AUTHOR_DOWNLOAD_GUIDANCE
 
 
 _EXPECT_DOWNLOAD_ATTR = "expect_download"

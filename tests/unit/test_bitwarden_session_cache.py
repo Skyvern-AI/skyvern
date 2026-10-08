@@ -15,19 +15,33 @@ before an item miss is believed.
 import asyncio
 import json
 import os
-from collections.abc import Iterator
+import random
+from collections.abc import Awaitable, Callable, Iterator
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import BitwardenGetItemError
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
     BitwardenConstants,
     BitwardenService,
     RunCommandResult,
 )
+from skyvern.forge.sdk.workflow.credential_fetch_outcome import (
+    RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE,
+    record_credential_fetch,
+)
+from skyvern.forge.sdk.workflow.models.parameter import BitwardenLoginCredentialParameter
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 APPDATA_ENV = bitwarden_module._BITWARDEN_APPDATA_ENV_VAR
+# Synthetic stand-ins for the base64 session keys the CLI prints.
+LOGIN_SESSION_KEY = "c3ludGhldGljLWxvZ2luLWtleQ=="
+UNLOCK_SESSION_KEY = "c3ludGhldGljLXVubG9jay1rZXk="
 ITEM_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ITEM_ID = "22222222-2222-2222-2222-222222222222"
 CARD_ITEM = {
@@ -58,11 +72,34 @@ def _isolated_session_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
 
 
+def _session_key_banner(title: str, session_key: str) -> str:
+    """What bw 2025.9.0 prints after an email `bw login` or a `bw unlock`."""
+    return (
+        f"{title}\n\n"
+        "To unlock your vault, set your session key to the `BW_SESSION` environment variable. ex:\n"
+        f'$ export BW_SESSION="{session_key}"\n'
+        f'> $env:BW_SESSION="{session_key}"\n\n'
+        "You can also pass the session key to any command with the `--session` option. ex:\n"
+        f"$ bw list items --session {session_key}"
+    )
+
+
+# What bw 2025.9.0 prints after `bw login --apikey`: the vault stays locked and no key is issued.
+API_KEY_LOGIN_OUTPUT = "You are logged in!\n\nTo unlock your vault, use the `unlock` command. ex:\n$ bw unlock"
+# What bw 2025.9.0 answers a read of a logged-in but locked vault with, captured from the real binary.
+VAULT_IS_LOCKED = RunCommandResult(stdout="", stderr="Vault is locked.", returncode=1)
+# The same read when it is allowed to prompt and its stdin is closed: exit 0, nothing read.
+MASTER_PASSWORD_PROMPT = RunCommandResult(
+    stdout="\n", stderr="? Master password: [input is hidden] \x1b[37D\x1b[37C", returncode=0
+)
+
+
 class FakeVaultCli:
     """Stands in for the `bw` binary, recording every step and the data directory it ran against."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
+        self.session_args: list[tuple[str, str | None]] = []
         self.item: dict = {
             "object": "item",
             "id": ITEM_ID,
@@ -70,10 +107,15 @@ class FakeVaultCli:
             "login": {"username": "alice@example.com", "password": "hunter2", "totp": ""},
             "fields": [{"name": "first_name", "value": "Alice"}],
         }
-        # stderr to answer the next `bw get` / `bw list` calls with, one per entry, before succeeding.
-        self.get_failures: list[str] = []
-        self.list_failures: list[str] = []
+        # What to answer the next `bw get` / `bw list` / `bw sync` calls with, one per entry, before
+        # succeeding: a bare string is a failure's stderr.
+        self.get_failures: list[str | RunCommandResult] = []
+        self.list_failures: list[str | RunCommandResult] = []
+        self.sync_failures: list[str] = []
         self.get_stderr = ""
+        self.login_stdout: str | None = None
+        self.login_stderr = ""
+        self.on_login: Callable[[], Awaitable[None]] | None = None
 
     @property
     def steps(self) -> list[str]:
@@ -86,22 +128,50 @@ class FakeVaultCli:
         self, command: list[str], additional_env: dict[str, str] | None = None, timeout: float = 60
     ) -> RunCommandResult:
         self.calls.append((command[1], (additional_env or {}).get(APPDATA_ENV)))
+        if "--session" in command:
+            self.session_args.append((command[1], command[command.index("--session") + 1]))
         if command[1] == "login":
-            return RunCommandResult(stdout="You are logged in!", stderr="", returncode=0)
+            if self.on_login is not None:
+                await self.on_login()
+            if self.login_stdout is not None:
+                stdout = self.login_stdout
+            elif "--apikey" in command:
+                stdout = API_KEY_LOGIN_OUTPUT
+            else:
+                stdout = _session_key_banner("You are logged in!", LOGIN_SESSION_KEY)
+            return RunCommandResult(stdout=stdout, stderr=self.login_stderr, returncode=0)
         if command[1] == "unlock":
             return RunCommandResult(
-                stdout='Your vault is now unlocked!\n$ export BW_SESSION="session-key"', stderr="", returncode=0
+                stdout=_session_key_banner("Your vault is now unlocked!", UNLOCK_SESSION_KEY), stderr="", returncode=0
             )
+        if command[1] == "sync" and self.sync_failures:
+            return RunCommandResult(stdout="", stderr=self.sync_failures.pop(0), returncode=1)
         if command[1] == "get":
             if self.get_failures:
-                return RunCommandResult(stdout="", stderr=self.get_failures.pop(0), returncode=1)
+                return _as_failure(self.get_failures.pop(0))
             return RunCommandResult(stdout=json.dumps(self.item), stderr=self.get_stderr, returncode=0)
         if command[1] == "list":
             if self.list_failures:
-                # How the CLI reports a dead session: non-zero, nothing on stdout, reason on stderr.
-                return RunCommandResult(stdout="", stderr=self.list_failures.pop(0), returncode=1)
+                return _as_failure(self.list_failures.pop(0))
             return RunCommandResult(stdout=json.dumps([self.item]), stderr="", returncode=0)
         return RunCommandResult(stdout="", stderr="", returncode=0)
+
+
+def _as_failure(failure: str | RunCommandResult) -> RunCommandResult:
+    if isinstance(failure, RunCommandResult):
+        return failure
+    # How the CLI reports a dead session: non-zero, nothing on stdout, reason on stderr.
+    return RunCommandResult(stdout="", stderr=failure, returncode=1)
+
+
+def _rendered_chain(error: BaseException) -> list[BaseException]:
+    """The exceptions a traceback shows for `error`: causes, and contexts not suppressed by `from None`."""
+    chain: list[BaseException] = []
+    link: BaseException | None = error
+    while link is not None:
+        chain.append(link)
+        link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+    return chain
 
 
 @pytest.fixture
@@ -118,7 +188,12 @@ def _identity_of(master_password: str = "master-password") -> "bitwarden_module.
     )
 
 
-async def _fetch(item_id: str = ITEM_ID, master_password: str = "master-password") -> dict[str, str]:
+async def _fetch(
+    item_id: str = ITEM_ID,
+    master_password: str = "master-password",
+    email: str | None = None,
+    max_retries: int = bitwarden_module.settings.BITWARDEN_MAX_RETRIES,
+) -> dict[str, str]:
     return await BitwardenService.get_secret_value_from_url(
         client_id="client-id",
         client_secret="client-secret",
@@ -126,7 +201,30 @@ async def _fetch(item_id: str = ITEM_ID, master_password: str = "master-password
         bw_organization_id="org-id",
         bw_collection_ids=None,
         item_id=item_id,
+        email=email,
+        max_retries=max_retries,
     )
+
+
+def _login_parameter() -> BitwardenLoginCredentialParameter:
+    now = datetime.now(UTC)
+    return BitwardenLoginCredentialParameter(
+        key="portal_login",
+        bitwarden_login_credential_parameter_id="blc_1",
+        workflow_id="wf_test",
+        bitwarden_client_id_aws_secret_key="unused",
+        bitwarden_client_secret_aws_secret_key="unused",
+        bitwarden_master_password_aws_secret_key="unused",
+        url_parameter_key="target_url",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+async def _recorded_fetch(email: str | None = None) -> None:
+    """A read wrapped the way a run wraps it, so it logs "Run credential fetch finished"."""
+    async with record_credential_fetch(_login_parameter(), CredentialVaultType.BITWARDEN):
+        await _fetch(email=email)
 
 
 @pytest.mark.asyncio
@@ -137,10 +235,263 @@ async def test_a_batch_of_runs_for_one_organization_pays_a_single_login(cli: Fak
     assert all(result[BitwardenConstants.PASSWORD] == "hunter2" for result in results)
     assert cli.steps.count("login") == 1
     assert cli.steps.count("unlock") == 1
-    assert cli.steps.count("sync") == 1
+    # `bw login` already ran a forced full sync, so a fresh session does not pay for another.
+    assert cli.steps.count("sync") == 0
     # Only the per-item decrypt is paid per run, and nothing logs the batch back out mid-flight.
     assert cli.steps.count("get") == 100
     assert "logout" not in cli.steps
+
+
+@pytest.mark.asyncio
+async def test_a_cold_email_read_logs_in_and_reads_with_the_key_the_login_printed(cli: FakeVaultCli) -> None:
+    """An email login unlocks the vault and prints its session key, so unlock and sync are both redundant."""
+    result = await _fetch(email="someone@example.com")
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps == ["login", "get"]
+    assert cli.session_args == [("get", LOGIN_SESSION_KEY)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "login_stdout",
+    [API_KEY_LOGIN_OUTPUT, _session_key_banner("You are logged in!", LOGIN_SESSION_KEY)],
+    ids=["no-key", "noninteractive-key"],
+)
+async def test_a_cold_api_key_read_still_unlocks(cli: FakeVaultCli, login_stdout: str) -> None:
+    """An API-key login leaves the vault locked; non-interactively it still prints a key, which unlocks nothing."""
+    cli.login_stdout = login_stdout
+
+    result = await _fetch()
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps == ["login", "unlock", "get"]
+    assert cli.session_args == [("get", UNLOCK_SESSION_KEY)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked_read", [VAULT_IS_LOCKED, MASTER_PASSWORD_PROMPT], ids=["noninteractive", "prompt"])
+@pytest.mark.parametrize("path", ["get", "list"])
+async def test_a_login_key_that_unlocks_nothing_costs_one_relogin_that_unlocks(
+    cli: FakeVaultCli, locked_read: RunCommandResult, path: str
+) -> None:
+    """Left unrepaired, every read for this identity on this pod fails until the session expires."""
+    if path == "get":
+        cli.get_failures = [locked_read]
+        result = await _fetch(email="someone@example.com")
+    else:
+        cli.list_failures = [locked_read]
+        result = await _fetch_by_url(email="someone@example.com")
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps == ["login", path, "login", "unlock", path]
+    assert cli.session_args == [(path, LOGIN_SESSION_KEY), (path, UNLOCK_SESSION_KEY)]
+
+
+@pytest.mark.asyncio
+async def test_an_email_login_that_prints_no_session_key_falls_back_to_unlock(cli: FakeVaultCli) -> None:
+    """A CLI version whose login output changes shape must cost an unlock, not the read."""
+    cli.login_stdout = "You are logged in!"
+
+    result = await _fetch(email="someone@example.com")
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps == ["login", "unlock", "get"]
+    assert cli.session_args == [("get", UNLOCK_SESSION_KEY)]
+
+
+@pytest.mark.asyncio
+async def test_a_login_with_unexpected_stderr_never_reveals_the_session_key(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The login succeeded and printed its key on stdout; only stderr is fit for the error and the logs."""
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    cli.login_stderr = "Something the CLI has never said before.\n"
+
+    with capture_logs() as logs, pytest.raises(bitwarden_module.BitwardenListItemsError) as excinfo:
+        await _fetch(email="someone@example.com", max_retries=2)
+
+    assert "Something the CLI has never said before." in str(excinfo.value)
+    assert all(LOGIN_SESSION_KEY not in str(link) for link in _rendered_chain(excinfo.value))
+    assert LOGIN_SESSION_KEY not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+async def test_a_login_whose_output_is_unrecognized_never_reveals_it(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Output that does not say "You are logged in!" can still carry the session key."""
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    cli.login_stdout = _session_key_banner("A login banner the CLI has never printed.", LOGIN_SESSION_KEY)
+
+    with capture_logs() as logs, pytest.raises(bitwarden_module.BitwardenListItemsError) as excinfo:
+        await _fetch(email="someone@example.com", max_retries=2)
+
+    assert "BitwardenLoginError" in str(excinfo.value)
+    assert all(LOGIN_SESSION_KEY not in str(link) for link in _rendered_chain(excinfo.value))
+    assert LOGIN_SESSION_KEY not in json.dumps(logs, default=str)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ['[{"login": {"password": "hunter2"', '{"login": {"password": "hunter2"}}'],
+    ids=["truncated", "not-a-list"],
+)
+@pytest.mark.parametrize("parser", ["list", "get"])
+def test_output_that_is_not_the_expected_json_never_reaches_the_error(stdout: str, parser: str) -> None:
+    """The stdout is the decrypted vault: neither the message nor a chained parse error may carry it."""
+    result = RunCommandResult(stdout=stdout, stderr="", returncode=0)
+
+    with pytest.raises((bitwarden_module.BitwardenListItemsError, BitwardenGetItemError)) as excinfo:
+        if parser == "list":
+            BitwardenService._parse_listed_items(result)
+        else:
+            BitwardenService._parse_fetched_item(result, ITEM_ID)
+
+    for link in _rendered_chain(excinfo.value):
+        assert "hunter2" not in str(link)
+        assert "hunter2" not in str(getattr(link, "doc", ""))
+
+
+@pytest.mark.asyncio
+async def test_a_busy_session_past_its_lifetime_is_replaced_by_a_fresh_login(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session that never sits idle long enough to be reclaimed is still retired once it is old."""
+    monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_SESSION_MAX_LIFETIME_SECONDS", 3600)
+    monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS", 3600)
+    await _fetch()
+    old = bitwarden_module._cli_sessions._sessions[_identity_of().fingerprint]
+    old.created_at -= 3600 * (1 + bitwarden_module._SESSION_LIFETIME_JITTER) + 1
+    cli.calls.clear()
+
+    result = await _fetch()
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps == ["login", "unlock", "get"]
+    assert old.retired is True
+    assert not os.path.isdir(old.appdata_dir)
+
+
+@pytest.mark.asyncio
+async def test_an_expiring_session_hands_over_without_waiting_for_its_readers(cli: FakeVaultCli) -> None:
+    """The reader that notices the expiry logs in at once; readers still on the old session finish there."""
+    await _fetch()
+    old = bitwarden_module._cli_sessions._sessions[_identity_of().fingerprint]
+    old.created_at -= bitwarden_module.settings.BITWARDEN_SESSION_MAX_LIFETIME_SECONDS * 2
+    cli.calls.clear()
+
+    async with old.in_use():
+        # Another reader is mid-sync on the old session, holding its lock.
+        async with old.lock:
+            result = await asyncio.wait_for(_fetch(), timeout=5)
+        assert old.session_key is not None
+        assert os.path.isdir(old.appdata_dir)
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps == ["login", "unlock", "get"]
+    assert not os.path.isdir(old.appdata_dir)
+
+
+def test_sessions_logged_in_together_do_not_all_expire_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A burst's sessions would otherwise all pay a cold login at the same moment."""
+    monkeypatch.setattr(bitwarden_module, "random", random.Random(0))
+    lifetime = bitwarden_module.settings.BITWARDEN_SESSION_MAX_LIFETIME_SECONDS
+    jitter = bitwarden_module._SESSION_LIFETIME_JITTER
+    sessions = [bitwarden_module._CliSession(_identity_of(), f"/unused/{index}") for index in range(20)]
+
+    expired_at_the_cap = [session.outlived(session.created_at + lifetime) for session in sessions]
+
+    assert any(expired_at_the_cap) and not all(expired_at_the_cap)
+    assert not any(session.outlived(session.created_at + lifetime * (1 - jitter) - 1) for session in sessions)
+    assert all(session.outlived(session.created_at + lifetime * (1 + jitter) + 1) for session in sessions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        'Syncing failed: {"response":{"error":"invalid_grant"},"statusCode":400}',
+        'Syncing failed: {"response":null,"statusCode":401}',
+        'Syncing failed: {"response": null, "statusCode": 401}',
+        "You are not logged in.",
+    ],
+    ids=["refresh-token-rejected", "unauthorized", "unauthorized-spaced", "logged-out"],
+)
+async def test_a_refresh_rejected_for_auth_logs_in_again_exactly_once(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch, rejection: str
+) -> None:
+    """The CLI logs itself out on a rejected login, so the cached copy must not be served as if fresh."""
+    monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS", 0)
+    await _fetch(email="someone@example.com")
+    cli.calls.clear()
+    cli.sync_failures = [rejection]
+
+    result = await _fetch(email="someone@example.com")
+
+    assert result[BitwardenConstants.PASSWORD] == "hunter2"
+    assert cli.steps.count("login") == 1
+    # The repair login unlocks explicitly rather than trust the login's key a second time.
+    assert cli.steps == ["sync", "login", "unlock", "get"]
+
+
+@pytest.mark.asyncio
+async def test_the_run_fetch_line_says_whether_a_read_logged_in(cli: FakeVaultCli) -> None:
+    with capture_logs() as logs:
+        for _ in range(2):
+            await _recorded_fetch(email="someone@example.com")
+        async with record_credential_fetch(_login_parameter(), CredentialVaultType.BITWARDEN):
+            pass
+
+    cold, warm, no_session = (log for log in logs if log["event"] == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE)
+    assert cold["session_reused"] is False
+    assert isinstance(cold["login_seconds"], float)
+    assert (warm["session_reused"], warm["login_seconds"]) == (True, None)
+    assert isinstance(warm["lock_wait_seconds"], float)
+    assert (no_session["session_reused"], no_session["login_seconds"], no_session["lock_wait_seconds"]) == (
+        None,
+        None,
+        None,
+    )
+
+
+class _ManualClock:
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_reads_that_wait_out_another_reads_login_are_cold_and_say_how_long_they_queued(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A burst's first read logs in while the rest queue behind it; none of them found a warm session."""
+    clock = _ManualClock()
+    monkeypatch.setattr(bitwarden_module, "time", clock)
+
+    async def a_thirty_second_login() -> None:
+        for _ in range(10):
+            # Lets every other read in the burst reach the session lock before the login finishes.
+            await asyncio.sleep(0)
+        clock.now += 30
+
+    cli.on_login = a_thirty_second_login
+
+    with capture_logs() as logs:
+        await asyncio.gather(*(_recorded_fetch(email="someone@example.com") for _ in range(5)))
+
+    lines = [log for log in logs if log["event"] == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE]
+    assert cli.steps.count("login") == 1
+    assert [line["session_reused"] for line in lines] == [False] * 5
+    assert sorted((line["lock_wait_seconds"], line["login_seconds"] or 0.0) for line in lines) == [
+        (0.0, 30.0),
+        (30.0, 0.0),
+        (30.0, 0.0),
+        (30.0, 0.0),
+        (30.0, 0.0),
+    ]
 
 
 @pytest.mark.asyncio
@@ -202,7 +553,7 @@ async def test_an_expired_session_is_re_established_before_the_run_fails(cli: Fa
     result = await _fetch()
 
     assert result[BitwardenConstants.PASSWORD] == "hunter2"
-    assert cli.steps == ["get", "login", "unlock", "sync", "get"]
+    assert cli.steps == ["get", "login", "unlock", "get"]
 
 
 @pytest.mark.asyncio
@@ -446,6 +797,8 @@ async def test_browsing_a_vault_always_syncs_but_reuses_the_login(cli: FakeVault
         )
 
     await list_overviews()
+    # The sync inside `bw login` swallows its own failure, so even a fresh login pays for one that reports it.
+    assert cli.steps == ["login", "sync", "list"]
     cli.calls.clear()
 
     await list_overviews()
@@ -496,7 +849,7 @@ async def test_concurrent_cli_commands_are_bounded(monkeypatch: pytest.MonkeyPat
     assert peak <= 2
 
 
-async def _fetch_by_url(master_password: str = "master-password") -> dict[str, str]:
+async def _fetch_by_url(master_password: str = "master-password", email: str | None = None) -> dict[str, str]:
     return await BitwardenService.get_secret_value_from_url(
         client_id="client-id",
         client_secret="client-secret",
@@ -504,6 +857,7 @@ async def _fetch_by_url(master_password: str = "master-password") -> dict[str, s
         bw_organization_id="org-id",
         bw_collection_ids=None,
         url="https://example.com/login",
+        email=email,
     )
 
 
@@ -517,7 +871,7 @@ async def test_an_expired_session_is_re_established_on_the_url_search_path(cli: 
     result = await _fetch_by_url()
 
     assert result[BitwardenConstants.PASSWORD] == "hunter2"
-    assert cli.steps == ["list", "login", "unlock", "sync", "list"]
+    assert cli.steps == ["list", "login", "unlock", "list"]
 
 
 @pytest.mark.asyncio
@@ -541,7 +895,7 @@ async def test_an_expired_session_is_re_established_on_the_identity_path(cli: Fa
     result = await fetch_identity()
 
     assert result == {"first_name": "Alice"}
-    assert cli.steps == ["list", "login", "unlock", "sync", "list"]
+    assert cli.steps == ["list", "login", "unlock", "list"]
 
 
 @pytest.mark.asyncio
@@ -661,7 +1015,7 @@ async def test_an_expired_session_is_re_established_on_the_credit_card_path(cli:
     result = await _fetch_card()
 
     assert result[BitwardenConstants.CREDIT_CARD_NUMBER] == "4111111111111111"
-    assert cli.steps == ["get", "login", "unlock", "sync", "get"]
+    assert cli.steps == ["get", "login", "unlock", "get"]
 
 
 @pytest.mark.asyncio

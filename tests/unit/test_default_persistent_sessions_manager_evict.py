@@ -8,10 +8,15 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.browser_retirement import BrowserRetirementReason
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import BrowserOperationRejected
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 
 @pytest.fixture
@@ -20,6 +25,68 @@ def manager() -> DefaultPersistentSessionsManager:
     mgr = DefaultPersistentSessionsManager(database=MagicMock())
     mgr._browser_sessions.clear()
     return mgr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_owned", [True, False])
+@pytest.mark.parametrize("ambient_run", [None, "unrelated-run"])
+@pytest.mark.parametrize("observer", [True, False])
+async def test_browser_runtime_event_default_pbs_passive_lookup_preserves_owner(
+    manager: DefaultPersistentSessionsManager, workflow_owned: bool, ambient_run: str | None, observer: bool
+) -> None:
+    context = MagicMock()
+    owner = BrowserRuntimeLogContext(
+        workflow_run_id="workflow-owner" if workflow_owned else None,
+        task_id="task-owner",
+        browser_session_id="session-owner",
+    )
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, runtime_event_context=owner)
+    manager._browser_sessions["session-owner"] = BrowserSession(browser_state=state)
+    with capture_logs() as logs:
+        state.record_browser_acquisition("create")
+        with skyvern_context.scoped(SkyvernContext(workflow_run_id=ambient_run)):
+            if observer:
+                result = await manager.get_observer_browser_state("session-owner")
+            else:
+                result = await manager.get_browser_state("session-owner")
+        state._on_browser_context_closed(context)
+    assert result is state
+    acquisitions = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert [(entry["acquire_mode"], entry["task_id"]) for entry in acquisitions] == [("create", "task-owner")]
+    ended = next(entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended")
+    assert ended["workflow_run_id"] == owner.workflow_run_id
+    assert ended["task_id"] == owner.task_id
+    assert ended["browser_session_id"] == owner.browser_session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_owned", [True, False])
+async def test_browser_runtime_event_default_pbs_adoption_rebinds_run(
+    manager: DefaultPersistentSessionsManager,
+    workflow_owned: bool,
+) -> None:
+    context = MagicMock()
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="previous-workflow")):
+        state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    manager._browser_sessions["session-owner"] = BrowserSession(browser_state=state)
+    run_kwargs = {
+        "acquire": True,
+        "workflow_run_id": "workflow-owner" if workflow_owned else None,
+        "task_id": "task-owner",
+        "expected_runnable_id": "workflow-owner" if workflow_owned else "task-owner",
+    }
+    with capture_logs() as logs:
+        result = await manager.get_browser_state("session-owner", **run_kwargs)
+        await manager.get_browser_state("session-owner", **run_kwargs)
+        state._on_browser_context_closed(context)
+    assert result is state
+    acquisitions = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert len(acquisitions) == 1
+    assert acquisitions[0]["acquire_mode"] == "reuse"
+    ended = next(entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended")
+    assert ended["workflow_run_id"] == run_kwargs["workflow_run_id"]
+    assert ended["task_id"] == "task-owner"
+    assert ended["browser_session_id"] == "session-owner"
 
 
 @pytest.mark.asyncio

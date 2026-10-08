@@ -43,9 +43,6 @@ vi.mock("@/api/AxiosClient", async (importOriginal) => ({
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => undefined,
 }));
-vi.mock("./useGlobalWorkflowsQuery", () => ({
-  useGlobalWorkflowsQuery: () => ({ data: [] }),
-}));
 
 function httpError(status: number): AxiosError {
   const error = new AxiosError("request failed");
@@ -249,6 +246,28 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("run read path", () => {
+  test("reads the run by id on the version-agnostic client, without waiting on global workflows", async () => {
+    const get = vi.fn((url: string) =>
+      url.includes(RUN_A_ID)
+        ? Promise.resolve({ data: buildRun(RUN_A_ID, Status.Completed) })
+        : new Promise(() => {}),
+    );
+    getClientMock.mockResolvedValue({ get, post: vi.fn() });
+    const client = makeClient();
+    const { result } = renderHook(
+      () => useWorkflowRunQuery({ workflowRunId: RUN_A_ID }),
+      { wrapper: harness(client, "/agents/wpid_1/studio") },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data?.workflow_run_id).toBe(RUN_A_ID),
+    );
+    expect(getClientMock).toHaveBeenCalledWith(undefined, "sans-api-v1");
+    expect(get.mock.calls[0]?.[0]).toBe(`/workflows/runs/${RUN_A_ID}`);
+  });
 });
 
 describe("run identity withholding", () => {

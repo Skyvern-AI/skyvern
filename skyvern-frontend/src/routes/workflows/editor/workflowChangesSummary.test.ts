@@ -17,6 +17,7 @@ const block = (label: string, extra: Record<string, unknown> = {}): BlockYAML =>
 
 type SaveOver = {
   title?: string;
+  description?: string | null;
   blocks?: Array<BlockYAML>;
   parameters?: Array<
     Record<string, unknown> & { key: string; parameter_type: string }
@@ -27,6 +28,7 @@ type SaveOver = {
 const saveData = (over: SaveOver = {}): WorkflowSaveData =>
   ({
     title: over.title ?? "T",
+    description: over.description ?? null,
     blocks: over.blocks ?? [],
     parameters: over.parameters ?? [],
     settings: over.settings ?? { proxyLocation: "RESIDENTIAL" },
@@ -284,7 +286,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
         saveData({ settings: { proxyLocation: "US-CA" } }),
         base,
       ),
-    ).toEqual(["Changed proxy location"]);
+    ).toEqual(["Workflow settings", "Changed proxy location"]);
   });
 
   it("names a boolean setting toggle", () => {
@@ -296,7 +298,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
         saveData({ settings: { persistBrowserSession: true } }),
         base,
       ),
-    ).toEqual(["Toggled persist browser session"]);
+    ).toEqual(["Workflow settings", "Toggled persist browser session"]);
   });
 
   it("names a browser-session reuse toggle", () => {
@@ -308,7 +310,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
         saveData({ settings: { reuseBrowserSession: true } }),
         base,
       ),
-    ).toEqual(["Toggled reuse browser session"]);
+    ).toEqual(["Workflow settings", "Toggled reuse browser session"]);
   });
 
   it("names a secret masking toggle", () => {
@@ -318,7 +320,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
         saveData({ settings: { maskSecrets: true } }),
         base,
       ),
-    ).toEqual(["Toggled secret masking"]);
+    ).toEqual(["Workflow settings", "Toggled secret masking"]);
   });
 
   it("groups a browser-profile change into one line", () => {
@@ -334,7 +336,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
         }),
         base,
       ),
-    ).toEqual(["Changed browser profile"]);
+    ).toEqual(["Workflow settings", "Changed browser profile"]);
   });
 
   it("groups sequential-run settings into one line", () => {
@@ -346,7 +348,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
         saveData({ settings: { runSequentially: true, sequentialKey: "k" } }),
         base,
       ),
-    ).toEqual(["Changed sequential run settings"]);
+    ).toEqual(["Workflow settings", "Changed sequential run settings"]);
   });
 
   it("emits nothing when a fully-populated settings object is unchanged", () => {
@@ -367,7 +369,6 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
       codeVersion: 2,
       scriptCacheKey: "c",
       aiFallback: true,
-      enableSelfHealing: false,
       maskSecrets: false,
       runSequentially: true,
       sequentialKey: "s",
@@ -474,5 +475,122 @@ describe("summarizeWorkflowChanges YAML draft path", () => {
     expect(summarizeWorkflowChanges(canvas, snap)).toContain(
       `Added code block "b"`,
     );
+  });
+});
+
+describe("envelope metadata and settings dirty state", () => {
+  afterEach(() =>
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    ),
+  );
+
+  it.each([
+    [{ max_screenshot_scrolls: 0 }, {}, "Workflow settings"],
+    [{ description: "Changed" }, {}, "Description"],
+    [{}, { retry_policy: null }, "Workflow settings"],
+  ] as const)(
+    "compares an envelope before and after commit",
+    (patch, definitionPatch, label) => {
+      const canvas = saveData({
+        description: "Original",
+        settings: {
+          maxScreenshotScrolls: 3,
+          retryPolicy: {
+            max_retries: 1,
+            delay_seconds: 0,
+            webhook_on_retry: "disabled",
+            retry_on: [{ status: "failed", error_codes: null }],
+          },
+        },
+      });
+      const baseline = snapshotOf(canvas);
+      useWorkflowYamlEditorStore.setState({
+        active: true,
+        entrySnapshot: "",
+        draft: toYaml({
+          ...patch,
+          workflow_definition: {
+            blocks: canvas.blocks,
+            parameters: canvas.parameters,
+            ...definitionPatch,
+          },
+        }),
+      });
+      expect(isDraftDirty(canvas, baseline)).toBe(true);
+      expect(summarizeWorkflowChanges(canvas, baseline)).toContain(label);
+      const committed = snapshotOf(canvas);
+      useWorkflowYamlEditorStore.setState(
+        useWorkflowYamlEditorStore.getInitialState(),
+      );
+      const afterCommit = { ...canvas, ...committed };
+      expect(isDraftDirty(afterCommit, baseline)).toBe(true);
+      expect(summarizeWorkflowChanges(afterCommit, baseline)).toContain(label);
+      expect(isDraftDirty(afterCommit, snapshotOf(afterCommit))).toBe(false);
+    },
+  );
+
+  it.each([
+    ["", false],
+    ["x", true],
+  ] as const)("description %j to null has dirty=%j", (description, dirty) => {
+    const canvas = saveData({ description });
+    const baseline = snapshotOf(canvas);
+    useWorkflowYamlEditorStore.setState({
+      active: true,
+      entrySnapshot: "",
+      draft: toYaml({ description: null, workflow_definition: { blocks: [] } }),
+    });
+    expect(isDraftDirty(canvas, baseline)).toBe(dirty);
+    expect(summarizeWorkflowChanges(canvas, baseline)).toEqual(
+      dirty ? ["Description"] : [],
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    expect(isDraftDirty({ ...canvas, description: null }, baseline)).toBe(
+      dirty,
+    );
+  });
+
+  it.each([
+    ["scriptCacheKey", null, "default"],
+    ["scriptCacheKey", "", "default"],
+    ["extraHttpHeaders", null, "{}"],
+    ["cdpConnectHeaders", null, "{}"],
+    ["webhookCallbackUrl", "", null],
+    ["extraHttpHeaders", '{"a":"","b":"2"}', '{ "b": "2", "a": "" }'],
+  ])("uses save equivalence for %s", (field, before, after) => {
+    const canvas = saveData({ settings: { [field!]: before } });
+    const baseline = snapshotOf(canvas);
+    const draft = saveData({ settings: { [field!]: after } });
+    expect(isDraftDirty(draft, baseline)).toBe(false);
+    expect(summarizeWorkflowChanges(draft, baseline)).toEqual([]);
+  });
+
+  it("retains meaningful empty entries inside settings objects", () => {
+    const baseline = snapshotOf(
+      saveData({ settings: { errorCodeMapping: { EMPTY: "" } } }),
+    );
+    const draft = saveData({ settings: { errorCodeMapping: {} } });
+    expect(isDraftDirty(draft, baseline)).toBe(true);
+    expect(summarizeWorkflowChanges(draft, baseline)).toContain(
+      "Workflow settings",
+    );
+  });
+
+  it("does not partially overlay an invalid envelope", () => {
+    const canvas = saveData({ description: "Original" });
+    const baseline = snapshotOf(canvas);
+    useWorkflowYamlEditorStore.setState({
+      active: true,
+      entrySnapshot: "",
+      draft: toYaml({
+        description: "Changed",
+        max_elapsed_time_minutes: 0,
+        workflow_definition: { blocks: [block("new")] },
+      }),
+    });
+    expect(isDraftDirty(canvas, baseline)).toBe(false);
   });
 });

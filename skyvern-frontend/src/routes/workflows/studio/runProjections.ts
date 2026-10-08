@@ -59,16 +59,13 @@ export function formatElapsed(
   return `${Math.floor(sec / 86400)}d ${Math.floor((sec % 86400) / 3600)}h`;
 }
 
-// The elapsed value's hover tooltip: the full created/queued/started/finished
-// breakdown, one per line, omitting timestamps the run doesn't have yet.
+// The elapsed value's hover tooltip supplements the visible Created timestamp
+// with the run's queue/start/finish breakdown.
 export function formatRunTimesTooltip(
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
 ): string {
   const finalized = runIsLogicallyFinal(workflowRun);
   return [
-    workflowRun.created_at
-      ? `Created ${basicLocalTimeFormat(workflowRun.created_at)}`
-      : null,
     workflowRun.queued_at
       ? `Queued ${basicLocalTimeFormat(workflowRun.queued_at)}`
       : null,

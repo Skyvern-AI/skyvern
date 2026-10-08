@@ -9,21 +9,32 @@ Verifies that the CodeBlock safety layer:
 import asyncio
 import inspect
 import json
+import operator
 import re
-from collections.abc import AsyncIterator
+import warnings
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timezone
-from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock
+from datetime import UTC
+from datetime import date as stdlib_date
+from datetime import datetime
+from datetime import time as stdlib_time
+from datetime import timedelta, timezone
+from functools import partial
+from types import FunctionType, SimpleNamespace
+from typing import Any, NoReturn
+from unittest.mock import AsyncMock, MagicMock
 
+import pyotp.totp as pyotp_totp
 import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import skyvern.forge.sdk.copilot.code_block_security as code_block_security
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow.code_block_safety import (
     ALWAYS_DENIED_BUILTINS,
     SANDBOX_ONLY_BUILTINS,
@@ -39,8 +50,15 @@ from skyvern.forge.sdk.workflow.models.block import (
     CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
     BranchEvaluationContext,
     CodeBlock,
+    CodeBlockOTPError,
+    _bind_code_block_open_page,
     _bind_code_block_set_dialog_policy,
+    _close_opened_code_block_pages,
+    _resolve_code_block_otp,
+    _resolve_code_block_otp_for_identifier,
+    dispose_opened_code_block_pages,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
@@ -53,11 +71,187 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.workflows import BlockStatus
+from skyvern.services.otp_email import (
+    MAX_SEEN_EMAIL_MESSAGE_IDS,
+    EmailOTPVerificationContext,
+    GmailOTPSource,
+    OutlookOTPSource,
+)
+from skyvern.services.otp_service import RawOTPVerificationContext
 from skyvern.webeye import dialog_handler
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.skycdp.errors import CdpError
-from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext
+from tests.unit.conftest import (
+    FakeClearingBrowserContext,
+    FakeSearchBrowserContext,
+    FakeSearchPage,
+    arm_search_api,
+    serpapi_page,
+)
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
+
+RAW_DATETIME_TYPES = (stdlib_date, datetime, stdlib_time)
+FACADE_MEMBERS = {"datetime", "date", "timedelta", "timezone", "UTC"}
+
+_DATE_PROBE_ARGS: dict[str, tuple[Any, ...]] = {
+    "__format__": ("%m/%d/%Y",),
+    "ctime": (),
+    "fromisocalendar": (2026, 38, 1),
+    "fromisoformat": ("2026-09-13",),
+    "fromordinal": (739872,),
+    "fromtimestamp": (1789603200,),
+    "isocalendar": (),
+    "isoformat": (),
+    "isoweekday": (),
+    "replace": (),
+    "strftime": ("%m/%d/%Y",),
+    "strptime": ("2026-09-13", "%Y-%m-%d"),
+    "timetuple": (),
+    "today": (),
+    "toordinal": (),
+    "weekday": (),
+}
+_DATETIME_PROBE_ARGS: dict[str, tuple[Any, ...]] = _DATE_PROBE_ARGS | {
+    "astimezone": (UTC,),
+    "combine": (stdlib_date(2026, 9, 13), stdlib_time(4, 5, 6)),
+    "date": (),
+    "dst": (),
+    "fromisoformat": ("2026-09-13T04:05:06",),
+    "now": (),
+    "time": (),
+    "timestamp": (),
+    "timetz": (),
+    "tzname": (),
+    "utcfromtimestamp": (1789603200,),
+    "utcnow": (),
+    "utcoffset": (),
+    "utctimetuple": (),
+}
+_TIME_PROBE_ARGS: dict[str, tuple[Any, ...]] = {
+    "__format__": ("%H:%M",),
+    "dst": (),
+    "fromisoformat": ("04:05:06",),
+    "isoformat": (),
+    "replace": (),
+    "strftime": ("%H:%M",),
+    "strptime": ("04:05", "%H:%M"),
+    "tzname": (),
+    "utcoffset": (),
+}
+
+
+class NoPageOperationPage:
+    def __getattr__(self, name: str) -> NoReturn:
+        raise AssertionError(f"a date read must not reach the page: {name}")
+
+
+def _call_from_sandbox_frame(member: Callable[..., Any], args: tuple[Any, ...]) -> Any:
+    return member(*args)
+
+
+def _accepts(member: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    try:
+        member(*args, **kwargs)
+    except TypeError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _delegate_parameter_kind_defects(
+    label: str,
+    instance: stdlib_date | stdlib_time,
+    stdlib_type: type,
+    probes: Mapping[str, tuple[Any, ...]],
+) -> list[str]:
+    """A delegate bound in place of a C stdlib method must accept the same arguments by keyword as
+    the method it shadows, or already-deployed blocks passing that argument by name start failing."""
+    defects: list[str] = []
+    sandbox_type = type(instance)
+    for name in sorted(vars(sandbox_type)):
+        if name.startswith("_"):
+            continue
+        sandbox_member = getattr(sandbox_type, name)
+        if not inspect.isroutine(sandbox_member):
+            continue
+        stdlib_member = getattr(stdlib_type, name, None)
+        if stdlib_member is None:
+            defects.append(f"{label}.{name} shadows nothing on {stdlib_type.__name__}")
+            continue
+        parameters = [
+            parameter for parameter in inspect.signature(sandbox_member).parameters if parameter not in ("self", "cls")
+        ]
+        keywords = dict(zip(parameters, probes.get(name, ())))
+        if len(keywords) != len(parameters):
+            defects.append(f"{label}.{name} has no probe arguments")
+            continue
+        arguments = () if inspect.ismethod(sandbox_member) else (instance,)
+        if _accepts(sandbox_member, arguments, keywords) != _accepts(stdlib_member, arguments, keywords):
+            defects.append(f"{label}.{name} does not accept the same keyword arguments as {stdlib_type.__name__}")
+    return defects
+
+
+def datetime_facade_defects(namespace: SimpleNamespace, sandbox_builtins: Mapping[str, Any]) -> list[str]:
+    """Exercise every public member of a CodeBlock datetime facade from a frame carrying the sandbox
+    builtins, where a member reaching CPython's hidden import raises and a raw C return re-breaks it."""
+    call = FunctionType(_call_from_sandbox_frame.__code__, {"__builtins__": sandbox_builtins})
+    defects: list[str] = []
+    if set(vars(namespace)) != FACADE_MEMBERS:
+        defects.append(f"facade members are {sorted(vars(namespace))}")
+    if not issubclass(namespace.datetime, namespace.date):
+        defects.append("datetime is not a subclass of date")
+    if not isinstance(call(namespace.datetime.now, ()), namespace.date):
+        defects.append("datetime.now() is not an instance of date")
+    # ``date`` precedes ``datetime`` in the facade MRO, so an unmirrored date delegate shadows datetime's.
+    unmirrored = {name for name in vars(namespace.date) if not name.startswith("_")} - set(vars(namespace.datetime))
+    if unmirrored:
+        defects.append(f"date members not mirrored on datetime: {sorted(unmirrored)}")
+    for label, instance, stdlib_type, probes in (
+        ("date", namespace.date(2026, 9, 13), stdlib_date, _DATE_PROBE_ARGS),
+        ("datetime", namespace.datetime(2026, 9, 13, 4, 5, 6, tzinfo=UTC), datetime, _DATETIME_PROBE_ARGS),
+        ("time", namespace.datetime(2026, 9, 13, 4, 5, 6).time(), stdlib_time, _TIME_PROBE_ARGS),
+    ):
+        defects += _delegate_parameter_kind_defects(label, instance, stdlib_type, probes)
+        try:
+            call(partial(instance.strftime, format=probes["strftime"][0]), ())
+        except Exception as error:
+            defects.append(f"{label}.strftime(format=) raised {type(error).__name__}: {error}")
+        for name in sorted(name for name in dir(instance) if not name.startswith("_") or name == "__format__"):
+            member = getattr(instance, name)
+            if not callable(member):
+                value = member
+            elif name not in probes:
+                defects.append(f"{label}.{name} has no probe arguments")
+                continue
+            else:
+                try:
+                    # utcnow/utcfromtimestamp only reach the hidden import when their
+                    # DeprecationWarning is actually emitted, which the default filter suppresses.
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("always", DeprecationWarning)
+                        value = call(member, probes[name])
+                except Exception as error:
+                    defects.append(f"{label}.{name} raised {type(error).__name__}: {error}")
+                    continue
+            if type(value) in RAW_DATETIME_TYPES:
+                defects.append(f"{label}.{name} returned a raw {type(value).__name__}")
+    for label, instance in (
+        ("date", namespace.date(2026, 9, 13)),
+        ("datetime", namespace.datetime(2026, 9, 13, 4, 5, 6)),
+    ):
+        for symbol, operation in (("+", operator.add), ("-", operator.sub)):
+            try:
+                shifted = call(operation, (instance, namespace.timedelta(days=1)))
+                call(shifted.strftime, ("%m/%d/%Y",))
+            except Exception as error:
+                defects.append(f"{label} {symbol} timedelta raised {type(error).__name__}: {error}")
+                continue
+            if type(shifted) in RAW_DATETIME_TYPES:
+                defects.append(f"{label} {symbol} timedelta returned a raw {type(shifted).__name__}")
+    return defects
+
 
 # ---------------------------------------------------------------------------
 # is_safe_code — rejection tests
@@ -599,6 +793,36 @@ class TestBuildSafeVars:
         assert safe_vars["datetime"].date(2026, 9, 13).isoformat() == "2026-09-13"
         assert safe_vars["datetime"].UTC is UTC
         assert not hasattr(safe_vars["datetime"], "now")
+
+    def test_datetime_facade_members_all_run_under_restricted_globals(self) -> None:
+        safe_vars = CodeBlock.build_safe_vars()
+        assert datetime_facade_defects(safe_vars["datetime"], safe_vars["__builtins__"]) == []
+
+    def test_datetime_facade_types_name_themselves_as_the_stdlib_types(self) -> None:
+        namespace = CodeBlock.build_safe_vars()["datetime"]
+        assert f"{namespace.date}" == f"{stdlib_date}"
+        assert f"{namespace.datetime}" == f"{datetime}"
+        assert repr(namespace.date(2026, 9, 13)) == repr(stdlib_date(2026, 9, 13))
+        assert (namespace.date.__name__, stdlib_date.__name__) == ("datetime.date", "date")
+        assert (namespace.datetime.__name__, datetime.__name__) == ("datetime.datetime", "datetime")
+
+    def test_datetime_facade_types_are_rebuilt_for_every_execution(self) -> None:
+        """The facade types are writable heap types; a block mutating one must not reach the next."""
+        assert CodeBlock.build_safe_vars()["datetime"].date is not CodeBlock.build_safe_vars()["datetime"].date
+
+    def test_datetime_facade_does_not_reopen_imports_or_builtins(self) -> None:
+        safe_vars = CodeBlock.build_safe_vars()
+        assert "__import__" not in safe_vars["__builtins__"]
+        for rejected in (
+            "import os",
+            "from os import path",
+            'x = __import__("os")',
+            "x = datetime.datetime.__mro__",
+            "x = datetime.date._SandboxDate",
+            'x = datetime.date.today.__globals__["os"]',
+        ):
+            with pytest.raises(InsecureCodeDetected):
+                CodeBlock.is_safe_code(rejected)
 
     def test_no_safe_var_exposes_dangerous_module(self) -> None:
         """No value in safe_vars should be a module that has subprocess/OS capabilities."""
@@ -1319,6 +1543,45 @@ async def wrapper({default_args}):
         assert await user_function() == {"zip_value": "94105", "len_value": "persisted-len"}
 
     @pytest.mark.asyncio
+    async def test_datetime_reads_execute_through_the_real_legacy_user_function(self) -> None:
+        code = (
+            "utc_today = datetime.datetime.now(datetime.UTC).strftime('%m/%d/%Y')\n"
+            "local_today = datetime.date.today()\n"
+            "local_via_today = datetime.datetime.today().date()\n"
+            "return {\n"
+            "    'utc_today': utc_today,\n"
+            "    'local_today': local_today.isoformat(),\n"
+            "    'local_via_today': local_via_today.isoformat(),\n"
+            "    'formatted': f'{local_today:%Y-%m-%d}',\n"
+            "}"
+        )
+        now = datetime.now(UTC)
+        block = CodeBlock(
+            label="datetime_block",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="datetime_output",
+                description="test output",
+                output_parameter_id="op_datetime",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+        for _ in range(3):
+            utc_before = datetime.now(UTC).date()
+            local_before = datetime.now().date()
+            result = await block.generate_async_user_function(block.code, NoPageOperationPage(), parameters={})()
+            utc_after = datetime.now(UTC).date()
+            local_after = datetime.now().date()
+
+            assert utc_before <= datetime.strptime(result["utc_today"], "%m/%d/%Y").date() <= utc_after
+            assert local_before <= stdlib_date.fromisoformat(result["local_today"]) <= local_after
+            assert local_before <= stdlib_date.fromisoformat(result["local_via_today"]) <= local_after
+            assert result["formatted"] == result["local_today"]
+
+    @pytest.mark.asyncio
     async def test_parameters_cannot_override_sandbox_internals(self) -> None:
         """Workflow parameters must not overwrite sandbox-controlled names."""
         import os
@@ -1427,6 +1690,20 @@ _RFC_TOTP_SEED = "JBSWY3DPEHPK3PXP"
 _CREDENTIAL_KEY = "login_credential"
 _WORKFLOW_RUN_ID = "wr_otp_test"
 _ORG_ID = "o_otp_test"
+_TOTP_ANCHOR = datetime(2026, 6, 14, 12, 0, 0)
+
+
+def _freeze_totp_clock(monkeypatch: pytest.MonkeyPatch, offset_seconds: int = 0) -> None:
+    """Pin pyotp's clock so a test's expected code and the block's minted code share one 30s window.
+    pyotp.TOTP.now() reads pyotp.totp.datetime.datetime.now()."""
+    frozen = _TOTP_ANCHOR + timedelta(seconds=offset_seconds)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return frozen
+
+    monkeypatch.setattr(pyotp_totp, "datetime", SimpleNamespace(datetime=_FrozenDatetime))
 
 
 def _register_credential_parameter(wrc, key: str = _CREDENTIAL_KEY) -> None:
@@ -1610,6 +1887,7 @@ class TestCodeBlockOtpMintAtCallTime:
 
         from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
 
@@ -1621,30 +1899,16 @@ class TestCodeBlockOtpMintAtCallTime:
     @pytest.mark.asyncio
     async def test_remint_differs_after_clock_advance(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Advancing the clock past a rotation yields a different code — proves re-mint, not the
-        stale pre-minted attribute. pyotp.TOTP.now() reads pyotp.totp.datetime.datetime.now()."""
-        import datetime as real_datetime
-
-        import pyotp.totp as pyotp_totp
-
+        stale pre-minted attribute."""
         from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
 
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
 
-        anchor = real_datetime.datetime(2026, 6, 14, 12, 0, 0)
-
-        def _frozen(offset_seconds: int):
-            class _FrozenDatetime(real_datetime.datetime):
-                @classmethod
-                def now(cls, tz: object = None) -> "real_datetime.datetime":
-                    return anchor + real_datetime.timedelta(seconds=offset_seconds)
-
-            return _FrozenDatetime
-
-        monkeypatch.setattr(pyotp_totp, "datetime", SimpleNamespace(datetime=_frozen(0)))
+        _freeze_totp_clock(monkeypatch)
         first = await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
 
-        monkeypatch.setattr(pyotp_totp, "datetime", SimpleNamespace(datetime=_frozen(60)))
+        _freeze_totp_clock(monkeypatch, offset_seconds=60)
         second = await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
 
         assert first != second
@@ -1759,6 +2023,9 @@ class TestCodeBlockOtpIdentifierFetch:
         assert link in set(wrc.secrets.values())
 
 
+_FillContexts = Callable[[EmailOTPVerificationContext, RawOTPVerificationContext], None]
+
+
 class TestCodeBlockOtpBudget:
     """AC2: the in-block poll budget raises a clear error, not the opaque 300s kill."""
 
@@ -1842,6 +2109,354 @@ class TestCodeBlockOtpBudget:
             await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
         assert "secret-identifier@example.com" not in str(exc_info.value)
 
+    @staticmethod
+    async def _timeout_after(monkeypatch: pytest.MonkeyPatch, fill_contexts: _FillContexts, identifier: str) -> str:
+        _patch_context_resolution(monkeypatch, _build_wrc_with_identifier(identifier=identifier))
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            fill_contexts(kwargs["email_context"], kwargs["raw_context"])
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+        with pytest.raises(CodeBlockOTPError) as exc_info:
+            await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+        return str(exc_info.value)
+
+    @staticmethod
+    def _no_inboxes(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        email_context.for_source(GmailOTPSource.name).credential_ids = []
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_never_loaded(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        email_context.for_source(GmailOTPSource.name)
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_seven_messages(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        for index in range(7):
+            gmail.remember_message("cred_1", f"msg_{index}")
+        gmail.completed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_past_the_cap(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        for index in range(MAX_SEEN_EMAIL_MESSAGE_IDS + 5):
+            gmail.remember_message("cred_1", f"msg_{index}")
+        gmail.completed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _nothing_consulted(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        return None
+
+    @staticmethod
+    def _one_gmail_inbox_search_failed(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.failed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_unreadable_message(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.unreadable_message_keys.update({("cred_1", "msg_a"), ("cred_1", "msg_b")})
+        gmail.completed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_search_cancelled(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _two_gmail_inboxes_one_still_searching(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_done", "cred_pending"]
+        gmail.completed_credential_ids.add("cred_done")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _two_gmail_inboxes_one_answered_one_pending(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_done", "cred_pending"]
+        gmail.completed_credential_ids.add("cred_done")
+        for index in range(3):
+            gmail.remember_message("cred_done", f"msg_{index}")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_read_some_and_refused_one(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.completed_credential_ids.add("cred_1")
+        for index in range(3):
+            gmail.remember_message("cred_1", f"msg_{index}")
+        gmail.unreadable_message_keys.add(("cred_1", "msg_refused"))
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_inbox_replaced_after_reading(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        for index in range(3):
+            gmail.remember_message("cred_gone", f"msg_{index}")
+        gmail.unreadable_message_keys.add(("cred_gone", "msg_refused"))
+        gmail.credential_ids = ["cred_new"]
+        gmail.completed_credential_ids.add("cred_new")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_list_went_stale(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = []
+        gmail.credential_list_refresh_failed = True
+        outlook = email_context.for_source(OutlookOTPSource.name)
+        outlook.credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _evicted_then_one_inbox_disconnected(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        for index in range(MAX_SEEN_EMAIL_MESSAGE_IDS):
+            gmail.remember_message("cred_kept", f"kept_{index}")
+        for index in range(100):
+            gmail.remember_message("cred_gone", f"gone_{index}")
+        gmail.credential_ids = ["cred_kept"]
+        gmail.completed_credential_ids.add("cred_kept")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_inbox_searched_then_failed(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.completed_credential_ids.add("cred_1")
+        gmail.failed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_one_message(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.completed_credential_ids.add("cred_1")
+        gmail.remember_message("cred_1", "msg_only")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _store_queried_only(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        raw_context.store_queried = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("identifier", "fill_contexts", "present", "absent"),
+        [
+            (
+                "otp@example.com",
+                _no_inboxes,
+                ["No Gmail or Outlook inbox is connected", "no code has been stored"],
+                [],
+            ),
+            (
+                "otp@example.com",
+                _gmail_never_loaded,
+                ["Gmail inbox list never loaded", "no Outlook inbox connected"],
+                ["no Gmail inbox"],
+            ),
+            ("otp@example.com", _one_gmail_inbox_seven_messages, ["1 Gmail inbox connected, 7 messages checked"], []),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_past_the_cap,
+                ["1 Gmail inbox connected, 500+ messages checked"],
+                ["505 messages"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_search_failed,
+                ["0 of 1 Gmail inbox searched, search failed"],
+                ["no messages read", "messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_unreadable_message,
+                ["1 Gmail inbox connected, 2 messages could not be read"],
+                ["no messages read", "search failed"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_search_cancelled,
+                ["0 of 1 Gmail inbox searched, no messages read"],
+                ["1 Gmail inbox connected", "search failed"],
+            ),
+            (
+                "otp@example.com",
+                _two_gmail_inboxes_one_still_searching,
+                ["1 of 2 Gmail inboxes searched, no messages read"],
+                ["2 Gmail inboxes connected"],
+            ),
+            (
+                "otp@example.com",
+                _two_gmail_inboxes_one_answered_one_pending,
+                ["1 of 2 Gmail inboxes searched, 3 messages checked"],
+                ["2 Gmail inboxes connected"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_read_some_and_refused_one,
+                ["1 Gmail inbox connected, 3 of 4 messages read"],
+                ["3 messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _gmail_inbox_replaced_after_reading,
+                ["1 Gmail inbox connected, no messages read"],
+                ["3 messages", "of 4 messages", "could not be read"],
+            ),
+            (
+                "otp@example.com",
+                _gmail_list_went_stale,
+                ["Gmail inbox list not refreshed", "no Outlook inbox connected"],
+                ["no Gmail inbox connected", "No Gmail or Outlook inbox is connected"],
+            ),
+            (
+                "otp@example.com",
+                _evicted_then_one_inbox_disconnected,
+                ["1 Gmail inbox connected, 400+ messages checked"],
+                ["400 messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _gmail_inbox_searched_then_failed,
+                ["1 Gmail inbox connected, search failed"],
+                ["no messages read", "0 of 1"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_one_message,
+                ["1 Gmail inbox connected, 1 message checked"],
+                ["1 messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _nothing_consulted,
+                ["No delivery source was checked before the wait ended."],
+                ["No Gmail or Outlook inbox is connected", "no code has been stored"],
+            ),
+            (
+                "+15555550147",
+                _store_queried_only,
+                ["no code has been stored"],
+                ["Gmail", "Outlook", "inbox"],
+            ),
+        ],
+        ids=[
+            "zero-sources",
+            "never-loaded",
+            "one-inbox",
+            "capped-inbox",
+            "search-failed",
+            "unreadable",
+            "search-cancelled",
+            "one-of-two-pending",
+            "partial-with-messages",
+            "read-some-refused-one",
+            "inbox-replaced",
+            "list-stale",
+            "evicted-then-disconnected",
+            "searched-then-failed",
+            "one-message-singular",
+            "nothing-queried",
+            "sms-identifier",
+        ],
+    )
+    async def test_timeout_names_the_sources_it_checked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        identifier: str,
+        fill_contexts: _FillContexts,
+        present: list[str],
+        absent: list[str],
+    ) -> None:
+        message = await self._timeout_after(monkeypatch, fill_contexts, identifier)
+
+        assert message != "OTP was not received within 120 seconds."
+        assert message.endswith("OTP was not received within 120 seconds.")
+        # Every downstream cap slices a prefix, the shortest being 120 chars in copilot turn
+        # compaction, applied after a ~45-char platform frame. The facts have to fit what is left.
+        for fact in present:
+            assert message.index(fact) + len(fact) <= 75
+        for fact in present:
+            assert fact in message
+        for fact in absent:
+            assert fact not in message
+
+    @pytest.mark.asyncio
+    async def test_timeout_sources_render_counts_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fill_contexts(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+            gmail = email_context.for_source(GmailOTPSource.name)
+            gmail.credential_ids = ["cred_redact_91c2"]
+            gmail.remember_message("cred_redact_91c2", "msg_redact_44d0")
+            gmail.provider_state["cred_redact_91c2"] = {"last_code": "918273"}
+            raw_context.seen_row_ids.add("otp_row_redact_5e1b")
+            raw_context.misses.add(("otp_row_redact_5e1b", OTPType.TOTP))
+            raw_context.store_queried = True
+
+        message = await self._timeout_after(monkeypatch, fill_contexts, "redact-me-7f3a@example.com")
+
+        assert "1 stored OTP message found" in message
+        for secret in ("redact-me-7f3a@example.com", "cred_redact_91c2", "msg_redact_44d0", "918273", "otp_row"):
+            assert secret not in message
+
 
 class TestCodeBlockOtpNoSource:
     """A credential with neither a seed nor an identifier raises a clear error."""
@@ -1913,6 +2528,7 @@ class TestCodeBlockOtpCredentialIdWorkflowParameter:
 
         from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         _rebind_as_workflow_parameter(wrc, WorkflowParameterType.CREDENTIAL_ID)
         _patch_context_resolution(monkeypatch, wrc)
@@ -2081,6 +2697,25 @@ class TestCodeBlockOtpForIdentifier:
         assert result.strip() == "445566"
 
     @pytest.mark.asyncio
+    async def test_sms_identifier_timeout_names_no_mailbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        wrc = _build_wrc_with_identifier(identifier="+15555550147")
+        self._patch_poll(monkeypatch, wrc, None)
+
+        async def timing_out_poll(**kwargs: object) -> NoReturn:
+            kwargs["raw_context"].store_queried = True
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", timing_out_poll)
+
+        with pytest.raises(CodeBlockOTPError) as exc_info:
+            await _resolve_code_block_otp_for_identifier("+15555550147", _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+
+        message = str(exc_info.value)
+        assert "no code has been stored" in message
+        for mailbox_word in ("Gmail", "Outlook", "inbox"):
+            assert mailbox_word not in message
+
+    @pytest.mark.asyncio
     async def test_builtin_routes_a_string_to_the_identifier_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.workflow.models.block import CodeBlock as _CB
         from skyvern.services.otp_service import OTPValue
@@ -2117,6 +2752,7 @@ class TestCodeBlockOtpNoLeak:
     async def test_execute_masks_otp_in_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2139,6 +2775,7 @@ class TestCodeBlockOtpNoLeak:
         """User code that raises with the OTP in the message must not leak it into failure_reason."""
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2169,6 +2806,7 @@ class TestCodeBlockOtpNoLeak:
         from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
         from skyvern.webeye.actions.actions import Action
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
         recorded_actions: list[Action] = []
@@ -2226,6 +2864,7 @@ class TestCodeBlockOtpNoLeak:
     async def test_legacy_totp_not_leaked_in_failure_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2249,6 +2888,7 @@ class TestCodeBlockLegacyTotpRegression:
     async def test_legacy_totp_attribute_and_registration(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
+        _freeze_totp_clock(monkeypatch)
         wrc = _build_wrc_with_totp_seed()
         expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
 
@@ -2515,6 +3155,37 @@ class TestCodeBlockMagicLink:
         assert "otp()" in message
 
     @pytest.mark.asyncio
+    async def test_an_unqueried_store_names_the_link_it_was_waiting_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            gmail = kwargs["email_context"].for_source(GmailOTPSource.name)
+            gmail.credential_ids = ["cred_1"]
+            gmail.completed_credential_ids.add("cred_1")
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        with pytest.raises(CodeBlockOTPError) as excinfo:
+            await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(_fake_code_block_page())
+
+        message = str(excinfo.value)
+        assert "stored sign-in links not checked" in message
+        assert "stored codes not checked" not in message
+
+    @pytest.mark.asyncio
     async def test_code_verb_against_a_link_mailbox_reports_the_mismatch_too(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2561,6 +3232,7 @@ class TestCodeBlockMagicLink:
             return _FakeWorkflowRun()
 
         async def fake_poll(**kwargs: object):
+            kwargs["raw_context"].store_queried = True
             raise asyncio.TimeoutError
 
         monkeypatch.setattr(
@@ -2570,8 +3242,12 @@ class TestCodeBlockMagicLink:
 
         page = _fake_code_block_page()
 
-        with pytest.raises(CodeBlockOTPError, match="was not received within"):
+        with pytest.raises(CodeBlockOTPError, match="was not received within") as exc_info:
             await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(page)
+
+        message = str(exc_info.value)
+        assert "no sign-in link has been stored" in message
+        assert "code has been stored" not in message
 
     @pytest.mark.asyncio
     async def test_a_page_of_the_blocks_own_making_is_refused_before_polling(
@@ -2735,15 +3411,18 @@ class TestCodeBlockTemplateSecretScoping:
 
 class TestFailedReadinessWaitPropagates:
     @staticmethod
-    def _page_whose_readiness_wait_times_out() -> object:
+    def _page_whose_readiness_wait_times_out() -> Page:
         class TimingOutLocator:
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
             async def wait_for(self, **kwargs: object) -> None:
                 raise PlaywrightTimeoutError(
                     'Locator.wait_for: Timeout 30000ms exceeded.\nwaiting for locator("body") to be visible'
                 )
 
         page = MagicMock(spec=Page)
-        page.locator = lambda _selector: TimingOutLocator()
+        page.locator = lambda _selector: TimingOutLocator(page)
         return page
 
     async def _execute(self, monkeypatch: pytest.MonkeyPatch, code: str) -> tuple[object, list[object]]:
@@ -2983,27 +3662,370 @@ class TestSearchWebHelperBinding:
         assert "search_web" in CodeBlock.build_safe_vars()
 
     @pytest.mark.asyncio
-    async def test_authored_code_reaches_the_search_helper_through_the_run_browser_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """OSS configures no search provider, so the observation says exactly that rather than
-        reporting a search that found nothing."""
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.web_search_provider",
-            lambda: None,
-        )
-        context = FakeSearchBrowserContext(html="<html>page</html>", page_title="Search results")
+    async def test_back_to_back_searches_open_no_browser_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def new_page_refused() -> None:
+            raise AssertionError("search_web opened a browser page")
+
+        arm_search_api(monkeypatch, (200, serpapi_page("https://a.example/", "https://b.example/")))
+        context = FakeSearchBrowserContext()
+        context.new_page = new_page_refused  # type: ignore[method-assign]
         page = SimpleNamespace(context=context)
         block = self._block()
 
         user_function = block.generate_async_user_function(
-            'found = await search_web("construction company", max_results=2)\nreturn found\n',
+            "found = []\n"
+            "for _ in range(4):\n"
+            '    found.append(await search_web("construction company", max_results=2))\n'
+            "return found\n",
             page,  # type: ignore[arg-type]
+        )
+        results = await user_function()
+
+        assert [(found["http_status"], found["error_kind"], len(found["results"])) for found in results] == [
+            (200, None, 2)
+        ] * 4
+        assert context.opened == []
+
+
+class TestOpenPageHelperBinding:
+    @staticmethod
+    def _block() -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="open_page_block",
+            code="",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="open_page_output",
+                description="test output",
+                output_parameter_id="op_open_page",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_opened_pages_share_the_recorder_and_close_at_block_end_unless_the_block_closed_them(
+        self,
+    ) -> None:
+        context = FakeSearchBrowserContext()
+        recording_page = RecordingPage(SimpleNamespace(context=context, url="https://example.test/listing"))
+        opened: list[Page | RecordingPage] = []
+
+        user_function = self._block().generate_async_user_function(
+            "first = await open_page(page, 'detail/1')\n"
+            "second = await open_page(page, 'https://example.test/detail/2')\n"
+            "titles = [await first.title(), await second.title()]\n"
+            "await second.close()\n"
+            "try:\n"
+            "    await open_page(first, 'https://example.test/detail/3')\n"
+            "    from_owned = 'no error'\n"
+            "except RuntimeError as error:\n"
+            "    from_owned = str(error)\n"
+            "try:\n"
+            "    await open_page(page, 'https://example.test/refused')\n"
+            "    refused = 'no error'\n"
+            "except Exception as error:\n"
+            "    refused = str(error)\n"
+            "return {'titles': titles, 'from_owned': from_owned, 'refused': refused}\n",
+            recording_page,
+            opened_pages=opened,
         )
         result = await user_function()
 
-        assert result["error_kind"] == "not_configured"
-        assert result["results"] == []
+        assert result["titles"] == ["title of https://example.test/detail/1", "title of https://example.test/detail/2"]
+        assert result["from_owned"] == "open_page requires the current CodeBlock page."
+        assert result["refused"] == "net::ERR_FAILED"
+        assert context.opened[0].url == "https://example.test/detail/1"
+        assert all(isinstance(page, RecordingPage) for page in opened)
+        # Only a page that reached its URL counts as opened; the refused one closed itself.
+        assert [page._underlying_page for page in opened] == context.opened[:2]
+        assert [page.closed for page in context.opened] == [False, True, True]
+        assert [(action.action_type, action.url) for action in recording_page.recorded_actions()][:2] == [
+            (ActionType.GOTO_URL, "https://example.test/detail/1"),
+            (ActionType.GOTO_URL, "https://example.test/detail/2"),
+        ]
+
+        root_still_open = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[recording_page._underlying_page]))
+        assert await _close_opened_code_block_pages(
+            opened,
+            root_page=recording_page,
+            browser_state=root_still_open,  # type: ignore[arg-type]
+        ) == (1, None)
+        assert [page.closed for page in context.opened] == [True, True, True]
+
+    @pytest.mark.asyncio
+    async def test_dispose_keeps_one_opened_page_when_closing_all_would_empty_the_context(self) -> None:
+        context = FakeSearchBrowserContext()
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: True)
+        opened: list[Page | RecordingPage] = []
+        open_page = _bind_code_block_open_page(root, opened)  # type: ignore[arg-type]
+        first = await open_page(root, "https://example.test/detail/1")
+        second = await open_page(root, "https://example.test/detail/2")
+        only_owned_survive = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[first, second]))
+
+        assert await _close_opened_code_block_pages(
+            opened,
+            root_page=root,
+            browser_state=only_owned_survive,  # type: ignore[arg-type]
+        ) == (1, second)
+        assert [page.closed for page in context.opened] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_open_page_refuses_at_the_browsers_page_cap_without_opening_a_tab(self) -> None:
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="https://example.test/listing")
+        cap = settings.BROWSER_MAX_PAGES_NUMBER
+        browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[object()] * cap))
+        open_page = _bind_code_block_open_page(page, [], browser_state)  # type: ignore[arg-type]
+
+        with pytest.raises(RuntimeError, match=f"{cap} tabs are open and the browser's limit is {cap}"):
+            await open_page(page, "https://example.test/detail/1")
+        assert context.opened == []
+        browser_state.list_valid_pages.assert_awaited_once_with(max_pages=0)
+
+        # No browser state for the run: the context's own open pages fill the cap just the same.
+        for _ in range(cap):
+            await context.new_page()
+        without_state = _bind_code_block_open_page(page, [])  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match=f"{cap} tabs are open and the browser's limit is {cap}"):
+            await without_state(page, "https://example.test/detail/1")
+        assert len(context.opened) == cap
+
+    @pytest.mark.asyncio
+    async def test_open_page_treats_a_non_positive_cap_as_unlimited(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "BROWSER_MAX_PAGES_NUMBER", 0)
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="https://example.test/listing")
+        for _ in range(3):
+            await context.new_page()
+
+        await _bind_code_block_open_page(page, [])(page, "https://example.test/detail/1")  # type: ignore[arg-type]
+        assert len(context.opened) == 4
+
+    @pytest.mark.asyncio
+    async def test_disposal_hands_the_selection_back_to_the_root_when_it_closed_the_selected_page(self) -> None:
+        context = FakeSearchBrowserContext()
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: False)
+        recording_root = RecordingPage(root)
+        opened: list[Page | RecordingPage] = []
+        open_page = _bind_code_block_open_page(recording_root, opened)
+        detail = await open_page(recording_root, "https://example.test/detail/1")
+        selected = detail._underlying_page if isinstance(detail, RecordingPage) else detail
+        browser_state = SimpleNamespace(
+            get_working_page=AsyncMock(return_value=selected),
+            set_active_page=AsyncMock(),
+        )
+
+        await dispose_opened_code_block_pages(
+            opened,
+            browser_state=browser_state,  # type: ignore[arg-type]
+            root_page=recording_root,
+            engine="inline",
+            workflow_run_id="wr-1",
+            workflow_run_block_id="wrb-1",
+            organization_id="org-1",
+        )
+
+        assert selected.closed is True
+        browser_state.get_working_page.assert_awaited_once_with(prune_excess_pages=False)
+        browser_state.set_active_page.assert_awaited_once_with(root, prune_excess_pages=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("root_closed", [False, True])
+    async def test_disposal_re_pins_nothing_unless_the_selected_page_was_closed(self, root_closed: bool) -> None:
+        context = FakeSearchBrowserContext()
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: root_closed)
+        opened: list[Page | RecordingPage] = []
+        detail = await _bind_code_block_open_page(root, opened)(root, "https://example.test/detail/1")  # type: ignore[arg-type]
+        popup = SimpleNamespace(url="https://example.test/popup", is_closed=lambda: False)
+        browser_state = SimpleNamespace(
+            get_working_page=AsyncMock(return_value=detail if root_closed else root),
+            set_active_page=AsyncMock(),
+            list_valid_pages=AsyncMock(return_value=[popup, detail]),
+        )
+
+        await dispose_opened_code_block_pages(
+            opened,
+            browser_state=browser_state,  # type: ignore[arg-type]
+            root_page=root,  # type: ignore[arg-type]
+            engine="inline",
+            workflow_run_id="wr-1",
+            workflow_run_block_id="wrb-1",
+            organization_id="org-1",
+        )
+
+        assert context.opened[0].closed is True
+        browser_state.set_active_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failure_on_an_owned_page_is_reported_from_that_page_before_it_is_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = FakeSearchBrowserContext()
+        timeout = PlaywrightTimeoutError("locator timed out")
+
+        class DetailLocator:
+            def __init__(self, page: FakeSearchPage) -> None:
+                self.page = page
+
+            async def click(self, **_kwargs: Any) -> None:
+                raise timeout
+
+            async def evaluate(self, _script: str, **_kwargs: Any) -> str:
+                return '<div id="cover">'
+
+        class DetailPage(FakeSearchPage):
+            def locator(self, _selector: str, **_kwargs: Any) -> DetailLocator:
+                return DetailLocator(self)
+
+            @property
+            def main_frame(self) -> SimpleNamespace:
+                return SimpleNamespace(page=self, goto=self.goto, child_frames=[], parent_frame=None)
+
+        async def new_page() -> DetailPage:
+            page = DetailPage(context=context)
+            context.opened.append(page)
+            return page
+
+        context.new_page = new_page  # type: ignore[method-assign]
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: False)
+        root.title = AsyncMock(return_value="Listing")
+        browser_state = SimpleNamespace(
+            browser_artifacts=BrowserArtifacts(),
+            get_working_page=AsyncMock(return_value=root),
+            list_valid_pages=AsyncMock(return_value=[root]),
+            set_active_page=AsyncMock(),
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", AsyncMock()
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
+        monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext(values={}))
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
+        block = self._block()
+        block.code = (
+            "detail = await open_page(page, 'https://example.test/detail/1')\nawait detail.locator('#berth').click()\n"
+        )
+
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        # The block's own page stays the block's final URL; the opened page is named beside it.
+        assert "Final URL: https://example.test/listing" in result.failure_reason
+        assert "Page title: Listing" in result.failure_reason
+        assert "Failed on opened page: https://example.test/detail/1" in result.failure_reason
+        assert 'Covering element: <div id="cover">' in result.failure_reason
+        # Closed after the evidence was read, not before.
+        assert [page.closed for page in context.opened] == [True]
+
+        # A page-level call on the opened page names it the same way, with no locator to ask.
+        context.opened.clear()
+        block.code = "detail = await open_page(page, 'https://example.test/detail/2')\nawait detail.goto('/refused')\n"
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", AsyncMock()
+        )
+
+        async def timing_out_goto(self: FakeSearchPage, url: str, **_kwargs: object) -> None:
+            if url.endswith("/refused"):
+                raise timeout
+            self.url = url
+
+        monkeypatch.setattr(DetailPage, "goto", timing_out_goto)
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        assert "Final URL: https://example.test/listing" in result.failure_reason
+        assert "Failed on opened page: https://example.test/detail/2" in result.failure_reason
+        assert "Covering element" not in result.failure_reason
+
+        # A navigation through the opened page's frame names that page too.
+        context.opened.clear()
+        block.code = "detail = await open_page(page, 'https://example.test/detail/3')\nawait detail.main_frame.goto('/refused')\n"
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        assert "Failed on opened page: https://example.test/detail/3" in result.failure_reason
+
+    @pytest.mark.asyncio
+    async def test_a_failure_on_a_claimed_popup_names_that_popup_and_leaves_it_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = FakeSearchBrowserContext()
+        timeout = PlaywrightTimeoutError("locator timed out")
+
+        class PopupLocator:
+            def __init__(self, page: FakeSearchPage) -> None:
+                self.page = page
+
+            async def click(self, **_kwargs: Any) -> None:
+                raise timeout
+
+            async def evaluate(self, _script: str, **_kwargs: Any) -> str:
+                return '<div id="cover">'
+
+        class PopupPage(FakeSearchPage):
+            def locator(self, _selector: str, **_kwargs: Any) -> PopupLocator:
+                return PopupLocator(self)
+
+        popup = PopupPage(context=context)
+        popup.url = "https://example.test/sign-in"
+
+        @asynccontextmanager
+        async def expect_popup(**_kwargs: Any) -> AsyncIterator[SimpleNamespace]:
+            value: asyncio.Future[PopupPage] = asyncio.get_running_loop().create_future()
+            value.set_result(popup)
+            yield SimpleNamespace(value=value)
+
+        root = SimpleNamespace(
+            context=context, url="https://example.test/listing", is_closed=lambda: False, expect_popup=expect_popup
+        )
+        root.title = AsyncMock(return_value="Listing")
+        browser_state = SimpleNamespace(
+            browser_artifacts=BrowserArtifacts(),
+            get_working_page=AsyncMock(return_value=root),
+            list_valid_pages=AsyncMock(return_value=[root]),
+            set_active_page=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", AsyncMock()
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
+        monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext(values={}))
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
+        block = self._block()
+        block.code = (
+            "async with page.expect_popup() as popup_info:\n"
+            "    pass\n"
+            "popup = await popup_info.value\n"
+            "await popup.locator('#user').click()\n"
+        )
+
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        assert "Final URL: https://example.test/listing" in result.failure_reason
+        assert "Failed on opened page: https://example.test/sign-in" in result.failure_reason
+        assert popup.closed is False
+
+    @pytest.mark.asyncio
+    async def test_open_page_fails_closed_without_a_run_browser(self) -> None:
+        with pytest.raises(RuntimeError, match="only supported while the run browser is open"):
+            await CodeBlock.build_safe_vars()["open_page"](None, "https://example.test/")
+
+    @pytest.mark.asyncio
+    async def test_open_page_names_a_relative_url_it_cannot_resolve(self) -> None:
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="about:blank")
+        open_page = _bind_code_block_open_page(page, [])  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError, match="not 'detail/1'"):
+            await open_page(page, "detail/1")
+        with pytest.raises(ValueError, match="not 'file:///etc/passwd'"):
+            await open_page(page, "file:///etc/passwd")
+        assert context.opened == []
 
 
 class TestClearBrowserDataHelperBinding:
@@ -3043,6 +4065,36 @@ class TestClearBrowserDataHelperBinding:
             'return {"value": clear_browser_data}\n',
             SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
             {"clear_browser_data": "keep"},
+        )
+
+        assert await user_function() == {"value": "keep"}
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_parameter_named_open_page_keeps_its_value(self) -> None:
+        user_function = self._block().generate_async_user_function(
+            'return {"value": open_page}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            {"open_page": "keep"},
+        )
+
+        assert await user_function() == {"value": "keep"}
+
+    @pytest.mark.asyncio
+    async def test_publish_file_in_process_refuses_with_its_reason(self) -> None:
+        user_function = self._block().generate_async_user_function(
+            'await publish_file("report.txt", text="hi")\nreturn {}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(RuntimeError, match="secure code runner"):
+            await user_function()
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_parameter_named_publish_file_keeps_its_value(self) -> None:
+        user_function = self._block().generate_async_user_function(
+            'return {"value": publish_file}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            {"publish_file": "keep"},
         )
 
         assert await user_function() == {"value": "keep"}
@@ -3188,17 +4240,28 @@ class TestClearBrowserDataHelperBinding:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("has_own_session", "reaches_storage", "skipped"),
+        ("has_own_session", "reaches_storage", "on_page_target", "skipped"),
         [
-            (True, False, True),
-            (True, True, False),
-            (False, False, False),
+            (True, False, False, True),
+            (True, True, False, False),
+            (False, False, False, False),
+            (True, False, True, True),
         ],
-        ids=["sandboxed_frame", "real_defect", "same_process_frame_cannot_be_classified"],
+        ids=[
+            "sandboxed_frame",
+            "real_defect",
+            "same_process_frame_cannot_be_classified",
+            "sandboxed_frame_whose_session_is_on_the_page_target",
+        ],
     )
     @pytest.mark.parametrize("refusal_error", [PlaywrightError, CdpError], ids=["playwright", "raw_cdp"])
     async def test_a_frame_whose_clear_fails_is_skipped_only_when_it_reports_no_storage_of_its_own(
-        self, has_own_session: bool, reaches_storage: bool, skipped: bool, refusal_error: type[BaseException]
+        self,
+        has_own_session: bool,
+        reaches_storage: bool,
+        on_page_target: bool,
+        skipped: bool,
+        refusal_error: type[BaseException],
     ) -> None:
         # A sandboxed iframe has no storage area to address, so a clear that cannot find one found
         # nothing to clear and the block carries on. A frame that CAN reach storage is an addressing
@@ -3221,6 +4284,8 @@ class TestClearBrowserDataHelperBinding:
             context.frames_without_storage = [page]
         elif not reaches_storage:
             context.frames_without_storage = [embedded]
+        if on_page_target:
+            context.frames_attached_to_page_target = [(embedded, page)]
 
         user_function = self._block().generate_async_user_function(
             'await clear_browser_data(page)\nreturn {"cleared": True}\n',
@@ -3334,7 +4399,6 @@ class TestClearBrowserDataHelperBinding:
                     [
                         ("Page.getFrameTree", None),
                         ("Storage.getStorageKeyForFrame", {"frameId": "frame-of-this-session"}),
-                        ("Runtime.evaluate", ANY),
                     ],
                 ),
             ]
@@ -3433,8 +4497,8 @@ class TestInertSlotRenderIsTheSpliceReference:
                 id="authored-alias-consumed-by-value",
             ),
             pytest.param(
-                "__skyvern_slot__ = page.context\nresult = await {{ alias }}.cookies()\n",
-                {"alias": "__skyvern_slot__"},
+                "__skyvern_slot__0 = page.context\nresult = await {{ alias }}.cookies()\n",
+                {"alias": "__skyvern_slot__0"},
                 True,
                 id="value-equal-to-the-inert-marker",
             ),
@@ -3467,6 +4531,36 @@ class TestInertSlotRenderIsTheSpliceReference:
         errors = rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code)
         assert bool(errors) is expect_refused, (authored, block.code)
 
+    @pytest.mark.parametrize(
+        ("template", "values", "named_expression", "names_json"),
+        [
+            pytest.param(
+                "data = json.loads({{ sheet | tojson }})\n",
+                {"sheet": {"rows": None, "cells": [{"bold": True}]}},
+                "{{ sheet | tojson }}",
+                True,
+                id="tojson-output-pasted-as-python",
+            ),
+            pytest.param(
+                "x = {{ a }}\ny = {{ b }}\n",
+                {"a": 1, "b": _EXFIL},
+                "{{ b }}",
+                False,
+                id="second-slot-carries-code",
+            ),
+        ],
+    )
+    def test_refusal_names_the_slot_that_carried_code(
+        self, template: str, values: dict[str, object], named_expression: str, names_json: bool
+    ) -> None:
+        block = self._block(template)
+
+        authored = block.render_code_with_reference(FakeWorkflowRunContext(values=values))
+
+        [error] = rendering_introduced_security_errors(label="read", authored_code=authored, rendered_code=block.code)
+        assert f"`{named_expression}`" in error
+        assert ("rendered JSON" in error) is names_json
+
     def test_reference_render_does_not_consume_what_the_real_render_consumed(self) -> None:
         block = self._block("{% set item = items.pop() %}result = {{ item }}\n")
         context = FakeWorkflowRunContext(values={"items": [7]})
@@ -3487,7 +4581,7 @@ class TestInertSlotRenderIsTheSpliceReference:
             block.format_potential_template_parameters(FakeWorkflowRunContext(values={}))
 
     def test_slot_form_the_rewrite_misses_is_rejected_by_the_parse(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(block_module, "_JINJA_PRINT_SLOT_RE", re.compile(r"(?!x)(x)(y)"))
+        monkeypatch.setattr(code_block_security, "_PRINT_SLOT_RE", re.compile(r"(?!x)(x)(y)"))
         block = self._block("result = {% print exfil %}\n")
 
         assert block.render_code_with_inert_slots(block.code, FakeWorkflowRunContext(values={"exfil": "1"})) is None

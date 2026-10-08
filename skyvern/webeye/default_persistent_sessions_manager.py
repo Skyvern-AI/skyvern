@@ -16,10 +16,14 @@ from playwright._impl._errors import TargetClosedError
 from skyvern.cli.core.session_manager import active_copilot_session_ids
 from skyvern.config import settings
 from skyvern.exceptions import (
+    BrowserSessionAlreadyEndedError,
+    BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionNotExtendable,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSettingsUnsupported,
+    ExternalBrowserSessionNotRunnable,
     MissingBrowserAddressError,
 )
 from skyvern.forge import app
@@ -29,14 +33,21 @@ from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_get_json
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    EXTERNAL_CDP_BROWSER_VENDOR,
     Extensions,
+    FreshExitOutcome,
+    FreshExitReceipt,
+    NoAlternateReason,
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
+    is_external_cdp_session,
     is_final_status,
+    unusable_browser_session_error,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
     EXTENSION_MIN_REMAINING_SECONDS,
@@ -45,11 +56,22 @@ from skyvern.schemas.browser_session_timeouts import (
     MAX_TIMEOUT,
     creation_timeout_minutes,
 )
+from skyvern.schemas.browser_settings import BrowserSettings, requested_timezone_id
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
+from skyvern.webeye.browser_settings_receipts import record_session_timezone_receipt
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _allocate_cdp_port, _release_cdp_port
+from skyvern.webeye.external_cdp_sessions import (
+    attach_registered_cdp_browser,
+    is_external_cdp_session_expired,
+    is_external_cdp_session_open,
+    renew_external_cdp_session,
+    seconds_until_external_deadline,
+)
 from skyvern.webeye.persistent_sessions_manager import (
+    BROWSER_RETIREMENT_DENIED_NOTE,
     PBS_TASK_RUNNABLE_TYPE,
     BrowserOperation,
     BrowserOperationRejected,
@@ -59,6 +81,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     PersistentSessionsManager,
 )
 from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
@@ -321,17 +344,32 @@ async def update_status(
     )
 
     completed_at = datetime.now(timezone.utc) if is_final_status(status) else None
-    persistent_browser_session = await db.browser_sessions.update_persistent_browser_session(
-        session_id,
-        status=status,
-        organization_id=organization_id,
-        completed_at=completed_at,
-        started_at=started_at,
-        browser_address=browser_address,
-        upstream_cdp_url=upstream_cdp_url,
-    )
+    try:
+        persistent_browser_session = await db.browser_sessions.update_persistent_browser_session(
+            session_id,
+            status=status,
+            organization_id=organization_id,
+            completed_at=completed_at,
+            started_at=started_at,
+            browser_address=browser_address,
+            upstream_cdp_url=upstream_cdp_url,
+        )
+    except BrowserSessionAlreadyEndedError:
+        # The row went terminal between the pre-read above and this write; the contract is
+        # "None when final", so honor it rather than resurrect the ended session.
+        LOG.warning(
+            "Browser session ended before its status update landed",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+            desired_status=status,
+        )
+        return None
 
     return persistent_browser_session
+
+
+def _is_external_browser_state(browser_state: BrowserState) -> bool:
+    return isinstance(browser_state, RealBrowserState) and browser_state.external_browser
 
 
 class DefaultPersistentSessionsManager(PersistentSessionsManager):
@@ -382,6 +420,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     _browser_sessions: dict[str, BrowserSession] = dict()
     _background_tasks: set[asyncio.Task[None]] = set()
     _close_cleanup_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+    _external_connect_locks: dict[str, asyncio.Lock] = {}
     _reaper_task: asyncio.Task[None] | None = None
     database: AgentDB
 
@@ -430,6 +469,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
     ) -> str:
         """
         Attempt to begin a session.
@@ -440,25 +483,38 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         LOG.info("Begin browser session", browser_session_id=browser_session_id)
 
-        persistent_browser_session = await self.database.browser_sessions.get_persistent_browser_session(
-            browser_session_id, organization_id
-        )
+        try:
+            persistent_browser_session = await self.database.browser_sessions.get_persistent_browser_session(
+                browser_session_id, organization_id
+            )
 
-        if persistent_browser_session is None:
-            raise Exception(f"Persistent browser session not found for {browser_session_id}")
+            if persistent_browser_session is None:
+                raise Exception(f"Persistent browser session not found for {browser_session_id}")
 
-        if is_final_status(persistent_browser_session.status):
-            raise BrowserSessionClosed(browser_session_id)
+            if is_external_cdp_session(persistent_browser_session):
+                raise ExternalBrowserSessionNotRunnable(browser_session_id)
 
-        runnable_generation_id = uuid.uuid4().hex
-        await self.occupy_browser_session(
-            session_id=browser_session_id,
-            runnable_type=runnable_type,
-            runnable_id=runnable_id,
-            organization_id=organization_id,
-            runnable_generation_id=runnable_generation_id,
-            download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
-        )
+            unusable = unusable_browser_session_error(persistent_browser_session)
+            if unusable is not None:
+                raise unusable
+
+            runnable_generation_id = expected_runnable_generation_id or uuid.uuid4().hex
+            await self.occupy_browser_session(
+                session_id=browser_session_id,
+                runnable_type=runnable_type,
+                runnable_id=runnable_id,
+                organization_id=organization_id,
+                runnable_generation_id=runnable_generation_id,
+                expected_runnable_generation_id=expected_runnable_generation_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+                download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
+            )
+        except BaseException as error:
+            if attempt_number is not None:
+                error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+            raise
 
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
         return runnable_generation_id
@@ -513,6 +569,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         session_id: str,
         organization_id: str | None = None,
         *,
+        acquire: bool = False,
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
@@ -523,7 +580,79 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     ) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
-        return browser_session.browser_state if browser_session else None
+        if browser_session is None or _is_external_browser_state(browser_session.browser_state):
+            browser_state = await self._get_external_browser_state(session_id, organization_id, browser_session)
+        else:
+            browser_state = browser_session.browser_state
+        if browser_state is not None and acquire:
+            browser_state.bind_runtime_event_context(
+                BrowserRuntimeLogContext.for_run(
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                )
+            )
+            browser_state.record_browser_acquisition(
+                "reuse" if browser_session is not None and browser_state is browser_session.browser_state else "attach"
+            )
+        return browser_state
+
+    async def _get_external_browser_state(
+        self, session_id: str, organization_id: str | None, cached: BrowserSession | None
+    ) -> BrowserState | None:
+        """Every attach re-reads the org-scoped row, so ownership and expiry hold on a warm cache too."""
+        if organization_id is None:
+            return None
+        try:
+            row = await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+        except Exception:
+            if cached is not None:
+                raise
+            LOG.warning("Could not read the session row on a cache miss", session_id=session_id, exc_info=True)
+            return None
+        if row is None or not is_external_cdp_session(row):
+            return None
+        if not is_external_cdp_session_open(row):
+            if cached is not None:
+                await self.evict_cached_browser_state(
+                    session_id, organization_id, expected=cached.browser_state, detach_remote_driver=True
+                )
+            self._external_connect_locks.pop(session_id, None)
+            return None
+        if is_external_cdp_session_expired(row):
+            await self.close_session(organization_id, session_id, reason=BrowserSessionCloseReason.expired)
+            raise BrowserSessionClosed(session_id, reason="has expired")
+        if cached is not None:
+            if cached.browser_state.is_connected():
+                return cached.browser_state
+            await self.evict_cached_browser_state(
+                session_id, organization_id, expected=cached.browser_state, detach_remote_driver=True
+            )
+        async with self._external_connect_locks.setdefault(session_id, asyncio.Lock()):
+            current = self._browser_sessions.get(session_id)
+            if current is not None:
+                return current.browser_state
+            assert row.upstream_cdp_url is not None
+            browser_state = await attach_registered_cdp_browser(row.upstream_cdp_url)
+            # A close that landed or started while the connect was in flight must win over publishing it: an
+            # in-flight close has already released the cache but not yet closed the row.
+            try:
+                row = await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+            except BaseException:
+                # Until it is published nothing else owns the new driver, so a cancelled read must release it.
+                await browser_state.close()
+                raise
+            if (
+                row is None
+                or (organization_id, session_id) in self._close_cleanup_tasks
+                or not is_external_cdp_session_open(row)
+                or is_external_cdp_session_expired(row)
+            ):
+                await browser_state.close()
+                return None
+            await self.set_browser_state(session_id, browser_state, organization_id)
+        return browser_state
 
     def get_cached_browser_state_for_release(
         self,
@@ -598,7 +727,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
         return True
 
-    async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
+    async def get_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        reconcile_in_background: bool = False,
+    ) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
 
@@ -624,28 +759,55 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         request_deadline_epoch_ms: int | None = None,
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
+        *,
+        session_kind: BrowserSessionKind,
+        profile_read_only: bool = False,
+        created_by: str | None = None,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
+        browser_settings: BrowserSettings | None = None,
+        created_for_workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
+        # The browser launches after this returns, so a dialed CDP browser that cannot take a timezone is refused now.
+        if settings.BROWSER_TYPE == "cdp-connect" and requested_timezone_id(browser_settings) is not None:
+            raise BrowserSettingsUnsupported()
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
+            session_kind=session_kind,
         )
-        session = await self.database.browser_sessions.create_persistent_browser_session(
-            organization_id=organization_id,
-            runnable_type=runnable_type,
-            runnable_id=runnable_id,
-            timeout_minutes=creation_timeout_minutes(timeout_minutes),
-            proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
-            extensions=extensions,
-            browser_type=browser_type,
-            browser_profile_id=browser_profile_id,
-            generate_browser_profile=generate_browser_profile,
-            inherit_profile_proxy=inherit_profile_proxy,
-            bound_workflow_permanent_id=bound_workflow_permanent_id,
-            bound_key=bound_key,
-            download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
-        )
+        try:
+            session = await self.database.browser_sessions.create_persistent_browser_session(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+                runnable_type=runnable_type,
+                runnable_id=runnable_id,
+                timeout_minutes=creation_timeout_minutes(timeout_minutes),
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+                extensions=extensions,
+                browser_type=browser_type,
+                browser_profile_id=browser_profile_id,
+                generate_browser_profile=generate_browser_profile,
+                inherit_profile_proxy=inherit_profile_proxy,
+                bound_workflow_permanent_id=bound_workflow_permanent_id,
+                bound_key=bound_key,
+                download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
+                profile_read_only=profile_read_only,
+                created_by=created_by,
+                browser_settings=browser_settings,
+                created_for_workflow_run_id=created_for_workflow_run_id,
+            )
+        except BaseException as error:
+            # A failed acknowledgement does not prove the committed session is an orphan.
+            if attempt_number is not None:
+                error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+            raise
 
         # Launch the browser immediately for standalone sessions so the
         # screencast/CDP input endpoints can connect. Triggered both by the
@@ -691,7 +853,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_profile_id=session.browser_profile_id,
+                profile_read_only=session.profile_read_only,
                 cdp_port=cdp_port,
+                timezone_id=requested_timezone_id(session.browser_settings),
+                runtime_event_context=BrowserRuntimeLogContext(
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                    org_age=BrowserRuntimeLogContext.for_run(organization_id=organization_id).org_age,
+                ),
             )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",
@@ -699,6 +868,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )
+            if requested_timezone_id(session.browser_settings) is not None:
+                await record_session_timezone_receipt(session, await browser_state.get_working_page())
             browser_address = await _probe_local_cdp_address(cdp_port) if cdp_port is not None else None
 
             session = await self.get_session(session_id, organization_id)
@@ -721,6 +892,17 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 cdp_port = None
                 await _discard_browser_state(browser_state, discarded_cdp_port)
                 return
+
+            if session.browser_profile_id is not None:
+                # Written before the session is registered, so a caller that waits for the browser state
+                # reads the load outcome and never the column's default of True.
+                await self.database.browser_sessions.update_persistent_browser_session(
+                    session_id,
+                    organization_id=organization_id,
+                    browser_profile_loaded=(
+                        browser_state.browser_artifacts.applied_browser_profile_id == session.browser_profile_id
+                    ),
+                )
 
             launched_session = BrowserSession(
                 browser_state=browser_state,
@@ -773,6 +955,21 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
             )
 
+    async def create_fresh_exit_session(
+        self,
+        *,
+        organization_id: str,
+        prior_browser_session_id: str,
+        proxy_location: ProxyLocationInput,
+        browser_profile_id: str | None,
+        session_kind: BrowserSessionKind,
+    ) -> FreshExitReceipt:
+        return FreshExitReceipt(
+            outcome=FreshExitOutcome.no_alternate,
+            reason=NoAlternateReason.unsupported,
+            prior_browser_session_id=prior_browser_session_id,
+        )
+
     async def occupy_browser_session(
         self,
         session_id: str,
@@ -782,23 +979,60 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         *,
         runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> None:
         """Occupy a specific browser session."""
-        await self.database.browser_sessions.occupy_persistent_browser_session(
-            session_id=session_id,
-            runnable_type=runnable_type,
-            runnable_id=runnable_id,
-            organization_id=organization_id,
-            runnable_generation_id=runnable_generation_id,
-            download_run_id=download_run_id,
-        )
+        try:
+            await self.database.browser_sessions.occupy_persistent_browser_session(
+                session_id=session_id,
+                runnable_type=runnable_type,
+                runnable_id=runnable_id,
+                organization_id=organization_id,
+                runnable_generation_id=runnable_generation_id,
+                expected_runnable_generation_id=expected_runnable_generation_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+                download_run_id=download_run_id,
+            )
+        except BrowserSessionAlreadyOccupiedError as error:
+            if attempt_number is not None or expected_runnable_generation_id is not None:
+                error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+            try:
+                current = await self.database.browser_sessions.get_persistent_browser_session(
+                    session_id, organization_id
+                )
+                unusable = unusable_browser_session_error(current) if current is not None else None
+                if unusable is not None:
+                    # A startup timeout stays a BrowserSessionClosed here: the reuse path catches only that type.
+                    raise (
+                        unusable if isinstance(unusable, BrowserSessionClosed) else BrowserSessionClosed(session_id)
+                    ) from None
+            except BaseException as classification_error:
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                    classification_error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+                raise
+            raise
 
     async def renew_or_close_session(
-        self, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        workflow_run_id: str | None = None,
+        close_on_failure: bool = True,
     ) -> PersistentBrowserSession:
+        session = await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+        if is_external_cdp_session(session):
+            return await renew_external_cdp_session(self, session, close_on_failure=close_on_failure)
         try:
             return await renew_session(self.database, session_id, organization_id, workflow_run_id=workflow_run_id)
         except BrowserSessionNotRenewable:
+            if not close_on_failure:
+                raise
             session = await self.get_session(session_id, organization_id)
             # Don't close sessions that haven't started yet (browser still launching)
             # unless they're stuck (older than 120s)
@@ -822,11 +1056,17 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return await extend_session(self.database, session_id, organization_id, additional_minutes)
 
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
-        """These sessions run on browsers this process owns, which can always be given longer."""
+        """Only a registered external browser has one; browsers this process owns can always be given longer."""
+        session = await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+        if is_external_cdp_session(session):
+            return seconds_until_external_deadline(session)
         return None
 
     async def remaining_lifetime_seconds(self, session_id: str, organization_id: str) -> float | None:
-        """This manager enforces no lifetime cap of its own, so there is no deadline the run cannot renew past."""
+        """Only a registered external browser has a cap here: its fixed registration deadline."""
+        session = await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+        if is_external_cdp_session(session):
+            return seconds_until_external_deadline(session)
         return None
 
     async def update_status(
@@ -941,6 +1181,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         )
         if browser_session is None:
             return False
+        self._external_connect_locks.pop(browser_session_id, None)
 
         LOG.info(
             "Closing browser session",
@@ -1083,6 +1324,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 exc_info=True,
             )
         await self.database.browser_sessions.close_persistent_browser_session(browser_session_id, organization_id)
+        self._external_connect_locks.pop(browser_session_id, None)
         if settings.BROWSER_STREAMING_MODE == "cdp":
             await self.database.browser_sessions.archive_browser_session_address(browser_session_id, organization_id)
 
@@ -1124,6 +1366,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             return
         stale_sessions = await self.database.browser_sessions.get_uncompleted_persistent_browser_sessions()
         for db_session in stale_sessions:
+            # A registration holds no process state, so a restart leaves it attachable until it expires.
+            if db_session.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR:
+                continue
             LOG.info(
                 "Closing stale browser session from previous run",
                 session_id=db_session.persistent_browser_session_id,
@@ -1216,7 +1461,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         sessions = await self.database.browser_sessions.get_uncompleted_persistent_browser_sessions()
         for db_session in sessions:
             # Only reap browsers this process holds; completing another process's row would hide its leak.
-            if db_session.persistent_browser_session_id not in self._browser_sessions:
+            # An external registration holds nothing but its row, so any process may expire it.
+            if db_session.persistent_browser_session_id not in self._browser_sessions and (
+                db_session.browser_vendor != EXTERNAL_CDP_BROWSER_VENDOR
+            ):
                 continue
             # Leave sessions occupied by a still-live run to that run's own teardown. A run that died
             # before releasing occupancy leaves runnable_id set forever, so resolve the owner and let
@@ -1225,8 +1473,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 db_session.runnable_id, db_session.runnable_type, db_session.organization_id
             ):
                 continue
-            # Leave sessions an active copilot turn is driving (no runnable_id and not renewed).
-            if db_session.persistent_browser_session_id in copilot_session_ids:
+            # Leave sessions an active copilot turn is driving (no runnable_id and not renewed). Activity never
+            # moves a registration's deadline, so a turn on one does not keep it open.
+            if (
+                db_session.persistent_browser_session_id in copilot_session_ids
+                and db_session.browser_vendor != EXTERNAL_CDP_BROWSER_VENDOR
+            ):
                 continue
             # Not-yet-started sessions are still launching.
             if db_session.started_at is None or db_session.timeout_minutes is None:
@@ -1340,6 +1592,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         if cls.instance:
             active_sessions = await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
             for db_session in active_sessions:
+                # A registration outlives this process: drop the handle, keep the row attachable after a restart.
+                if db_session.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR:
+                    await cls.instance.evict_cached_browser_state(
+                        db_session.persistent_browser_session_id, db_session.organization_id, detach_remote_driver=True
+                    )
+                    continue
                 await cls.instance.close_session(
                     db_session.organization_id,
                     db_session.persistent_browser_session_id,

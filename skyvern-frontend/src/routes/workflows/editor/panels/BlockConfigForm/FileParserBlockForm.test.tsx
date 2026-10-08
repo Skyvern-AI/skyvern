@@ -76,12 +76,14 @@ vi.mock("@/components/WorkflowBlockInput", () => ({
   WorkflowBlockInput: ({
     value,
     onChange,
+    "data-testid": testId = "file-url-input",
   }: {
     value: string;
     onChange: (v: string) => void;
+    "data-testid"?: string;
   }) => (
     <input
-      data-testid="file-url-input"
+      data-testid={testId}
       value={value}
       onChange={(e) => onChange(e.target.value)}
     />
@@ -208,6 +210,7 @@ describe("FileParserBlockForm (SKY-9381)", () => {
 
     expect(screen.getByTestId("file-parser-block-form")).toBeDefined();
     expect(screen.getByTestId("file-url-input")).toBeDefined();
+    expect(screen.getByTestId("worksheet-input")).toBeDefined();
     // File Type select trigger renders the label as visible text.
     expect(screen.getByText("Auto detect")).toBeDefined();
     expect(screen.getByTestId("json-schema-input")).toBeDefined();

@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import datetime
+import hashlib
 import html
 import re
+import unicodedata
 from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, TypedDict
+from itertools import islice
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, TypedDict
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -26,6 +31,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch, ObservedTabs
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
+    # Deferred for the same reason: the experimentation module reads this context, so importing it
+    # here at runtime would cycle. String annotation below.
+    from skyvern.forge.sdk.experimentation.workflow_block_engine import WorkflowBlockEngineArmDecision
+
     # Deferred import: skyvern_context.py sits below the service layer and
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
@@ -39,11 +48,330 @@ class MultiFieldTotpAttempt:
     code_source: str
     valid_from: float | None = None
     valid_until: float | None = None
-    filled_code_hash: str | None = None
+    filled_code_hash: str | None = field(default=None, repr=False)
     filled_at: float | None = None
+    filled_url: str | None = None
+    filled_loader_id: str | None = None
     fill_verified: bool = False
     hint_code: str | None = field(default=None, repr=False)
     credential_placeholders: frozenset[str] = field(default_factory=frozenset, repr=False)
+    external_code_obtained_at: float | None = None
+    filled_group_identity: str | None = field(default=None, repr=False)
+    observed_max_filled: int = 0
+
+
+@dataclass
+class MultiFieldTotpRejection:
+    rejected_code_hash: str = field(repr=False)
+    rejected_at: datetime.datetime
+    rejected_valid_from: float | None
+    original_reason: str
+    retry_used: bool = False
+    submitted_at: datetime.datetime | None = None
+    expected_digits: int = 6
+    hint_code: str | None = field(default=None, repr=False)
+    rejected_code_obtained_at: datetime.datetime | None = None
+    delivered_code_hashes: set[str] = field(default_factory=builtins.set, repr=False)
+
+    def __post_init__(self) -> None:
+        self.delivered_code_hashes.add(self.rejected_code_hash)
+
+
+def multi_field_totp_retry_budget_exhausted(
+    task_id: str | None = None,
+    *,
+    log_refusal: bool = False,
+    workflow_run_id: str | None = None,
+    step_id: str | None = None,
+) -> bool:
+    context = current()
+    task_id = task_id or (context.task_id if context else None)
+    rejection = context.multi_field_totp_rejections.get(task_id) if context and task_id else None
+    if rejection is None or not rejection.retry_used:
+        return False
+    if log_refusal:
+        LOG.info(
+            "Multi-field TOTP retry skipped",
+            reason="retry_budget_exhausted",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id or (context.workflow_run_id if context else None),
+            step_id=step_id or (context.step_id if context else None),
+        )
+    return True
+
+
+_MULTI_FIELD_TOTP_SEPARATORS = frozenset("-–—.·:/")
+
+
+def strip_multi_field_totp_code_separators(value: str) -> str:
+    return "".join(
+        char
+        for char in unicodedata.normalize("NFKC", value)
+        if not char.isspace() and char not in _MULTI_FIELD_TOTP_SEPARATORS
+    )
+
+
+def find_multi_field_totp_code_spans(
+    text: str, *, hashes: Iterable[str], expected_digits: int | Iterable[int], raw_forms: Iterable[str]
+) -> list[tuple[int, int]]:
+    """Find original-text spans using bounded gapped scans and a trie of known literal forms."""
+    lengths = (expected_digits,) if isinstance(expected_digits, int) else expected_digits
+    known_hashes = builtins.set(hashes)
+    hashes_by_length = {length: known_hashes.copy() for length in lengths}
+    literals: dict[str, Any] = {}
+    max_literal_length = 0
+    for form in raw_forms:
+        if not form:
+            continue
+        canonical = strip_multi_field_totp_code_separators(form)
+        if canonical:
+            hashes_by_length.setdefault(len(canonical), builtins.set()).add(
+                hashlib.sha256(canonical.encode()).hexdigest()
+            )
+        for spelling in (form, unicodedata.normalize("NFKC", form), canonical):
+            if not spelling:
+                continue
+            spelling = "".join(unicodedata.normalize("NFKC", char) for char in spelling)
+            branch = literals
+            for char in spelling:
+                branch = branch.setdefault(char, {})
+            branch[""] = True
+            max_literal_length = max(max_literal_length, len(spelling))
+    normalized = [unicodedata.normalize("NFKC", char) for char in text]
+    alphanumeric = [char.isalnum() or normalized[index].isalnum() for index, char in enumerate(text)]
+    max_digits = max(hashes_by_length, default=0)
+    spans: list[tuple[int, int]] = []
+    covered_until = 0
+    for start in range(len(text)):
+        if start < covered_until or (start and alphanumeric[start - 1]):
+            continue
+        best_end = start
+        branch = literals
+        for index in range(start, min(len(text), start + max_literal_length)):
+            for char in normalized[index]:
+                branch = branch.get(char, {})
+            if not branch:
+                break
+            if "" in branch and (index + 1 == len(text) or not alphanumeric[index + 1]):
+                best_end = index + 1
+        if alphanumeric[start]:
+            digest = hashlib.sha256()
+            digits = 0
+            for index in range(start, min(len(text), start + 8 * max_digits)):
+                char = normalized[index]
+                if char.isalnum():
+                    digits += len(char)
+                    if digits > max_digits:
+                        break
+                    digest.update(char.encode())
+                    if (
+                        digits in hashes_by_length
+                        and (index + 1 == len(text) or not alphanumeric[index + 1])
+                        and digest.hexdigest() in hashes_by_length[digits]
+                    ):
+                        best_end = max(best_end, index + 1)
+                    if digits == max_digits:
+                        break
+                elif char and all(c.isspace() or c in _MULTI_FIELD_TOTP_SEPARATORS for c in char):
+                    continue
+                else:
+                    break
+        if best_end > start:
+            spans.append((start, best_end))
+            covered_until = best_end
+    return spans
+
+
+def mask_multi_field_totp_text(
+    text: str,
+    *,
+    hashes: Iterable[str],
+    expected_digits: int | Iterable[int],
+    raw_forms: Iterable[str],
+    replacement: str = "*",
+) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in find_multi_field_totp_code_spans(
+        text, hashes=hashes, expected_digits=expected_digits, raw_forms=raw_forms
+    ):
+        pieces.extend((text[cursor:start], replacement))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _multi_field_totp_mask_context(task_id: str | None) -> tuple[builtins.set[str], int, builtins.set[str]]:
+    context = current()
+    if context is None:
+        return builtins.set(), 0, builtins.set()
+    task_id = task_id or context.task_id or ""
+    attempt = context.multi_field_totp.get(task_id)
+    rejection = context.multi_field_totp_rejections.get(task_id)
+    forms = builtins.set(context.multi_field_totp_mask_values.get(task_id, ()))
+    forms.update(context.multi_field_totp_rejected_candidates.get(task_id, ()))
+    if code := context.totp_codes.get(f"{task_id}_totp_cache"):
+        forms.add(code)
+    return (
+        rejection.delivered_code_hashes if rejection else builtins.set(),
+        rejection.expected_digits if rejection else attempt.expected_digits if attempt else 0,
+        forms,
+    )
+
+
+def is_multi_field_totp_candidate(value: str | None, task_id: str | None = None) -> bool:
+    if not value:
+        return False
+    hashes, digits, forms = _multi_field_totp_mask_context(task_id)
+    return bool(find_multi_field_totp_code_spans(value, hashes=hashes, expected_digits=digits, raw_forms=forms))
+
+
+def multi_field_totp_masking_task_ids() -> builtins.set[str]:
+    context = current()
+    if context is None:
+        return builtins.set()
+    return (
+        context.multi_field_totp.keys()
+        | context.multi_field_totp_rejections.keys()
+        | context.multi_field_totp_mask_values.keys()
+        | context.multi_field_totp_rejected_candidates.keys()
+    )
+
+
+MULTI_FIELD_TOTP_ARTIFACT_SCAN_LIMIT = 2 * 1024 * 1024
+
+
+def multi_field_totp_artifact_scan_allowed(size: int) -> bool:
+    if size <= MULTI_FIELD_TOTP_ARTIFACT_SCAN_LIMIT:
+        return True
+    LOG.info("Multi-field OTP artifact masking skipped", reason="size")
+    return False
+
+
+def mask_multi_field_totp_artifact_text(text: str, *, replacement: str) -> str:
+    context = current()
+    task_ids = multi_field_totp_masking_task_ids()
+    if context is None or not task_ids:
+        return text
+    if not multi_field_totp_artifact_scan_allowed(len(text)):
+        return text
+    if not text.isascii() and not multi_field_totp_artifact_scan_allowed(len(text.encode())):
+        return text
+    hashes: builtins.set[str] = builtins.set()
+    lengths: builtins.set[int] = builtins.set()
+    forms: builtins.set[str] = builtins.set()
+    fingerprints: list[tuple[frozenset[str], int]] = []
+    for task_id in task_ids:
+        task_hashes, digits, task_forms = _multi_field_totp_mask_context(task_id)
+        hashes.update(task_hashes)
+        if digits:
+            lengths.add(digits)
+        forms.update(task_forms)
+        cached = context.multi_field_totp_artifact_fingerprints.get(task_id)
+        if cached is None or cached[0] != task_forms:
+            required = []
+            for form in task_forms:
+                canonical = strip_multi_field_totp_code_separators(form)
+                characters = frozenset(char for char in canonical if char.isalnum())
+                if characters:
+                    required.append((characters, sum(char.isalnum() for char in canonical)))
+            cached = (frozenset(task_forms), tuple(required))
+            context.multi_field_totp_artifact_fingerprints[task_id] = cached
+        fingerprints.extend(cached[1])
+    known_form_hashes = {
+        hashlib.sha256(strip_multi_field_totp_code_separators(form).encode()).hexdigest() for form in forms
+    }
+    normalized = text if text.isascii() else unicodedata.normalize("NFKC", text)
+    possible_lengths = [length for chars, length in fingerprints if all(char in normalized for char in chars)]
+    if hashes - known_form_hashes:
+        possible_lengths.extend(lengths)
+    if not possible_lengths:
+        return text
+    minimum = min(possible_lengths)
+    if minimum and sum(1 for _ in islice(re.finditer(r"[^\W_]", normalized), minimum)) < minimum:
+        return text
+    return mask_multi_field_totp_text(
+        text, hashes=hashes, expected_digits=lengths, raw_forms=forms, replacement=replacement
+    )
+
+
+def register_multi_field_totp_candidate(
+    value: str | None, *, task_id: str | None = None, for_multi_field: bool = False
+) -> builtins.set[str]:
+    if not value:
+        return builtins.set()
+    normalized = unicodedata.normalize("NFKC", value)
+    forms = {value, normalized, strip_multi_field_totp_code_separators(value)} - {""}
+    context = current()
+    if context is not None:
+        for form in forms:
+            context.register_secret_value(form)
+        task_id = task_id or context.task_id
+        if for_multi_field and task_id:
+            context.multi_field_totp_mask_values.setdefault(task_id, builtins.set()).update(forms)
+    return forms
+
+
+def is_rejected_multi_field_totp_candidate(value: str | None, task_id: str | None = None) -> bool:
+    context = current()
+    if context is None or not value:
+        return False
+    task_id = task_id or context.task_id
+    forms = context.multi_field_totp_rejected_candidates.get(task_id or "", ())
+    return (0, len(value)) in find_multi_field_totp_code_spans(value, hashes=(), expected_digits=0, raw_forms=forms)
+
+
+def is_supported_multi_field_totp_code(value: str) -> bool:
+    canonical = strip_multi_field_totp_code_separators(value)
+    return len(value) <= 8 * len(canonical) and re.fullmatch(r"[0-9A-Za-z]+", canonical) is not None
+
+
+def normalize_multi_field_totp_code(
+    value: str | None, expected_digits: int | None = None, *, task_id: str | None = None
+) -> str | None:
+    if value is None:
+        return None
+    normalized = strip_multi_field_totp_code_separators(value)
+    forms = register_multi_field_totp_candidate(value, task_id=task_id, for_multi_field=True)
+    context = current()
+    if context is not None and (candidate_task_id := task_id or context.task_id):
+        context.multi_field_totp_prompt_values.setdefault(candidate_task_id, builtins.set()).update(forms)
+    if not is_supported_multi_field_totp_code(value) or (
+        expected_digits is not None and len(normalized) != expected_digits
+    ):
+        context = current()
+        if context is not None and (candidate_task_id := task_id or context.task_id):
+            context.multi_field_totp_rejected_candidates.setdefault(candidate_task_id, builtins.set()).update(forms)
+        LOG.info(
+            "Multi-field OTP code unavailable",
+            reason="unsupported_code_format",
+            task_id=context.task_id if context else None,
+            workflow_run_id=context.workflow_run_id if context else None,
+            step_id=context.step_id if context else None,
+        )
+        return None
+    return normalized
+
+
+def mask_multi_field_totp_data(value: Any, *, task_id: str | None = None) -> Any:
+    context = current()
+    task_id = task_id or (context.task_id if context else None)
+    if task_id not in multi_field_totp_masking_task_ids():
+        return value
+    hashes, digits, forms = _multi_field_totp_mask_context(task_id)
+
+    def mask(item: Any) -> Any:
+        if isinstance(item, str):
+            return mask_multi_field_totp_text(item, hashes=hashes, expected_digits=digits, raw_forms=forms)
+        if isinstance(item, dict):
+            return {key: mask(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [mask(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(mask(child) for child in item)
+        return item
+
+    return mask(value)
 
 
 def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[str, Any]:
@@ -63,24 +391,23 @@ def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[s
 
 
 def action_for_multi_field_totp_persistence(action: Action) -> Action:
-    """Return a safe copy of a multi-box OTP action for database persistence."""
+    """Return a copy of a multi-box OTP action carrying only the seed-free timing metadata.
+
+    The digit typed into the box stays on the row: the one-time code is a record the customer has to
+    be able to read back, and only the seed that mints codes is a secret. The allowlist below is what
+    keeps a `totp_secret` out of `totp_timing_info`.
+    """
     timing_info = action.totp_timing_info
     if not timing_info or not timing_info.get("is_totp_sequence"):
         return action
 
     updates: dict[str, Any] = {
-        "text": "*",
-        "reasoning": "Entered a one-time code digit.",
         "totp_timing_info": {
             key: timing_info[key]
             for key in ("is_totp_sequence", "action_index", "box_element_ids", "code_source")
             if key in timing_info
         },
     }
-    if action.intention is not None:
-        updates["intention"] = "*"
-    if action.response is not None:
-        updates["response"] = "*"
     if action.skyvern_element_data is not None:
         updates["skyvern_element_data"] = redact_multi_field_totp_element_data(action.skyvern_element_data)
     if action.input_or_select_context is not None:
@@ -111,6 +438,7 @@ MODEL_HIDDEN_PLACEHOLDER = "[withheld: sign-in link]"
 # other trailing punctuation below.
 URL_IN_TEXT = re.compile(r"https?://[^\s<>\"`]+", re.IGNORECASE)
 _URL_START = re.compile(r"https?://", re.IGNORECASE)
+_TRAILING_URL = re.compile(r"https?://[^\s<>\"`]++\Z", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
 # Upper bound on prose punctuation or quotes tried around one URL span, so a page-controlled run of
@@ -148,12 +476,14 @@ def opaque_url_echo_forms(url: str) -> tuple[str, ...]:
 def opaque_url_echo_window(urls: Iterable[str]) -> int:
     """The longest text the masker recognises as one payload URL, in UTF-16 code units so a JS slice()
     measures it the same way; the slack covers the punctuation a span search trims around it."""
-    return (
-        max((len(form.encode("utf-16-le")) // 2 for url in urls for form in opaque_url_echo_forms(url)), default=0) + 16
-    )
+    return _echo_window(form for url in urls for form in opaque_url_echo_forms(url))
 
 
-def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
+def _echo_window(forms: Iterable[str]) -> int:
+    return max((len(form.encode("utf-16-le")) // 2 for form in forms), default=0) + 16
+
+
+def _mask_url_span(raw: str, canonical: dict[str, str], window: int, form_lengths: frozenset[int]) -> str:
     """Rewrite every payload ref inside one URL-shaped span. Iterative and window-bounded, so a page
     that glues thousands of refs with quotes costs linear time and no stack."""
     quotes = [i for i, ch in enumerate(raw) if ch == "'"]
@@ -169,15 +499,19 @@ def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
         limit = min(len(raw), start + window)
         first, last = bisect_left(quotes, start), bisect_right(quotes, limit)
         stops = {*quotes[first : first + _MAX_SPAN_CUTS], *quotes[max(first, last - _MAX_SPAN_CUTS) : last], limit}
-        ends: builtins.set[int] = builtins.set()
+        # A ref can run straight into a character that is legal inside a URL (observe's `value|text`), where
+        # no delimiter marks its end; the length of each form it is echoed in does.
+        ends: builtins.set[int] = {start + length for length in form_lengths if start + length <= limit}
         for stop in stops:
             floor = stop
-            while floor > start and raw[floor - 1] in _URL_TRAILING_PUNCTUATION:
+            while floor > start and (raw[floor - 1] in _URL_TRAILING_PUNCTUATION or raw[floor - 1] <= " "):
                 floor -= 1
             ends.update((stop, *range(floor, min(stop, floor + _MAX_SPAN_CUTS))))
         token = None
         for stop in sorted(ends, reverse=True):
-            if stop <= start:
+            # The URL parser strips a trailing control character or space, so a span ending in one would
+            # compare equal to the ref and the token would swallow it (a clip span's NUL).
+            if stop <= start or raw[stop - 1] <= " ":
                 continue
             span = raw[start:stop]
             # A span lifted out of HTML carries entity-escaped separators (&amp;); a ref never does, so
@@ -197,12 +531,14 @@ def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
     return "".join(out)
 
 
-def mask_opaque_urls_in_text(text: str, refs: dict[str, str]) -> str:
+def mask_opaque_urls_in_text(text: str, refs: dict[str, str], *, cut: bool = False) -> str:
     """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token — the
     inverse of resolving that token. Masking is by PROVENANCE (membership in ``refs``), never URL
     shape, so a live-page URL the model must reason about is untouched even when it is itself
     signing-shaped (a ``?gclid=``/``?token=`` landing page). ``refs`` maps token -> real URL (the
-    OpaqueUrlRefs.refs shape). Same object when nothing matches."""
+    OpaqueUrlRefs.refs shape). ``cut`` says the text may have been cut short before it got here: a trailing
+    URL that is the head of a ref is then dropped, since the caller already marks the text as cut. Same
+    object when nothing matches."""
     if not refs:
         return text
     masked = text
@@ -220,9 +556,33 @@ def mask_opaque_urls_in_text(text: str, refs: dict[str, str]) -> str:
     if not URL_IN_TEXT.search(masked):
         return masked
     canonical = {canonical_url(url): token for token, url in refs.items()}
-    window = opaque_url_echo_window(refs.values())
-    rewritten = URL_IN_TEXT.sub(lambda m: _mask_url_span(m.group(0), canonical, window), masked)
+    forms = [form for url in refs.values() for form in opaque_url_echo_forms(url)]
+    window = _echo_window(forms)
+    form_lengths = frozenset(len(form) for form in forms)
+    rewritten = URL_IN_TEXT.sub(lambda m: _mask_url_span(m.group(0), canonical, window, form_lengths), masked)
+    if cut and (tail := _TRAILING_URL.search(rewritten)) is not None:
+        # Dropped, not masked: a head cannot say which object it was cut from, and a token would claim one.
+        # It can be glued behind another URL (observe's `value|text`), so every start in the span is tried.
+        for head in _URL_START.finditer(tail.group(0)):
+            if _is_ref_head(tail.group(0)[head.start() :], forms):
+                rewritten = rewritten[: tail.start() + head.start()]
+                break
     return masked if rewritten == masked else rewritten
+
+
+def _is_ref_head(head: str, forms: list[str]) -> bool:
+    """``head`` is the start of a ref and runs past its host; a shorter head names nothing on that host."""
+    folded = head.casefold()
+    for form in forms:
+        if not form.casefold().startswith(folded):
+            continue
+        try:
+            split = urlsplit(form)
+        except ValueError:
+            continue
+        if len(head) > len(f"{split.scheme}://{split.netloc}"):
+            return True
+    return False
 
 
 def _unwired_authority() -> RuntimeOriginAuthority:
@@ -237,6 +597,9 @@ class DialogEntry(TypedDict):
     type: str
     message: str
     count: int
+
+
+RunArm = Literal["treatment", "control", "unrandomized"]
 
 
 class EnrichTreeMode(StrEnum):
@@ -273,6 +636,16 @@ class PendingFileChooserListener:
             self.handler = None
 
 
+def compute_org_age(created_at: datetime.datetime | None, *, now: datetime.datetime | None = None) -> int | None:
+    """Whole days since the organization was created, or None for a missing or invalid timestamp."""
+    if not isinstance(created_at, datetime.datetime):
+        return None
+    reference = now or datetime.datetime.now(datetime.timezone.utc)
+    created = created_at if created_at.tzinfo else created_at.replace(tzinfo=datetime.timezone.utc)
+    reference = reference if reference.tzinfo else reference.replace(tzinfo=datetime.timezone.utc)
+    return max(0, (reference - created).days)
+
+
 @dataclass
 class SkyvernContext:
     request_id: str | None = None
@@ -280,6 +653,9 @@ class SkyvernContext:
     organization_name: str | None = None
     org_default_llm_key: str | None = None
     org_default_secondary_llm_key: str | None = None
+    # Whole days since the organization was created, stamped wherever organization_id and
+    # organization_name are set from a loaded organization. A log field only, never a metric tag.
+    org_age: int | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_id: str | None = None
@@ -327,6 +703,13 @@ class SkyvernContext:
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
+    multi_field_totp_rejections: dict[str, MultiFieldTotpRejection] = field(default_factory=dict)
+    multi_field_totp_mask_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    multi_field_totp_prompt_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    multi_field_totp_artifact_fingerprints: dict[str, tuple[frozenset[str], tuple[tuple[frozenset[str], int], ...]]] = (
+        field(default_factory=dict, repr=False)
+    )
+    multi_field_totp_rejected_candidates: dict[str, set[str]] = field(default_factory=dict, repr=False)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
@@ -337,6 +720,9 @@ class SkyvernContext:
     # scoped so bare tasks with no workflow-run context are still redacted; unioned into
     # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
     runtime_secret_values: set[str] = field(default_factory=builtins.set)
+    # Copilot credential values this request filled or scrubbed with. Its log lines and span exceptions
+    # scrub them at any length, while other sessions' values reach its log lines only above a length floor.
+    copilot_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
     # Subset of runtime_secret_values that must also never reach the model's own view of tool
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.
@@ -348,6 +734,10 @@ class SkyvernContext:
     # this like workflow_block_engine_lock or one task's refs stomp another's mid-flight.
     opaque_url_refs: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
+    # Empty-page recovery: the step whose plan was replaced by an internal-recovery
+    # ClosePageAction, and a per-task consecutive-attempt counter that caps recovery at 3.
+    empty_page_recovery_step_id: str | None = None
+    empty_page_recovery_attempts: dict[str, int] = field(default_factory=dict)
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
     max_screenshot_scrolls: int | None = None
@@ -391,29 +781,33 @@ class SkyvernContext:
     # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
     # extraction / error-detection scrapes never touch it.
     transient_ui_consecutive_suppressions: int = 0
+    # The URLs the workflow AUTHOR typed into the running task block's own `url`/`navigation_goal`,
+    # read before those fields are rendered, and the (workflow_run_id, block label) the reading was
+    # done for. A Task V3 guard verdict publishes a landed URL's path only when it is one of these, so
+    # a URL that only exists after a template rendered a prior block's page-derived output is not one.
+    # Written and read only through skyvern.forge.taskv3.handoff_redaction; a stale owner reads as
+    # empty, which is host-only in the verdict.
+    caller_authored_block_urls: frozenset[str] = frozenset()
+    caller_authored_block_urls_owner: tuple[str, str] | None = None
     # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
     # task block of that run dispatches to, or None for control.
     workflow_block_engine_override: RunEngine | None = None
+    # Why that arm, as the resolver decided it: the route reason, the billing tier it bucketed on and
+    # the new-workflow rollout resolution. Pinned so the run's terminal telemetry reports the values
+    # the experiment used instead of reading them again at finalize time; None until a run resolves.
+    workflow_block_engine_arm_decision: WorkflowBlockEngineArmDecision | None = None
     # The workflow run the override above was resolved for. A nested execution sharing this context
     # (an inline child workflow run) has its own id and its own definition, so it must re-resolve
     # rather than inherit an arm that was never checked against its blocks.
     workflow_block_engine_resolved_run_id: str | None = None
     # Single-flight the first-use provider resolution when parallel branches share one context.
     workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # TASK_V3_FRAME_PERCEPTION arm, resolved once per run before the v3 loop starts; read through
-    # frame_perception_enabled(), never directly. The flag is written before the run-id sentinel, so
-    # a concurrent reader sees "unresolved" -- off, today's behaviour -- rather than a torn pair.
-    frame_perception_flag: bool = False
-    # The run the pin above was resolved for; a nested execution with a different id re-resolves.
-    # Last writer wins with no save/restore, so this prevents inheriting an unchecked arm but would
-    # not isolate two interleaved runs sharing one context, which nothing constructs today.
-    frame_perception_resolved_run_id: str | None = None
-    # Single-flight the first resolution when parallel branches share one context. Without it both
-    # branches pass the sentinel check, and the second -- which answers False on any provider
-    # failure -- overwrites the arm the first already baked into its observe description.
-    frame_perception_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
+    # Task V3 run arms by flag: (run id the arm was resolved for, arm), resolved once per run; a nested execution
+    # with a different id re-resolves. Written and read only through skyvern.forge.taskv3.run_arms.
+    run_arms: dict[str, tuple[str, RunArm]] = field(default_factory=dict)
+    run_arms_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
     # The lock makes first-use resolution single-flight under parallel prompt builds.
@@ -449,8 +843,6 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
-    # Caller-selected block labels for a partial workflow run; None/empty = full run.
-    run_block_labels: list[str] | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None
@@ -487,6 +879,65 @@ class SkyvernContext:
     # popup it stranded. Task-keyed and dropped on task teardown so a claim never leaks into a later
     # task/run/persistent-session scope.
     download_popup_claims: dict[str, list[Page]] = field(default_factory=dict)
+
+    # Capture survives action return, but stops before the next action can create unrelated Pages.
+    download_popup_context_listeners: dict[str, list[tuple[Any, Callable[[Any], None]]]] = field(default_factory=dict)
+
+    # Reservations outlive capture until durable credit, intentional adoption, or terminal cleanup.
+    download_popup_late_candidates: dict[str, list[Page]] = field(default_factory=dict)
+
+    # A dispatched-then-failed action's reservations are not released inline (the browser effect may
+    # still credit a download after the action seam returns). The pre-action snapshot is stashed here
+    # and the release is deferred to the next durable-credit seam, applied only if no credit arrived.
+    pending_download_reservation_release: dict[str, tuple[tuple[Page, ...], tuple[Page, ...]]] = field(
+        default_factory=dict
+    )
+
+    # Monotonic time the bounded dead-blank recovery grace STARTED for each exact popup Page, keyed
+    # task_id -> id(page). Anchored first-wins at the first eligible blank-page recovery observation (NOT
+    # at claim creation): the handler's own post-click wait already spent its separate budget, so recovery
+    # must still grant ~one full grace for a late/silent final file. Event-recorded and finally-swept
+    # claims get identical recovery-grace semantics; a later recovery call consumes the remaining budget
+    # and never restarts it; sibling pages have independent deadlines. id(page) is a safe key because the
+    # claim/late-candidate registries strong-reference every keyed Page (no GC-then-reuse while claimed);
+    # the entry is dropped the moment the page leaves BOTH registries, so a stale anchor can never outlive
+    # its page or resurrect after credit.
+    download_popup_recovery_grace_started_at: dict[str, dict[int, float]] = field(default_factory=dict)
+
+    # Snapshot of the download files present when each exact popup Page's claim was FIRST created,
+    # keyed task_id -> id(page) -> baseline paths. Dead-blank recovery observation compares a claimed
+    # page against ITS OWN baseline, so a file that landed for an earlier action or a sibling page
+    # before this page's claim is never miscredited to it (a non-complete block reuses one stale
+    # block-level baseline across recursive steps). Strict subordinate of the two Page registries with
+    # the same lifecycle as the creation anchor above; never feeds the authoritative block-level
+    # credit/finalization baseline.
+    download_popup_claim_baseline: dict[str, dict[int, tuple[str, ...]]] = field(default_factory=dict)
+
+    # Exact popup Pages (keyed task_id -> {id(page)}) whose claim baseline was built with a persistent
+    # browser-session listing (the download-action path). Dead-blank recovery only unions session files
+    # into ITS observation for these pages: a claim WITHOUT a session baseline (the v4 false-click path,
+    # which must never do a remote listing) cannot be credited by session-only files, because it has no
+    # session reference to tell a genuinely new file from one an earlier action already produced. Strict
+    # subordinate of the two Page registries with the same lifecycle as the baseline snapshot above.
+    download_popup_claim_session_observed: dict[str, set[int]] = field(default_factory=dict)
+
+    # AUGMENTED session baseline per exact popup Page (task_id -> {id(page): {paths}}). Unlike the
+    # first-wins baseline snapshot above, later session observations are UNIONED in: the event-recorded
+    # popup claim anchors the stale pre-action session snapshot, but the action-finally resnapshot re-records
+    # the same page and augments it, so a session download from an earlier action that settled between the
+    # pre-action fetch and this popup's mint is baselined out and cannot be miscredited. Augmentation only
+    # ever makes the baseline MORE conservative; a still-pending own download is absent from the later
+    # snapshot, so it can still credit during the grace. Local facts stay first-wins in the snapshot above.
+    download_popup_claim_session_baseline: dict[str, dict[int, set[str]]] = field(default_factory=dict)
+
+    # Exact popup Pages (task_id -> {id(page)}) claimed together in a MULTI-popup action-finally delta
+    # sweep -- the only place a batch of same-action siblings is discovered at one instant. For these,
+    # a new completed file that appears during ONE sibling's dead-blank grace cannot be causally
+    # attributed to it rather than a sibling (no file->page mapping exists), so a non-complete recovery
+    # must not early-credit-and-close it on that file while its own download may still be in flight; it
+    # waits its full grace instead. Strict subordinate of the two Page registries, same lifecycle as the
+    # baseline snapshots above. A lone delta popup and the sync/false-click recorders are never marked.
+    download_popup_claim_delta_siblings: dict[str, set[int]] = field(default_factory=dict)
 
     # Tasks whose terminal cleanup has already run its download half -- settle, save, and artifact
     # outcome recording -- so a recovery path can tell "never recorded" from "recorded" without
@@ -639,8 +1090,20 @@ class SkyvernContext:
         attempt.valid_until = None
         attempt.filled_code_hash = None
         attempt.filled_at = None
+        attempt.filled_url = None
+        attempt.filled_loader_id = None
+        attempt.external_code_obtained_at = None
+        attempt.filled_group_identity = None
+        attempt.observed_max_filled = 0
         attempt.fill_verified = False
         self.totp_codes.pop(f"{task_id}_totp_cache", None)
+
+    def clear_multi_field_totp_rejection(self, task_id: str) -> None:
+        self.multi_field_totp_rejections.pop(task_id, None)
+        self.multi_field_totp_artifact_fingerprints.pop(task_id, None)
+        self.multi_field_totp_mask_values.pop(task_id, None)
+        self.multi_field_totp_prompt_values.pop(task_id, None)
+        self.multi_field_totp_rejected_candidates.pop(task_id, None)
 
     def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
         attempt = self.multi_field_totp.pop(task_id, None)
@@ -717,10 +1180,124 @@ class SkyvernContext:
             return False
         return True
 
-    def record_download_popup_claim(self, task_id: str, page: Page) -> None:
+    def record_download_popup_claim(
+        self,
+        task_id: str,
+        page: Page,
+        baseline_files: Iterable[str] | None = None,
+        session_observed: bool = False,
+        session_baseline_files: Iterable[str] | None = None,
+    ) -> None:
         claims = self.download_popup_claims.setdefault(task_id, [])
         if all(existing is not page for existing in claims):
             claims.append(page)
+        self._anchor_download_popup_claim_baseline(task_id, page, baseline_files)
+        self._augment_download_popup_claim_session_baseline(task_id, page, session_baseline_files)
+        if session_observed:
+            self.download_popup_claim_session_observed.setdefault(task_id, builtins.set()).add(id(page))
+
+    def anchor_download_popup_recovery_grace(self, task_id: str, page: Page, now: float) -> None:
+        # First-wins: anchor the recovery-observation grace to the FIRST eligible blank-page recovery
+        # observation of this exact Page. A later recovery call (or re-entry/cancellation) reuses this
+        # anchor and consumes the remaining budget rather than restarting it; siblings are independent.
+        self.download_popup_recovery_grace_started_at.setdefault(task_id, {}).setdefault(id(page), now)
+
+    def _anchor_download_popup_claim_baseline(
+        self, task_id: str, page: Page, baseline_files: Iterable[str] | None
+    ) -> None:
+        # setdefault -> anchor to the FIRST creation snapshot, mirroring the creation anchor above. A
+        # None snapshot (a caller without a resolved download dir) records nothing, so recovery falls
+        # back to the block baseline for that page rather than a wrong page-specific one.
+        if baseline_files is None:
+            return
+        self.download_popup_claim_baseline.setdefault(task_id, {}).setdefault(id(page), tuple(baseline_files))
+
+    def _augment_download_popup_claim_session_baseline(
+        self, task_id: str, page: Page, session_baseline_files: Iterable[str] | None
+    ) -> None:
+        # UNION (not setdefault): a later session observation for a re-recorded page can only make the
+        # baseline more conservative, so augment it rather than keep the stale first snapshot.
+        if session_baseline_files is None:
+            return
+        self.download_popup_claim_session_baseline.setdefault(task_id, {}).setdefault(id(page), builtins.set()).update(
+            session_baseline_files
+        )
+
+    def download_popup_claim_baseline_for(self, task_id: str, page: Page) -> tuple[str, ...] | None:
+        """The exact-Page download baseline captured when this page's claim was created, or None when
+        no snapshot was anchored for it."""
+        by_page = self.download_popup_claim_baseline.get(task_id)
+        if not by_page:
+            return None
+        return by_page.get(id(page))
+
+    def download_popup_claim_session_baseline_for(self, task_id: str, page: Page) -> tuple[str, ...] | None:
+        """The augmented per-Page session baseline (every session observation unioned across re-records),
+        or None when none was anchored for it."""
+        by_page = self.download_popup_claim_session_baseline.get(task_id)
+        if not by_page:
+            return None
+        session = by_page.get(id(page))
+        return tuple(session) if session is not None else None
+
+    def download_popup_claim_session_was_observed(self, task_id: str, page: Page) -> bool:
+        """Whether this exact page's claim baseline was built with a browser-session listing. False for a
+        v4 false-click claim (local-only baseline), so recovery must not union session files for it."""
+        return id(page) in self.download_popup_claim_session_observed.get(task_id, builtins.set())
+
+    def mark_download_popup_claim_delta_siblings(self, task_id: str, pages: Iterable[Page]) -> None:
+        """Mark exact popup Pages claimed together in one multi-popup delta sweep as sibling-ambiguous, so
+        recovery cannot causally attribute a new file to one of them over the others."""
+        bucket = self.download_popup_claim_delta_siblings.setdefault(task_id, builtins.set())
+        for page in pages:
+            bucket.add(id(page))
+
+    def download_popup_claim_has_delta_siblings(self, task_id: str, page: Page) -> bool:
+        """Whether this exact page was claimed alongside siblings in one multi-popup delta sweep."""
+        return id(page) in self.download_popup_claim_delta_siblings.get(task_id, builtins.set())
+
+    def remaining_download_popup_grace(self, task_id: str, page: Page, grace: float, now: float) -> float | None:
+        """Remaining grace for ONE exact page: ``grace - (now - started)`` clamped at 0.0 (an aged
+        anchor never waits again). None when this exact page has no recovery-grace anchor yet."""
+        by_page = self.download_popup_recovery_grace_started_at.get(task_id)
+        if not by_page:
+            return None
+        started = by_page.get(id(page))
+        if started is None:
+            return None
+        return max(0.0, grace - (now - started))
+
+    def _drop_claim_deadline_if_unreferenced(self, task_id: str, page: Page) -> None:
+        # The recovery-grace anchor and the baseline snapshot are strict subordinates of the union of the
+        # two Page registries: drop them only once the exact page is gone from BOTH, so a page still live
+        # in the sibling registry keeps them.
+        if self.has_download_popup_claim(task_id, page):
+            return
+        by_page = self.download_popup_recovery_grace_started_at.get(task_id)
+        if by_page:
+            by_page.pop(id(page), None)
+            if not by_page:
+                del self.download_popup_recovery_grace_started_at[task_id]
+        baseline_by_page = self.download_popup_claim_baseline.get(task_id)
+        if baseline_by_page:
+            baseline_by_page.pop(id(page), None)
+            if not baseline_by_page:
+                del self.download_popup_claim_baseline[task_id]
+        session_observed = self.download_popup_claim_session_observed.get(task_id)
+        if session_observed:
+            session_observed.discard(id(page))
+            if not session_observed:
+                del self.download_popup_claim_session_observed[task_id]
+        session_baseline_by_page = self.download_popup_claim_session_baseline.get(task_id)
+        if session_baseline_by_page:
+            session_baseline_by_page.pop(id(page), None)
+            if not session_baseline_by_page:
+                del self.download_popup_claim_session_baseline[task_id]
+        delta_siblings = self.download_popup_claim_delta_siblings.get(task_id)
+        if delta_siblings:
+            delta_siblings.discard(id(page))
+            if not delta_siblings:
+                del self.download_popup_claim_delta_siblings[task_id]
 
     def discard_download_popup_claim(self, task_id: str, page: Page) -> bool:
         """Retire a stale claim once its exact Page is reused as a later action's initiating page.
@@ -737,13 +1314,199 @@ class SkyvernContext:
             self.download_popup_claims[task_id] = remaining
         else:
             del self.download_popup_claims[task_id]
+        self._drop_claim_deadline_if_unreferenced(task_id, page)
         return True
 
+    def has_download_popup_claim(self, task_id: str, page: Page) -> bool:
+        return any(existing is page for existing in self.download_popup_claims.get(task_id, [])) or any(
+            existing is page for existing in self.download_popup_late_candidates.get(task_id, [])
+        )
+
+    def arm_download_popup_context_listener(
+        self, task_id: str, browser_context: Any, callback: Callable[[Any], None]
+    ) -> None:
+        listeners = self.download_popup_context_listeners.setdefault(task_id, [])
+        if any(existing_context is browser_context for existing_context, _ in listeners):
+            return
+
+        def capture_if_current(page: Any) -> None:
+            # A queued callback or failed remove_listener must not resurrect an expired reservation.
+            if any(
+                current_callback is capture_if_current
+                for _, current_callback in self.download_popup_context_listeners.get(task_id, [])
+            ):
+                callback(page)
+
+        browser_context.on("page", capture_if_current)
+        listeners.append((browser_context, capture_if_current))
+
+    def stop_download_popup_capture(self, task_id: str) -> None:
+        for browser_context, callback in self.download_popup_context_listeners.pop(task_id, []):
+            try:
+                browser_context.remove_listener("page", callback)
+            except Exception:
+                pass
+
+    def record_download_popup_late_candidate(
+        self,
+        task_id: str,
+        page: Page,
+        baseline_files: Iterable[str] | None = None,
+        session_observed: bool = False,
+        session_baseline_files: Iterable[str] | None = None,
+    ) -> None:
+        candidates = self.download_popup_late_candidates.setdefault(task_id, [])
+        if all(existing is not page for existing in candidates):
+            candidates.append(page)
+        self._anchor_download_popup_claim_baseline(task_id, page, baseline_files)
+        self._augment_download_popup_claim_session_baseline(task_id, page, session_baseline_files)
+        if session_observed:
+            self.download_popup_claim_session_observed.setdefault(task_id, builtins.set()).add(id(page))
+
+    def discard_download_popup_late_candidate(self, task_id: str, page: Page) -> bool:
+        """Retire a late candidate once its exact Page is a deliberately-created/adopted tab. Mirrors
+        ``discard_download_popup_claim``: removes only ``existing is page``, preserves siblings, drops the
+        task key when empty, and returns whether a candidate was removed."""
+        candidates = self.download_popup_late_candidates.get(task_id)
+        if not candidates:
+            return False
+        remaining = [existing for existing in candidates if existing is not page]
+        if len(remaining) == len(candidates):
+            return False
+        if remaining:
+            self.download_popup_late_candidates[task_id] = remaining
+        else:
+            del self.download_popup_late_candidates[task_id]
+        self._drop_claim_deadline_if_unreferenced(task_id, page)
+        return True
+
+    def release_download_popup_claim(self, task_id: str, page: Page) -> None:
+        """Release ONE exact Page from both download-popup reservation registries (claim + late-candidate)
+        by identity, dropping its subordinate creation anchor and baseline snapshot. Preserves sibling,
+        task, and context entries and is idempotent. This is the narrow release primitive; call it to
+        release an expired dead-blank recovery claim."""
+        self.discard_download_popup_claim(task_id, page)
+        self.discard_download_popup_late_candidate(task_id, page)
+
+    def retire_intentional_page(self, task_id: str, page: Page) -> None:
+        """Retire a deliberately-created/adopted Page (NEW_TAB, magic link) from BOTH download-popup
+        reservation registries by exact identity. A newly created page joins the context and is recorded by
+        the ``context.on("page")`` owner while still blank; an intentional page must never be closed by a
+        delayed download credit. Same exact-Page release as ``release_download_popup_claim`` -- named for
+        the deliberate-tab-protection intent at NEW_TAB/magic-link sites."""
+        self.release_download_popup_claim(task_id, page)
+
+    def detach_all_download_popup_context_listeners(self) -> None:
+        for task_id in list(self.download_popup_context_listeners):
+            self.stop_download_popup_capture(task_id)
+        self.download_popup_claims.clear()
+        self.download_popup_late_candidates.clear()
+        self.pending_download_reservation_release.clear()
+        self.download_popup_recovery_grace_started_at.clear()
+        self.download_popup_claim_baseline.clear()
+        self.download_popup_claim_session_observed.clear()
+        self.download_popup_claim_session_baseline.clear()
+        self.download_popup_claim_delta_siblings.clear()
+
+    def take_download_popup_late_candidates(self, task_id: str) -> list[Page]:
+        self.stop_download_popup_capture(task_id)
+        taken = self.download_popup_late_candidates.pop(task_id, [])
+        for page in taken:
+            self._drop_claim_deadline_if_unreferenced(task_id, page)
+        return taken
+
     def take_download_popup_claims(self, task_id: str) -> list[Page]:
-        return self.download_popup_claims.pop(task_id, [])
+        self.stop_download_popup_capture(task_id)
+        taken = self.download_popup_claims.pop(task_id, [])
+        for page in taken:
+            self._drop_claim_deadline_if_unreferenced(task_id, page)
+        return taken
 
     def clear_download_popup_claims(self, task_id: str) -> None:
+        self.stop_download_popup_capture(task_id)
         self.download_popup_claims.pop(task_id, None)
+        self.download_popup_late_candidates.pop(task_id, None)
+        self.pending_download_reservation_release.pop(task_id, None)
+        self.download_popup_recovery_grace_started_at.pop(task_id, None)
+        self.download_popup_claim_baseline.pop(task_id, None)
+        self.download_popup_claim_session_observed.pop(task_id, None)
+        self.download_popup_claim_session_baseline.pop(task_id, None)
+        self.download_popup_claim_delta_siblings.pop(task_id, None)
+
+    def snapshot_download_popup_reservations(self, task_id: str) -> tuple[tuple[Page, ...], tuple[Page, ...]]:
+        return (
+            tuple(self.download_popup_claims.get(task_id, [])),
+            tuple(self.download_popup_late_candidates.get(task_id, [])),
+        )
+
+    def retain_download_popup_reservations(
+        self, task_id: str, snapshot: tuple[tuple[Page, ...], tuple[Page, ...]]
+    ) -> None:
+        self.stop_download_popup_capture(task_id)
+        # Filter current entries so adoption and credit consumption are never undone.
+        for registry, prior_pages in (
+            (self.download_popup_claims, snapshot[0]),
+            (self.download_popup_late_candidates, snapshot[1]),
+        ):
+            remaining = [
+                page for page in registry.get(task_id, []) if any(page is prior_page for prior_page in prior_pages)
+            ]
+            if remaining:
+                registry[task_id] = remaining
+            else:
+                registry.pop(task_id, None)
+        self._prune_claim_deadlines(task_id)
+
+    def _prune_claim_deadlines(self, task_id: str) -> None:
+        # The recovery-grace anchor and the baseline snapshot are strict subordinates of the two Page
+        # registries: prune BOTH against the same live-id set, or a stale baseline (first-wins under
+        # id() reuse) could later attach to a freshly created Page in the miscredit direction.
+        live_ids = {id(p) for p in self.download_popup_claims.get(task_id, [])}
+        live_ids |= {id(p) for p in self.download_popup_late_candidates.get(task_id, [])}
+        for registry in (self.download_popup_recovery_grace_started_at, self.download_popup_claim_baseline):
+            by_page = registry.get(task_id)
+            if not by_page:
+                continue
+            for page_id in [pid for pid in by_page if pid not in live_ids]:
+                by_page.pop(page_id, None)
+            if not by_page:
+                del registry[task_id]
+        session_observed = self.download_popup_claim_session_observed.get(task_id)
+        if session_observed:
+            session_observed.intersection_update(live_ids)
+            if not session_observed:
+                del self.download_popup_claim_session_observed[task_id]
+        session_baseline_by_page = self.download_popup_claim_session_baseline.get(task_id)
+        if session_baseline_by_page:
+            for page_id in [pid for pid in session_baseline_by_page if pid not in live_ids]:
+                session_baseline_by_page.pop(page_id, None)
+            if not session_baseline_by_page:
+                del self.download_popup_claim_session_baseline[task_id]
+        delta_siblings = self.download_popup_claim_delta_siblings.get(task_id)
+        if delta_siblings:
+            delta_siblings.intersection_update(live_ids)
+            if not delta_siblings:
+                del self.download_popup_claim_delta_siblings[task_id]
+
+    def stash_pending_download_reservation_release(
+        self, task_id: str, snapshot: tuple[tuple[Page, ...], tuple[Page, ...]]
+    ) -> None:
+        """Keep the earliest failed dispatch's snapshot for release at the step's no-credit seam.
+        A later dispatched success cancels this instruction, retaining all live reservations for credit or cleanup.
+        """
+        self.pending_download_reservation_release.setdefault(task_id, snapshot)
+
+    def cancel_pending_download_reservation_release(self, task_id: str) -> None:
+        self.pending_download_reservation_release.pop(task_id, None)
+
+    def apply_pending_download_reservation_release(self, task_id: str) -> None:
+        """Release a previously-deferred dispatched-then-failed epoch if the credit seam did not consume
+        it. A no-op when nothing is pending; when credit already emptied the registries, the retain
+        filters to an empty set and is inert."""
+        snapshot = self.pending_download_reservation_release.pop(task_id, None)
+        if snapshot is None:
+            return
+        self.retain_download_popup_reservations(task_id, snapshot)
 
     def mark_cleanup_downloads_recorded(self, task_id: str) -> None:
         self.cleanup_downloads_recorded_task_ids.add(task_id)
@@ -894,6 +1657,11 @@ def _cleanup_outgoing_context(context: SkyvernContext | None) -> None:
     if context.feature_flag_entries:
         context.flush_feature_flags()
     context.cleanup_pending_file_chooser()
+    # The download-popup context.on("page") listeners are owned for the lifetime of THIS context. Detaching
+    # them here (reset/replace/_restore) guarantees a task that abandons before clean_up_task cannot leak a
+    # listener on a persistent BrowserContext. scoped() cleans a distinct child context whose buckets are
+    # empty, so this stays a no-op for the still-current task's own listeners.
+    context.detach_all_download_popup_context_listeners()
 
 
 def _restore(token: Token[SkyvernContext | None]) -> None:

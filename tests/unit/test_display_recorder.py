@@ -405,6 +405,197 @@ async def test_stop_is_idempotent() -> None:
     assert len(proc.signals) == n_signals
 
 
+def _recorder_with_path(proc: _FakeProc, video_path) -> dr.DisplayRecorder:
+    from skyvern.webeye.browser_artifacts import VideoArtifact
+
+    return dr.DisplayRecorder(
+        display=":99",
+        owner_id="wr_x",
+        process=proc,
+        lock_fd=-1,
+        video_artifact=VideoArtifact(video_path=str(video_path)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_graceful_remuxes_finalized_recording_in_place(tmp_path, monkeypatch) -> None:
+    video_path = tmp_path / "rec.mp4"
+    video_path.write_bytes(b"FRAGMENTED-ORIGINAL")
+
+    calls: list[str] = []
+
+    async def _fake_remux(src: str) -> str:
+        calls.append(src)
+        out = tmp_path / "faststart.mp4"
+        out.write_bytes(b"FASTSTART-REMUXED")
+        return str(out)
+
+    monkeypatch.setattr(dr, "remux_mp4_faststart", _fake_remux, raising=False)
+
+    rec = _recorder_with_path(_FakeProc(exits_on="SIGINT"), video_path)
+    assert await rec.stop() is True
+    # Remuxed exactly once, on the finalized recording, applied in place before upload.
+    assert calls == [str(video_path)]
+    assert video_path.read_bytes() == b"FASTSTART-REMUXED"
+
+
+@pytest.mark.asyncio
+async def test_stop_nongraceful_does_not_remux(tmp_path, monkeypatch) -> None:
+    video_path = tmp_path / "rec.mp4"
+    video_path.write_bytes(b"FRAGMENTED-PARTIAL")
+
+    calls: list[str] = []
+
+    async def _fake_remux(src: str) -> str:
+        calls.append(src)
+        return src
+
+    monkeypatch.setattr(dr, "remux_mp4_faststart", _fake_remux, raising=False)
+
+    # Nonzero finalize (failed/forced) is crash-salvage: the fragmented partial must be preserved.
+    rec = _recorder_with_path(_FakeProc(exits_on="SIGINT", exit_code=1), video_path)
+    assert await rec.stop() is False
+    assert calls == []
+    assert video_path.read_bytes() == b"FRAGMENTED-PARTIAL"
+
+
+@pytest.mark.asyncio
+async def test_stop_graceful_remux_failure_keeps_original(tmp_path, monkeypatch) -> None:
+    video_path = tmp_path / "rec.mp4"
+    video_path.write_bytes(b"FRAGMENTED-ORIGINAL")
+
+    async def _fake_remux_none(src: str) -> None:
+        return None
+
+    monkeypatch.setattr(dr, "remux_mp4_faststart", _fake_remux_none, raising=False)
+
+    rec = _recorder_with_path(_FakeProc(exits_on="SIGINT"), video_path)
+    # Fail-open: a remux that yields nothing must not fail cleanup or lose the recording.
+    assert await rec.stop() is True
+    assert video_path.read_bytes() == b"FRAGMENTED-ORIGINAL"
+
+
+@pytest.mark.asyncio
+async def test_stop_graceful_keeps_original_when_swap_fails(tmp_path, monkeypatch) -> None:
+    video_path = tmp_path / "rec.mp4"
+    video_path.write_bytes(b"FRAGMENTED-ORIGINAL")
+    tmp_out = tmp_path / "faststart.mp4"
+
+    async def _fake_remux(src: str) -> str:
+        tmp_out.write_bytes(b"FASTSTART-REMUXED")
+        return str(tmp_out)
+
+    def _swap_boom(src: str, dst: str) -> None:
+        raise OSError("atomic swap failed")
+
+    monkeypatch.setattr(dr, "remux_mp4_faststart", _fake_remux, raising=False)
+    monkeypatch.setattr(dr.os, "replace", _swap_boom)
+
+    rec = _recorder_with_path(_FakeProc(exits_on="SIGINT"), video_path)
+    # Swap failure must not fail cleanup; the original recording stays byte-identical and the temp is cleaned.
+    assert await rec.stop() is True
+    assert video_path.read_bytes() == b"FRAGMENTED-ORIGINAL"
+    assert not tmp_out.exists()
+
+
+@pytest.mark.asyncio
+async def test_stop_retries_faststart_after_cancellation(tmp_path, monkeypatch) -> None:
+    video_path = tmp_path / "rec.mp4"
+    video_path.write_bytes(b"FRAGMENTED-ORIGINAL")
+    tmp_out = tmp_path / "faststart.mp4"
+    calls = {"n": 0}
+
+    async def _remux(src: str) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise asyncio.CancelledError()  # cancelled mid-finalize
+        tmp_out.write_bytes(b"FASTSTART-REMUXED")
+        return str(tmp_out)
+
+    monkeypatch.setattr(dr, "remux_mp4_faststart", _remux, raising=False)
+
+    proc = _FakeProc(exits_on="SIGINT")
+    rec = _recorder_with_path(proc, video_path)
+    # First finalize: the recorder stops gracefully but the faststart remux is cancelled and propagates.
+    with pytest.raises(asyncio.CancelledError):
+        await rec.finalize_keeping_reservation()
+    assert rec.is_stopped  # recorder stop latched exactly once
+    assert video_path.read_bytes() == b"FRAGMENTED-ORIGINAL"  # not remuxed yet
+
+    # Cleanup retry attempts the remux again (without re-escalating the already-stopped recorder).
+    assert await rec.stop() is True
+    assert calls["n"] == 2
+    assert video_path.read_bytes() == b"FASTSTART-REMUXED"
+    assert proc.signals.count(signal.SIGINT) == 1  # exactly-once stop: no second escalation
+
+
+@pytest.mark.asyncio
+async def test_no_remux_before_terminal_stop(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def _fake_remux(src: str) -> str:
+        calls.append(src)
+        return src
+
+    monkeypatch.setattr(dr, "remux_mp4_faststart", _fake_remux, raising=False)
+
+    rec = _recorder_with_path(_FakeProc(exits_on="SIGINT"), tmp_path / "rec.mp4")
+    assert rec.arm_capture() is True
+    # While recording (armed, not yet stopped) the fragmented MP4 is never remuxed.
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_stop_graceful_real_ffmpeg_defragments_finalized_recording(tmp_path) -> None:
+    import shutil as _shutil
+    import struct
+    import subprocess
+
+    if _shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    video_path = tmp_path / "rec.mp4"
+    subprocess.check_call(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=160x90:rate=15:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            str(video_path),
+        ]
+    )
+    assert b"moof" in video_path.read_bytes()  # precondition: fragmented while recording
+
+    rec = _recorder_with_path(_FakeProc(exits_on="SIGINT"), video_path)
+    assert await rec.stop() is True
+
+    out = video_path.read_bytes()
+    # Finalized terminal recording is de-fragmented and carries a real (non-zero) duration,
+    # so a native <video> can read the length and seek without a full-file scan.
+    assert b"moof" not in out
+    i = out.find(b"mvhd")
+    assert i >= 0
+    body = out[i + 4 :]
+    if body[0] == 1:
+        duration = struct.unpack(">Q", body[4 + 8 + 8 + 4 : 4 + 8 + 8 + 4 + 8])[0]
+    else:
+        duration = struct.unpack(">I", body[4 + 4 + 4 + 4 : 4 + 4 + 4 + 4 + 4])[0]
+    assert duration > 0
+
+
 @pytest.mark.asyncio
 async def test_stop_owner_sweep_finishes_then_reraises_cancellation(monkeypatch) -> None:
     # Finish-then-re-raise (mirrors stop()/_reap/_reclaim): a per-owner release that COMPLETES then raises

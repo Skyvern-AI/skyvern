@@ -45,4 +45,4 @@ const useSidebarStore = create<SidebarStore>((set) => {
   };
 });
 
-export { useSidebarStore };
+export { SIDEBAR_COLLAPSED_STORAGE_KEY, useSidebarStore };

@@ -1,14 +1,15 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+  COPILOT_ATTENTION_DOT,
+  useCopilotHeaderStore,
+} from "@/store/useCopilotHeaderStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { cn } from "@/util/utils";
 
 import { WorkflowCopilotHistory } from "../copilot/WorkflowCopilotHistory";
 import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
+import { ControlTooltip } from "./ControlTooltip";
 
 /**
  * Copilot pane header chrome: the History and New-chat controls the docked
@@ -29,21 +30,26 @@ export function CopilotPaneControls() {
         currentChatId={controls.currentChatId}
         onSelect={controls.onSelectChat}
         disabled={controls.disabled}
+        lockedReason={controls.navigationLockedReason ?? undefined}
         compact
       />
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            onClick={controls.onNewChat}
-            aria-label="New chat"
-            className={PANE_HEADER_ICON_BUTTON_CLASS}
-          >
-            <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">New chat</TooltipContent>
-      </Tooltip>
+      {/* Disabled buttons swallow the trigger's events, so the reason a locked control gives
+          has to hang off a focusable wrapper or a keyboard user never reaches it. */}
+      <ControlTooltip
+        content="New chat"
+        reason={controls.navigationLockedReason}
+        blocked={controls.newChatDisabled}
+      >
+        <button
+          type="button"
+          onClick={controls.onNewChat}
+          disabled={controls.newChatDisabled}
+          aria-label="New chat"
+          className={PANE_HEADER_ICON_BUTTON_CLASS}
+        >
+          <PlusIcon className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      </ControlTooltip>
     </>
   );
 }
@@ -51,14 +57,48 @@ export function CopilotPaneControls() {
 /**
  * Presence badge on the Copilot pane-header icon, replacing the old "● Active"
  * text chip (which was an always-on session indicator; the dot keeps that
- * meaning with the state voiced through the aria-label).
+ * meaning with the state voiced through the aria-label). A pending request
+ * outranks recording here because recording keeps its own header label.
  */
 export function CopilotActiveDot() {
+  const recording = useRecordingStore(
+    (state) => state.isRecording || state.finishRequested || state.isCommitting,
+  );
+  const attention = useCopilotHeaderStore((state) => state.attention);
+  const label = attention
+    ? COPILOT_ATTENTION_DOT[attention]
+    : recording
+      ? "Copilot recording active"
+      : "Copilot session active";
   return (
     <span
       role="img"
-      aria-label="Copilot session active"
-      className="absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-success ring-2 ring-slate-elevation1"
+      aria-label={label}
+      title={attention ? label : undefined}
+      className={cn(
+        "absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-2 ring-slate-elevation1",
+        attention ? "bg-amber-500" : recording ? "bg-red-500" : "bg-success",
+      )}
     />
+  );
+}
+
+export function CopilotPaneStatus() {
+  const recording = useRecordingStore((state) => state.isRecording);
+  const finishing = useRecordingStore(
+    (state) => state.finishRequested || state.isCommitting,
+  );
+  if (!recording && !finishing) return null;
+  return (
+    <span className="flex items-center gap-1 text-[10px] font-medium text-red-600 dark:text-red-400">
+      <span
+        className={cn(
+          "size-1 rounded-full bg-red-500",
+          !finishing && "animate-pulse motion-reduce:animate-none",
+        )}
+        aria-hidden="true"
+      />
+      {finishing ? "Finishing" : "Recording"}
+    </span>
   );
 }

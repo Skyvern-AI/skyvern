@@ -22,6 +22,17 @@ MAX_ACTION_TIMEOUT_MS = 60000
 # path and buys an accurate reason on the path that needs one.
 ELEMENT_STATE_PROBE_TIMEOUT_MS = 3000
 ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS = 500
+ERROR_MESSAGE_MAX_CHARS = 500
+ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
+
+ACTION_DEADLINE_HINT = (
+    "The browser never answered within the action timeout, so whether the action took effect is "
+    "unknown — read the page before retrying, since a re-run would repeat anything it did"
+)
+ACTION_DEADLINE_READ_HINT = (
+    "The browser never answered within the action timeout; this call only reads the page, so read it "
+    "again once the browser responds"
+)
 
 ACTION_TIMEOUT_DESCRIPTION = (
     "Max time to wait for the element in ms. "
@@ -81,6 +92,48 @@ def resolve_action_timeout_ms(timeout: int | None, *, direct_action: bool) -> in
     if timeout is not None:
         return timeout
     return _direct_action_timeout_default_ms() if direct_action else DEFAULT_ACTION_TIMEOUT_MS
+
+
+def truncate_error_message(message: str) -> str:
+    message = message.strip()
+    if len(message) <= ERROR_MESSAGE_MAX_CHARS:
+        return message
+    return f"{message[:ERROR_MESSAGE_MAX_CHARS]}..."
+
+
+def message_from_error_body(body: Any) -> str | None:
+    if isinstance(body, dict):
+        for key in ERROR_BODY_MESSAGE_KEYS:
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return truncate_error_message(value)
+            if isinstance(value, dict):
+                nested = message_from_error_body(value)
+                if nested:
+                    return nested
+    # Only whitelisted dict keys are surfaced. A raw string body (or any unrecognized shape)
+    # from an SDK ApiError can carry secrets/tokens, so it is never surfaced verbatim.
+    return None
+
+
+def exception_message(exc: Exception) -> str:
+    status_code = getattr(exc, "status_code", None)
+    # 5xx bodies carry the backend's wrapped internal exception text (see
+    # get_user_facing_exception_message's "Unexpected error: {exception}" fallback in
+    # skyvern/exceptions.py) — never surface them. 4xx bodies are the API's intended
+    # client-facing feedback (typed BadRequest/NotFound/UnprocessableEntity errors).
+    surface_body = status_code is None or (isinstance(status_code, int) and 400 <= status_code < 500)
+    body_message = message_from_error_body(getattr(exc, "body", None)) if surface_body else None
+    if body_message:
+        return f"HTTP {status_code}: {body_message}" if status_code is not None else body_message
+    # API-error-shaped exceptions (SDK ApiError) have a leaky __str__ that renders headers
+    # and the raw body; never fall back to str(exc) for them — surface only status + type.
+    if status_code is not None or hasattr(exc, "body"):
+        return f"HTTP {status_code}: {type(exc).__name__}" if status_code is not None else type(exc).__name__
+    message = str(exc).strip()
+    if message:
+        return truncate_error_message(message)
+    return type(exc).__name__
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -173,3 +226,16 @@ def element_state_error(state: ElementState, exc: Exception, *, selector: str, t
 async def make_direct_action_error(page: Any, selector: str, exc: Exception, *, timeout_ms: int) -> dict[str, Any]:
     state = await classify_element_state(page, selector, pointer_intercepted=is_pointer_interception_error(exc))
     return element_state_error(state, exc, selector=selector, timeout_ms=timeout_ms)
+
+
+def action_deadline_error(
+    exc: Exception,
+    *,
+    mutating: bool = True,
+    details: dict[str, Any] | None = None,
+    suffix: str | None = None,
+) -> dict[str, Any]:
+    hint = ACTION_DEADLINE_HINT if mutating else ACTION_DEADLINE_READ_HINT
+    if suffix:
+        hint = f"{hint}. {suffix}"
+    return make_error(ErrorCode.TIMEOUT, exception_message(exc), hint, details=details, exc=exc)

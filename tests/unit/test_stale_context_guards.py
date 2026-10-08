@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,7 +9,153 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import MissingElement, MissingElementDict, MultipleElementsFound
+from skyvern.webeye.scraper import scraper as scraper_module
 from skyvern.webeye.utils.dom import SkyvernElement, is_element_detached_error, resolve_locator
+
+_CONTEXT_DESTROYED_ERROR = "Execution context was destroyed, most likely because of a navigation."
+
+
+class _NeverResolvingHandle:
+    """Frame ElementHandle whose direct handle reads never resolve. Both the selector-based
+    ``get_attribute`` (which the driver re-resolves through a 30s ``:scope`` wait after the parent
+    document navigated) and the handle-bound ``evaluate`` hang forever, so any regression that reads
+    the id straight off the handle instead of through the common ``SkyvernFrame.evaluate`` abstraction
+    trips the bounded wait."""
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def get_attribute(self, name: str) -> str | None:
+        await asyncio.Event().wait()
+        raise AssertionError("get_attribute should never resolve")
+
+    async def evaluate(self, expression: str, arg: object = None) -> object:
+        await asyncio.Event().wait()
+        raise AssertionError("handle.evaluate should never resolve")
+
+
+class _FrameStub:
+    def __init__(self, handle: _NeverResolvingHandle, parent_frame: object, page: object = None) -> None:
+        self._handle = handle
+        self.parent_frame = parent_frame
+        self.page = page
+
+    async def frame_element(self) -> _NeverResolvingHandle:
+        return self._handle
+
+
+class _EvaluateSpy:
+    """Stands in for the common ``SkyvernFrame.evaluate`` abstraction and records how it was called."""
+
+    def __init__(self, *, result: object) -> None:
+        self._result = result
+        self.calls: list[SimpleNamespace] = []
+
+    async def __call__(self, *, frame: object, expression: str, arg: object = None, **kwargs: object) -> object:
+        self.calls.append(SimpleNamespace(frame=frame, expression=expression, arg=arg, kwargs=kwargs))
+        if isinstance(self._result, BaseException):
+            raise self._result
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_add_frame_interactable_elements_reads_id_through_parent_frame_abstraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_id = "AB12"
+    handle = _NeverResolvingHandle()
+    parent = object()
+    frame = _FrameStub(handle, parent_frame=parent)
+    engine_selection = object()
+    spy = _EvaluateSpy(result=frame_id)
+    monkeypatch.setattr(scraper_module.SkyvernFrame, "evaluate", spy)
+    built_child = {"id": frame_id, "attributes": {}}
+    skyvern_frame = MagicMock()
+    skyvern_frame.build_tree_from_body = AsyncMock(return_value=([built_child], [built_child], {}))
+    monkeypatch.setattr(scraper_module.SkyvernFrame, "create_instance", AsyncMock(return_value=skyvern_frame))
+    monkeypatch.setattr(scraper_module, "_wait_for_scrape_ready", AsyncMock())
+
+    elements: list[dict] = [{"id": frame_id}]
+    tree: list[dict] = [{"id": frame_id}]
+    result_elements, result_tree = await asyncio.wait_for(
+        scraper_module.add_frame_interactable_elements(frame, 0, elements, tree, {}, engine_selection=engine_selection),
+        timeout=2,
+    )
+
+    assert built_child in result_elements
+    assert result_tree[0]["children"] == [built_child]
+    assert skyvern_frame.build_tree_from_body.await_args.kwargs["frame_name"] == frame_id
+    assert len(spy.calls) == 1
+    # The iframe's ElementHandle lives in the PARENT frame's execution context, so the id must be
+    # read there with the handle as the argument -- not from the child frame or off the handle.
+    assert spy.calls[0].frame is parent
+    assert spy.calls[0].arg is handle
+    assert spy.calls[0].kwargs.get("engine_selection") is engine_selection
+
+
+@pytest.mark.asyncio
+async def test_add_frame_interactable_elements_reads_orphan_id_via_main_frame_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An orphan iframe (child attach arrives before its parent) briefly has parent_frame=None; its
+    # handle is owned by main_frame, so the read must evaluate there -- not from the child frame.
+    frame_id = "AB12"
+    handle = _NeverResolvingHandle()
+    main_frame = object()
+    frame = _FrameStub(handle, parent_frame=None, page=SimpleNamespace(main_frame=main_frame))
+    spy = _EvaluateSpy(result=frame_id)
+    monkeypatch.setattr(scraper_module.SkyvernFrame, "evaluate", spy)
+    built_child = {"id": frame_id, "attributes": {}}
+    skyvern_frame = MagicMock()
+    skyvern_frame.build_tree_from_body = AsyncMock(return_value=([built_child], [built_child], {}))
+    monkeypatch.setattr(scraper_module.SkyvernFrame, "create_instance", AsyncMock(return_value=skyvern_frame))
+    monkeypatch.setattr(scraper_module, "_wait_for_scrape_ready", AsyncMock())
+
+    elements: list[dict] = [{"id": frame_id}]
+    tree: list[dict] = [{"id": frame_id}]
+    await asyncio.wait_for(
+        scraper_module.add_frame_interactable_elements(frame, 0, elements, tree, {}),
+        timeout=2,
+    )
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0].frame is main_frame
+    assert spy.calls[0].arg is handle
+
+
+@pytest.mark.asyncio
+async def test_add_frame_interactable_elements_skips_when_frame_id_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = _FrameStub(_NeverResolvingHandle(), parent_frame=object())
+    monkeypatch.setattr(scraper_module.SkyvernFrame, "evaluate", _EvaluateSpy(result=None))
+    elements: list[dict] = [{"id": "existing"}]
+    tree: list[dict] = [{"id": "existing"}]
+
+    result = await asyncio.wait_for(
+        scraper_module.add_frame_interactable_elements(frame, 0, elements, tree, {}),
+        timeout=2,
+    )
+
+    assert result == (elements, tree)
+
+
+@pytest.mark.asyncio
+async def test_add_frame_interactable_elements_skips_when_execution_context_destroyed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = _FrameStub(_NeverResolvingHandle(), parent_frame=object())
+    monkeypatch.setattr(
+        scraper_module.SkyvernFrame, "evaluate", _EvaluateSpy(result=PlaywrightError(_CONTEXT_DESTROYED_ERROR))
+    )
+    elements: list[dict] = [{"id": "existing"}]
+    tree: list[dict] = [{"id": "existing"}]
+
+    result = await asyncio.wait_for(
+        scraper_module.add_frame_interactable_elements(frame, 0, elements, tree, {}),
+        timeout=2,
+    )
+
+    assert result == (elements, tree)
+
 
 _DETACHED_ERROR = "ElementHandle.content_frame: Element is not attached to the DOM"
 _FRAME_DETACHED_ERROR = "Locator.count: Frame was detached"

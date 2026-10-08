@@ -21,6 +21,23 @@ vi.mock("@microsoft/fetch-event-source", () => ({
 const { fetchStreamingSse } = await import("./sse");
 
 describe("fetchStreamingSse", () => {
+  it.each([401, 422, 500])(
+    "preserves HTTP %i and its response body",
+    async (status) => {
+      const body = '{"detail":"Request rejected"}';
+      mockFetchEventSource.mockImplementationOnce(async (_url, opts) => {
+        await opts.onopen?.(new Response(body, { status }));
+      });
+      await expect(
+        fetchStreamingSse(
+          "http://localhost/test",
+          { method: "POST" },
+          () => false,
+        ),
+      ).rejects.toMatchObject({ status, body });
+    },
+  );
+
   it("passes openWhenHidden: true to fetchEventSource", async () => {
     await fetchStreamingSse(
       "http://localhost/test",

@@ -13,6 +13,7 @@ from .action_block_parameters_item import ActionBlockParametersItem
 from .ai_fallback_mode import AiFallbackMode
 from .aws_secret_parameter import AwsSecretParameter
 from .branch_condition import BranchCondition
+from .code_block_data_schema import CodeBlockDataSchema
 from .code_block_parameters_item import CodeBlockParametersItem
 from .code_block_step import CodeBlockStep
 from .email_inbox_block_email_client import EmailInboxBlockEmailClient
@@ -111,6 +112,7 @@ class WorkflowDefinitionBlocksItem_Code(UniversalBaseModel):
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
     prompt: typing.Optional[str] = None
     steps: typing.Optional[typing.List[CodeBlockStep]] = None
+    data_schema: typing.Optional[CodeBlockDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -732,15 +734,15 @@ class WorkflowDefinitionBlocksItem_SendEmail(UniversalBaseModel):
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
     smtp_password: AwsSecretParameter
-    custom_smtp_host: typing.Optional[str] = None
-    custom_smtp_port: typing.Optional[int] = None
-    custom_smtp_username: typing.Optional[str] = None
-    custom_smtp_password: typing.Optional[str] = None
     sender: str
     recipients: typing.List[str]
     subject: str
     body: str
     file_attachments: typing.Optional[typing.List[str]] = None
+    custom_smtp_host: typing.Optional[str] = None
+    custom_smtp_port: typing.Optional[int] = None
+    custom_smtp_username: typing.Optional[str] = None
+    custom_smtp_password: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

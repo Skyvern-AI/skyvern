@@ -17,16 +17,18 @@ import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConf
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
 import { buildScheduleParametersPayload } from "@/routes/workflows/components/scheduleParameters";
 import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
+import { getLocalTimezone } from "./cronUtils";
 import {
-  getLocalTimezone,
-  isValidCron,
-  meetsMinCronInterval,
-} from "./cronUtils";
+  buildCadencePayload,
+  isCadenceAccepted,
+  type CadencePayload,
+  type IntervalDraft,
+} from "./scheduleCadence";
 
 type Props = {
   workflowParameters: ReadonlyArray<Parameter>;
   onSubmit: (
-    cronExpression: string,
+    cadence: CadencePayload,
     timezone: string,
     name: string,
     description: string,
@@ -43,6 +45,7 @@ function CreateScheduleDialog({
 }: Readonly<Props>) {
   const [open, setOpen] = useState(false);
   const [cronExpression, setCronExpression] = useState("0 9 * * *");
+  const [interval, setIntervalDraft] = useState<IntervalDraft | null>(null);
   const [timezone, setTimezone] = useState(getLocalTimezone);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -66,11 +69,11 @@ function CreateScheduleDialog({
     }
   }, [open, workflowParameters, resetParameters]);
 
-  const valid = isValidCron(cronExpression);
-  const cronAccepted = valid && meetsMinCronInterval(cronExpression);
+  const cadenceAccepted = isCadenceAccepted(cronExpression, interval, timezone);
 
   function resetFormState() {
     setCronExpression("0 9 * * *");
+    setIntervalDraft(null);
     setTimezone(getLocalTimezone());
     setName("");
     setDescription("");
@@ -79,17 +82,24 @@ function CreateScheduleDialog({
 
   function handleSubmit() {
     const parametersValid = validateParameters();
-    if (!cronAccepted || !parametersValid) return;
+    if (!cadenceAccepted || !parametersValid) return;
     const payload = buildScheduleParametersPayload(
       parameters,
       workflowParameters,
     );
-    onSubmit(cronExpression, timezone, name, description, payload, {
-      onSuccess: () => {
-        setOpen(false);
-        resetFormState();
+    onSubmit(
+      buildCadencePayload(cronExpression, interval, timezone),
+      timezone,
+      name,
+      description,
+      payload,
+      {
+        onSuccess: () => {
+          setOpen(false);
+          resetFormState();
+        },
       },
-    });
+    );
   }
 
   return (
@@ -145,6 +155,8 @@ function CreateScheduleDialog({
             timezone={timezone}
             onCronChange={setCronExpression}
             onTimezoneChange={setTimezone}
+            interval={interval}
+            onIntervalChange={setIntervalDraft}
             disabled={isPending}
           />
         </div>
@@ -153,7 +165,10 @@ function CreateScheduleDialog({
           <Button variant="secondary" onClick={() => setOpen(false)}>
             Cancel
           </Button>
-          <Button disabled={!cronAccepted || isPending} onClick={handleSubmit}>
+          <Button
+            disabled={!cadenceAccepted || isPending}
+            onClick={handleSubmit}
+          >
             {isPending ? "Creating..." : "Create Schedule"}
           </Button>
         </DialogFooter>

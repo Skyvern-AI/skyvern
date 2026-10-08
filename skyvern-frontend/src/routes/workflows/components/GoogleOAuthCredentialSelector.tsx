@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   CustomSelectItem,
   Select,
@@ -16,6 +16,7 @@ import {
   isGoogleOAuthCredentialActive,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
+import { useOAuthCredentialAutoFill } from "@/routes/workflows/editor/hooks/useOAuthCredentialAutoFill";
 import { PlusIcon } from "@radix-ui/react-icons";
 
 type Props = {
@@ -49,10 +50,6 @@ function GoogleOAuthCredentialSelector({
       hasGoogleOAuthCredentialScopes(credential, requiredScopes),
   );
 
-  // Keep latest callback without forcing effect re-runs.
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-
   // If the value looks like a Jinja template, default to advanced mode
   const isTemplateValue = value.includes("{{") || value.includes("{%");
   const useAdvanced = showAdvanced || isTemplateValue;
@@ -71,18 +68,16 @@ function GoogleOAuthCredentialSelector({
   const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
   const needsAutoFill = !optional && !value;
 
-  useEffect(() => {
-    if (
-      isLoading ||
-      isFetching ||
-      !hasCredentials ||
-      !needsAutoFill ||
-      !firstValidId
-    ) {
-      return;
-    }
-    onChangeRef.current(firstValidId);
-  }, [isLoading, isFetching, hasCredentials, needsAutoFill, firstValidId]);
+  useOAuthCredentialAutoFill({
+    nodeId,
+    field: "credentialId:google",
+    value,
+    firstValidId,
+    needsAutoFill,
+    isLoading,
+    isFetching,
+    onChange,
+  });
 
   const handlePickerValueChange = (selected: string) => {
     if (selected === NONE_OPTION) {
@@ -120,6 +115,7 @@ function GoogleOAuthCredentialSelector({
       {useAdvanced ? (
         <>
           <WorkflowBlockInputTextarea
+            name="credentialId:google"
             nodeId={nodeId}
             value={value}
             onChange={onChange}

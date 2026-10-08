@@ -120,8 +120,8 @@ class StateMachineHover(StateMachine):
 
             return None
 
-        xp = (self.mouse.xp or -1) if self.mouse else None
-        yp = (self.mouse.yp or -1) if self.mouse else None
+        xp = self.mouse.xp if self.mouse and self.mouse.xp is not None else None
+        yp = self.mouse.yp if self.mouse and self.mouse.yp is not None else None
 
         LOG.debug("~ emitting hover action", exfiltrated_event=event)
 
@@ -136,6 +136,7 @@ class StateMachineHover(StateMachine):
             role=self.target.role,
             accessible_name=self.target.accessibleName,
             input_type=self.target.inputType,
+            in_child_frame=self.target.inChildFrame,
         )
 
         action = ActionHover(

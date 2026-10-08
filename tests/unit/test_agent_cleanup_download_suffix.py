@@ -15,6 +15,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.api.files import check_downloading_files_and_wait_for_download_to_complete
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from tests.unit._fingerprint_expectations import expected_fingerprint
@@ -1616,6 +1617,106 @@ async def test_execute_step_complete_on_download_closes_claimed_popup_before_han
     close_i = order.index("close")
     update_task_indices = [i for i, entry in enumerate(order) if entry.startswith("update_task:")]
     assert update_task_indices and all(close_i < i for i in update_task_indices)
+
+
+@pytest.mark.asyncio
+async def test_execute_step_no_credit_releases_deferred_dispatched_failure_reservation(tmp_path) -> None:
+    """Point-(a) wiring on the real execute_step path: when the complete_on_download seam finds NO durable
+    credit, a dispatched-then-failed action's deferred reservation is released at the step boundary --
+    before the retry scrape -- restoring generic blank-page recovery. Removing the execute_step apply-call
+    leaves the marker wedged and blocks #17139 recovery."""
+    agent = ForgeAgent()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    task = _make_task(task_id="task-no-credit")
+    task.status = SimpleNamespace(value="running")
+    task.navigation_goal = "Download invoice"
+    task.data_extraction_goal = None
+    task.complete_criterion = None
+    task.terminate_criterion = None
+    task.browser_address = None
+    task.max_steps_per_run = None
+    task.url = "https://example.com"
+    task.proxy_location = None
+    task.llm_key = None
+    task.task_type = "general"
+
+    step = MagicMock()
+    step.step_id = "step-1"
+    step.order = 0
+    step.retry_index = 0
+    step.status = StepStatus.failed
+
+    organization = MagicMock()
+    organization.organization_id = task.organization_id
+    organization.max_steps_per_run = None
+
+    task_block = MagicMock()
+    task_block.complete_on_download = True
+    task_block.download_timeout = None
+    task_block.download_suffix = "req-123"
+
+    marker = _claimed_popup(":")
+    browser_state = MagicMock()
+    browser_state.browser_context = _RUN_CONTEXT
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    ctx = SkyvernContext(task_id=task.task_id)
+    ctx.record_download_popup_claim(task.task_id, marker)
+    # A prior dispatched-then-failed action deferred its release to this step's credit seam.
+    ctx.stash_pending_download_reservation_release(task.task_id, ((), ()))
+
+    async def agent_step_side_effect(*args, **kwargs):
+        # No download file lands: the complete_on_download seam finds no credit.
+        return step, DetailedAgentStepOutput(
+            scraped_page=None,
+            extract_action_prompt=None,
+            llm_response=None,
+            actions=None,
+            action_results=None,
+            actions_and_results=None,
+            cua_response=None,
+        )
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=ctx),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=[]),
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch.object(agent, "initialize_execution_state", AsyncMock(return_value=(step, browser_state, None))),
+        patch.object(agent, "agent_step", AsyncMock(side_effect=agent_step_side_effect)),
+        patch.object(agent, "update_step", AsyncMock(side_effect=lambda s, *a, **k: s)),
+        patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
+        patch.object(agent, "handle_failed_step", AsyncMock(return_value=None)),
+        patch.object(agent, "clean_up_task", AsyncMock()),
+    ):
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+        mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
+        mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+
+        await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            task_block=task_block,
+            close_browser_on_completion=True,
+            complete_verification=True,
+            engine=RunEngine.skyvern_v1,
+        )
+
+    # No credit -> the deferred release fired at the step seam: the marker is freed for blank recovery,
+    # not closed, and the pending release is consumed.
+    assert not ctx.has_download_popup_claim(task.task_id, marker)
+    assert task.task_id not in ctx.pending_download_reservation_release
+    marker.close.assert_not_called()
 
 
 @pytest.mark.asyncio

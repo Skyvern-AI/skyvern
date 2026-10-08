@@ -11,7 +11,9 @@ import {
 import { MemoryRouter } from "react-router-dom";
 
 import { LabelManagement } from "./LabelManagement";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import type { TagValue } from "@/routes/workflows/types/tagTypes";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 
 // Radix Popover/Dialog and cmdk touch DOM APIs jsdom lacks.
 class MockResizeObserver {
@@ -60,20 +62,29 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderSurface() {
+function renderSurface(
+  flags: { tagging: boolean | undefined } = { tagging: true },
+) {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
       mutations: { retry: false },
     },
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
-        <LabelManagement />
-      </MemoryRouter>
+      <FeatureFlagContext.Provider
+        value={(flag) =>
+          flag === WORKFLOW_TAGGING_FLAG ? flags.tagging : undefined
+        }
+      >
+        <MemoryRouter>
+          <LabelManagement />
+        </MemoryRouter>
+      </FeatureFlagContext.Provider>
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
 describe("LabelManagement", () => {
@@ -294,5 +305,27 @@ describe("LabelManagement", () => {
 
     expect(await screen.findByText(/No labels yet/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "New label" })).toBeTruthy();
+  });
+
+  it("keeps loading, with no request or create button, while the tagging flag is pending", () => {
+    const { client } = renderSurface({ tagging: undefined });
+
+    expect(screen.getByRole("status", { name: "Loading labels" })).toBeTruthy();
+    expect(screen.queryByText(/Labels aren't available/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "New label" })).toBeNull();
+    expect(client.isFetching()).toBe(0);
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it("says labels are unavailable, with no request or create button, when tagging is off", () => {
+    const { client } = renderSurface({ tagging: false });
+
+    expect(
+      screen.getByText("Labels aren't available for this organization."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("status", { name: "Loading labels" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New label" })).toBeNull();
+    expect(client.isFetching()).toBe(0);
+    expect(getMock).not.toHaveBeenCalled();
   });
 });

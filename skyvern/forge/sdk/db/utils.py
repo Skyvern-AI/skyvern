@@ -5,8 +5,11 @@ from typing import TYPE_CHECKING, Any
 import pydantic
 import pydantic.json
 import structlog
+from sqlalchemy import Column, ColumnElement, or_
 
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -43,11 +46,14 @@ from skyvern.forge.sdk.schemas.organizations import (
     BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
+    TwilioCredential,
+    TwilioOrganizationAuthToken,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -68,6 +74,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.browser_settings import BrowserSettingsReceipt, BrowserSettingsStatus
 from skyvern.schemas.proxy_pinning import redact_proxy_location
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse, read_browser_type
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
@@ -128,6 +135,13 @@ def escape_like_term(term: str) -> str:
 
 def nullable_column_equals(column: Any, value: Any) -> Any:
     return column.is_(None) if value is None else column == value
+
+
+def browser_settings_receipt_replaceable(column: Column[Any], receipt: BrowserSettingsReceipt) -> ColumnElement[bool]:
+    """A recorded verified, mismatch or unapplied receipt is final; only a measured result may replace unknown."""
+    if receipt.status not in (BrowserSettingsStatus.verified, BrowserSettingsStatus.mismatch):
+        return column.is_(None)
+    return or_(column.is_(None), column["status"].as_string() == BrowserSettingsStatus.unknown.value)
 
 
 def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
@@ -305,6 +319,13 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
+def as_stored_json(value: typing.Any) -> typing.Any:
+    """Return value as a JSON column hands it back after a write: NULs stripped, non-JSON types encoded."""
+    if value is None:
+        return None
+    return _scrub_nul_chars(json.loads(_custom_json_serializer(value)))
+
+
 def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
     """Fail-open size guard for jsonb-column writes (SKY-9779)."""
     # Fast-path: None and scalars can't approach the cap; skip the full re-serialization
@@ -454,8 +475,19 @@ def convert_to_workflow_copilot_chat_message(
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,
+        feedback=_message_feedback_from_row(message_model),
         created_at=message_model.created_at,
         modified_at=message_model.modified_at,
+    )
+
+
+def _message_feedback_from_row(message_model: WorkflowCopilotChatMessageModel) -> WorkflowCopilotMessageFeedback | None:
+    if message_model.feedback_rating not in ("up", "down") or message_model.feedback_at is None:
+        return None
+    return WorkflowCopilotMessageFeedback(
+        rating=message_model.feedback_rating,
+        reason=message_model.feedback_reason,
+        rated_at=message_model.feedback_at,
     )
 
 
@@ -484,6 +516,8 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
 
 
 def convert_to_organization(org_model: OrganizationModel) -> Organization:
+    # Side effect: every org read records created_at in the process-wide cache that gives log lines org_age.
+    remember_organization_created_at(org_model.organization_id, org_model.created_at)
     return Organization(
         organization_id=org_model.organization_id,
         organization_name=org_model.organization_name,
@@ -505,7 +539,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | TwilioOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -524,6 +558,17 @@ async def convert_to_organization_auth_token(
     elif token_type == OrganizationAuthTokenType.bitwarden_credential:
         credential = BitwardenCredential.model_validate_json(token)
         return BitwardenOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.twilio_credential:
+        credential = TwilioCredential.model_validate_json(token)
+        return TwilioOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),
@@ -672,6 +717,8 @@ def convert_to_workflow_run(
         start_fresh_browser=workflow_run_model.start_fresh_browser,
         reuse_browser_session=workflow_run_model.reuse_browser_session,
         reuse_bound_key=workflow_run_model.reuse_bound_key,
+        workflow_definition_sha256=workflow_run_model.workflow_definition_sha256,
+        task_queue=workflow_run_model.task_queue,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
         retried_from_workflow_run_id=workflow_run_model.retried_from_workflow_run_id,
@@ -706,8 +753,11 @@ def convert_to_workflow_run(
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
+        browser_settings=workflow_run_model.browser_settings,
+        browser_settings_receipt=workflow_run_model.browser_settings_receipt,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
         copilot_session_id=workflow_run_model.copilot_session_id,
+        created_by=workflow_run_model.created_by,
         credits_used=workflow_run_model.credits_used or 0,
         cached_credits_used=workflow_run_model.cached_credits_used or 0,
     )
@@ -780,6 +830,7 @@ def convert_to_bitwarden_login_credential_parameter(
         bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
         bitwarden_item_id=bitwarden_login_credential_parameter_model.bitwarden_item_id,
         url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
+        totp_identifier=bitwarden_login_credential_parameter_model.totp_identifier,
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,
         deleted_at=bitwarden_login_credential_parameter_model.deleted_at,
@@ -864,10 +915,14 @@ def convert_to_workflow_run_parameter(
             workflow_parameter_id=workflow_run_parameter_model.workflow_parameter_id,
         )
 
+    value = workflow_run_parameter_model.value
+    # Retention scrubbing overwrites the value with SCRUBBED_VALUE whatever the declared type, so it is not convertible.
+    if value != SCRUBBED_VALUE:
+        value = workflow_parameter.workflow_parameter_type.convert_value(value)
     return WorkflowRunParameter(
         workflow_run_id=workflow_run_parameter_model.workflow_run_id,
         workflow_parameter_id=workflow_run_parameter_model.workflow_parameter_id,
-        value=workflow_parameter.workflow_parameter_type.convert_value(workflow_run_parameter_model.value),
+        value=value,
         created_at=workflow_run_parameter_model.created_at,
     )
 

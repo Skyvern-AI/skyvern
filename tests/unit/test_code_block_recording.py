@@ -98,6 +98,28 @@ def _recording(page: SimpleNamespace) -> CodeBlockActionRecording:
 
 
 @pytest.mark.asyncio
+async def test_drag_to_unwraps_destination_and_records_drag() -> None:
+    source = SimpleNamespace(drag_to=AsyncMock())
+    destination = SimpleNamespace()
+    page = SimpleNamespace(
+        url="https://example.com/",
+        locator=MagicMock(side_effect=[source, destination]),
+        on=MagicMock(),
+    )
+    actions: list[Action] = []
+
+    async def capture(action: Action) -> None:
+        actions.append(action)
+
+    recording_page = RecordingPage(page, on_action=capture)
+
+    await recording_page.locator("#card").drag_to(recording_page.locator("#column"))
+
+    source.drag_to.assert_awaited_once_with(destination)
+    assert [action.action_type for action in actions] == [ActionType.DRAG]
+
+
+@pytest.mark.asyncio
 async def test_capture_uses_the_short_recording_budget_not_the_browser_default() -> None:
     # 20s of a dying page is charged to the block's execution timeout and buys nothing, so this
     # best-effort capture must not inherit BROWSER_SCREENSHOT_TIMEOUT_MS.
@@ -642,3 +664,27 @@ def test_an_in_memory_upload_payload_records_its_filename_as_a_typed_upload_acti
     )
     assert type(action).__name__ == "UploadFileAction"
     assert b"secret bytes" not in repr(action).encode()
+
+
+@pytest.mark.asyncio
+async def test_recorded_action_code_line_survives_masking_and_upsert() -> None:
+    """Falsifier: the generation-side receipt relies on the DURABLE recorded-action rows (no separate
+    success event is emitted). Prove the ``output.code_line`` join coordinate survives the persistence
+    masking round-trip; if this ever fails, the durable rows are not a valid receipt substrate and a
+    dedicated receipt event would be required."""
+    action = Action(
+        action_type=ActionType.CLICK,
+        status=ActionStatus.completed,
+        output={"code_line": 7, "duration_ms": 12},
+    )
+    page = SimpleNamespace(
+        url="https://example.com/", screenshot=AsyncMock(return_value=b"png"), is_closed=lambda: False
+    )
+    recording = _recording(page)
+    upsert = AsyncMock()
+    with patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", upsert):
+        await recording._persist_action(action, recording._remember_action_metadata(action))
+
+    persisted = upsert.await_args.args[0]
+    assert isinstance(persisted.output, dict)
+    assert persisted.output.get("code_line") == 7

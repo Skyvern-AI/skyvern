@@ -25,6 +25,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
+from skyvern.forge.sdk.routes.streaming.run_stream_outcome import RunStreamConnection, RunStreamOutcome
 from skyvern.forge.sdk.routes.streaming.screencast import (
     release_browser_state,
     start_screencast_loop,
@@ -81,35 +82,33 @@ async def task_stream(
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()
 
+    connection = RunStreamConnection(organization_id=organization_id, viewer_reconnects=False, task_id=task_id)
     disconnected = watch_for_client_disconnect(websocket)
     try:
         while True:
             if disconnected.done():
                 LOG.info("Client disconnected. Closing connection", task_id=task_id, organization_id=organization_id)
-                return
-            # if no activity for 5 minutes, close the connection
-            if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
-                LOG.info(
-                    "No activity for 5 minutes. Closing connection", task_id=task_id, organization_id=organization_id
-                )
-                await websocket.send_json(
-                    {
-                        "task_id": task_id,
-                        "status": "timeout",
-                    }
-                )
+                connection.end("viewer_left")
                 return
 
             task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
             if not task:
                 LOG.info("Task not found. Closing connection", task_id=task_id, organization_id=organization_id)
-                await websocket.send_json(
+                connection.end("run_not_found")
+                await _send_to_viewer(
+                    websocket,
                     {
                         "task_id": task_id,
                         "status": "not_found",
-                    }
+                    },
                 )
                 return
+            connection.observe_run(
+                status=task.status,
+                is_final=task.status.is_final(),
+                browser_session_id=task.browser_session_id,
+                workflow_run_id=task.workflow_run_id,
+            )
             if task.status.is_final():
                 LOG.info(
                     "Task is in a final state. Closing connection",
@@ -117,11 +116,27 @@ async def task_stream(
                     task_id=task_id,
                     organization_id=organization_id,
                 )
-                await websocket.send_json(
+                connection.end("run_finished")
+                await _send_to_viewer(
+                    websocket,
                     {
                         "task_id": task_id,
                         "status": task.status,
-                    }
+                    },
+                )
+                return
+            # if no activity for 5 minutes, close the connection
+            if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
+                LOG.info(
+                    "No activity for 5 minutes. Closing connection", task_id=task_id, organization_id=organization_id
+                )
+                connection.end("no_frame_timeout")
+                await _send_to_viewer(
+                    websocket,
+                    {
+                        "task_id": task_id,
+                        "status": "timeout",
+                    },
                 )
                 return
 
@@ -133,24 +148,30 @@ async def task_stream(
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")
-                    await websocket.send_json(
+                    await _send_to_viewer(
+                        websocket,
                         {
                             "task_id": task_id,
                             "status": task.status,
                             "screenshot": encoded_screenshot,
-                        }
+                        },
                     )
+                    connection.frame_sent()
                     last_activity_timestamp = datetime.utcnow()
             await asyncio.sleep(2)
 
     except ValidationError as e:
+        connection.end("run_unreadable")
         await websocket.send_text(f"Invalid data: {e}")
     except WebSocketDisconnect:
+        connection.end("viewer_left")
         LOG.info("WebSocket connection closed", task_id=task_id, organization_id=organization_id)
     except ConnectionClosedOK:
+        connection.end("viewer_left")
         LOG.info("ConnectionClosedOK error while streaming", task_id=task_id, organization_id=organization_id)
         return
     except ConnectionClosedError:
+        connection.end("viewer_left")
         LOG.warning(
             "ConnectionClosedError while streaming (client likely disconnected)",
             task_id=task_id,
@@ -158,10 +179,12 @@ async def task_stream(
         )
         return
     except Exception:
+        connection.end("stream_error")
         LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id, exc_info=True)
         return
     finally:
         disconnected.cancel()
+        await connection.finish()
     LOG.info("WebSocket connection closed successfully", task_id=task_id, organization_id=organization_id)
     return
 
@@ -210,6 +233,9 @@ async def workflow_run_streaming(
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()
 
+    connection = RunStreamConnection(
+        organization_id=organization_id, viewer_reconnects=True, workflow_run_id=workflow_run_id
+    )
     disconnected = watch_for_client_disconnect(websocket)
     try:
         while True:
@@ -219,20 +245,7 @@ async def workflow_run_streaming(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
                 )
-                return
-            # if no activity for 5 minutes, close the connection
-            if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
-                LOG.info(
-                    "WofklowRun Streaming: No activity for 5 minutes. Closing connection",
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                )
-                await websocket.send_json(
-                    {
-                        "workflow_run_id": workflow_run_id,
-                        "status": "timeout",
-                    }
-                )
+                connection.end("viewer_left")
                 return
 
             workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
@@ -245,29 +258,50 @@ async def workflow_run_streaming(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
                 )
-                await websocket.send_json(
+                connection.end("run_not_found")
+                await _send_to_viewer(
+                    websocket,
                     {
                         "workflow_run_id": workflow_run_id,
                         "status": "not_found",
-                    }
+                    },
                 )
                 return
-            if workflow_run.status in [
-                WorkflowRunStatus.completed,
-                WorkflowRunStatus.failed,
-                WorkflowRunStatus.terminated,
-            ]:
+            connection.observe_run(
+                status=workflow_run.status,
+                is_final=workflow_run.status.is_final(),
+                browser_session_id=workflow_run.browser_session_id,
+            )
+            if workflow_run.status.is_final():
                 LOG.info(
                     "Workflow run is in a final state. Closing connection",
                     workflow_run_status=workflow_run.status,
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
                 )
-                await websocket.send_json(
+                connection.end("run_finished")
+                await _send_to_viewer(
+                    websocket,
                     {
                         "workflow_run_id": workflow_run_id,
                         "status": workflow_run.status,
-                    }
+                    },
+                )
+                return
+            # if no activity for 5 minutes, close the connection
+            if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
+                LOG.info(
+                    "WofklowRun Streaming: No activity for 5 minutes. Closing connection",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                connection.end("no_frame_timeout")
+                await _send_to_viewer(
+                    websocket,
+                    {
+                        "workflow_run_id": workflow_run_id,
+                        "status": "timeout",
+                    },
                 )
                 return
 
@@ -277,25 +311,30 @@ async def workflow_run_streaming(
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")
-                    await websocket.send_json(
+                    await _send_to_viewer(
+                        websocket,
                         {
                             "workflow_run_id": workflow_run_id,
                             "status": workflow_run.status,
                             "screenshot": encoded_screenshot,
-                        }
+                        },
                     )
+                    connection.frame_sent()
                     last_activity_timestamp = datetime.utcnow()
             await asyncio.sleep(2)
 
     except ValidationError as e:
+        connection.end("run_unreadable")
         await websocket.send_text(f"Invalid data: {e}")
     except WebSocketDisconnect:
+        connection.end("viewer_left")
         LOG.info(
             "WofklowRun Streaming: WebSocket connection closed",
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
     except ConnectionClosedOK:
+        connection.end("viewer_left")
         LOG.info(
             "WofklowRun Streaming: ConnectionClosedOK error while streaming",
             workflow_run_id=workflow_run_id,
@@ -303,6 +342,7 @@ async def workflow_run_streaming(
         )
         return
     except ConnectionClosedError:
+        connection.end("viewer_left")
         LOG.warning(
             "WofklowRun Streaming: ConnectionClosedError while streaming (client likely disconnected)",
             workflow_run_id=workflow_run_id,
@@ -310,6 +350,7 @@ async def workflow_run_streaming(
         )
         return
     except Exception:
+        connection.end("stream_error")
         LOG.warning(
             "WofklowRun Streaming: Error while streaming",
             workflow_run_id=workflow_run_id,
@@ -319,6 +360,7 @@ async def workflow_run_streaming(
         return
     finally:
         disconnected.cancel()
+        await connection.finish()
     LOG.info(
         "WofklowRun Streaming: WebSocket connection closed successfully",
         workflow_run_id=workflow_run_id,
@@ -373,6 +415,19 @@ async def browser_session_streaming(
     return
 
 
+# uvicorn and Starlette report a send after the viewer closed as a RuntimeError, not a disconnect.
+_SEND_AFTER_CLOSE_MARKERS = ("after sending 'websocket.close'", "once a close message has been sent")
+
+
+async def _send_to_viewer(websocket: WebSocket, payload: dict) -> None:
+    try:
+        await websocket.send_json(payload)
+    except RuntimeError as e:
+        if any(marker in str(e) for marker in _SEND_AFTER_CLOSE_MARKERS):
+            raise WebSocketDisconnect(code=1006) from e
+        raise
+
+
 async def _send_status(websocket: WebSocket, id_key: str, entity_id: str, status: str) -> None:
     await websocket.send_json({id_key: entity_id, "status": status})
 
@@ -389,12 +444,20 @@ async def _run_local_screencast(
     # silently unreachable for whichever caller forgot to pass it.
     organization_id: str,
     get_workflow_run_id: Callable[[], str | None] | None = None,
+    # Only a browser session's stream reports an outcome here, so the endings below are in its terms.
+    live_stream: RunStreamConnection | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
     browser_state = None
+
+    def ended(outcome: RunStreamOutcome) -> None:
+        if live_stream is not None:
+            live_stream.end_first(outcome)
+
     try:
         early_exit_status = await wait_for_running()
         if early_exit_status is not None:
+            ended("session_ended")
             await _send_status(websocket, id_key, entity_id, early_exit_status)
             return
 
@@ -418,6 +481,7 @@ async def _run_local_screencast(
                         current_status == "session_expired" or is_final_status(current_status)
                     ):
                         stream_status = current_status
+            ended("no_frame_timeout" if stream_status == "timeout" else "session_ended")
             await _send_status(websocket, id_key, entity_id, stream_status)
             return
 
@@ -429,20 +493,29 @@ async def _run_local_screencast(
             check_finalized=check_finalized,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
+            on_frame_sent=live_stream.frame_sent if live_stream is not None else None,
         )
 
         final_status = await get_current_status()
+        if final_status is None or final_status == "session_expired" or is_final_status(final_status):
+            ended("session_ended")
         if final_status is not None:
             try:
                 await _send_status(websocket, id_key, entity_id, final_status)
             except Exception:
+                ended("viewer_left")
                 LOG.debug("Could not send final status (WebSocket likely closed)", **{id_key: entity_id})
+        # A status that is not final is the viewer's cue to reconnect.
+        ended("stream_error")
 
     except (WebSocketDisconnect, ConnectionClosedOK):
+        ended("viewer_left")
         LOG.info("WebSocket closed during local screencast", **{id_key: entity_id})
     except ConnectionClosedError:
+        ended("viewer_left")
         LOG.warning("WebSocket connection error during local screencast", **{id_key: entity_id})
     except Exception:
+        ended("stream_error")
         LOG.warning("Error in local screencast", **{id_key: entity_id}, exc_info=True)
     finally:
         await release_browser_state(browser_state, entity_type, entity_id)
@@ -558,11 +631,20 @@ async def _local_screencast_for_browser_session(
     browser_session_id: str,
     organization_id: str,
 ) -> None:
+    # The viewer redials any close that carries no final status (streamLifecycle.shouldReconnectStream).
+    live_stream = RunStreamConnection(
+        organization_id=organization_id,
+        viewer_reconnects=True,
+        transport="cdp_screencast",
+        browser_session_id=browser_session_id,
+    )
+
     async def wait_for_running() -> str | None:
         session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
             session_id=browser_session_id,
             organization_id=organization_id,
         )
+        live_stream.observe_session(session)
         if not session:
             LOG.warning(
                 "Browser session not found for organization",
@@ -579,6 +661,7 @@ async def _local_screencast_for_browser_session(
             session_id=browser_session_id,
             organization_id=organization_id,
         )
+        live_stream.observe_session(s)
         return s is None or is_final_status(s.status)
 
     async def get_current_status() -> str | None:
@@ -586,14 +669,19 @@ async def _local_screencast_for_browser_session(
             session_id=browser_session_id,
             organization_id=organization_id,
         )
+        live_stream.observe_session(s)
         return _browser_session_stream_status(s.status) if s else None
 
-    await _run_local_screencast(
-        websocket=websocket,
-        entity_id=browser_session_id,
-        entity_type="browser_session",
-        wait_for_running=wait_for_running,
-        check_finalized=check_finalized,
-        get_current_status=get_current_status,
-        organization_id=organization_id,
-    )
+    try:
+        await _run_local_screencast(
+            websocket=websocket,
+            entity_id=browser_session_id,
+            entity_type="browser_session",
+            wait_for_running=wait_for_running,
+            check_finalized=check_finalized,
+            get_current_status=get_current_status,
+            organization_id=organization_id,
+            live_stream=live_stream,
+        )
+    finally:
+        await live_stream.finish()

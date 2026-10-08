@@ -96,6 +96,7 @@ function ValidationEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInputTextarea
+          name="completeCriterion"
           aiImprove={AI_IMPROVE_CONFIGS.validation.completeCriterion}
           nodeId={blockId}
           onChange={(next) => update({ completeCriterion: next })}
@@ -108,6 +109,7 @@ function ValidationEditorBody({
           Terminate if...
         </Label>
         <WorkflowBlockInputTextarea
+          name="terminateCriterion"
           aiImprove={AI_IMPROVE_CONFIGS.validation.terminateCriterion}
           nodeId={blockId}
           onChange={(next) => update({ terminateCriterion: next })}
@@ -176,6 +178,7 @@ function ValidationEditorBody({
                 </div>
                 {errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={label}
                     value={errorCodeMapping}
                     onChange={(next) => update({ errorCodeMapping: next })}

@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 
+import { StudioPaneDefaultsProvider } from "../StudioPaneDefaults";
+import { useStudioPanes } from "../useStudioPanes";
+
 import {
   QueryClient,
   QueryClientProvider,
@@ -349,9 +352,11 @@ function seedRunningRun() {
 }
 
 function LocationSpy() {
+  const { panes } = useStudioPanes();
   const location = useLocation();
   return (
     <>
+      <output data-testid="runtime-panes">{panes.join(",")}</output>
       <div data-testid="location-pathname">{location.pathname}</div>
       <div data-testid="location-search">{location.search}</div>
       <div data-testid="location-state">{JSON.stringify(location.state)}</div>
@@ -452,30 +457,32 @@ function renderRunView(
     <QueryClientProvider client={queryClient}>
       <PageSlotsProvider value={pageSlots}>
         <MemoryRouter initialEntries={[initialEntry]}>
-          {/* The toggles live in the pane header (StudioShell); render them
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            {/* The toggles live in the pane header (StudioShell); render them
               alongside the body, under a TooltipProvider, the way the shell
               composes them. Only headerExtras (the toggles) sit under the
               compact context in production (StudioShell.tsx), not the body. */}
-          <TooltipProvider delayDuration={0}>
-            <StudioPaneCompactContext.Provider value={compact}>
-              <RunPaneViewToggles />
-            </StudioPaneCompactContext.Provider>
-            {(typeof initialEntry === "string"
-              ? initialEntry
-              : initialEntry.pathname
-            ).startsWith("/runs/") ? (
-              <Routes>
-                <Route
-                  path="/runs/:runId"
-                  element={<RunView workflowRunId="wr_1" {...props} />}
-                />
-              </Routes>
-            ) : (
-              <RunView workflowRunId="wr_1" {...props} />
-            )}
-          </TooltipProvider>
-          <LocationSpy />
-          {extra}
+            <TooltipProvider delayDuration={0}>
+              <StudioPaneCompactContext.Provider value={compact}>
+                <RunPaneViewToggles />
+              </StudioPaneCompactContext.Provider>
+              {(typeof initialEntry === "string"
+                ? initialEntry
+                : initialEntry.pathname
+              ).startsWith("/runs/") ? (
+                <Routes>
+                  <Route
+                    path="/runs/:runId"
+                    element={<RunView workflowRunId="wr_1" {...props} />}
+                  />
+                </Routes>
+              ) : (
+                <RunView workflowRunId="wr_1" {...props} />
+              )}
+            </TooltipProvider>
+            <LocationSpy />
+            {extra}
+          </StudioPaneDefaultsProvider>
         </MemoryRouter>
       </PageSlotsProvider>
     </QueryClientProvider>
@@ -724,15 +731,21 @@ describe("RunView view toggles", () => {
     });
   });
 
-  test("writes the required Overview pane when selecting a run view", async () => {
+  test("opens Overview without writing panes when selecting a run view", async () => {
     seedCompletedRun();
     renderRunView({}, "/?wr=wr_1");
 
     fireEvent.click(screen.getByRole("button", { name: "Inputs" }));
 
     await waitFor(() => {
+      expect(screen.getByTestId("runtime-panes").textContent).toContain(
+        "overview",
+      );
+      expect(screen.getByTestId("location-search").textContent).not.toContain(
+        "panes=",
+      );
       expect(screen.getByTestId("location-search").textContent).toContain(
-        "panes=overview,browser",
+        "view=inputs",
       );
     });
   });
@@ -1501,7 +1514,7 @@ describe("RunView failure presentation", () => {
     const { getByTestId } = renderRunView();
     const line = within(getByTestId("run-failure-line"));
 
-    const headline = line.getByText("for_loop block failed");
+    const headline = line.getByText("Failed to execute code block");
     expect(headline.getAttribute("title")).toContain(
       "Exception: boom\n  stack trace",
     );
@@ -1681,7 +1694,10 @@ describe("RunView failure presentation", () => {
       "CodeBlock failed because a browser operation failed at line 4.",
       "browser_operation_failed",
     );
-    const { container, getByTestId } = renderRunView({}, "/?wr=wr_1");
+    const { container, getByTestId } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=overview",
+    );
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
 
     fireEvent.click(
@@ -1691,7 +1707,10 @@ describe("RunView failure presentation", () => {
     );
 
     await waitFor(() =>
-      expect(getByTestId("location-search").textContent).toContain("browser"),
+      expect(getByTestId("runtime-panes").textContent).toContain("browser"),
+    );
+    expect(getByTestId("location-search").textContent).toContain(
+      "panes=overview",
     );
     await waitFor(() =>
       expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code"),
@@ -1729,11 +1748,9 @@ describe("RunView failure presentation", () => {
     );
 
     await waitFor(() =>
-      expect(getByTestId("location-search").textContent).toContain(
-        "panes=browser",
-      ),
+      expect(getByTestId("runtime-panes").textContent).toBe("browser"),
     );
-    expect(getByTestId("location-search").textContent).not.toContain(
+    expect(getByTestId("location-search").textContent).toContain(
       "panes=overview",
     );
   });
@@ -1848,7 +1865,7 @@ describe("RunView failure presentation", () => {
     const { getByTestId } = renderRunView();
     const line = within(getByTestId("run-failure-line"));
 
-    expect(line.getByText("task block failed")).not.toBeNull();
+    expect(line.getByText("Login rejected")).not.toBeNull();
     expect(line.queryByText(/code sandbox was unreachable/)).toBeNull();
   });
 
@@ -2002,7 +2019,10 @@ describe("RunView live affordances", () => {
     // Park the Browser pane on a pinned replay view: the Live CTA promises
     // live, so the pinned pill must not swallow the handoff.
     useStudioBrowserStore.setState({ view: "screenshots" });
-    const { container, getByTestId } = renderRunView();
+    const { container, getByTestId } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=overview",
+    );
     const scope = within(container);
 
     fireEvent.click(
@@ -2012,7 +2032,10 @@ describe("RunView live affordances", () => {
     // Unpins to the live edge and pins the Browser pane's view intent to live.
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
     expect(useStudioBrowserStore.getState().view).toBe("live");
-    expect(getByTestId("location-search").textContent).toContain("browser");
+    expect(getByTestId("runtime-panes").textContent).toContain("browser");
+    expect(getByTestId("location-search").textContent).toBe(
+      "?wr=wr_1&panes=overview",
+    );
   });
 
   test("a queued run shows only the queued status pill — no Live chip, no banner", () => {
@@ -2463,7 +2486,7 @@ describe("finished-run landing", () => {
     };
   }
 
-  test("a completed run opens on its outputs and pins the block that finished last", async () => {
+  test("a completed run opens on its timeline and pins the block that finished last", async () => {
     seedCapturedCodeBlockRun(Status.Completed);
     renderRunView({}, "/?wr=wr_1");
 
@@ -2472,33 +2495,11 @@ describe("finished-run landing", () => {
         lastExecuted.workflow_run_block_id,
       );
     });
-    expect(useRunPaneViewStore.getState().view).toBe("outputs");
+    expect(useRunPaneViewStore.getState().view).toBe("timeline");
     expect(useRunViewStore.getState().pinnedFrameId).not.toBe(
       actionBearing.actions[actionBearing.actions.length - 1]!.action_id,
     );
   });
-
-  // A deep link names what to show. Switching the pane off it would restore the
-  // selection and then hide it, so the URL and the pane disagree.
-  test.each([
-    [
-      "?active=",
-      `/?wr=wr_1&active=${capturedRun.blocks[1]!.actions[0]!.action_id}`,
-    ],
-    ["?bl=", "/?wr=wr_1&bl=code_block_2"],
-    ["?view=", "/?wr=wr_1&view=timeline"],
-  ])(
-    "a completed run deep-linked with %s stays on the timeline",
-    async (_label, route) => {
-      seedCapturedCodeBlockRun(Status.Completed);
-      renderRunView({}, route);
-
-      await waitFor(() => {
-        expect(mocks.workflowRun).toBeDefined();
-      });
-      expect(useRunPaneViewStore.getState().view).toBe("timeline");
-    },
-  );
 
   test("a failed run stays on the timeline so its failure stays on screen", async () => {
     seedCapturedCodeBlockRun(Status.Failed);
@@ -2534,5 +2535,96 @@ describe("finished-run landing", () => {
     expect(container.textContent).not.toContain(
       "No output captured for this run",
     );
+  });
+});
+
+describe("RunView human-interaction banner", () => {
+  function seedPausedOnHumanInteraction(
+    humanInteractionStatus: Status = Status.Running,
+  ) {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_nav",
+          workflow_run_id: "wr_1",
+          block_type: "navigation",
+          label: "open_login",
+          status: Status.Completed,
+          created_at: "2026-06-10T00:00:00Z",
+        }),
+      ),
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_hi",
+          workflow_run_id: "wr_1",
+          block_type: "human_interaction",
+          label: "manual_login",
+          status: humanInteractionStatus,
+          instructions: "Sign in to the portal manually.",
+          positive_descriptor: "Login complete",
+          negative_descriptor: "Cancel",
+          created_at: "2026-06-10T00:00:20Z",
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Paused,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  test("a run paused on a human-interaction block shows its actions once, in the pane banner, whichever block is selected", () => {
+    seedPausedOnHumanInteraction();
+    useRunViewStore.getState().pinFrame("wrb_nav");
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    const banner = scope.getByRole("region", { name: "Action needed" });
+    expect(
+      within(banner).getByRole("button", { name: "Login complete" }),
+    ).toBeTruthy();
+    expect(within(banner).getByRole("button", { name: "Cancel" })).toBeTruthy();
+    // The block detail panel no longer carries its own copy.
+    expect(
+      scope.getAllByRole("button", { name: "Login complete" }),
+    ).toHaveLength(1);
+  });
+
+  test("the banner stays up outside the Timeline view", () => {
+    seedPausedOnHumanInteraction();
+    useRunPaneViewStore.getState().setView("inputs");
+    const { container } = renderRunView();
+
+    expect(
+      within(container).getByRole("region", { name: "Action needed" }),
+    ).toBeTruthy();
+  });
+
+  test("a resolved human-interaction block shows no banner while the run is paused elsewhere", () => {
+    seedPausedOnHumanInteraction(Status.Completed);
+    const { container } = renderRunView();
+
+    expect(
+      within(container).queryByRole("region", { name: "Action needed" }),
+    ).toBeNull();
+  });
+
+  test("a running run shows no banner", () => {
+    seedPausedOnHumanInteraction();
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    const { container } = renderRunView();
+
+    expect(
+      within(container).queryByRole("region", { name: "Action needed" }),
+    ).toBeNull();
   });
 });

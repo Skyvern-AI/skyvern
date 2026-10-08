@@ -78,7 +78,7 @@ async def invoke(arguments: str, ctx: CopilotContext) -> Any:
 @pytest.mark.parametrize("metadata", ["<metadata truncated: 11234 chars>", "<metadata truncated: 11615 chars>"])
 async def test_rejected_arguments_and_corrected_retry(handler_boundary: SimpleNamespace, metadata: str) -> None:
     ctx = make_copilot_ctx()
-    arguments = {"workflow_yaml": "title: Example", "block_labels": ["example"], "code_artifact_metadata": metadata}
+    arguments = {"workflow": {"title": "Example"}, "block_labels": ["example"], "code_artifact_metadata": metadata}
     output = await invoke(json.dumps(arguments), ctx)
     parsed = parse_tool_output(output)
     assert parsed["ok"] is False
@@ -115,7 +115,7 @@ async def test_rejected_arguments_and_corrected_retry(handler_boundary: SimpleNa
 async def test_handler_results_are_preserved(handler_boundary: SimpleNamespace, output: str) -> None:
     handler_boundary.execute.return_value = output
     ctx = make_copilot_ctx()
-    arguments = json.dumps({"workflow_yaml": "title: Example", "block_labels": ["example"]})
+    arguments = json.dumps({"workflow": {"title": "Example"}, "block_labels": ["example"]})
     actual = await invoke(arguments, ctx)
     assert actual == output
     handler_boundary.entered.assert_awaited_once()
@@ -125,7 +125,7 @@ async def test_handler_results_are_preserved(handler_boundary: SimpleNamespace, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arguments", ['{"workflow_yaml": "unregistered-sensitive-value",', '{"block_labels": []}'])
+@pytest.mark.parametrize("arguments", ['{"workflow": "unregistered-sensitive-value",', '{"block_labels": []}'])
 async def test_malformed_or_missing_arguments_do_not_echo_input(
     handler_boundary: SimpleNamespace, arguments: str
 ) -> None:
@@ -141,7 +141,7 @@ async def test_exception_details_scrub_registered_secrets(handler_boundary: Simp
     secret = "private-runtime-value"
     register_secret_scrub_value(ctx, secret)
     handler_boundary.execute.side_effect = RuntimeError(f"Execution rejected {secret}")
-    arguments = json.dumps({"workflow_yaml": "title: Example", "block_labels": ["example"]})
+    arguments = json.dumps({"workflow": {"title": "Example"}, "block_labels": ["example"]})
     output = await invoke(arguments, ctx)
     assert parse_tool_output(output)["ok"] is False
     assert secret not in output

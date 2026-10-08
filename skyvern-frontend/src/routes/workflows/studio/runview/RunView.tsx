@@ -67,6 +67,7 @@ import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithW
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
+import { WorkflowRunHumanInteraction } from "../../workflowRun/WorkflowRunHumanInteraction";
 import { ScriptUpdateCard } from "../../workflowRun/ScriptUpdateCard";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
@@ -77,6 +78,7 @@ import {
   collectTimelineSearchTargets,
   filterTimelineToAttempt,
   findActiveItem,
+  findAwaitingHumanInteractionBlock,
   flattenTimelineChronologically,
   parseActiveIterationParam,
   type TimelineSearchTarget,
@@ -107,6 +109,7 @@ import {
 } from "./RunOutputsSection";
 import { failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
@@ -297,7 +300,12 @@ export function RunView({
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const resetRunView = useRunViewStore((s) => s.reset);
-  const { panes: studioPanes, openPane, setOpenPanes } = useStudioPanes();
+  const {
+    panes: studioPanes,
+    openPane,
+    setOpenPanes,
+    preserveNextEntry,
+  } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("overview");
   const navigate = useNavigate();
   const location = useLocation();
@@ -516,8 +524,16 @@ export function RunView({
     } else {
       next.delete("iteration");
     }
-    navigate({ search: toReadableSearch(next) }, { replace: true });
-  }, [activeIteration, pinnedFrameId, workflowRunId, navigate]);
+    const search = toReadableSearch(next);
+    preserveNextEntry(search);
+    navigate({ search }, { replace: true });
+  }, [
+    activeIteration,
+    pinnedFrameId,
+    workflowRunId,
+    navigate,
+    preserveNextEntry,
+  ]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
   // the Overview pane being open: RunView stays mounted while its pane is closed.
@@ -547,11 +563,10 @@ export function RunView({
     if (new URLSearchParams(live).get("wr")) {
       return;
     }
-    navigate(
-      { search: searchWithRunReference(live, workflowRunId) },
-      { replace: true },
-    );
-  }, [runPaneOpen, workflowRunId, pathRunId, navigate]);
+    const search = searchWithRunReference(live, workflowRunId);
+    preserveNextEntry(search);
+    navigate({ search }, { replace: true });
+  }, [runPaneOpen, workflowRunId, pathRunId, navigate, preserveNextEntry]);
 
   const frames = useMemo(
     () => buildFilmstrip(currentTimeline),
@@ -679,50 +694,6 @@ export function RunView({
     pathRunId,
     runIsPlaceholder,
     timelineIsPlaceholder,
-  ]);
-
-  // A run that had already succeeded when it was opened lands on its Outputs;
-  // a failed one keeps the timeline, where its failure section and Fix/Retry live.
-  // Explicit choices win here for the same reason they do for the pin above:
-  // a deep link names what to show, and switching the pane hides it.
-  const outputsLandingDecidedForRunRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (
-      !workflowRunId ||
-      outputsLandingDecidedForRunRef.current === workflowRunId ||
-      !workflowRun ||
-      runIsPlaceholder ||
-      timelineIsPlaceholder
-    ) {
-      return;
-    }
-    outputsLandingDecidedForRunRef.current = workflowRunId;
-    if (!finalized || outcome !== "success") {
-      return;
-    }
-    const landingSearchParams = new URLSearchParams(
-      window.location.search || searchParamsRef.current.toString(),
-    );
-    if (
-      landingSearchParams.has("view") ||
-      hasExplicitSelection(landingSearchParams)
-    ) {
-      return;
-    }
-    if (
-      runHasOutputs(workflowRun) &&
-      useRunPaneViewStore.getState().view === "timeline"
-    ) {
-      setPaneView("outputs");
-    }
-  }, [
-    workflowRunId,
-    workflowRun,
-    finalized,
-    outcome,
-    runIsPlaceholder,
-    timelineIsPlaceholder,
-    setPaneView,
   ]);
 
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
@@ -975,12 +946,20 @@ export function RunView({
   const jumpToFailedBlock = failedBlock
     ? () => selectTimelineBlock(failedBlock)
     : undefined;
+  const awaitingHumanInteraction = currentTimeline
+    ? findAwaitingHumanInteractionBlock(currentTimeline)
+    : null;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col gap-2 overflow-hidden p-2">
       <WorkflowRunVerificationCodeForm
         workflowRunId={workflowRun.workflow_run_id}
       />
+      {awaitingHumanInteraction ? (
+        <WorkflowRunHumanInteraction
+          workflowRunBlock={awaitingHumanInteraction}
+        />
+      ) : null}
       {embedded ? null : (
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1">
           <RunTagsEditor workflowRunId={workflowRun.workflow_run_id} />
@@ -1033,6 +1012,16 @@ export function RunView({
               />
             }
           />
+          {!statusUnavailable &&
+          !runIsPlaceholder &&
+          !canceled &&
+          runIsLogicallyFinal(workflowRun) ? (
+            <RunFeedback
+              targetType="workflow_run"
+              targetId={workflowRun.workflow_run_id}
+              variant={failed ? "report" : "thumbs"}
+            />
+          ) : null}
           {failed || runIsRetryWaiting(workflowRun) ? (
             <RunFailureLine
               workflowRun={workflowRun}

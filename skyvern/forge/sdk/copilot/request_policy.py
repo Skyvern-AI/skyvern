@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
+    parse_workflow_yaml,
     workflow_credential_ids,
     workflow_credential_origins,
 )
@@ -61,11 +62,13 @@ from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
+    CopilotSteerMessage,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -494,9 +497,6 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
-# Matches any final reply containing these substrings, not just credential-blocking
-# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
-_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 RAW_SECRET_QUESTION = (
@@ -887,7 +887,13 @@ class QuestionResponseSiteURLSource:
     kind: Literal["question_response"] = field(default="question_response", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+@dataclass(frozen=True)
+class SteerMessageSiteURLSource:
+    steer_id: str
+    kind: Literal["steer_message"] = field(default="steer_message", init=False)
+
+
+SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource | SteerMessageSiteURLSource
 
 
 @dataclass(frozen=True)
@@ -952,6 +958,9 @@ class RequestPolicy:
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # A credential the user named before a refused cross-site fill connected a provider login in its place.
+    # Kept apart so the fill seam's which-credential check still sees only the provider login as named.
+    origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
     # Explicit user approvals hydrated from the existing trusted structured chat context.
     prior_approved_credential_ids: set[str] = field(default_factory=set)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
@@ -961,10 +970,17 @@ class RequestPolicy:
     # The ordinary user message or accepted interactive response each URL came from, so a release
     # records truthful provenance without retaining or logging the response text.
     user_site_url_sources: dict[str, SiteURLSource] = field(default_factory=dict)
+    # Spreadsheet ids from every URL the user wrote, not one per origin: two sheets share an origin.
+    user_provided_spreadsheet_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
+    persisted_workflow_browser_profile_id: str | None = None
+    # The profile saved from the user's own sign-in on this turn's credential card, and its site. It may
+    # seed this turn's test runs before Accept saves it as the workflow's pick.
+    credential_pause_signed_in_profile_id: str | None = None
+    credential_pause_signed_in_site: str | None = None
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
@@ -989,6 +1005,18 @@ class RequestPolicy:
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
+
+    def project_steer_message(self, steer: CopilotSteerMessage) -> None:
+        # A delivered steer is more of the current user turn, so exact credential citations read it too.
+        self.canonical_user_message = f"{self.canonical_user_message}\n{steer.text}".strip()
+        if steer.raw_secret_detected:
+            self.apply_raw_secret_redacted_draft()
+            return
+        _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
+
+    @property
+    def raw_secret_redacted_draft(self) -> bool:
+        return self.raw_secret_detected and self.raw_secret_handling == "redacted_draft"
 
     def apply_raw_secret_redacted_draft(self) -> None:
         self.raw_secret_detected = True
@@ -1181,18 +1209,15 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
     )
 
 
-def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
-    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
-    # allow_missing_credentials_in_draft alone also covers the generic skip_test
-    # fallthrough with no credential involvement — then a text marker.
-    if isinstance(policy, RequestPolicy):
-        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
-            return policy.clarification_reason
-        if policy.credential_draft_deferred_explicitly:
-            return "credential_deferred_draft"
-    normalized = " ".join((final_text or "").lower().split())
-    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
-        return "assistant_directed"
+def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
+    # The explicit-defer flag, not allow_missing_credentials_in_draft, because the latter
+    # also covers the generic skip_test fallthrough with no credential involvement.
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+        return policy.clarification_reason
+    if policy.credential_draft_deferred_explicitly:
+        return "credential_deferred_draft"
     return None
 
 
@@ -4160,12 +4185,32 @@ def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> l
     return [_SiteURLText(text=text, source=source) for text in texts]
 
 
+def _steer_message_url_texts(steer: CopilotSteerMessage) -> list[_SiteURLText]:
+    if steer.raw_secret_detected or steer.delivered_at is None:
+        return []
+    return [_SiteURLText(text=steer.text, source=SteerMessageSiteURLSource(steer_id=steer.steer_id))]
+
+
+def _persisted_steer_message_url_texts(raw_steer: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        return _steer_message_url_texts(CopilotSteerMessage.model_validate(raw_steer))
+    except ValidationError:
+        return []
+
+
 def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
     try:
         interaction = QuestionInteraction.model_validate(raw_interaction)
     except ValidationError:
         return []
     return _accepted_question_response_url_texts(interaction)
+
+
+def _spreadsheet_id_in_url(url: str) -> str | None:
+    try:
+        return extract_spreadsheet_id(url)
+    except ValueError:
+        return None
 
 
 def _project_user_provided_sites(
@@ -4178,12 +4223,18 @@ def _project_user_provided_sites(
     if reset:
         policy.user_provided_site_urls = []
         policy.user_site_url_sources = {}
+        policy.user_provided_spreadsheet_ids = []
     seen_origins = {parts[2] for url in policy.user_provided_site_urls if (parts := _url_parts(url)) is not None}
     for item in url_texts:
         for candidate in URL_CANDIDATE_RE.findall(item.text):
             cleaned = candidate.rstrip(".,;:!?")
             parts = _url_parts(cleaned)
-            if parts is None or parts[2] in seen_origins:
+            if parts is None:
+                continue
+            spreadsheet_id = _spreadsheet_id_in_url(cleaned)
+            if spreadsheet_id is not None and spreadsheet_id not in policy.user_provided_spreadsheet_ids:
+                policy.user_provided_spreadsheet_ids.append(spreadsheet_id)
+            if parts[2] in seen_origins:
                 continue
             seen_origins.add(parts[2])
             policy.user_provided_site_urls.append(cleaned)
@@ -4202,10 +4253,10 @@ def _ground_user_provided_sites(
     user_message: str,
     full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
 ) -> None:
-    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+    """Rebuild the URL facts the person supplied in USER rows, accepted question responses and delivered steers.
 
     Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
-    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    in the three structured user-authored text surfaces; prompts, choices, rendered history, and
     PRODUCT or AI prose never become credential-origin authority.
     """
     url_texts: list[_SiteURLText] = []
@@ -4223,6 +4274,8 @@ def _ground_user_provided_sites(
             continue
         for raw_interaction in message.narrative_payload.get("questionInteractions", []):
             url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+        for raw_steer in message.narrative_payload.get("steerMessages", []):
+            url_texts.extend(_persisted_steer_message_url_texts(raw_steer))
     if user_message:
         url_texts.append(
             _SiteURLText(
@@ -4677,6 +4730,13 @@ async def _build_request_policy_bootstrap(
         canonical_user_message=(redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message),
     )
     policy.persisted_workflow_credential_ids = sorted(workflow_credential_ids(persisted_workflow_yaml or ""))
+    persisted_workflow = parse_workflow_yaml(persisted_workflow_yaml) if persisted_workflow_yaml else None
+    persisted_browser_profile_id = (
+        persisted_workflow.get("browser_profile_id") if isinstance(persisted_workflow, dict) else None
+    )
+    policy.persisted_workflow_browser_profile_id = (
+        persisted_browser_profile_id if isinstance(persisted_browser_profile_id, str) else None
+    )
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
@@ -4744,7 +4804,7 @@ async def _build_request_policy_bootstrap(
     # the safety-approved redacted draft update-only and prevents a browser run.
     if policy.raw_secret_detected:
         policy.allow_run_blocks = False
-        redacted_draft_candidate = policy.raw_secret_handling == "redacted_draft"
+        redacted_draft_candidate = policy.raw_secret_redacted_draft
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
 

@@ -228,27 +228,30 @@ describe("PasswordCredentialContent — built-in two-factor methods", () => {
     installEmailCredentialHooks();
   });
 
-  it("exposes every method as a focusable pressed button and updates selection", () => {
+  it("keeps 2FA optional and allows the selected method to be deselected", () => {
+    const onChange = vi.fn();
     render(
       <MemoryRouter>
-        <PasswordCredentialContent values={INITIAL_VALUES} onChange={vi.fn()} />
+        <PasswordCredentialContent
+          values={INITIAL_VALUES}
+          onChange={onChange}
+        />
       </MemoryRouter>,
     );
 
     fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    expect(onChange).not.toHaveBeenCalled();
 
     const methodNames = ["Authenticator App", "Email", "Text Message"];
     const methodButtons = methodNames.map((name) =>
       screen.getByRole("button", { name }),
     );
 
-    for (const [index, button] of methodButtons.entries()) {
+    for (const button of methodButtons) {
       expect(button).toBeInstanceOf(HTMLButtonElement);
       expect((button as HTMLButtonElement).type).toBe("button");
       expect(button.tabIndex).toBe(0);
-      expect(button.getAttribute("aria-pressed")).toBe(
-        index === 0 ? "true" : "false",
-      );
+      expect(button.getAttribute("aria-pressed")).toBe("false");
     }
 
     const emailButton = methodButtons[1]!;
@@ -258,6 +261,22 @@ describe("PasswordCredentialContent — built-in two-factor methods", () => {
 
     expect(emailButton.getAttribute("aria-pressed")).toBe("true");
     expect(methodButtons[0]?.getAttribute("aria-pressed")).toBe("false");
+
+    onChange.mockClear();
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Email" }));
+
+    expect(
+      screen
+        .getByRole("button", { name: "Email" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(onChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ totp_type: "none" }),
+    );
   });
 });
 
@@ -456,37 +475,75 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     expect(onEnableEditValues).toHaveBeenCalledOnce();
   });
 
-  it("marks Authenticator App as the selected 2FA method when a new credential opens the 2FA section", async () => {
+  it("lets users enter an unset authenticator key without clicking the edit button", async () => {
     const onChangeSpy = vi.fn();
+    const onEnableEditValues = vi.fn();
 
     render(
       <MemoryRouter>
         <PasswordCredentialContent
           values={{
-            name: "New cred",
-            username: "new-user@example.com",
-            password: "password",
+            name: "Example Login",
+            username: "user@example.com",
+            password: "",
             totp: "",
             totp_type: "none",
             totp_identifier: "",
           }}
           onChange={onChangeSpy}
+          editMode
+          editingGroups={{ name: false, values: false }}
+          onEnableEditValues={onEnableEditValues}
         />
       </MemoryRouter>,
     );
 
-    await act(async () => {
-      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
+
+    const authenticatorKeyInput = screen.getByPlaceholderText(
+      "e.g. JBSWY3DPEHPK3PXP",
+    );
+    expect(screen.getByRole("button", { name: "Scan QR" })).toBeTruthy();
+
+    fireEvent.change(authenticatorKeyInput, {
+      target: { value: "JBSWY3DPEHPK3PXP" },
     });
 
-    const authenticatorCall = onChangeSpy.mock.calls.find((call) => {
-      const next = call[0] as Values;
-      return next.totp_type === "authenticator";
-    });
-    expect(authenticatorCall).toBeTruthy();
+    expect(onEnableEditValues).toHaveBeenCalled();
+    expect(onChangeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        totp: "JBSWY3DPEHPK3PXP",
+        totp_type: "authenticator",
+      }),
+    );
   });
 
-  it("keeps Authenticator App selected when the user types a key without clicking the method tile", async () => {
+  it("keeps a configured authenticator key masked while credential values are locked", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "Example Login",
+            username: "user@example.com",
+            password: "",
+            totp: "",
+            totp_type: "authenticator",
+            totp_identifier: "",
+          }}
+          onChange={vi.fn()}
+          editMode
+          editingGroups={{ name: false, values: false }}
+          onEnableEditValues={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getAllByDisplayValue("••••••••")).toHaveLength(2);
+    expect(screen.queryByPlaceholderText("e.g. JBSWY3DPEHPK3PXP")).toBeNull();
+  });
+
+  it("does not select a 2FA method when a new credential opens the section", async () => {
     const onChangeSpy = vi.fn();
 
     render(
@@ -508,6 +565,38 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     await act(async () => {
       fireEvent.click(screen.getByText("Two-Factor Authentication"));
     });
+
+    expect(onChangeSpy).not.toHaveBeenCalled();
+    expect(
+      screen
+        .getByRole("button", { name: "Authenticator App" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+  });
+
+  it("keeps Authenticator App selected when the user types a key", async () => {
+    const onChangeSpy = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "New cred",
+            username: "new-user@example.com",
+            password: "password",
+            totp: "",
+            totp_type: "none",
+            totp_identifier: "",
+          }}
+          onChange={onChangeSpy}
+        />
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     fireEvent.change(screen.getByPlaceholderText("e.g. JBSWY3DPEHPK3PXP"), {
       target: { value: "JBSWY3DPEHPK3PXP" },
     });
@@ -554,6 +643,7 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     await act(async () => {
       fireEvent.click(screen.getByText("Two-Factor Authentication"));
     });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     fireEvent.change(screen.getByLabelText("Upload QR code image"), {
       target: {
         files: [new File(["qr"], "totp.png", { type: "image/png" })],
@@ -613,6 +703,7 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     await act(async () => {
       fireEvent.click(screen.getByText("Two-Factor Authentication"));
     });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     fireEvent.change(screen.getByLabelText("Upload QR code image"), {
       target: {
         files: [new File(["qr"], "totp.png", { type: "image/png" })],
@@ -661,6 +752,7 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     await act(async () => {
       fireEvent.click(screen.getByText("Two-Factor Authentication"));
     });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     fireEvent.change(screen.getByLabelText("Upload QR code image"), {
       target: {
         files: [new File(["qr"], "totp.png", { type: "image/png" })],
@@ -708,6 +800,7 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
     await act(async () => {
       fireEvent.click(screen.getByText("Two-Factor Authentication"));
     });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     fireEvent.change(screen.getByLabelText("Upload QR code image"), {
       target: {
         files: [new File(["qr"], "totp.png", { type: "image/png" })],
@@ -935,6 +1028,7 @@ describe("PasswordCredentialContent — supported authenticator copy", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Two-Factor Authentication"));
     });
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     return onChangeSpy;
   }
 

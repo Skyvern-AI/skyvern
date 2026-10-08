@@ -55,6 +55,13 @@ class PasswordCredentialResponse(BaseModel):
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
     )
+    has_totp: bool = Field(
+        default=False,
+        description=(
+            "Whether the stored password credential includes a non-empty TOTP seed. "
+            "Legacy rows with an unknown value report false until the credential is updated."
+        ),
+    )
 
 
 class CredentialTotpCodeResponse(BaseModel):
@@ -324,6 +331,7 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Opaque Skyvern-managed proxy sticky-session id.",
     )
+    created_by: str | None = Field(default=None, description="ID of the user who created the credential")
 
     @field_validator("proxy_session_id")
     @classmethod
@@ -394,6 +402,10 @@ class Credential(BaseModel):
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
     )
+    has_totp_seed: bool | None = Field(
+        default=None,
+        description="Whether the stored vault credential contains a non-empty TOTP seed",
+    )
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
@@ -429,6 +441,7 @@ class Credential(BaseModel):
         description="Opaque Skyvern-managed proxy sticky-session id.",
     )
 
+    created_by: str | None = Field(default=None, description="ID of the user who created the credential")
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
     deleted_at: datetime | None = Field(None, description="Timestamp when the credential was deleted, if applicable")
@@ -563,7 +576,7 @@ class TestCredentialRequest(BaseModel):
     def validate_url(self) -> Self:
         result = validate_url(self.url)
         if result is None:
-            raise SkyvernHTTPException(message=f"Invalid URL: {self.url}", status_code=status.HTTP_400_BAD_REQUEST)
+            raise SkyvernHTTPException(message="Invalid url: missing host.", status_code=status.HTTP_400_BAD_REQUEST)
         self.url = result
         return self
 
@@ -632,7 +645,7 @@ class TestLoginRequest(BaseModel):
     def validate_url(self) -> Self:
         result = validate_url(self.url)
         if result is None:
-            raise SkyvernHTTPException(message=f"Invalid URL: {self.url}", status_code=status.HTTP_400_BAD_REQUEST)
+            raise SkyvernHTTPException(message="Invalid url: missing host.", status_code=status.HTTP_400_BAD_REQUEST)
         self.url = result
         return self
 

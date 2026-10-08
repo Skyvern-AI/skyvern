@@ -204,6 +204,27 @@ class RecordingInterpretationSessionRegistry:
         self._finalized_last_seen[interpretation_session_id] = time.monotonic()
         return list(finalized.actions)
 
+    def get_live_session(
+        self,
+        *,
+        browser_session_id: str,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> RecordingInterpretationSession | None:
+        self._prune_expired_sessions()
+        session = self._sessions.get(browser_session_id)
+        if session is None:
+            return None
+        if session.organization_id != organization_id or session.workflow_permanent_id != workflow_permanent_id:
+            LOG.warning(
+                "Rejected live recording session with mismatched ownership",
+                browser_session_id=browser_session_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+        return session
+
     def discard_finalized_actions(self, interpretation_session_id: str | None) -> None:
         if interpretation_session_id is None:
             return

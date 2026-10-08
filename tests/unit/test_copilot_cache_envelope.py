@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -12,10 +14,13 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
     build_explicit_cache_envelope,
+    item_parts_key,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
 _CODE_ONLY_HEADER = "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE"
 
@@ -49,6 +54,7 @@ def _cache_body(
         model_settings=ModelSettings(),
         tools=tools or [_first_tool],
         handoffs=[],
+        reasoning_effort="medium",
     )
     assert result is not None
     return result
@@ -89,22 +95,39 @@ def test_responses_envelope_marks_only_the_stable_system_prefix() -> None:
     assert result.prompt_cache_key.startswith("copilot:")
 
 
-def test_explicit_cache_opts_out_when_litellm_fallbacks_are_configured() -> None:
+_ASSISTANT_TEXT_THEN_CALL: list[Any] = [
+    {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "x", "annotations": []}]},
+    {"type": "function_call", "call_id": "call_1", "name": "_first_tool", "arguments": "{}"},
+    {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "done"}]},
+]
+
+
+@pytest.mark.parametrize(("anchor", "keyed_roles"), [(0, ["system", "user"]), (1, ["system"]), (3, ["system", None])])
+def test_rolling_breakpoint_lands_only_on_an_anchor_whose_items_prefix_the_request(
+    anchor: int, keyed_roles: list[str | None]
+) -> None:
     result = build_explicit_cache_envelope(
         model="gpt-5.6-sol",
         base_url=None,
-        system_instructions=CacheableSystemInstructions(
-            "stable",
-            "dynamic",
-            cache_namespace="wcc_one",
-        ),
-        input=[{"role": "user", "content": "hello"}],
-        model_settings=ModelSettings(extra_args={"fallbacks": ["gpt-5.6-sol"]}),
+        system_instructions=CacheableSystemInstructions("stable", "dynamic", cache_namespace="wcc_one"),
+        input=_ASSISTANT_TEXT_THEN_CALL,
+        model_settings=ModelSettings(),
         tools=[_first_tool],
         handoffs=[],
+        reasoning_effort="medium",
+        anchors=[anchor],
     )
 
-    assert result is None
+    assert result is not None
+    keyed = [
+        item.get("role")
+        for item in result.responses_input
+        for part in item.get(item_parts_key(item)) or []
+        if isinstance(part, dict) and "prompt_cache_breakpoint" in part
+    ]
+    assert keyed == keyed_roles
+    assert result.breakpoint_count == len(keyed_roles)
 
 
 def test_system_prompt_text_is_identical_to_direct_template_render(
@@ -245,7 +268,7 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     assert str(prompt) == prompt.stable_prefix + prompt.dynamic_suffix
 
 
-def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None:
+def test_no_authoring_policy_section_reaches_either_prompt_half() -> None:
     config = agent_module.CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
 
     base_prompt = agent_module._build_system_prompt(tool_usage_guide="tools", config=config)
@@ -268,4 +291,18 @@ def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None
     assert _CODE_ONLY_HEADER not in str(base_prompt)
     assert isinstance(prompt, CacheableSystemInstructions)
     assert _CODE_ONLY_HEADER not in prompt.stable_prefix
-    assert _CODE_ONLY_HEADER in prompt.dynamic_suffix
+    assert _CODE_ONLY_HEADER not in prompt.dynamic_suffix
+
+
+@pytest.mark.parametrize("duplicate", [copy.copy, copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value))])
+def test_cacheable_system_instructions_survive_the_copy_litellm_makes(duplicate: Any) -> None:
+    original = CacheableSystemInstructions("stable ", "dynamic", cache_namespace="ns")
+
+    duplicated = duplicate(original)
+
+    assert duplicated == original
+    assert (duplicated.stable_prefix, duplicated.dynamic_suffix, duplicated.cache_namespace) == (
+        "stable ",
+        "dynamic",
+        "ns",
+    )

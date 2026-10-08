@@ -306,14 +306,15 @@ class TestGetElementVisible:
 async def test_large_helper_expression_is_bounded_in_timeout_logs(failures, monkeypatch):
     from skyvern.webeye.utils import page as page_utils
 
-    warning = MagicMock()
-    monkeypatch.setattr(page_utils.LOG, "warning", warning)
+    log = MagicMock()
+    # Patching the lazy structlog proxy's method would freeze LOG for later capture_logs tests.
+    monkeypatch.setattr(page_utils, "LOG", log)
     frame = AsyncMock()
     frame.evaluate.side_effect = failures
     expression = "x" * 135000
     with pytest.raises(SkyvernPageAnalysisTimeout):
         await SkyvernFrame.evaluate(frame=frame, expression=expression)
-    logged = [call.kwargs["expression"] for call in warning.call_args_list if "expression" in call.kwargs]
+    logged = [call.kwargs["expression"] for call in log.warning.call_args_list if "expression" in call.kwargs]
     assert logged
     assert all(value == expression[:200] for value in logged)
 

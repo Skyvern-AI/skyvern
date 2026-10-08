@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +22,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotEntry,
     ScreenshotProvenance,
     enqueue_screenshot,
-    stage_screenshot_from_artifact,
 )
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -131,14 +132,23 @@ class TestEnqueueScreenshot:
         assert entry.provenance == provenance
 
     def test_older_capture_cannot_replace_newer_pending_frame(self) -> None:
-        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[])
+        ctx = SimpleNamespace(
+            supports_vision=True,
+            pending_screenshots=[],
+            pending_chat_screenshots=[],
+            chat_screenshot_capture_ids=set(),
+        )
         provenance = ScreenshotProvenance.unknown(source_tool="inspect_page_for_composition")
+        older = io.BytesIO()
+        Image.new("RGB", (30, 20), (10, 120, 200)).save(older, format="PNG")
+        older_b64 = base64.b64encode(older.getvalue()).decode()
 
         assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=20.0) is True
         newest = ctx.pending_screenshots[0]
-        assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=10.0) is False
+        assert enqueue_screenshot(ctx, older_b64, provenance=provenance, captured_at=10.0) is False
 
         assert ctx.pending_screenshots == [newest]
+        assert [frame.capture_id for frame in ctx.pending_chat_screenshots] == [newest.capture_id]
 
     def test_skips_when_no_vision(self) -> None:
         from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
@@ -231,78 +241,6 @@ def test_run_result_screenshot_provenance_reads_nested_run_facts() -> None:
         workflow_run_id="wr_123",
         action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
     )
-
-
-class TestStageScreenshotFromArtifact:
-    """The non-inline screenshot tool returns a local artifact path, not image bytes."""
-
-    @staticmethod
-    def _png(path: Path, size: tuple[int, int]) -> str:
-        Image.new("RGB", size, (10, 120, 200)).save(path, format="PNG")
-        return str(path)
-
-    @staticmethod
-    def _ctx() -> SimpleNamespace:
-        return SimpleNamespace(supports_vision=True, pending_screenshots=[])
-
-    @staticmethod
-    def _provenance() -> ScreenshotProvenance:
-        return ScreenshotProvenance.unknown(source_tool="click")
-
-    def test_stages_the_artifact_the_path_names(self, tmp_path: Path) -> None:
-        ctx = self._ctx()
-        result = {"ok": True, "data": {"path": self._png(tmp_path / "frame.png", (400, 300))}}
-
-        assert stage_screenshot_from_artifact(ctx, result, provenance=self._provenance()) is True
-        assert len(ctx.pending_screenshots) == 1
-        assert ctx.pending_screenshots[0].mime == "image/jpeg"
-
-    def test_staged_frame_is_bounded_to_the_copilot_maximum(self, tmp_path: Path) -> None:
-        ctx = self._ctx()
-        result = {"ok": True, "data": {"path": self._png(tmp_path / "big.png", (2400, 1800))}}
-
-        assert stage_screenshot_from_artifact(ctx, result, provenance=self._provenance()) is True
-        width, height = Image.open(io.BytesIO(base64.b64decode(ctx.pending_screenshots[0].b64))).size
-        assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
-        assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
-
-    @pytest.mark.parametrize(
-        "data",
-        [
-            pytest.param({}, id="no_path"),
-            pytest.param({"path": ""}, id="empty_path"),
-            pytest.param({"path": "/nonexistent/frame.png"}, id="missing_file"),
-        ],
-    )
-    def test_unresolvable_artifact_is_no_frame_not_an_error(self, data: dict[str, Any]) -> None:
-        ctx = self._ctx()
-
-        assert (
-            stage_screenshot_from_artifact(
-                ctx,
-                {"ok": True, "data": data},
-                provenance=self._provenance(),
-            )
-            is False
-        )
-        assert ctx.pending_screenshots == []
-
-    def test_failed_capture_over_a_stale_entry_does_not_report_staged(self, tmp_path: Path) -> None:
-        """A queue-length check would call this staged: the earlier frame is still pending."""
-        stale = _screenshot_entry("stale")
-        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[stale])
-        corrupt = tmp_path / "corrupt.png"
-        corrupt.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-an-image" * 40)
-
-        assert (
-            stage_screenshot_from_artifact(
-                ctx,
-                {"ok": True, "data": {"path": str(corrupt)}},
-                provenance=self._provenance(),
-            )
-            is False
-        )
-        assert ctx.pending_screenshots == [stale]
 
 
 class TestCapturePostInteractionScreenshot:
@@ -413,6 +351,43 @@ class TestCapturePostInteractionScreenshot:
             is False
         )
         assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_staged_frame_is_bounded_to_the_copilot_maximum(self, tmp_path: Path) -> None:
+        frame = tmp_path / "big.png"
+        Image.new("RGB", (2400, 1800), (10, 120, 200)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame)}})
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is True
+        width, height = Image.open(io.BytesIO(base64.b64decode(ctx.pending_screenshots[0].b64))).size
+        assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
+        assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="no_path"),
+            pytest.param({"path": ""}, id="empty_path"),
+            pytest.param({"path": "/nonexistent/frame.png"}, id="missing_file"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unresolvable_artifact_is_no_frame_not_an_error(self, data: dict[str, Any]) -> None:
+        ctx = self._ctx({"ok": True, "data": data})
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is False
+        assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_failed_capture_over_a_stale_entry_does_not_report_staged(self, tmp_path: Path) -> None:
+        """A queue-length check would call this staged: the earlier frame is still pending."""
+        stale = _screenshot_entry("stale")
+        corrupt = tmp_path / "corrupt.png"
+        corrupt.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-an-image" * 40)
+        ctx = self._ctx({"ok": True, "data": {"path": str(corrupt)}}, pending_screenshots=[stale])
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is False
+        assert ctx.pending_screenshots == [stale]
 
 
 class TestConsumePendingScreenshots:
@@ -1172,6 +1147,37 @@ class TestAttachFailedBlockScreenshots:
             "No at-failure screenshot or final URL is available for this block."
         )
         assert _resolve_run_screenshot_b64(live_capture=None, results=result["data"]["blocks"], run_ok=False) is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_row_read_by_key_keeps_its_at_failure_facts_without_the_image_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+        from skyvern.forge.sdk.copilot.tools import get_run_results_tool
+
+        block = run_result_block_row("open_item", "failed", "https://example.com/item/7")
+        block.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        block.parent_workflow_run_block_id = None
+        block.current_index = None
+        block.current_value = None
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        ctx.secret_scrub_values = []
+        self._add_artifact_store(run_block_artifact=MagicMock())
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+
+        raw = await get_run_results_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="get_run_results"),
+            json.dumps({"workflow_run_id": "wr-1", "row_keys": ["wrb_open_item"]}),
+        )
+
+        row = json.loads(raw)["data"]["block_details"][0]
+        assert row["final_url"] == "https://example.com/item/7"
+        assert row["screenshot_b64"] == "[base64 image omitted — screenshot was taken successfully]"
+        assert base64.b64encode(self.PNG_BYTES).decode("utf-8") not in raw
 
     @pytest.mark.asyncio
     async def test_get_run_results_wires_the_persisted_end_url_into_the_packet(

@@ -8,8 +8,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+from skyvern.forge.sdk.copilot.mcp_adapter import _EFFECT_UNKNOWN_GUIDANCE, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.runtime import RAW_SECRET_BROWSER_ERROR
 
 
 class _RaisingClient:
@@ -101,7 +102,7 @@ async def test_redacted_raw_secret_refuses_browser_mcp_call_at_action_seam() -> 
     result = await server.call_tool("click", {"selector": "#submit"})
 
     text = "".join(getattr(block, "text", "") for block in result.content)
-    assert "raw-secret draft cannot use browser tools" in text
+    assert RAW_SECRET_BROWSER_ERROR in text
 
 
 class _HangingClient:
@@ -133,7 +134,7 @@ async def test_an_overlay_ceiling_bounds_a_call_that_never_returns() -> None:
     assert "1s" in text
     # The call is cancelled mid-flight, and click/type_text carry a ceiling too, so the result says
     # the effect is unknown rather than reporting an action that may have landed as a clean failure.
-    assert "unknown" in text
+    assert _EFFECT_UNKNOWN_GUIDANCE in text
 
 
 @pytest.mark.asyncio

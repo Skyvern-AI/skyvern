@@ -58,8 +58,8 @@ def test_sweep_removes_aged_log_and_download_entries(tmp_path, monkeypatch):
 
 
 def test_sweep_removes_aged_video_and_har_day_dirs(tmp_path, monkeypatch):
-    # Multi-activity workers no longer wipe these roots at teardown (SKY-14139), so the sweep is
-    # their only reaper. Both are per-day dirs like LOG_PATH: an aged day is genuinely finished.
+    # Files written outside a run land in per-day dirs that no run's teardown owns (SKY-14139), so the
+    # sweep is their only reaper on multi-activity workers. An aged day is genuinely finished.
     _patch_paths(monkeypatch, tmp_path)
     video_dir = tmp_path / "video"
     har_dir = tmp_path / "har"
@@ -81,6 +81,37 @@ def test_sweep_removes_aged_video_and_har_day_dirs(tmp_path, monkeypatch):
     assert not stale_har_day.exists()
     assert fresh_video_day.exists()
     assert fresh_har_day.exists()
+
+
+def test_sweep_reaps_a_crashed_runs_folder_but_not_a_live_sibling(tmp_path, monkeypatch):
+    # A run's recordings live in <root>/<org>/<run>. When its teardown never ran, the sweep reaps the run
+    # folder; the org folder's mtime stays old while a sibling run writes, so it is never reaped whole.
+    _patch_paths(monkeypatch, tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    monkeypatch.setattr(settings, "VIDEO_PATH", str(video_dir))
+    monkeypatch.setattr(settings, "HAR_PATH", "")
+    _set_backend(monkeypatch, _RemoteStorage())
+
+    org_dir = video_dir / "o_1"
+    org_dir.mkdir()
+    crashed_run = _make_aged_run_dir(org_dir, "wr_crashed", age_hours=72)
+    live_run = _make_entry(org_dir, "wr_live", age_hours=1)
+    stamp = time.time() - 72 * 3600
+    os.utime(org_dir, (stamp, stamp))
+    emptied_org = video_dir / "o_2"
+    emptied_org.mkdir()
+    os.utime(emptied_org, (stamp, stamp))
+    stale_day = _make_entry(video_dir, "2026-07-01", age_hours=72)
+
+    removed = sweep_stale_temp_artifacts(max_age_hours=48)
+
+    assert removed == 2
+    assert not crashed_run.exists()
+    assert not stale_day.exists()
+    assert live_run.exists()
+    # An org folder teardown left empty goes too, once it is old; one still holding a run stays.
+    assert not emptied_org.exists()
 
 
 def test_sweep_skips_unconfigured_video_and_har_paths(tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ from skyvern.exceptions import BrowserStateDiagnostic
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
+from skyvern.webeye.browser_runtime_events import AcquireMode, BrowserRuntimeLogContext
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 
 if TYPE_CHECKING:
@@ -32,9 +33,25 @@ class BrowserState(Protocol):
     # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
     # response). The Task V3 loop reads it to classify a dead/removed starting URL.
     last_navigation_status: int | None
+    # The URL that status came back on, recorded from the same response: the verdict naming a dead page
+    # must name the page the status belongs to, not wherever the page went afterwards.
+    last_navigation_url: str | None
     # The proxy this browser was actually built with. A consumer reading a flattened failure
     # sentence cannot tell which hop it went through; this carries that fact from where it is known.
     built_with_proxy_location: ProxyLocationInput
+
+    def bind_runtime_event_context(self, context: BrowserRuntimeLogContext) -> None: ...
+
+    @property
+    def runtime_event_context(self) -> BrowserRuntimeLogContext: ...
+
+    def record_browser_acquisition(
+        self, acquire_mode: AcquireMode, requested_at_monotonic: float | None = None
+    ) -> None: ...
+
+    def publish_runtime_events(self) -> None: ...
+
+    def mark_run_released(self) -> None: ...
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 
@@ -57,6 +74,10 @@ class BrowserState(Protocol):
 
     def is_connected(self) -> bool: ...
 
+    def record_connection_probe_failure(
+        self, context: BrowserContext | None, driver: Playwright, *, timed_out: bool = False
+    ) -> None: ...
+
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None: ...
 
     async def reconnect(
@@ -75,7 +96,7 @@ class BrowserState(Protocol):
         stale_context_is_unusable: bool = False,
     ) -> None: ...
 
-    async def get_working_page(self) -> Page | None: ...
+    async def get_working_page(self, *, prune_excess_pages: bool = True) -> Page | None: ...
 
     async def must_get_working_page(self) -> Page: ...
 

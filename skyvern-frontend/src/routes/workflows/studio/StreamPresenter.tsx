@@ -4,6 +4,7 @@ import { BrowserStream } from "@/components/BrowserStream";
 import { RecordingPill } from "@/components/RecordingPill";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { useRecordingStore } from "@/store/useRecordingStore";
 
 type StreamPresenterProps = {
@@ -18,6 +19,7 @@ type StreamPresenterProps = {
   // Only the CDP transport carries the page URL; VNC is pixels-only and never
   // calls this.
   onUrlChange?: (url: string) => void;
+  onStreamStateChange?: StreamStateChangeHandler;
   onActivity?: () => void;
 };
 
@@ -37,6 +39,7 @@ export function StreamPresenter({
   hideRecordingIndicator = false,
   enableUrlInput = false,
   onUrlChange,
+  onStreamStateChange,
   onActivity,
 }: StreamPresenterProps) {
   const { streamTransport } = useStreamTransport(browserSessionId);
@@ -70,11 +73,12 @@ export function StreamPresenter({
           interactive={interactive}
           showControlButtons={showControlButtons}
           enableUrlInput={enableUrlInput}
-          // undefined keeps the recording message channel closed on the
-          // non-recording live view; a defined value opens it.
+          // A defined value starts recording capture; undefined leaves the
+          // message channel open only while the user is in control.
           exfiltrate={isRecording ? !finishRequested : undefined}
           workflowPermanentId={workflowPermanentId}
           onUrlChange={onUrlChange}
+          onStreamStateChange={onStreamStateChange}
           onActivity={onActivity}
           centered
         />
@@ -97,6 +101,7 @@ export function StreamPresenter({
       // StrictMode remounts this component; the recording must survive that.
       // StudioBrowserStream owns the session-level reset instead.
       resetRecordingOnUnmount={false}
+      onStreamStateChange={onStreamStateChange}
       onActivity={onActivity}
     />
   );

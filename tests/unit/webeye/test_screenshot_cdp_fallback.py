@@ -16,8 +16,12 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.webeye import action_deadline
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME
+from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame, _current_viewpoint_screenshot_helper
 
@@ -137,13 +141,11 @@ async def test_successful_capture_keeps_playwright_arguments_and_skips_cdp(mode:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["full_page", "firefox", "webkit", "unknown_browser", "skycdp"])
+@pytest.mark.parametrize("kind", ["full_page", "firefox", "webkit", "skycdp"])
 async def test_ineligible_captures_keep_animation_retry_and_never_attach(kind: str) -> None:
     page = _page()
     if kind in {"firefox", "webkit"}:
         page.context.browser.browser_type.name = kind
-    elif kind == "unknown_browser":
-        page.context.browser = None
     selection = None
     if kind == "skycdp":
         selection = SimpleNamespace(
@@ -170,6 +172,37 @@ async def test_non_timeout_failure_does_not_become_a_success(error: Exception) -
         await _current_viewpoint_screenshot_helper(page)
     assert raised.value.__cause__ is error
     page.context.new_cdp_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_cancel", ["raise", "wait_again", "return_late_image"])
+async def test_capture_the_driver_never_answers_ends_as_a_screenshot_timeout(
+    monkeypatch: pytest.MonkeyPatch, on_cancel: str
+) -> None:
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", 0.05)
+    page = _page()
+
+    async def ignores_its_own_timeout(**_kwargs: object) -> bytes:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if on_cancel == "raise":
+                raise
+            if on_cancel == "return_late_image":
+                return b"late"
+            await asyncio.Event().wait()
+        return b""
+
+    page.screenshot.side_effect = ignores_its_own_timeout
+    with skyvern_context.scoped(SkyvernContext()) as context:
+        with pytest.raises(FailedToTakeScreenshot):
+            await asyncio.wait_for(_current_viewpoint_screenshot_helper(page, timeout=50), timeout=5)
+
+    page.screenshot.assert_awaited_once()
+    page.context.new_cdp_session.assert_not_awaited()
+    assert context.browser_health.stuck_operations == {BrowserOperation.SCREENSHOT}
+    assert context.browser_health.consecutive_timeouts == 1
 
 
 @pytest.mark.asyncio

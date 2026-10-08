@@ -31,6 +31,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_run_metadata,
     normalize_run_with,
 )
+from skyvern.schemas.browser_settings import BrowserSettingsReceipt
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
     ERROR_CODE_MAPPING_EXAMPLES,
@@ -193,17 +194,17 @@ else:
     WorkflowRunTypeField = Literal[RunType.workflow_run]
 
 
-def _validate_browser_address(browser_address: str | None) -> str | None:
+def _validate_browser_address(browser_address: str | None, *, field_name: str = "browser_address") -> str | None:
     if not browser_address:
         return browser_address
 
     try:
         parsed = _BROWSER_ADDRESS_ADAPTER.validate_python(browser_address)
     except ValidationError as exc:
-        raise ValueError("browser_address must be an HTTP(S) or WebSocket URL with a host") from exc
+        raise ValueError(f"{field_name} must be an HTTP(S) or WebSocket URL with a host") from exc
 
     if not parsed.host:
-        raise ValueError("browser_address must include a host")
+        raise ValueError(f"{field_name} must include a host")
 
     validate_browser_host(parsed.host)
     return browser_address
@@ -357,7 +358,7 @@ class TaskRunRequest(BaseModel):
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
-    def validate_callback_urls(cls, url: str | None) -> str | None:
+    def validate_callback_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         """
         Validates that URLs provided to Skyvern are properly formatted.
 
@@ -370,7 +371,7 @@ class TaskRunRequest(BaseModel):
         if not url:
             return url
 
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
@@ -553,10 +554,10 @@ class WorkflowRunRequest(BaseModel):
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         if not url:
             return url
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
@@ -654,11 +655,16 @@ class ScriptRunResponse(BaseModel):
     # True iff a fallback fired during this run, flipping at least one
     # block's execution from cached script to the agent. Writers: the two
     # `services/script_service.py` fallback paths (script-block failure +
-    # conditional-agent episode) and the `_execute_single_block` script-
-    # failure path. `False` here does NOT imply "no AI execution" — blocks
-    # that were ALWAYS-agent (via `requires_agent`, `disable_cache`, or
-    # non-cacheable block types) never create a fallback episode and don't
-    # flip this flag. For per-block routing ground truth, consult the
+    # conditional-agent episode), the `_execute_single_block` script-
+    # failure path, which also fires when the in-process script policy
+    # denies the cached script and a block with cached code runs via the
+    # agent instead (no episode is recorded for that). `False` here does
+    # NOT imply "no AI execution": blocks that were ALWAYS-agent (via
+    # `requires_agent`, `disable_cache`, or non-cacheable block types)
+    # never create a fallback episode and don't flip this flag, and neither
+    # does code-block AI fallback (an authored code block that throws and
+    # is finished by the agent; it ignores `ai_fallback` and records a heal
+    # episode instead). For per-block routing ground truth, consult the
     # `Block execution mode resolved` log emitted at per-block execution
     # time in `skyvern/forge/sdk/workflow/service.py`.
     ai_fallback_triggered: bool = False
@@ -831,6 +837,11 @@ class WorkflowRunResponse(BaseRunResponse):
         description="Which layer of the seed-precedence chain seeded this run's browser (provenance).",
         examples=["credential", "own_memory", "fresh"],
     )
+    browser_settings_receipt: BrowserSettingsReceipt | None = Field(
+        default=None,
+        description="The timezone the run's browser reported against the one its workflow version requested. "
+        "Null when the version requests no browser settings or the browser has not been measured yet.",
+    )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
@@ -864,6 +875,7 @@ class TaskRunListItem(BaseModel):
     workflow_deleted: bool = False
     script_run: bool = False
     trigger_type: WorkflowRunTriggerType | None = None
+    created_by: str | None = Field(default=None, description="ID of the user who started the run")
     searchable_text: str | None = Field(default=None, exclude=True)
 
     @field_validator("script_run", mode="before")

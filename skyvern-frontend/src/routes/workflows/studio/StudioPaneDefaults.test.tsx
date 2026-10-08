@@ -1,17 +1,24 @@
 // @vitest-environment jsdom
 
-import { useLayoutEffect, useMemo } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { useEffect, useLayoutEffect, useMemo, type ReactNode } from "react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useManualSignInStore } from "@/store/useManualSignInStore";
 
 import { shouldOpenCopilotPaneForHandoff } from "../discoverCopilotHandoff";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
+import { useSwitchStudioRun } from "./runSwitchNavigation";
 import { StudioWorkflowDeletedContext } from "./StudioShellContext";
 import { useStudioPanes } from "./useStudioPanes";
 
@@ -73,17 +80,20 @@ function renderStudio({
   hasBlocks = true,
   stageWidth,
   workflowDeletedAt = null,
+  children,
 }: {
   path?: string;
   hasBlocks?: boolean;
   stageWidth?: number;
   workflowDeletedAt?: string | null;
+  children?: ReactNode;
 } = {}) {
   const tree = (
     <MemoryRouter initialEntries={[path]}>
       <StudioWorkflowDeletedContext.Provider value={workflowDeletedAt}>
         <StudioPaneDefaultsProvider hasBlocks={hasBlocks}>
           {stageWidth !== undefined ? <StageProbe width={stageWidth} /> : null}
+          {children}
           <PanesProbe />
         </StudioPaneDefaultsProvider>
       </StudioWorkflowDeletedContext.Provider>
@@ -104,49 +114,86 @@ function addressText(): string {
   return screen.getByTestId("address").textContent ?? "";
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  useManualSignInStore.getState().setBrowserSessionId(null);
+});
 beforeEach(() => {
   localStorage.clear();
-  useStudioFirstRunStore.setState({
-    coachMarkSeen: false,
-    narrowNudgeSeen: false,
-  });
-  useStudioShellStore.getState().reset();
+  useStudioFirstRunStore.setState({ narrowNudgeSeen: false });
   toastMock.mockReset();
 });
 
 describe("cold-entry default panes (the four contexts)", () => {
-  test("an empty agent starts on Editor + Browser", () => {
+  test.each(["?via=blank", "?via=discover", "?record=1"])(
+    "a new agent created with %s starts on Copilot + Browser",
+    (search) => {
+      renderStudio({
+        path: `/workflows/wpid_1/studio${search}`,
+        hasBlocks: false,
+      });
+      expect(panesText()).toBe("copilot,browser");
+    },
+  );
+
+  test("a new agent created from a template keeps Copilot + Browser + Editor", () => {
+    renderStudio({ path: "/workflows/wpid_1/studio?via=template" });
+    expect(panesText()).toBe("copilot,browser,editor");
+  });
+
+  test("drops a create-only ?via= once the panes resolve, so a reload opens as an Edit", () => {
+    renderStudio({
+      path: "/workflows/wpid_1/studio?via=blank&cache-key-value=x",
+      hasBlocks: false,
+    });
+    expect(panesText()).toBe("copilot,browser");
+    expect(addressText()).toBe("/workflows/wpid_1/studio?cache-key-value=x");
+  });
+
+  test("keeps ?via=discover for the Copilot handoff that strips it later", () => {
+    renderStudio({
+      path: "/workflows/wpid_1/studio?via=discover",
+      hasBlocks: false,
+    });
+    expect(addressText()).toBe("/workflows/wpid_1/studio?via=discover");
+  });
+
+  test("Edit on an existing empty agent opens Copilot + Editor", () => {
     renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("editor,browser");
+    expect(panesText()).toBe("copilot,editor");
   });
 
-  test("a built agent also starts on Editor + Browser", () => {
+  test("a built agent starts on Copilot + Editor", () => {
     renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("editor,browser");
+    expect(panesText()).toBe("copilot,editor");
   });
 
-  test("a run in the URL lands on Browser + Overview", () => {
+  test("a run in the URL lands on Overview + Browser", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
-    expect(panesText()).toBe("browser,overview");
+    expect(panesText()).toBe("overview,browser");
   });
 
-  test("a block-run deep link lands on Editor + Browser + Overview", () => {
+  test("a cold block-run deep link lands on Overview + Browser", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1&bl=block_1" });
-    expect(panesText()).toBe("editor,browser,overview");
+    expect(panesText()).toBe("overview,browser");
   });
 
   test("a blocks signal that changes after mount does not reshuffle the panes", () => {
-    const { rerender } = renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("editor,browser");
+    const { rerender } = renderStudio({
+      path: "/workflows/wpid_1/studio?via=blank",
+      hasBlocks: false,
+    });
+    expect(panesText()).toBe("copilot,browser");
     rerender(
-      <MemoryRouter initialEntries={["/workflows/wpid_1/studio"]}>
-        <StudioPaneDefaultsProvider hasBlocks={true}>
-          <PanesProbe />
-        </StudioPaneDefaultsProvider>
+      <MemoryRouter initialEntries={["/workflows/wpid_1/studio?via=blank"]}>
+        <StudioWorkflowDeletedContext.Provider value={null}>
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            <PanesProbe />
+          </StudioPaneDefaultsProvider>
+        </StudioWorkflowDeletedContext.Provider>
       </MemoryRouter>,
     );
-    expect(panesText()).toBe("editor,browser");
+    expect(panesText()).toBe("copilot,browser");
   });
 
   test("an explicit ?panes= is never overridden by the state default", () => {
@@ -159,10 +206,11 @@ describe("cold-entry default panes (the four contexts)", () => {
     expect(panesText()).toBe("copilot,overview");
   });
 
-  test("toggling from the state default writes the default plus the change", () => {
+  test("toggling from the state default updates runtime panes without changing the URL", () => {
     renderStudio({ hasBlocks: false });
     fireEvent.click(screen.getByText("toggle-overview"));
-    expect(panesText()).toBe("editor,browser,overview");
+    expect(panesText()).toBe("copilot,editor,overview");
+    expect(addressText()).toBe("/workflows/wpid_1/studio");
   });
 });
 
@@ -227,14 +275,14 @@ function messageText(): string {
 }
 
 describe("Discover → Studio handoff opens the Copilot pane", () => {
-  test("a seeded handoff opens Copilot on top of the default editor+browser", () => {
+  test("a seeded handoff retains the default Copilot and Browser", () => {
     renderHandoff();
-    expect(panesText()).toBe("editor,browser,copilot");
+    expect(panesText()).toBe("copilot,browser");
   });
 
   test("no handoff prompt leaves the default panes untouched", () => {
     renderHandoff({ hasInitialCopilotMessage: false });
-    expect(panesText()).toBe("editor,browser");
+    expect(panesText()).toBe("copilot,browser");
   });
 
   test("an explicit ?panes=copilot handoff is left as-is (no duplicate open)", () => {
@@ -253,10 +301,11 @@ describe("Discover → Studio handoff opens the Copilot pane", () => {
       {},
       {
         pathname: "/workflows/wpid_1/studio",
+        search: "?panes=browser",
         state: { copilotMessage: "Fill out the contact form" },
       },
     );
-    expect(panesText()).toBe("editor,browser,copilot");
+    expect(panesText()).toBe("browser,copilot");
     expect(messageText()).toBe("Fill out the contact form");
   });
 
@@ -265,10 +314,11 @@ describe("Discover → Studio handoff opens the Copilot pane", () => {
       { threadState: false },
       {
         pathname: "/workflows/wpid_1/studio",
+        search: "?panes=browser",
         state: { copilotMessage: "Fill out the contact form" },
       },
     );
-    expect(panesText()).toBe("editor,browser,copilot");
+    expect(panesText()).toBe("browser,copilot");
     expect(messageText()).toBe("Fill out the contact form");
   });
 });
@@ -298,29 +348,23 @@ describe("narrow-viewport clamp of shared links", () => {
     expect(panesText()).toBe("copilot,editor,overview");
   });
 
-  test("clamps the runtime-restored Copilot selection", () => {
-    useStudioShellStore
-      .getState()
-      .setCopilotSelection("edit", { open: true, index: 0 });
+  test("live panes include Copilot from the clamped shared selection", () => {
     renderStudio({
-      path: "/workflows/wpid_1/studio?panes=editor,browser,copilot",
+      path: "/workflows/wpid_1/studio?panes=copilot,editor,browser",
       stageWidth: 600,
     });
     expect(panesText()).toBe("copilot,editor");
-    expect(livePanesText()).toBe("editor,browser");
+    expect(livePanesText()).toBe("copilot,editor");
   });
 
   test("clamps a deleted workflow without restoring blocked Copilot", () => {
-    useStudioShellStore
-      .getState()
-      .setCopilotSelection("run", { open: true, index: 0 });
     renderStudio({
       path: "/workflows/wpid_1/studio?wr=wr_1",
       stageWidth: 500,
       workflowDeletedAt: "2026-08-12T00:00:00Z",
     });
-    expect(panesText()).toBe("browser");
-    expect(livePanesText()).toBe("browser");
+    expect(panesText()).toBe("overview");
+    expect(livePanesText()).toBe("overview");
   });
 
   test("a Copilot-only close does not reveal a clamp-hidden run pane", () => {
@@ -358,9 +402,7 @@ describe("narrow-viewport clamp of shared links", () => {
     fireEvent.click(screen.getByText("show-editor-only"));
 
     expect(panesText()).toBe("editor");
-    expect(addressText()).toBe(
-      "/workflows/wpid_1/studio?panes=copilot,editor#proof",
-    );
+    expect(addressText()).toBe(address);
   });
 });
 
@@ -396,140 +438,200 @@ describe("narrow-viewport nudge", () => {
     expect(panesText()).toBe("copilot");
     expect(toastMock).not.toHaveBeenCalled();
   });
-
-  test("a pane write marks the coach mark as learned", () => {
-    renderStudio({ stageWidth: 2000 });
-    expect(useStudioFirstRunStore.getState().coachMarkSeen).toBe(false);
-    fireEvent.click(screen.getByText("toggle-overview"));
-    expect(useStudioFirstRunStore.getState().coachMarkSeen).toBe(true);
-  });
 });
 
-// GestureLearningProbe calls togglePane with and without the learn flag so
-// tests can verify which writes reach the store.
-function GestureLearningProbe() {
-  const { panes, togglePane } = useStudioPanes();
+// Mirrors the Copilot credential card: the sign-in starts, and a pane showing a
+// past run is sent back to the live browser by dropping ?wr=.
+function SignInProbe() {
+  const navigate = useNavigate();
+  const location = useLocation();
   return (
-    <div>
-      <output data-testid="panes">{panes.join(",")}</output>
-      <button onClick={() => togglePane("editor", { learn: true })}>
-        gesture-toggle-editor
-      </button>
-      <button onClick={() => togglePane("overview")}>
-        system-toggle-overview
-      </button>
-    </div>
+    <button
+      onClick={() => {
+        useManualSignInStore.getState().setBrowserSessionId("pbs_1");
+        const params = new URLSearchParams(location.search);
+        params.delete("wr");
+        navigate(
+          { pathname: location.pathname, search: params.toString() },
+          { replace: true },
+        );
+      }}
+    >
+      start-sign-in
+    </button>
   );
 }
 
-function renderGestureStudio({
-  path = "/workflows/wpid_1/studio",
-  hasBlocks = true,
-}: { path?: string; hasBlocks?: boolean } = {}) {
-  return render(
-    <MemoryRouter initialEntries={[path]}>
-      <StudioPaneDefaultsProvider hasBlocks={hasBlocks}>
-        <GestureLearningProbe />
-      </StudioPaneDefaultsProvider>
-    </MemoryRouter>,
-  );
-}
-
-describe("gesture learning — edit-class writes reach the store", () => {
-  test("a gesture toggle on an edit URL learns the resulting layout", () => {
-    renderGestureStudio();
-    fireEvent.click(screen.getByText("gesture-toggle-editor"));
-    // default built-agent: editor,browser → toggle closes editor → browser
-    expect(useStudioShellStore.getState().paneLayouts["edit"]).toEqual([
-      "browser",
-    ]);
+describe("Copilot manual sign-in", () => {
+  test("opens the Browser pane on the Edit layout", () => {
+    renderStudio();
+    expect(panesText()).toBe("copilot,editor");
+    act(() => {
+      useManualSignInStore.getState().setBrowserSessionId("pbs_1");
+    });
+    expect(panesText()).toBe("copilot,editor,browser");
   });
 
-  test("a system (non-gesture) toggle does NOT update the store", () => {
-    renderGestureStudio({
-      path: "/workflows/wpid_1/studio?panes=copilot,browser,overview",
+  test("ignores a previous agent's sign-in still in the store at mount", () => {
+    useManualSignInStore.getState().setBrowserSessionId("pbs_previous_agent");
+    renderStudio();
+    expect(panesText()).toBe("copilot,editor");
+    act(() => {
+      useManualSignInStore.getState().setBrowserSessionId(null);
     });
-    fireEvent.click(screen.getByText("system-toggle-overview"));
-    expect(useStudioShellStore.getState().paneLayouts["edit"]).toBeUndefined();
+    expect(panesText()).toBe("copilot,editor");
   });
 
-  test("a gesture on a run URL learns the run class", () => {
-    renderGestureStudio({
-      path: "/workflows/wpid_1/studio?wr=wr_1&panes=copilot,browser,overview",
-    });
-    fireEvent.click(screen.getByText("gesture-toggle-editor"));
-    expect(useStudioShellStore.getState().paneLayouts["run"]).toBeDefined();
-    expect(useStudioShellStore.getState().paneLayouts["edit"]).toBeUndefined();
+  test("keeps the Browser pane open when the sign-in leaves a past run", () => {
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_1/studio?wr=wr_1"]}>
+        <StudioWorkflowDeletedContext.Provider value={null}>
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            <SignInProbe />
+            <PanesProbe />
+          </StudioPaneDefaultsProvider>
+        </StudioWorkflowDeletedContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("start-sign-in"));
+    expect(addressText()).toBe("/workflows/wpid_1/studio");
+    expect(panesText().split(",")).toContain("browser");
   });
 
-  test("a gesture on a block-iterate URL (wr+bl) does not learn any class", () => {
-    renderGestureStudio({
-      path: "/workflows/wpid_1/studio?wr=wr_1&bl=block_1&panes=copilot,browser,overview",
-    });
-    fireEvent.click(screen.getByText("gesture-toggle-editor"));
-    expect(useStudioShellStore.getState().paneLayouts).toEqual({});
+  // Copilot + Editor + Browser needs 868px at min widths; the clamp keeps a
+  // leading prefix, so Browser must not sit last.
+  test("keeps the Browser pane through a narrow-stage re-resolve", () => {
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_1/studio?wr=wr_1"]}>
+        <StudioWorkflowDeletedContext.Provider value={null}>
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            <StageProbe width={800} />
+            <SignInProbe />
+            <PanesProbe />
+          </StudioPaneDefaultsProvider>
+        </StudioWorkflowDeletedContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("start-sign-in"));
+    expect(addressText()).toBe("/workflows/wpid_1/studio");
+    expect(panesText()).toBe("copilot,browser");
+  });
+
+  test("catches a sign-in a child writes in its first passive effect", () => {
+    function SignInOnMount() {
+      useEffect(() => {
+        useManualSignInStore.getState().setBrowserSessionId("pbs_1");
+      }, []);
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_1/studio"]}>
+        <StudioWorkflowDeletedContext.Provider value={null}>
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            <SignInOnMount />
+            <PanesProbe />
+          </StudioPaneDefaultsProvider>
+        </StudioWorkflowDeletedContext.Provider>
+      </MemoryRouter>,
+    );
+    expect(panesText()).toBe("copilot,editor,browser");
   });
 });
 
-describe("restore from learned edit layout", () => {
-  test("a built agent restores the last learned edit layout", () => {
-    // Pre-seed a layout distinct from the factory default so the restore is provable.
-    useStudioShellStore.getState().setPaneLayout("edit", ["browser", "editor"]);
+// Mirrors the Copilot chat focusing the test run its turn just started.
+function CopilotRunProbe() {
+  const switchRun = useSwitchStudioRun({ replace: true, systemFocus: true });
+  return <button onClick={() => switchRun("wr_1")}>copilot-run-started</button>;
+}
 
-    renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("browser,editor");
+describe("Copilot test run", () => {
+  test("opens the Browser pane on the Edit layout", () => {
+    renderStudio({ children: <CopilotRunProbe /> });
+    expect(panesText()).toBe("copilot,editor");
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(addressText()).toBe("/workflows/wpid_1/studio?wr=wr_1&wrs=copilot");
+    expect(panesText()).toBe("copilot,editor,browser");
   });
 
-  test("an empty agent ignores the learned layout and always shows factory default", () => {
-    useStudioShellStore
-      .getState()
-      .setPaneLayout("edit", ["overview", "browser"]);
-
-    renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("editor,browser");
+  // #18330's narrow-stage rule: Copilot + Editor + Browser needs 868px at min
+  // widths, so the run's Browser displaces Editor instead of cramping all three.
+  test("keeps Copilot + Browser on a narrow stage", () => {
+    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    expect(panesText()).toBe("copilot,editor");
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(panesText()).toBe("copilot,browser");
+    expect(toastMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("open-editor"));
+    expect(panesText()).toBe("copilot,editor,browser");
   });
 
-  test("an explicit ?panes= beats the learned layout", () => {
-    useStudioShellStore.getState().setPaneLayout("edit", ["editor", "browser"]);
-
-    renderStudio({ path: "/workflows/wpid_1/studio?panes=overview" });
-    expect(panesText()).toBe("overview");
+  test("leaves a cramped layout with Browser already open alone", () => {
+    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    fireEvent.click(screen.getByText("open-browser"));
+    expect(panesText()).toBe("copilot,editor,browser");
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(panesText()).toBe("copilot,editor,browser");
   });
 
-  test("a deep-link run URL beats the learned layout", () => {
-    useStudioShellStore.getState().setPaneLayout("edit", ["editor", "browser"]);
+  test.each([
+    [600, "copilot,browser"],
+    [400, "browser"],
+  ])(
+    "keeps Browser when other panes fill a %ipx stage",
+    (stageWidth, expected) => {
+      renderStudio({
+        path: "/workflows/wpid_1/studio?panes=copilot,overview",
+        stageWidth,
+        children: <CopilotRunProbe />,
+      });
+      fireEvent.click(screen.getByText("copilot-run-started"));
+      expect(panesText()).toBe(expected);
+    },
+  );
 
-    renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
-    expect(panesText()).toBe("browser,overview");
-  });
-
-  test("a learned layout with an unknown pane id is sanitized to known ids only", () => {
-    // Inject a stale persisted layout that contains a no-longer-valid id.
-    useStudioShellStore.setState({
-      paneLayouts: {
-        edit: ["editor", "bogus" as never, "browser"],
-      },
+  test("displaces only Editor from a reordered narrow layout", () => {
+    renderStudio({
+      path: "/workflows/wpid_1/studio?panes=editor,copilot",
+      stageWidth: 800,
+      children: <CopilotRunProbe />,
     });
-
-    renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("editor,browser");
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(panesText()).toBe("copilot,browser");
+    fireEvent.click(screen.getByText("open-editor"));
+    expect(panesText()).toBe("editor,copilot,browser");
   });
 
-  test("a learned layout that becomes all-unknown falls back to the factory default", () => {
-    useStudioShellStore.setState({
-      paneLayouts: { edit: ["bogus" as never] },
+  test("keeps a pane order the user arranged", () => {
+    renderStudio({
+      path: "/workflows/wpid_1/studio?panes=editor,copilot",
+      children: <CopilotRunProbe />,
     });
-
-    renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("editor,browser");
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(panesText()).toBe("editor,copilot,browser");
   });
 
-  test("a corrupted non-array learned layout falls back without throwing", () => {
-    useStudioShellStore.setState({
-      paneLayouts: { edit: "corrupt" as never },
+  test("leaves an open Browser pane where it is", () => {
+    renderStudio({
+      path: "/workflows/wpid_1/studio?panes=browser,copilot",
+      children: <CopilotRunProbe />,
     });
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(panesText()).toBe("browser,copilot");
+  });
 
-    renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("editor,browser");
+  test("a run during a narrow-stage sign-in keeps the sign-in layout", () => {
+    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    act(() => {
+      useManualSignInStore.getState().setBrowserSessionId("pbs_1");
+    });
+    const signInPanes = panesText();
+    expect(signInPanes.split(",")).toContain("browser");
+    fireEvent.click(screen.getByText("copilot-run-started"));
+    expect(panesText()).toBe(signInPanes);
+  });
+
+  test("a reload of a Copilot-focused run keeps the Edit panes", () => {
+    renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1&wrs=copilot" });
+    expect(panesText()).toBe("copilot,editor");
   });
 });

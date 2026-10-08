@@ -14,13 +14,14 @@ import libcst as cst
 import pytest
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
-from skyvern.core.script_generations.generate_script import _build_for_loop_statement
+from skyvern.core.script_generations.generate_script import _build_for_loop_statement, _build_run_fn
 from skyvern.core.script_generations.transform_workflow_run import (
     CodeGenInput,
     transform_workflow_run_to_code_gen_input,
 )
 from skyvern.forge.sdk.workflow.service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.schemas.workflows import BlockType
+from skyvern.services.workflow_script_service import is_block_type_cacheable
 
 
 class TestForLoopInCacheableBlocks:
@@ -463,6 +464,102 @@ class TestForLoopScriptExecution:
 
         # Should have values = '' (empty string), not None
         assert "values = ''" in code or 'values = ""' in code
+
+    def test_loop_holding_a_conditional_is_not_cacheable(self) -> None:
+        """Loop codegen emits every child in list order, so a cached loop would run both branches."""
+        forloop_block = {
+            "block_type": "for_loop",
+            "label": "loop_1",
+            "loop_variable_reference": "rows",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "cond_1",
+                    "branch_conditions": [
+                        {
+                            "criteria": {"criteria_type": "jinja2_template", "expression": "{{ current_value.ok }}"},
+                            "next_block_label": "branch_a_http",
+                        },
+                        {"is_default": True, "next_block_label": "branch_b_http"},
+                    ],
+                },
+                {
+                    "block_type": "http_request",
+                    "label": "branch_a_http",
+                    "method": "GET",
+                    "url": "https://example.com/a",
+                },
+                {
+                    "block_type": "http_request",
+                    "label": "branch_b_http",
+                    "method": "GET",
+                    "url": "https://example.com/b",
+                },
+            ],
+        }
+
+        loop_code = cst.Module(body=[_build_for_loop_statement("loop_1", forloop_block)]).code
+
+        assert "branch_a_http" in loop_code and "branch_b_http" in loop_code
+        assert is_block_type_cacheable(forloop_block) is False
+
+    @pytest.mark.parametrize("shape", ["loop_holding_a_conditional", "nested_loop_holding_a_conditional", "plain_loop"])
+    @pytest.mark.asyncio
+    async def test_whole_script_run_refuses_a_loop_holding_an_engine_only_child_before_any_block_runs(
+        self, shape: str
+    ) -> None:
+        def prompt(label: str) -> dict[str, Any]:
+            return {"block_type": "text_prompt", "label": label, "prompt": label}
+
+        conditional = {
+            "block_type": "conditional",
+            "label": "cond_1",
+            "next_block_label": "after",
+            "branch_conditions": [
+                {
+                    "criteria": {"criteria_type": "jinja2_template", "expression": "{{ current_value.ok }}"},
+                    "next_block_label": "branch_a",
+                },
+                {"is_default": True, "next_block_label": "branch_b"},
+            ],
+        }
+        body = [prompt("step")] if shape == "plain_loop" else [conditional, prompt("branch_a"), prompt("branch_b")]
+        loop: dict[str, Any] = {"block_type": "for_loop", "label": "loop_1", "loop_blocks": body}
+        if shape == "nested_loop_holding_a_conditional":
+            loop = {**loop, "label": "outer", "loop_blocks": [{**loop, "label": "inner"}]}
+
+        ran: list[str] = []
+
+        class FakeSkyvern:
+            def workflow(self, **_: Any) -> Any:
+                return lambda fn: fn
+
+            async def setup(self, *_: Any) -> tuple[None, None]:
+                ran.append("setup")
+                return None, None
+
+            async def loop(self, **_: Any) -> Any:
+                for value in ("row_0", "row_1"):
+                    yield value
+
+            async def prompt(self, label: str, **_: Any) -> None:
+                ran.append(label)
+
+        namespace: dict[str, Any] = {
+            "skyvern": FakeSkyvern(),
+            "Any": Any,
+            "WorkflowParameters": type("WorkflowParameters", (), {}),
+            "GeneratedWorkflowParameters": None,
+        }
+        exec(cst.Module(body=[_build_run_fn([prompt("before"), loop], {"title": "t"})]).code, namespace)
+
+        if shape == "plain_loop":
+            await namespace["run_workflow"](parameters={})
+            assert ran == ["setup", "before", "step", "step"]
+        else:
+            with pytest.raises(RuntimeError, match="conditional"):
+                await namespace["run_workflow"](parameters={})
+            assert ran == []
 
 
 class TestForLoopScriptCompilation:

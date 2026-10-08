@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.services import otp_service
 from skyvern.services.otp_service import (
+    MagicLinkSurfacing,
     OTPValue,
     _clean_url,
     _get_otp_value_from_db,
@@ -34,6 +36,23 @@ from skyvern.services.otp_service import (
     resolve_otp_value,
     try_generate_totp_from_credential,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+
+@pytest.mark.asyncio
+async def test_payload_otp_inspection_is_pure_and_resolution_registers_selected_value() -> None:
+    context = SkyvernContext(task_id="task-payload")
+    task = SimpleNamespace(task_id=context.task_id, navigation_payload={"otp_code": "ABCDEF", "mfa_code": "SECOND"})
+    with skyvern_context.scoped(context):
+        assert [value.value for value in otp_service.iter_totp_from_navigation_inputs(task.navigation_payload)] == [
+            "ABCDEF",
+            "SECOND",
+        ]
+        assert otp_service.has_otp_source(task)
+        assert not context.runtime_secret_values
+        resolved = await resolve_otp_value(task)
+        assert resolved is not None and resolved.value == "ABCDEF"
+        assert context.runtime_secret_values == {"ABCDEF"}
 
 
 class TestIsMfaLikeParameterKey:
@@ -341,6 +360,7 @@ def _patch_totp_url_response(
     monkeypatch.setattr(otp_service, "_post_totp_verification_url", post_totp_verification_url)
 
 
+@pytest.mark.usefixtures("public_dns")
 class TestGetOtpValueFromUrl:
     @pytest.mark.asyncio
     async def test_returns_totp_from_valid_json_verification_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1185,6 +1205,63 @@ class TestParseOtpLogin:
         assert result is None  # no digit-run candidate to recover from; better than storing a short code
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("code", "next_word"),
+        [("482913", "This"), ("202613", "Note"), ("551207", "Enter")],
+    )
+    async def test_code_glued_to_the_next_word_is_recovered_not_the_footer_year(
+        self, monkeypatch: pytest.MonkeyPatch, code: str, next_word: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=code)
+        content = (
+            f"Your verification code is {code}{next_word} code expires in 10 minutes. "
+            "(c)2026 Example Co, 1 Example Way, Exampletown 99999"
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "llm_value", "expected"),
+        [
+            (
+                (
+                    "Your verification code is 482913This code expires in 10 minutes. "
+                    "(c)2026 Example Co, 1 Example Way, Exampletown 99999"
+                ),
+                "48291",
+                "482913",
+            ),
+            ("Your verification code is 202613This code expires in 10 minutes. (c)2026Example Co", "2026", "202613"),
+            ("Your verification code is 482913. Order 48291377Shipped today. (c)2026Example Co", "48291", "482913"),
+        ],
+        ids=["glued_code", "glued_code_read_as_glued_year", "separate_code_beside_glued_number"],
+    )
+    async def test_truncated_read_recovers_the_whole_code_not_a_glued_number(
+        self, monkeypatch: pytest.MonkeyPatch, content: str, llm_value: str, expected: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("llm_value", ["482913ab56", "48291356"], ids=["case_misread", "letters_dropped"])
+    async def test_case_misread_or_letter_dropped_alphanumeric_code_is_not_cut_to_its_digits(
+        self, monkeypatch: pytest.MonkeyPatch, llm_value: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content="Your code: 482913Ab56 (c)2026 Example Co", organization_id="o_test")
+
+        assert result is None or result.value == "482913Ab56"  # never the fragment "482913" or the year
+
+    @pytest.mark.asyncio
     async def test_does_not_charge_when_llm_call_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
         from skyvern.services import otp_service
@@ -2017,6 +2094,7 @@ class TestTryGenerateTotpFromCredential:
             assert try_generate_totp_from_credential("wr_test") is None
 
 
+@pytest.mark.usefixtures("public_dns")
 class TestPostTotpVerificationUrlSeam:
     """`_post_totp_verification_url` must route through app.AGENT_FUNCTION so the
     cloud override can egress via the NAT proxy (static IP), like webhook/file-upload."""
@@ -2348,6 +2426,7 @@ async def test_get_otp_value_from_db_forwards_created_after(monkeypatch: pytest.
 async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided() -> None:
     """Run-scoped polling prefers exact rows but keeps unscoped email/SMS pushes eligible."""
     unscoped = SimpleNamespace(
+        totp_code_id="otp_unscoped",
         code="111111",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 4, 0),
@@ -2357,6 +2436,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         expired_at=None,
     )
     other_run = SimpleNamespace(
+        totp_code_id="otp_other_run",
         code="333333",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 5, 0),
@@ -2366,6 +2446,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         expired_at=None,
     )
     scoped = SimpleNamespace(
+        totp_code_id="otp_scoped",
         code="222222",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 6, 0),
@@ -2398,6 +2479,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
 @pytest.mark.asyncio
 async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() -> None:
     unscoped = SimpleNamespace(
+        totp_code_id="otp_unscoped",
         code="111111",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 4, 0),
@@ -2407,6 +2489,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
         expired_at=None,
     )
     other_run = SimpleNamespace(
+        totp_code_id="otp_other_run",
         code="333333",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 5, 0),
@@ -2434,6 +2517,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
 @pytest.mark.asyncio
 async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_run() -> None:
     unscoped = SimpleNamespace(
+        totp_code_id="otp_unscoped",
         code="111111",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 4, 0),
@@ -2461,6 +2545,7 @@ def _parsed_otp_row(
     otp_type: OTPType,
     created_at: datetime = datetime(2026, 7, 30, 12, 0, 0),
     workflow_run_id: str | None = None,
+    task_id: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         totp_code_id=totp_code_id,
@@ -2470,7 +2555,7 @@ def _parsed_otp_row(
         created_at=created_at,
         workflow_run_id=workflow_run_id,
         workflow_id=None,
-        task_id=None,
+        task_id=task_id,
         expired_at=None,
     )
 
@@ -2701,6 +2786,203 @@ async def test_get_otp_value_from_db_retries_unchecked_newer_content_after_attem
     assert mock_app.DATABASE.otp.get_raw_otp_codes.await_count == 2
 
 
+_POLL_STARTED = datetime(2026, 7, 30, 12, 0, 0)
+_STORED_LINK = "https://example.test/careers/activate/synthetictoken4567/"
+_RESENT_LINK = "https://example.test/careers/activate/synthetictoken8901/"
+# A bare link the store cleaned: an HTML-escaped query separator decoded, a trailing period dropped.
+_ESCAPED_LINK_CONTENT = "https://example.test/careers/activate?u=alex&amp;t=synthetictoken4567."
+_CLEANED_LINK = "https://example.test/careers/activate?u=alex&t=synthetictoken4567"
+_SURFACE_LINKS = MagicLinkSurfacing(created_after=_POLL_STARTED, spent_values=frozenset())
+# 07:00 at UTC-5 is 12:00 UTC: an aware anchor must be compared in UTC, not by its wall-clock digits.
+_UTC_MINUS_5 = timezone(timedelta(hours=-5))
+
+
+def _stored_link(
+    *,
+    seconds: int = 5,
+    link: str = _STORED_LINK,
+    content: str | None = None,
+    workflow_run_id: str | None = "wr_test",
+    task_id: str | None = None,
+) -> SimpleNamespace:
+    return _parsed_otp_row(
+        totp_code_id=f"otp_link_{seconds}",
+        content=link if content is None else content,
+        code=link,
+        otp_type=OTPType.MAGIC_LINK,
+        created_at=_POLL_STARTED + timedelta(seconds=seconds),
+        workflow_run_id=workflow_run_id,
+        task_id=task_id,
+    )
+
+
+def _stored_code(code: str, *, seconds: int) -> SimpleNamespace:
+    return _parsed_otp_row(
+        totp_code_id=f"otp_{code}",
+        content=code,
+        code=code,
+        otp_type=OTPType.TOTP,
+        created_at=_POLL_STARTED + timedelta(seconds=seconds),
+        workflow_run_id="wr_test",
+    )
+
+
+_LINK = OTPValue(value=_STORED_LINK, type=OTPType.MAGIC_LINK)
+_CODE = OTPValue(value="482913", type=OTPType.TOTP)
+_NO_PARSE_CREDIT = otp_service.InsufficientCreditsForOTPParse()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "reparsed", "surfacing", "rejected_code", "expected"),
+    [
+        pytest.param([_stored_link()], None, None, None, None, id="off_unless_the_caller_opts_in"),
+        pytest.param([_stored_link()], _NO_PARSE_CREDIT, _SURFACE_LINKS, None, _LINK, id="bare_link_needs_no_parse"),
+        pytest.param(
+            [_stored_link(workflow_run_id=None, task_id="tsk_test")],
+            _NO_PARSE_CREDIT,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="bare_task_scoped_link",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5), _stored_code("482913", seconds=10)],
+            None,
+            _SURFACE_LINKS,
+            None,
+            _CODE,
+            id="newer_code_beats_older_link",
+        ),
+        pytest.param(
+            [_stored_code("48291", seconds=5), _stored_link(seconds=6)],
+            None,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="link_one_second_after_a_short_value_wins",
+        ),
+        pytest.param(
+            [_stored_code("482913", seconds=5), _stored_link(seconds=10)],
+            None,
+            MagicLinkSurfacing(created_after=_POLL_STARTED, spent_values=frozenset({_STORED_LINK})),
+            None,
+            _CODE,
+            id="spent_link_falls_back_to_older_code",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5), _stored_link(seconds=60, link=_RESENT_LINK)],
+            None,
+            MagicLinkSurfacing(created_after=_POLL_STARTED, spent_values=frozenset({_RESENT_LINK})),
+            None,
+            None,
+            id="spent_link_retires_the_older_link_it_replaced",
+        ),
+        pytest.param(
+            [_stored_link(link=_CLEANED_LINK, content=_ESCAPED_LINK_CONTENT)],
+            _NO_PARSE_CREDIT,
+            _SURFACE_LINKS,
+            None,
+            OTPValue(value=_CLEANED_LINK, type=OTPType.MAGIC_LINK),
+            id="bare_link_the_store_cleaned_needs_no_parse",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            _CODE,
+            _SURFACE_LINKS,
+            None,
+            _CODE,
+            id="email_with_a_code_and_a_link_yields_the_code",
+        ),
+        pytest.param(
+            [
+                _stored_link(
+                    content=f"Hi Alex Demo, confirm your account: {_STORED_LINK} Help: https://example.test/help"
+                )
+            ],
+            None,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="email_with_only_a_link_yields_the_link",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            _CODE,
+            _SURFACE_LINKS,
+            "482913",
+            _LINK,
+            id="email_whose_code_was_rejected_yields_the_link",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            _NO_PARSE_CREDIT,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="email_with_a_code_and_a_link_yields_the_link_without_parse_credit",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            RuntimeError("transient parser failure"),
+            _SURFACE_LINKS,
+            None,
+            None,
+            id="email_with_a_code_and_a_link_retries_a_transient_parse_failure",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5)],
+            None,
+            MagicLinkSurfacing(
+                created_after=datetime(2026, 7, 30, 7, 0, 0, tzinfo=_UTC_MINUS_5), spent_values=frozenset()
+            ),
+            None,
+            _LINK,
+            id="aware_anchor_before_the_link",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5)],
+            None,
+            MagicLinkSurfacing(
+                created_after=datetime(2026, 7, 30, 7, 0, 10, tzinfo=_UTC_MINUS_5), spent_values=frozenset()
+            ),
+            None,
+            None,
+            id="aware_anchor_after_the_link",
+        ),
+    ],
+)
+async def test_code_poll_hands_back_only_a_fresh_unspent_link_bound_to_this_run(
+    rows: list[SimpleNamespace],
+    reparsed: OTPValue | Exception | None,
+    surfacing: MagicLinkSurfacing | None,
+    rejected_code: str | None,
+    expected: OTPValue | None,
+) -> None:
+    # A caller that can open links opts in to receiving a stored link while it waits for a code; every
+    # other caller keeps the old answer. The newest usable value of either type wins, and an email holding
+    # both a code and a link still yields the code.
+    parse = AsyncMock(side_effect=reparsed) if isinstance(reparsed, Exception) else AsyncMock(return_value=reparsed)
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=parse),
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=rows)
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "application_synthetic0001",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            expected_otp_type=OTPType.TOTP,
+            raw_context=otp_service.RawOTPVerificationContext(),
+            rejected_code_hash=hashlib.sha256(rejected_code.encode()).hexdigest() if rejected_code else None,
+            surface_magic_link=surfacing,
+        )
+
+    assert result == expected
+
+
 def _raw_otp_row(
     totp_code_id: str = "otp_raw",
     task_id: str | None = None,
@@ -2715,6 +2997,61 @@ def _raw_otp_row(
         task_id=task_id,
         expired_at=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_counts_rows_the_filters_drop() -> None:
+    expired = _raw_otp_row(totp_code_id="otp_expired")
+    expired.expired_at = datetime(2020, 1, 1)
+    other_run = _parsed_otp_row(
+        totp_code_id="otp_other_run",
+        content="Your code is 123456.",
+        code="123456",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_other",
+    )
+    context = otp_service.RawOTPVerificationContext()
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[other_run])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[expired])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            workflow_run_id="wr_test",
+            expected_otp_type=OTPType.TOTP,
+            raw_context=context,
+        )
+
+    assert result is None
+    assert context.seen_row_ids == {"otp_expired", "otp_other_run"}
+    assert context.store_queried is True
+
+
+@pytest.mark.asyncio
+async def test_seen_rows_include_rows_the_reparse_budget_never_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [
+        _raw_otp_row(totp_code_id=f"otp_{index}", created_at=datetime(2026, 7, 30, 12, index, 0))
+        for index in range(otp_service._RAW_OTP_REPARSE_LIMIT + 2)
+    ]
+    context = otp_service.RawOTPVerificationContext()
+
+    async def fake_parse_otp_login(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=rows)
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=context,
+        )
+
+    assert result is None
+    assert len(context.seen_row_ids) == len(rows)
+    assert len(context.misses) == otp_service._RAW_OTP_REPARSE_LIMIT
 
 
 @pytest.mark.asyncio
@@ -2954,3 +3291,163 @@ class TestScopeSuppressionRegressionSentinel:
         assert with_webhook is polled
         assert unscoped is not None
         assert not [r for r in logs if r["event"] == otp_service.SCOPE_SUPPRESSED_LEGACY_CREDENTIAL_EVENT]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["webhook", "email", "db"])
+async def test_retry_poll_rejects_old_hash_until_fresh_candidate(monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    rejected = OTPValue(value="650294", type=OTPType.TOTP)
+    fresh = OTPValue(value="483917", type=OTPType.TOTP)
+    cutoff = datetime(2026, 1, 1)
+    fetchers = {name: AsyncMock(return_value=None) for name in ("webhook", "email", "db")}
+    fetchers[source].side_effect = [rejected, fresh]
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_url", fetchers["webhook"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_email", fetchers["email"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_db", fetchers["db"])
+    monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.organizations, "get_valid_org_auth_token", AsyncMock(return_value=_mock_org_token())
+    )
+    result = await poll_otp_value(
+        organization_id="org-test",
+        totp_identifier="test@example.test",
+        totp_verification_url="https://example.test/otp",
+        created_after=cutoff,
+        rejected_code_hash=hashlib.sha256(rejected.value.encode()).hexdigest(),
+    )
+    assert result == fresh
+    assert fetchers["webhook"].await_args is not None
+    for name in ("email", "db"):
+        for args in fetchers[name].await_args_list:
+            assert args.kwargs["created_after"] == cutoff
+
+
+@pytest.mark.asyncio
+async def test_retry_resolution_forwards_cutoff_and_ignores_inline_rejected_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejected = "650294"
+    cutoff = datetime(2026, 1, 1)
+    task = SimpleNamespace(
+        task_id="task-test",
+        organization_id="org-test",
+        workflow_run_id=None,
+        navigation_payload={"otp": rejected},
+        totp_identifier="test@example.test",
+        totp_verification_url=None,
+    )
+    fresh = OTPValue(value="483917", type=OTPType.TOTP)
+    poll = AsyncMock(return_value=fresh)
+    monkeypatch.setattr(otp_service, "poll_otp_value", poll)
+    monkeypatch.setattr(otp_service, "try_generate_totp_from_credential", lambda *args: None)
+    rejected_hash = hashlib.sha256(rejected.encode()).hexdigest()
+    result = await resolve_otp_value(
+        task, expected_otp_type=OTPType.TOTP, created_after=cutoff, rejected_code_hash=rejected_hash
+    )
+    assert result == fresh
+    assert poll.await_args.kwargs["created_after"] == cutoff
+    assert poll.await_args.kwargs["rejected_code_hash"] == rejected_hash
+    assert poll.await_args.kwargs["max_wait_seconds"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+async def test_retry_db_skips_rejected_candidates_in_same_batch(monkeypatch: pytest.MonkeyPatch, raw: bool) -> None:
+    cutoff = datetime(2026, 7, 30, 11)
+    fresh_row = _parsed_otp_row(totp_code_id="fresh", content="", code="483917", otp_type=OTPType.TOTP)
+    rejected_row = _parsed_otp_row(
+        totp_code_id="rejected",
+        content="",
+        code="650294",
+        otp_type=OTPType.TOTP,
+        created_at=fresh_row.created_at + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.otp,
+        "get_otp_codes",
+        AsyncMock(
+            return_value=[fresh_row] if raw else [rejected_row, fresh_row],
+        ),
+    )
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.otp,
+        "get_raw_otp_codes",
+        AsyncMock(
+            return_value=[_raw_otp_row(created_at=rejected_row.created_at)] if raw else [],
+        ),
+    )
+    monkeypatch.setattr(
+        otp_service, "parse_otp_login", AsyncMock(return_value=OTPValue(value="650294", type=OTPType.TOTP))
+    )
+    result = await _get_otp_value_from_db(
+        "org-test",
+        "test@example.test",
+        expected_otp_type=OTPType.TOTP,
+        created_after=cutoff,
+        rejected_code_hash=hashlib.sha256(b"650294").hexdigest(),
+    )
+    assert result is not None and result.value == fresh_row.code
+    assert otp_service.app.DATABASE.otp.get_otp_codes.await_args.kwargs["created_after"] == cutoff
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["webhook", "email", "db"])
+@pytest.mark.parametrize(
+    ("supplied", "accepted"), [("AB-12C", "483917"), ("１２３４５６", "123456"), ("ABé12C", "483917")]
+)
+async def test_multi_box_poll_normalizes_or_skips_unsupported_codes(
+    monkeypatch: pytest.MonkeyPatch, source: str, supplied: str, accepted: str
+) -> None:
+    fetchers = {key: AsyncMock(return_value=None) for key in ("webhook", "email", "db")}
+    fetchers[source].side_effect = [
+        OTPValue(value=supplied, type=OTPType.TOTP),
+        OTPValue(value="483917", type=OTPType.TOTP),
+    ]
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_url", fetchers["webhook"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_email", fetchers["email"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_db", fetchers["db"])
+    monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.organizations, "get_valid_org_auth_token", AsyncMock(return_value=_mock_org_token())
+    )
+    context = skyvern_context.SkyvernContext(task_id="task-format")
+    with skyvern_context.scoped(context), structlog.testing.capture_logs() as logs:
+        result = await poll_otp_value(
+            organization_id="org-test",
+            totp_identifier="test@example.test",
+            totp_verification_url="https://example.test/otp",
+            expected_otp_type=OTPType.TOTP,
+            multi_field_expected_digits=6,
+        )
+    assert result is not None and result.value == accepted
+    if supplied != "１２３４５６":
+        assert any(entry.get("reason") == "unsupported_code_format" for entry in logs)
+    assert supplied not in str(logs)
+    assert supplied in context.runtime_secret_values
+    assert supplied in context.multi_field_totp_mask_values["task-format"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_raw_otp_is_parsed_once_across_poll_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = _raw_otp_row()
+    context = otp_service.RawOTPVerificationContext()
+    parser = AsyncMock(return_value=OTPValue(value="ABC DEF", type=OTPType.TOTP))
+    monkeypatch.setattr(otp_service, "parse_otp_login", parser)
+    monkeypatch.setattr(otp_service.app.DATABASE.otp, "get_otp_codes", AsyncMock(return_value=[]))
+    monkeypatch.setattr(otp_service.app.DATABASE.otp, "get_raw_otp_codes", AsyncMock(return_value=[row]))
+    promote = AsyncMock()
+    monkeypatch.setattr(otp_service.app.DATABASE.otp, "promote_raw_otp_code", promote)
+    for _ in range(2):
+        assert (
+            await _get_otp_value_from_db(
+                "org-test",
+                "test@example.test",
+                expected_otp_type=OTPType.TOTP,
+                raw_context=context,
+                rejected_code_hash=hashlib.sha256(b"ABCDEF").hexdigest(),
+                multi_field_expected_digits=6,
+            )
+            is None
+        )
+    assert parser.await_count == 1
+    assert not promote.await_args_list

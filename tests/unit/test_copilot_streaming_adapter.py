@@ -1,40 +1,81 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import io
 import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import quote
 
 import pytest
-from agents.items import RunItem
+from agents import Agent, RunConfig, Runner, function_tool
+from agents.items import ModelResponse, RunItem
+from agents.mcp.util import MCPUtil
+from agents.models.interface import Model
 from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
+from agents.tool_context import ToolContext
+from fastmcp import FastMCP
 from openai.types.responses import (
+    ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
 )
 from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from PIL import Image
 
+from skyvern.forge import app
+from skyvern.forge.sdk.api.files import parse_uri_to_path
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
-from skyvern.forge.sdk.copilot.context import CopilotContext, InFlightStreamToolCall
-from skyvern.forge.sdk.copilot.narration import NarratorState, TransitionKind
+from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_system_prompt
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_SCHEMA, CopilotContext, InFlightStreamToolCall
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
+from skyvern.forge.sdk.copilot.narration import (
+    MAX_DESIGN_ACTIVITY_ENTRIES,
+    NarratorState,
+)
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, capturing_tool_call, enqueue_screenshot
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     _sanitize_input,
     _update_enforcement_from_tool,
     flush_goal_satisfied_tool_result,
     stream_to_sse,
 )
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.copilot.tools import _with_action_reason, copilot_native_tools
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+    WorkflowCopilotStreamMessageType,
+)
+from tests.unit.copilot_test_helpers import FakeCopilotStream
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
-def test_strips_workflow_yaml() -> None:
-    result = _sanitize_input({"workflow_yaml": "title: x", "block_labels": ["a"]})
-    assert "workflow_yaml" not in result
-    assert result["block_labels"] == ["a"]
+@pytest.mark.parametrize(
+    ("key", "definition"),
+    [("workflow", {"title": "x"}), ("block", {"block_type": "code", "label": "a"}), ("workflow_yaml", "title: x")],
+)
+def test_strips_submitted_definition(key: str, definition: dict[str, str] | str) -> None:
+    result = _sanitize_input({key: definition, "block_labels": ["a"]})
+    assert result == {"block_labels": ["a"]}
 
 
 def test_redacts_password_in_parameters() -> None:
@@ -168,9 +209,12 @@ def _item_done_event(output_index: int, name: str, arguments: str, item_id: str 
     )
 
 
-def _tool_called_event(call_id: str, name: str, arguments: str = "{}") -> RunItemStreamEvent:
+def _tool_called_event(
+    call_id: str, name: str, arguments: str = "{}", agent: Agent[Any] | None = None
+) -> RunItemStreamEvent:
     call_item = MagicMock(spec=RunItem)
     call_item.raw_item = {"call_id": call_id, "name": name, "arguments": arguments}
+    call_item.agent = agent or Agent(name="no-tools")
     return RunItemStreamEvent(name="tool_called", item=call_item)
 
 
@@ -181,13 +225,29 @@ def _tool_output_event(call_id: str, ok: bool = True, block_count: int = 2) -> R
     return RunItemStreamEvent(name="tool_output", item=out_item)
 
 
-def _new_ctx() -> SimpleNamespace:
-    return SimpleNamespace(
-        last_artifact_health_blocker_reason=None,
-        pending_code_write_diffs={},
-        completion_verification_result=None,
-        design_start_emitted=False,
+def _new_ctx() -> CopilotContext:
+    return CopilotContext(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        workflow_id=None,
+        workflow_yaml=None,
+        browser_session_id=None,
+        stream=None,
     )
+
+
+def _test_copilot_context(**overrides: Any) -> CopilotContext:
+    ctx = _new_ctx()
+    for name, value in overrides.items():
+        setattr(ctx, name, value)
+    return ctx
+
+
+def _fixture_pending_identity(ctx: Any) -> None:
+    pending = ctx.in_flight_stream_tool_call
+    ctx.stream_tool_calls = {pending.call_id: pending} if pending else {}
+    ctx.pending_stream_tool_call_ids = {pending.call_id} if pending else set()
+    ctx.goal_satisfied_tool_call_id = pending.call_id if pending else None
 
 
 @pytest.mark.asyncio
@@ -236,7 +296,7 @@ async def test_goal_satisfied_flush_entry_shares_the_clock_read_of_its_sse_updat
     stream.send = _send
 
     narrator_state = NarratorState()
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         narrator_state=narrator_state,
         in_flight_stream_tool_call=InFlightStreamToolCall(
             call_id="c9", tool_name="update_workflow", iteration=2, display_label=None
@@ -248,6 +308,7 @@ async def test_goal_satisfied_flush_entry_shares_the_clock_read_of_its_sse_updat
         pending_code_write_diffs={},
     )
 
+    _fixture_pending_identity(ctx)
     await flush_goal_satisfied_tool_result(stream, ctx)  # type: ignore[arg-type]
 
     entry = narrator_state.design_activity[0]
@@ -287,7 +348,7 @@ async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
     stream.is_disconnected = AsyncMock(return_value=True)
     stream.send = AsyncMock(return_value=True)
 
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
@@ -323,7 +384,7 @@ async def test_tool_call_sse_uses_product_safe_activity_label() -> None:
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
@@ -365,7 +426,7 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
 
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
@@ -375,97 +436,6 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
         await stream_to_sse(result, stream, ctx)
 
     result.cancel.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_stream_to_sse_tags_narration_to_the_iteration_carrying_typed_activity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End-to-end: a completed update_workflow round-trip registers a
-    workflow_updated transition, and the narration it produces is emitted and
-    persisted against the same iteration as that round-trip's typed rows.
-    """
-    from agents.items import RunItem
-    from agents.stream_events import RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.context import CopilotContext
-    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-
-    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
-        return "Revising the workflow draft."
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.streaming_adapter.resolve_narrator_handler",
-        AsyncMock(return_value=_handler),
-    )
-
-    # Tool input / output raw_items matching the shapes streaming_adapter reads.
-    call_raw = {"call_id": "c-upd", "name": "update_workflow", "arguments": "{}"}
-    call_item = MagicMock(spec=RunItem)
-    call_item.raw_item = call_raw
-    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
-
-    # Shape the output so _update_enforcement_from_tool sets
-    # update_workflow_called=True (needs ok=True + non-empty block_count).
-    output_payload = [{"type": "text", "text": '{"ok": true, "data": {"block_count": 2}}'}]
-    out_item = MagicMock(spec=RunItem)
-    out_item.raw_item = {"call_id": "c-upd", "name": "update_workflow"}
-    out_item.output = output_payload
-    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
-
-    # In production the SDK yields tool events slowly (LLM latency between
-    # them), giving the background narration task ample time to finish before
-    # stream_to_sse's finally cancels anything still in flight. Simulate that
-    # by inserting explicit event-loop yields between synthetic events and
-    # after the last one, so the narration task can run to completion under
-    # the test's microsecond-fast loop.
-    async def _slow_stream_events() -> Any:
-        yield tool_call_event
-        await asyncio.sleep(0)
-        yield tool_output_event
-        # Let the scheduled narration task complete before the async generator
-        # exits and stream_to_sse's finally cancels any still-running task.
-        for _ in range(10):
-            await asyncio.sleep(0)
-
-    result = MagicMock()
-    result.stream_events = _slow_stream_events
-    result.cancel = MagicMock()
-
-    sent: list[Any] = []
-
-    async def _send(payload: Any) -> bool:
-        sent.append(payload)
-        return True
-
-    stream = MagicMock()
-    stream.is_disconnected = AsyncMock(return_value=False)
-    stream.send = _send
-
-    ctx = CopilotContext(
-        organization_id="org_test",
-        workflow_id="wf_test",
-        workflow_permanent_id="wpid_test",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=None,  # type: ignore[arg-type]
-        api_key=None,
-        user_message="",
-    )
-
-    await stream_to_sse(result, stream, ctx)
-
-    narration_payloads = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
-    assert [p.iteration for p in narration_payloads] == [0]
-    narration_entries = [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"]
-    assert [e["iteration"] for e in narration_entries] == [0]
-    tool_types = [getattr(p, "type", None) for p in sent]
-    assert WorkflowCopilotStreamMessageType.TOOL_CALL in tool_types
-    assert WorkflowCopilotStreamMessageType.TOOL_RESULT in tool_types
-    typed_iterations = {
-        e["iteration"] for e in ctx.narrator_state.design_activity if e["kind"] in ("tool_call", "tool_result")
-    }
-    assert typed_iterations == {0}
 
 
 @pytest.mark.asyncio
@@ -511,7 +481,7 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         latest_tool_blocker_signal=signal,
         tool_blocker_signals=[signal],
         last_artifact_health_blocker_reason=None,
@@ -539,22 +509,34 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
 
 
 @pytest.mark.asyncio
-async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error() -> None:
+@pytest.mark.parametrize("tool_name", ["get_browser_screenshot", "run_browser_code"])
+@pytest.mark.parametrize(
+    "error_json",
+    [
+        '{"ok": false, "error": "Browser session pbs_123 not found while taking screenshot (404)."}',
+        # run_browser_code names a lost browser by its typed code, in prose with no status or "not found".
+        '{"ok": false, "error": "The chat\'s browser session is no longer available.", '
+        '"error_code": "browser_session_unavailable"}',
+    ],
+    ids=["prose", "typed"],
+)
+async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error(
+    tool_name: str, error_json: str
+) -> None:
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
 
     from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError
 
-    error_text = "Browser session pbs_123 not found while taking screenshot (404)."
     events = []
     for call_id in ("c1", "c2"):
         call_item = MagicMock(spec=RunItem)
-        call_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot", "arguments": "{}"}
+        call_item.raw_item = {"call_id": call_id, "name": tool_name, "arguments": "{}"}
         events.append(RunItemStreamEvent(name="tool_called", item=call_item))
 
         output_item = MagicMock(spec=RunItem)
-        output_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot"}
-        output_item.output = [{"type": "text", "text": f'{{"ok": false, "error": "{error_text}"}}'}]
+        output_item.raw_item = {"call_id": call_id, "name": tool_name}
+        output_item.output = [{"type": "text", "text": error_json}]
         events.append(RunItemStreamEvent(name="tool_output", item=output_item))
 
     result = MagicMock()
@@ -564,10 +546,13 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
+        user_message="",
     )
 
     with pytest.raises(CopilotUnrecoverableToolError):
@@ -612,7 +597,7 @@ async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
 
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
@@ -810,6 +795,107 @@ def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
     assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
 
 
+def test_tool_result_executed_source_reference_only_for_browser_code() -> None:
+    from skyvern.forge.sdk.copilot.streaming_adapter import _tool_result_executed_source_reference
+
+    payload = {"ok": True, "executed_source_reference": "browser-code-source:opaque"}
+    assert _tool_result_executed_source_reference("run_browser_code", payload) == "browser-code-source:opaque"
+    assert _tool_result_executed_source_reference("edit_block_and_run", payload) is None
+    assert _tool_result_executed_source_reference("run_browser_code", {"executed_source_reference": 42}) is None
+
+
+@pytest.mark.asyncio
+async def test_a_stored_work_plan_outlives_its_row_being_capped_away() -> None:
+    plan = ["Open the admin page", "Create the user"]
+
+    def tool_output(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+        out_item = MagicMock(spec=RunItem)
+        out_item.raw_item = {"call_id": call_id}
+        out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+        return RunItemStreamEvent(name="tool_output", item=out_item)
+
+    # Enough later calls that the design activity cap trims the plan's own rows.
+    filler = [
+        event
+        for index in range(MAX_DESIGN_ACTIVITY_ENTRIES)
+        for event in (
+            _tool_called_event(f"f{index}", "evaluate"),
+            tool_output(f"f{index}", {"ok": True}),
+        )
+    ]
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("p1", "set_work_plan"),
+        tool_output("p1", {"ok": True, "items": plan}),
+        # A refused write echoes the plan still in force; it is not a new plan.
+        _tool_called_event("p2", "set_work_plan"),
+        tool_output("p2", {"ok": False, "error": "too long", "items": ["something else"]}),
+        *filler,
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = _new_ctx()
+
+    await stream_to_sse(result, stream, ctx)
+
+    plan_results = [
+        p
+        for p in sent
+        if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT and p.tool_name == "set_work_plan"
+    ]
+    assert [p.work_plan for p in plan_results] == [plan, None]
+    assert "tr-p1" not in {row["id"] for row in ctx.narrator_state.design_activity}
+    assert ctx.narrator_state.work_plan == {"toolCallId": "p1", "items": plan}
+
+
+@pytest.mark.asyncio
+async def test_browser_code_steps_ride_the_result_event_and_its_saved_row() -> None:
+    def tool_output(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+        out_item = MagicMock(spec=RunItem)
+        out_item.raw_item = {"call_id": call_id}
+        out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+        return RunItemStreamEvent(name="tool_output", item=out_item)
+
+    operations = [{"operation": "goto", "status": "ok"}, {"operation": "click", "status": "ok", "selector": "#next"}]
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("b1", "run_browser_code"),
+        tool_output("b1", {"ok": True, "operations": operations}),
+        _tool_called_event("b2", "run_browser_code"),
+        tool_output("b2", {"ok": False, "error": "boom", "operations": operations}),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = _new_ctx()
+
+    await stream_to_sse(result, stream, ctx)
+
+    steps = ["Opened a page", "clicked '#next'"]
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [p.browser_steps for p in tool_results] == [steps, None]
+    rows = {row["id"]: row for row in ctx.narrator_state.design_activity}
+    assert rows["tr-b1"]["browserSteps"] == steps
+    assert "browserSteps" not in rows["tr-b2"]
+
+
 @pytest.mark.asyncio
 async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() -> None:
     diffs = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n-old\n+new"}]
@@ -832,7 +918,7 @@ async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() 
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={"c1": diffs},
         completion_verification_result=None,
@@ -876,7 +962,7 @@ async def test_two_writes_resolving_out_of_order_each_keep_their_own_diff() -> N
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={"c1": first, "c2": second},
         completion_verification_result=None,
@@ -915,7 +1001,7 @@ async def test_a_write_that_failed_does_not_display_a_sibling_write_diff() -> No
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
     # c2 stashed nothing: its write raised before a diff could be built.
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={"c1": healthy},
         completion_verification_result=None,
@@ -953,7 +1039,7 @@ async def test_a_foreign_result_arriving_first_does_not_cost_the_write_its_count
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={"c1": diffs},
         completion_verification_result=None,
@@ -983,6 +1069,7 @@ class TestFlushGoalSatisfiedToolResult:
             goal_satisfied_tool_name="update_and_run_blocks",
             goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_1"}},
             pending_code_write_diffs={},
+            pending_chat_screenshots=[],
             narrator_state=None,
         )
         defaults.update(overrides)
@@ -1007,6 +1094,7 @@ class TestFlushGoalSatisfiedToolResult:
         sent: list[Any] = []
         ctx = self._ctx()
 
+        _fixture_pending_identity(ctx)
         await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
 
         assert len(sent) == 1
@@ -1026,6 +1114,7 @@ class TestFlushGoalSatisfiedToolResult:
         sent: list[Any] = []
         ctx = self._ctx(pending_code_write_diffs={"c9": diffs})
 
+        _fixture_pending_identity(ctx)
         await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
 
         assert sent[0].code_diffs == diffs
@@ -1043,6 +1132,7 @@ class TestFlushGoalSatisfiedToolResult:
             pending_code_write_diffs={"c1": diffs},
         )
 
+        _fixture_pending_identity(ctx)
         await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
 
         assert sent[0].code_diffs is None
@@ -1058,6 +1148,7 @@ class TestFlushGoalSatisfiedToolResult:
         sent: list[Any] = []
         ctx = self._ctx(in_flight_stream_tool_call=None)
 
+        _fixture_pending_identity(ctx)
         await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
 
         assert sent == []
@@ -1069,10 +1160,12 @@ class TestFlushGoalSatisfiedToolResult:
         sent: list[Any] = []
         ctx = self._ctx(goal_satisfied_tool_name="get_run_results")
 
+        _fixture_pending_identity(ctx)
+        ctx.goal_satisfied_tool_call_id = "unobserved-call"
         await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
 
         assert sent == []
-        assert ctx.in_flight_stream_tool_call is None
+        assert ctx.in_flight_stream_tool_call is not None
 
     @pytest.mark.asyncio
     async def test_records_narrator_activity_but_skips_send_when_disconnected(self) -> None:
@@ -1083,6 +1176,7 @@ class TestFlushGoalSatisfiedToolResult:
         narrator_state = NarratorState()
         ctx = self._ctx(narrator_state=narrator_state)
 
+        _fixture_pending_identity(ctx)
         await flush_goal_satisfied_tool_result(self._stream(sent, disconnected=True), ctx)
 
         assert sent == []
@@ -1205,52 +1299,6 @@ class TestCodeRepairProgressStreaming:
         assert ctx.narrator_state.current_iteration == 2
 
     @pytest.mark.asyncio
-    async def test_classified_progress_text_not_doubled_with_narrator_enabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """With the narrator handler enabled, the progress text still emits at most once."""
-
-        async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
-            return "a generic tool-start narration sentence"
-
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.streaming_adapter.resolve_narrator_handler",
-            AsyncMock(return_value=_handler),
-        )
-
-        events: list[Any] = []
-        for idx in range(3):
-            events.extend(_round_trip_events(f"c{idx}", "update_and_run_blocks", _code_repair_reject_payload()))
-
-        async def _slow_events() -> Any:
-            for event in events:
-                yield event
-                await asyncio.sleep(0)
-            for _ in range(10):
-                await asyncio.sleep(0)
-
-        result = MagicMock()
-        result.stream_events = _slow_events
-        result.cancel = MagicMock()
-
-        sent: list[Any] = []
-        ctx = _copilot_ctx()
-
-        await stream_to_sse(result, _sink_stream(sent), ctx)
-
-        progress_frames = [
-            p
-            for p in sent
-            if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION and p.narration == _PROGRESS_TEXT
-        ]
-        assert len(progress_frames) == 1
-
-        progress_entries = [
-            e for e in ctx.narrator_state.design_activity if e["kind"] == "narration" and e["text"] == _PROGRESS_TEXT
-        ]
-        assert len(progress_entries) == 1
-
-    @pytest.mark.asyncio
     async def test_classified_reject_persists_one_entry_on_disconnect(self) -> None:
         """A disconnected client still gets the persisted progress entry; no live frame is sent."""
         events = _round_trip_events("c1", "update_and_run_blocks", _code_repair_reject_payload())
@@ -1347,7 +1395,7 @@ async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) ->
     await stream_to_sse(
         result,
         stream,
-        SimpleNamespace(
+        _test_copilot_context(
             last_artifact_health_blocker_reason=None, pending_code_write_diffs={}, completion_verification_result=None
         ),
     )
@@ -1405,9 +1453,15 @@ def _codegen_payloads(sent: list[Any]) -> list[Any]:
 async def test_codegen_progress_pins_incremental_label_extraction_on_raw_deltas() -> None:
     """Regression pin: fails on old code because RawResponsesStreamEvent is dropped at the
     ``isinstance(event, RunItemStreamEvent)`` skip, so zero CODEGEN_PROGRESS frames are ever sent."""
-    delta1 = '{"workflow_yaml": "blocks:\\n- block_type: navigation\\n  label: open_page\\n'
-    delta2 = "  navigation_goal: Navigate to the page\\n- block_type: task\\n  label: fill_form\\n"
-    delta3 = '  navigation_goal: Fill out the form\\n"'
+    delta1 = (
+        '{"workflow": {"workflow_definition": {"blocks": [{"block_type": "navigation", "label": "open_page", '
+        '"next_block_label": "branch_target", '
+    )
+    delta2 = (
+        '"navigation_goal": "Navigate to the page"}, {"block_type": "task", "label": "fill_form", '
+        '"next_block_label": null, '
+    )
+    delta3 = '"navigation_goal": "Fill out the form"}]}}'
     delta4 = ', "block_labels": ["open_page", "fill_form"]}'
     full_args = delta1 + delta2 + delta3 + delta4
 
@@ -1477,6 +1531,37 @@ async def test_codegen_progress_does_not_leak_truncated_label_split_across_delta
     all_labels = {label for p in codegen_payloads for label in p.blocks_drafted}
     assert "open_pa" not in all_labels
     assert any(p.blocks_drafted == ["open_page"] for p in codegen_payloads)
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_does_not_report_the_block_edit_block_and_run_targets() -> None:
+    args = '{"label": "extract_totals", "code": "rows = []\\nreturn rows"}'
+    events = [
+        _item_added_event(0, "edit_block_and_run"),
+        _args_delta_event(0, args),
+        _args_done_event(0, args, "edit_block_and_run"),
+        _item_done_event(0, "edit_block_and_run", args),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    assert codegen_payloads
+    assert all(p.blocks_drafted == [] for p in codegen_payloads)
 
 
 @pytest.mark.asyncio
@@ -1588,6 +1673,8 @@ async def test_codegen_progress_resets_on_response_created() -> None:
     events = [
         _item_added_event(0, "update_and_run_blocks"),
         _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: block_one\\n"}'),
+        _item_added_event(1, "update_workflow"),
+        _args_delta_event(1, '{"workflow_yaml": "blocks:\\n  label: block_extra\\n"}'),
         _response_created_event(),
         _item_added_event(0, "update_and_run_blocks"),
         _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: block_two\\n"}'),
@@ -1612,6 +1699,16 @@ async def test_codegen_progress_resets_on_response_created() -> None:
     codegen_payloads = _codegen_payloads(sent)
     assert any(p.blocks_drafted == ["block_two"] for p in codegen_payloads)
     assert not any("block_one" in p.blocks_drafted for p in codegen_payloads if p.blocks_drafted == ["block_two"])
+
+    # The restarted response opens exactly like a second authoring call, so only the id separates them.
+    ids = [p.generation_id for p in codegen_payloads]
+    assert len(ids) == 6 and None not in ids
+    assert len(set(ids[:4])) == 1 and len(set(ids[4:])) == 1 and ids[0] != ids[4]
+
+    # Each enforcement pass streams through a fresh tracker; its ids must not repeat the last pass's.
+    result.stream_events = lambda: _stream_events_from(_item_added_event(0, "update_and_run_blocks"))
+    await stream_to_sse(result, stream, _new_ctx())
+    assert _codegen_payloads(sent)[-1].generation_id not in ids
 
 
 @pytest.mark.asyncio
@@ -1691,7 +1788,7 @@ async def test_codegen_progress_is_disconnected_bounded_when_client_gone(
 
 
 def _label_probe_ctx() -> SimpleNamespace:
-    return SimpleNamespace(
+    return _test_copilot_context(
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
@@ -1759,22 +1856,6 @@ async def test_non_dict_tool_arguments_degrade_to_the_generic_label_and_keep_dra
 
 
 @pytest.mark.asyncio
-async def test_banked_transition_loses_its_iteration_tag_on_each_stream_pass() -> None:
-    ctx = _label_probe_ctx()
-    await _drive(_tool_round_trip("edit_block", '{"label": "Log in"}', json.dumps({"ok": True, "data": {}})), ctx)
-
-    # Pass 2's iteration numbers restart at 0, so a tag carried over would pair
-    # pass 1's banked prose to an unrelated pass 2 step.
-    ctx.narrator_state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    assert ctx.narrator_state.pending_transition_iteration is not None
-
-    await _drive([], ctx)
-
-    assert ctx.narrator_state.pending_transition is TransitionKind.WORKFLOW_UPDATED
-    assert ctx.narrator_state.pending_transition_iteration is None
-
-
-@pytest.mark.asyncio
 async def test_goal_satisfied_flush_reuses_the_pending_calls_label() -> None:
     sent: list[Any] = []
 
@@ -1786,7 +1867,7 @@ async def test_goal_satisfied_flush_reuses_the_pending_calls_label() -> None:
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
     narrator_state = NarratorState()
-    ctx = SimpleNamespace(
+    ctx = _test_copilot_context(
         in_flight_stream_tool_call=InFlightStreamToolCall(
             call_id="c9", tool_name="edit_block", iteration=3, display_label='Editing block "Log In"'
         ),
@@ -1796,6 +1877,7 @@ async def test_goal_satisfied_flush_reuses_the_pending_calls_label() -> None:
         narrator_state=narrator_state,
     )
 
+    _fixture_pending_identity(ctx)
     await flush_goal_satisfied_tool_result(stream, ctx)
 
     assert [p.display_label for p in sent] == ['Editing block "Log In"']
@@ -1827,3 +1909,542 @@ async def test_design_start_narrates_for_a_plain_agent_context() -> None:
 
     assert len(sent) == 1
     assert ctx.design_start_emitted is True
+
+
+@pytest.mark.asyncio
+async def test_actor_reason_native_dispatch_preserves_ordinary_validation() -> None:
+    ctx = CopilotContext(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        workflow_id=None,
+        workflow_yaml=None,
+        browser_session_id=None,
+        stream=None,
+    )
+    tool = next(
+        tool
+        for tool in copilot_native_tools(
+            supports_question_tool=True, browser_code_available=False, run_tools_available=True
+        )
+        if tool.name == "set_work_plan"
+    )
+    schema = tool.params_json_schema
+    assert "user_facing_reason" in schema["properties"]
+    assert "user_facing_reason" not in schema.get("required", [])
+    assert tool.strict_json_schema is False
+    tc = ToolContext(context=ctx, tool_name=tool.name, tool_call_id="plan-call", tool_arguments="{}")
+    for reason in ("I will plan the booking steps.", None, "", "   ", 17, {"bad": True}):
+        raw = {"items": ["Inspect availability"], "user_facing_reason": reason}
+        result = json.loads(await tool.on_invoke_tool(tc, json.dumps(raw)))
+        assert result["ok"] is True
+        assert ctx.work_plan == ["Inspect availability"]
+    result = await tool.on_invoke_tool(tc, json.dumps({"user_facing_reason": "Explain", "items": 17}))
+    assert "error" in result.lower()
+
+
+class _ActorCallModel(Model):
+    """Deterministic SDK input source; no live actor or adapter replacement."""
+
+    def __init__(self, name: str, arguments: dict[str, Any]) -> None:
+        self.name = name
+        self.arguments = arguments
+        self.called = False
+        self.served_instructions: str | None = None
+        self.served_tools: list[Any] = []
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        raise AssertionError("streamed execution required")
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: Any,
+        model_settings: Any,
+        tools: list[Any],
+        *args: Any,
+        **kwargs: Any,
+    ):
+        self.served_instructions = system_instructions
+        self.served_tools = tools
+        if self.called:
+            item = ResponseOutputMessage(
+                id="msg_done",
+                role="assistant",
+                status="completed",
+                type="message",
+                content=[ResponseOutputText(type="output_text", text="Done", annotations=[])],
+            )
+        else:
+            self.called = True
+            item = ResponseFunctionToolCall(
+                id="fc_held",
+                call_id="call_held",
+                name=self.name,
+                arguments=json.dumps(self.arguments),
+                type="function_call",
+            )
+        yield ResponseOutputItemDoneEvent(
+            item=item, output_index=0, sequence_number=1, type="response.output_item.done"
+        )
+        response = _minimal_response().model_copy(update={"output": [item], "status": "completed"})
+        yield ResponseCompletedEvent(response=response, sequence_number=2, type="response.completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["native", "mcp"])
+async def test_real_runner_streams_actor_reason_before_held_action_returns(
+    transport: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    seen: list[str] = []
+    hook_call_ids: list[str] = []
+    pre_hook_inputs: list[dict[str, Any]] = []
+
+    class ObservedHooks(CopilotRunHooks):
+        async def on_tool_end(self, context, agent, tool, result):
+            hook_call_ids.append(context.tool_call_id)
+            await super().on_tool_end(context, agent, tool, result)
+
+    async def pre_hook(arguments, _ctx):
+        pre_hook_inputs.append(dict(arguments))
+        return None
+
+    async def leaf(value: str) -> str:
+        entered.set()
+        await release.wait()
+        seen.append(value)
+        return json.dumps({"ok": True, "data": {"value": value}})
+
+    ctx = _new_ctx()
+    ctx.api_key = "test-in-process-key"
+    monkeypatch.setattr(streaming_adapter_module.settings, "ENV", "local")
+    monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+    stream = FakeCopilotStream()
+    ctx.stream = stream
+    server = None
+    if transport == "native":
+        tool = _with_action_reason(function_tool(leaf, name_override="probe"))
+    else:
+        probe = FastMCP("actor-reason-held")
+        probe.tool(name="skyvern_probe")(leaf)
+        server = SkyvernOverlayMCPServer(
+            transport=probe,
+            overlays={
+                "probe": SchemaOverlay(
+                    copilot_params={"user_facing_reason": USER_FACING_REASON_SCHEMA}, pre_hook=pre_hook
+                )
+            },
+            alias_map={"probe": "skyvern_probe"},
+            allowlist=frozenset({"skyvern_probe"}),
+            context_provider=lambda: ctx,
+        )
+        await server.connect()
+        advertised = await server.list_tools()
+        tool = MCPUtil.to_function_tool(advertised[0], server, convert_schemas_to_strict=False)
+    reason = "I will check this value before booking."
+    assert tool.params_json_schema["properties"]["user_facing_reason"]["type"] == ["string", "null"]
+    assert "user_facing_reason" not in tool.params_json_schema.get("required", [])
+    dump = serialize_tool_surface([tool])
+    assert dump.payload["tools"][0]["params_json_schema"] == tool.params_json_schema
+    model = _ActorCallModel(tool.name, {"value": "ordinary", "user_facing_reason": reason})
+    result = Runner.run_streamed(
+        Agent(name="controlled", model=model, tools=[tool], instructions=_build_system_prompt(tool_usage_guide="")),
+        input="controlled",
+        context=ctx,
+        hooks=ObservedHooks(ctx),
+        run_config=RunConfig(tracing_disabled=True),
+    )
+    pump = asyncio.create_task(stream_to_sse(result, stream, ctx))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        assert model.served_instructions is not None
+        assert "user_facing_reason" in model.served_instructions
+        assert "progress and explanation channel" in model.served_instructions
+        assert "substantive inspection, authoring and test actions" in model.served_instructions
+        assert "Describe intent, not an outcome before results" in model.served_instructions
+        served_reason = model.served_tools[0].params_json_schema["properties"]["user_facing_reason"]
+        assert "displayed above this action while it runs" in served_reason["description"]
+        assert "Null or absence is accepted" in served_reason["description"]
+        for _ in range(100):
+            calls = [frame for frame in stream.sent if frame.type == WorkflowCopilotStreamMessageType.TOOL_CALL]
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        assert len(calls) == 1
+        assert calls[0].tool_call_id == "call_held"
+        assert calls[0].reason == reason
+        assert calls[0].tool_input == {"value": "ordinary"}
+        assert not any(frame.type == WorkflowCopilotStreamMessageType.TOOL_RESULT for frame in stream.sent)
+        assert ctx.narrator_state.design_activity[0]["reason"] == reason
+        release.set()
+        await asyncio.wait_for(pump, 5)
+        receipt = next(frame for frame in stream.sent if frame.type == WorkflowCopilotStreamMessageType.TOOL_RESULT)
+        assert receipt.reason == reason
+        assert receipt.activity_started_at == calls[0].timestamp
+        assert seen == ["ordinary"]
+        assert hook_call_ids == ["call_held"]
+        if transport == "mcp":
+            assert pre_hook_inputs == [{"value": "ordinary"}]
+        capture_files = list((tmp_path / "actor-dispatch" / ctx.turn_id).glob("*.json"))
+        assert len(capture_files) == 1
+        written = capture_files[0].read_text()
+        assert "ordinary" not in written and reason not in written
+        capture = json.loads(written)
+        assert capture["tool_call_id"] == calls[0].tool_call_id
+        assert capture["arguments_shape"] == {"value": "str", "user_facing_reason": "str"}
+        assert (
+            capture["arguments_sha256"]
+            == hashlib.sha256(json.dumps(model.arguments, ensure_ascii=False).encode()).hexdigest()
+        )
+        assert capture["activity_bucket"] == calls[0].activity_bucket
+        assert capture["commit"]
+    finally:
+        release.set()
+        if not pump.done():
+            pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+        if server is not None:
+            await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_reason_custody_reversed_results_iteration_reset_secret_scrub_and_flush(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _new_ctx()
+    monkeypatch.setattr(streaming_adapter_module.settings, "ENV", "local")
+    monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+    stream = FakeCopilotStream()
+    secret = "safe-test-secret/value"
+    register_secret_scrub_value(ctx, secret)
+    a_arguments = json.dumps({"expression": "a", "user_facing_reason": f"Read {secret} {quote(secret, safe='')}"})
+    a = _tool_called_event("a", "evaluate", a_arguments)
+    b = _tool_called_event(
+        "b",
+        "evaluate",
+        json.dumps({"expression": "b", "user_facing_reason": "The booking has completed successfully."}),
+    )
+    first = MagicMock(stream_events=lambda: _stream_events_from(a, b))
+    await stream_to_sse(first, stream, ctx)
+    captures = {}
+    for file in (tmp_path / "actor-dispatch" / ctx.turn_id).glob("*.json"):
+        written = file.read_text()
+        assert secret not in written and quote(secret, safe="") not in written
+        capture = json.loads(written)
+        assert capture["undeclared_argument_shapes"] == ["str", "str"]
+        captures[capture["tool_call_id"]] = capture
+    assert set(captures) == {"a", "b"}
+    assert captures["a"]["arguments_sha256"] != hashlib.sha256(a_arguments.encode()).hexdigest()
+    original_a = ctx.stream_tool_calls["a"]
+    original_b = ctx.stream_tool_calls["b"]
+    ctx.narrator_state.running_block_id = "wrb_later"
+    ctx.narrator_state.running_block_label = "later"
+    second = MagicMock(
+        stream_events=lambda: _stream_events_from(_tool_output_event("b", ok=False), _tool_output_event("a"))
+    )
+    await stream_to_sse(second, stream, ctx)
+    receipts = [frame for frame in stream.sent if frame.type == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [r.tool_call_id for r in receipts] == ["b", "a"]
+    assert [r.reason for r in receipts] == [original_b.reason, original_a.reason]
+    assert receipts[0].success is False
+    assert all(r.activity_bucket == {"kind": "design"} for r in receipts)
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="Finished", narrative_summary=None)
+    serialized = json.dumps(payload)
+    assert secret not in serialized and quote(secret, safe="") not in serialized
+    assert payload["designActivity"][-1]["reason"] == original_a.reason
+    ctx.stream_tool_calls["a"] = original_a
+    ctx.pending_stream_tool_call_ids.update({"a", "b"})
+    ctx.goal_satisfied_tool_call_id = "a"
+    ctx.goal_satisfied_tool_output = {"ok": True}
+    ctx.in_flight_stream_tool_call = original_b
+    await flush_goal_satisfied_tool_result(stream, ctx)
+    assert stream.sent[-1].tool_call_id == "a"
+    assert stream.sent[-1].reason == original_a.reason
+    assert ctx.in_flight_stream_tool_call == original_b
+    assert ctx.pending_stream_tool_call_ids == {"b"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_source", ["native", "mcp"])
+async def test_actor_dispatch_capture_writes_only_declared_names_and_no_model_authored_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_source: str,
+) -> None:
+    async def leaf(
+        expression: str, options: dict[str, Any] | None = None, parameters: dict[str, Any] | None = None
+    ) -> str:
+        return "{}"
+
+    ctx = _new_ctx()
+    ctx.api_key = "test-in-process-key"
+    monkeypatch.setattr(streaming_adapter_module.settings, "ENV", "local")
+    monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+    server = None
+    if schema_source == "native":
+        tool = _with_action_reason(function_tool(leaf, name_override="probe", strict_mode=False))
+        agent = Agent(name="capture", tools=[tool])
+    else:
+        probe = FastMCP("actor-capture-schema")
+        probe.tool(name="skyvern_probe")(leaf)
+        server = SkyvernOverlayMCPServer(
+            transport=probe,
+            overlays={"probe": SchemaOverlay(copilot_params={"user_facing_reason": USER_FACING_REASON_SCHEMA})},
+            alias_map={"probe": "skyvern_probe"},
+            allowlist=frozenset({"skyvern_probe"}),
+            context_provider=lambda: ctx,
+        )
+        await server.connect()
+        agent = Agent(name="capture", mcp_servers=[server])
+    unregistered = "unregistered-test-password/Zx9"
+    arguments = {
+        "expression": f"document.querySelector('#password').value = '{unregistered}'",
+        "options": {"timeout_ms": 500, "strict": True, "frame": None, "selectors": ["#user", unregistered]},
+        "parameters": {unregistered: {"retries": 3}},
+        unregistered: 7,
+        "user_facing_reason": f"I will sign in with {unregistered} at the café.",
+    }
+    result = MagicMock(
+        stream_events=lambda: _stream_events_from(_tool_called_event("typed", "probe", json.dumps(arguments), agent))
+    )
+    try:
+        await stream_to_sse(result, FakeCopilotStream(), ctx)
+    finally:
+        if server is not None:
+            await server.cleanup()
+    capture_files = list((tmp_path / "actor-dispatch" / ctx.turn_id).glob("*.json"))
+    assert len(capture_files) == 1
+    written = capture_files[0].read_text()
+    assert unregistered not in written
+    capture = json.loads(written)
+    assert capture["tool_call_id"] == "typed"
+    assert capture["tool_name"] == "probe"
+    assert capture["arguments_shape"] == {
+        "expression": "str",
+        "options": {"dict": ["int", "bool", "NoneType", ["str", "str"]]},
+        "parameters": {"dict": [{"dict": ["int"]}]},
+        "user_facing_reason": "str",
+    }
+    assert capture["undeclared_argument_shapes"] == ["int"]
+    expected_bytes = json.dumps(arguments, ensure_ascii=False).encode()
+    assert capture["arguments_sha256"] == hashlib.sha256(expected_bytes).hexdigest()
+
+
+_FRAME_SIZE = (1400, 900)
+
+
+def _stage_frame(ctx: CopilotContext, image_format: str = "PNG", color: str = "white") -> bool:
+    buf = io.BytesIO()
+    Image.new("RGB", _FRAME_SIZE, color).save(buf, format=image_format)
+    return enqueue_screenshot(
+        ctx,
+        base64.b64encode(buf.getvalue()).decode(),
+        provenance=ScreenshotProvenance.unknown(source_tool="click"),
+    )
+
+
+def _click_round_trip() -> list[RunItemStreamEvent]:
+    return [_tool_called_event("c1", "click"), _tool_output_event("c1")]
+
+
+def _saved_screenshots(ctx: CopilotContext) -> list[dict[str, str]] | None:
+    """What a reloaded chat receives: the history model drops payload keys it does not declare."""
+    reloaded = WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
+        content="Finished",
+        created_at=datetime.now(UTC),
+        narrative_payload=_build_narrative_payload(
+            ctx, terminal="response", terminal_message="Finished", narrative_summary=None
+        ),
+    )
+    return reloaded.model_dump(mode="json")["narrative_payload"].get("screenshots")
+
+
+@pytest.fixture
+def chat_screenshot_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """The real artifact manager over local storage; only the row insert is faked."""
+    rows: list[dict[str, Any]] = []
+
+    async def create_artifact(
+        artifact_id: str, artifact_type: ArtifactType, uri: str, *, organization_id: str, **stamps: str | int | None
+    ) -> Artifact:
+        rows.append({"artifact_id": artifact_id, "uri": uri, "organization_id": organization_id, **stamps})
+        now = datetime.now(UTC)
+        return Artifact(
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            organization_id=organization_id,
+            created_at=now,
+            modified_at=now,
+        )
+
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
+    monkeypatch.setattr(app, "STORAGE", LocalStorage(str(tmp_path)))
+    monkeypatch.setattr(app.DATABASE.artifacts, "create_artifact", create_artifact)
+    return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_format", "client_gone"), [("PNG", False), ("JPEG", True)])
+async def test_a_frame_staged_for_the_model_is_stored_once_for_the_chat(
+    chat_screenshot_rows: list[dict[str, Any]], source_format: str, client_gone: bool
+) -> None:
+    ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
+    with capturing_tool_call("c1"):
+        assert _stage_frame(ctx, source_format)
+    assert _stage_frame(ctx, source_format)
+    sent: list[Any] = []
+    result = MagicMock(stream_events=lambda: _stream_events_from(*_click_round_trip()))
+
+    with skyvern_context.scoped(SkyvernContext(run_id="pbs_other", workflow_run_id="wr_other", task_id="tsk_other")):
+        await stream_to_sse(result, _sink_stream(sent, disconnected=client_gone), ctx)
+
+    [row] = chat_screenshot_rows
+    assert (row["organization_id"], row["workflow_run_id"], row["run_id"], row["task_id"]) == (
+        "org_test",
+        None,
+        None,
+        None,
+    )
+    assert "/logs/workflow_copilot_chat/wcc_1/" in row["uri"]
+    with Image.open(parse_uri_to_path(row["uri"])) as stored:
+        assert (stored.format, stored.size) == ("PNG", _FRAME_SIZE)
+    [saved] = _saved_screenshots(ctx) or []
+    assert (saved["artifactId"], saved["toolCallId"]) == (row["artifact_id"], "c1")
+    assert datetime.fromisoformat(saved["capturedAt"]).utcoffset() == timedelta(0)
+
+    if client_gone:
+        assert sent == []
+        return
+    frames = [p for p in sent if p.type in ("screenshot", WorkflowCopilotStreamMessageType.TOOL_RESULT)]
+    assert [p.type for p in frames] == ["screenshot", WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    wire = frames[0].model_dump(mode="json")
+    assert wire == {
+        "type": "screenshot",
+        "artifact_id": row["artifact_id"],
+        "captured_at": wire["captured_at"],
+        "tool_call_id": "c1",
+    }
+    assert saved["capturedAt"] == frames[0].captured_at.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [{"workflow_copilot_chat_id": "wcc_1", "supports_vision": False}, {"workflow_copilot_chat_id": None}],
+    ids=["model_has_no_vision", "turn_has_no_chat"],
+)
+async def test_no_frame_reaches_the_chat_without_vision_or_a_chat(
+    chat_screenshot_rows: list[dict[str, Any]], overrides: dict[str, Any]
+) -> None:
+    ctx = _test_copilot_context(**overrides)
+    _stage_frame(ctx)
+
+    sent = await _drive(_click_round_trip(), ctx)
+
+    assert chat_screenshot_rows == []
+    assert "screenshot" not in [p.type for p in sent]
+    assert _saved_screenshots(ctx) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_fault", ["refuses", "stalls"])
+async def test_a_failed_screenshot_upload_leaves_the_tool_result_as_it_was(
+    chat_screenshot_rows: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch, storage_fault: str
+) -> None:
+    dictation_upload = asyncio.create_task(asyncio.Event().wait())
+    app.ARTIFACT_MANAGER.upload_aiotasks_map["wcc_1"].append(dictation_upload)
+    dictation_waits: list[asyncio.Task[None]] = []
+    save_budgets: list[asyncio.Timeout] = []
+    save_budget_delays: list[float | None] = []
+
+    def save_budget(delay: float | None) -> asyncio.Timeout:
+        save_budget_delays.append(delay)
+        save_budgets.append(asyncio.timeout(delay))
+        return save_budgets[-1]
+
+    async def refuse(artifact: Artifact, data: bytes) -> None:
+        # A dictation request for the same chat starts waiting while this upload is in flight.
+        dictation_waits.append(asyncio.create_task(app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(["wcc_1"])))
+        if storage_fault == "stalls":
+            # Expire the save budget only once the upload is in flight; a short real budget let a slow
+            # runner expire it before the upload started.
+            save_budgets[-1].reschedule(asyncio.get_running_loop().time())
+            await asyncio.Event().wait()
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(app.STORAGE, "store_artifact", refuse)
+    monkeypatch.setattr(streaming_adapter_module, "asyncio", ScopedAsyncio(timeout=save_budget))
+
+    def tool_results(sent: list[Any]) -> list[dict[str, Any]]:
+        return [
+            p.model_dump(exclude={"timestamp", "activity_started_at"})
+            for p in sent
+            if p.type == WorkflowCopilotStreamMessageType.TOOL_RESULT
+        ]
+
+    undisturbed = await _drive(_click_round_trip(), _test_copilot_context(workflow_copilot_chat_id="wcc_1"))
+    ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
+    assert _stage_frame(ctx)
+
+    # Count only the saves made by the drive under test, not by the undisturbed drive above.
+    save_budgets.clear()
+    save_budget_delays.clear()
+    try:
+        sent = await _drive(_click_round_trip(), ctx)
+        await asyncio.sleep(0)
+
+        # Pins the production save budget, not just the constant's name.
+        assert save_budget_delays == [5]
+        assert [budget.expired() for budget in save_budgets] == [storage_fault == "stalls"]
+        assert "screenshot" not in [p.type for p in sent]
+        assert _saved_screenshots(ctx) is None
+        assert len(tool_results(sent)) == 1
+        assert tool_results(sent) == tool_results(undisturbed)
+        every_upload = [u for uploads in app.ARTIFACT_MANAGER.upload_aiotasks_map.values() for u in uploads]
+        assert [u for u in every_upload if not u.done()] == [dictation_upload]
+        assert [wait.done() for wait in dictation_waits] == [False]
+    finally:
+        for task in [*dictation_waits, dictation_upload]:
+            task.cancel()
+        app.ARTIFACT_MANAGER.upload_aiotasks_map.pop("wcc_1", None)
+
+
+@pytest.mark.asyncio
+async def test_every_distinct_frame_one_tool_staged_reaches_the_chat_in_order(
+    chat_screenshot_rows: list[dict[str, Any]],
+) -> None:
+    ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
+    for color in ("white", "black", "red"):
+        assert _stage_frame(ctx, color=color)
+
+    sent = await _drive(_click_round_trip(), ctx)
+
+    stored = [row["artifact_id"] for row in chat_screenshot_rows]
+    assert len(stored) == 3
+    assert [p.artifact_id for p in sent if p.type == "screenshot"] == stored
+    assert [shot["artifactId"] for shot in _saved_screenshots(ctx) or []] == stored
+
+
+@pytest.mark.asyncio
+async def test_goal_satisfied_flush_stores_the_frame_its_tool_staged(
+    chat_screenshot_rows: list[dict[str, Any]],
+) -> None:
+    ctx = _test_copilot_context(
+        workflow_copilot_chat_id="wcc_1",
+        in_flight_stream_tool_call=InFlightStreamToolCall(call_id="c9", tool_name="update_workflow", iteration=2),
+        goal_satisfied_tool_output={"ok": True, "data": {"block_count": 1}},
+    )
+    _fixture_pending_identity(ctx)
+    assert _stage_frame(ctx)
+    sent: list[Any] = []
+
+    await flush_goal_satisfied_tool_result(_sink_stream(sent), ctx)
+
+    assert [p.type for p in sent] == ["screenshot", WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [shot["artifactId"] for shot in _saved_screenshots(ctx) or []] == [chat_screenshot_rows[0]["artifact_id"]]

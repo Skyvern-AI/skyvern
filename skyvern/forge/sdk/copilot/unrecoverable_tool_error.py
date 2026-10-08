@@ -1,12 +1,18 @@
 """Unrecoverable browser-session tool-error detection, shared by enforcement and the stream adapter."""
 
+from __future__ import annotations
+
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
 LOG = structlog.get_logger()
 
@@ -37,6 +43,11 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "skyvern_frame_list",
         "skyvern_frame_switch",
         "skyvern_frame_main",
+        "skyvern_tab_list",
+        "skyvern_tab_new",
+        "skyvern_tab_switch",
+        "skyvern_tab_close",
+        "run_browser_code",
     }
 )
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
@@ -65,13 +76,18 @@ def _result_text_values(value: Any) -> list[str]:
     return []
 
 
+def _result_text_without_page_state(output: dict[str, Any]) -> str:
+    # The top-level page_state carries the page's own title, and a page can title itself anything.
+    return " ".join(_result_text_values({key: item for key, item in output.items() if key != "page_state"}))
+
+
 def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
     raw_reason = output.get("error")
     if not isinstance(raw_reason, str) or not raw_reason.strip():
         data = output.get("data")
         raw_reason = data.get("failure_reason") if isinstance(data, dict) else None
     if not isinstance(raw_reason, str) or not raw_reason.strip():
-        raw_reason = " ".join(_result_text_values(output))
+        raw_reason = _result_text_without_page_state(output)
     reason = " ".join(str(raw_reason or "Browser session was no longer reachable.").split())
     reason = redact_browser_session_references(reason)
     return reason[:240].rstrip()
@@ -80,7 +96,11 @@ def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
 def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, Any]) -> bool:
     if tool_name not in _BROWSER_SESSION_TOOL_NAMES or output.get("ok", True):
         return False
-    lowered = " ".join(_result_text_values(output)).lower()
+    # The typed code comes first: run_browser_code names a lost browser this way, in prose that carries
+    # neither "not found" nor a status, and the same dead browser must count whichever tool met it.
+    if output.get("error_code") == BROWSER_SESSION_UNAVAILABLE_ERROR_CODE:
+        return True
+    lowered = _result_text_without_page_state(output).lower()
     if "no browser context" in lowered:
         return True
     has_session_signal = "browser session" in lowered or "browser context" in lowered
@@ -88,7 +108,7 @@ def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, An
     return has_session_signal and has_lost_signal
 
 
-def _record_unrecoverable_tool_error_contract(ctx: Any, tool_name: str, reason: str) -> None:
+def _record_unrecoverable_tool_error_contract(ctx: CopilotContext, tool_name: str, reason: str) -> None:
     result = {
         "ok": False,
         "error": reason,
@@ -114,7 +134,7 @@ def _record_unrecoverable_tool_error_contract(ctx: Any, tool_name: str, reason: 
         pass
 
 
-def _maybe_raise_unrecoverable_tool_error(ctx: Any, tool_name: str, output: dict[str, Any]) -> None:
+def _maybe_raise_unrecoverable_tool_error(ctx: CopilotContext, tool_name: str, output: dict[str, Any]) -> None:
     if not _is_unrecoverable_browser_session_error(tool_name, output):
         if tool_name in _BROWSER_SESSION_TOOL_NAMES and output.get("ok", False):
             ctx.unrecoverable_tool_error_streak_count = 0

@@ -21,7 +21,11 @@ import structlog
 from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.config import settings
-from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS, SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION
+from skyvern.core.script_generations.constants import (
+    SCRIPT_TASK_BLOCKS,
+    SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION,
+    engine_only_loop_child_types,
+)
 from skyvern.core.script_generations.deterministic_field_naming import (
     infer_credential_subscript_for_emit,
     pick_credential_root_for_block,
@@ -1570,6 +1574,10 @@ def _build_block_fn(
         )
     else:
         for act in actions:
+            # Internal-recovery closes are runtime-synthesized and have no ACTION_MAP entry; skip
+            # only the marked ones so user-authored close_page semantics are left untouched.
+            if act.get("is_internal_recovery"):
+                continue
             if act["action_type"] in [
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
@@ -2448,6 +2456,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             )
         )
 
+    if block.get("worksheet"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("worksheet"),
+                value=_value(block.get("worksheet")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -2901,10 +2921,7 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     # Create the for loop target (current_value)
     target = cst.Name("current_value")
 
-    # Build body statements from loop_blocks
     body_statements = []
-
-    # Add loop_data assignment as the first statement
     for loop_block in loop_blocks:
         stmt = _build_block_statement(loop_block)
         body_statements.append(stmt)
@@ -3273,7 +3290,20 @@ def _build_block_statement(
 
 
 def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> FunctionDef:
-    body = [
+    body: list[cst.BaseStatement] = []
+    # Loop code cannot run an engine-only child (a conditional would run every branch), so refuse before setup.
+    held = ", ".join(
+        f"{block.get('label')!r} ({', '.join(sorted(child_type.value for child_type in child_types))})"
+        for block in blocks
+        if (child_types := engine_only_loop_child_types(block))
+    )
+    if held:
+        message = (
+            "This script cannot run end to end because these loops hold blocks that only a workflow run "
+            f"executes: {held}. Run it as a workflow run instead."
+        )
+        body.append(cst.parse_statement(f"raise RuntimeError({message!r})"))
+    body += [
         cst.parse_statement(
             "parameters = parameters.model_dump() if isinstance(parameters, WorkflowParameters) else parameters"
         ),

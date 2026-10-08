@@ -1,3 +1,8 @@
+import {
+  useWorkflowHasChangesStore,
+  useWorkflowSave,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
 import { usePostHog } from "posthog-js/react";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
@@ -10,18 +15,23 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useOnChange } from "@/hooks/useOnChange";
+import {
+  flushBufferedEditorEdits,
+  subscribeToBufferedEdits,
+} from "@/hooks/useDeferredLockedEdit";
 import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
-import {
-  useWorkflowHasChangesStore,
-  useWorkflowSave,
-  type WorkflowSaveData,
-} from "@/store/WorkflowHasChangesStore";
+
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
+  selectEditorMutationLocked,
   commitYamlDraft,
+  refuseMutationDuringYamlCommit,
+  filterWorkflowChanges,
+  isWorkflowMutation,
+  isLockedByOther,
   subscribeToYamlDraftChanges,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
@@ -66,7 +76,6 @@ import {
 import { useDebouncedCallback } from "use-debounce";
 import { useBlocker, useParams } from "react-router-dom";
 import {
-  AWSSecretParameter,
   debuggableWorkflowBlockTypes,
   WorkflowApiResponse,
   WorkflowEditorParameterTypes,
@@ -80,7 +89,6 @@ import {
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
   AzureVaultCredentialParameterYAML,
-  ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
 import {
@@ -102,6 +110,7 @@ import {
 } from "./collapse/useNodeCollapseStore";
 import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import {
+  centeredNodeViewport,
   isMeaningfulPaneResize,
   isViewportStranded,
   PANE_FIT_DEBOUNCE_MS,
@@ -109,9 +118,9 @@ import {
   paneRefitDuration,
   relayoutDriftCorrection,
   START_ANCHOR_MIN_ZOOM,
-  startAnchoredViewport,
 } from "./paneFit";
 import { useBlockerExit } from "./useBlockerExit";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { FlowJumpControls } from "./controls/FlowJumpControls";
@@ -122,6 +131,7 @@ import { ZoomInControl } from "./controls/ZoomInControl";
 import { ZoomOutControl } from "./controls/ZoomOutControl";
 import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import { OPEN_WORKFLOW_SETTINGS_EVENT } from "./nodes/StartNode/types";
+import { useLocateBlockStore } from "./runValidation/useLocateBlockStore";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -136,7 +146,6 @@ import {
   createNode,
   descendants,
   generateNodeLabel,
-  getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
@@ -154,7 +163,6 @@ import {
   processDimensionChanges,
   resetDimensionConvergence,
 } from "./dimensionConvergence";
-import { hasStructuralNodeChange } from "./structuralNodeChanges";
 import { useCanvasSelectionSync } from "./hooks/useCanvasSelectionSync";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
@@ -195,9 +203,12 @@ import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
 import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
 import {
+  beginFocusGeneration,
   blockJumpDuration,
   collectBlockSearchTargets,
   focusBlockTarget,
+  invalidateFocusGeneration,
+  type FocusFraming,
   waitForNodeSettle,
 } from "../studio/blockSearch";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
@@ -398,6 +409,7 @@ type Props = {
   onEdgesChange: (changes: Array<EdgeChange>) => void;
   initialTitle: string;
   workflow: WorkflowApiResponse;
+  parameterBaseline?: WorkflowApiResponse["workflow_definition"]["parameters"];
   onDebuggableBlockCountChange?: (count: number) => void;
   onMouseDownCapture?: () => void;
   zIndex?: number;
@@ -441,6 +453,8 @@ type Props = {
   // Studio pane-layout key (open set + committed divider widths); a change
   // recenters the canvas once the layout settles.
   paneLayoutKey?: string;
+  // A new Studio visit can reuse this mounted canvas.
+  paneEntryKey?: number;
 };
 
 function FlowRenderer({
@@ -455,6 +469,7 @@ function FlowRenderer({
   onEdgesChange,
   initialTitle,
   workflow,
+  parameterBaseline = workflow.workflow_definition.parameters,
   onDebuggableBlockCountChange,
   onMouseDownCapture,
   zIndex,
@@ -467,6 +482,7 @@ function FlowRenderer({
   centerOffsetX = 0,
   embedded = false,
   paneLayoutKey,
+  paneEntryKey,
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
@@ -474,7 +490,11 @@ function FlowRenderer({
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
   const isCanvasLocked = useIsCanvasLocked();
-  const { title, initializeTitle } = useWorkflowTitleStore();
+  const hydrationLocked = useWorkflowYamlEditorStore(
+    selectEditorMutationLocked,
+  );
+  const { title, description, initializeTitle, initializeDescription } =
+    useWorkflowTitleStore();
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const finallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
@@ -652,6 +672,7 @@ function FlowRenderer({
       const meta = event.metaKey || event.ctrlKey;
       if (event.shiftKey && (event.key === "!" || event.key === "1")) {
         event.preventDefault();
+        lastCanvasInteractionAtRef.current = Date.now();
         runFitViewRef.current?.();
         return;
       }
@@ -732,23 +753,73 @@ function FlowRenderer({
     // In read-only / comparison renders the title from a historical version
     // would otherwise overwrite the live editor title and the next user
     // save would persist that stale comparison title.
-    if (readOnly) return;
-    initializeTitle(initialTitle);
-  }, [initialTitle, initializeTitle, readOnly]);
+    if (readOnly || hydrationLocked) return;
+    initializeTitle(initialTitle, workflow.workflow_permanent_id);
+  }, [
+    initialTitle,
+    workflow.workflow_permanent_id,
+    initializeTitle,
+    readOnly,
+    hydrationLocked,
+  ]);
+
+  useEffect(() => {
+    if (readOnly || hydrationLocked) return;
+    initializeDescription(workflow.workflow_permanent_id, workflow.description);
+  }, [
+    workflow.workflow_permanent_id,
+    workflow.description,
+    initializeDescription,
+    readOnly,
+    hydrationLocked,
+  ]);
 
   const workflowChangesStore = useWorkflowHasChangesStore();
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
   useShouldNotifyWhenClosingTab(!readOnly && workflowChangesStore.hasChanges);
+  const pendingGoalChanges = useCopilotActionStore(
+    (state) => state.pendingGoalChanges,
+  );
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
+    if (readOnly || nextLocation.pathname === currentLocation.pathname) {
+      return false;
+    }
+    // A Goal change can be saved without being applied (API writes, or a proposal accepted for
+    // another block), so Run has to ask even when nothing is unsaved.
     return (
-      !readOnly &&
-      workflowChangesStore.hasChanges &&
-      nextLocation.pathname !== currentLocation.pathname
+      workflowChangesStore.hasChanges ||
+      (pendingGoalChanges.length > 0 &&
+        nextLocation.pathname ===
+          `/agents/${workflow.workflow_permanent_id}/run`)
     );
   });
   const blockerExit = useBlockerExit(blocker);
+  const unsavedResolutionCapturedRef = useRef(false);
+
+  useEffect(() => {
+    if (blocker.state === "blocked") {
+      unsavedResolutionCapturedRef.current = false;
+    }
+  }, [blocker.state]);
+
+  const captureUnsavedResolution = (
+    choice: "stay" | "discard" | "save" | "apply_goal",
+  ) => {
+    if (unsavedResolutionCapturedRef.current) {
+      return;
+    }
+    unsavedResolutionCapturedRef.current = true;
+    postHog.capture("builder.unsaved_changes.resolved", {
+      org_id: workflow.organization_id,
+      workflow_permanent_id: workflow.workflow_permanent_id,
+      choice,
+    });
+  };
+  const applyPendingGoalChanges = useCopilotActionStore(
+    (state) => state.applyPendingGoalChanges,
+  );
 
   // Studio-only: list what changed inside the leave/run unsaved-changes modal.
   // Memoized on the blocked state so it runs once when the modal opens (the
@@ -769,8 +840,14 @@ function FlowRenderer({
     }
   }, [embedded, isNavBlocked]);
 
+  const pendingLayoutRef = useRef(false);
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
+      if (refuseMutationDuringYamlCommit()) {
+        pendingLayoutRef.current = true;
+        return null;
+      }
+      pendingLayoutRef.current = false;
       const layoutedElements = layout(nodes, edges, targettedBlockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
@@ -783,6 +860,10 @@ function FlowRenderer({
   // when copy-pasting triggers rapid successive dimension changes
   const debouncedLayoutForDimensions = useDebouncedCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
+      if (isLockedByOther()) {
+        pendingLayoutRef.current = true;
+        return;
+      }
       if (isLayoutingRef.current) {
         return;
       }
@@ -801,6 +882,7 @@ function FlowRenderer({
         // fit/jump is animating so the two don't fight.
         const startBefore = tempNodes.find((node) => node.type === "start");
         const layoutedElements = doLayout(tempNodes, currentEdges);
+        if (!layoutedElements) return;
         if (startBefore && !fitViewInProgressRef.current) {
           const startAfter = layoutedElements.nodes.find(
             (node) => node.id === startBefore.id,
@@ -835,9 +917,34 @@ function FlowRenderer({
     { leading: true, trailing: true, maxWait: 200 },
   );
 
+  const queueDimensionLayout = useCallback(
+    (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
+      // The measured size is already stored on the node, so a dropped layout
+      // never re-triggers; replay it once the lock clears.
+      if (isLockedByOther()) {
+        pendingLayoutRef.current = true;
+        return;
+      }
+      debouncedLayoutForDimensions(tempNodes, currentEdges);
+    },
+    [debouncedLayoutForDimensions],
+  );
+
   useEffect(() => {
+    return useWorkflowYamlEditorStore.subscribe((state, previous) => {
+      if (
+        (state.commitInProgress && !previous.commitInProgress) ||
+        (state.copilotAcceptance && !previous.copilotAcceptance)
+      ) {
+        debouncedLayoutForDimensions.cancel();
+      }
+    });
+  }, [debouncedLayoutForDimensions]);
+
+  useEffect(() => {
+    if (hydrationLocked) return;
     if (nodesInitialized && !hasCompletedInitialLoad.current) {
-      doLayout(nodes, edges);
+      if (!doLayout(nodes, edges)) return;
       // After Dagre computes positions, wait one frame for the DOM to update
       // with new positions, then fade in the nodes/edges at their final positions.
       const rafId = requestAnimationFrame(() => {
@@ -861,7 +968,7 @@ function FlowRenderer({
     // re-running on every nodes/edges/doLayout change would re-trigger the
     // pre-layout fade after every edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodesInitialized]);
+  }, [nodesInitialized, hydrationLocked]);
 
   // Re-layout when the targeted block changes to account for the status row
   // that appears when a block is being debugged
@@ -890,6 +997,12 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targettedBlockLabel, nodesInitialized]);
 
+  useEffect(() => {
+    if (hydrationLocked || !pendingLayoutRef.current) return;
+    // The transaction may have replaced the graph since layout was requested.
+    doLayout(nodes, edges);
+  }, [hydrationLocked, nodes, edges, doLayout]);
+
   // Re-layout when a loop node's header height changes (e.g., data schema toggled)
   useEffect(() => {
     const timerRef: { current: ReturnType<typeof setTimeout> | null } = {
@@ -903,7 +1016,7 @@ function FlowRenderer({
         timerRef.current = null;
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
-        debouncedLayoutForDimensions(currentNodes, currentEdges);
+        queueDimensionLayout(currentNodes, currentEdges);
         collapseRelayoutBeforeDebounceRef.current = false;
       }, 10);
     };
@@ -916,7 +1029,7 @@ function FlowRenderer({
       );
       if (timerRef.current !== null) clearTimeout(timerRef.current);
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
   useEffect(() => {
@@ -931,7 +1044,7 @@ function FlowRenderer({
         timerRef.current = null;
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
-        debouncedLayoutForDimensions(currentNodes, currentEdges);
+        queueDimensionLayout(currentNodes, currentEdges);
         collapseRelayoutBeforeDebounceRef.current = false;
       }, 10);
     };
@@ -947,7 +1060,7 @@ function FlowRenderer({
       );
       if (timerRef.current !== null) clearTimeout(timerRef.current);
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   // Re-layout when a workflow trigger node's async content changes
   // (e.g., target workflow parameters finish loading, skeleton → actual fields)
@@ -961,7 +1074,7 @@ function FlowRenderer({
         timerRef.current = null;
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
-        debouncedLayoutForDimensions(currentNodes, currentEdges);
+        queueDimensionLayout(currentNodes, currentEdges);
       }, 10);
     };
 
@@ -976,7 +1089,7 @@ function FlowRenderer({
       );
       if (timerRef.current !== null) clearTimeout(timerRef.current);
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
@@ -1006,38 +1119,26 @@ function FlowRenderer({
       );
     const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
-    const filteredParameters = workflow.workflow_definition.parameters.filter(
-      (parameter) => {
-        return parameter.parameter_type === "aws_secret";
-      },
-    ) as Array<AWSSecretParameter>;
-
-    const echoParameters = convertEchoParameters(filteredParameters);
-
-    const overallParameters = [
-      ...parameters,
-      ...echoParameters,
-    ] as Array<ParameterYAML>;
-
-    // if there is an email node, we need to add the email aws secret parameters
-    const emailAwsSecretParameters = getAdditionalParametersForEmailBlock(
-      upgradedBlocks,
-      overallParameters,
-    );
+    const echoParameters = convertEchoParameters(parameterBaseline);
 
     return {
-      parameters: [
-        ...echoParameters,
-        ...parametersInYAMLConvertibleJSON,
-        ...emailAwsSecretParameters,
-      ],
+      parameters: [...echoParameters, ...parametersInYAMLConvertibleJSON],
       blocks: upgradedBlocks,
       workflowDefinitionVersion,
       title,
+      description,
       settings,
       workflow,
     };
-  }, [nodes, edges, parameters, title, workflow]);
+  }, [
+    nodes,
+    edges,
+    parameters,
+    parameterBaseline,
+    title,
+    description,
+    workflow,
+  ]);
 
   // Studio unsaved-changes baseline: freeze a clean snapshot at the
   // first user interaction after a load/save, so post-load canvas
@@ -1091,11 +1192,13 @@ function FlowRenderer({
     document.addEventListener("pointerup", onPointerUp, true);
     document.addEventListener("pointercancel", onPointerUp, true);
     document.addEventListener("keydown", onKeyDown, true);
+    const unsubscribeBufferedEdits = subscribeToBufferedEdits(markGesture);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("pointerup", onPointerUp, true);
       document.removeEventListener("pointercancel", onPointerUp, true);
       document.removeEventListener("keydown", onKeyDown, true);
+      unsubscribeBufferedEdits();
     };
   }, [embedded, readOnly]);
 
@@ -1145,14 +1248,30 @@ function FlowRenderer({
     setGetSaveDataRef.current(constructSaveData);
   }, [constructSaveData, readOnly]);
 
+  const hasBlockNode = nodes.some(isWorkflowBlockNode);
+  useEffect(() => {
+    if (readOnly) {
+      return;
+    }
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: hasBlockNode });
+  }, [hasBlockNode, readOnly]);
+  useEffect(() => {
+    if (readOnly) {
+      return;
+    }
+    return () => useWorkflowHasChangesStore.setState({ editorHasBlocks: null });
+  }, [readOnly]);
+
   async function handleSave(): Promise<boolean> {
     // With the YAML editor open (e.g. the nav-blocker "Save changes" dialog),
     // persist the parsed draft directly instead of the stale pre-edit canvas.
     if (useWorkflowYamlEditorStore.getState().active) {
       return commitYamlDraft(true);
     }
-    // Validate before saving; block if any workflow errors exist
-    const errors = getWorkflowErrors(nodes);
+    useWorkflowYamlEditorStore.getState().flushDraft?.();
+    flushBufferedEditorEdits();
+    const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+    const errors = getWorkflowErrors(currentNodes);
     if (errors.length > 0) {
       toast({
         title: "Can not save workflow because of errors:",
@@ -1167,8 +1286,12 @@ function FlowRenderer({
       });
       return false;
     }
-    await saveWorkflow.mutateAsync(undefined);
-    return true;
+    try {
+      await saveWorkflow.mutateAsync(undefined);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   const deleteNode = useCallback(
@@ -1232,8 +1355,15 @@ function FlowRenderer({
       );
 
       workflowChangesStore.setHasChanges(true);
+      const { pendingRecordingId, pendingRecordingWorkflowPermanentId } =
+        useWorkflowHasChangesStore.getState();
       postHog.capture("builder.block.removed", {
         org_id: workflow.organization_id,
+        workflow_permanent_id: workflow.workflow_permanent_id,
+        pending_recording_id:
+          pendingRecordingWorkflowPermanentId === workflow.workflow_permanent_id
+            ? (pendingRecordingId ?? undefined)
+            : undefined,
         block_type: blockTypeFromNode(node) ?? node.type,
       });
 
@@ -1260,6 +1390,7 @@ function FlowRenderer({
       workflowChangesStore,
       postHog,
       workflow.organization_id,
+      workflow.workflow_permanent_id,
     ],
   );
 
@@ -1305,6 +1436,7 @@ function FlowRenderer({
       workflowChangesStore.setHasChanges(true);
       postHog.capture("builder.block.duplicated", {
         org_id: workflow.organization_id,
+        workflow_permanent_id: workflow.workflow_permanent_id,
         position: result.position,
         source_block_id: id,
       });
@@ -1320,6 +1452,7 @@ function FlowRenderer({
       workflowChangesStore,
       postHog,
       workflow.organization_id,
+      workflow.workflow_permanent_id,
     ],
   );
 
@@ -1407,7 +1540,7 @@ function FlowRenderer({
           relayoutFrame = null;
           const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
           const currentEdges = reactFlowInstance.getEdges();
-          debouncedLayoutForDimensions(currentNodes, currentEdges);
+          queueDimensionLayout(currentNodes, currentEdges);
         });
       });
     };
@@ -1418,7 +1551,7 @@ function FlowRenderer({
         cancelAnimationFrame(relayoutFrame);
       }
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   // Ordered ids of the top-level sortable siblings. M2 extends this with a
   // scope per loop container and per conditional branch
@@ -1747,7 +1880,11 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
   useAutoGenerateWorkflowTitle(nodes, edges, readOnly);
-  useResolveDefaultGoogleSheetsCredential(nodes, readOnly);
+  useResolveDefaultGoogleSheetsCredential(
+    nodes,
+    readOnly,
+    workflow.workflow_permanent_id ?? null,
+  );
 
   useEffect(() => {
     doLayout(nodes, edges);
@@ -1778,11 +1915,12 @@ function FlowRenderer({
   // Studio pane fit. The editor pane can mount hidden (display:none while
   // closed) and resizes in discrete steps as sibling panes toggle. Fit once
   // when the initial Dagre pass has settled AND the pane is visible; after
-  // that, a pane-layout change (?panes=) recenters once the flex layout
+  // that, a pane-layout change recenters once the flex layout
   // settles, and a debounced ResizeObserver re-fits only when a real
   // geometry change leaves the viewport stranded, so neither path fights a
   // deliberate pan/zoom.
   const hasInitialPaneFitRef = useRef(false);
+  const initialPaneInteractionAtRef = useRef(0);
   const lastPaneSizeRef = useRef<{ width: number; height: number } | null>(
     null,
   );
@@ -1790,8 +1928,13 @@ function FlowRenderer({
   const paneLayoutChangedAtRef = useRef(0);
   const paneSettleTimerRef = useRef<number | null>(null);
   const paneSettleRef = useRef<(() => void) | null>(null);
+  const initialPaneTargetRef = useRef<{
+    nodeId: string;
+    ready: boolean;
+    interactionAt: number;
+  } | null>(null);
   const layoutSettledRef = useRef(false);
-  layoutSettledRef.current = layoutPhase !== "pre-layout";
+  layoutSettledRef.current = layoutPhase === "ready" && nodesInitialized;
 
   // One debounce shared by the ResizeObserver and pane-layout changes, so a
   // recenter fires once, after the last of the layout event and its resize
@@ -1806,30 +1949,28 @@ function FlowRenderer({
     }, PANE_FIT_DEBOUNCE_MS);
   }, []);
 
-  // Anchors the flow's start at the pane top instead of centering the whole
-  // graph, matching the legacy editor's default zoom on long workflows.
-  const runStartAnchoredFit = useCallback(
+  const centerEntryTarget = useCallback(
     (pane: { width: number; height: number }) => {
-      const visibleNodes = reactFlowInstance
-        .getNodes()
-        .filter((node) => !node.hidden);
-      if (visibleNodes.length === 0) {
-        return;
-      }
-      const viewport = startAnchoredViewport({
+      const target = initialPaneTargetRef.current;
+      if (!target?.ready) return false;
+      const node = reactFlowInstance.getNode(target.nodeId);
+      const internal = reactFlowInstance.getInternalNode(target.nodeId);
+      if (!node || node.hidden || !internal) return false;
+      const viewport = centeredNodeViewport({
         pane,
-        bounds: getNodesBounds(visibleNodes),
+        bounds: {
+          ...internal.internals.positionAbsolute,
+          width: internal.measured.width ?? 0,
+          height: internal.measured.height ?? 0,
+        },
       });
-      if (viewport === null) {
-        return;
-      }
-      // The initial anchor is deliberately instant (no animation, unlike the
-      // recenter below); 50ms just covers the viewport state flush.
+      if (!viewport) return false;
       fitViewInProgressRef.current = true;
-      reactFlowInstance.setViewport(viewport);
+      void reactFlowInstance.setViewport(viewport);
       window.setTimeout(() => {
         fitViewInProgressRef.current = false;
       }, 50);
+      return true;
     },
     [reactFlowInstance],
   );
@@ -1878,18 +2019,52 @@ function FlowRenderer({
     };
   }, []);
 
+  // Each focus/locate bumps this; a run superseded by a later one turns its
+  // pan + selection into no-ops (and resolves false) so a rapid second Locate
+  // wins the viewport instead of racing the first, slower nested reveal.
+  const focusGenerationRef = useRef(0);
   const focusBlockForSearch = useCallback(
-    (nodeId: string) => {
+    (
+      nodeId: string,
+      entryIsCurrent?: () => boolean,
+      framing: FocusFraming = "top-anchored",
+    ) => {
+      const isCurrent = beginFocusGeneration(focusGenerationRef);
+      const canFocus = () =>
+        isCurrent() && (!entryIsCurrent || entryIsCurrent());
       const duration = blockJumpDuration();
-      const getNodes = () => reactFlowInstance.getNodes() as Array<AppNode>;
-      void focusBlockTarget(nodeId, {
+      if (!entryIsCurrent) {
+        lastCanvasInteractionAtRef.current = Date.now();
+      }
+      const getNodes = () =>
+        !canFocus() ? [] : (reactFlowInstance.getNodes() as Array<AppNode>);
+      return focusBlockTarget(nodeId, {
         getNodes,
         getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
         getPaneWidth: () =>
           editorElementRef.current?.getBoundingClientRect().width ?? 0,
+        getPaneHeight: () =>
+          editorElementRef.current?.getBoundingClientRect().height ?? 0,
+        // Read at landing time, not at click time: the header may be mid
+        // collapse/expand transition, and it slides fully off the pane.
+        // Queried from the document because Workspace renders the header as a
+        // sibling of this canvas, not a descendant of it.
+        getPaneTopInset: () => {
+          const pane = editorElementRef.current?.getBoundingClientRect();
+          const header = document
+            .querySelector("[data-workflow-editor-header]")
+            ?.getBoundingClientRect();
+          if (!pane || !header) {
+            return 0;
+          }
+          return Math.max(0, header.bottom - pane.top);
+        },
+        framing,
         viewportZoom: reactFlowInstance.getViewport().zoom,
         duration,
         setViewport: (viewport, options) => {
+          // Entry reuses reveal/settle, then centers once at fixed zoom.
+          if (entryIsCurrent || !canFocus()) return;
           // An explicit jump outranks any pending pane-layout recenter and,
           // like runFitView, must not be clamped by constrainPan mid-flight.
           lastCanvasInteractionAtRef.current = Date.now();
@@ -1903,8 +2078,16 @@ function FlowRenderer({
             fitViewInProgressRef.current = false;
           }, options.duration + 50);
         },
-        selectBlock: setSelectedBlockId,
+        selectBlock: (id) => {
+          if (!entryIsCurrent && canFocus()) {
+            setSelectedBlockId(id);
+          }
+        },
+        // Guarded like expandBlock: a superseded run must not arm the relayout
+        // gate, since its expandBlock no-op never fires the header-resize that
+        // disarms it, and waitForNodeSettle would time out on every later jump.
         beforeExpand: (label) => {
+          if (!canFocus()) return;
           const workflowId = workflow.workflow_permanent_id ?? "__global__";
           if (
             isBlockCollapsedAt(
@@ -1916,11 +2099,14 @@ function FlowRenderer({
             collapseRelayoutBeforeDebounceRef.current = true;
           }
         },
-        expandBlock: (label) =>
+        expandBlock: (label) => {
+          if (!canFocus()) return;
           useNodeCollapseStore
             .getState()
-            .expandBlock(workflow.workflow_permanent_id ?? "__global__", label),
+            .expandBlock(workflow.workflow_permanent_id ?? "__global__", label);
+        },
         switchBranch: (conditionalId, branchId) => {
+          if (!canFocus()) return;
           // Same write and dirty-state guard as the branch tab click
           // (BranchesEditor.handleSelectBranch): switching branches is UI
           // state, so the `replace` change must not mark the workflow dirty.
@@ -1944,9 +2130,10 @@ function FlowRenderer({
             getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
             isRelayoutPending: () =>
               collapseRelayoutBeforeDebounceRef.current ||
+              isLayoutingRef.current ||
               debouncedLayoutForDimensions.isPending(),
           }),
-      });
+      }).then((revealed) => revealed && canFocus());
     },
     [
       reactFlowInstance,
@@ -1976,27 +2163,100 @@ function FlowRenderer({
     };
   }, [embedded, readOnly, reactFlowInstance, focusBlockForSearch]);
 
+  // Locate (from the run-blocking panel) reuses the block-search focus engine:
+  // a target inside a collapsed loop or an inactive conditional branch is first
+  // revealed level by level, then panned into view — a plain fitView would land
+  // on empty space. Gated on readOnly only; the engine works on any live canvas
+  // (unlike the search-store registration above, which is studio-only).
+  // glow(0.85s) x 3 iterations; hold the pulse just past the last cycle.
+  const RUN_BLOCKING_LOCATE_PULSE_MS = 2600;
+  const locateRequest = useLocateBlockStore((s) => s.request);
+  const clearLocate = useLocateBlockStore((s) => s.clearLocate);
+  const startLocatePulse = useLocateBlockStore((s) => s.startPulse);
+  const clearLocatePulse = useLocateBlockStore((s) => s.clearPulse);
+  const locatePulseTimerRef = useRef<number | null>(null);
+  const locateMountedRef = useRef(true);
+
+  useEffect(() => {
+    if (readOnly || locateRequest === null) {
+      return;
+    }
+    const { nodeId } = locateRequest;
+    if (!reactFlowInstance.getNode(nodeId)) {
+      clearLocate();
+      return;
+    }
+    void focusBlockForSearch(nodeId, undefined, "centered").then((revealed) => {
+      // focusBlockForSearch folds in the supersession guard, so a newer Locate
+      // resolves this to false: skip the glow and leave the newer request
+      // untouched. Clearing here — not in a cleanup that the clear itself would
+      // re-fire — is what lets a collapsed/nested reveal finish and still glow.
+      // A reveal that resolves after unmount would set the shared pulse and a
+      // timer past the cleanup that could have cleared them, glowing a same-id
+      // node on the next canvas. Leave the request for that canvas to handle.
+      if (revealed === false || !locateMountedRef.current) {
+        return;
+      }
+      startLocatePulse(nodeId);
+      if (locatePulseTimerRef.current !== null) {
+        window.clearTimeout(locatePulseTimerRef.current);
+      }
+      locatePulseTimerRef.current = window.setTimeout(() => {
+        clearLocatePulse();
+        locatePulseTimerRef.current = null;
+      }, RUN_BLOCKING_LOCATE_PULSE_MS);
+      clearLocate();
+    });
+  }, [
+    locateRequest,
+    readOnly,
+    reactFlowInstance,
+    focusBlockForSearch,
+    clearLocate,
+    startLocatePulse,
+    clearLocatePulse,
+  ]);
+
+  useEffect(() => {
+    locateMountedRef.current = true;
+    return () => {
+      locateMountedRef.current = false;
+      invalidateFocusGeneration(focusGenerationRef);
+      if (locatePulseTimerRef.current !== null) {
+        window.clearTimeout(locatePulseTimerRef.current);
+      }
+      clearLocatePulse();
+    };
+  }, [clearLocatePulse]);
+
   // "initial-load" lands one frame after Dagre positions commit (mid fade-in),
   // so fitting here can't read pre-layout node positions. layoutPhase only
   // advances once nodesInitialized flips, but guard explicitly so a future
   // layout-phase refactor can't reintroduce a zero-size fit.
   useEffect(() => {
-    if (
-      !embedded ||
-      hasInitialPaneFitRef.current ||
-      layoutPhase === "pre-layout" ||
-      !nodesInitialized
-    ) {
-      return;
-    }
-    const rect = editorElementRef.current?.getBoundingClientRect();
-    if (!rect || rect.width === 0 || rect.height === 0) {
-      return;
-    }
-    hasInitialPaneFitRef.current = true;
-    lastPaneSizeRef.current = { width: rect.width, height: rect.height };
-    runStartAnchoredFit({ width: rect.width, height: rect.height });
-  }, [embedded, layoutPhase, nodesInitialized, runStartAnchoredFit]);
+    if (!embedded) return;
+    hasInitialPaneFitRef.current = false;
+    initialPaneInteractionAtRef.current = lastCanvasInteractionAtRef.current;
+    initialPaneTargetRef.current = null;
+    pendingPaneRecenterRef.current = false;
+    lastPaneSizeRef.current = null;
+    schedulePaneSettle();
+    return () => {
+      // Invalidate any reveal still awaiting branch/container layout.
+      initialPaneTargetRef.current = null;
+    };
+  }, [
+    embedded,
+    paneEntryKey,
+    workflow.workflow_permanent_id,
+    schedulePaneSettle,
+  ]);
+
+  // Final node measurements can arrive after the pane's own resize. Keep the
+  // entry target centered through those passes, until the user takes control.
+  useEffect(() => {
+    if (embedded) schedulePaneSettle();
+  }, [embedded, nodes, layoutPhase, nodesInitialized, schedulePaneSettle]);
 
   // Pane-set/order changes and committed divider resizes (drag release,
   // double-click reset, keyboard step) are explicit recenter triggers: they
@@ -2025,16 +2285,66 @@ function FlowRenderer({
     if (!el) {
       return;
     }
-    // Covers a pane that was hidden while layout settled; before that, the
-    // layout-phase effect above owns the first fit.
     const initialFit = (size: { width: number; height: number }) => {
-      if (!layoutSettledRef.current) {
+      if (!layoutSettledRef.current) return;
+      if (!initialPaneTargetRef.current) {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const selectedId = useWorkflowPanelStore.getState().selectedBlockId;
+        const node =
+          currentNodes.find(
+            (candidate) =>
+              candidate.id === selectedId && isWorkflowBlockNode(candidate),
+          ) ??
+          currentNodes.find(
+            (candidate) => candidate.type === "start" && !candidate.parentId,
+          );
+        if (!node) return;
+        const target = {
+          nodeId: node.id,
+          ready: false,
+          interactionAt: initialPaneInteractionAtRef.current,
+        };
+        initialPaneTargetRef.current = target;
+        const isCurrent = () =>
+          initialPaneTargetRef.current === target &&
+          lastCanvasInteractionAtRef.current === target.interactionAt;
+        const reveal = async () => {
+          if (isWorkflowBlockNode(node)) {
+            await focusBlockForSearch(node.id, isCurrent);
+          }
+          if (!isCurrent()) return;
+          // focusBlockTarget expands the selected block last. Wait again for
+          // that expansion's measurements, including nested absolute positions.
+          await waitForNodeSettle(node.id, {
+            getNodes: () =>
+              isCurrent()
+                ? (reactFlowInstance.getNodes() as Array<AppNode>)
+                : [],
+            getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
+            isRelayoutPending: () =>
+              isLayoutingRef.current ||
+              collapseRelayoutBeforeDebounceRef.current ||
+              debouncedLayoutForDimensions.isPending(),
+          });
+          if (!isCurrent()) return;
+          target.ready = true;
+          schedulePaneSettle();
+        };
+        void reveal();
         return;
       }
+      if (
+        isLayoutingRef.current ||
+        collapseRelayoutBeforeDebounceRef.current ||
+        debouncedLayoutForDimensions.isPending()
+      ) {
+        schedulePaneSettle();
+        return;
+      }
+      if (!centerEntryTarget(size)) return;
       hasInitialPaneFitRef.current = true;
       pendingPaneRecenterRef.current = false;
       lastPaneSizeRef.current = size;
-      runStartAnchoredFit(size);
     };
     const paneRecenter = (size: { width: number; height: number }) => {
       lastPaneSizeRef.current = size;
@@ -2071,7 +2381,25 @@ function FlowRenderer({
         return;
       }
       const size = { width: rect.width, height: rect.height };
+      const target = initialPaneTargetRef.current;
+      if (
+        (!hasInitialPaneFitRef.current || target) &&
+        lastCanvasInteractionAtRef.current !==
+          initialPaneInteractionAtRef.current
+      ) {
+        // A user gesture also cancels an entry reveal that is still waiting.
+        initialPaneTargetRef.current = null;
+        hasInitialPaneFitRef.current = true;
+        // Do not treat cancellation during entry as a stranded resize.
+        lastPaneSizeRef.current = size;
+      }
       if (!hasInitialPaneFitRef.current) {
+        initialFit(size);
+        return;
+      }
+      if (initialPaneTargetRef.current) {
+        // Initial pane-key effects must not replace the selected-node center
+        // with a whole-chain fit-width recenter.
         initialFit(size);
         return;
       }
@@ -2083,6 +2411,7 @@ function FlowRenderer({
       strandedRefit(size);
     };
     paneSettleRef.current = settle;
+    schedulePaneSettle();
     const markInteraction = () => {
       lastCanvasInteractionAtRef.current = Date.now();
     };
@@ -2091,12 +2420,15 @@ function FlowRenderer({
       passive: true,
     });
     el.addEventListener("pointerdown", markInteraction, { capture: true });
+    // Click also covers keyboard activation without intercepting key presses.
+    el.addEventListener("click", markInteraction, { capture: true });
     const observer = new ResizeObserver(() => {
       schedulePaneSettle();
     });
     observer.observe(el);
     return () => {
       observer.disconnect();
+      el.removeEventListener("click", markInteraction, { capture: true });
       el.removeEventListener("wheel", markInteraction, { capture: true });
       el.removeEventListener("pointerdown", markInteraction, {
         capture: true,
@@ -2112,7 +2444,9 @@ function FlowRenderer({
     reactFlowInstance,
     runFitView,
     runPaneRecenter,
-    runStartAnchoredFit,
+    centerEntryTarget,
+    focusBlockForSearch,
+    debouncedLayoutForDimensions,
     schedulePaneSettle,
   ]);
 
@@ -2221,16 +2555,31 @@ function FlowRenderer({
           open={blocker.state === "blocked"}
           onOpenChange={(open) => {
             if (!open) {
+              captureUnsavedResolution("stay");
               blockerExit.reset();
             }
           }}
         >
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Unsaved Changes</DialogTitle>
+              <DialogTitle>
+                {pendingGoalChanges.length === 0
+                  ? "Unsaved Changes"
+                  : pendingGoalChanges.length === 1
+                    ? "New Goal not applied"
+                    : "New Goals not applied"}
+              </DialogTitle>
               <DialogDescription>
-                Your workflow has unsaved changes. Do you want to save them
-                before leaving?
+                {pendingGoalChanges.length > 0
+                  ? `${pendingGoalChanges
+                      .map((change) => `“${change.label}”`)
+                      .join(", ")} ${
+                      pendingGoalChanges.length === 1
+                        ? "has a new Goal it doesn't follow yet. Apply it"
+                        : "have new Goals they don't follow yet. Apply them"
+                    } first, or continue with the last saved version.`
+                  : workflowChangesStore.saveBlockedReason ||
+                    "Your workflow has unsaved changes. Do you want to save them before leaving?"}
               </DialogDescription>
             </DialogHeader>
             <WorkflowChangesList changes={unsavedChangeSummary} />
@@ -2238,26 +2587,48 @@ function FlowRenderer({
               <Button
                 variant="secondary"
                 onClick={() => {
+                  captureUnsavedResolution("discard");
+                  useWorkflowTitleStore
+                    .getState()
+                    .clearCopilotMetadata(workflow.workflow_permanent_id);
                   blockerExit.proceed();
                 }}
               >
                 Continue without saving
               </Button>
-              <Button
-                onClick={() => {
-                  handleSave().then((ok) => {
-                    if (ok) {
-                      blockerExit.proceed();
-                    }
-                  });
-                }}
-                disabled={workflowChangesStore.saveIsPending}
-              >
-                {workflowChangesStore.saveIsPending && (
-                  <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                )}
-                Save changes
-              </Button>
+              {pendingGoalChanges.length > 0 ? (
+                <Button
+                  onClick={() => {
+                    captureUnsavedResolution("apply_goal");
+                    blockerExit.reset();
+                    applyPendingGoalChanges();
+                  }}
+                >
+                  {pendingGoalChanges.length === 1
+                    ? "Apply new Goal"
+                    : "Apply new Goals"}
+                </Button>
+              ) : (
+                <Button
+                  onClick={() => {
+                    handleSave().then((ok) => {
+                      if (ok) {
+                        captureUnsavedResolution("save");
+                        blockerExit.proceed();
+                      }
+                    });
+                  }}
+                  disabled={
+                    workflowChangesStore.saveIsPending ||
+                    Boolean(workflowChangesStore.saveBlockedReason)
+                  }
+                >
+                  {workflowChangesStore.saveIsPending && (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Save changes
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -2316,8 +2687,10 @@ function FlowRenderer({
                 ref={editorElementRef}
                 nodes={nodes}
                 edges={edges}
-                onNodesChange={(changes) => {
-                  const hasStructuralChange = hasStructuralNodeChange(changes);
+                onNodesChange={(incomingChanges) => {
+                  const changes = filterWorkflowChanges(incomingChanges);
+                  if (changes.length === 0) return;
+                  const hasStructuralChange = changes.some(isWorkflowMutation);
 
                   // A genuine structural edit re-arms the convergence budget so
                   // a real resize that follows isn't starved by a prior loop.
@@ -2341,7 +2714,7 @@ function FlowRenderer({
                       );
 
                     if (shouldLayout) {
-                      debouncedLayoutForDimensions(tempNodes, edges);
+                      queueDimensionLayout(tempNodes, edges);
                     }
                   }
 
@@ -2411,7 +2784,7 @@ function FlowRenderer({
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}
                 // colorMode="dark"
-                fitView={true}
+                fitView={!embedded}
                 fitViewOptions={{
                   maxZoom: 1,
                 }}

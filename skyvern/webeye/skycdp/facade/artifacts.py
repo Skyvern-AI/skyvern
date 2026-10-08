@@ -114,7 +114,8 @@ class FileChooser:
         """
         return self._multiple
 
-    async def set_files(self, files: str | list[str]) -> None:
+    async def set_files(self, files: str | list[str], *, timeout: float | None = None) -> None:
+        # Playwright's signature has `timeout` and production passes it; one CDP call has nothing to time out.
         paths = [files] if isinstance(files, str) else list(files)
         missing = [path for path in paths if not Path(path).is_file()]
         if missing:

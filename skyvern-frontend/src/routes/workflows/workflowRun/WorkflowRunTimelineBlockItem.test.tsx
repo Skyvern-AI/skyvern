@@ -317,6 +317,72 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.queryByText("0 actions")).toBeNull();
   });
 
+  it("flags a completed conditional that routed on an evaluation error, and only that one", () => {
+    const error =
+      "Workflow branch evaluation context is too large to process safely. Reduce the workflow input or prior block output size, then retry.";
+    const promptBranch = {
+      branch_id: "b_prompt",
+      branch_index: 0,
+      criteria_type: "prompt",
+      original_expression: "user selected premium plan",
+      result: false,
+      is_matched: false,
+      is_default: false,
+      next_block_label: "premium",
+      error: null,
+    };
+    const defaultBranch = {
+      branch_id: "b_default",
+      branch_index: 1,
+      criteria_type: null,
+      original_expression: null,
+      rendered_expression: null,
+      result: null,
+      is_matched: true,
+      is_default: true,
+      next_block_label: "fallback_block",
+      error: null,
+    };
+    const evaluated = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "check_plan",
+      status: Status.Completed,
+      executed_branch_id: "b_default",
+      executed_branch_next_block: "fallback_block",
+      output: {
+        branch_taken: "fallback_block",
+        evaluations: [promptBranch, defaultBranch],
+      },
+    });
+    const errored = buildBlock({
+      ...evaluated,
+      output: {
+        branch_taken: "fallback_block",
+        evaluations: [{ ...promptBranch, result: null, error }, defaultBranch],
+        evaluation_error: error,
+      },
+    });
+    const renderRow = (block: WorkflowRunBlock) => (
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />
+    );
+
+    const { rerender } = render(renderRow(evaluated));
+    expect(screen.queryByText("evaluation error")).toBeNull();
+
+    rerender(renderRow(errored));
+    const flag = screen.getByText("evaluation error");
+    expect(flag.getAttribute("title")).toContain(error);
+    // The block still reports completed; the flag sits beside that status.
+    expect(screen.getByRole("img", { name: "completed" })).toBeDefined();
+  });
+
   it("renders action rows under a code block and lets the user select an action", () => {
     const onActionClick = vi.fn();
     const block = buildBlock({
@@ -904,7 +970,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "goto",
-        title: "Open the homepage",
+        description: "Open the homepage",
         line_start: 1,
         line_end: 1,
       },
@@ -946,7 +1012,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "execute_js", title: "Run a script" },
+      { action_type: "execute_js", description: "Run a script" },
     ];
 
     render(
@@ -975,7 +1041,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "execute_js", title: "Summarize the page" },
+      { action_type: "execute_js", description: "Summarize the page" },
     ];
 
     render(
@@ -1055,7 +1121,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
     ];
 
     render(
@@ -1106,12 +1172,16 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto_url", title: "Open the homepage", line_start: 1 },
-      { action_type: "click", title: "Submit the form", line_start: 3 },
-      { action_type: "extract", title: "Read the result", line_start: 5 },
+      {
+        action_type: "goto_url",
+        description: "Open the homepage",
+        line_start: 1,
+      },
+      { action_type: "click", description: "Submit the form", line_start: 3 },
+      { action_type: "extract", description: "Read the result", line_start: 5 },
       {
         action_type: "execute_js",
-        title: "Summarize the page",
+        description: "Summarize the page",
         line_start: 7,
         line_end: 8,
       },
@@ -1168,8 +1238,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
-      { action_type: "click", title: "Submit the form", line_start: 3 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
+      { action_type: "click", description: "Submit the form", line_start: 3 },
     ];
 
     render(
@@ -1208,8 +1278,12 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "extract", title: "Has a line position", line_start: 5 },
-      { action_type: "execute_js", title: "No line position" },
+      {
+        action_type: "extract",
+        description: "Has a line position",
+        line_start: 5,
+      },
+      { action_type: "execute_js", description: "No line position" },
     ];
 
     render(
@@ -1248,7 +1322,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "extract", title: "A later step", line_start: 5 },
+      { action_type: "extract", description: "A later step", line_start: 5 },
     ];
 
     render(
@@ -1286,8 +1360,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
-      { action_type: "extract", title: "Read the result", line_start: 5 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
+      { action_type: "extract", description: "Read the result", line_start: 5 },
     ];
 
     render(
@@ -1325,7 +1399,10 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Outline step that should be hidden" },
+      {
+        action_type: "goto",
+        description: "Outline step that should be hidden",
+      },
     ];
 
     render(
@@ -1367,7 +1444,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "extract",
-        title: "Extract the product details",
+        description: "Extract the product details",
         line_start: 12,
         line_end: 12,
       },
@@ -1415,7 +1492,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "click",
-        title: "Submit the application",
+        description: "Submit the application",
         line_start: 3,
         line_end: 6,
       },
@@ -1457,7 +1534,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "extract",
-        title: "A step on another line",
+        description: "A step on another line",
         line_start: 1,
       },
     ];
@@ -1576,6 +1653,43 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText(/plan is active/)).toBeDefined();
   });
 
+  // Task V3 persists its own navigations as goto_url rows whose url never reaches the client: the
+  // intention says where it meant to go and only the response says the page was a dead end.
+  it("shows a recorded outcome alongside the intention it followed", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_dead_end",
+      block_type: "task",
+      label: "contact",
+      actions: [
+        {
+          action_id: "act_dead_end",
+          action_type: ActionTypes.GotoUrl,
+          status: Status.Failed,
+          reasoning: null,
+          text: null,
+          intention: "Tried to navigate to https://example.com/contact-us/",
+          response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+          description: "task_v3 goto https://example.com/contact-us/",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText(/Tried to navigate to/)).toBeDefined();
+    expect(screen.getByText(/HTTP 404, dead end/)).toBeDefined();
+  });
+
   // A Task V3 turn that emits only tool calls persists every action of that round with no prose at
   // all, which used to leave the row as a bare icon and index.
   it("falls back to a visible action type when an action carries no prose", () => {
@@ -1609,7 +1723,9 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    const summary = screen.getByText(`${TIMELINE_DESCRIPTOR_SEPARATOR} Click`);
+    const summary = screen.getByText("Click", {
+      selector: "[aria-hidden='true']",
+    });
     expect(summary.className).not.toContain("sr-only");
     expect(
       screen.getByRole("button", { name: /Click/ }).getAttribute("title"),

@@ -144,6 +144,7 @@ def test_render_template_with_label_injects_workflow_run_id():
     context = SimpleNamespace(workflow_run_id="wr_cached_run", script_run_parameters={}, loop_metadata=None)
     workflow_run_context = SimpleNamespace(
         values={},
+        secrets={},
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",

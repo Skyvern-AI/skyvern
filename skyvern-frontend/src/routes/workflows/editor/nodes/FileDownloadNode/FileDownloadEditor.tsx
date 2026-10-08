@@ -26,6 +26,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
+import { cn } from "@/util/utils";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -37,6 +38,10 @@ import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useUpdate } from "../../useUpdate";
@@ -139,6 +144,7 @@ function FileDownloadEditorBody({
     blockId,
   );
   const isFirstBrowserTask = isFirstBrowserTaskBlock(nodes, edges, blockId);
+  const urlError = useBlockUrlError(blockId);
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
@@ -162,16 +168,32 @@ function FileDownloadEditorBody({
             <HelpTooltip content={urlTooltip} />
           </div>
           <WorkflowBlockInputTextarea
+            name="url"
             nodeId={blockId}
             onChange={(next) => update({ url: next })}
             value={url}
             placeholder={urlPlaceholder}
-            className="nopan text-xs"
+            aria-invalid={urlError !== null}
+            aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+            className={cn(
+              "nopan text-xs",
+              urlError !== null && "border-destructive",
+            )}
           />
-          {isFirstBrowserTask && !url.trim() && (
-            <p className="text-xs text-amber-700 dark:text-amber-400">
-              Nothing runs before this block, so it needs a URL to start from.
+          {urlError ? (
+            <p
+              id={blockUrlErrorId(blockId)}
+              className="text-xs text-destructive"
+            >
+              {urlError}
             </p>
+          ) : (
+            isFirstBrowserTask &&
+            !url.trim() && (
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                Nothing runs before this block, so it needs a URL to start from.
+              </p>
+            )
           )}
         </div>
         <div className="space-y-2">
@@ -182,6 +204,7 @@ function FileDownloadEditorBody({
             <HelpTooltip content={navigationGoalTooltip} />
           </div>
           <WorkflowBlockInputTextarea
+            name="navigationGoal"
             aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
             nodeId={blockId}
             onChange={(next) => update({ navigationGoal: next })}
@@ -264,6 +287,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["aws_access_key_id"]}
             >
               <WorkflowBlockInputTextarea
+                name="awsAccessKeyId"
                 nodeId={blockId}
                 onChange={(value) => update({ awsAccessKeyId: value })}
                 value={awsAccessKeyId as string}
@@ -275,6 +299,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["aws_secret_access_key"]}
             >
               <WorkflowBlockInput
+                name="awsSecretAccessKey"
                 nodeId={blockId}
                 type="password"
                 value={awsSecretAccessKey as string}
@@ -287,6 +312,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["s3_bucket"]}
             >
               <WorkflowBlockInputTextarea
+                name="s3Bucket"
                 nodeId={blockId}
                 onChange={(value) => update({ s3Bucket: value })}
                 value={s3Bucket as string}
@@ -298,6 +324,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["region_name"]}
             >
               <WorkflowBlockInputTextarea
+                name="regionName"
                 nodeId={blockId}
                 onChange={(value) => update({ regionName: value })}
                 value={regionName as string}
@@ -309,6 +336,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["endpoint_url"]}
             >
               <WorkflowBlockInputTextarea
+                name="endpointUrl"
                 nodeId={blockId}
                 onChange={(value) => update({ endpointUrl: value })}
                 value={endpointUrl as string}
@@ -321,6 +349,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["path"]}
             >
               <WorkflowBlockInputTextarea
+                name="path:s3"
                 nodeId={blockId}
                 onChange={(value) => update({ path: value })}
                 value={path as string}
@@ -337,6 +366,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["azure_storage_account_name"]}
             >
               <WorkflowBlockInputTextarea
+                name="azureStorageAccountName"
                 nodeId={blockId}
                 onChange={(value) => update({ azureStorageAccountName: value })}
                 value={azureStorageAccountName as string}
@@ -348,6 +378,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["azure_storage_account_key"]}
             >
               <WorkflowBlockInput
+                name="azureStorageAccountKey"
                 nodeId={blockId}
                 type="password"
                 value={azureStorageAccountKey as string}
@@ -360,6 +391,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["azure_blob_container_name"]}
             >
               <WorkflowBlockInputTextarea
+                name="azureBlobContainerName"
                 nodeId={blockId}
                 onChange={(value) => update({ azureBlobContainerName: value })}
                 value={azureBlobContainerName as string}
@@ -371,6 +403,7 @@ function FileDownloadEditorBody({
               help="Optional folder path within the blob container. Defaults to {{ workflow_run_id }} if not specified."
             >
               <WorkflowBlockInputTextarea
+                name="path:azure"
                 nodeId={blockId}
                 onChange={(value) => update({ path: value })}
                 value={path as string}
@@ -398,6 +431,7 @@ function FileDownloadEditorBody({
               help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
             >
               <WorkflowBlockInputTextarea
+                name="googleDriveFolderId"
                 nodeId={blockId}
                 onChange={(value) => update({ googleDriveFolderId: value })}
                 value={googleDriveFolderId ?? ""}
@@ -414,6 +448,7 @@ function FileDownloadEditorBody({
               help="The SFTP host to upload files to."
             >
               <WorkflowBlockInputTextarea
+                name="sftpHost"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpHost: value })}
                 value={sftpHost ?? ""}
@@ -425,6 +460,7 @@ function FileDownloadEditorBody({
               help="Numeric only — template values are not supported. Defaults to 22 if left blank."
             >
               <WorkflowBlockInputTextarea
+                name="sftpPort"
                 nodeId={blockId}
                 onChange={(value) =>
                   update({ sftpPort: value.replace(/[^0-9]/g, "") })
@@ -435,6 +471,7 @@ function FileDownloadEditorBody({
             </DestinationField>
             <DestinationField label="Username" help="The SFTP username.">
               <WorkflowBlockInputTextarea
+                name="sftpUsername"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpUsername: value })}
                 value={sftpUsername ?? ""}
@@ -446,6 +483,7 @@ function FileDownloadEditorBody({
               help="Password auth. Leave blank if using a private key. Reference a secret parameter for security."
             >
               <WorkflowBlockInput
+                name="sftpPassword"
                 nodeId={blockId}
                 type="password"
                 onChange={(value) => update({ sftpPassword: value })}
@@ -458,6 +496,7 @@ function FileDownloadEditorBody({
               help="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security."
             >
               <WorkflowBlockInputTextarea
+                name="sftpPrivateKey"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpPrivateKey: value })}
                 value={sftpPrivateKey ?? ""}
@@ -469,6 +508,7 @@ function FileDownloadEditorBody({
               help="Optional passphrase for the private key."
             >
               <WorkflowBlockInput
+                name="sftpPrivateKeyPassphrase"
                 nodeId={blockId}
                 type="password"
                 onChange={(value) =>
@@ -483,6 +523,7 @@ function FileDownloadEditorBody({
               help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
             >
               <WorkflowBlockInputTextarea
+                name="sftpRemotePath"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpRemotePath: value })}
                 value={sftpRemotePath ?? ""}
@@ -494,6 +535,7 @@ function FileDownloadEditorBody({
               help="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
             >
               <WorkflowBlockInputTextarea
+                name="sftpHostKey"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpHostKey: value })}
                 value={sftpHostKey ?? ""}
@@ -524,6 +566,7 @@ function FileDownloadEditorBody({
             help={helpTooltips["fileDownload"]["prompt"]}
           >
             <WorkflowBlockInputTextarea
+              name="prompt"
               nodeId={blockId}
               onChange={(value) => update({ prompt: value })}
               value={prompt ?? ""}
@@ -628,6 +671,7 @@ function FileDownloadEditorBody({
                 </div>
                 {errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={label}
                     value={errorCodeMapping}
                     onChange={(next) => update({ errorCodeMapping: next })}
@@ -676,6 +720,7 @@ function FileDownloadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="downloadSuffix"
                   nodeId={blockId}
                   onChange={(next) => update({ downloadSuffix: next })}
                   value={downloadSuffix ?? ""}
@@ -694,6 +739,7 @@ function FileDownloadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(next) => update({ totpIdentifier: next })}
                   value={totpIdentifier ?? ""}
@@ -720,6 +766,7 @@ function FileDownloadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(next) => update({ totpVerificationUrl: next })}
                   value={totpVerificationUrl ?? ""}

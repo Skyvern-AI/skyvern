@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from skyvern.webeye.skycdp.errors import CdpError, CdpTimeoutError
-from skyvern.webeye.skycdp.facade.elements import ElementHandle, InputFiles, wait_for
+from skyvern.webeye.skycdp.facade.elements import (
+    ElementHandle,
+    InputFiles,
+    not_editable_error,
+    wait_for,
+    wait_until_editable,
+)
 from skyvern.webeye.skycdp.facade.timeouts import DEFAULT_ACTION_TIMEOUT_MS, seconds_from_ms
 
 if TYPE_CHECKING:
@@ -642,8 +648,36 @@ class Locator:
         try:
             return await self.element_handle(timeout=timeout)
         except CdpTimeoutError as exc:
-            budget = DEFAULT_ACTION_TIMEOUT_MS if timeout is None else timeout
-            raise CdpTimeoutError(f"{name}: no element matched {self._selector!r} within {budget}ms") from exc
+            raise self._no_match_error(name, timeout) from exc
+
+    def _no_match_error(self, name: str, timeout: float | None) -> CdpTimeoutError:
+        budget = DEFAULT_ACTION_TIMEOUT_MS if timeout is None else timeout
+        return CdpTimeoutError(f"{name}: no element matched {self._selector!r} within {budget}ms")
+
+    async def _act_editable(self, name: str, timeout: float | None) -> ElementHandle:
+        """Resolution and editability share one budget, and every poll re-resolves so a re-rendered
+        element is seen. Each rejected handle is released, or a long refusal pins one remote object per poll."""
+        matched = False
+
+        async def resolve_editable() -> ElementHandle | None:
+            nonlocal matched
+            handle = await self._resolve()
+            matched = handle is not None
+            if handle is None:
+                return None
+            editable = False
+            try:
+                editable = await handle._fillable(name)
+            finally:
+                if not editable:
+                    await handle.dispose()
+            return handle if editable else None
+
+        return await wait_until_editable(
+            resolve_editable,
+            timeout=timeout,
+            on_deadline=lambda: not_editable_error(name, timeout) if matched else self._no_match_error(name, timeout),
+        )
 
     # -- reads --------------------------------------------------------------
 
@@ -722,11 +756,13 @@ class Locator:
     async def blur(self, timeout: float | None = None) -> None:
         await (await self._act("blur", timeout)).blur()
 
-    async def fill(self, value: str, timeout: float | None = None) -> None:
-        await (await self._act("fill", timeout)).fill(value)
+    # force and no_wait_after are accepted as Playwright's are, but force never skips the editability wait:
+    # text sent to a read-only field is silently dropped, which is the failure that wait exists to report.
+    async def fill(self, value: str, timeout: float | None = None, **_: Any) -> None:
+        await (await self._act_editable("fill", timeout))._commit_fill(value)
 
-    async def clear(self, timeout: float | None = None) -> None:
-        await (await self._act("clear", timeout)).fill("")
+    async def clear(self, timeout: float | None = None, **_: Any) -> None:
+        await (await self._act_editable("clear", timeout))._commit_fill("")
 
     async def type(self, text: str, delay: float | None = None, timeout: float | None = None) -> None:
         await (await self._act("type", timeout)).type(text, delay=delay)

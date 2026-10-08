@@ -17,14 +17,8 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
-    _SELECTION_MATCH_BASES,
-    AuthoringParameterBindingCandidate,
     AuthoringParameterFieldBinding,
     AuthoringParameterTerminalBinding,
-    authored_selection_parameter_bindings,
-    authored_selector_parameter_bindings,
-    authoring_parameter_binding_directive_consumed,
-    build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
@@ -74,6 +68,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _code_block_safety_errors,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 from tests.unit.copilot_test_helpers import carried_interaction
 
@@ -270,56 +265,6 @@ def test_authoring_parameter_snapshot_recovers_missing_fill_before_enter() -> No
     assert result.parameters == [{"key": "search_location"}]
 
 
-def test_authoring_parameter_directive_consumption_requires_structural_and_final_code_evidence() -> None:
-    snapshot = build_authoring_parameter_binding_snapshot(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        field_bindings=[
-            AuthoringParameterFieldBinding(
-                declared_key="search_location",
-                field_selector="#location",
-                field_trajectory_index=0,
-                match_basis="exact_authored_selector",
-            )
-        ],
-        terminal=AuthoringParameterTerminalBinding(
-            tool_name="click",
-            trajectory_index=1,
-            selector="#submit",
-        ),
-    )
-    directive = build_authoring_parameter_binding_directive(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        candidates=[
-            AuthoringParameterBindingCandidate(
-                declared_key="search_location",
-                field_selector="#location",
-            )
-        ],
-    )
-    code = 'await page.locator("#location").fill(str(search_location))'
-
-    assert authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code=code,
-        parameter_keys=["search_location"],
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive.model_copy(update={"structural_key": "stale"}),
-        snapshot,
-        code=code,
-        parameter_keys=["search_location"],
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#other").fill(str(search_location))',
-        parameter_keys=["search_location"],
-    )
-
-
 def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_changes() -> None:
     trajectory = [_interaction("press_key", selector="#location", key="Tab", source_url="https://example.com/form")]
     snapshot = build_authoring_parameter_binding_snapshot(
@@ -341,56 +286,6 @@ def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_change
     )
 
     assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
-
-
-def test_authored_selection_bindings_recognizes_templated_click_and_select_option() -> None:
-    code = (
-        'await page.locator(f"[data-account=\\"{account_number}\\"]").click()\n'
-        'await page.locator("#plan").select_option(str(plan_tier))\n'
-    )
-    bindings = authored_selection_parameter_bindings(code, {"account_number", "plan_tier"})
-    assert bindings is not None
-    assert bindings.get("#plan") == {"plan_tier"}
-    assert {key for keys in bindings.values() for key in keys} == {"account_number", "plan_tier"}
-    assert authored_selector_parameter_bindings(code, {"account_number", "plan_tier"}) == {}
-
-
-def test_authored_selection_bindings_ignores_literal_only_click() -> None:
-    code = 'await page.locator("#row-account-AC12345").click()\n'
-    assert authored_selection_parameter_bindings(code, {"account_number"}) == {}
-
-
-def test_authoring_parameter_directive_consumed_via_select_option_value_argument() -> None:
-    snapshot = build_authoring_parameter_binding_snapshot(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        field_bindings=[
-            AuthoringParameterFieldBinding(
-                declared_key="plan_tier",
-                field_selector="#plan",
-                field_trajectory_index=0,
-                match_basis="scouted_option_value",
-            )
-        ],
-        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
-    )
-    directive = build_authoring_parameter_binding_directive(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        candidates=[AuthoringParameterBindingCandidate(declared_key="plan_tier", field_selector="#plan")],
-    )
-    assert authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#plan").select_option(str(plan_tier))',
-        parameter_keys=["plan_tier"],
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#plan").select_option("premium")',
-        parameter_keys=["plan_tier"],
-    )
 
 
 def test_selection_snapshot_select_option_binds_value_argument() -> None:
@@ -438,7 +333,6 @@ def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
     result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
     assert result is not None
     assert ".select_option(" not in result.code
-    assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
@@ -963,6 +857,24 @@ class TestLocatorSynthesis:
         assert "_read_value_0 = await page.evaluate(" in result.code
         assert '"error_count"' in result.code
         assert [d["selector"] for d in _dropped_root_targets(result)] == ["body"]
+
+    def test_a_synthesized_read_passes_both_code_security_checks(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/report", trajectory_index=0),
+                _interaction(
+                    "read_value",
+                    read_expression="document.querySelector('#count').textContent",
+                    read_output_path="output.error_count",
+                    trajectory_index=1,
+                ),
+            ]
+        )
+        assert result is not None
+        block_code = textwrap.dedent(result.code)
+        assert "await page.evaluate(" in block_code
+        assert author_time_code_security_errors(label="read_count", code=block_code) == []
+        assert runtime_code_security_errors([CodeBlockSecurityInput(label="read_count", code=block_code)]) == []
 
     def test_strict_dynamic_row_gate_outranks_the_root_container_role_retarget(self) -> None:
         interaction = _interaction(
@@ -2048,6 +1960,16 @@ class TestPreflightSurfacesSyntaxError:
 
         assert [error.reason_code for error in author_errors] == ["AUTHOR_PAGE_CONTEXT"]
         assert [error.reason_code for error in runtime_errors] == ["RUNTIME_PAGE_CONTEXT"]
+
+    def test_open_page_is_the_sanctioned_second_tab_while_page_context_stays_refused(self) -> None:
+        refused = author_time_code_security_errors(label="detail", code="tab = await page.context.new_page()")
+        assert [error.reason_code for error in refused] == ["AUTHOR_PAGE_CONTEXT"]
+        code = (
+            "detail = await open_page(page, url)\n"
+            "berth = await detail.locator('#berth').inner_text()\n"
+            "await detail.close()"
+        )
+        assert author_time_code_security_errors(label="detail", code=code) == []
 
     def test_literal_attribute_block_has_no_dynamic_attribute_error(self) -> None:
         code = 'await page.goto("https://example.com/")\ntitle = await page.title()'
@@ -3436,6 +3358,7 @@ class TestEmittedInteractionPartition:
             record["trajectory_index"]: record["reason_code"] for record in diagnostics.dropped_interactions
         }
         assert dropped_reasons[2] == "missing_selector_and_role_name"
+        assert "needs repair" not in result.code
         assert set(self._lane_index_counts(diagnostics)) == set(diagnostics.retained_trajectory_indices)
         assert set(self._lane_index_counts(diagnostics).values()) == {1}
 
@@ -4021,6 +3944,7 @@ def test_login_submit_emits_solve_captcha_after_navigation_commit() -> None:
     captcha_position = result.code.index("await solve_captcha(page)", navigation_position)
     assert submit_position < navigation_position < captcha_position
     assert result.code.count("await solve_captcha(page)") == 1
+    assert "image=" not in result.code
 
 
 def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
@@ -4041,6 +3965,63 @@ def test_unstamped_click_emits_no_solve_captcha() -> None:
     )
     assert result is not None
     assert "solve_captcha" not in result.code
+
+
+def test_image_captcha_trajectory_never_synthesizes_the_image_form() -> None:
+    form = "http://localhost:8888/image_captcha_form.html"
+    trajectory = [
+        _interaction("type_text", selector="#firstName", source_url=form, typed_value="Ada"),
+        _interaction("click", selector="#captchaImage", source_url=form),
+        _interaction("type_text", selector="#captchaAnswer", source_url=form, typed_value="K7QPX"),
+        _interaction("click", selector="button[type=submit]", source_url=form),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert "solve_captcha" not in result.code
+    assert "image=" not in result.code
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_saved_workflow")
+async def test_authored_image_captcha_loop_is_saved_with_its_image_call() -> None:
+    image_call = 'await solve_captcha(page, image="#captchaImage", input="#captchaAnswer")'
+    code = (
+        "for attempt in range(8):\n"
+        "    try:\n"
+        f"        {image_call}\n"
+        "    except Exception:\n"
+        '        await page.locator("#refreshCaptcha").click()\n'
+        "        continue\n"
+        '    await page.locator("button[type=submit]").click()\n'
+        '    if await page.locator("#captchaAnswer").count() == 0:\n'
+        "        break\n"
+        '    await page.locator("#refreshCaptcha").click()\n'
+        "else:\n"
+        '    raise Exception("captcha not accepted")\n'
+    )
+    workflow_yaml = (
+        "title: Image captcha form\n"
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: submit_request\n"
+        "    code: |\n" + textwrap.indent(code, "      ")
+    )
+
+    assert _code_block_safety_errors(workflow_yaml, None) == []
+    workflow = await _process_workflow_yaml(
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        organization_id="o_1",
+        workflow_yaml=workflow_yaml,
+        settings_fallback_yaml="enable_self_healing: false",
+    )
+    saved_code = workflow.workflow_definition.blocks[0].code
+    assert image_call in saved_code
+    assert "solve_captcha(page)" not in saved_code
 
 
 class TestScoutedReadSynthesis:

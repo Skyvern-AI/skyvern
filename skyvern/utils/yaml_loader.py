@@ -13,6 +13,27 @@ resolver removed so such strings stay as plain ``str`` values.
 from typing import Any
 
 import yaml
+from yaml.nodes import ScalarNode
+
+# Wide enough that safe_dump never folds a title onto a second line.
+_YAML_NO_FOLD_WIDTH = 1 << 30
+
+
+class _WorkflowYAMLDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_workflow_string(dumper: yaml.SafeDumper, value: str) -> ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style="|" if "\n" in value else None)
+
+
+_WorkflowYAMLDumper.add_representer(str, _represent_workflow_string)
+
+
+def dump_workflow_yaml(parsed: dict[str, Any]) -> str:
+    """Serialize a parsed workflow without folding: a wrapped long line reloads as one joined
+    string, which corrupts generated code."""
+    return yaml.dump(parsed, Dumper=_WorkflowYAMLDumper, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH)
 
 
 class NoDatesSafeLoader(yaml.SafeLoader):

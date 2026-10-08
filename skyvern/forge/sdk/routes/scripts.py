@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import WorkflowScriptModel
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -49,31 +51,25 @@ from skyvern.services.workflow_script_service import (
 
 LOG = structlog.get_logger()
 
+SCRIPT_FILE_FETCH_CONCURRENCY = 8
+_MAIN_SCRIPT_PATH = "main.py"
 
-async def _load_main_script_content(
-    organization_id: str,
-    script_revision_id: str,
-) -> str | None:
-    """Load the main.py content from a script revision, if it exists."""
-    script_files = await app.DATABASE.scripts.get_script_files(
-        script_revision_id=script_revision_id,
-        organization_id=organization_id,
-    )
-    for f in script_files:
-        if f.file_path == "main.py" and f.artifact_id:
-            artifact = await app.DATABASE.artifacts.get_artifact_by_id(f.artifact_id, organization_id)
-            if artifact:
-                data = await app.STORAGE.retrieve_artifact(artifact)
-                if data:
-                    try:
-                        return data.decode("utf-8") if isinstance(data, bytes) else data
-                    except UnicodeDecodeError:
-                        LOG.error(
-                            "main.py content is not valid UTF-8",
-                            script_revision_id=script_revision_id,
-                            organization_id=organization_id,
-                        )
-    return None
+
+async def _retrieve_artifact_contents(artifacts: list[Artifact]) -> dict[str, bytes | None]:
+    # Per call on purpose: a shared semaphore would queue every request's downloads on the pod behind each other.
+    semaphore = asyncio.Semaphore(SCRIPT_FILE_FETCH_CONCURRENCY)
+
+    async def _retrieve(artifact: Artifact) -> bytes | None:
+        async with semaphore:
+            return await app.STORAGE.retrieve_artifact(artifact)
+
+    try:
+        async with asyncio.TaskGroup() as task_group:
+            tasks = {artifact.artifact_id: task_group.create_task(_retrieve(artifact)) for artifact in artifacts}
+    except ExceptionGroup as group:
+        # Re-raise the storage error itself so callers see its type, not the TaskGroup wrapper.
+        raise group.exceptions[0]
+    return {artifact_id: task.result() for artifact_id, task in tasks.items()}
 
 
 async def get_script_blocks_response(
@@ -96,31 +92,54 @@ async def get_script_blocks_response(
             organization_id=organization_id,
             script_revision_id=script_revision_id,
         )
-        main_script = None
-        if include_main_script:
-            main_script = await _load_main_script_content(
-                organization_id=organization_id,
+        if not include_main_script:
+            return ScriptBlocksResponse(blocks={}, script_id=script_id, version=version)
+
+    script_files = await app.DATABASE.scripts.get_script_files(
+        script_revision_id=script_revision_id,
+        organization_id=organization_id,
+    )
+    # Only this revision's files: a block that points at another revision's file is skipped.
+    files_by_id = {script_file.file_id: script_file for script_file in script_files}
+    # Reviewer-created blocks have no script_file_id; their code is extracted from main.py.
+    needs_main_script = include_main_script or any(not block.script_file_id for block in script_blocks)
+    main_script_artifact_id = next(
+        (f.artifact_id for f in script_files if needs_main_script and f.file_path == _MAIN_SCRIPT_PATH), None
+    )
+
+    artifact_ids: dict[str, None] = {}
+    for script_block in script_blocks:
+        block_file = files_by_id.get(script_block.script_file_id) if script_block.script_file_id else None
+        if block_file and block_file.artifact_id:
+            artifact_ids[block_file.artifact_id] = None
+    if main_script_artifact_id:
+        artifact_ids[main_script_artifact_id] = None
+
+    artifacts = await app.DATABASE.artifacts.get_artifacts_by_ids(list(artifact_ids), organization_id)
+    contents = await _retrieve_artifact_contents(artifacts)
+
+    main_script: str | None = None
+    main_script_data = contents.get(main_script_artifact_id) if main_script_artifact_id else None
+    if main_script_data:
+        try:
+            main_script = main_script_data.decode("utf-8")
+        except UnicodeDecodeError:
+            LOG.error(
+                "main.py content is not valid UTF-8",
                 script_revision_id=script_revision_id,
+                organization_id=organization_id,
             )
-        return ScriptBlocksResponse(blocks={}, main_script=main_script, script_id=script_id, version=version)
 
     result: dict[str, str] = {}
     main_py_block_codes: dict[str, str] | None = None
 
-    # TODO(jdo): make concurrent to speed up
     for script_block in script_blocks:
         script_file_id = script_block.script_file_id
 
         if not script_file_id:
-            # Reviewer-created blocks have no script_file_id — fall back to
-            # extracting the block code from main.py (lazy-loaded once).
             block_label = script_block.script_block_label
             if main_py_block_codes is None:
-                content = await _load_main_script_content(
-                    organization_id=organization_id,
-                    script_revision_id=script_revision_id,
-                )
-                main_py_block_codes = extract_cached_blocks_from_source(content) if content else {}
+                main_py_block_codes = extract_cached_blocks_from_source(main_script) if main_script else {}
 
             if block_label in main_py_block_codes:
                 result[block_label] = main_py_block_codes[block_label]
@@ -135,11 +154,7 @@ async def get_script_blocks_response(
             )
             continue
 
-        script_file = await app.DATABASE.scripts.get_script_file_by_id(
-            script_revision_id=script_revision_id,
-            file_id=script_file_id,
-            organization_id=organization_id,
-        )
+        script_file = files_by_id.get(script_file_id)
 
         if not script_file:
             LOG.info(
@@ -165,12 +180,7 @@ async def get_script_blocks_response(
             )
             continue
 
-        artifact = await app.DATABASE.artifacts.get_artifact_by_id(
-            artifact_id,
-            organization_id,
-        )
-
-        if not artifact:
+        if artifact_id not in contents:
             LOG.warning(
                 "No artifact found for script file",
                 workflow_permanent_id=workflow_permanent_id,
@@ -182,7 +192,7 @@ async def get_script_blocks_response(
             )
             continue
 
-        data = await app.STORAGE.retrieve_artifact(artifact)
+        data = contents[artifact_id]
 
         if not data:
             LOG.warning(
@@ -211,14 +221,12 @@ async def get_script_blocks_response(
             )
             continue
 
-    main_script = None
-    if include_main_script:
-        main_script = await _load_main_script_content(
-            organization_id=organization_id,
-            script_revision_id=script_revision_id,
-        )
-
-    return ScriptBlocksResponse(blocks=result, main_script=main_script, script_id=script_id, version=version)
+    return ScriptBlocksResponse(
+        blocks=result,
+        main_script=main_script if include_main_script else None,
+        script_id=script_id,
+        version=version,
+    )
 
 
 @base_router.post(
@@ -242,12 +250,20 @@ async def create_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CreateScriptResponse:
     """Create a new script with optional files and metadata."""
-    return await script_service.create_script(
+    result = await script_service.create_script(
         organization_id=current_org.organization_id,
         workflow_id=data.workflow_id,
         run_id=data.run_id,
         files=data.files,
     )
+    await record_request_audit_event(
+        current_org.organization_id,
+        "script.create",
+        "script",
+        result.script_id,
+        related_resource_ids=(data.workflow_id,) if data.workflow_id else (),
+    )
+    return result
 
 
 @base_router.post(
@@ -261,11 +277,21 @@ async def deploy_cached_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> DeployCachedScriptResponse:
     """Validate or commit a cached script deployment."""
-    return await cached_script_deploy_service.deploy_cached_script(
+    result = await cached_script_deploy_service.deploy_cached_script(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         request=data,
     )
+    if result.script_was_created:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "script.update",
+            "script",
+            result.script_id,
+            changed_fields=("version",),
+            related_resource_ids=(workflow_permanent_id,),
+        )
+    return result
 
 
 @base_router.get(
@@ -677,6 +703,9 @@ async def deploy_script(
                 requires_agent=sb.requires_agent,
             )
 
+        await record_request_audit_event(
+            current_org.organization_id, "script.update", "script", new_script.script_id, changed_fields=("version",)
+        )
         return CreateScriptResponse(
             script_id=new_script.script_id,
             version=new_script.version,
@@ -1120,6 +1149,7 @@ async def delete_workflow_cache_key_value(
         workflow_permanent_id=workflow_permanent_id,
     )
 
+    await record_request_audit_event(current_org.organization_id, "script.delete", "workflow", workflow_permanent_id)
     LOG.info(
         "Deleted workflow cache key value",
         organization_id=current_org.organization_id,
@@ -1183,6 +1213,10 @@ async def clear_workflow_cache(
         workflow_permanent_id=workflow_permanent_id,
     )
 
+    if deleted_count:
+        await record_request_audit_event(
+            current_org.organization_id, "script.delete", "workflow", workflow_permanent_id
+        )
     LOG.info(
         "Cleared workflow cache",
         organization_id=current_org.organization_id,
@@ -1237,6 +1271,14 @@ async def pin_workflow_script(
     if not result:
         raise HTTPException(status_code=404, detail="No script found for the given cache key value")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "script.update",
+        "script",
+        result.script_id,
+        changed_fields=("is_pinned",),
+        related_resource_ids=(workflow_permanent_id,),
+    )
     return PinScriptResponse(
         workflow_permanent_id=workflow_permanent_id,
         cache_key_value=data.cache_key_value,
@@ -1284,6 +1326,14 @@ async def unpin_workflow_script(
     if not result:
         raise HTTPException(status_code=404, detail="No script found for the given cache key value")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "script.update",
+        "script",
+        result.script_id,
+        changed_fields=("is_pinned",),
+        related_resource_ids=(workflow_permanent_id,),
+    )
     return PinScriptResponse(
         workflow_permanent_id=workflow_permanent_id,
         cache_key_value=data.cache_key_value,
@@ -1413,6 +1463,14 @@ async def review_script_with_instructions(
         review_results=review_results,
     )
 
+    await record_request_audit_event(
+        organization_id,
+        "script.update",
+        "script",
+        new_script.script_id,
+        changed_fields=("version",),
+        related_resource_ids=(workflow_permanent_id,),
+    )
     LOG.info(
         "Script reviewed with user instructions",
         organization_id=organization_id,

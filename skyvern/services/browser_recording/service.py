@@ -23,12 +23,20 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
 from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
-from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
+from skyvern.services.browser_recording.evidence import (
+    RecordingEvidencePacket,
+    build_recording_evidence,
+    recorded_credential_urls,
+)
 from skyvern.services.browser_recording.redact import is_secret_field, redact_console_event, texts_are_labels
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
+    ActionDialog,
+    ActionDragDrop,
     ActionInputText,
     ActionKind,
     ActionUrlChange,
@@ -59,6 +67,7 @@ _DURABLE_TARGET_TAGS = frozenset(
         "button",
         "div",
         "input",
+        "iframe",
         "label",
         "li",
         "option",
@@ -205,15 +214,34 @@ def build_durable_recording_evidence(actions: list[Action]) -> list[dict[str, t.
             }.items()
             if value is not None
         }
-        evidence.append(
-            {
-                "kind": action.kind.value,
-                "timestamp_start": action.timestamp_start,
-                "timestamp_end": action.timestamp_end,
-                "url": _durable_recording_url(action.url),
-                "target": target,
+        item: dict[str, t.Any] = {
+            "kind": action.kind.value,
+            "timestamp_start": action.timestamp_start,
+            "timestamp_end": action.timestamp_end,
+            "url": _durable_recording_url(action.url),
+            "target": target,
+        }
+        if action.incomplete_capture_reason is not None:
+            item["incomplete_capture_reason"] = action.incomplete_capture_reason.value
+        if isinstance(action, ActionDialog):
+            item["dialog"] = {
+                "type": action.dialog_type,
+                "response": action.response,
+                "prompt_text_redacted": action.prompt_text_redacted,
+                "prompt_length": len(action.prompt_text) if action.prompt_text is not None else None,
             }
-        )
+        if isinstance(action, ActionDragDrop):
+            item["source_target"] = {
+                key: value
+                for key, value in {
+                    "tag_name": _allowlisted_target_value(action.source.tag_name, _DURABLE_TARGET_TAGS),
+                    "role": _allowlisted_target_value(action.source.role, _DURABLE_TARGET_ROLES),
+                    "input_type": _allowlisted_target_value(action.source.input_type, _DURABLE_TARGET_INPUT_TYPES),
+                    "autocomplete": _allowlisted_autocomplete(action.source.autocomplete),
+                }.items()
+                if value is not None
+            }
+        evidence.append(item)
     return evidence
 
 
@@ -320,14 +348,27 @@ DUPLICATE_ACTION_SCAN_DEPTH = 8
 
 def _action_identity(action: Action) -> tuple[str, str, str, str, str]:
     """Stable identity fields used for duplicate-action suppression."""
+    action_detail = ""
+    if isinstance(action, ActionInputText):
+        action_detail = action.input_value
+    elif isinstance(action, ActionDialog):
+        action_detail = f"{action.dialog_type}:{action.response}:{len(action.prompt_text or '')}"
+    elif isinstance(action, ActionDragDrop):
+        action_detail = ":".join(
+            (
+                action.source.sky_id or "",
+                action.source.id or "",
+                action.source.selector or "",
+                action.target.selector or "",
+            )
+        )
+
     return (
         str(action.kind),
         action.url,
         action.target.sky_id or "",
         action.target.id or "",
-        # A <select> fires change once per type-ahead keystroke. Without the value those read as
-        # one action, and suppression keeps the first — an option the user only passed through.
-        action.input_value if isinstance(action, ActionInputText) else "",
+        action_detail,
     )
 
 
@@ -557,6 +598,8 @@ class Processor:
 
         machines = machines or [
             sm.Click(),
+            sm.Dialog(),
+            sm.DragDrop(),
             sm.Hover(),
             sm.InputText(),
             sm.FileUpload(),
@@ -705,7 +748,7 @@ class Processor:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
-        blocks, parameters, _, _, evidence = await self.process_with_evidence(
+        blocks, parameters, _, _, evidence, _ = await self.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             recorded_actions=recorded_actions,
@@ -725,6 +768,7 @@ class Processor:
         list[dict[str, t.Any]],
         dict[str, t.Any],
         RecordingEvidencePacket,
+        list[tuple[str, str]],
     ]:
         if recorded_actions is None:
             events = self.compressed_chunks_to_events(compressed_chunks)
@@ -768,6 +812,7 @@ class Processor:
                 interpretation_session_id=self.interpretation_session_id,
             ),
             refinement_evidence,
+            recorded_credential_urls(actions, draft_steps),
         )
 
 
@@ -800,7 +845,14 @@ class BrowserSessionRecordingService:
             interpretation_session_id=interpretation_session_id,
         )
 
-        blocks, parameters, evidence, metadata, refinement_evidence = await processor.process_with_evidence(
+        (
+            blocks,
+            parameters,
+            evidence,
+            metadata,
+            refinement_evidence,
+            recorded_credentials,
+        ) = await processor.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             recorded_actions=recorded_actions,
@@ -808,6 +860,25 @@ class BrowserSessionRecordingService:
         )
         if not blocks:
             return blocks, parameters, None, refinement_evidence
+
+        credential_urls: dict[str, str] = {}
+        for credential_id, url in recorded_credentials:
+            admitted_url = safe_admitted_url(url)
+            if admitted_url and canonicalize_origin(admitted_url) is not None:
+                credential_urls.setdefault(credential_id, admitted_url)
+        if credential_urls:
+            owned_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+                list(credential_urls),
+                organization_id=organization_id,
+            )
+            metadata["credential_approvals"] = [
+                {
+                    "credential_id": credential.credential_id,
+                    "admitted_url": credential_urls[credential.credential_id],
+                }
+                for credential in owned_credentials
+                if credential.credential_id in credential_urls
+            ]
 
         recording = await app.DATABASE.browser_recordings.create_recording(
             organization_id=organization_id,
@@ -817,4 +888,5 @@ class BrowserSessionRecordingService:
             evidence=evidence,
             metadata=metadata,
         )
+        refinement_evidence.recording_id = recording.recording_id
         return blocks, parameters, recording.recording_id, refinement_evidence

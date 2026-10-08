@@ -10,7 +10,8 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
 
-DEFAULT_INSTRUCTIONS_SHA256 = "2c3698446bf4df160c10e033683b1fd42125a33859373e40f8fe1f222e9f9bcc"
+# Re-frozen for SKY-17457: engine guidance omits the field by default and sets skyvern-1.0 only on request.
+DEFAULT_INSTRUCTIONS_SHA256 = "3b05238400b52f2120120403f80b2a8af9c487e41990b95efb5310ccd0376312"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.
@@ -32,9 +33,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_browser_profile_update": "e83c3227ef13e827bd0c7d6e23bb0e03fefe2fe83e73bfa4b3ca696d151b2b61",
     "skyvern_browser_session_close": "d0923948805b1bbccd7803df1a3748426263a8bf630cf9fcbee5a21f2f463825",
     "skyvern_browser_session_connect": "7c21d99fbb35dc0199e59367373387dca0e8f8d9dd4615303a3f09f579db2d06",
-    # Re-frozen for SKY-13272: `timeout` is now rejected above MAX_TIMEOUT instead of clamped, so the param
-    # description says "max 240" rather than "capped at 240". Description text only; the schema is unchanged.
-    "skyvern_browser_session_create": "6244d9614c04f403ee9db0c6b0cdee10f5be121cf85979b069a106044b08b161",
+    # Re-frozen for SKY-17978: adds the optional `browser_type` param the REST API and SDK already accept.
+    "skyvern_browser_session_create": "34ef250f51908bd925929f0fc9bd7097ac266982d1d9725fffa74ff9f9af704a",
     "skyvern_browser_session_get": "fdf579ac23ce28eea5e243a407a8f810fdcca6ed491c2da7fbe56836b1474109",
     "skyvern_browser_session_list": "dac429184440a1f76d2a787fb81793e37220408d749f0d3cacfbd29222e55f19",
     "skyvern_clear_local_storage": "8a6b80bfdbe3b1e2e36f7f485cb5bb7ff527594e37536816c2f6b614852078f5",
@@ -52,10 +52,10 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_credential_get": "b91bc6df14644a3a9b47e61ba05623652d208dbee58d75b595863112261c26b6",
     "skyvern_credential_list": "25377204b867b5ad92e7a18b49a081dc84a109002841263c5c2132857b6e5dac",
     "skyvern_drag": "58b53906edc106537f2c799da2bf5e1b8991ec9ce6a3ac5df01827aaf91b3564",
-    # Re-frozen for SKY-15733: the description now says an expression that never settles returns TIMEOUT on
-    # the page/CDP route and ACTION_FAILED on the extension route. Description text only; the schema is unchanged.
-    "skyvern_evaluate": "b6877865ef47e4db303bc5e4d344f3715dd991ce471349831e8d35e3bf92b762",
-    "skyvern_evaluate_and_screenshot": "2e886e466be8ed71e003f3f0c06d4ac7cb627a7eb4b2d8698a4cc0694d258de6",
+    # Re-frozen for SKY-17181: both descriptions now say that direct JavaScript evaluation is unavailable
+    # in extension mode. Description text only; the schemas are unchanged.
+    "skyvern_evaluate": "871062d2b6a6c00df9213787dc3ba642f1b4641ecd7311c8b10f08533778b5d7",
+    "skyvern_evaluate_and_screenshot": "5047c99d93ea43b8810047cae4dfb368bdbad79e7fcfbed1af5f748ec0f41aef",
     "skyvern_execute": "2cb175e508b11a4e40564d2057a0725566fc1ba72080ac789512e350b8b0d532",
     "skyvern_extract": "1a6323ec190bb05a00ff1739fc8e379fc6325e4ed16b4058d532743976c3f5dc",
     "skyvern_extract_and_screenshot": "005995f97c6a8078bd1f589d78415c51e7a1189752da35ea2f56c7da902bee01",
@@ -96,14 +96,14 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_org_update": "bbb6283207460a33b0d2759d563ecf4a8431fdc8c5cf7dbb15d10d27f36e0951",
     "skyvern_press_key": "ad74ceb98f5b21483940f027747817d21f751eebb781c11f97529c5be968a9c4",
     "skyvern_run_task": "e48efaa780ab1f49c8d5a7c489edf293880448d07e7e0f3d88b65807d559cb23",
-    "skyvern_schedule_create": "c96af8fafabe9cd3164f91c1489f1069a5259e9f3c5405f109ad3e16e0c1db71",
+    "skyvern_schedule_create": "b7a4305713340d816176ae39c8f20045da3d084c5e58303e29ca202a99c5fdd6",
     "skyvern_schedule_delete": "ad6fa7d028b0c168e0b12a475c0e3c954d6402843bc1a984ad605d3b3766adae",
     "skyvern_schedule_disable": "c9e5e01c54c1934db991ab4a81a4fa369340cfabc580ac73990b1b71589101ef",
     "skyvern_schedule_enable": "6df661f097e8cfd30c52fe66d66cc4e1a4b3ff555da2978bcc0acc4bf011fe9d",
     "skyvern_schedule_get": "2eb8f151ace8e2c4116399437672bd41836536db9ac52545207d5905535c94c1",
     "skyvern_schedule_list": "4aa92418fe65c6f07ab89f86ef26828e711cb37e178c2b6d90810ddf296187db",
     "skyvern_schedule_list_for_workflow": "a9949b4ddce25849378936b675f59621165b9587e0ee6b516cb8b1e31b64709e",
-    "skyvern_schedule_update": "c8736498aef521f0a021ffecae4aeb2972d21e9a6f06e17e474450526d7db1af",
+    "skyvern_schedule_update": "f9da5e0ce2657c594c526f0201fcb082ff6b939f6c8c98a468f2140b8a35b75d",
     "skyvern_screenshot": "96f506db0c7780f79d45261d8a432114893130b04160f977214d08865771a2b8",
     "skyvern_script_deploy": "c14adba89381f2e3b6010d44f5a2c66b840b57fc835cfe08ac864aaacba63b8e",
     "skyvern_script_fallback_episodes": "c6f23e8270426a40ff2692ef33dc738b8083e0a38eaf9d0e2e08f93768d645e6",
@@ -121,20 +121,24 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_tab_switch": "4bad7852b8db4c9e1b7e421e12ad36a59321bdbf98c1203295259c6b6d3cdb96",
     "skyvern_tab_wait_for_new": "2b0131b628f71645137af7ca78af6d997126b0e1e302d8816cbeeba3ab41e0e2",
     "skyvern_trajectory_get": "6c78c6de100a821fc7ec65d860ef42eaef181c573b185345d38090a25f8960a1",
-    "skyvern_type": "325c3b15693fa41962347f4267b8b21d36473f456a7fd01b3ccf2bb28ee86877",
+    # SKY-16939 adds the explicit fixed extension value-fill mode; keyboard remains the default.
+    "skyvern_type": "9ba96866420495f66cd638e699fc12edd82613ff773ea727a9f31bf6b9fa1b44",
     "skyvern_validate": "782d01e1b6b71b98a04fb6b12371578efe241f01c2875ec89dcf33fb2351d6db",
     "skyvern_wait": "7f9b8d8d39762eaa2c2962ab3b1e4b997454d9a1039ee2fee1b5aaa07019786a",
     "skyvern_wait_for_either_state": "b4b127498f91a7d9e1536d11a8993cb9d1cbf7b1557f9bec832afaa127ea1613",
     "skyvern_workflow_cancel": "0ee1a599421c3a116bf09906613574807b7f0a4e7f72b6a79adf6cfb84edb3d1",
-    "skyvern_workflow_create": "42dd751b5ba7607a6be052093eea1d986b03e14c02525b9741618865db666189",
+    # Re-frozen for SKY-16333: the description said a code block's `steps` outline is "derived from the code
+    # when omitted"; steps are now always rebuilt on save. Description text only; the schema is unchanged.
+    "skyvern_workflow_create": "f9062f485a05cc359f0a818ebe09b047a5b03aebc29024999188ba413e4bf692",
     "skyvern_workflow_delete": "4b8b6574f78122c5d6bf8ee12f5b3cedeb83832d08462445889259cfd0c8b861",
     "skyvern_workflow_get": "b9340c5d1cfa0db49431d4e914c0879f15e458d4c6d4879de0d0de653de842da",
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
     "skyvern_workflow_retry": "da8782d457ba3bcc8b87fffb90ce9dbc287943f28260816d699233a7427b6978",
-    "skyvern_workflow_run": "9a149c1cc66deb0afe879b00308aa6c750cfbf4a3fe4ed0af0d7eb307d8229cc",
-    # Re-frozen for SKY-14441: adds the optional `include_child_runs` param (default false, preserving the
-    # existing result set) and says in the description that child runs are excluded by default.
-    "skyvern_workflow_run_list": "5ed785968941b6b3ae3421d6d67ef15af365a2b59a9a1bd21c7bc54dff67e205",
+    # Re-frozen for SKY-17978: adds the optional `max_steps_override` and `ai_fallback` params the SDK accepts.
+    "skyvern_workflow_run": "4c5351d5dce73a8c4513d9ea7de548ccb74c6e6aa613ad2b382f0719a270ef76",
+    # Re-frozen for SKY-15975: the `search_key` description now names webhook callback URLs and the
+    # exact-match browser profile, browser session and credential IDs. Description text only.
+    "skyvern_workflow_run_list": "4e86472ab42dfd49f42bb882a6b966dde69ae34f9fa0cb603b25d84529e46333",
     "skyvern_workflow_status": "730fd46aae7cb9e974b631abdca8fdbc5c5c8a77917c22c3bd76735388103487",
     "skyvern_workflow_update": "3931c7a6b3faee202ebb57291fc2a437b838411ff0082be93d3763dbf727d060",
     "skyvern_workflow_update_folder": "52efdfa02cf84cb9995bfbeb6d00562fdd1364e832e297e853d233ff6f68392d",
@@ -144,8 +148,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
 # Resolved memberships for the three pre-existing scopes must remain byte-for-byte stable.
 LEGACY_SCOPE_MEMBERSHIP_DIGESTS: dict[MCPScope, tuple[int, str]] = {
     "browser": (54, "8c05058f36d5d4472e11f384ed68cabbae0478b3e16d2f7da6c2d07dda21703a"),
-    "build": (61, "3d5e09451edd441de5c79f489539a8b0f97679e0e342972c7541757eb4de14a4"),
-    "operate": (29, "d5181b03b06212403ce381a6f95a916d12e303987949acd46b8f813f38e413f0"),
+    "build": (62, "0f6d512bf4a3af872181682aa1deb47df8180c9bf4da83e3ae9c63fc3b8ec121"),
+    "operate": (30, "fb27a193d3bedb074331306de64264afcce59dd88223b33045cb41d95cc612b7"),
 }
 
 

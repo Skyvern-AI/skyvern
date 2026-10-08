@@ -5,15 +5,28 @@ import { useRunViewStore } from "@/store/RunViewStore";
 
 import { liveSearch } from "./liveSearch";
 import {
+  fitPanesToWidth,
+  panesFitWidth,
   searchWithRunReference,
   SYSTEM_RUN_FOCUS_PARAM,
   toReadableSearch,
+  withPaneOpen,
+  type StudioPaneId,
 } from "./panes";
 import { useStudioRunId } from "./useStudioRunId";
+import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
+
+// Which panes a Copilot run keeps on a narrow stage, first to last.
+const NARROW_RUN_PANE_RANK: Record<StudioPaneId, number> = {
+  browser: 0,
+  copilot: 1,
+  overview: 2,
+  editor: 3,
+};
 
 // Point the studio at a different run: set ?wr=, drop the per-run selection
-// params (?active=, ?bl=, ?iteration=), and keep everything else — notably
-// ?panes=, so the layout rides through untouched. The caller merges this
+// params (?active=, ?bl=, ?iteration=). User navigation drops pane overrides.
+// The caller merges this
 // against the LIVE URL string, never a render-closure (a concurrent navigate is
 // already visible there), same rule as useStudioPanes.
 export function searchWithRunSwitched(
@@ -30,6 +43,7 @@ export function searchWithRunSwitched(
     params.get(SYSTEM_RUN_FOCUS_PARAM) !== null ||
     (params.get("wr") === null && params.get("active") === null);
   params.set("wr", runId);
+  if (!options?.systemFocus) params.delete("panes");
   if (options?.systemFocus && copilotOwnsFocus) {
     params.set(SYSTEM_RUN_FOCUS_PARAM, "copilot");
   } else {
@@ -45,37 +59,19 @@ export function searchWithRunSwitched(
   return toReadableSearch(params);
 }
 
-// The inverse of searchWithRunSwitched: stop inspecting any run, keeping the
-// rest of the URL (notably ?panes=) untouched.
-export function searchWithRunCleared(search: string): string {
+// Point the studio back at its live browser: drop the inspected run and its per-run selection.
+export function searchWithoutRun(search: string): string {
   const params = new URLSearchParams(search);
-  params.delete("wr");
-  params.delete(SYSTEM_RUN_FOCUS_PARAM);
-  params.delete("active");
-  params.delete("bl");
-  params.delete("iteration");
+  for (const key of [
+    "wr",
+    SYSTEM_RUN_FOCUS_PARAM,
+    "active",
+    "bl",
+    "iteration",
+  ]) {
+    params.delete(key);
+  }
   return toReadableSearch(params);
-}
-
-/**
- * Release a run the caller focused itself (not one the user chose). Nothing
- * happens unless the live URL still names that run — a user who switched runs
- * meanwhile owns the focus, and their choice must survive.
- */
-export function useReleaseStudioRun(): (runId: string) => void {
-  const navigate = useNavigate();
-  const location = useLocation();
-  return useCallback(
-    (runId: string) => {
-      const search = liveSearch(location.search);
-      if (new URLSearchParams(search).get("wr") !== runId) return;
-      useRunViewStore.getState().reset();
-      // Replace, not push: a release is not a user navigation, and pushing it
-      // would let Back re-focus the run we just let go of.
-      navigate({ search: searchWithRunCleared(search) }, { replace: true });
-    },
-    [navigate, location.search],
-  );
 }
 
 /**
@@ -85,9 +81,10 @@ export function useReleaseStudioRun(): (runId: string) => void {
  * dropped before the switch; RunView re-resolves the new run's selection.
  *
  * `replace` and `systemFocus` are for a caller that focuses a run on the
- * user's behalf rather than at their request — same reason useReleaseStudioRun
- * replaces. `systemFocus` keeps the layout in whatever class it already had,
- * so following the run never remaps the user's pane arrangement.
+ * user's behalf rather than at their request, so Back never re-focuses it.
+ * `systemFocus` keeps the layout in whatever class it already had,
+ * so following the run never remaps the user's pane arrangement; it only adds
+ * the Browser pane, so a Copilot test run started from Edit is visible.
  */
 export function useSwitchStudioRun(options?: {
   replace?: boolean;
@@ -95,6 +92,7 @@ export function useSwitchStudioRun(options?: {
 }): (runId: string) => void {
   const navigate = useNavigate();
   const location = useLocation();
+  const { preserveNextEntry, updatePanes } = useStudioPaneDefaults();
   const studioRunId = useStudioRunId();
   const replace = options?.replace ?? false;
   const systemFocus = options?.systemFocus ?? false;
@@ -111,15 +109,39 @@ export function useSwitchStudioRun(options?: {
       // Push by default (unlike the pane-toggle writes in useStudioPanes): a
       // run switch the user asked for is a real navigation, so browser
       // back/forward steps through the runs they have viewed.
-      navigate(
-        {
-          search: searchWithRunSwitched(effectiveSearch, runId, {
-            systemFocus,
-          }),
-        },
-        { replace },
-      );
+      const nextSearch = searchWithRunSwitched(effectiveSearch, runId, {
+        systemFocus,
+      });
+      if (systemFocus) {
+        updatePanes((panes, slots, stageWidth) => {
+          if (panes.includes("browser")) return panes;
+          const opened = withPaneOpen(panes, "browser", slots);
+          if (stageWidth <= 0 || panesFitWidth(opened, stageWidth)) {
+            return opened;
+          }
+          // Narrow stage: keep Browser, then Copilot, then whatever else fits,
+          // with Editor dropped first (the sign-in rule); keep on-screen order.
+          const priority = [...opened].sort(
+            (a, b) => NARROW_RUN_PANE_RANK[a] - NARROW_RUN_PANE_RANK[b],
+          );
+          const kept = fitPanesToWidth(priority, stageWidth);
+          return {
+            panes: opened.filter((id) => kept.includes(id)),
+            arrangement: opened,
+          };
+        });
+      }
+      preserveNextEntry(systemFocus ? nextSearch : null);
+      navigate({ search: nextSearch }, { replace });
     },
-    [navigate, location.search, studioRunId, replace, systemFocus],
+    [
+      navigate,
+      location.search,
+      studioRunId,
+      replace,
+      systemFocus,
+      preserveNextEntry,
+      updatePanes,
+    ],
   );
 }

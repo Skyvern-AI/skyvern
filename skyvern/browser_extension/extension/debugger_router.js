@@ -4,6 +4,7 @@ import {
   ERROR_CODES,
   EVENTS,
   ProtocolError,
+  isPageChangeExempt,
   requireArgs,
   requireTabId,
 } from "./protocol.js";
@@ -34,6 +35,8 @@ export class DebuggerRouter {
     tabScope,
     sendEvent,
     onAttachedChange,
+    isIndicatorVisible = () => false,
+    sendIndicatorMessage = async () => undefined,
     attachTimeoutMs = ATTACH_TIMEOUT_MS,
     commandTimeoutMs = COMMAND_TIMEOUT_MS,
     recoveryTimeoutMs = RECOVERY_TIMEOUT_MS,
@@ -42,6 +45,9 @@ export class DebuggerRouter {
     this.tabScope = tabScope;
     this.sendEvent = sendEvent;
     this.onAttachedChange = onAttachedChange;
+    this.isIndicatorVisible = isIndicatorVisible;
+    this.sendIndicatorMessage = sendIndicatorMessage;
+    this.captureReleases = new Map();
     this.attachedTabs = new Set();
     this.attachStates = new Map();
     this.childTargets = new Map();
@@ -55,6 +61,7 @@ export class DebuggerRouter {
       void this.handleDebuggerEvent(source, method, params);
     });
     chrome.debugger.onDetach.addListener((source, reason) => {
+      this.releaseCaptures(source.tabId);
       void this.handleDebuggerDetach(source, reason);
     });
   }
@@ -274,7 +281,7 @@ export class DebuggerRouter {
   async send(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
-    return this.tabScope.runTabOperation(tabId, async (lease) => {
+    const sendCommand = async (lease) => {
       await this.ensureStillControllableLocked(tabId, lease);
       if (
         !this.attachedTabs.has(tabId) ||
@@ -343,12 +350,18 @@ export class DebuggerRouter {
       );
       let result;
       try {
+        const release =
+          values.method === "Page.captureScreenshot" &&
+          this.isIndicatorVisible(tabId)
+            ? await this.suppressIndicator(tabId)
+            : undefined;
         result = await this.sendCommandWithTimeout(
           target,
           values.method,
           values.params ?? {},
           commandTimeoutMs,
           lease,
+          release,
         );
       } catch (error) {
         if (urlChangeGranted) {
@@ -385,7 +398,22 @@ export class DebuggerRouter {
         );
       }
       return { result: result ?? {} };
-    });
+    };
+    const classifyLease = (lease) => {
+      lease.debuggerCommand = true;
+      lease.dispatched = false;
+      lease.pageChangeExempt = isPageChangeExempt(
+        values.method,
+        values.params ?? {},
+      );
+    };
+    return this.tabScope.runTabOperation(
+      tabId,
+      sendCommand,
+      this.tabScope.operationGeneration,
+      true,
+      classifyLease,
+    );
   }
 
   async assertCanSend(tabId) {
@@ -400,16 +428,71 @@ export class DebuggerRouter {
     });
   }
 
+  getCaptureTokens(tabId) {
+    return [...(this.captureReleases.get(tabId)?.keys() ?? [])];
+  }
+
+  async suppressIndicator(tabId) {
+    const token = crypto.randomUUID();
+    const releases = this.captureReleases.get(tabId) ?? new Map();
+    this.captureReleases.set(tabId, releases);
+    const release = () => {
+      if (!releases.delete(token)) return;
+      if (releases.size === 0) this.captureReleases.delete(tabId);
+      void this.messageIndicator(tabId, {
+        type: "skyvern.indicator.release",
+        token,
+      });
+    };
+    releases.set(token, release);
+    try {
+      await this.withTimeout(
+        () =>
+          this.messageIndicator(tabId, {
+            type: "skyvern.indicator.suppress",
+            token,
+          }),
+        250,
+      );
+    } catch {}
+    return release;
+  }
+
+  async messageIndicator(tabId, message) {
+    try {
+      return await this.sendIndicatorMessage(tabId, message);
+    } catch {}
+  }
+
+  releaseCaptures(tabId) {
+    for (const release of this.captureReleases.get(tabId)?.values() ?? [])
+      release();
+  }
+
   async sendCommandWithTimeout(
     target,
     method,
     params,
     timeoutMs,
     lease = null,
+    onSettled,
   ) {
     let timedOut = false;
     const command = this.withTimeout(
-      () => chrome.debugger.sendCommand(target, method, params),
+      () => {
+        try {
+          lease?.assertCurrent();
+          if (lease) lease.dispatched = true;
+          const pending = chrome.debugger.sendCommand(target, method, params);
+          // The timeout/lease race can end before Chrome has sampled the pixels.
+          return onSettled
+            ? Promise.resolve(pending).finally(onSettled)
+            : pending;
+        } catch (error) {
+          onSettled?.();
+          throw error;
+        }
+      },
       timeoutMs,
       () => {
         timedOut = true;
@@ -557,6 +640,7 @@ export class DebuggerRouter {
     if (token !== null && this.attachStates.get(tabId)?.token !== token) {
       return;
     }
+    this.releaseCaptures(tabId);
     this.notifyDetached(tabId, reason);
     this.attachStates.delete(tabId);
     this.forgetChildTargets(tabId);

@@ -19,9 +19,10 @@ export type PasteShortcutEvent = Pick<
 
 const VNC_CONTROL_LEFT_KEYSYM = 0xffe3;
 const VNC_V_KEYSYM = 0x0076;
-// noVNC maps physical macOS left Cmd to Alt_L and right Cmd to Super_L on this path.
-const VNC_CMD_LEFT_RELEASE_KEYSYM = 0xffe9;
-const VNC_CMD_RIGHT_RELEASE_KEYSYM = 0xffeb;
+// noVNC maps macOS right Cmd to Super_L; BrowserStream sends left Cmd as Super_L too instead of noVNC's Alt_L.
+const VNC_SUPER_L_KEYSYM = 0xffeb;
+const VNC_CMD_LEFT_RELEASE_KEYSYM = VNC_SUPER_L_KEYSYM;
+const VNC_CMD_RIGHT_RELEASE_KEYSYM = VNC_SUPER_L_KEYSYM;
 const VNC_BLANKET_META_RELEASES: Array<{ keysym: number; code: string }> = [
   { keysym: 0xffe9, code: "AltLeft" },
   { keysym: 0xffea, code: "AltRight" },
@@ -59,6 +60,23 @@ function sendVncPasteShortcut(
   rfb.sendKey(VNC_CONTROL_LEFT_KEYSYM, "ControlLeft", false);
 }
 
+async function syncTextToVnc(
+  rfb: VncClipboardRfb,
+  text: string,
+  syncDelayMs = DEFAULT_VNC_CLIPBOARD_SYNC_DELAY_MS,
+) {
+  rfb.clipboardPasteFrom(text);
+  if (syncDelayMs > 0) {
+    await sleep(syncDelayMs);
+  }
+}
+
+// For a paste started without a keystroke (a button), so no modifiers are held.
+async function pasteTextIntoVnc(rfb: VncClipboardRfb, text: string) {
+  await syncTextToVnc(rfb, text);
+  sendVncPasteShortcut(rfb);
+}
+
 async function handleVncClipboardPasteShortcut(
   event: PasteShortcutEvent,
   rfb: VncClipboardRfb | null,
@@ -66,6 +84,8 @@ async function handleVncClipboardPasteShortcut(
     readClipboardText?: () => Promise<string>;
     syncDelayMs?: number;
     onPasteError?: (err: unknown) => void;
+    onPasted?: (text: string) => void;
+    onEmptyClipboard?: () => void;
     getHeldMetaSides?: () => HeldMetaSides;
   },
 ) {
@@ -75,8 +95,10 @@ async function handleVncClipboardPasteShortcut(
 
   const {
     readClipboardText = () => navigator.clipboard.readText(),
-    syncDelayMs = DEFAULT_VNC_CLIPBOARD_SYNC_DELAY_MS,
+    syncDelayMs,
     onPasteError,
+    onPasted,
+    onEmptyClipboard,
     getHeldMetaSides,
   } = options ?? {};
 
@@ -84,17 +106,20 @@ async function handleVncClipboardPasteShortcut(
   event.stopPropagation();
   event.stopImmediatePropagation();
 
+  let text: string;
   try {
-    const text = await readClipboardText();
-    rfb.clipboardPasteFrom(text);
-    if (syncDelayMs > 0) {
-      await sleep(syncDelayMs);
+    text = await readClipboardText();
+    if (!text) {
+      onEmptyClipboard?.();
+      return true;
     }
+    await syncTextToVnc(rfb, text, syncDelayMs);
   } catch (err) {
     console.error("Failed to sync clipboard contents to VNC:", err);
     onPasteError?.(err);
     return true;
   }
+  onPasted?.(text);
 
   if (!event.metaKey) {
     sendVncPasteShortcut(rfb);
@@ -127,7 +152,9 @@ async function handleVncClipboardPasteShortcut(
 }
 
 export {
+  VNC_SUPER_L_KEYSYM,
   handleVncClipboardPasteShortcut,
   isClipboardPasteShortcut,
+  pasteTextIntoVnc,
   sendVncPasteShortcut,
 };

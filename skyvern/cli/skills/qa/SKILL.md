@@ -187,6 +187,26 @@ skyvern_navigate(url="http://localhost:<port>/<route>")
 
 Health gate after navigation:
 
+In extension mode, use this health gate. Do not call `skyvern_evaluate`. Before each `skyvern_navigate` to a route under test, call `skyvern_get_errors(clear=True)`, `skyvern_console_messages(clear=True)`, `skyvern_handle_dialog(clear=True)`, and `skyvern_network_requests(clear=True)`; discard what they return.
+
+```text
+skyvern_tab_list()
+skyvern_get_errors()
+skyvern_console_messages(level="error")
+skyvern_get_html(selector="body")
+skyvern_find(by="role", value="alert")
+skyvern_find(by="role", value="dialog")
+skyvern_handle_dialog()
+```
+
+PASS requires the active tab URL to match the expected route, with no unexpected login redirect.
+The body must contain the expected page content, not only scripts or an empty app container.
+Require no unexpected error text, visible alerts, visible dialogs, JavaScript errors, console errors, or JavaScript dialog events.
+`skyvern_handle_dialog` reads dialog history; JavaScript dialogs are auto-dismissed by default.
+If a call fails or evidence is incomplete, record FAIL and stop this test. Do not treat missing evidence as PASS.
+
+Outside extension mode, use this health gate:
+
 ```text
 skyvern_evaluate(expression="(() => {
   const errors = [];
@@ -203,7 +223,15 @@ skyvern_evaluate(expression="(() => {
 })()")
 ```
 
-Prefer deterministic DOM assertions:
+In extension mode, use `skyvern_find`, `skyvern_get_html`, `skyvern_get_value`, or `skyvern_tab_list` for assertions.
+
+```text
+skyvern_find(by="role", value="button")
+skyvern_get_html(selector="h1")
+skyvern_tab_list()
+```
+
+Outside extension mode, prefer deterministic DOM assertions:
 
 ```text
 skyvern_evaluate(expression="!!document.querySelector('button')")
@@ -220,7 +248,9 @@ skyvern_validate(prompt="The page shows the success toast and the form is no lon
 skyvern_screenshot()
 ```
 
-Also check for failed network requests once per page:
+In extension mode, call `skyvern_network_requests()` and inspect captured requests for failures or HTTP status codes of 400 or greater.
+If capture is unavailable or incomplete, report the network check as unverified.
+Outside extension mode, check for failed network requests once per page:
 
 ```text
 skyvern_evaluate(expression="(() => {

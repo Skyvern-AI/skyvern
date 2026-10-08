@@ -564,3 +564,17 @@ def test_run_id_only_context_emits_task_feature_flags(
     assert len(task_summaries) == 1
     assert task_summaries[0]["run_id"] == "run_only"
     assert task_summaries[0]["feature_resolutions"] == {"TEST_FLAG": True}
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_payload_read_keeps_the_recorded_variant() -> None:
+    _set_context()
+    provider = FakeExperimentationProvider(value_results=["treatment"], payload_results=["JUDGE_KEY"])
+
+    assert await provider.get_value_cached("ARM_FLAG", "wr_123") == "treatment"
+    assert await provider.get_payload_cached("ARM_FLAG", "wr_123", record=False) == "JUDGE_KEY"
+
+    context = skyvern_context.current()
+    assert context is not None
+    assert context.feature_flag_entries["ARM_FLAG"] == "treatment"
+    skyvern_context.reset()

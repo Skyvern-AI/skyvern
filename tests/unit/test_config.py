@@ -133,9 +133,10 @@ def test_api_limit_concurrency_rejects_negative(monkeypatch: pytest.MonkeyPatch)
         ("disabled", None),
     ],
 )
+@pytest.mark.parametrize("setting", ["TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", "TASK_V3_CHOSEN_ENGINE_CUTOFF"])
 def test_task_v3_default_engine_workflow_cutoff_env_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str, expected: datetime | None
+    monkeypatch: pytest.MonkeyPatch, setting: str, raw_value: str, expected: datetime | None
 ) -> None:
-    monkeypatch.setenv("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", raw_value)
+    monkeypatch.setenv(setting, raw_value)
 
-    assert Settings(_env_file=None).TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF == expected
+    assert getattr(Settings(_env_file=None), setting) == expected

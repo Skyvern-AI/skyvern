@@ -1,9 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
-import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
+import {
+  useRecordingMessageChannel,
+  type Command,
+} from "@/routes/streaming/useRecordingMessageChannel";
+import { toast } from "@/components/ui/use-toast";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import { useManualSignInControl } from "@/store/useManualSignInStore";
+import {
+  toastClipboardReadFailed,
+  toastNothingToPaste,
+  usePastedNotice,
+} from "@/routes/streaming/pasteFeedback";
 import {
   markCommit,
   markLoad,
@@ -31,8 +42,15 @@ import {
   shouldReconnectStream,
   streamReconnectDelayMs,
 } from "@/routes/streaming/streamLifecycle";
+import type {
+  StreamState,
+  StreamStateChangeHandler,
+} from "@/routes/streaming/streamState";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import {
+  captureRecordBrowser,
+  getRecordBrowserContext,
+} from "@/util/recordBrowserTelemetry";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -43,6 +61,9 @@ type StreamMessage = {
   viewport_height?: number;
   url?: string;
 };
+
+// Mirrors MAX_CLIPBOARD_PASTE_BYTES in skyvern/forge/sdk/routes/streaming/payload_limits.py.
+const MAX_CLIPBOARD_PASTE_BYTES = 1024 * 1024;
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
   title: "Waking up your local browser",
@@ -81,6 +102,7 @@ interface Props {
   showControlButtons?: boolean;
   centered?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onStreamStateChange?: StreamStateChangeHandler;
   onUrlChange?: (url: string) => void;
   onActivity?: () => void;
   // Bypasses a stale RFB selection after the authenticated RFB socket has failed.
@@ -102,6 +124,7 @@ function BrowserSessionStream({
   showControlButtons = false,
   centered = false,
   onReadyChange,
+  onStreamStateChange,
   onUrlChange,
   onActivity,
   forceCdp = false,
@@ -118,7 +141,9 @@ function BrowserSessionStream({
   const [currentUrl, setCurrentUrl] = useState("");
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
+  const [isStopped, setIsStopped] = useState(false);
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -142,6 +167,7 @@ function BrowserSessionStream({
   const lastCommittedTokenRef = useRef<number>(0);
   const reconnectAttemptsRef = useRef(0);
   const streamFinishedRef = useRef(false);
+  const parseFailureLoggedRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordingReconnectTimerRef = useRef<ReturnType<
     typeof setTimeout
@@ -152,6 +178,13 @@ function BrowserSessionStream({
   // the close handler so a reconnect notice augments that reason instead of
   // replacing it with a generic "closed with code 1000".
   const streamEndedDiagnosticRef = useRef<StreamDiagnostic | null>(null);
+  const keepMessageChannelAliveRef = useRef(false);
+  // Clipboard callbacks go to useCdpInput before the message channel exists (the
+  // channel opens on its userIsControlling), so they reach the channel through this.
+  const sendMessageCommandRef = useRef<(command: Command) => boolean>(
+    () => false,
+  );
+  const [pastedCharacters, showPasted] = usePastedNotice();
   exfiltrateRef.current = !!exfiltrate;
 
   const scheduleRecordingReconnect = useCallback(() => {
@@ -160,7 +193,7 @@ function BrowserSessionStream({
     }
     recordingReconnectTimerRef.current = setTimeout(() => {
       recordingReconnectTimerRef.current = null;
-      if (exfiltrateRef.current) {
+      if (keepMessageChannelAliveRef.current) {
         setRecordingReconnectTrigger((trigger) => trigger + 1);
       }
     }, 1000);
@@ -180,7 +213,7 @@ function BrowserSessionStream({
         return;
       }
       recordingChannelDisconnectedRef.current = true;
-      if (exfiltrateRef.current) {
+      if (keepMessageChannelAliveRef.current) {
         scheduleRecordingReconnect();
       }
     },
@@ -195,36 +228,50 @@ function BrowserSessionStream({
     };
   }, []);
 
-  const recordingChannelEnabled = exfiltrate !== undefined;
-  const { isMessageConnected, sendCommand: sendRecordingCommand } =
-    useRecordingMessageChannel({
-      browserSessionId,
-      enabled: recordingChannelEnabled,
-      exfiltrate: !!exfiltrate,
-      workflowPermanentId: workflowPermanentId ?? null,
-      clipboard: "message",
-      reconnectTrigger: recordingReconnectTrigger,
-      onConnectionChange: handleRecordingConnectionChange,
-    });
+  const sendClipboardCommand = useCallback(
+    (command: Command, failureTitle: string) => {
+      const sent = sendMessageCommandRef.current(command);
+      if (!sent) {
+        toast({
+          variant: "destructive",
+          title: failureTitle,
+          description:
+            "Still connecting to the browser. Try again in a moment.",
+        });
+      }
+      return sent;
+    },
+    [],
+  );
 
-  useEffect(() => {
-    if (
-      exfiltrate &&
-      !isMessageConnected &&
-      recordingChannelDisconnectedRef.current
-    ) {
-      scheduleRecordingReconnect();
-    }
-  }, [exfiltrate, isMessageConnected, scheduleRecordingReconnect]);
   const onClipboardPaste = useCallback(
     (text: string) => {
-      sendRecordingCommand({ kind: "clipboard-paste", text });
+      if (!text) {
+        toastNothingToPaste();
+        return;
+      }
+      // Checked here too so an oversized paste never flashes a success notice
+      // before the backend's rejection arrives.
+      if (new TextEncoder().encode(text).length > MAX_CLIPBOARD_PASTE_BYTES) {
+        toast({
+          variant: "destructive",
+          title: "Paste failed",
+          description: "Your clipboard text is over 1 MB, too large to paste.",
+        });
+        return;
+      }
+      if (
+        !sendClipboardCommand({ kind: "clipboard-paste", text }, "Paste failed")
+      ) {
+        return;
+      }
+      showPasted(text);
     },
-    [sendRecordingCommand],
+    [sendClipboardCommand, showPasted],
   );
   const onClipboardCopy = useCallback(() => {
-    sendRecordingCommand({ kind: "clipboard-copy" });
-  }, [sendRecordingCommand]);
+    sendClipboardCommand({ kind: "clipboard-copy" }, "Copy failed");
+  }, [sendClipboardCommand]);
 
   // The CDP input socket must be wired whenever the stream can be controlled,
   // whether by default interaction or via the take-control button.
@@ -243,16 +290,68 @@ function BrowserSessionStream({
     navigate,
     historyNavigate,
     navigateError,
+    pasteClipboard,
   } = useCdpInput({
     inputWsUrl,
     interactive: controllable,
     viewportWidth,
     viewportHeight,
-    onClipboardPaste:
-      exfiltrate && isMessageConnected ? onClipboardPaste : undefined,
-    onClipboardCopy:
-      exfiltrate && isMessageConnected ? onClipboardCopy : undefined,
+    onClipboardPaste: controllable ? onClipboardPaste : undefined,
+    onClipboardPasteError: toastClipboardReadFailed,
+    onClipboardCopy: controllable ? onClipboardCopy : undefined,
+    // Recording keeps copy local so the keystroke never lands in the capture.
+    forwardCopyShortcut: !exfiltrate,
   });
+  useManualSignInControl(
+    controllable ? browserSessionId : undefined,
+    setUserIsControlling,
+  );
+  const keepMessageChannelAlive = !!exfiltrate || userIsControlling;
+  keepMessageChannelAliveRef.current = keepMessageChannelAlive;
+
+  // Outside a recording the channel is open only while the user is in control, so
+  // pasting works without holding a socket per passive viewer. exfiltrate stays
+  // false then, so opening it never sends begin-exfiltration.
+  const recordingChannelActive = exfiltrate !== undefined;
+  const messageChannelEnabled = recordingChannelActive || userIsControlling;
+  const previousRecordingChannelActiveRef = useRef(recordingChannelActive);
+  useEffect(() => {
+    // Closing the socket is what finalizes a recording and clears its retained
+    // identity, so a user still in control after one gets a fresh socket.
+    if (previousRecordingChannelActiveRef.current && !recordingChannelActive) {
+      setRecordingReconnectTrigger((trigger) => trigger + 1);
+    }
+    previousRecordingChannelActiveRef.current = recordingChannelActive;
+  }, [recordingChannelActive]);
+  const { isMessageConnected, sendCommand: sendMessageCommand } =
+    useRecordingMessageChannel({
+      browserSessionId,
+      enabled: messageChannelEnabled,
+      exfiltrate: !!exfiltrate,
+      workflowPermanentId: workflowPermanentId ?? null,
+      clipboard: "message",
+      reconnectTrigger: recordingReconnectTrigger,
+      onConnectionChange: handleRecordingConnectionChange,
+    });
+  sendMessageCommandRef.current = sendMessageCommand;
+
+  useEffect(() => {
+    if (!messageChannelEnabled) {
+      // A drop from a closed channel must not trigger a reconnect of the next one.
+      recordingChannelDisconnectedRef.current = false;
+    } else if (
+      keepMessageChannelAlive &&
+      !isMessageConnected &&
+      recordingChannelDisconnectedRef.current
+    ) {
+      scheduleRecordingReconnect();
+    }
+  }, [
+    keepMessageChannelAlive,
+    isMessageConnected,
+    messageChannelEnabled,
+    scheduleRecordingReconnect,
+  ]);
 
   useEffect(() => {
     const recordingStarted =
@@ -293,6 +392,7 @@ function BrowserSessionStream({
       recordingHealthFlushTimerRef.current = null;
     }
     recordingHealthEndedRef.current = false;
+    const recordingContext = getRecordBrowserContext();
     recordingFrameCountRef.current = 0;
     recordingFpsSamplesRef.current = [];
     let sampleStartedAtMs = Date.now();
@@ -318,6 +418,7 @@ function BrowserSessionStream({
       recordingFpsSamplesRef.current = [];
       const flushTimer = window.setTimeout(() => {
         captureRecordBrowser("record_browser.cdp_stream_health", {
+          ...recordingContext,
           fps_avg:
             samples.reduce((total, sample) => total + sample, 0) /
             samples.length,
@@ -351,9 +452,11 @@ function BrowserSessionStream({
     setViewportHeight(720);
     setCurrentUrl("");
     setDiagnostic(STARTING_DIAGNOSTIC);
+    setIsStopped(false);
     hasFrameRef.current = false;
     reconnectAttemptsRef.current = 0;
     streamFinishedRef.current = false;
+    parseFailureLoggedRef.current = false;
     streamEndedDiagnosticRef.current = null;
 
     const clearReconnectTimer = () => {
@@ -494,14 +597,24 @@ function BrowserSessionStream({
             // screencast ended is exactly the case worth redialling.
             if (isTerminal) {
               streamFinishedRef.current = true;
+              setIsStopped(true);
             }
             socket.close();
           }
         } catch (e) {
           console.error("Failed to parse message", e);
+          if (!parseFailureLoggedRef.current) {
+            parseFailureLoggedRef.current = true;
+            logging.warn("Stream message parse failed", {
+              stream: "cdp",
+              browser_session_id: browserSessionId,
+              workflow_run_id: null,
+            });
+          }
           // The backend only sends non-JSON text to reject credentials, and
           // retrying that would just burn the reconnect budget in silence.
           streamFinishedRef.current = true;
+          setIsStopped(true);
           setDiagnostic({
             title: "The stream said something funny",
             detail: "The browser sent a message the UI couldn't parse.",
@@ -576,9 +689,17 @@ function BrowserSessionStream({
           hasFrameRef.current = false;
           streamImgSrcRef.current = "";
           setStreamImgSrc("");
+          setIsStopped(true);
           setDiagnostic(
             diagnosticForReconnectExhausted(BROWSER_SESSION_STREAM_SUBJECT),
           );
+          logging.warn("Stream gave up", {
+            stream: "cdp",
+            browser_session_id: browserSessionId,
+            workflow_run_id: null,
+            reason: "reconnect_exhausted",
+            reconnect_attempts: reconnectAttemptsRef.current,
+          });
         }
       });
     }
@@ -594,9 +715,14 @@ function BrowserSessionStream({
         socket.close();
       }
     };
-  }, [credentialGetter, browserSessionId, forceCdp]);
+  }, [credentialGetter, browserSessionId, forceCdp, logging]);
 
   const isReady = streamImgSrc.length > 0;
+  const streamState: StreamState = isReady
+    ? "live"
+    : isStopped
+      ? "stopped"
+      : "connecting";
 
   useEffect(() => {
     onUrlChange?.(currentUrl);
@@ -615,6 +741,18 @@ function BrowserSessionStream({
       onReadyChange?.(false, null);
     };
   }, [onReadyChange]);
+
+  useEffect(() => {
+    // Same reason as onReadyChange: browserSessionId is read, not a dep.
+    onStreamStateChange?.(streamState, browserSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamState, onStreamStateChange]);
+
+  useEffect(() => {
+    return () => {
+      onStreamStateChange?.("connecting", null);
+    };
+  }, [onStreamStateChange]);
 
   useEffect(() => {
     settingsStore.setIsUsingABrowser(isReady);
@@ -643,6 +781,8 @@ function BrowserSessionStream({
         onFrameWidthChange={onFrameWidthChange}
         frameToken={streamImgToken}
         onFrameLoad={markLoad}
+        onPasteClipboard={controllable ? pasteClipboard : undefined}
+        pastedCharacters={pastedCharacters}
       />
     );
   }

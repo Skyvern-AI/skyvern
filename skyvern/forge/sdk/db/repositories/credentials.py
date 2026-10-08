@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -39,10 +39,12 @@ class CredentialRepository(BaseRepository):
         card_last4: str | None,
         card_brand: str | None,
         totp_identifier: str | None = None,
+        has_totp_seed: bool = False,
         secret_label: str | None = None,
         tested_url: str | None = None,
         proxy_location: ProxyLocationInput = None,
         proxy_session_id: str | None = None,
+        created_by: str | None = None,
     ) -> Credential:
         proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
             proxy_location=proxy_location,
@@ -58,6 +60,7 @@ class CredentialRepository(BaseRepository):
                 credential_type=credential_type,
                 username=username,
                 totp_type=totp_type,
+                has_totp_seed=has_totp_seed,
                 totp_identifier=totp_identifier,
                 card_last4=card_last4,
                 card_brand=card_brand,
@@ -65,6 +68,7 @@ class CredentialRepository(BaseRepository):
                 tested_url=tested_url,
                 proxy_location=serialized_proxy_location,
                 proxy_session_id=proxy_session_id,
+                created_by=created_by,
             )
             session.add(credential)
             await session.flush()
@@ -148,6 +152,17 @@ class CredentialRepository(BaseRepository):
                 )
             ).all()
             return [Credential.model_validate(credential) for credential in credentials]
+
+    @db_operation("count_credentials")
+    async def count_credentials(self, organization_id: str) -> int:
+        async with self.Session() as session:
+            query = (
+                select(func.count())
+                .select_from(CredentialModel)
+                .filter_by(organization_id=organization_id)
+                .filter(CredentialModel.deleted_at.is_(None))
+            )
+            return int(await session.scalar(query) or 0)
 
     @db_operation("get_credentials")
     async def get_credentials(
@@ -267,6 +282,7 @@ class CredentialRepository(BaseRepository):
         username: str | None = None,
         totp_type: str = "none",
         totp_identifier: str | None = None,
+        has_totp_seed: bool | None = None,
         card_last4: str | None = None,
         card_brand: str | None = None,
         secret_label: str | None = None,
@@ -293,6 +309,8 @@ class CredentialRepository(BaseRepository):
             credential.username = username
             credential.totp_type = totp_type
             credential.totp_identifier = totp_identifier
+            if has_totp_seed is not None:
+                credential.has_totp_seed = has_totp_seed
             credential.card_last4 = card_last4
             credential.card_brand = card_brand
             credential.secret_label = secret_label

@@ -8,7 +8,8 @@ Known limitations:
   reproduced here.
 * ``LLMRouterConfig`` (fallback chains) is accepted by resolving the
   ``main_model_group`` entry as the primary ``LLMConfig`` and passing the
-  remaining provider model names through LiteLLM's ``fallbacks`` argument.
+  remaining groups, each with its own credentials, through LiteLLM's
+  ``fallbacks`` argument.
   Load-balancing across multiple deployments for the same router group and
   Redis-coordinated cooldowns are not applied on the copilot-v2 path. Proper
   router support through the Agents SDK model interface is tracked in SKY-9256.
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.copilot.cache_envelope import ROUTER_HOP_FIELDS
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
@@ -84,22 +86,36 @@ _DROP_FIELDS = frozenset({"thinking_level"})
 _WARNED_DROP_KEYS: set[str] = set()
 
 
-def _router_model_name(config: LLMRouterConfig, model_group: str) -> str:
-    """Return the concrete provider model for a router group alias."""
-    entry = next((m for m in config.model_list if m.model_name == model_group), None)
-    if entry is None:
-        return model_group
-    return str(entry.litellm_params.get("model") or entry.model_name)
-
-
-def _router_fallback_models(config: LLMRouterConfig) -> list[str]:
+def _fallback_groups(config: LLMRouterConfig) -> list[str]:
     if not config.fallback_model_group:
         return []
     if isinstance(config.fallback_model_group, str):
-        fallback_groups = [config.fallback_model_group]
-    else:
-        fallback_groups = list(config.fallback_model_group)
-    return [_router_model_name(config, group) for group in fallback_groups]
+        return [config.fallback_model_group]
+    return list(config.fallback_model_group)
+
+
+def _router_fallback_models(config: LLMRouterConfig) -> list[dict[str, Any]]:
+    fallbacks: list[dict[str, Any]] = []
+    for group in _fallback_groups(config):
+        entry = next((m for m in config.model_list if m.model_name == group), None)
+        params = entry.litellm_params if entry is not None else {}
+        hop = {field: params.get(field) for field in ROUTER_HOP_FIELDS}
+        # LiteLLM's Responses route calls .get on model_info, so None crashes the hop.
+        hop["model_info"] = params.get("model_info") or {}
+        hop["model"] = str(params.get("model") or group)
+        hop["base_url"] = params.get("api_base")
+        hop["timeout"] = params.get("timeout", settings.LLM_CONFIG_TIMEOUT)
+        fallbacks.append(hop)
+    return fallbacks
+
+
+def router_fallback_llm_key(llm_key: str) -> str | None:
+    """The registered key a router falls back to, when its fallback group is named after one."""
+    if not LLMConfigRegistry.is_registered(llm_key):
+        return None
+    config = LLMConfigRegistry.get_config(llm_key)
+    groups = _fallback_groups(config) if isinstance(config, LLMRouterConfig) else []
+    return groups[0] if groups and LLMConfigRegistry.is_registered(groups[0]) else None
 
 
 def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfig:
@@ -109,9 +125,9 @@ def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfi
     full bridge lands (SKY-9256), the copilot-v2 path needs a way to run on
     orgs whose configured llm_key resolves to a router. We use the entry whose
     ``model_name`` matches ``main_model_group``; if none match we fall back to
-    ``model_list[0]`` and warn. Fallback groups are converted to concrete
-    provider model strings and passed to LiteLLM's plain ``acompletion``
-    fallback path via ModelSettings.extra_args.
+    ``model_list[0]`` and warn. Each fallback group becomes a LiteLLM fallback
+    entry carrying its own model, credentials and tier, passed to the plain
+    ``acompletion`` fallback path via ModelSettings.extra_args.
 
     The happy-path resolution is the expected code path on every copilot-v2
     call in staging/prod, so it logs at INFO. WARN is reserved for the
@@ -146,7 +162,7 @@ def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfi
         llm_key=llm_key,
         main_model_group=config.main_model_group,
         selected_model_name=direct_model_name,
-        fallback_models=fallback_models,
+        fallback_models=[hop["model"] for hop in fallback_models],
     )
 
     return LLMConfig(
@@ -213,6 +229,9 @@ def resolve_model_config(
 
     if config.reasoning_effort:
         extra_args["reasoning_effort"] = config.reasoning_effort
+        # LiteLLM's chat parameter check rejects reasoning_effort for GPT-6 even on an explicit Responses route.
+        if config.model_name.startswith(("openai/responses/", "azure/responses/")):
+            extra_args["allowed_openai_params"] = ["reasoning_effort", "service_tier"]
 
     if isinstance(config, LLMConfig) and config.litellm_params:
         lp = config.litellm_params

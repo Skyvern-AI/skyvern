@@ -9,8 +9,6 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
-import { useRuntimeConfig } from "@/hooks/useRuntimeConfig";
-import { RuntimeFeatureFlagProvider } from "@/providers/RuntimeFeatureFlagProvider";
 
 type StreamBody = {
   message: string;
@@ -71,12 +69,6 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-vi.mock("@/hooks/useRuntimeConfig", () => ({
-  useRuntimeConfig: vi.fn(),
-}));
-
-const useRuntimeConfigMock = vi.mocked(useRuntimeConfig);
-
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -131,9 +123,14 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.
@@ -141,7 +138,10 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 type FlagConfig = {
   codeBlockMode?: boolean;
@@ -161,22 +161,6 @@ async function renderChat(flags: FlagConfig) {
   return view;
 }
 
-async function renderOssChat() {
-  useRuntimeConfigMock.mockReturnValue({
-    data: {
-      workflow_copilot_code_block_mode: true,
-      code_block_access: true,
-    },
-  } as ReturnType<typeof useRuntimeConfig>);
-  const view = render(
-    <RuntimeFeatureFlagProvider>
-      <WorkflowCopilotChat />
-    </RuntimeFeatureFlagProvider>,
-  );
-  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-  return view;
-}
-
 function textarea(): HTMLTextAreaElement {
   return screen.getByRole("textbox") as HTMLTextAreaElement;
 }
@@ -185,19 +169,6 @@ async function submit(value: string) {
   fireEvent.change(textarea(), { target: { value } });
   await act(async () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
-  });
-}
-
-async function selectMode(label: "Build" | "Build with code") {
-  await act(async () => {
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-  });
-  const item = await screen.findByRole("menuitem", { name: label });
-  await act(async () => {
-    fireEvent.click(item);
   });
 }
 
@@ -217,60 +188,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-});
-
-describe("WorkflowCopilotChat — Build composer", () => {
-  it("uses the OSS server fallback as the visible default", async () => {
-    await renderOssChat();
-
-    expect(
-      screen.getByRole("button", { name: "Switch mode" }).textContent,
-    ).toContain("Build with code");
-
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("defaults to Build with code when code-first is accessible", async () => {
-    await renderChat({ codeBlockMode: true });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("lands on code ON when selecting Build with code", async () => {
-    await renderChat({ codeBlockMode: true });
-    await selectMode("Build with code");
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("turns code OFF when selecting plain Build", async () => {
-    await renderChat({ codeBlockMode: true });
-    await selectMode("Build");
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
-  });
-
-  it("explicitly selects non-code Build when code-first is inaccessible", async () => {
-    await renderChat({ codeBlockMode: false });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
-    expect(screen.queryByRole("button", { name: "Switch mode" })).toBeNull();
-  });
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — canvas selection context", () => {

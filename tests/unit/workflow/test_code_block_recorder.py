@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +21,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy import select
 
 import skyvern.webeye.navigation as navigation_module
+from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE, FailedToNavigateToUrl
@@ -40,8 +42,11 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
+    DOCUMENT_FAILURE_ATTRIBUTE,
     RECORDED_FAILURE_CAPTURE_MAX_CHARS,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    SIGN_IN_FORM_SCRIPT,
+    DocumentFailureReceipt,
     PendingAction,
     PlaywrightInputDefaults,
     RecordingKeyboard,
@@ -64,6 +69,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.self_heal import HealSkipReason, HealStatus
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -80,6 +87,8 @@ from skyvern.webeye.playwright_input import (
     playwright_input_defaults_for_page,
     register_playwright_input_context,
 )
+from skyvern.webeye.skycdp.facade.network_events import NetworkRequest
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 
 
 class FakeFrame:
@@ -182,6 +191,9 @@ class FakePage:
 
     def set_default_timeout(self, timeout: float) -> None:
         self.default_timeout = timeout
+
+    def is_closed(self) -> bool:
+        return False
 
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
@@ -1586,7 +1598,11 @@ async def test_goal_code_block_finalizes_step_on_cancellation(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_self_heal_success_finalizes_seat_completed(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    copilot_workflow_toggle_off: SimpleNamespace,
+) -> None:
     """A healed code block finalizes its SEAT task to completed — never a completed block over a failed seat."""
 
     class ExplodingLocator(FakeLocator):
@@ -1596,16 +1612,9 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
     page = FakePage()
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
+    context.workflow = copilot_workflow_toggle_off
     mocks = _patch_execute_environment(monkeypatch, page, context)
-    # The enabled-gate now lives at the chokepoint, ahead of the mocked floor.
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
-    # Force the floor path deterministically so this exercises execute()'s seat-finalization
-    # wiring regardless of ambient cap-cache / api-key state leaked by other tests in the suite.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
-        AsyncMock(return_value=1),
-    )
-    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
+    ai_fallback_flag("o_test")
     block = _make_code_block("await page.locator('#x').click()", goal="go")
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the
     # heal itself. The stub carries the full BlockResult surface the finalizer reads — heal
@@ -1633,7 +1642,11 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_self_heal_decline_finalizes_seat_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    copilot_workflow_toggle_off: SimpleNamespace,
+) -> None:
     """When the heal declines (None), the block fails closed and the seat task is finalized failed."""
 
     class ExplodingLocator(FakeLocator):
@@ -1643,13 +1656,16 @@ async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.Monke
     page = FakePage()
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
+    context.workflow = copilot_workflow_toggle_off
     mocks = _patch_execute_environment(monkeypatch, page, context)
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
-    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+    ai_fallback_flag("o_test")
+    declining_heal = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", declining_heal)
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
+    declining_heal.assert_awaited()
     assert result.success is False
     statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
     assert TaskStatus.failed in statuses
@@ -1793,15 +1809,15 @@ async def test_code_block_solver_lifecycle_streams_one_persisted_action(
     context = FakeWorkflowRunContext(secrets={"customer_path": "/account?token=solver-secret#challenge"})
     mocks = _patch_execute_environment(monkeypatch, page, context)
 
-    async def ladder(recording_page: RecordingPage, **_kwargs: object) -> bool:
+    async def ladder(recording_page: RecordingPage, **_kwargs: object) -> ChallengeOutcome:
         await recording_page.locator("#challenge").click()
         if outcome == "caught_unsolved":
-            raise block_module.CaptchaChallengeUnsolvedError(
-                "https://example.com/account?token=solver-secret#challenge"
-            )
-        return outcome == "solved"
+            return ChallengeOutcome(ChallengeStatus.UNSOLVED)
+        if outcome == "solved":
+            return ChallengeOutcome(ChallengeStatus.SOLVED, arm="extension")
+        return ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
 
-    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    monkeypatch.setattr(block_module, "solve_challenge", ladder)
     code = (
         "try:\n    solver_result = await solve_captcha(page)\nexcept Exception:\n    code_continued = True"
         if outcome == "caught_unsolved"
@@ -1846,7 +1862,7 @@ async def test_code_block_solver_cancellation_streams_failed_action_and_propagat
     async def cancel(_recording_page: RecordingPage, **_kwargs: object) -> bool:
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(block_module, "solve_challenge_ladder", cancel)
+    monkeypatch.setattr(block_module, "solve_challenge", cancel)
     with pytest.raises(asyncio.CancelledError):
         await _make_code_block("await solve_captcha(page)", goal="handle challenge").execute(
             workflow_run_id="wr_test",
@@ -2287,12 +2303,15 @@ def _release_guard(allowed_url: str = "https://dash.example.com/account/login") 
 
 
 @pytest.mark.asyncio
-async def test_off_site_credential_fill_is_refused_before_release() -> None:
+@pytest.mark.parametrize("through_main_frame", [False, True])
+async def test_off_site_credential_fill_is_refused_before_release(through_main_frame: bool) -> None:
     fake = FakePage()
+    fake.main_frame = SimpleNamespace(locator=lambda selector: fake.inner)  # type: ignore[attr-defined]
     fake.inner.frame_url = "https://accounts.example.org/challenge/pwd"
     page = RecordingPage(fake, credential_release_guard=_release_guard())
+    owner = page.main_frame if through_main_frame else page
     with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
-        await page.locator('input[type="password"]').fill("Sup3rSecretPW!")
+        await owner.locator('input[type="password"]').fill("Sup3rSecretPW!")
     assert "login_credentials" in str(exc_info.value)
     assert re.search(r"https://example\.org", str(exc_info.value))
     assert not any(call.startswith("fill:") for call in fake.inner.calls)
@@ -2657,15 +2676,23 @@ async def test_failure_nav_error_code_tracks_the_exception_that_navigated() -> N
 
 
 @pytest.mark.asyncio
-async def test_block_code_cannot_reword_the_navigation_error_it_catches(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param('    e.args = ("net::ERR_NAME_NOT_RESOLVED",)\n', id="rewords_the_error"),
+        pytest.param('    await page.click("#retry")\n', id="makes_a_recorded_call_first"),
+    ],
+)
+async def test_block_code_cannot_reword_the_navigation_error_it_catches(
+    monkeypatch: pytest.MonkeyPatch, handler: str
+) -> None:
     """Block code holds the driver's exception before the block does, so the code it reports has to be
-    the one the navigation raised, not whatever the block re-raises."""
+    the one the navigation raised, not whatever the block re-raises or calls before re-raising."""
     page = FakePage()
     page.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/"))  # type: ignore[method-assign]
     _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
     block = _make_code_block(
-        'try:\n    await page.goto("https://x.test/")\n'
-        'except Exception as e:\n    e.args = ("net::ERR_NAME_NOT_RESOLVED",)\n    raise'
+        f'try:\n    await page.goto("https://x.test/")\nexcept Exception as e:\n{handler}    raise'
     )
 
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
@@ -3021,13 +3048,19 @@ async def test_failure_locator_tracks_exact_exception_without_reparsing_selector
     assert recording.failure_locator(caught.value) is None
 
 
+def _passthrough_codeblock_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        block_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters, **_budget: value),
+    )
+
+
 @pytest.mark.asyncio
 async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_locator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The inline diagnostic reads the recorded locator, never a selector parsed from the error."""
-    from skyvern.forge.sdk.workflow.models import block as block_module
-
     secret = "credential-secret"
     exception = PlaywrightTimeoutError("locator timed out")
 
@@ -3047,11 +3080,7 @@ async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_loca
     recording = RecordingPage(SnapshotPage())
     locator = TimedOutLocator()
     monkeypatch.setattr(RecordingPage, "failure_locator", lambda _self, exc: locator if exc is exception else None)
-    monkeypatch.setattr(
-        block_module.app,
-        "AGENT_FUNCTION",
-        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters: value),
-    )
+    _passthrough_codeblock_redaction(monkeypatch)
     context = SimpleNamespace(mask_secrets_in_data=lambda value: value.replace(secret, "*****"))
     block = _make_code_block("pass")
 
@@ -3073,6 +3102,98 @@ async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_loca
         workflow_run_context=context,
         redaction_parameters={},
     ) == {"final_url": "https://fixture.test/checkout?token=*****", "page_title": state["page_title"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("navigates_during", "expected_state"),
+    [
+        ("title", {"final_url": "https://portal.fixture.test/dashboard"}),
+        ("title_raises", {"final_url": "https://portal.fixture.test/dashboard"}),
+        (
+            "covering_element",
+            {
+                "final_url": "https://portal.fixture.test/login",
+                "page_title": "Ops Portal",
+                "covering_element": "div.banner",
+            },
+        ),
+    ],
+)
+async def test_inline_failure_snapshot_never_pairs_a_title_with_another_documents_url(
+    monkeypatch: pytest.MonkeyPatch, navigates_during: str, expected_state: dict[str, str]
+) -> None:
+    class NavigatingPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.url = "https://portal.fixture.test/login"
+
+        async def title(self) -> str:
+            if navigates_during != "covering_element":
+                self.url = "https://portal.fixture.test/dashboard"
+            if navigates_during == "title_raises":
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return "Ops Portal"
+
+    page = NavigatingPage()
+
+    class NavigatingLocator:
+        async def evaluate(self, _script: str) -> str:
+            page.url = "https://portal.fixture.test/dashboard"
+            return "div.banner"
+
+    _passthrough_codeblock_redaction(monkeypatch)
+    state = await _make_code_block("pass")._capture_inline_failure_page_state(
+        page=RecordingPage(page),
+        failure_locator=NavigatingLocator() if navigates_during == "covering_element" else None,
+        workflow_run_context=SimpleNamespace(mask_secrets_in_data=lambda value: value),
+        redaction_parameters={},
+    )
+
+    assert state == expected_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failing_url_reads", "expected_state"),
+    [
+        ({2}, {"final_url": "https://portal.fixture.test/login"}),
+        ({1}, {"final_url": "https://portal.fixture.test/dashboard"}),
+        ({1, 2}, {}),
+    ],
+)
+async def test_inline_failure_snapshot_drops_the_title_when_the_first_url_read_or_the_url_reread_fails(
+    monkeypatch: pytest.MonkeyPatch, failing_url_reads: set[int], expected_state: dict[str, str]
+) -> None:
+    class UrlReadFailsPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.url_reads = 0
+            self.urls = ["https://portal.fixture.test/login", "https://portal.fixture.test/dashboard"]
+
+        @property
+        def url(self) -> str:
+            self.url_reads += 1
+            if self.url_reads in failing_url_reads:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return self.urls[self.url_reads - 1]
+
+        @url.setter
+        def url(self, _value: str) -> None:
+            pass
+
+        async def title(self) -> str:
+            return "Ops Portal"
+
+    _passthrough_codeblock_redaction(monkeypatch)
+    state = await _make_code_block("pass")._capture_inline_failure_page_state(
+        page=RecordingPage(UrlReadFailsPage()),
+        failure_locator=None,
+        workflow_run_context=SimpleNamespace(mask_secrets_in_data=lambda value: value),
+        redaction_parameters={},
+    )
+
+    assert state == expected_state
 
 
 @pytest.mark.asyncio
@@ -3129,6 +3250,100 @@ async def test_a_code_block_navigation_reports_a_proxy_code_only_for_a_live_targ
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "failing_call", "message", "host_is_dead", "fallback_org", "skipped_code"),
+    [
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            False,
+            "o_test",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            id="proxy_tunnel",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            False,
+            None,
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            id="proxy_tunnel_flag_off",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_SOCKS_CONNECTION_FAILED at https://x.test/",
+            False,
+            "o_test",
+            "net::ERR_SOCKS_CONNECTION_FAILED",
+            id="proxy_socks",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_NAME_NOT_RESOLVED at https://x.test/",
+            False,
+            "o_test",
+            None,
+            id="dns_failure_heals",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            True,
+            "o_test",
+            None,
+            id="dead_host_behind_proxy_heals",
+        ),
+        pytest.param(
+            'await page.click("#go")',
+            "click",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            False,
+            "o_test",
+            None,
+            id="code_only_in_the_message_heals",
+        ),
+    ],
+)
+async def test_a_proxy_transport_failure_skips_the_ai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    copilot_workflow_toggle_off: SimpleNamespace,
+    code: str,
+    failing_call: str,
+    message: str,
+    host_is_dead: bool,
+    fallback_org: str | None,
+    skipped_code: str | None,
+) -> None:
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: host_is_dead)
+    page = FakePage()
+    setattr(page, failing_call, AsyncMock(side_effect=PlaywrightError(message)))
+    context = FakeWorkflowRunContext()
+    context.workflow = copilot_workflow_toggle_off
+    _patch_execute_environment(monkeypatch, page, context)
+    ai_fallback_flag(fallback_org)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+    create_heal_episode = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.self_heal, "create_heal_episode", create_heal_episode)
+    block = _make_code_block(code, goal="open the catalogue")
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    episodes = [(c.kwargs["status"], c.kwargs["skip_reason"]) for c in create_heal_episode.await_args_list]
+    if skipped_code is None:
+        assert episodes == [(HealStatus.fired_failed, None)]
+    else:
+        assert episodes == [(HealStatus.skipped, HealSkipReason.proxy_transport)]
+        assert result.error_codes == [skipped_code]
+
+
+@pytest.mark.asyncio
 async def test_a_dead_target_still_reports_a_code_the_driver_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     """The corroboration answers only for a raw driver error. A typed navigation failure already
     carries the verdict of the layer that raised it, and re-deciding it here would discard one."""
@@ -3173,3 +3388,1252 @@ async def test_a_cancelled_run_is_not_reported_as_a_navigation_verdict(monkeypat
         await navigation_module.reported_nav_error_code(failure, "https://x.test/")
         == "net::ERR_TUNNEL_CONNECTION_FAILED"
     )
+
+
+class FakeDocumentRequest:
+    def __init__(
+        self,
+        url: str,
+        frame: FakeFrame,
+        *,
+        navigation: bool,
+        redirected_from: FakeDocumentRequest | None,
+        post_data: str | None,
+        headers: dict[str, str],
+    ) -> None:
+        self.url = url
+        self.frame = frame
+        self.redirected_from = redirected_from
+        self.post_data = post_data
+        self.headers = headers
+        self.failure: str | None = None
+        self._navigation = navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._navigation
+
+
+class DocumentEventPage(FakePage):
+    """Fires request/response/requestfailed in the order the driver does for one document request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_frame = FakeFrame("about:blank")
+        self.listeners: dict[str, list[Callable[[Any], None]]] = {}
+
+    def on(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event: str, handler: Callable[[Any], None]) -> None:
+        self.listeners[event].remove(handler)
+
+    def navigate(
+        self,
+        url: str,
+        *,
+        redirected_from: FakeDocumentRequest | None = None,
+        frame: FakeFrame | None = None,
+        navigation: bool = True,
+        status: int | None = None,
+        failure: str | None = None,
+        post_data: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FakeDocumentRequest:
+        request = FakeDocumentRequest(
+            url,
+            self.main_frame if frame is None else frame,
+            navigation=navigation,
+            redirected_from=redirected_from,
+            post_data=post_data,
+            headers=headers or {},
+        )
+        for handler in list(self.listeners.get("request", [])):
+            handler(request)
+        if status is not None:
+            for handler in list(self.listeners.get("response", [])):
+                handler(SimpleNamespace(request=request, status=status))
+        if failure is not None:
+            request.failure = failure
+            for handler in list(self.listeners.get("requestfailed", [])):
+                handler(request)
+        return request
+
+
+async def _submit_then_wait(
+    page: DocumentEventPage,
+    recording: RecordingPage,
+    during_submit: Callable[[DocumentEventPage], object],
+    *,
+    before_wait: Callable[[], Awaitable[object]] | None = None,
+    wait_error: BaseException | None = None,
+    page_level_wait: bool = False,
+) -> BaseException:
+    error = wait_error or PlaywrightTimeoutError("Locator.wait_for: Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        during_submit(page)
+
+    async def wait_for(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.inner.wait_for = wait_for  # type: ignore[method-assign]
+    page.wait_for_selector = wait_for  # type: ignore[attr-defined]
+    await recording.locator("button[type=submit]").click()
+    if before_wait is not None:
+        await before_wait()
+    with pytest.raises(type(error)) as caught:
+        if page_level_wait:
+            await recording.wait_for_selector("#welcome", timeout=5000)
+        else:
+            await recording.locator("#welcome").wait_for(timeout=5000)
+    return caught.value
+
+
+def _redirect_to_a_closed_connection(page: DocumentEventPage) -> None:
+    login = page.navigate(
+        "https://user:pw-secret@app.fixture.test:8443/login?token=query-secret",
+        status=302,
+        post_data="password=body-secret",
+        headers={"cookie": "sid=cookie-secret"},
+    )
+    page.navigate(
+        "https://app.fixture.test:8443/home?session=redirect-secret",
+        redirected_from=login,
+        failure="net::ERR_EMPTY_RESPONSE",
+    )
+
+
+_CLOSED_CONNECTION_RECEIPT = DocumentFailureReceipt(
+    attempt_id=1,
+    origin="https://app.fixture.test:8443",
+    driver_code="net::ERR_EMPTY_RESPONSE",
+    response_status=None,
+    relation="associated",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_text",
+    [
+        pytest.param("Timeout 5000ms exceeded. net::ERR_CONNECTION_REFUSED", id="text_names_another_code"),
+        pytest.param("Locator.wait_for: Timeout 5000ms exceeded.", id="text_names_no_code"),
+    ],
+)
+async def test_a_wait_behind_a_failed_redirected_document_carries_the_driver_receipt(wait_text: str) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    error = await _submit_then_wait(
+        page, recording, _redirect_to_a_closed_connection, wait_error=PlaywrightTimeoutError(wait_text)
+    )
+
+    receipt = recording.failure_document_receipt(error)
+
+    assert receipt == _CLOSED_CONNECTION_RECEIPT
+    assert recording.failure_nav_error_code(error) is None
+    serialized = json.dumps(asdict(receipt))
+    for leaked in ("pw-secret", "query-secret", "body-secret", "cookie-secret", "redirect-secret", "/home", "/login"):
+        assert leaked not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "method", "argument"),
+    [
+        ("page", "wait_for_selector", "#welcome"),
+        ("page", "wait_for_url", "**/home"),
+        ("page", "wait_for_load_state", "load"),
+        ("keyboard", "press", "Enter"),
+        ("keyboard", "type", "text"),
+        ("keyboard", "down", "Shift"),
+        ("frame", "wait_for_selector", "#welcome"),
+    ],
+)
+@pytest.mark.parametrize("document", ["failed", "healthy", "other_tab"])
+async def test_a_page_level_call_behind_a_failed_document_carries_the_receipt(
+    owner: str, method: str, argument: str, document: str
+) -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    recording._wrap_page(other_tab)
+    error = PlaywrightTimeoutError(f"{method}: Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        if document == "failed":
+            _redirect_to_a_closed_connection(page)
+        elif document == "healthy":
+            _redirect_to_a_healthy_document(page)
+        else:
+            _redirect_to_a_closed_connection(other_tab)
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    page.inner.click = click  # type: ignore[method-assign]
+    setattr({"page": page, "keyboard": page.keyboard, "frame": page.main_frame}[owner], method, fail)
+    await recording.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await getattr(
+            {"page": recording, "keyboard": recording.keyboard, "frame": recording.main_frame}[owner], method
+        )(argument)
+
+    assert recording.failure_document_receipt(error) == (_CLOSED_CONNECTION_RECEIPT if document == "failed" else None)
+    assert recording.failure_page(error) is None
+    assert recording.failure_nav_error_code(error) is None
+    recording._detach_document_observers()
+    assert not any(page.listeners.values()) and not any(other_tab.listeners.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait", ["frame", "context", "expect_popup"])
+async def test_a_wait_after_a_failed_locator_call_keeps_that_calls_failure(wait: str) -> None:
+    page = DocumentEventPage()
+    page.context = SimpleNamespace()
+    recording = RecordingPage(page, strategy_aware_typing=True)
+    error = PlaywrightTimeoutError("Locator.click: Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        raise error
+
+    async def settle(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.main_frame.wait_for_selector = settle  # type: ignore[attr-defined]
+    page.context.wait_for_event = settle
+    page.expect_popup = lambda **kwargs: _ExpectEvent(settle)  # type: ignore[attr-defined]
+    with pytest.raises(PlaywrightTimeoutError):
+        await recording.locator("#submit").click()
+    if wait == "frame":
+        await recording.main_frame.wait_for_selector("#done")
+    elif wait == "context":
+        await recording.context.wait_for_event("page")
+    else:
+        async with recording.expect_popup():
+            pass
+
+    assert recording.failure_locator(error) is page.inner
+    assert recording.failure_page(error) is page
+
+
+@pytest.mark.asyncio
+async def test_a_failure_overtaken_by_a_concurrent_call_still_names_its_own_tab() -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    opened = recording._wrap_page(other_tab)
+    error = PlaywrightTimeoutError("Locator.click: Timeout 5000ms exceeded.")
+    newer_call_started = asyncio.Event()
+
+    async def fail_after_the_newer_call_starts(**kwargs: Any) -> None:
+        await newer_call_started.wait()
+        raise error
+
+    async def start(**kwargs: Any) -> None:
+        newer_call_started.set()
+
+    other_tab.inner.click = fail_after_the_newer_call_starts  # type: ignore[method-assign]
+    page.inner.click = start  # type: ignore[method-assign]
+    older, _ = await asyncio.gather(
+        opened.locator("#orders").click(), recording.locator("#search").click(), return_exceptions=True
+    )
+
+    assert older is error
+    assert recording.failing_tab(error) is other_tab
+
+
+@pytest.mark.asyncio
+async def test_a_failed_element_handle_action_names_the_page_that_produced_the_handle() -> None:
+    # An ElementHandle has no page attribute, so reading one off the failed receiver would crash the
+    # block's failure handling instead of reporting the authored timeout.
+    error = PlaywrightTimeoutError("ElementHandle.click: Timeout 500ms exceeded.")
+
+    class ElementHandle:
+        async def click(self, **kwargs: Any) -> None:
+            raise error
+
+    ElementHandle.__module__ = "playwright.async_api._generated"
+    page = DocumentEventPage()
+    page.query_selector = AsyncMock(return_value=ElementHandle())  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    handle = await recording.query_selector("#hidden")
+    with pytest.raises(PlaywrightTimeoutError):
+        await handle.click()
+
+    assert recording.failure_page(error) is page
+
+
+@pytest.mark.asyncio
+async def test_an_element_handles_owner_frame_is_the_pages_recorded_frame() -> None:
+    # A frame handed back by an element handle belongs to the page that produced the handle, so its
+    # locators are recorded and guarded exactly like page.main_frame's.
+    class Frame:
+        pass
+
+    class ElementHandle:
+        async def owner_frame(self) -> Frame:
+            return frame
+
+    for cls in (Frame, ElementHandle):
+        cls.__module__ = "playwright.async_api._generated"
+    frame = Frame()
+    page = DocumentEventPage()
+    page.main_frame = frame  # type: ignore[attr-defined]
+    page.query_selector = AsyncMock(return_value=ElementHandle())  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    handle = await recording.query_selector("#hidden")
+
+    assert await handle.owner_frame() is recording.main_frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["wait_for_selector", "click"])
+@pytest.mark.parametrize("failed_tab", ["own", "other"])
+async def test_an_element_handle_call_binds_the_receipt_of_the_page_that_produced_it(
+    call: str, failed_tab: str
+) -> None:
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    class ElementHandle:
+        __module__ = "playwright.async_api"
+
+        async def wait_for_selector(self, selector: str, **kwargs: Any) -> None:
+            raise error
+
+        async def click(self, **kwargs: Any) -> None:
+            raise error
+
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    recording._wrap_page(other_tab)
+
+    async def query_selector(selector: str) -> ElementHandle:
+        return ElementHandle()
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page if failed_tab == "own" else other_tab)
+
+    page.query_selector = query_selector  # type: ignore[attr-defined]
+    page.inner.click = click  # type: ignore[method-assign]
+    form = await recording.query_selector("form")
+    await recording.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await (form.wait_for_selector("#welcome") if call == "wait_for_selector" else form.click())
+
+    assert recording.failure_document_receipt(error) == (_CLOSED_CONNECTION_RECEIPT if failed_tab == "own" else None)
+
+
+class _ExpectEvent:
+    """Playwright's expect_* context: the wait is awaited on the way out, unless the body raised."""
+
+    def __init__(self, wait: Callable[[], Awaitable[None]]) -> None:
+        self._wait = wait
+
+    async def __aenter__(self) -> SimpleNamespace:
+        self._waiter = asyncio.ensure_future(self._wait())
+        return SimpleNamespace(value=self._waiter)
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        if exc_info[1] is not None:
+            self._waiter.cancel()
+            return
+        await self._waiter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape",
+    ["gather", "expect_navigation", "expect_response_value", "frame_expect_navigation", "context_wait_for_event"],
+)
+async def test_a_wait_started_before_its_trigger_carries_the_receipt(shape: str) -> None:
+    page = DocumentEventPage()
+    page.context = SimpleNamespace()
+    recording = RecordingPage(page, strategy_aware_typing=True)
+    triggered = asyncio.Event()
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+        triggered.set()
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await triggered.wait()
+        raise error
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    page.expect_navigation = lambda **kwargs: _ExpectEvent(wait_then_fail)  # type: ignore[attr-defined]
+    page.expect_response = lambda *args, **kwargs: _ExpectEvent(wait_then_fail)  # type: ignore[attr-defined]
+    page.main_frame.expect_navigation = lambda **kwargs: _ExpectEvent(wait_then_fail)
+    page.context.wait_for_event = wait_then_fail
+    submit = recording.locator("button[type=submit]")
+
+    with pytest.raises(PlaywrightTimeoutError):
+        if shape == "gather":
+            await asyncio.gather(recording.wait_for_url("**/home"), submit.click())
+        elif shape == "expect_navigation":
+            async with recording.expect_navigation():
+                await submit.click()
+        elif shape == "expect_response_value":
+            async with recording.expect_response("**/home") as info:
+                await submit.click()
+                await info.value
+        elif shape == "frame_expect_navigation":
+            async with recording.main_frame.expect_navigation():
+                await submit.click()
+        else:
+            await asyncio.gather(recording.context.wait_for_event("page"), submit.click())
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_an_in_flight_wait_never_claims_a_document_older_than_itself() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    released = asyncio.Event()
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await released.wait()
+        raise error
+
+    async def evaluate(*args: Any, **kwargs: Any) -> None:
+        released.set()
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    await recording.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await asyncio.gather(recording.wait_for_url("**/home"), recording.evaluate("1"))
+
+    receipt = recording.failure_document_receipt(error)
+    assert receipt is not None and receipt.relation == "context"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_level_wait", [False, True], ids=["locator_wait", "page_wait"])
+async def test_a_document_failing_after_the_wait_raised_still_binds_the_receipt(page_level_wait: bool) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    in_flight: list[FakeDocumentRequest] = []
+
+    async def evaluate(expression: str) -> None:
+        return None
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    error = await _submit_then_wait(
+        page,
+        recording,
+        lambda page: in_flight.append(page.navigate("https://app.fixture.test:8443/home")),
+        page_level_wait=page_level_wait,
+    )
+    assert recording.failure_document_receipt(error) is None
+    await recording.evaluate("1")
+    in_flight[0].failure = "net::ERR_EMPTY_RESPONSE"
+    for handler in page.listeners["requestfailed"]:
+        handler(in_flight[0])
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+    assert vars(error)[DOCUMENT_FAILURE_ATTRIBUTE] == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_wait_raises_then_failing_probe_binds_then_requestfailed_fires() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    in_flight: list[FakeDocumentRequest] = []
+
+    async def evaluate(expression: str) -> None:
+        raise PlaywrightError("Execution context was destroyed")
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    error = await _submit_then_wait(
+        page, recording, lambda page: in_flight.append(page.navigate("https://app.fixture.test:8443/home"))
+    )
+    assert recording.failure_document_receipt(error) is None
+    assert vars(error).get(DOCUMENT_FAILURE_ATTRIBUTE) is None
+    with pytest.raises(PlaywrightError):
+        await recording.evaluate("1")
+    in_flight[0].failure = "net::ERR_EMPTY_RESPONSE"
+    for handler in page.listeners["requestfailed"]:
+        handler(in_flight[0])
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+    assert vars(error)[DOCUMENT_FAILURE_ATTRIBUTE] == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_an_older_wait_failing_after_a_newer_one_leaves_the_newer_receipt_associated() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    released = asyncio.Event()
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await released.wait()
+        raise PlaywrightTimeoutError("wait_for_url: Timeout 5000ms exceeded.")
+
+    async def newer_call() -> BaseException:
+        try:
+            return await _submit_then_wait(page, recording, _redirect_to_a_closed_connection)
+        finally:
+            released.set()
+
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    older, newer = await asyncio.gather(recording.wait_for_url("**/home"), newer_call(), return_exceptions=True)
+
+    assert isinstance(older, PlaywrightTimeoutError) and isinstance(newer, PlaywrightTimeoutError)
+    assert recording.failure_document_receipt(newer) == _CLOSED_CONNECTION_RECEIPT
+    assert vars(older).get(DOCUMENT_FAILURE_ATTRIBUTE) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_waits_on_two_tabs_never_borrow_each_others_receipt() -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    other_recording = recording._wrap_page(other_tab)
+    released = asyncio.Event()
+
+    async def wait_then_fail(*args: Any, **kwargs: Any) -> None:
+        await released.wait()
+        raise PlaywrightTimeoutError("wait_for_url: Timeout 5000ms exceeded.")
+
+    async def fail_behind_a_closed_connection(*args: Any, **kwargs: Any) -> None:
+        try:
+            _redirect_to_a_closed_connection(other_tab)
+            raise PlaywrightTimeoutError("wait_for_url: Timeout 5000ms exceeded.")
+        finally:
+            released.set()
+
+    page.wait_for_url = wait_then_fail  # type: ignore[attr-defined]
+    other_tab.wait_for_url = fail_behind_a_closed_connection  # type: ignore[attr-defined]
+    own, foreign = await asyncio.gather(
+        recording.wait_for_url("**/home"), other_recording.wait_for_url("**/home"), return_exceptions=True
+    )
+
+    assert isinstance(own, PlaywrightTimeoutError) and isinstance(foreign, PlaywrightTimeoutError)
+    assert recording.failure_document_receipt(foreign) == _CLOSED_CONNECTION_RECEIPT
+    assert recording.failure_document_receipt(own) is None
+
+
+@pytest.mark.asyncio
+async def test_a_document_failure_without_a_driver_code_keeps_the_code_unknown() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+
+    error = await _submit_then_wait(
+        page,
+        recording,
+        lambda page: page.navigate("http://10.0.0.7/report", status=503, failure="connection closed"),
+    )
+
+    assert recording.failure_document_receipt(error) == DocumentFailureReceipt(
+        attempt_id=1, origin="http://10.0.0.7", driver_code=None, response_status=503, relation="associated"
+    )
+
+
+def _redirect_to_a_healthy_document(page: DocumentEventPage) -> None:
+    login = page.navigate("https://app.fixture.test/login", status=302)
+    page.navigate("https://app.fixture.test/home", redirected_from=login, status=200)
+
+
+def _failed_subresource(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/home", status=200)
+    page.navigate("https://cdn.fixture.test/app.js", navigation=False, failure="net::ERR_EMPTY_RESPONSE")
+
+
+def _failed_iframe_document(page: DocumentEventPage) -> None:
+    page.navigate(
+        "https://widget.fixture.test/",
+        frame=FakeFrame("https://widget.fixture.test/"),
+        failure="net::ERR_EMPTY_RESPONSE",
+    )
+
+
+def _superseded_failure(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/home", failure="net::ERR_EMPTY_RESPONSE")
+    page.navigate("https://app.fixture.test/retry", status=200)
+
+
+def _navigation_that_became_a_download(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/report.pdf", status=200, failure="net::ERR_ABORTED")
+
+
+def _cancelled_navigation(page: DocumentEventPage) -> None:
+    page.navigate("https://app.fixture.test/slow", failure="net::ERR_ABORTED")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "during_submit",
+    [
+        pytest.param(_redirect_to_a_healthy_document, id="redirect_then_200"),
+        pytest.param(_failed_subresource, id="subresource"),
+        pytest.param(_failed_iframe_document, id="iframe"),
+        pytest.param(_superseded_failure, id="superseded_by_a_new_document"),
+        pytest.param(_navigation_that_became_a_download, id="download"),
+        pytest.param(_cancelled_navigation, id="err_aborted"),
+        pytest.param(lambda page: None, id="no_document"),
+    ],
+)
+async def test_only_a_failed_main_document_on_the_waiting_page_is_reported(
+    during_submit: Callable[[DocumentEventPage], object],
+) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+
+    error = await _submit_then_wait(page, recording, during_submit)
+
+    assert recording.failure_document_receipt(error) is None
+    assert recording.failure_document_receipt(RuntimeError("net::ERR_EMPTY_RESPONSE")) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "method"), [("page", "goto"), ("page", "reload"), ("page", "go_back"), ("frame", "goto")]
+)
+async def test_a_failed_navigation_reports_its_own_code_and_no_document_receipt(
+    monkeypatch: pytest.MonkeyPatch, owner: str, method: str
+) -> None:
+    monkeypatch.setattr(navigation_module, "_unresolvable_navigation_host", AsyncMock(return_value=False))
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    error = PlaywrightError(f"Page.{method}: net::ERR_EMPTY_RESPONSE at https://app.fixture.test:8443/home")
+
+    async def navigate(*args: Any, **kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+        raise error
+
+    setattr(page if owner == "page" else page.main_frame, method, navigate)
+    with pytest.raises(PlaywrightError):
+        await getattr(recording if owner == "page" else recording.main_frame, method)(
+            *(["https://app.fixture.test:8443/login"] if method == "goto" else [])
+        )
+
+    assert recording.failure_nav_error_code(error) == "net::ERR_EMPTY_RESPONSE"
+    assert recording.failure_document_receipt(error) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["locator_wait_for", "locator_click", "expect_navigation", "expect_response_value"])
+async def test_a_call_cancelled_behind_a_failed_document_binds_the_receipt_on_every_path(shape: str) -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    triggered = asyncio.Event()
+
+    async def submit(*args: Any, **kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+        triggered.set()
+
+    async def cancel(*args: Any, **kwargs: Any) -> None:
+        await triggered.wait()
+        raise asyncio.CancelledError()
+
+    page.inner.press = submit  # type: ignore[method-assign]
+    page.inner.wait_for = cancel  # type: ignore[method-assign]
+    page.inner.click = cancel  # type: ignore[method-assign]
+    page.expect_navigation = lambda **kwargs: _ExpectEvent(cancel)  # type: ignore[attr-defined]
+    page.expect_response = lambda *args, **kwargs: _ExpectEvent(cancel)  # type: ignore[attr-defined]
+    password = recording.locator("input[name=password]")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        if shape == "expect_navigation":
+            async with recording.expect_navigation():
+                await password.press("Enter")
+        elif shape == "expect_response_value":
+            async with recording.expect_response("**/home") as info:
+                await password.press("Enter")
+                await info.value
+        else:
+            await password.press("Enter")
+            await getattr(recording.locator("#welcome"), shape.removeprefix("locator_"))()
+
+    assert recording.failure_document_receipt(caught.value) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_a_document_that_failed_before_the_trigger_is_not_the_waits_cause() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    page.navigate("https://app.fixture.test/", failure="net::ERR_EMPTY_RESPONSE")
+
+    error = await _submit_then_wait(page, recording, lambda page: None)
+
+    receipt = recording.failure_document_receipt(error)
+    assert receipt is not None and receipt.relation == "context"
+
+
+@pytest.mark.asyncio
+async def test_a_sync_frame_query_between_trigger_and_wait_keeps_the_receipt_associated() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+    page.main_frame.is_detached = lambda: False  # type: ignore[attr-defined]
+
+    async def touch_frames() -> None:
+        assert recording.main_frame.is_detached() is False
+
+    error = await _submit_then_wait(page, recording, _redirect_to_a_closed_connection, before_wait=touch_frames)
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_an_older_or_wrapped_document_failure_is_context_not_cause() -> None:
+    page = DocumentEventPage()
+    recording = RecordingPage(page)
+
+    error = await _submit_then_wait(
+        page, recording, _redirect_to_a_closed_connection, before_wait=lambda: recording.wait_for_load_state()
+    )
+    older = recording.failure_document_receipt(error)
+    authored = recording.failure_document_receipt(RuntimeError("net::ERR_EMPTY_RESPONSE"))
+
+    assert older is not None and older.relation == "context"
+    assert authored is not None and authored.relation == "context"
+    await recording.wait_for_load_state()
+    assert recording.failure_document_receipt(RuntimeError("net::ERR_EMPTY_RESPONSE")) is None
+
+
+@pytest.mark.asyncio
+async def test_inline_block_output_carries_the_receipt_beside_the_unchanged_wait_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run(fail: bool) -> BlockResult:
+        page = DocumentEventPage()
+        origin = "https://tenant-secret.fixture.test:8443"
+
+        async def click(**kwargs: Any) -> None:
+            login = page.navigate(f"{origin}/login?token=query-secret", status=302)
+            if fail:
+                page.navigate(f"{origin}/home", redirected_from=login, failure="net::ERR_EMPTY_RESPONSE")
+            else:
+                page.navigate(f"{origin}/home", redirected_from=login, status=200)
+
+        async def wait_for(**kwargs: Any) -> None:
+            raise PlaywrightTimeoutError("Locator.wait_for: Timeout 5000ms exceeded.")
+
+        page.inner.click = click  # type: ignore[method-assign]
+        page.inner.wait_for = wait_for  # type: ignore[method-assign]
+        context = FakeWorkflowRunContext(secrets={"tenant": "tenant-secret"})
+        _patch_execute_environment(monkeypatch, page, context)
+        block = _make_code_block(
+            "await page.locator('button[type=submit]').click()\nawait page.locator('#welcome').wait_for(timeout=5000)"
+        )
+        return await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    result = await run(True)
+    control = await run(False)
+
+    assert result.status == BlockStatus.failed
+    assert (result.failure_reason, result.error_codes) == (control.failure_reason, control.error_codes)
+    output = result.output_parameter_value
+    assert isinstance(output, dict)
+    assert output["associated_navigation"] == {
+        "attempt_id": 1,
+        "origin": "https://*****.fixture.test:8443",
+        "driver_code": "net::ERR_EMPTY_RESPONSE",
+        "response_status": None,
+        "relation": "associated",
+    }
+    assert {key: value for key, value in output.items() if key != "associated_navigation"} == (
+        control.output_parameter_value
+    )
+    assert isinstance(control.output_parameter_value, dict)
+    assert "associated_navigation" not in control.output_parameter_value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("after_the_wait", "error_codes"),
+    [
+        pytest.param(
+            "    raise ErrorCode('LOGIN_FAILED', 'login page never loaded')\n", ["LOGIN_FAILED"], id="declared"
+        ),
+        pytest.param("    pass\nawait sleep(5)\n", [], id="block_timeout"),
+    ],
+)
+async def test_inline_declared_and_timeout_failures_carry_the_receipt_as_context(
+    monkeypatch: pytest.MonkeyPatch, after_the_wait: str, error_codes: list[str]
+) -> None:
+    page = DocumentEventPage()
+
+    async def click(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+
+    async def wait_for(**kwargs: Any) -> None:
+        raise PlaywrightTimeoutError("Locator.wait_for: Timeout 5000ms exceeded.")
+
+    page.inner.click = click  # type: ignore[method-assign]
+    page.inner.wait_for = wait_for  # type: ignore[method-assign]
+    _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    monkeypatch.setattr(settings, "CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS", 0.2)
+    block = _make_code_block(
+        "await page.locator('button[type=submit]').click()\n"
+        "try:\n"
+        "    await page.locator('#welcome').wait_for(timeout=5000)\n"
+        "except Exception:\n" + after_the_wait
+    )
+    block.error_code_mapping = {"LOGIN_FAILED": "The login page never loaded"}
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.status == BlockStatus.failed
+    assert result.error_codes == error_codes
+    assert isinstance(result.output_parameter_value, dict)
+    assert result.output_parameter_value["associated_navigation"] == {
+        **asdict(_CLOSED_CONNECTION_RECEIPT),
+        "relation": "context",
+    }
+    assert not any(page.listeners.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sign_in_form", [True, False])
+async def test_a_block_timeout_on_a_sign_in_form_is_recorded_on_the_run(
+    monkeypatch: pytest.MonkeyPatch, sign_in_form: bool
+) -> None:
+    page = DocumentEventPage()
+
+    async def evaluate(expression: str, *args: object, **kwargs: object) -> bool | None:
+        return sign_in_form if expression == SIGN_IN_FORM_SCRIPT else None
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    monkeypatch.setattr(settings, "CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS", 0.2)
+    block = _make_code_block("await sleep(5)\n")
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    _, _, run_category = WorkflowService._resolve_block_terminal_outcome(block=block, block_result=result)
+    reason_codes = {entry.get("reason_code") for entry in run_category or []}
+    assert ("sign_in_form_visible" in reason_codes) is sign_in_form
+
+
+@pytest.mark.asyncio
+async def test_a_block_cancelled_during_setup_leaves_no_document_listeners(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = DocumentEventPage()
+    mocks = _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    mocks["create_task_and_step"].side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _make_code_block("value = 1").execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    assert not any(page.listeners.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame_id", "expected"),
+    [
+        pytest.param(
+            "main-frame",
+            DocumentFailureReceipt(
+                attempt_id=1,
+                origin="https://app.fixture.test",
+                driver_code="net::ERR_EMPTY_RESPONSE",
+                response_status=None,
+                relation="associated",
+            ),
+            id="main_frame_id",
+        ),
+        pytest.param("unknown-frame", None, id="unknown_frame_id"),
+    ],
+)
+async def test_skycdp_document_requests_count_only_with_the_main_frame_id(
+    frame_id: str, expected: DocumentFailureReceipt | None
+) -> None:
+    page = DocumentEventPage()
+    page.main_frame.frame_id = "main-frame"
+    # An unknown frame id makes NetworkRequest.frame fall back to the main frame.
+    page._frames = {}
+    recording = RecordingPage(page)
+
+    def fail_document(page: DocumentEventPage) -> None:
+        request = NetworkRequest(
+            page,  # type: ignore[arg-type]
+            "request-1",
+            {"request": {"url": "https://app.fixture.test/home"}, "type": "Document", "frameId": frame_id},
+        )
+        assert request.frame is page.main_frame
+        for handler in page.listeners["request"]:
+            handler(request)
+        request.note_failure("net::ERR_EMPTY_RESPONSE")
+        for handler in page.listeners["requestfailed"]:
+            handler(request)
+
+    error = await _submit_then_wait(page, recording, fail_document)
+
+    assert recording.failure_document_receipt(error) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_on_another_tab_keeps_a_pending_receipt() -> None:
+    page = DocumentEventPage()
+    other_tab = DocumentEventPage()
+    recording = RecordingPage(page)
+    recording._wrap_page(other_tab)
+    in_flight: list[FakeDocumentRequest] = []
+
+    error = await _submit_then_wait(
+        page, recording, lambda page: in_flight.append(page.navigate("https://app.fixture.test:8443/home"))
+    )
+    other_tab.navigate("https://other.fixture.test/dashboard", status=200)
+    in_flight[0].failure = "net::ERR_EMPTY_RESPONSE"
+    for handler in page.listeners["requestfailed"]:
+        handler(in_flight[0])
+
+    assert recording.failure_document_receipt(error) == _CLOSED_CONNECTION_RECEIPT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["locator_wait", "handle_click"])
+@pytest.mark.parametrize("frame", ["main", "child"])
+async def test_a_main_frame_locator_or_handle_behind_a_failed_document_carries_the_receipt(
+    shape: str, frame: str
+) -> None:
+    error = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+
+    class ElementHandle:
+        __module__ = "playwright.async_api"
+
+        async def click(self, **kwargs: Any) -> None:
+            raise error
+
+    async def submit(**kwargs: Any) -> None:
+        _redirect_to_a_closed_connection(page)
+
+    async def wait_for(**kwargs: Any) -> None:
+        raise error
+
+    async def query_selector(selector: str) -> ElementHandle:
+        return ElementHandle()
+
+    page = DocumentEventPage()
+    page.frames = [page.main_frame, FakeFrame("about:blank")]  # type: ignore[attr-defined]
+    raw_frame = page.frames[0 if frame == "main" else 1]  # type: ignore[attr-defined]
+    raw_frame.locator = lambda selector, **kwargs: page.inner
+    raw_frame.query_selector = query_selector
+    page.inner.click = submit  # type: ignore[method-assign]
+    page.inner.wait_for = wait_for  # type: ignore[method-assign]
+    recording = RecordingPage(page)
+    recorded_frame = recording.main_frame if frame == "main" else recording.frames[1]
+
+    handle = await recorded_frame.query_selector("#welcome")
+    await recorded_frame.locator("button[type=submit]").click()
+    with pytest.raises(PlaywrightTimeoutError):
+        await (recorded_frame.locator("#welcome").wait_for(timeout=5000) if shape == "locator_wait" else handle.click())
+
+    assert recording.failure_document_receipt(error) == (_CLOSED_CONNECTION_RECEIPT if frame == "main" else None)
+    assert [action.action_type for action in recording.recorded_actions()] == (
+        [ActionType.CLICK] * (1 if shape == "locator_wait" else 2) if frame == "main" else []
+    )
+
+
+class _FakeCountLocator:
+    """Minimal locator stand-in whose count() is instrumented for the diagnostic probe."""
+
+    def __init__(self, *, value: int | None = None, exc: BaseException | None = None, hang: bool = False) -> None:
+        self._value = value
+        self._exc = exc
+        self._hang = hang
+        self.count_awaited = 0
+
+    async def count(self) -> int:
+        self.count_awaited += 1
+        if self._hang:
+            await asyncio.sleep(10)
+        if self._exc is not None:
+            raise self._exc
+        assert self._value is not None
+        return self._value
+
+
+def _probe_code_block() -> CodeBlock:
+    now = datetime(2026, 8, 9, 15, 0, tzinfo=timezone.utc)
+    output_parameter = OutputParameter(
+        parameter_type=ParameterType.OUTPUT,
+        key="code_output",
+        description="test output",
+        output_parameter_id="op_code",
+        workflow_id="w_test",
+        created_at=now,
+        modified_at=now,
+    )
+    return CodeBlock(label="code_1", code="pass", output_parameter=output_parameter)
+
+
+@pytest.mark.parametrize("count_value", [0, 1, 2, 7])
+@pytest.mark.asyncio
+async def test_locator_probe_reports_exact_count(count_value: int) -> None:
+    locator = _FakeCountLocator(value=count_value)
+    result = await _probe_code_block()._probe_failed_locator_count(locator)
+    assert result == (count_value, "counted")
+    assert locator.count_awaited == 1  # exact locator instance is the one probed
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_reports_large_count_exactly() -> None:
+    # The probe records the exact non-negative Locator.count(); it must never bucket or cap at
+    # emission (query-time aggregation may bucket later).
+    locator = _FakeCountLocator(value=6000)
+    assert await _probe_code_block()._probe_failed_locator_count(locator) == (6000, "counted")
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_error_is_fail_open() -> None:
+    locator = _FakeCountLocator(exc=RuntimeError("boom"))
+    assert await _probe_code_block()._probe_failed_locator_count(locator) == (None, "error")
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_timeout_is_fail_open() -> None:
+    from skyvern.forge.sdk.workflow.models.block import CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS
+
+    assert CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS <= 0.2
+    locator = _FakeCountLocator(hang=True)
+    # Use the real bounded probe; it must return a timeout status rather than hang the caller.
+    count, status = await asyncio.wait_for(_probe_code_block()._probe_failed_locator_count(locator), timeout=2.0)
+    assert (count, status) == (None, "timeout")
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_reraises_cancellation() -> None:
+    class _CancelLocator:
+        async def count(self) -> int:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _probe_code_block()._probe_failed_locator_count(_CancelLocator())
+
+
+@pytest.mark.asyncio
+async def test_locator_probe_consumes_a_late_failing_count_after_timeout() -> None:
+    import gc
+
+    # A driver reply that lands after the bounded wait (a navigation that destroys the execution
+    # context) must be retrieved by the probe, not left as an unretrieved-future error -- the exact
+    # signal this telemetry measures. Without the detached-task consume wiring, the late task
+    # exception is logged by asyncio at GC; this asserts it is not.
+    loop = asyncio.get_running_loop()
+    captured: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, ctx: captured.append(ctx))
+
+    class _LateNavFailLocator:
+        async def count(self) -> int:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation") from None
+
+    try:
+        result = await _probe_code_block()._probe_failed_locator_count(_LateNavFailLocator())
+        assert result == (None, "timeout")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert not any("never retrieved" in str(ctx.get("message", "")) for ctx in captured)
+
+
+@pytest.mark.asyncio
+async def test_operation_attribution_event_allowlist_and_privacy() -> None:
+    from structlog.testing import capture_logs
+
+    from skyvern.forge.sdk.workflow.models.block import _OPERATION_ATTRIBUTION_ALLOWLIST
+
+    context = WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+        mask_secrets=True,
+    )
+    sentinel_selector = "SENTINEL_SELECTOR_should_never_appear"
+    exc = PlaywrightError(f'locator("{sentinel_selector}") resolved to 2 elements')
+
+    with capture_logs() as logs:
+        _probe_code_block()._emit_operation_attribution_failure(
+            organization_id="o_test",
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            failing_line=3,
+            exception_class=type(exc).__name__,
+            probe_match_count=2,
+            probe_status="counted",
+        )
+
+    events = [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"]
+    assert len(events) == 1
+    envelope = events[0]["operation_attribution"]
+    assert set(envelope.keys()) == set(_OPERATION_ATTRIBUTION_ALLOWLIST)
+    assert envelope["exception_class"] == "Error"  # class name only, never the message
+    assert envelope["probe_match_count"] == 2
+    assert envelope["probe_status"] == "counted"
+    assert envelope["code_line"] == 3
+    # ambiguous_operation is intentionally not emitted (misleading on the secure arm; derivable at
+    # query time from the persisted recorded-action rows).
+    assert "ambiguous_operation" not in envelope
+    assert envelope["block_label"] == "code_1"
+    assert sentinel_selector not in json.dumps(envelope)
+    assert "resolved to 2 elements" not in json.dumps(envelope)
+
+
+class _StrictFailLocator(FakeLocator):
+    """A recorded locator whose action raises a non-timeout strict-style Playwright Error and whose
+    exact match count is 2 -- the 2+ cohort the probe exists to measure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count_calls = 0
+
+    async def click(self, **kwargs):  # noqa: ANN003, ANN201
+        raise PlaywrightError('locator("#x") resolved to 2 elements')
+
+    async def count(self) -> int:
+        self.count_calls += 1
+        return 2
+
+
+async def _run_probe_failure_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, list[dict[str, Any]], list[Action], _StrictFailLocator]:
+    from structlog.testing import capture_logs
+
+    page = FakePage()
+    locator = _StrictFailLocator()
+    page.inner = locator
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+    events = [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"]
+    return result, events, _created_actions(mocks), locator
+
+
+@pytest.mark.asyncio
+async def test_execute_arm_emits_probe_unconditionally_without_polluting_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No config/feature gate: a recorder-bound locator failure always probes and emits.
+    result, events, actions, locator = await _run_probe_failure_scenario(monkeypatch)
+
+    assert result.success is False
+    assert locator.count_calls == 1  # the exact failed locator is counted exactly once
+    assert len(events) == 1
+    envelope = events[0]["operation_attribution"]
+    assert envelope["probe_match_count"] == 2
+    assert envelope["probe_status"] == "counted"
+    assert envelope["engine"] == "inline"
+    assert envelope["exception_class"] == "Error"  # non-timeout strict-style Playwright Error
+    assert envelope["workflow_run_block_id"] == "wrb_test"
+    assert envelope["block_label"] == "code_1"
+    assert isinstance(envelope["code_line"], int)
+    assert "ambiguous_operation" not in envelope
+
+    # No probe/envelope field leaks into the outcome or persisted rows.
+    outcome_blob = json.dumps(
+        {
+            "failure_reason": result.failure_reason,
+            "output": result.output_parameter_value,
+            "error_codes": result.error_codes,
+        },
+        default=str,
+    )
+    assert "operation_attribution" not in outcome_blob
+    assert "probe_match_count" not in outcome_blob
+    assert "probe_status" not in outcome_blob
+    actions_blob = json.dumps([a.model_dump(mode="json") for a in actions], default=str)
+    assert "operation_attribution" not in actions_blob
+    assert "probe_match_count" not in actions_blob
+
+
+@pytest.mark.asyncio
+async def test_execute_arm_skips_probe_for_non_recorder_bound_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A plain user-raised exception is not bound to any recorded locator, so failure_locator(e) is
+    # None and the structural gate (`if probe_locator is not None`) must skip the probe entirely --
+    # no probe call, no codeblock.locator_probe event. Removing that gate would call the probe with
+    # None and emit an event, failing both assertions below.
+    from structlog.testing import capture_logs
+
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+
+    probe_calls: list[Any] = []
+    real_probe = CodeBlock._probe_failed_locator_count
+
+    async def spy_probe(self: CodeBlock, locator: Any) -> tuple[int | None, str]:
+        probe_calls.append(locator)
+        return await real_probe(self, locator)
+
+    monkeypatch.setattr(CodeBlock, "_probe_failed_locator_count", spy_probe)
+
+    block = _make_code_block("raise RuntimeError('boom')", goal="go")
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    assert result.success is False
+    assert probe_calls == []  # the locator count() probe is never entered for a non-recorder failure
+    assert [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"] == []
+
+
+@pytest.mark.asyncio
+async def test_execute_arm_attribution_failure_is_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The diagnostic probe/emit runs inside the CodeBlock failure handler. Any failure there --
+    # locator identification, probe, attribute assembly, or emission -- must leave the original
+    # classified failure/result unchanged. Here emission is forced to raise: without the outer
+    # fail-open guard that RuntimeError escapes execute() (RED); with it, execute() still returns
+    # the original strict-style locator failure and the diagnostic exception never surfaces.
+    page = FakePage()
+    page.inner = _StrictFailLocator()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+
+    def _raise_emit(self: CodeBlock, **_kwargs: Any) -> None:
+        raise RuntimeError("attribution emit must never surface")
+
+    monkeypatch.setattr(CodeBlock, "_emit_operation_attribution_failure", _raise_emit)
+
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    # The original classified failure is preserved; the diagnostic exception never surfaces.
+    assert result.success is False
+    assert result.failure_reason  # a real classified failure reason, not an empty/replaced outcome
+    outcome_blob = json.dumps(
+        {
+            "failure_reason": result.failure_reason,
+            "output": result.output_parameter_value,
+            "error_codes": result.error_codes,
+        },
+        default=str,
+    )
+    assert "attribution emit must never surface" not in outcome_blob

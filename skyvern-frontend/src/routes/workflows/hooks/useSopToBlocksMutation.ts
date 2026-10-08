@@ -4,6 +4,10 @@ import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
+import {
+  useWorkflowYamlEditorStore,
+  type YamlCommitOwner,
+} from "@/store/WorkflowYamlEditorStore";
 import { WorkflowBlock, WorkflowParameter } from "../types/workflowTypes";
 
 type SopToBlocksResponse = {
@@ -11,8 +15,32 @@ type SopToBlocksResponse = {
   parameters: Array<WorkflowParameter>;
 };
 
+type SopUpload = {
+  file: File;
+  owner: YamlCommitOwner | null;
+  action: symbol | null;
+};
+
+function captureUpload(file: File): SopUpload {
+  const state = useWorkflowYamlEditorStore.getState();
+  return { file, owner: state.editorOwner, action: state.authoringAction };
+}
+
+function currentUploadOwner(upload: SopUpload): YamlCommitOwner | null {
+  const state = useWorkflowYamlEditorStore.getState();
+  const owner = state.editorOwner;
+  if (
+    !owner?.active ||
+    owner.workflowPermanentId !== upload.owner?.workflowPermanentId ||
+    state.authoringAction !== upload.action ||
+    (upload.action && state.authoringActionOwner !== owner)
+  )
+    return null;
+  return owner;
+}
+
 type UseSopToBlocksMutationOptions = {
-  onSuccess?: (result: SopToBlocksResponse) => void;
+  onSuccess?: (result: SopToBlocksResponse, owner: YamlCommitOwner) => void;
 };
 
 function useSopToBlocksMutation({ onSuccess }: UseSopToBlocksMutationOptions) {
@@ -20,7 +48,10 @@ function useSopToBlocksMutation({ onSuccess }: UseSopToBlocksMutationOptions) {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const mutation = useMutation({
-    mutationFn: async (file: File) => {
+    mutationFn: async (upload: SopUpload) => {
+      if (!currentUploadOwner(upload))
+        throw new Error("The workflow editor is no longer available");
+      const { file } = upload;
       // Create new AbortController for this request
       abortControllerRef.current = new AbortController();
 
@@ -40,15 +71,18 @@ function useSopToBlocksMutation({ onSuccess }: UseSopToBlocksMutationOptions) {
         )
       ).data;
     },
-    onSuccess: (result) => {
+    onSuccess: (result, upload) => {
+      const owner = currentUploadOwner(upload);
+      if (!owner) return;
       toast({
         variant: "success",
         title: "SOP converted",
         description: `Generated ${result.blocks.length} workflow step${result.blocks.length === 1 ? "" : "s"}`,
       });
-      onSuccess?.(result);
+      onSuccess?.(result, owner);
     },
-    onError: (error) => {
+    onError: (error, upload) => {
+      if (!currentUploadOwner(upload)) return;
       // Don't show error toast if request was cancelled
       if (error instanceof AxiosError && error.code === "ERR_CANCELED") {
         toast({
@@ -88,7 +122,12 @@ function useSopToBlocksMutation({ onSuccess }: UseSopToBlocksMutationOptions) {
     abortControllerRef.current = null;
   };
 
-  return { ...mutation, cancel };
+  return {
+    ...mutation,
+    mutate: (file: File) => mutation.mutate(captureUpload(file)),
+    mutateAsync: (file: File) => mutation.mutateAsync(captureUpload(file)),
+    cancel,
+  };
 }
 
 export { useSopToBlocksMutation };

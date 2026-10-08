@@ -41,22 +41,27 @@ from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_requ
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.security import assert_signing_key_usable
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.routes.sms_inbound import sms_inbound_router
+from skyvern.forge.sdk.routes.twilio_integration import twilio_integration_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
     ensure_local_org,
     fingerprint_token,
     regenerate_local_api_key,
 )
+from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
@@ -64,6 +69,7 @@ from skyvern.services.cleanup_service import (
     stop_cleanup_scheduler,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
     stop_workflow_schedule_scheduler,
@@ -73,6 +79,10 @@ LOG = structlog.get_logger()
 
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 
 async def db_unavailable_handler(
@@ -105,7 +115,14 @@ SECURITY_HEADERS = {
     # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
 }
+
+
+def security_headers() -> dict[str, str]:
+    if settings.STRICT_TRANSPORT_SECURITY:
+        return {**SECURITY_HEADERS, "Strict-Transport-Security": settings.STRICT_TRANSPORT_SECURITY}
+    return SECURITY_HEADERS
 
 
 class SecurityHeadersMiddleware:
@@ -122,8 +139,9 @@ class SecurityHeadersMiddleware:
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                for key, value in SECURITY_HEADERS.items():
-                    headers[key] = value
+                for key, value in security_headers().items():
+                    # A route-set header (e.g. a stricter per-response CSP) must win over the default.
+                    headers.setdefault(key, value)
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
@@ -405,6 +423,12 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # task group which is required for handling MCP requests.
     mcp_app = getattr(fastapi_app.state, "mcp_starlette_app", None)
     retry_recovery_task = asyncio.create_task(_recover_pending_retries(), name="workflow-retry-recovery")
+    # Cloud runs this sweep from its own periodic task loop.
+    group_recovery_task = (
+        asyncio.create_task(run_workflow_run_group_recovery_loop(), name="workflow-run-group-recovery")
+        if isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
+        else None
+    )
     try:
         if mcp_app:
             async with mcp_app.lifespan(mcp_app):
@@ -415,7 +439,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
             yield
     finally:
         retry_recovery_task.cancel()
-        await asyncio.gather(retry_recovery_task, return_exceptions=True)
+        if group_recovery_task is not None:
+            group_recovery_task.cancel()
+        await asyncio.gather(
+            retry_recovery_task, *([group_recovery_task] if group_recovery_task else []), return_exceptions=True
+        )
         # The initial pass starts the periodic sweep even when cancelled; stop it so the loop can drain.
         await AsyncExecutorFactory.get_executor().stop_retry_recovery()
 
@@ -481,6 +509,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize Laminar tracing", error=str(e))
 
+    assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
 
     add_credentialed_cors_middleware(fastapi_app)
@@ -494,21 +523,77 @@ def create_api_app() -> FastAPI:
     # remove either as a "duplicate". ``include_in_schema=False`` keeps the OAuth
     # endpoints out of the public OpenAPI/Swagger surface — they're consumed by
     # the frontend, not by SDK users.
-    fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
-    fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
-    fastapi_app.include_router(microsoft_oauth_router, prefix="/v1/microsoft", include_in_schema=False)
-    fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
-    fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
-    fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
+    fastapi_app.include_router(
+        google_oauth_router, prefix="/v1/google", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        google_oauth_router,
+        prefix="/api/v1/google",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        microsoft_oauth_router,
+        prefix="/v1/microsoft",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        microsoft_oauth_router,
+        prefix="/api/v1/microsoft",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        google_sheets_router,
+        prefix="/v1/google/sheets",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        google_sheets_router,
+        prefix="/api/v1/google/sheets",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
+    # the handler) and the org-scoped integration management routes. Same
+    # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
+    fastapi_app.include_router(
+        sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        sms_inbound_router, prefix="/api/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        twilio_integration_router,
+        prefix="/v1/integrations/twilio",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        twilio_integration_router,
+        prefix="/api/v1/integrations/twilio",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
 
     # local dev endpoints
     if settings.ENV == "local":
-        fastapi_app.include_router(internal_auth.router, prefix="/v1")
-        fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
-        fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
-        fastapi_app.include_router(internal_llms.router, prefix="/v1")
-        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
-        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_auth.router, prefix="/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY])
+        fastapi_app.include_router(
+            internal_auth.router, prefix="/api/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(
+            internal_auth.router, prefix="/api/v2", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(internal_llms.router, prefix="/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY])
+        fastapi_app.include_router(
+            internal_llms.router, prefix="/api/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(
+            internal_llms.router, prefix="/api/v2", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
@@ -529,9 +614,7 @@ def create_api_app() -> FastAPI:
     async def handle_not_found_error(request: Request, exc: NotFoundError) -> Response:
         return Response(status_code=status.HTTP_404_NOT_FOUND)
 
-    @fastapi_app.exception_handler(SkyvernHTTPException)
-    async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     register_db_unavailable_handlers(fastapi_app)
 
@@ -545,11 +628,12 @@ def create_api_app() -> FastAPI:
 
     @fastapi_app.exception_handler(RequestValidationError)
     async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
-        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
-        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
         path = request.url.path.rstrip("/")
-        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+        if path == "/api/v1/users/me/onboarding":
+            # Both validation messages and unknown field names can contain reported contact details.
+            return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
+        sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(
@@ -573,7 +657,7 @@ def create_api_app() -> FastAPI:
         response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
-            headers=SECURITY_HEADERS,
+            headers=security_headers(),
         )
         log_raw_request_exception(response.status_code)
         return response

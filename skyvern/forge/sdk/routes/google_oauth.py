@@ -11,6 +11,7 @@ from google.auth.exceptions import GoogleAuthError
 from oauthlib.oauth2 import InvalidGrantError, OAuth2Error
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
     CreateGoogleOAuthCallbackRequest,
@@ -256,6 +257,21 @@ async def google_oauth_callback(
     except google_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
+    if not prior_state_known or prior_state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR}:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "google_oauth.update",
+            "google_oauth_credential",
+            credential.id,
+        )
+    else:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "google_oauth.create",
+            "google_oauth_credential",
+            credential.id,
+        )
+
     if not prior_state_known:
         LOG.warning(
             "Skipping Google integration lifecycle analytics because prior credential state is unknown",
@@ -362,6 +378,30 @@ async def update_google_oauth_client_config(
         raise HTTPException(status_code=404, detail=str(exc))
     except google_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    existing_config = resolved.config if resolved and resolved.source == "organization" else None
+    changed_fields = tuple(
+        sorted(
+            field_name
+            for field_name in GoogleOAuthClientConfig.model_fields
+            if existing_config is None or getattr(config, field_name) != getattr(existing_config, field_name)
+        )
+    )
+    if existing_config is None:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "google_oauth.create",
+            "google_oauth_client_config",
+            current_org.organization_id,
+            changed_fields=changed_fields,
+        )
+    elif changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "google_oauth.update",
+            "google_oauth_client_config",
+            current_org.organization_id,
+            changed_fields=changed_fields,
+        )
     return GoogleOAuthClientConfigResponse(config=saved.safe())
 
 
@@ -372,9 +412,16 @@ async def delete_google_oauth_client_config(
     """Clear the organization-level Google OAuth client config and fall back to environment config."""
     _require_organization_client_config_enabled()
     try:
-        await google_oauth_service.delete_client_config(current_org.organization_id)
+        changed = await google_oauth_service.delete_client_config(current_org.organization_id)
     except google_oauth_service.OrganizationGoogleOAuthConfigDisabledError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    if changed:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "google_oauth.delete",
+            "google_oauth_client_config",
+            current_org.organization_id,
+        )
     return {"success": True}
 
 
@@ -415,6 +462,13 @@ async def rename_google_oauth_credential(
     )
     if updated is None:
         raise HTTPException(status_code=404, detail="Credential not found")
+    await record_request_audit_event(
+        current_org.organization_id,
+        "google_oauth.update",
+        "google_oauth_credential",
+        credential_id,
+        changed_fields=("credential_name",),
+    )
     return GoogleOAuthCredentialResponse(credential=updated)
 
 
@@ -432,4 +486,10 @@ async def delete_google_oauth_credential(
     )
     if not revoked:
         raise HTTPException(status_code=404, detail="Credential not found")
+    await record_request_audit_event(
+        current_org.organization_id,
+        "google_oauth.delete",
+        "google_oauth_credential",
+        credential_id,
+    )
     return {"success": True}

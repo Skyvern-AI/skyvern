@@ -24,12 +24,17 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Load, with_expression
 
+from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import TaskRunModel, WorkflowRunAttemptModel, WorkflowRunModel
-from skyvern.schemas.run_enums import TERMINAL_STATUSES
+from skyvern.schemas.run_enums import (
+    TERMINAL_STATUSES,
+    WebhookDeliveryStatus,
+    resolve_webhook_delivery_projection,
+)
 
 # Keep terminal recovery bounded so a degraded database does not load the entire backlog at once.
 ATTEMPT_RECOVERY_BATCH_SIZE = 200
@@ -484,7 +489,23 @@ class WorkflowRunAttemptsRepository(BaseRepository):
                     WorkflowRunModel.started_at.is_(None),
                     prepared_attempt.exists(),
                 )
-                .values(status="failed", failure_reason=failure_reason, finished_at=now, modified_at=now)
+                .values(
+                    status="failed",
+                    failure_reason=failure_reason,
+                    finished_at=now,
+                    modified_at=now,
+                    # This terminal write bypasses the finalization helpers, so it must own
+                    # attribution too. No typed failure_category is available on the
+                    # prepared-attempt abandonment path, so record an explicit bounded
+                    # unattributed document; COALESCE keeps it idempotent and first-writer.
+                    failure_attribution=func.coalesce(
+                        WorkflowRunModel.failure_attribution,
+                        literal(
+                            derive_failure_attribution(None),
+                            type_=WorkflowRunModel.failure_attribution.type,
+                        ),
+                    ),
+                )
                 .returning(WorkflowRunModel.workflow_run_id)
             )
             claimed = result.scalar_one_or_none() is not None
@@ -822,6 +843,9 @@ class WorkflowRunAttemptsRepository(BaseRepository):
         kind: Literal["interim", "final"],
         expected_claim_at: datetime | None,
         max_attempts: int,
+        final_exhausted_projection: WebhookDeliveryStatus | None = None,
+        expected_status: str | None = None,
+        expected_finished_at: datetime | None = None,
     ) -> int | None:
         if kind == "interim":
             completion_column = WorkflowRunAttemptModel.interim_webhook_sent_at
@@ -838,6 +862,24 @@ class WorkflowRunAttemptsRepository(BaseRepository):
             completion_column.is_(None),
         ]
         async with self.Session() as session:
+            # Retry preparation takes these locks in workflow_run -> attempt order too.
+            run = None
+            if (
+                kind == "final"
+                and final_exhausted_projection is not None
+                and expected_status in TERMINAL_STATUSES
+                and expected_finished_at is not None
+            ):
+                run = await session.scalar(
+                    select(WorkflowRunModel)
+                    .where(
+                        WorkflowRunModel.workflow_run_id == workflow_run_id,
+                        WorkflowRunModel.status == expected_status,
+                        WorkflowRunModel.finished_at == to_naive_utc(expected_finished_at),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
             attempt = await session.scalar(
                 select(WorkflowRunAttemptModel)
                 .options(attempt_metadata_options(session.bind.dialect.name))
@@ -855,6 +897,15 @@ class WorkflowRunAttemptsRepository(BaseRepository):
                 progress["webhook_delivery_exhausted_at"] = now.isoformat()
                 values[completion_column.key] = now
                 reserved_attempt = 0
+                # Commit the final projection with the marker so a crash cannot make recovery
+                # skip an unknown outcome.
+                if run is not None and final_exhausted_projection is not None:
+                    resolved = resolve_webhook_delivery_projection(
+                        run.webhook_delivery_status, final_exhausted_projection
+                    )
+                    if resolved != run.webhook_delivery_status:
+                        run.webhook_delivery_status = resolved
+                        run.webhook_delivery_finalized_at = now
             else:
                 reserved_attempt = delivery_attempts + 1
                 progress["webhook_delivery_attempts"] = reserved_attempt

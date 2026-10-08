@@ -42,9 +42,23 @@ def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step
         block["file_url"] = "{{ source_pdf }}"
         block["prompt"] = "Fill the PDF using the payload."
         block["payload"] = {"name": "{{ applicant.name }}"}
+    elif block_type == "web_search":
+        block.update(
+            query="site:example.com {{ terms }}",
+            provider="auto",
+            num_results=100,
+            no_results_error_code="NO_SEARCH_RESULTS",
+            no_match_error_code="NO_MATCHING_RESULT",
+            prompt="Return the relevant links.",
+            json_schema={"type": "array", "items": {"type": "string"}},
+            parameter_keys=["terms"],
+        )
     elif block_type == "navigation":
         block["url"] = "https://example.com"
         block["navigation_goal"] = "do the thing"
+    elif block_type == "terminate":
+        block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        block["error_code"] = "ACCOUNT_NOT_FOUND"
     return {
         "workflow_permanent_id": workflow_id,
         "workflow_id": f"wf_{workflow_id.split('_', 1)[-1]}",
@@ -96,6 +110,8 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
         _make_workflow_dict("wpid_ok", "navigation"),
         _make_workflow_dict("wpid_sheets", "google_sheets_read"),
         _make_workflow_dict("wpid_pdf_fill", "pdf_fill"),
+        _make_workflow_dict("wpid_search", "web_search"),
+        _make_workflow_dict("wpid_stop", "terminate"),
     ]
     request_mock = _patch_skyvern_list_response(monkeypatch, payload=payload)
 
@@ -103,10 +119,10 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
 
     assert result["ok"] is True, result
     data = result["data"]
-    assert data["count"] == 3
+    assert data["count"] == 5
     assert data["page"] == 1
     ids = {wf["workflow_permanent_id"] for wf in data["workflows"]}
-    assert ids == {"wpid_ok", "wpid_sheets", "wpid_pdf_fill"}
+    assert ids == {"wpid_ok", "wpid_sheets", "wpid_pdf_fill", "wpid_search", "wpid_stop"}
 
     request_mock.assert_awaited_once()
     call = request_mock.await_args
@@ -117,6 +133,20 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
     assert params["page"] == 1
     assert params["page_size"] == 10
     assert params["only_workflows"] is False
+
+
+@pytest.mark.parametrize("block_type", ["web_search", "terminate"])
+def test_block_fields_survive_mcp_definition_normalization(block_type: str) -> None:
+    workflow = _make_workflow_dict("wpid_block", block_type)
+    if block_type == "web_search":
+        workflow["workflow_definition"]["blocks"][0]["error_code_mapping"] = {"NO_RESULT": "No result fits."}
+    workflow["workflow_definition"]["parameters"] = [
+        {"parameter_type": "workflow", "key": "terms", "workflow_parameter_type": "string", "default_value": "example"}
+    ]
+    normalized = mcp_workflow._normalize_json_definition(workflow)
+    block = normalized["workflow_definition"]["blocks"][0]
+    expected = workflow["workflow_definition"]["blocks"][0]
+    assert {key: block[key] for key in expected} == expected
 
 
 @pytest.mark.asyncio

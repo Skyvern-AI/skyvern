@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import Callable
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+import pytest_asyncio
 
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.context import (
     ApprovedCredential,
     CopilotContext,
@@ -15,6 +22,8 @@ from skyvern.forge.sdk.copilot.context import (
     adopt_model_authored_context,
     record_approved_credentials_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _approve_server_verified_google_sheet_bindings,
     _approved_run_credential_ids,
@@ -25,7 +34,9 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _parsed_workflow_definition,
     _retire_stale_google_connection_denial,
     canonicalize_named_google_sheet_bindings,
+    resolve_google_sheet_tabs_from_gid,
 )
+from skyvern.forge.sdk.copilot.tools.integrations import _read_google_sheet
 from skyvern.forge.sdk.copilot.turn_outcome import (
     connected_account_choice_context,
     selected_connected_account_id,
@@ -42,6 +53,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
 )
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -1569,3 +1581,314 @@ def test_retiring_a_stale_google_denial_never_widens_the_run_approved_ids() -> N
     assert ctx.connected_account_recovery_choices == []
     assert policy.run_approved_google_connection_ids == []
     assert _approved_run_credential_ids(policy) == set()
+
+
+SPREADSHEET_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+ENGINEERING_GID = 1226505961
+RECORDED_TABS_PAYLOAD = {
+    "sheets": [
+        {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        {"properties": {"sheetId": ENGINEERING_GID, "title": "Engineering", "index": 1}},
+    ]
+}
+
+
+def _gid_sheets_yaml(block_type: str, url: str, extra: str = "") -> str:
+    return (
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "    - label: engineering_rows\n"
+        f"      block_type: {block_type}\n"
+        f"      spreadsheet_url: {url}\n"
+        f"      credential_id: {CITED_ACCOUNT_ID}\n"
+        f"{extra}"
+    )
+
+
+def _gid_turn_policy() -> request_policy_module.RequestPolicy:
+    return request_policy_module.RequestPolicy(
+        canonical_user_message=f"append the total to the sheet using the {CITED_ACCOUNT_NAME}"
+    )
+
+
+def _saved_sheets_block(workflow_yaml: str) -> dict[str, object]:
+    return safe_load_no_dates(workflow_yaml)["workflow_definition"]["blocks"][0]
+
+
+@pytest.fixture
+def recorded_sheets_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sheets_transport: Callable[[Callable[[httpx.Request], httpx.Response]], None],
+) -> list[httpx.Request]:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=RECORDED_TABS_PAYLOAD)
+
+    mock_sheets_transport(handler)
+    connections = [_google(CITED_ACCOUNT_ID, CITED_ACCOUNT_NAME)]
+    _patch_visible_credentials(monkeypatch, connections)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_credentials_for_org",
+        AsyncMock(return_value=connections),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_sheets_credentials", AsyncMock(return_value="sheets-token"))
+    return requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write"])
+@pytest.mark.parametrize("gid_suffix", [f"/edit#gid={ENGINEERING_GID}", f"/edit?gid={ENGINEERING_GID}"])
+async def test_update_workflow_saves_the_tab_named_by_the_url_gid(
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_sheets_tabs: list[httpx.Request],
+    block_type: str,
+    gid_suffix: str,
+) -> None:
+    ctx = make_copilot_ctx(request_policy=_gid_turn_policy())
+    process_workflow_yaml = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_workflow_yaml)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE",
+        SimpleNamespace(update_workflow_definition=AsyncMock()),
+    )
+    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}{gid_suffix}"
+
+    result = await tools_module._update_workflow(
+        {"workflow_yaml": _gid_sheets_yaml(block_type, url, "      range: D:D\n")}, ctx
+    )
+
+    assert result["ok"] is True, result
+    assert [(fact["status"], fact.get("sheet_name")) for fact in result["data"]["google_sheet_tab_resolution"]] == [
+        ("resolved", "Engineering")
+    ]
+    saved = _saved_sheets_block(process_workflow_yaml.await_args.kwargs["workflow_yaml"])
+    assert (saved["sheet_name"], saved["range"], saved["spreadsheet_url"]) == ("Engineering", "D:D", url)
+    assert _saved_sheets_block(ctx.staged_workflow_yaml)["sheet_name"] == "Engineering"
+    assert [request.url.path for request in recorded_sheets_tabs] == [f"/v4/spreadsheets/{SPREADSHEET_ID}"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gid", "extra", "expected_fact", "expected_sheet_name"),
+    [
+        (ENGINEERING_GID, "      sheet_name: Summary\n", None, "Summary"),
+        (
+            987654321,
+            "",
+            {"status": "gid_not_found", "available_tabs": ["Sheet1", "Engineering"]},
+            None,
+        ),
+        (
+            ENGINEERING_GID,
+            "      range: \"'Sheet1'!D:D\"\n",
+            {"status": "ineligible", "reason": "range_not_plain_cells"},
+            None,
+        ),
+        (
+            ENGINEERING_GID,
+            '      range: "{{ destination_range }}"\n',
+            {"status": "ineligible", "reason": "range_not_plain_cells"},
+            None,
+        ),
+        (
+            ENGINEERING_GID,
+            "      range: MyNamedRange\n",
+            {"status": "ineligible", "reason": "range_not_plain_cells"},
+            None,
+        ),
+        (
+            ENGINEERING_GID,
+            "      range: TAX\n",
+            {"status": "ineligible", "reason": "range_not_plain_cells"},
+            None,
+        ),
+    ],
+    ids=[
+        "explicit_sheet_name",
+        "gid_absent_from_tabs",
+        "range_names_a_sheet",
+        "templated_range",
+        "named_range",
+        "short_uppercase_named_range",
+    ],
+)
+async def test_gid_resolution_never_overwrites_or_guesses_a_tab(
+    recorded_sheets_tabs: list[httpx.Request],
+    gid: int,
+    extra: str,
+    expected_fact: dict[str, object] | None,
+    expected_sheet_name: str | None,
+) -> None:
+    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={gid}"
+    draft = _gid_sheets_yaml("google_sheets_write", url, extra)
+
+    resolved_yaml, facts = await resolve_google_sheet_tabs_from_gid(
+        draft, make_copilot_ctx(workflow_yaml=draft, request_policy=_gid_turn_policy())
+    )
+
+    assert resolved_yaml == draft
+    assert _saved_sheets_block(resolved_yaml).get("sheet_name") == expected_sheet_name
+    if expected_fact is None:
+        assert facts == []
+    else:
+        assert [{key: fact.get(key) for key in expected_fact} for fact in facts] == [expected_fact]
+        assert facts[0]["resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_gid_resolution_reads_no_tabs_through_a_connection_this_turn_did_not_approve(
+    recorded_sheets_tabs: list[httpx.Request],
+) -> None:
+    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={ENGINEERING_GID}"
+    draft = _gid_sheets_yaml("google_sheets_write", url)
+    ctx = make_copilot_ctx(
+        workflow_yaml=draft,
+        request_policy=request_policy_module.RequestPolicy(canonical_user_message="append the total to the sheet"),
+    )
+
+    resolved_yaml, facts = await resolve_google_sheet_tabs_from_gid(draft, ctx)
+
+    assert resolved_yaml == draft
+    assert [(fact["status"], fact.get("reason"), "available_tabs" in fact) for fact in facts] == [
+        ("ineligible", "connection_not_approved", False)
+    ]
+    assert recorded_sheets_tabs == []
+
+
+@pytest.mark.asyncio
+async def test_gid_resolution_bounds_a_hung_tab_lookup_once_per_spreadsheet(
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_sheets_tabs: list[httpx.Request],
+) -> None:
+    lookups: list[str] = []
+
+    async def hung_token(organization_id: str, credential_id: str) -> str:
+        lookups.append(credential_id)
+        await asyncio.Event().wait()
+        return "never"
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_sheets_credentials", hung_token)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.credentials._GID_TAB_LOOKUP_TIMEOUT_SECONDS", 0.05)
+    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={ENGINEERING_GID}"
+    block = _gid_sheets_yaml("google_sheets_write", url).split("  blocks:\n", 1)[1]
+    draft = "workflow_definition:\n  blocks:\n" + block + block.replace("engineering_rows", "engineering_copy")
+
+    _, facts = await asyncio.wait_for(
+        resolve_google_sheet_tabs_from_gid(
+            draft, make_copilot_ctx(workflow_yaml=draft, request_policy=_gid_turn_policy())
+        ),
+        timeout=2,
+    )
+
+    assert [fact["status"] for fact in facts] == ["lookup_failed", "lookup_failed"]
+    assert lookups == [CITED_ACCOUNT_ID]
+
+
+OPENING_ACCOUNT_ID = "goac_opens_sheet"
+DENIED_ACCOUNT_ID = "goac_cannot_open_sheet"
+OPENING_ACCOUNT_NAME = "Ops Sheets"
+READ_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={ENGINEERING_GID}"
+READ_SHEET_METADATA = {
+    "properties": {"title": "Fleet metrics"},
+    "sheets": [
+        {
+            "properties": {
+                "sheetId": ENGINEERING_GID,
+                "title": "Engineering",
+                "gridProperties": {"rowCount": 20, "columnCount": 4},
+            }
+        }
+    ],
+}
+
+
+@pytest_asyncio.fixture
+async def ctx_after_read_google_sheet(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sheets_transport: Callable[[Callable[[httpx.Request], httpx.Response]], None],
+) -> CopilotContext:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["Authorization"] != f"Bearer token-{OPENING_ACCOUNT_ID}":
+            return httpx.Response(404, json={"error": {"code": 404, "message": "Requested entity was not found."}})
+        if "ranges" in request.url.params:
+            return httpx.Response(200, json={"sheets": [{"data": [{"rowData": []}]}]})
+        return httpx.Response(200, json=READ_SHEET_METADATA)
+
+    async def mint(organization_id: str, connection_id: str) -> str:
+        return f"token-{connection_id}"
+
+    mock_sheets_transport(handler)
+    _patch_visible_credentials(
+        monkeypatch,
+        [_google(OPENING_ACCOUNT_ID, OPENING_ACCOUNT_NAME), _google(DENIED_ACCOUNT_ID, "Personal Sheets")],
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_sheets_credentials", mint)
+    user_message = f"read Sessions Started from https://example.com/dashboard and update {READ_SHEET_URL}"
+    policy = request_policy_module.RequestPolicy(canonical_user_message=user_message)
+    request_policy_module._ground_user_provided_sites(policy, user_message, [])
+    ctx = make_copilot_ctx(request_policy=policy)
+
+    result = await _read_google_sheet({"spreadsheet_url": READ_SHEET_URL}, ctx)
+    tool = SimpleNamespace(name="read_google_sheet")
+    await CopilotRunHooks(ctx).on_tool_end(
+        MagicMock(), MagicMock(), tool, json.dumps(sanitize_tool_result_for_llm("read_google_sheet", result))
+    )
+    return ctx
+
+
+async def _approved_after_tool_activity(ctx: CopilotContext, credential_id: str) -> list[str]:
+    assert isinstance(ctx.request_policy, request_policy_module.RequestPolicy)
+    return await _approve_server_verified_google_sheet_bindings(
+        [(SHEETS_BLOCK_LABEL, credential_id)],
+        tool_activity=ctx.tool_activity,
+        organization_id="org-1",
+        request_policy=ctx.request_policy,
+    )
+
+
+@pytest.mark.asyncio
+async def test_connection_that_opened_the_sheet_is_run_approved_in_the_same_turn(
+    ctx_after_read_google_sheet: CopilotContext,
+) -> None:
+    ctx = ctx_after_read_google_sheet
+
+    approved = await _approved_after_tool_activity(ctx, OPENING_ACCOUNT_ID)
+
+    assert approved == [OPENING_ACCOUNT_ID]
+    assert (
+        _credential_run_approval_blocker_signal(
+            [OPENING_ACCOUNT_ID], ctx.request_policy, additional_approved_ids=approved
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential_id", [OPENING_ACCOUNT_NAME, DENIED_ACCOUNT_ID, "goac_never_reported"])
+async def test_name_or_connection_the_sheet_read_did_not_open_stays_authority_denied(
+    ctx_after_read_google_sheet: CopilotContext, credential_id: str
+) -> None:
+    ctx = ctx_after_read_google_sheet
+
+    assert await _approved_after_tool_activity(ctx, credential_id) == []
+    assert ctx.request_policy.run_approved_google_connection_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "later_listing",
+    [
+        [{"tool": "list_integrations", "integrations": "malformed"}],
+        _listed_integrations(_google("goac_other", "Other Sheets")),
+    ],
+)
+async def test_later_listing_neither_erases_an_opened_connection_nor_admits_one_that_did_not_open(
+    ctx_after_read_google_sheet: CopilotContext, later_listing: list[dict[str, object]]
+) -> None:
+    ctx = ctx_after_read_google_sheet
+    ctx.tool_activity.extend(later_listing)
+
+    assert await _approved_after_tool_activity(ctx, OPENING_ACCOUNT_ID) == [OPENING_ACCOUNT_ID]
+    assert await _approved_after_tool_activity(ctx, DENIED_ACCOUNT_ID) == []

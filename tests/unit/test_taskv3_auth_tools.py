@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+import skyvern.webeye.navigation as navigation_module
 from skyvern.exceptions import (
     BlockedHost,
     FailedToGetTOTPVerificationCode,
@@ -25,15 +26,20 @@ from skyvern.forge.log_redaction import REDACTED
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import redact_sensitive_event_fields
-from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
+from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow import context_manager as cm
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import auth_tools
+from skyvern.forge.taskv3 import loop as taskv3_loop
 from skyvern.forge.taskv3.tools import OBSERVE_URL_MAX_CHARS
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPValue
 from skyvern.utils.secret_redaction import redact_secrets_from_bytes
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+_TASK_CREATED_AT = datetime(2026, 9, 30, 17, 50, 0)
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -44,6 +50,7 @@ def _task(**overrides: Any) -> SimpleNamespace:
         "totp_verification_url": None,
         "totp_identifier": None,
         "navigation_payload": None,
+        "created_at": _TASK_CREATED_AT,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -52,7 +59,7 @@ def _task(**overrides: Any) -> SimpleNamespace:
 def test_build_auth_tools_absent_without_code_source(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
     tools, guidance = auth_tools.build_auth_tools(_task())
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 def test_build_auth_tools_bare_task_no_workflow_lookup() -> None:
@@ -60,7 +67,7 @@ def test_build_auth_tools_bare_task_no_workflow_lookup() -> None:
     # workflow-run-context lookup — has_credential_totp_candidate short-circuits on the falsy run id and
     # never reaches the getter that raises when a context isn't registered.
     tools, guidance = auth_tools.build_auth_tools(_task())
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 def test_has_credential_totp_candidate_unregistered_context_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -884,7 +891,7 @@ def test_build_auth_tools_present_with_payload_only_totp_source(monkeypatch: pyt
 def test_build_auth_tools_absent_with_no_code_source_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
     tools, guidance = auth_tools.build_auth_tools(_task(navigation_payload={"unrelated_field": "value"}))
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 def test_build_auth_tools_absent_with_magic_link_only_payload_source(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -894,7 +901,7 @@ def test_build_auth_tools_absent_with_magic_link_only_payload_source(monkeypatch
     tools, guidance = auth_tools.build_auth_tools(
         _task(navigation_payload={"verification_link": "https://example.test/x"})
     )
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 @pytest.mark.asyncio
@@ -1037,6 +1044,158 @@ def test_try_generate_totp_from_credential_disambiguates_via_active_key(monkeypa
         skyvern_context.reset()
     assert otp is not None
     assert otp.value == "code::SEED_TWO"
+
+
+_VALID_SEED = "JBSWY3DPEHPK3PXP"
+_TOTP_FIELD = "placeholder_Zz9_totp"
+# A TOTP step boundary: 30 * 33_333_334. The clock below sits `offset` seconds into that step.
+_STEP_START = 1_000_000_020
+
+
+def _credential_totp_context(*, seed: str | None = _VALID_SEED) -> WorkflowRunContext:
+    workflow_run_context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_test",
+        workflow_permanent_id="wp_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    workflow_run_context.parameters["login"] = _credential_parameter("login")
+    workflow_run_context.values["login"] = {"totp": _TOTP_FIELD}
+    workflow_run_context.secrets[_TOTP_FIELD] = "BW_TOTP"
+    if seed is not None:
+        workflow_run_context.secrets[workflow_run_context.totp_secret_value_key(_TOTP_FIELD)] = seed
+    return workflow_run_context
+
+
+def _clock_in_step(monkeypatch: pytest.MonkeyPatch, offset: int) -> AsyncMock:
+    """Start the TOTP clock `offset` seconds into a 30s step; the recorded window sleep advances it instantly."""
+    assert _STEP_START % 30 == 0
+    clock = {"now": float(_STEP_START + offset)}
+    monkeypatch.setattr(credentials_module, "time", SimpleNamespace(time=lambda: clock["now"]))
+
+    def _advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    sleep = AsyncMock(side_effect=_advance)
+    monkeypatch.setattr(credentials_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    return sleep
+
+
+def _install_run(monkeypatch: pytest.MonkeyPatch, run_context: WorkflowRunContext) -> None:
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_test"] = run_context
+    monkeypatch.setattr(otp_service.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("offset", "expected_wait"), [(25, 5.0), (3, None)])
+@pytest.mark.parametrize("entry", ["get_verification_code", "totp_placeholder"])
+async def test_a_v3_credential_code_waits_out_a_nearly_spent_totp_window(
+    monkeypatch: pytest.MonkeyPatch, entry: str, offset: int, expected_wait: float | None
+) -> None:
+    # A code minted with 5s left can expire before the site checks it. Both v3 entry points into the
+    # credential's TOTP wait for the next step when fewer than the configured seconds remain, and
+    # only then.
+    sleep = _clock_in_step(monkeypatch, offset)
+    _install_run(monkeypatch, _credential_totp_context())
+    task = _task(workflow_run_id="wr_test")
+    state = auth_tools.VerificationState(task=task, totp_min_remaining_seconds=20)
+    tools, _ = auth_tools.build_auth_tools(task, state=state, allowed_credential_parameter_keys=["login"])
+    skyvern_context.set(SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test"))
+    try:
+        if entry == "get_verification_code":
+            result = await tools[0].handler({})
+            assert result.status == "ok"
+        else:
+            await state.resolve_totp_placeholder(_TOTP_FIELD)
+    finally:
+        skyvern_context.reset()
+    if expected_wait is None:
+        sleep.assert_not_awaited()
+    else:
+        sleep.assert_awaited_once_with(expected_wait)
+    assert state.values_delivered == 1
+
+
+@pytest.mark.asyncio
+async def test_the_step_engine_credential_code_never_waits_for_a_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The step engine's callers pass nothing, so a code 5s from expiry is still minted immediately.
+    sleep = _clock_in_step(monkeypatch, 25)
+    _install_run(monkeypatch, _credential_totp_context())
+    skyvern_context.set(SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test"))
+    try:
+        otp_value = await otp_service.resolve_otp_value(
+            _task(workflow_run_id="wr_test"), expected_otp_type=OTPType.TOTP
+        )
+    finally:
+        skyvern_context.reset()
+    assert otp_value is not None and otp_value.from_credential_seed
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_link_poll_never_waits_on_a_credential_totp_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The credential's TOTP cannot answer a link poll, so waiting out its window only spends the shared
+    # polling budget on a code that is thrown away.
+    sleep = _clock_in_step(monkeypatch, 25)
+    _install_run(monkeypatch, _credential_totp_context())
+    skyvern_context.set(SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test"))
+    try:
+        otp_value = await otp_service.resolve_otp_value(
+            _task(workflow_run_id="wr_test"), expected_otp_type=OTPType.MAGIC_LINK, min_remaining_seconds=20
+        )
+    finally:
+        skyvern_context.reset()
+    assert otp_value is None
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seed", "owned_by_credential"),
+    [(None, True), ("not a totp secret!", True), (_VALID_SEED, False)],
+    ids=["no_secret", "unparseable_secret", "no_owning_credential"],
+)
+async def test_a_totp_placeholder_with_no_usable_source_is_refused_and_recorded(
+    monkeypatch: pytest.MonkeyPatch, seed: str | None, owned_by_credential: bool
+) -> None:
+    _clock_in_step(monkeypatch, 3)
+    run_context = _credential_totp_context(seed=seed)
+    if not owned_by_credential:
+        run_context.values["login"] = {}
+    _install_run(monkeypatch, run_context)
+    state = auth_tools.VerificationState(task=_task(workflow_run_id="wr_test"))
+    ctx = SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test")
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs, pytest.raises(taskv3_loop.ToolRefusal) as excinfo:
+            await state.resolve_totp_placeholder(_TOTP_FIELD)
+    finally:
+        skyvern_context.reset()
+    assert state.totp_source_missing is True
+    assert state.values_delivered == 0
+    assert ctx.runtime_secret_values == set()
+    assert "Never invent or guess a code" in str(excinfo.value)
+    assert _TOTP_FIELD not in str(excinfo.value) and _TOTP_FIELD not in str(logs)
+    assert "BW_TOTP" not in str(excinfo.value) and "BW_TOTP" not in str(logs)
+
+
+def test_the_never_invent_guidance_reaches_a_run_offered_no_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rule that keeps a model from typing a made-up code must not depend on a code source being
+    # configured -- that is exactly the run with no real code to type. It must not point at a tool
+    # the run was not given, and must stay true on a run whose credential placeholder still yields a
+    # code without the tool (several TOTP credentials, none pinned), so it names that placeholder.
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
+    tools, guidance = auth_tools.build_auth_tools(_task())
+    assert tools == []
+    assert "Never invent or guess a code" in guidance
+    assert "get_verification_code" not in guidance
+    assert "TOTP placeholder" in guidance
+    assert "No verification-code source is configured" not in guidance
+    offered_tools, offered_guidance = auth_tools.build_auth_tools(_task(totp_identifier="user@example.com"))
+    assert [t.name for t in offered_tools] == ["get_verification_code"]
+    assert "Never invent or guess a code" in offered_guidance and "get_verification_code" in offered_guidance
 
 
 def test_get_secret_values_for_run_standalone_task_respects_disabled_global_artifact_redaction(
@@ -1250,6 +1409,30 @@ async def test_open_verification_link_consumes_the_link_so_the_next_call_polls_f
     assert page.goto_calls == [_LINK, _LINK]
     for leak in (_LINK, _LINK_TOKEN):
         assert leak not in first.content and leak not in str(logs)
+
+
+@pytest.mark.asyncio
+async def test_open_verification_link_keeps_the_driver_code_through_the_return_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The return navigation that puts the tab back is cleanup, not the navigation the task chose, so its
+    # success must not wipe the code of the link that failed.
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=OTPValue(value=_LINK, type=None)))
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: False)
+    page = _FakePage(
+        goto_error=Exception(f"net::ERR_TUNNEL_CONNECTION_FAILED at {_LINK}"),
+        url_after_goto_error="https://example.test/interstitial",
+    )
+    handlers = _link_tools(page)
+    context = SkyvernContext(task_id="tsk_1")
+    skyvern_context.set(context)
+    try:
+        result = await handlers["open_verification_link"]({})
+    finally:
+        skyvern_context.reset()
+    assert result.status == "error"
+    assert page.goto_calls[:2] == [_LINK, "https://app.test/login"]
+    assert context.task_nav_error_codes == {"tsk_1": "net::ERR_TUNNEL_CONNECTION_FAILED"}
 
 
 @pytest.mark.asyncio
@@ -1520,6 +1703,177 @@ async def test_link_tool_hands_a_verification_code_back_to_the_code_tool(monkeyp
     assert resolver.await_count == 1
 
 
+_RUN_ID = "wr_link"
+_STORED_IDENTIFIER = "application_synthetic0001"
+_ACTIVATION_LINK = "https://example.test/careers/activate/synthetictoken4567/"
+_RESENT_ACTIVATION_LINK = "https://example.test/careers/activate/synthetictoken8901/"
+# A slice that has to time out; one that delivers returns on the first tick of the default 5 s slice.
+_TIMEOUT_SLICE_SECONDS = 0.3
+
+
+def _stored_row(
+    totp_code_id: str,
+    code: str,
+    otp_type: OTPType,
+    created_at: datetime,
+    *,
+    workflow_run_id: str | None = _RUN_ID,
+) -> TOTPCode:
+    return TOTPCode(
+        totp_code_id=totp_code_id,
+        totp_identifier=_STORED_IDENTIFIER,
+        organization_id="o_1",
+        content=code,
+        code=code,
+        otp_type=otp_type,
+        workflow_run_id=workflow_run_id,
+        created_at=created_at,
+        modified_at=created_at,
+    )
+
+
+def _stored_code_tools(
+    monkeypatch: pytest.MonkeyPatch, rows: list[TOTPCode], page: _FakePage, *, page_offered: bool = True
+) -> dict[str, Any]:
+    """Both tools over a workflow-run task whose only source is the stored-code table, read through the real
+    resolve_otp_value -> poll_otp_value -> _get_otp_value_from_db chain."""
+
+    async def _get_otp_codes(**_kwargs: Any) -> list[TOTPCode]:
+        return list(rows)
+
+    async def _brief_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0.01)
+
+    run = SimpleNamespace(
+        workflow_id="w_1", workflow_permanent_id="wpid_1", started_at=_TASK_CREATED_AT - timedelta(minutes=10)
+    )
+    monkeypatch.setattr(otp_service.app, "WORKFLOW_CONTEXT_MANAGER", WorkflowContextManager())
+    monkeypatch.setattr(
+        otp_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            otp=SimpleNamespace(get_otp_codes=_get_otp_codes, get_raw_otp_codes=AsyncMock(return_value=[])),
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)),
+        ),
+    )
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_email", AsyncMock(return_value=None))
+    # The LLM seam: neither a bare link nor these rows' content holds a code.
+    monkeypatch.setattr(otp_service, "parse_otp_login", AsyncMock(return_value=None))
+    monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=_brief_sleep))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 5.0)
+    task = _task(workflow_run_id=_RUN_ID, totp_identifier=_STORED_IDENTIFIER)
+    tools, _ = auth_tools.build_auth_tools(task, _provider(page) if page_offered else None)
+    return {t.name: t.handler for t in tools}
+
+
+@pytest.mark.asyncio
+async def test_code_tool_hands_a_stored_run_scoped_sign_in_link_to_the_link_tool_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A site that verifies by link while the model asks for a code: the newest stored link for this run must
+    # send the model to the link tool instead of waiting out the code budget. Once opened, neither it nor the
+    # older link its resend replaced may be handed back, since the page may then ask for a real code.
+    page = _FakePage()
+    rows = [
+        _stored_row("otp_link", _ACTIVATION_LINK, OTPType.MAGIC_LINK, _TASK_CREATED_AT + timedelta(seconds=40)),
+        _stored_row(
+            "otp_resent", _RESENT_ACTIVATION_LINK, OTPType.MAGIC_LINK, _TASK_CREATED_AT + timedelta(seconds=90)
+        ),
+    ]
+    handlers = _stored_code_tools(monkeypatch, rows, page)
+    skyvern_context.set(SkyvernContext(task_id="tsk_1"))
+    try:
+        redirect = await handlers["get_verification_code"]({})
+        opened = await handlers["open_verification_link"]({})
+        monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", _TIMEOUT_SLICE_SECONDS)
+        after_open = await handlers["get_verification_code"]({})
+    finally:
+        skyvern_context.reset()
+
+    assert redirect.status == "error" and redirect.content == auth_tools._MAGIC_LINK_REDIRECT
+    assert opened.status == "ok"
+    assert "available yet" in after_open.content
+    assert page.goto_calls == [_RESENT_ACTIVATION_LINK]
+
+
+@pytest.mark.asyncio
+async def test_code_tool_called_again_instead_of_opening_the_link_polls_for_a_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A model sent to the link tool that asks for a code again may be on a page that wants one (a site that
+    # mails a code and a link): it must get the stored code, not the same redirect on every call.
+    page = _FakePage()
+    rows = [
+        _stored_row("otp_code", "482913", OTPType.TOTP, _TASK_CREATED_AT + timedelta(seconds=30)),
+        _stored_row("otp_link", _ACTIVATION_LINK, OTPType.MAGIC_LINK, _TASK_CREATED_AT + timedelta(seconds=40)),
+    ]
+    handlers = _stored_code_tools(monkeypatch, rows, page)
+    skyvern_context.set(SkyvernContext(task_id="tsk_1"))
+    try:
+        redirect = await handlers["get_verification_code"]({})
+        repeat = await handlers["get_verification_code"]({})
+    finally:
+        skyvern_context.reset()
+
+    assert redirect.content == auth_tools._MAGIC_LINK_REDIRECT
+    assert repeat.content == "verification_code: 482913"
+    assert page.goto_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "page_offered", "expected"),
+    [
+        pytest.param(
+            [
+                _stored_row(
+                    "otp_link",
+                    "https://other.example.test/activate/synthetictoken8901/",
+                    OTPType.MAGIC_LINK,
+                    _TASK_CREATED_AT + timedelta(seconds=60),
+                    workflow_run_id=None,
+                ),
+                _stored_row("otp_code", "482913", OTPType.TOTP, _TASK_CREATED_AT + timedelta(seconds=30)),
+            ],
+            True,
+            "verification_code: 482913",
+            id="unscoped_link_on_a_shared_identifier",
+        ),
+        pytest.param(
+            [_stored_row("otp_link", _ACTIVATION_LINK, OTPType.MAGIC_LINK, _TASK_CREATED_AT - timedelta(seconds=60))],
+            True,
+            "available yet",
+            id="run_scoped_link_from_before_this_task",
+        ),
+        pytest.param(
+            [_stored_row("otp_link", _ACTIVATION_LINK, OTPType.MAGIC_LINK, _TASK_CREATED_AT + timedelta(seconds=40))],
+            False,
+            "available yet",
+            id="page_free_run_cannot_open_a_link",
+        ),
+    ],
+)
+async def test_code_tool_never_redirects_to_a_stored_link_this_task_must_not_follow(
+    monkeypatch: pytest.MonkeyPatch, rows: list[TOTPCode], page_offered: bool, expected: str
+) -> None:
+    # An identifier shared across runs stores other sites' links unscoped, an earlier block's link is not
+    # this page's, and a page-free run has no link tool: none of them may turn a code wait into a redirect
+    # or a terminal "unsupported link", and a code the page asked for is still delivered.
+    page = _FakePage()
+    handlers = _stored_code_tools(monkeypatch, rows, page, page_offered=page_offered)
+    if expected == "available yet":
+        monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", _TIMEOUT_SLICE_SECONDS)
+    skyvern_context.set(SkyvernContext(task_id="tsk_1"))
+    try:
+        result = await handlers["get_verification_code"]({})
+    finally:
+        skyvern_context.reset()
+
+    assert expected in result.content
+    assert result.content != auth_tools._MAGIC_LINK_REDIRECT
+    assert page.goto_calls == []
+
+
 @pytest.mark.asyncio
 async def test_verification_tools_share_one_polling_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     # Two tools over one verification source must not double the wait a never-answering source can buy.
@@ -1601,6 +1955,24 @@ async def test_giveup_gate_holds_exactly_while_awaiting_a_code_it_has_budget_for
     # never a reason to refuse one.
     assert await state.block_finish("completed") == await state.block_completion()
     assert await state.block_finish("failed") == await state.block_giveup("failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asked", ["awaiting", "source_missing", "none"])
+async def test_a_reask_conversion_is_refused_while_a_requested_code_was_never_delivered(asked: str) -> None:
+    # A code awaited or refused for want of a source is not source_failed, so block_completion lets it through.
+    state = auth_tools.VerificationState(task=_task())
+    if asked == "awaiting":
+        state.awaiting_code_since = time.monotonic()
+    elif asked == "source_missing":
+        state.totp_source_missing = True
+    assert await state.block_completion() is None
+
+    blocked = await state.block_finish(taskv3_loop.CONVERSION_VERIFICATION_STATUS)
+
+    assert (blocked is not None) is (asked != "none")
+    state.record_delivery("get_verification_code")
+    assert await state.block_finish(taskv3_loop.CONVERSION_VERIFICATION_STATUS) is None
 
 
 @pytest.mark.asyncio
@@ -1689,6 +2061,30 @@ async def test_the_giveup_gate_records_both_the_hold_and_the_budget_it_let_go(
         assert await state.block_giveup("terminated") is not None
     terminated = [e for e in terminated_logs if e.get("event") == "task_v3 verification give-up gate"]
     assert [e["finish_status"] for e in terminated] == ["terminated"]
+
+
+@pytest.mark.asyncio
+async def test_a_giveup_that_never_polled_is_recorded_only_when_the_code_tool_was_offered() -> None:
+    # The "offered a code tool, never called it" give-up. Gated on the offer: a give-up on a run with no code
+    # tool is every failed v3 finish, and logging those would bury the population this read is for.
+    offered = auth_tools.VerificationState(task=_task())
+    offered.code_tool_offered = True
+    not_offered = auth_tools.VerificationState(task=_task())
+
+    with capture_logs() as logs:
+        assert await offered.block_giveup("failed") is None
+        assert await not_offered.block_giveup("failed") is None
+
+    records = [e for e in logs if e.get("event") == "task_v3 verification give-up gate"]
+    assert len(records) == 1
+    assert records[0]["code_tool_offered"] is True
+    # Together these separate "never called" from a call that failed or answered instantly.
+    assert (records[0]["polling_spent_seconds"], records[0]["values_delivered"], records[0]["source_failed"]) == (
+        0,
+        0,
+        False,
+    )
+    assert (records[0]["held"], records[0]["reason"]) == (False, "not_awaiting")
 
 
 @pytest.mark.asyncio

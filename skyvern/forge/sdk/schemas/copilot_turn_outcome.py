@@ -29,10 +29,6 @@ class OutputPolicyReason(StrEnum):
     CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
-    INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
-    INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
-    SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
-    WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
 
 
 _UNSAFE_IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_\- ]")
@@ -62,6 +58,13 @@ class ConnectedAccountChoice(BaseModel):
     name: str
     state: str
     email_address: str | None = None
+
+
+class DeliveredOutputFile(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    artifact_id: str
+    filename: str
 
 
 class ConnectedAccountChoiceReference(BaseModel):
@@ -110,9 +113,13 @@ class TurnOutcome(BaseModel):
     # Client-generated per-request correlation value. Retained after the pending
     # marker is cleared so a disconnected client can recover the exact chat.
     request_cancel_token: str | None = None
+    # True on an interrupted row no late finalizer can replace. Chat history serves every stored
+    # interrupted row this way; False only reaches a client from a backend that still replaced rows.
+    interrupted_row_final: bool = False
     idempotency_digest: str | None = None
     unresolved_runtime_failure: UnresolvedRuntimeFailure | None = None
     connected_account_choices: list[ConnectedAccountChoice] | None = None
+    output_files: list[DeliveredOutputFile] | None = None
 
     @field_validator("output_policy_reasons", mode="before")
     @classmethod

@@ -696,7 +696,7 @@ async def test_resolve_login_block_credential_ids_returns_selected_rotating_id()
         )
 
     assert credential_ids == ["cred_b"]
-    context.resolve_credential_parameter_id.assert_awaited_once_with(parameter, "org_test")
+    context.resolve_credential_parameter_id.assert_awaited_once_with(parameter, "org_test", read_only=False)
 
 
 def _setup_workflow_with_rotating_credential(browser_profile_key: str | None = "{{ login_cred }}") -> SimpleNamespace:
@@ -770,6 +770,7 @@ async def _attempt_setup_rotation_profile_run(
         organization_name="Test Org",
         default_llm_key=None,
         default_secondary_llm_key=None,
+        created_at=None,
     )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
@@ -838,6 +839,7 @@ async def _setup_bound_credentials(
         organization_name="Test Org",
         default_llm_key=None,
         default_secondary_llm_key=None,
+        created_at=None,
     )
     repo = selection_repo or _SelectionRepo()
 

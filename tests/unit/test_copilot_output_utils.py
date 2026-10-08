@@ -1,13 +1,15 @@
-"""Tests for truncate_output and sanitize_tool_result_for_llm."""
+"""Tests for sanitize_tool_result_for_llm and tool-result summaries."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.cli.mcp_tools import workflow as workflow_tools
+from skyvern.forge.failure_classifier import with_sign_in_form_visible
 from skyvern.forge.sdk.copilot import output_utils as output_utils_module
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestEvidencePacket,
@@ -26,50 +28,19 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     _sanitize_failure_text,
+    browser_code_steps_for_user,
     build_run_blocks_response,
     format_tool_result_for_user,
     iter_failure_reasons,
-    looks_like_workflow_yaml_in_chat,
     mark_mcp_result_untrusted_for_llm,
     parse_final_response,
     sanitize_tool_result_for_llm,
     screened_recorded_url,
     summarize_tool_result,
     summarize_tool_result_detail,
-    truncate_output,
     user_facing_success,
 )
-
-
-def test_truncate_output_none() -> None:
-    assert truncate_output(None) is None
-
-
-def test_truncate_output_short_string() -> None:
-    assert truncate_output("ok") == "ok"
-
-
-def test_truncate_output_long_string_truncates() -> None:
-    text = "x" * 2100
-    result = truncate_output(text, max_chars=2000)
-
-    assert result is not None
-    assert result.startswith("x" * 2000)
-    assert result.endswith("\n... [truncated]")
-
-
-def test_truncate_output_serializes_dict() -> None:
-    result = truncate_output({"a": 1, "b": True})
-    assert result == '{"a": 1, "b": true}'
-
-
-def test_truncate_output_falls_back_to_str_on_json_error() -> None:
-    circular: dict[str, object] = {}
-    circular["self"] = circular
-
-    result = truncate_output(circular)
-    assert result is not None
-    assert "self" in result
+from tests.unit.helpers import unsolved_captcha_relabel_categories
 
 
 def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
@@ -101,22 +72,6 @@ def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
     assert blocks[1]["screenshot_b64"] == "[base64 image omitted — screenshot was taken successfully]"
     assert blocks[1]["failure_reason"] == "timeout"
     assert blocks[0]["status"] == "completed"
-
-
-def test_sanitize_get_run_results_bounds_recorded_block_output_without_packet() -> None:
-    recorded_output = {"service_name": "a" * 2200}
-    result = {
-        "ok": True,
-        "data": {
-            "workflow_run_id": "wr_123",
-            "blocks": [{"label": "collect_service", "output": recorded_output}],
-        },
-    }
-
-    sanitized = sanitize_tool_result_for_llm("get_run_results", result)
-
-    assert sanitized["data"]["blocks"][0]["output"].endswith("\n... [truncated]")
-    assert result["data"]["blocks"][0]["output"] is recorded_output
 
 
 def test_sanitize_does_not_mutate_original_blocks() -> None:
@@ -959,16 +914,34 @@ class TestSanitization:
         assert sanitized["data"]["schema"]["_truncated"] is True
 
     def test_get_block_schema_returns_the_schema_it_was_called_for(self) -> None:
-        """The truncation steer says to call get_block_schema for the block type — so applying it to
-        that call's own answer leaves the model no route to the fields it asked for."""
-        from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
-
-        big_schema = {f"field_{i}": {"type": "string"} for i in range(200)}
-        result = {"ok": True, "data": {"block_type": "code", "schema": big_schema}}
+        properties = {f"field_{i}": {"type": "string"} for i in range(200)}
+        properties.update(
+            {
+                "totp_identifier": {"type": "string", "description": "Identifier for TOTP verification."},
+                "totp_verification_url": {"type": "string", "description": "URL for TOTP verification."},
+            }
+        )
+        schema = {"type": "object", "properties": properties}
+        result = {"ok": True, "data": {"block_type": "login", "schema": schema}}
 
         sanitized = sanitize_tool_result_for_llm("get_block_schema", result)
 
-        assert sanitized["data"]["schema"] == big_schema
+        assert sanitized["data"]["schema"] == schema
+
+    def test_totp_scalars_are_withheld_including_inside_lists(self) -> None:
+        runtime = {
+            "ok": True,
+            "data": {
+                "totp_identifier": "user@example.com",
+                "totp_verification_url": "https://example.com/totp",
+                "attempts": [{"totp_identifier": 123456}],
+            },
+        }
+        assert sanitize_tool_result_for_llm("get_run_results", runtime)["data"] == {
+            "totp_identifier": "[WITHHELD]",
+            "totp_verification_url": "[WITHHELD]",
+            "attempts": [{"totp_identifier": "[WITHHELD]"}],
+        }
 
     def test_run_blocks_sanitizer_bounds_the_summary_when_no_packet_is_attached(self) -> None:
         overlong = "click #add-to-cart failed response=" + "page detail " * 200 + "overlong-tail"
@@ -1034,6 +1007,31 @@ class TestSummarizeToolResult:
 
         assert summary == "Found 1 credential: Saved Login"
         assert "Found 0" not in summary
+
+    @pytest.mark.parametrize(
+        ("tool_name", "result", "expected"),
+        [
+            (
+                "solve_page_challenge",
+                {"ok": True, "outcome": "solved"},
+                "Challenge solver reported the challenge solved",
+            ),
+            (
+                "solve_page_challenge",
+                {"ok": True, "outcome": "unsolved", "timed_out": True},
+                "Challenge solver could not clear the challenge in this browser (timed out)",
+            ),
+            (
+                "start_fresh_browser",
+                {"ok": True, "old_browser_closed": True},
+                "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone",
+            ),
+        ],
+    )
+    def test_page_challenge_activity_row_names_the_outcome(
+        self, tool_name: str, result: dict[str, Any], expected: str
+    ) -> None:
+        assert format_tool_result_for_user(tool_name, result) == expected
 
     def test_exact_credential_success_sanitizes_name_for_activity_summary(self) -> None:
         summary = self._summarize(
@@ -1413,25 +1411,25 @@ class TestFormatToolResultForUser:
         result = {
             "ok": False,
             "error": (
-                "The run has not made progress. Run ID: wr_stalled. Outcome is uncertain. "
-                "Do NOT re-invoke block-running tools without first calling get_run_results."
+                "The run did not reach a terminal status within the 1190s absolute ceiling. Run ID: wr_stalled. "
+                "Outcome is uncertain. Do NOT re-invoke block-running tools without first calling get_run_results."
             ),
             "data": {
                 "failure_reason": (
-                    "The run stopped after no observable progress for 120s. Run ID: wr_stalled. Outcome is uncertain."
+                    "The run did not finish within the 1190s absolute ceiling. Run ID: wr_stalled. Outcome is uncertain."
                 ),
                 "control_signal": {
-                    "kind": "watchdog_stagnation",
-                    "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                    "kind": "watchdog_ceiling",
+                    "user_facing_summary": "The run did not finish within the 1190s absolute ceiling.",
                 },
-                "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                "user_facing_summary": "The run did not finish within the 1190s absolute ceiling.",
             },
         }
 
         summary = self._format("run_blocks_and_collect_debug", result)
         detail = summarize_tool_result_detail(result, tool_name="run_blocks_and_collect_debug")
 
-        assert summary == "The run stopped after no observable progress for 120s."
+        assert summary == "The run did not finish within the 1190s absolute ceiling."
         assert detail == summary
         assert "wr_stalled" not in summary
         assert "get_run_results" not in detail
@@ -1641,6 +1639,51 @@ class TestFormatToolResultForUser:
         )
         assert agent_summary == "Clicked 'xpath=//button[2]'"
 
+    def test_summarize_tool_result_reports_browser_code_operations_and_page(self) -> None:
+        agent_summary = summarize_tool_result(
+            "run_browser_code",
+            {
+                "ok": True,
+                "current_url": "https://example.com/members?page=3",
+                "operations": [
+                    {"operation": "goto", "status": "ok"},
+                    {"operation": "click", "status": "ok", "selector": "#nextBtn"},
+                ],
+            },
+        )
+        assert agent_summary == "Ran browser code (2 operation(s)) at https://example.com/members?page=3"
+
+    def test_format_tool_result_for_user_describes_browser_code_steps(self) -> None:
+        result = {
+            "ok": True,
+            "current_url": "https://example.com/jobs",
+            "operations": [
+                {"operation": "goto", "status": "ok"},
+                {"operation": "wait_for_selector", "status": "ok", "selector": ".job"},
+                *({"operation": "text_content", "status": "ok", "selector": f".job:nth({i})"} for i in range(10)),
+                {"operation": "click", "status": "failed", "selector": "#next"},
+                {"operation": "screenshot", "status": "ok"},
+            ],
+        }
+        assert browser_code_steps_for_user("run_browser_code", {**result, "operations_omitted": 3}) == [
+            "Opened a page",
+            "waited for '.job'",
+            "read ×10",
+            "clicked '#next' (failed)",
+            "screenshot",
+            "3 more operation(s)",
+        ]
+        assert format_tool_result_for_user("run_browser_code", result) == (
+            "Opened a page → waited for '.job' → read ×10 → clicked '#next' (failed) → screenshot"
+            " at https://example.com/jobs"
+        )
+        assert summarize_tool_result("run_browser_code", result) == (
+            "Ran browser code (14 operation(s)) at https://example.com/jobs"
+        )
+        assert format_tool_result_for_user("run_browser_code", {"ok": True, "operations": []}) == (
+            "Ran browser code (0 operation(s))"
+        )
+
 
 class TestUserFacingSuccess:
     @staticmethod
@@ -1801,6 +1844,19 @@ class TestParseFinalResponse:
         assert parsed["type"] == "REPLY"
         assert parsed["user_response"] == "ok"
 
+    def test_a_draft_object_before_the_final_envelope_does_not_win(self) -> None:
+        text = (
+            '{"type": "REPLY", "user_response": "draft"}\n\nOn reflection:\n'
+            '{"type": "REPLY", "user_response": "final", "global_llm_context": {"user_goal": "x"}}'
+        )
+        parsed = parse_final_response(text)
+        assert parsed["user_response"] == "final"
+        assert parsed["global_llm_context"] == {"user_goal": "x"}
+
+    def test_an_object_nested_in_a_malformed_envelope_is_not_read_as_the_reply(self) -> None:
+        text = '{"type": "REPLY", "user_response": "answer", "global_llm_context": {"user_response": "context"},}'
+        assert parse_final_response(text)["user_response"] == "answer"
+
     def test_pass_b_rejects_non_envelope_dict_in_prose(self) -> None:
         text = 'I cannot help with {"foo": "bar"}'
         parsed = parse_final_response(text)
@@ -1865,85 +1921,6 @@ class TestParseFinalResponse:
         text = "I'm not sure how to help with that."
         parsed = parse_final_response(text)
         assert parsed == {"type": "REPLY", "user_response": text}
-
-
-class TestLooksLikeWorkflowYamlInChat:
-    def test_detects_block_yaml_with_navigation_goal(self) -> None:
-        text = (
-            "Here's how the block now looks:\n\n"
-            "    - label: fill_form\n"
-            "      block_type: navigation\n"
-            "      navigation_goal: Fill the abuse form.\n"
-            "      url: https://example.test/abuse\n"
-            "      parameter_keys:\n"
-            "        - name\n"
-        )
-        assert looks_like_workflow_yaml_in_chat(text) is True
-
-    def test_detects_block_yaml_inside_fenced_code(self) -> None:
-        text = (
-            "I've drafted the change:\n\n"
-            "```yaml\n"
-            "block_type: extraction\n"
-            "data_extraction_goal: Pull the table.\n"
-            "label: extract_data\n"
-            "```\n"
-        )
-        assert looks_like_workflow_yaml_in_chat(text) is True
-
-    def test_detects_full_workflow_definition_paste(self) -> None:
-        text = (
-            "workflow_definition:\n"
-            "  parameters: []\n"
-            "  blocks:\n"
-            "    - block_type: validation\n"
-            "      complete_criterion: The page shows a thank-you message.\n"
-        )
-        assert looks_like_workflow_yaml_in_chat(text) is True
-
-    def test_does_not_flag_inline_block_type_mention(self) -> None:
-        text = (
-            "I'll use a navigation block to fill the form. The block_type field on a "
-            "navigation block accepts goals like a navigation_goal string — but the user "
-            "doesn't need to see the YAML directly."
-        )
-        assert looks_like_workflow_yaml_in_chat(text) is False
-
-    def test_does_not_flag_short_prose(self) -> None:
-        assert looks_like_workflow_yaml_in_chat("Sure, I can do that.") is False
-
-    def test_does_not_flag_empty_or_non_string(self) -> None:
-        assert looks_like_workflow_yaml_in_chat("") is False
-        assert looks_like_workflow_yaml_in_chat(None) is False
-        assert looks_like_workflow_yaml_in_chat(12345) is False
-
-    def test_detects_bare_block_type_line(self) -> None:
-        text = "Here's a small snippet:\n\n    - block_type: navigation\n      label: open_page\n"
-        assert looks_like_workflow_yaml_in_chat(text) is True
-
-    def test_unknown_block_type_value_does_not_trip(self) -> None:
-        text = "Diagnostic note:\n\n    block_type: experimental_thing\n    detail: not a real block\n"
-        assert looks_like_workflow_yaml_in_chat(text) is False
-
-    def test_detects_json_shape_block_paste(self) -> None:
-        text = (
-            "Here is the block as JSON:\n\n"
-            "```json\n"
-            "{\n"
-            '  "block_type": "navigation",\n'
-            '  "navigation_goal": "Fill the form.",\n'
-            '  "parameter_keys": ["name"]\n'
-            "}\n"
-            "```\n"
-        )
-        assert looks_like_workflow_yaml_in_chat(text) is True
-
-    def test_inline_field_mention_does_not_trip(self) -> None:
-        text = (
-            "When the navigation_goal field is unset and the block_type is wrong, the block "
-            "will fail validation — those fields need to come from the user."
-        )
-        assert looks_like_workflow_yaml_in_chat(text) is False
 
 
 def test_summarize_tool_result_detail_returns_none_on_success() -> None:
@@ -2346,3 +2323,85 @@ def test_the_reported_failure_reason_is_the_one_the_run_stopped_on() -> None:
     }
 
     assert next(iter_failure_reasons(result), None) == "no result row"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_org_workflow", "skyvern_workflow_get"])
+async def test_saved_workflow_reader_uses_document_privacy_projection(monkeypatch, tool_name):
+    private = {
+        "extra_http_headers": {"X-Private": "header-private"},
+        "cdp_connect_headers": {"X-Private": "cdp-private"},
+        "webhook_callback_url": "https://example.test/callback-private",
+        "proxy_location": {"server": "https://example.test/proxy-private", "password": "proxy-private"},
+        "totp_identifier": "workflow-private",
+        "totp_verification_url": "https://example.test/workflow-private",
+    }
+    workflow = {
+        "title": "Saved workflow",
+        **private,
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "label": "verify",
+                    "block_type": "task",
+                    "navigation_goal": "Verify",
+                    "totp_identifier": "block-private",
+                    "totp_verification_url": "https://example.test/block-private",
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(workflow_tools, "get_workflow_by_id", AsyncMock(return_value=workflow))
+    raw = await workflow_tools.skyvern_workflow_get("wpid_123456789")
+    result = _copilot_to_call_tool_result(raw, tool_name=tool_name)
+    serialized = result.content[0].text
+    projected = json.loads(serialized)["data"]
+    assert (set(private) - {"extra_http_headers", "cdp_connect_headers"}).isdisjoint(projected)
+    assert projected["extra_http_headers"] == {"X-Private": "***"}
+    assert projected["cdp_connect_headers"] == {"X-Private": "***"}
+    for value in (
+        "header-private",
+        "cdp-private",
+        "callback-private",
+        "proxy-private",
+        "workflow-private",
+    ):
+        assert value not in serialized
+    assert json.loads(serialized)["data"]["workflow_definition"] == workflow["workflow_definition"]
+    assert raw["data"]["totp_identifier"] == "workflow-private"
+    monkeypatch.setattr(workflow_tools, "list_workflows_raw", AsyncMock(return_value=[workflow]))
+    listed = await workflow_tools.skyvern_workflow_list()
+    metadata = listed["data"]["workflows"][0]
+    assert set(private).isdisjoint(metadata)
+    assert "workflow_definition" not in metadata
+
+
+def _run_tool_result(failure_category: list[dict]) -> dict[str, Any]:
+    task_output = {"task_id": "tsk_1", "status": "failed", "failure_category": failure_category}
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "failure_category": failure_category,
+            "blocks": [{"label": "submit", "status": "failed", "output": task_output, "extracted_data": task_output}],
+            "registered_output_parameter_values": [{"block_label": "submit", "value": task_output}],
+        },
+    }
+
+
+@pytest.mark.parametrize("tool_name", ["get_run_results", "run_blocks_and_collect_debug"])
+def test_the_model_reads_the_same_run_categories_after_an_output_only_relabel(tool_name: str) -> None:
+    before, after = unsolved_captcha_relabel_categories()
+    assert sanitize_tool_result_for_llm(tool_name, _run_tool_result(after)) == sanitize_tool_result_for_llm(
+        tool_name, _run_tool_result(before)
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["get_run_results", "run_blocks_and_collect_debug"])
+def test_the_model_reads_the_same_run_categories_after_a_sign_in_form_label(tool_name: str) -> None:
+    before = [{"category": "ELEMENT_STATE_TIMEOUT", "confidence_float": 0.85}]
+    after = with_sign_in_form_visible(before)
+    assert sanitize_tool_result_for_llm(tool_name, _run_tool_result(after)) == sanitize_tool_result_for_llm(
+        tool_name, _run_tool_result(before)
+    )
