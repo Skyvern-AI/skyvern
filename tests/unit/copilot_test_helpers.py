@@ -16,6 +16,18 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import pytest
+from agents import Agent, FunctionTool, OutputGuardrail, RunConfig, SQLiteSession
+from agents.items import ModelResponse, TResponseInputItem
+from agents.models.interface import Model, ModelProvider
+from agents.result import RunResultStreaming
+from openai.types.responses import (
+    ResponseCompletedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
+from openai.types.responses.response import Response
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from playwright.async_api import Page, Route, async_playwright
 from playwright.sync_api import sync_playwright
 
@@ -25,9 +37,10 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
-from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.agent import _run_agent_loop_with_surface, run_copilot_agent
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -37,12 +50,22 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     VerificationResult,
 )
-from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, _mark_copilot_total_timeout
+from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotTotalTimeoutError,
+    _mark_copilot_total_timeout,
+    run_with_enforcement,
+)
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
+from skyvern.forge.sdk.copilot.session_factory import (
+    copilot_call_model_input_filter,
+    copilot_session_input_callback,
+)
+from skyvern.forge.sdk.copilot.tools import reply_ends_turn, reply_tool
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -52,7 +75,11 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatRequest,
+    WorkflowCopilotStreamMessageType,
+    WorkflowCopilotTitleUpdate,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
@@ -1537,3 +1564,171 @@ class FakeCopilotStream:
 
     def titles(self) -> list[str]:
         return [event.title for event in self.sent if isinstance(event, WorkflowCopilotTitleUpdate)]
+
+
+def _scripted_response() -> Response:
+    return Response(
+        id="resp_1",
+        created_at=0.0,
+        model="gpt-4o",
+        object="response",
+        output=[],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+    )
+
+
+ScriptedOutput = list[ResponseFunctionToolCall | ResponseOutputMessage]
+
+
+def scripted_call(name: str, arguments: dict[str, Any], call_id: str = "call_held") -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        id=f"fc_{call_id}", call_id=call_id, name=name, arguments=json.dumps(arguments), type="function_call"
+    )
+
+
+def scripted_text(text: str) -> ResponseOutputMessage:
+    return ResponseOutputMessage(
+        id="msg_done",
+        role="assistant",
+        status="completed",
+        type="message",
+        content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+    )
+
+
+class ScriptedModel(Model):
+    """Deterministic SDK input source: one scripted output per model call, None for a stream that never completes."""
+
+    def __init__(self, script: list[ScriptedOutput | None]) -> None:
+        self.script = script
+        self.inputs: list[list[Any]] = []
+        self.served_instructions: str | None = None
+        self.served_tools: list[Any] = []
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        raise AssertionError("streamed execution required")
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: Any,
+        model_settings: Any,
+        tools: list[Any],
+        *args: Any,
+        **kwargs: Any,
+    ):
+        self.served_instructions = system_instructions
+        self.served_tools = tools
+        self.inputs.append(list(input))
+        output = self.script[len(self.inputs) - 1]
+        if output is None:
+            return
+        for index, item in enumerate(output):
+            yield ResponseOutputItemDoneEvent(
+                item=item, output_index=index, sequence_number=index + 1, type="response.output_item.done"
+            )
+        response = _scripted_response().model_copy(update={"output": output, "status": "completed"})
+        yield ResponseCompletedEvent(response=response, sequence_number=len(output) + 1, type="response.completed")
+
+
+REPLY_ARGUMENTS = {"user_response": "Use a `for_loop` block.", "global_llm_context": {"user_goal": "loop over URLs"}}
+
+
+async def run_scripted_turn(
+    model: ScriptedModel,
+    *,
+    tools: list[FunctionTool] | None = None,
+    max_turns: int = 10,
+    output_guardrails: list[OutputGuardrail[CopilotContext]] | None = None,
+    saved_items: list[TResponseInputItem] | None = None,
+) -> tuple[RunResultStreaming, CopilotContext, FakeCopilotStream]:
+    ctx = make_copilot_ctx(
+        organization_id="org_test", workflow_permanent_id="wpid_test", workflow_id=None, workflow_yaml=None, stream=None
+    )
+    stream = FakeCopilotStream()
+    ctx.stream = stream
+    session = SQLiteSession("scripted-turn")
+    try:
+        result = await run_with_enforcement(
+            agent=Agent(
+                name="controlled",
+                model=model,
+                tools=[*(tools or []), reply_tool],
+                tool_use_behavior=reply_ends_turn,
+                output_guardrails=output_guardrails or [],
+            ),
+            initial_input="How do I loop over a list of URLs?",
+            ctx=ctx,
+            stream=stream,
+            session=session,
+            max_turns=max_turns,
+            hooks=CopilotRunHooks(ctx),
+            run_config=RunConfig(
+                tracing_disabled=True,
+                session_input_callback=copilot_session_input_callback,
+                call_model_input_filter=copilot_call_model_input_filter,
+            ),
+        )
+    finally:
+        if saved_items is not None:
+            saved_items.extend(await session.get_items())
+        session.close()
+    return result, ctx, stream
+
+
+def tool_outputs_for(model_input: list[Any], call_id: str) -> list[str]:
+    return [
+        item["output"]
+        for item in model_input
+        if isinstance(item, dict) and item.get("type") == "function_call_output" and item.get("call_id") == call_id
+    ]
+
+
+def tool_frame_types(stream: FakeCopilotStream) -> list[WorkflowCopilotStreamMessageType]:
+    return [
+        frame.type
+        for frame in stream.sent
+        if frame.type in (WorkflowCopilotStreamMessageType.TOOL_CALL, WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    ]
+
+
+class ScriptedProvider(ModelProvider):
+    def __init__(self, model: Model) -> None:
+        self.model = model
+
+    def get_model(self, model_name: str | None) -> Model:
+        return self.model
+
+
+async def run_production_loop(
+    model: ScriptedModel,
+    *,
+    final_reply: bool = False,
+    output_guardrails: list[OutputGuardrail[CopilotContext]] | None = None,
+    native_tools: list[FunctionTool] | None = None,
+) -> tuple[RunResultStreaming, CopilotContext, FakeCopilotStream]:
+    ctx = make_copilot_ctx(
+        organization_id="org_test", workflow_permanent_id="wpid_test", workflow_id=None, workflow_yaml=None, stream=None
+    )
+    ctx.api_key = "test-in-process-key"
+    stream = FakeCopilotStream()
+    ctx.stream = stream
+    result = await _run_agent_loop_with_surface(
+        ctx=ctx,
+        stream=stream,
+        chat_id="chat-1",
+        initial_input="How do I loop over a list of URLs?",
+        system_prompt="system prompt",
+        model_name="scripted",
+        run_config=RunConfig(tracing_disabled=True, model_provider=ScriptedProvider(model)),
+        llm_key="PRIMARY",
+        copilot_config=CopilotConfig(),
+        native_tools=native_tools or [reply_tool],
+        alias_map={},
+        overlays={},
+        output_guardrails=output_guardrails or [],
+        final_reply=final_reply,
+    )
+    return result, ctx, stream

@@ -35,6 +35,7 @@ from agents import (
 from agents.exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
+    ModelBehaviorError,
     OutputGuardrailTripwireTriggered,
 )
 from agents.items import ToolCallItem
@@ -2366,6 +2367,11 @@ def _fake_run_result(payload: dict) -> SimpleNamespace:
     return SimpleNamespace(final_output=json.dumps(payload), new_items=[])
 
 
+def _tool_call_item() -> ToolCallItem:
+    call = ResponseFunctionToolCall(type="function_call", name="navigate_browser", call_id="call_1", arguments="{}")
+    return ToolCallItem(agent=MagicMock(), raw_item=call)
+
+
 def _stage_proposal(staged_workflow: MagicMock) -> Callable[[CopilotContext], None]:
     staged_yaml = "workflow_definition:\n  parameters: []\n  blocks: []"
 
@@ -2436,9 +2442,7 @@ async def _run_tool_bearing_empty_completion_turn(
             during_attempt(ctx)
         if attempt.error is not None:
             raise attempt.error
-        return SimpleNamespace(
-            final_output="", new_items=[MagicMock(spec=ToolCallItem)] if attempt.returns_tool_call else []
-        )
+        return SimpleNamespace(final_output="", new_items=[_tool_call_item()] if attempt.returns_tool_call else [])
 
     real_run_streamed_with_deadline = enforcement_module._run_streamed_with_deadline
 
@@ -7258,7 +7262,7 @@ class TestCopilotConfig:
             stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
         )
         tool_bearing = agent_module._empty_completion_error(
-            SimpleNamespace(final_output="", new_items=[MagicMock(spec=ToolCallItem)]),
+            SimpleNamespace(final_output="", new_items=[_tool_call_item()]),
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
@@ -7381,7 +7385,7 @@ class TestCopilotConfig:
             ("SECONDARY", "SECONDARY", _EnforcementAttempt(runs_tool=False, returns_tool_call=True)),
         ],
     )
-    async def test_tool_bearing_empty_completion_gets_one_tool_less_final_reply(
+    async def test_tool_bearing_empty_completion_gets_one_final_reply_call(
         self,
         monkeypatch: pytest.MonkeyPatch,
         fallback_llm_key: str | None,
@@ -7402,7 +7406,7 @@ class TestCopilotConfig:
         assert isinstance(call.current_input, str)
         assert call.current_input.startswith(NUDGE_SENTINEL)
         assert call.max_turns == 1
-        assert call.model_settings.tool_choice == "none"
+        assert call.model_settings.tool_choice is None
         assert call.model_settings.temperature == 0.1
         assert len(call.agent.tools) > 0
         assert isinstance(call.hooks, FinalReplyRunHooks)
@@ -7469,7 +7473,7 @@ class TestCopilotConfig:
         [
             pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
             pytest.param(_fake_run_result({"type": "REPLY", "user_response": "  "}), id="blank_user_response"),
-            pytest.param(RuntimeError("provider rejected tool_choice"), id="failed"),
+            pytest.param(RuntimeError("provider rejected the request"), id="failed"),
             pytest.param(FinalReplyToolRefusedError("navigate_browser"), id="tool_refused"),
         ],
     )
@@ -7534,9 +7538,7 @@ class TestCopilotConfig:
         return OutputGuardrailTripwireTriggered(guardrail_result)
 
     @pytest.mark.asyncio
-    async def test_reply_withheld_for_a_raw_secret_shape_gets_one_tool_less_reask(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_reply_withheld_for_a_raw_secret_shape_gets_one_reask(self, monkeypatch: pytest.MonkeyPatch) -> None:
         lead_in = "The run signed in and opened the billing page for card 4111111111111111. " * 5 + "Use "
         withheld = lead_in + "password: Hunter2Secret! next time. Trailing note after the secret."
         run = await _run_tool_bearing_empty_completion_turn(
@@ -7556,7 +7558,7 @@ class TestCopilotConfig:
         assert "Hunter2Secret" not in call.current_input
         assert "Trailing note" not in call.current_input
         assert "billing page" not in call.current_input
-        assert call.model_settings.tool_choice == "none"
+        assert call.model_settings.tool_choice is None
         assert call.max_turns == 1
         assert run.result.user_response == "The page shows receipt FV-0F9080EE."
 
@@ -7658,7 +7660,7 @@ class TestCopilotConfig:
         assert run.result.proposal_disposition == "review_untested"
 
     @pytest.mark.asyncio
-    async def test_empty_completion_final_reply_refuses_returned_tool_call(
+    async def test_empty_completion_final_reply_never_runs_a_returned_tool_call(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ctx = _ctx()
@@ -7702,7 +7704,7 @@ class TestCopilotConfig:
                         )
                     ],
                     parallel_tool_calls=True,
-                    tool_choice="none",
+                    tool_choice="auto",
                     tools=[],
                     status="completed",
                 )
@@ -7714,7 +7716,7 @@ class TestCopilotConfig:
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", consume_sdk_stream)
 
-        with pytest.raises(FinalReplyToolRefusedError):
+        with pytest.raises(ModelBehaviorError):
             await run_final_reply_drain(
                 Agent(name="final-reply-test", model=ToolCallingModel(), tools=[navigate_browser]),
                 ctx,
@@ -7727,8 +7729,8 @@ class TestCopilotConfig:
         assert not tool_ran
         assert ctx.tool_calls_this_turn == 7
         assert len(model_calls) == 1
-        assert model_calls[0]["model_settings"].tool_choice == "none"
-        assert [tool.name for tool in model_calls[0]["tools"]] == ["navigate_browser"]
+        assert model_calls[0]["model_settings"].tool_choice is None
+        assert model_calls[0]["tools"] == []
 
     @pytest.mark.asyncio
     async def test_preexisting_tool_count_allows_current_empty_attempt_fallback(

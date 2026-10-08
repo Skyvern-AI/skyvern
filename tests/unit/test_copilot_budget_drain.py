@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from agents import function_tool
 from agents.exceptions import MaxTurnsExceeded
 
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -17,15 +18,24 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionPart, QuestionResponse
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.enforcement import run_with_enforcement
+from skyvern.forge.sdk.copilot.enforcement import BUDGET_DRAIN_HEADROOM, run_with_enforcement
+from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
+    WorkflowCopilotStreamMessageType,
 )
 from skyvern.utils.yaml_loader import safe_load_no_dates
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    REPLY_ARGUMENTS,
+    ScriptedModel,
+    make_copilot_ctx,
+    run_scripted_turn,
+    scripted_call,
+    tool_outputs_for,
+)
 
 
 def _result(final_output: str) -> MagicMock:
@@ -600,3 +610,58 @@ async def test_sdk_overlapping_human_waits_resume_with_both_answers_without_expi
         assert not ctx.budget_expiry_state.drain_attempted
     finally:
         session.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_on_the_last_allowed_turn_reaches_the_budget_drain_once() -> None:
+    model = ScriptedModel(
+        [[scripted_call("REPLY", {}, "call_made_up")], [scripted_call("reply", REPLY_ARGUMENTS, "call_reply")]]
+    )
+    result, ctx, _stream = await run_scripted_turn(model, max_turns=1)
+
+    assert ctx.budget_expiry_state.drain_attempted
+    assert len(model.inputs) == 2
+    (unknown_result,) = tool_outputs_for(model.inputs[1], "call_made_up")
+    assert "REPLY" in json.loads(unknown_result)["error"]
+    assert parse_final_response(extract_final_text(result))["user_response"] == REPLY_ARGUMENTS["user_response"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_inside_the_budget_drain_gets_a_result_and_one_more_call() -> None:
+    model = ScriptedModel(
+        [
+            [scripted_call("REPLY", {}, "call_first")],
+            [scripted_call("REPLY", {}, "call_in_drain")],
+            [scripted_call("reply", REPLY_ARGUMENTS, "call_reply")],
+        ]
+    )
+    result, ctx, stream = await run_scripted_turn(model, max_turns=1)
+
+    assert ctx.budget_expiry_state.drain_attempted
+    assert len(model.inputs) == 3
+    (drain_result,) = tool_outputs_for(model.inputs[2], "call_in_drain")
+    assert json.loads(drain_result)["ok"] is False
+    assert parse_final_response(extract_final_text(result))["user_response"] == REPLY_ARGUMENTS["user_response"]
+    results = [f for f in stream.sent if f.type == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [(f.tool_call_id, f.success) for f in results] == [("call_first", False), ("call_in_drain", False)]
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_recovery_keeps_the_budget_drain_within_its_headroom() -> None:
+    @function_tool
+    async def probe() -> str:
+        return json.dumps({"ok": True})
+
+    model = ScriptedModel(
+        [
+            [scripted_call("REPLY", {}, "call_first")],
+            [scripted_call("REPLY", {}, "call_in_drain")],
+            *[[scripted_call("probe", {}, f"call_probe_{index}")] for index in range(BUDGET_DRAIN_HEADROOM - 1)],
+            [scripted_call("reply", REPLY_ARGUMENTS, "call_past_headroom")],
+        ]
+    )
+
+    with pytest.raises(MaxTurnsExceeded):
+        await run_scripted_turn(model, tools=[probe], max_turns=1)
+
+    assert len(model.inputs) == 1 + BUDGET_DRAIN_HEADROOM
