@@ -215,7 +215,7 @@ class CodeArtifactClaimedOutcome(BaseModel):
             "JSON Schema the user confirmed for this claim's extraction shape, serialized as a JSON "
             'string (an object, or `{"type":"array","items":{...}}` for repeated records). Named '
             "fields, types, and nesting the `goal_value_paths` index into; the block return is conformed "
-            "and validated against it. Same dialect as the legacy `data_schema` lever."
+            "and validated against it."
         ),
     )
     extraction_schema_provenance: ExtractionSchemaProvenance | None = None

@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
+    is_external_cdp_session,
 )
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 
@@ -211,7 +212,8 @@ class BrowserSessionResponse(BaseModel):
             organization_id=browser_session.organization_id,
             browser_session_id=browser_session.persistent_browser_session_id,
             browser_address=browser_session.browser_address,
-            upstream_cdp_url=browser_session.upstream_cdp_url,
+            # A registered external browser is dialed only in-process, never minted a router URL.
+            upstream_cdp_url=None if is_external_cdp_session(browser_session) else browser_session.upstream_cdp_url,
         )
 
         stream_transport: str | None = None

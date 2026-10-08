@@ -48,7 +48,9 @@ async def derive_agent_title(organization_id: str, canonical_user_message: str) 
     # No fallback to the user's own words: the pattern scrub is the only filter here, so a
     # credential shape it misses would land in a durable, org-visible title.
     prompt = prompt_engine.load_prompt(
-        template=_TITLE_PROMPT_NAME, request=redact_raw_secrets_for_prompt(canonical_user_message)
+        template=_TITLE_PROMPT_NAME,
+        request=redact_raw_secrets_for_prompt(canonical_user_message),
+        title_max_chars=_TITLE_MAX_CHARS,
     )
     handler = get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)
     async with asyncio.timeout(_TITLE_TIMEOUT_SECONDS):

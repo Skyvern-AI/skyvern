@@ -520,6 +520,18 @@ async def _validate_block_pre_hook(
     }
 
 
+async def _validate_block_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    data = result.get("data")
+    # A valid `task` block's only server warning calls the type deprecated, which is false where it is authorable.
+    if isinstance(data, dict) and data.get("block_type") == "task" and "task" not in _copilot_banned_block_types(ctx):
+        result.pop("warnings", None)
+    return result
+
+
 PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
     "call": "await publish_file(filename, text=|data=|sheets=|report=|folder=, sources=None)",
     "shadowed_by_parameter": "publish_file",
@@ -756,9 +768,34 @@ def _agent_block_schema_guidance() -> list[str]:
     return [
         _ENGINE_FIELD_DESCRIPTION,
         "Use engine-less blocks for orchestration, integrations, direct navigation, waits, files, and human interaction.",
-        "Use `loop_over_parameter_key` for for_loop input and explicit `jinja2_template` criteria for conditional or while_loop control flow.",
+        "Use explicit `jinja2_template` criteria for conditional or while_loop control flow.",
         "task_v2, free-form for_loop inputs, prompt control-flow criteria, and download-gated validation are unavailable.",
     ]
+
+
+# The shared section bans `task` and points at navigation/extraction. Every authoring capability either
+# allows `task` or bans those two, so the section is false on every Copilot turn.
+_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+
+
+async def _get_workflow_knowledge_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    topics = params.get("topics")
+    if not isinstance(topics, list):
+        return None
+    kept = [
+        topic
+        for topic in topics
+        if not (isinstance(topic, str) and topic.strip().lower() == _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC)
+    ]
+    if kept:
+        params["topics"] = kept
+    elif topics:
+        # The server lists the catalog when topics is absent, which beats an empty sections object.
+        del params["topics"]
+    return None
 
 
 async def _get_workflow_knowledge_post_hook(
@@ -768,6 +805,11 @@ async def _get_workflow_knowledge_post_hook(
 ) -> dict[str, Any]:
     capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
+    if isinstance(data, dict):
+        catalog = data.get("topics")
+        if isinstance(catalog, list) and _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC in catalog:
+            catalog.remove(_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC)
+            data["count"] = len(catalog)
     sections = data.get("sections") if isinstance(data, dict) else None
     if not isinstance(sections, dict):
         return result
@@ -2381,6 +2423,7 @@ def _build_skyvern_mcp_overlays(
         "get_workflow_knowledge": SchemaOverlay(
             description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
             description_suffix=_block_schema_banned_types_note(capability),
+            pre_hook=_get_workflow_knowledge_pre_hook,
             post_hook=_get_workflow_knowledge_post_hook,
         ),
         "get_block_schema": SchemaOverlay(
@@ -2396,7 +2439,9 @@ def _build_skyvern_mcp_overlays(
                 "Check one workflow block definition, passed as a JSON string in block_json, against its block "
                 "type's schema. It does not run the block. Returns field-level errors."
             ),
+            hide_params=frozenset({"code_only"}),
             pre_hook=_validate_block_pre_hook,
+            post_hook=_validate_block_post_hook,
         ),
         "list_org_workflows": SchemaOverlay(
             description=(
@@ -2418,7 +2463,7 @@ def _build_skyvern_mcp_overlays(
         ),
         "navigate_browser": SchemaOverlay(
             description=(
-                "Navigate the debug browser to a URL. "
+                "Navigate the browser to a URL. "
                 "Use this to reset browser state or navigate to a starting page before running blocks."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
@@ -2429,7 +2474,7 @@ def _build_skyvern_mcp_overlays(
         ),
         "get_browser_screenshot": SchemaOverlay(
             description=(
-                "Take a screenshot of the current debug browser session. "
+                "Take a screenshot of the current browser session. "
                 "Returns a base64-encoded PNG image. "
                 "Use this to see what the browser looks like after running blocks."
             ),
@@ -2466,7 +2511,7 @@ def _build_skyvern_mcp_overlays(
         ),
         "click": SchemaOverlay(
             description=(
-                "Click an element in the browser by CSS selector. The click is instant and "
+                "Click an element in the browser by CSS selector or XPath, or by x/y coordinates. The click is instant and "
                 "deterministic. Derive the selector from page evidence. When a shared "
                 "class matches many elements (e.g. one button per result row), scope the "
                 "selector to the specific item (its container or a unique attribute). If a "
@@ -2483,13 +2528,11 @@ def _build_skyvern_mcp_overlays(
         "type_text": SchemaOverlay(
             description=(
                 "Type text into an input element with Skyvern's active input event strategy while "
-                "targeting the supplied CSS selector directly. Derive the selector from page evidence; "
+                "targeting the supplied selector directly. Derive the selector from page evidence; "
                 "if it does not resolve, "
                 "inspect the page again and derive a better one. "
                 "Optionally clear the field first. Use this for form filling. "
-                "NEVER type a raw secret value (for example, a password) received in "
-                "chat. Ask the user to store the value as a saved credential and "
-                "reply with its name; do not type or submit the raw value."
+                "NEVER type a raw secret value (for example, a password) received in chat."
             ),
             # input_method is the Chrome-extension fill; its description names clear, intent and delay,
             # none of which this surface exposes under those names.

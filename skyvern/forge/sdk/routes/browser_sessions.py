@@ -3,6 +3,7 @@ import base64
 import binascii
 import json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import structlog
 from fastapi import Depends, HTTPException, Path, Query, Request, status
@@ -10,10 +11,15 @@ from fastapi.responses import ORJSONResponse
 from pydantic import ValidationError
 
 from skyvern import analytics
-from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
+from skyvern.exceptions import (
+    BrowserSessionExtensionUnconfirmed,
+    BrowserSessionNotExtendable,
+    ExternalBrowserUnavailable,
+)
 from skyvern.forge import app
 from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAME
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
@@ -31,6 +37,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     API_BROWSER_SESSION_CREATED_BY,
     PersistentBrowserSessionStatus,
+    is_external_cdp_session,
     is_final_status,
 )
 from skyvern.forge.sdk.services import org_auth_service
@@ -59,14 +66,25 @@ from skyvern.schemas.browser_sessions import (
     ExtendBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
     ProcessBrowserSessionRecordingResponse,
+    RegisterExternalBrowserSessionRequest,
     UpdateBrowserSessionRequest,
 )
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.services.browser_recording.session_registry import interpretation_registry
+from skyvern.webeye.external_cdp_sessions import (
+    close_expired_external_cdp_sessions,
+    connect_external_cdp_browser,
+    seal_cdp_url,
+)
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 LOG = structlog.get_logger(__name__)
+
+MAX_OPEN_EXTERNAL_BROWSER_SESSIONS = 5
+MAX_EXTERNAL_REGISTRATION_ATTEMPTS_PER_MINUTE = 10
+# ponytail: a per-process bound on in-flight registration probes; a shared limiter if API pods cannot each absorb 4.
+_REGISTRATION_PROBES = asyncio.Semaphore(4)
 
 _ACTION_LOG_MAX_PAST_AGE = timedelta(days=7)
 _ACTION_LOG_MAX_FUTURE_SKEW = timedelta(minutes=5)
@@ -287,6 +305,77 @@ async def create_browser_session(
 
 
 @base_router.post(
+    "/browser_sessions/external",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/browser_sessions/external/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def register_external_browser_session(
+    request: RegisterExternalBrowserSessionRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    organization_id = current_org.organization_id
+    browser_sessions = app.DATABASE.browser_sessions
+    try:
+        sealed_cdp_url = await seal_cdp_url(request.cdp_url)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Registering an external browser needs encryption enabled on this deployment (ENABLE_ENCRYPTION).",
+        )
+    if _REGISTRATION_PROBES.locked():
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many external browser registrations are in progress. Retry shortly.",
+        )
+    async with _REGISTRATION_PROBES:
+        # Not every deployment runs a reaper, so expired registrations are closed here rather than counted.
+        await close_expired_external_cdp_sessions(browser_sessions, organization_id)
+        reserved = await browser_sessions.reserve_external_cdp_session(
+            organization_id,
+            request.timeout,
+            max_open=MAX_OPEN_EXTERNAL_BROWSER_SESSIONS,
+            max_attempts_per_minute=MAX_EXTERNAL_REGISTRATION_ATTEMPTS_PER_MINUTE,
+        )
+        if reserved is None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"An organization can hold {MAX_OPEN_EXTERNAL_BROWSER_SESSIONS} external browser registrations "
+                f"at once and attempt {MAX_EXTERNAL_REGISTRATION_ATTEMPTS_PER_MINUTE} per minute. Close one or wait, "
+                "then retry.",
+            )
+        session_id = reserved.persistent_browser_session_id
+        try:
+            probe = await connect_external_cdp_browser(request.cdp_url)
+            try:
+                await probe.close()
+            except Exception as error:
+                # A peer the probe cannot detach from would strand a driver on every later attach too.
+                LOG.warning("Failed to detach the registration probe", error_type=type(error).__name__)
+                raise ExternalBrowserUnavailable("connection failed") from None
+        except Exception:
+            await browser_sessions.update_persistent_browser_session(
+                session_id, status="failed", organization_id=organization_id, completed_at=naive_utc_now()
+            )
+            raise
+    browser_session = await browser_sessions.update_persistent_browser_session(
+        session_id, status="running", organization_id=organization_id, upstream_cdp_url=sealed_cdp_url
+    )
+    LOG.info(
+        "Registered external CDP browser session",
+        browser_session_id=session_id,
+        organization_id=organization_id,
+        cdp_host=urlparse(request.cdp_url).hostname,
+        timeout_minutes=request.timeout,
+    )
+    return await BrowserSessionResponse.from_browser_session(browser_session)
+
+
+@base_router.post(
     "/browser_sessions/{browser_session_id}/close",
     tags=["Browser Sessions"],
     openapi_extra={
@@ -399,6 +488,11 @@ async def extend_browser_session(
         raise HTTPException(
             status_code=409,
             detail=f"Browser session {browser_session_id} has already ended and can no longer be extended.",
+        )
+    if is_external_cdp_session(existing):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Browser session {browser_session_id} is a registered external browser whose lifetime is fixed.",
         )
     try:
         extension = await app.PERSISTENT_SESSIONS_MANAGER.extend_session(
