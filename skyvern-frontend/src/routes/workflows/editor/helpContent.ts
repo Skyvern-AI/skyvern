@@ -14,7 +14,7 @@ export const baseHelpTooltipContent = {
   completeOnDownload:
     "Allow Skyvern to auto-complete the block when it downloads a file.",
   fileSuffix:
-    "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name.",
+    "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name. Use {{ original_filename }} to keep the name the site gave the file, e.g. {{ fund }}_{{ original_filename }} to prefix it.",
   errorCodeMapping:
     "Knowing about why a block terminated can be important, specify error messages here.",
   totpVerificationUrl:
@@ -39,7 +39,8 @@ export const basePlaceholderContent = {
   dataExtractionGoal: "What data do you need to extract?",
   maxRetries: "Default: 3",
   maxStepsOverride: "Default: 10",
-  downloadSuffix: "Enter the complete filename (without extension)",
+  downloadSuffix:
+    "Enter the complete filename (without extension), or prefix the site's own name with {{ original_filename }}",
   totpVerificationUrl: "Provide your 2FA endpoint",
   totpIdentifier: "Add an ID that links your TOTP to the block",
 };
