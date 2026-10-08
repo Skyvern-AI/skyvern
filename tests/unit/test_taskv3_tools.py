@@ -13386,13 +13386,16 @@ async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_
         except Exception as exc:
             assert "outside of the viewport" in str(exc), exc
         else:
-            assert r.status == "error", r.content
             if text != text.strip():
-                # The focus path Tabs out, so the widget has committed its trimmed value: it is reported
-                # and left in place, not taken back.
-                assert "holds '2023'" in r.content, r.content
+                # The focus path Tabs out and the widget commits "2023". The skinned group's settle confirms that year,
+                # so the write landed; the plain group's does not, so the trimmed value is reported and left in place.
+                if template == _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML:
+                    assert r.status == "ok", r.content
+                else:
+                    assert r.status == "error" and "holds '2023'" in r.content, r.content
                 assert await page.eval_on_selector("#year", "el => el.value") == "2023"
                 return
+            assert r.status == "error", r.content
             assert "NOT filled" in r.content, r.content
         assert await page.eval_on_selector("#year", "el => el.value") == ""
         assert await page.eval_on_selector("#month", "el => el.value") == ""
@@ -15225,6 +15228,57 @@ async def test_type_errors_when_the_other_date_segment_cannot_be_read_back() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
         assert r.status == "error" and r.error_class == "date_sibling_unverified", r.content
+        # Only a genuine read failure says the date could not be read back.
+        assert "could not be read back" in r.content, r.content
+
+
+# The year's first key lands in the day, and the day then refuses focus, so the tool cannot put it back.
+_DAY_BLEED_LOCKED = """
+<script>
+  window.DAYBLEED = 1;
+  document.addEventListener("keydown", (e) => {
+    if (e.target.id !== "year" || !/^[0-9]$/.test(e.key) || window.DAYBLEED <= 0) return;
+    window.DAYBLEED--;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    document.getElementById("day").value = e.key;
+    window.LOCKDAY = 1;
+  }, true);
+  document.getElementById("day").addEventListener("focus", () => {
+    if (window.LOCKDAY) document.getElementById("other").focus();
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret", [False, True], ids=["plain", "secret"])
+@pytest.mark.parametrize("year_trimmed", [False, True], ids=["year_kept", "year_trimmed"])
+async def test_a_moved_day_that_cannot_be_put_back_is_named_with_its_value(secret: bool, year_trimmed: bool) -> None:
+    # The group reads fine, so "could not be read back" would send the model on with a wrong day; the result names the
+    # day and, unless the typed text is a secret, what it holds and what it should hold. A written segment the page
+    # changed after the Tab is named with it, since no caller re-reads it.
+    trim = (
+        '<script>document.getElementById("year").addEventListener("blur", (e) => {'
+        " e.target.value = e.target.value.slice(0, 3); });</script>"
+        if year_trimmed
+        else ""
+    )
+    html = _clamping_group("03", "15", "2024").replace("</script>", "</script>" + _DAY_BLEED_LOCKED + trim, 1)
+    async with _content_page(html) as page:
+        resolve = (lambda t: "2023" if t == "placeholder_year" else t) if secret else None  # noqa: E731
+        tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=resolve)
+        text = "placeholder_year" if secret else "2023"
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": text})
+        assert await page.eval_on_selector("#day", "el => el.value") == "2", "fixture did not misroute the key"
+    assert r.status == "error" and r.error_class == "date_sibling_moved", r.content
+    assert "could not be read back" not in r.content and "re-type the day" in r.content, r.content
+    if secret:
+        assert "15" not in r.content and "holds 2" not in r.content, r.content
+    else:
+        assert "the day holds 2, not 15" in r.content, r.content
+    assert ("year" in r.content.split("re-type")[-1]) is year_trimmed, r.content
 
 
 @_skip_no_browser
@@ -15280,24 +15334,28 @@ def _segment_reformatting_on_blur(reformat: str) -> str:
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reformat", "typed", "held"),
+    ("reformat", "typed", "held", "landed"),
     [
-        ('year.value = year.value.padStart(2, "0");', "3", "03"),
-        ('if (year.value.length === 2) year.value = "20" + year.value;', "23", "2023"),
+        # The same segment value, written the widget's way: the group settle compares segments by integer.
+        ('year.value = year.value.padStart(2, "0");', "3", "03", True),
+        ('if (year.value.length === 2) year.value = "20" + year.value;', "23", "2023", False),
         # A substitution the model did not ask for: reported, never a success.
-        ("year.value = String(Math.min(12, Number(year.value)));", "13", "12"),
-        ('year.value = "1999";', "2023", "1999"),
-        # Differs only by whitespace: taking it back would empty the input while the widget keeps "3".
-        ("year.value = year.value.trim();", "3 ", "3"),
+        ("year.value = String(Math.min(12, Number(year.value)));", "13", "12", False),
+        ('year.value = "1999";', "2023", "1999", False),
+        ("year.value = year.value.trim();", "3 ", "3", True),
     ],
     ids=["zero-pad", "century", "clamp", "unrelated", "trim"],
 )
 async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_text(
-    reformat: str, typed: str, held: str
+    reformat: str, typed: str, held: str, landed: bool
 ) -> None:
     async with _content_page(_segment_reformatting_on_blur(reformat)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": typed})
+        if landed:
+            assert r.status == "ok", r.content
+            assert await page.eval_on_selector("#year", "el => el.value") == held
+            return
         assert r.status == "error", r.content
         assert f"holds '{held}'" in r.content, r.content
         assert "NOT filled" not in r.content, r.content
@@ -42437,3 +42495,164 @@ async def test_the_failed_read_count_resets_on_a_success_and_on_navigation(monke
         await page.goto("http://shop.test/review?again=1")
         after = await act(1)
         assert after[4] is None and after[1] == 0, after
+
+
+# One field per variant the field-entry read-back judges; each script stands in for a page's own handling of the value.
+_FIELD_ENTRY_MATRIX_HTML = """
+<input id="date" type="date">
+<input id="date_masked" type="date" placeholder="dd/mm/yyyy">
+<input id="number" type="number">
+<input id="email" type="email">
+<input id="phone" type="text" style="width:200px">
+<input id="capped" type="text" maxlength="3">
+<input id="cleared" type="email">
+<input id="rewritten" type="text">
+<div id="rich" contenteditable="true" style="width:200px;height:30px"></div>
+<select id="pick"><option>Alpha</option><option>Beta</option></select>
+<select id="reset"><option>Alpha</option><option>Beta</option></select>
+<select id="coded"><option value="CA">Canada</option><option value="US">United States</option></select>
+<button id="go">Go</button>
+<script>
+  const digits = (v) => v.replace(/\\D/g, "");
+  document.getElementById("phone").addEventListener("input", (e) => {
+    const d = digits(e.target.value);
+    if (d.length === 10) e.target.value = `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
+  });
+  document.getElementById("cleared").addEventListener("input", (e) => { e.target.value = ""; });
+  document.getElementById("rewritten").addEventListener("change", (e) => { e.target.value = "N/A"; });
+  document.getElementById("rewritten").addEventListener("input", (e) => { e.target.value = "N/A"; });
+  document.getElementById("reset").addEventListener("change", (e) => { e.target.selectedIndex = 0; });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "text", "status", "ok_class", "error_class", "held"),
+    [
+        ("#date", "09/18/2026", "ok", None, None, "2026-09-18"),
+        ("#date", "05/09/2026", "error", None, "date_format_refused", ""),
+        ("#date_masked", "05/09/2026", "ok", None, None, "2026-09-05"),
+        ("#number", "1500", "ok", None, None, "1500"),
+        ("#email", "a@b.co", "ok", None, None, "a@b.co"),
+        ("#phone", "5551234567", "ok", "held_as", None, "(555) 123-4567"),
+        ("#capped", "abcdef", "ok", "held_differs", None, "abc"),
+        ("#cleared", "a@b.co", "error", None, "text_not_held", ""),
+        ("#rewritten", "Paris", "ok", "held_differs", None, "N/A"),
+    ],
+    ids=[
+        "native_date_us_text",
+        "native_date_ambiguous",
+        "native_date_masked_order",
+        "number",
+        "email",
+        "mask_reformats",
+        "capped",
+        "page_clears",
+        "page_rewrites",
+    ],
+)
+async def test_type_reads_every_field_back_and_names_what_it_holds(
+    selector: str, text: str, status: str, ok_class: str | None, error_class: str | None, held: str
+) -> None:
+    async with _content_page(_FIELD_ENTRY_MATRIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": selector, "text": text})
+        assert await page.eval_on_selector(selector, "el => el.value") == held
+    assert (r.status, r.ok_class, r.error_class) == (status, ok_class, error_class), r.content
+    assert r.entry_unconfirmed is (ok_class == "held_differs")
+    if ok_class in ("held_as", "held_differs"):
+        assert f"'{held}'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_does_not_press_enter_on_a_value_the_field_did_not_keep() -> None:
+    html = '<form onsubmit="window.__submitted = true; return false"><input id="q" type="email"></form>'
+    html += (
+        "<script>document.getElementById('q').addEventListener('input', (e) => { e.target.value = 'x@y.z'; });</script>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#q", "text": "a@b.co", "press_enter": True})
+        submitted = await page.evaluate("() => window.__submitted === true")
+    assert r.status == "ok" and r.entry_unconfirmed and "Enter was not pressed" in r.content, r.content
+    assert not submitted
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_password_the_page_changed_is_never_a_reformat_and_is_not_submitted() -> None:
+    html = '<form onsubmit="window.__submitted = true; return false"><input id="pw" type="password"></form>'
+    html += "<script>document.getElementById('pw').addEventListener('input', (e) => {"
+    html += " e.target.value = e.target.value.toLowerCase(); });</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#pw", "text": "AbCd", "press_enter": True})
+        submitted = await page.evaluate("() => window.__submitted === true")
+    assert r.ok_class == "held_differs" and "Enter was not pressed" in r.content, r.content
+    # The tool-call record carries the withheld Enter, so the read can count what the skip costs.
+    assert (taskv3_loop._ENTRY_RECORD.get() or {}).get("entry_enter_withheld") is True
+    assert "abcd" not in r.content
+    assert not submitted
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_delivered_code_typed_as_is_is_not_echoed_once_the_page_spaces_it() -> None:
+    html = '<input id="code" type="text" style="width:120px">'
+    html += "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    html += " const d = e.target.value.replace(/\\D/g, ''); if (d.length === 6) e.target.value = d.slice(0, 3) + ' ' + d.slice(3); });"
+    html += "</script>"
+    async with _content_page(html) as page:
+        with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3", runtime_secret_values={"482913"})):
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+    assert r.status == "ok" and "482" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_contenteditable_is_read_back() -> None:
+    async with _content_page(_FIELD_ENTRY_MATRIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#rich", "text": "Some notes"})
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_does_not_echo_what_a_secret_field_holds() -> None:
+    html = '<input id="pin" type="text" maxlength="3">'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(
+            _fixed_page_provider(page), resolve_typed_text=lambda t: "44171" if t == "placeholder_pin" else t
+        )
+        r = await _tool(tools, "type").handler({"selector": "#pin", "text": "placeholder_pin"})
+    assert r.ok_class == "held_differs" and "441" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "args", "status"),
+    [
+        ("#pick", {"label": "Beta"}, "ok"),
+        ("#pick", {"labels": ["Beta"]}, "ok"),
+        ("#pick", {"value": "Beta"}, "ok"),
+        ("#reset", {"label": "Beta"}, "error"),
+        ("#coded", {"value": "United States"}, "ok"),
+        ("#coded", {"value": "US"}, "ok"),
+    ],
+    ids=["label", "label_list", "value", "page_resets", "value_names_a_label", "value_names_a_value"],
+)
+async def test_select_option_reads_a_visible_single_select_back(
+    selector: str, args: dict[str, Any], status: str
+) -> None:
+    async with _content_page(_FIELD_ENTRY_MATRIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": selector, **args})
+    assert r.status == status, r.content
+    if status == "error":
+        assert r.error_class == "did_not_commit" and "'Alpha'" in r.content, r.content

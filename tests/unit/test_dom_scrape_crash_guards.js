@@ -482,6 +482,11 @@ test("isElementVisible: display:contents parent containing an option does not ov
     context.window.globalListnerFlag = true;
     context.window.globalDomDepthMap = new Map();
     context.window.globalHoverStylesMap = new Map();
+    context.window.globalIncrementalSession = {
+      open: true,
+      remaining: 3000,
+      depthMap: context.window.globalDomDepthMap,
+    };
     context.window.globalParsedElementCounter = {
       get: async () => 100,
       add: async () => {},

@@ -36,9 +36,14 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    model_written_context_fields,
+    tool_recorded_context_fields,
+)
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
+from skyvern.forge.sdk.db.utils import _custom_json_serializer
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -255,6 +260,8 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
     current_datetime="2026-01-01T00:00:00Z",
     tool_usage_guide="",
     security_rules="",
+    model_written_context_fields=model_written_context_fields(),
+    tool_recorded_context_fields=tool_recorded_context_fields(),
 )
 
 
@@ -379,7 +386,7 @@ async def sqlite_engine_factory(
     def _make() -> AsyncEngine:
         db_path = tmp_path / f"db_{next(counter)}.db"
         shutil.copyfile(sqlite_schema_template, db_path)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", json_serializer=_custom_json_serializer)
         engines.append(engine)
         return engine
 

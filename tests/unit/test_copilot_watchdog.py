@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginOutputSnapshot,
     SelectedOutputSource,
 )
+from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     WatchdogExitReason,
@@ -260,6 +261,29 @@ async def test_ceiling_error_message_advises_splitting() -> None:
     assert "Run ID: wr_test" in msg
     assert "get_run_results" in msg
     assert "Do NOT re-invoke block-running tools" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handoff_arrived", "url_reported"), [(False, False), (True, True)])
+async def test_a_non_terminal_exit_reports_the_live_url_only_once_the_runs_secrets_are_registered(
+    monkeypatch: pytest.MonkeyPatch, handoff_arrived: bool, url_reported: bool
+) -> None:
+    registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_test",
+        parameters={"password": "hunter2-password"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=handoff_arrived,
+        awaiting_runtime_secret_values=not handoff_arrived,
+    )
+    monkeypatch.setattr(
+        run_execution,
+        "_fallback_page_info",
+        AsyncMock(return_value=("https://portal.fixture.test/verify?code=424242", "")),
+    )
+
+    msg = await _watchdog_error_message("ceiling", _ErrorCtx(), "wr_test", _fake_run(), 240, origin_registry=registry)
+
+    assert ("Browser was on: https://portal.fixture.test/verify?code=424242" in msg) is url_reported
 
 
 @pytest.mark.asyncio

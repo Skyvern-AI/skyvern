@@ -6,7 +6,7 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 
 from skyvern.exceptions import InvalidElementForTextInput
-from skyvern.webeye.actions import handler
+from skyvern.utils.date_values import canonical_iso_date, strict_date_mask_order
 from skyvern.webeye.actions.handler import (
     _is_selected_engine_error,
     _is_selected_engine_timeout,
@@ -200,10 +200,10 @@ async def test_input_sequentially_reraises_unrelated_errors(monkeypatch: pytest.
 # day/month order is unambiguous, and prose / first-letter lookalikes never define an order.
 # --------------------------------------------------------------------------- #
 def test_strict_date_mask_order_accepts_real_masks() -> None:
-    assert handler._strict_date_mask_order("mm/dd/yyyy") == ("m", "d", "y")
-    assert handler._strict_date_mask_order("dd-mm-yyyy") == ("d", "m", "y")
-    assert handler._strict_date_mask_order("yyyy.mm.dd") == ("y", "m", "d")
-    assert handler._strict_date_mask_order("d/m/yyyy") == ("d", "m", "y")
+    assert strict_date_mask_order("mm/dd/yyyy") == ("m", "d", "y")
+    assert strict_date_mask_order("dd-mm-yyyy") == ("d", "m", "y")
+    assert strict_date_mask_order("yyyy.mm.dd") == ("y", "m", "d")
+    assert strict_date_mask_order("d/m/yyyy") == ("d", "m", "y")
 
 
 def test_strict_date_mask_order_rejects_prose_and_lookalikes() -> None:
@@ -216,9 +216,9 @@ def test_strict_date_mask_order_rejects_prose_and_lookalikes() -> None:
         "mm/yyyy",
         "day mm/dd/yyyy",
     ):
-        assert handler._strict_date_mask_order(prose) is None
-    assert handler._strict_date_mask_order(None) is None
-    assert handler._strict_date_mask_order("") is None
+        assert strict_date_mask_order(prose) is None
+    assert strict_date_mask_order(None) is None
+    assert strict_date_mask_order("") is None
 
 
 @pytest.mark.parametrize(
@@ -256,4 +256,4 @@ def test_strict_date_mask_order_rejects_prose_and_lookalikes() -> None:
     ],
 )
 def test_canonical_iso_date(text: str, placeholder: str | None, expected: str | None) -> None:
-    assert handler._canonical_iso_date(text, placeholder) == expected
+    assert canonical_iso_date(text, placeholder) == expected

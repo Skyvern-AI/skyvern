@@ -1050,7 +1050,7 @@ async def test_overlength_video_status_is_persisted_and_reported_once(monkeypatc
     )
 
     persist_too_long.assert_awaited_once_with(frozenset({"file_1"}))
-    assert "exceeded the five-minute limit" in json.dumps(captured["initial_input"])
+    assert "-minute limit; ask the user to trim or split them" in json.dumps(captured["initial_input"])
 
 
 @pytest.mark.asyncio
@@ -1091,7 +1091,7 @@ async def test_persisted_overlength_video_is_not_reprocessed(monkeypatch: pytest
     )
 
     load_evidence.assert_not_awaited()
-    assert "exceeded the five-minute limit" in json.dumps(captured["initial_input"])
+    assert "-minute limit; ask the user to trim or split them" in json.dumps(captured["initial_input"])
 
 
 @pytest.mark.asyncio
