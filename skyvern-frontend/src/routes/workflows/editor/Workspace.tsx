@@ -243,12 +243,17 @@ import {
   type WorkflowUpdateOptions,
 } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
+import { SYSTEM_RUN_FOCUS_PARAM } from "../studio/panes";
 import { copilotRunId } from "./copilotRunId";
 import {
   shouldOpenCopilotPaneForHandoff,
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
+import {
+  initialEditorAutoOpenState,
+  shouldAutoOpenEditor,
+} from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -461,13 +466,29 @@ function CopyText({ className, text }: { className?: string; text: string }) {
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
 export function useWorkspaceCopilotUpdate({
   applyWorkflowUpdate,
+  embedded = false,
+  initialBlockCount = 0,
 }: {
   applyWorkflowUpdate: (
     workflow: WorkflowVersion,
     options: WorkflowUpdateOptions & { userDriven: boolean },
   ) => boolean | void;
+  embedded?: boolean;
+  initialBlockCount?: number;
 }) {
   const logging = useLogging();
+  const { reopenEditor } = useStudioPaneDefaults();
+  // The studio shell remounts Workspace per workflow, so this arms only for an
+  // agent that had no blocks when it opened.
+  const editorAutoOpenStateRef = useRef(
+    initialEditorAutoOpenState(initialBlockCount),
+  );
+  // A run the user opened owns the stage; Copilot's own run focus does not.
+  const [searchParams] = useSearchParams();
+  const studioRunId = useStudioRunId();
+  const inspectingUserRunRef = useRef(false);
+  inspectingUserRunRef.current =
+    Boolean(studioRunId) && !searchParams.has(SYSTEM_RUN_FOCUS_PARAM);
   return (workflowData: WorkflowVersion, options?: WorkflowUpdateOptions) => {
     try {
       // All Copilot-driven applies are user edits (mid-turn draft, accept,
@@ -478,6 +499,17 @@ export function useWorkspaceCopilotUpdate({
         false
       )
         throw new Error("The editor refused the Copilot update");
+      const { fire, nextState } = shouldAutoOpenEditor(
+        editorAutoOpenStateRef.current,
+        {
+          embedded,
+          applied: options?.applied,
+          midTurnDraft: options?.midTurnDraft,
+          blockCount: workflowData.workflow_definition.blocks.length,
+        },
+      );
+      editorAutoOpenStateRef.current = nextState;
+      if (fire && !inspectingUserRunRef.current) reopenEditor();
     } catch (error) {
       console.error("Failed to parse and apply agent", error, workflowData);
       logging.error("Copilot agent apply failed", {
@@ -2213,6 +2245,8 @@ function Workspace({
 
   const handleCopilotWorkflowUpdate = useWorkspaceCopilotUpdate({
     applyWorkflowUpdate,
+    embedded,
+    initialBlockCount: workflow.workflow_definition.blocks.length,
   });
   const reportStudioPaneCrash = (
     pane: string,

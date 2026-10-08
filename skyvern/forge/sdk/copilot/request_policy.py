@@ -963,6 +963,9 @@ class RequestPolicy:
     origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
     # Explicit user approvals hydrated from the existing trusted structured chat context.
     prior_approved_credential_ids: set[str] = field(default_factory=set)
+    # The site each approval or proposal carried in from an earlier turn recorded. Naming the credential
+    # again drops it from live_page_admitted_urls, so the pick card reads it here.
+    carried_credential_urls: dict[str, str] = field(default_factory=dict)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -4313,6 +4316,7 @@ async def _seed_prior_approved_credentials(
     for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
         if record.credential_id in approved_ids and record.admitted_url:
             policy.live_page_admitted_urls.setdefault(record.credential_id, record.admitted_url)
+            policy.carried_credential_urls.setdefault(record.credential_id, record.admitted_url)
             policy.seeded_proposal_credential_ids.add(record.credential_id)
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
@@ -4356,6 +4360,7 @@ async def _seed_proposed_credential(
     # Restoring the recorded origin keeps the hydrated id page-vouched, so the turn-end recorder
     # still skips it rather than promoting a one-turn carry to durable approval.
     policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
+    policy.carried_credential_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.seeded_proposal_credential_ids.add(seed.credential_id)
     # The server bound this and the user did not name it, so it enters through the auto-bound record:
     # a write to current_turn_named_credential_ids would refuse the user's own later answer.

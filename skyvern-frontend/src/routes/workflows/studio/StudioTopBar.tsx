@@ -588,7 +588,7 @@ export function StudioTopBar() {
   // editor-only layout on entry (an explicit override, like the full-run
   // reset). Exiting doesn't restore the previous set — reopen as needed.
   const openVersionHistory = () => {
-    setOpenPanes(["editor"]);
+    setOpenPanes(["editor"], { byUser: true });
     toggleHistoryPanel();
   };
   return (
