@@ -193,6 +193,7 @@ class CredentialRepository(BaseRepository):
                 search_pattern = f"%{escaped}%"
                 query = query.filter(
                     or_(
+                        CredentialModel.credential_id == search.strip(),
                         CredentialModel.name.ilike(search_pattern, escape="\\"),
                         CredentialModel.username.ilike(search_pattern, escape="\\"),
                         CredentialModel.secret_label.ilike(search_pattern, escape="\\"),
