@@ -3,21 +3,10 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.agent import _format_chat_history
 from skyvern.forge.sdk.routes.workflow_copilot import WorkflowCopilotChatSender
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage
-
-_AGENT_TEMPLATE_DEFAULTS = {
-    "workflow_knowledge_base": "test kb",
-    "current_datetime": "2026-01-01T00:00:00Z",
-    "tool_usage_guide": "",
-    "security_rules": "",
-}
-
-
-def _render_agent_prompt() -> str:
-    return prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+from tests.unit.conftest import render_agent_prompt as _render_agent_prompt
 
 
 def test_prompt_consolidates_ask_vs_edit_routing_without_a_separate_policy_section() -> None:

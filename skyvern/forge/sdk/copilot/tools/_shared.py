@@ -47,21 +47,17 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
 )
 from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     BrowserProbeOutcome,
     CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
     _browser_context_attachability,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
+    browser_session_turn,
     effective_browser_session_id,
     live_working_page,
     mcp_browser_context,
     resolve_browser_state_for_context,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.task_output_envelope import (
@@ -1087,11 +1083,7 @@ async def on_working_page(
     no_page_error: str,
     act: Callable[[Page], Awaitable[dict[str, Any]]],
 ) -> dict[str, Any]:
-    async with browser_page_custody_lock(ctx), browser_evidence_commit_lock(ctx):
-        if sensitive_origin_page_has_active_run(ctx):
-            return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
-        if sensitive_origin_page_is_tainted(ctx):
-            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+    async with browser_session_turn(ctx), browser_evidence_commit_lock(ctx):
         entered_browser = False
         try:
             async with mcp_browser_context(ctx):

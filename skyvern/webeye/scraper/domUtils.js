@@ -1848,11 +1848,13 @@ function getElementText(element) {
   return visibleText.length > 0 ? visibleText.join(";") : "";
 }
 
-function getSelectOptions(element) {
-  const options = Array.from(element.options);
+function getSelectOptions(element, maxOptions = Infinity) {
+  const options = element.options;
+  const count = Math.min(options.length, maxOptions);
   const selectOptions = [];
 
-  for (const option of options) {
+  for (let i = 0; i < count; i++) {
+    const option = options[i];
     selectOptions.push({
       optionIndex: option.index,
       text: removeMultipleSpaces(option.textContent),
@@ -2348,9 +2350,20 @@ async function buildElementObject(
   element,
   interactable,
   purgeable = false,
+  budget = null,
 ) {
-  var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
   var elementTagNameLower = element.tagName.toLowerCase();
+  // Reserve synchronously before the first await so concurrent builds cannot overdraw the budget.
+  let maxOptions = Infinity;
+  if (budget) {
+    if (budget.remaining <= 0) return null;
+    budget.remaining -= 1;
+    if (elementTagNameLower === "select") {
+      maxOptions = Math.min(element.options?.length ?? 0, budget.remaining);
+      budget.remaining -= maxOptions;
+    }
+  }
+  var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
   element.setAttribute("unique_id", element_id);
   // Inputs can appear after the stamp pass while the asynchronous tree build runs.
   if (
@@ -2509,7 +2522,7 @@ async function buildElementObject(
   let selectOptions = null;
   let selectedValue = "";
   if (elementTagNameLower === "select") {
-    [selectOptions, selectedValue] = getSelectOptions(element);
+    [selectOptions, selectedValue] = getSelectOptions(element, maxOptions);
   }
 
   if (selectOptions) {
@@ -2596,6 +2609,7 @@ async function buildElementTree(
   hoverStylesMap = undefined,
   maxElementNumber = 0,
   must_included_tags = [],
+  elementBudget = null,
 ) {
   otpContainerCounts = new WeakMap();
   stampOtpInputBoxes();
@@ -2616,6 +2630,8 @@ async function buildElementTree(
 
   var elements = [];
   var resultArray = [];
+  const buildCapped = (frame, element, interactable, purgeable = false) =>
+    buildElementObject(frame, element, interactable, purgeable, elementBudget);
 
   async function processElement(
     element,
@@ -2632,6 +2648,9 @@ async function buildElementTree(
       _jsConsoleWarn(
         "Max element number reached, aborting the element tree building",
       );
+      return;
+    }
+    if (elementBudget && elementBudget.remaining <= 0) {
       return;
     }
 
@@ -2683,41 +2702,36 @@ async function buildElementTree(
         interactable = true;
       }
       if (interactable) {
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (
         tagName === "frameset" ||
         tagName === "iframe" ||
         tagName === "frame"
       ) {
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (element.shadowRoot) {
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (isTableRelatedElement(element)) {
         // build all table related elements into skyvern element
         // we need these elements to preserve the DOM structure
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (hasBeforeOrAfterPseudoContent(element)) {
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (tagName === "svg") {
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (
         (isParentSVG = element.closest("svg")) &&
         isParentSVG.getAttribute("unique_id")
       ) {
         // if element is the children of the <svg> with an unique_id
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (
         tagName === "embed" &&
         element.getAttribute("type")?.toLowerCase() === "application/pdf"
       ) {
-        elementObj = await buildElementObject(
-          frame,
-          element,
-          interactable,
-          true,
-        );
+        elementObj = await buildCapped(frame, element, interactable, true);
       } else if (
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
@@ -2726,17 +2740,12 @@ async function buildElementTree(
           // force all textual elements to be interactable
           interactable = true;
         }
-        elementObj = await buildElementObject(frame, element, interactable);
+        elementObj = await buildCapped(frame, element, interactable);
       } else if (full_tree) {
         // when building full tree, we only get text from element itself
         // elements without text are purgeable
-        elementObj = await buildElementObject(
-          frame,
-          element,
-          interactable,
-          true,
-        );
-        if (elementObj.text.length > 0) {
+        elementObj = await buildCapped(frame, element, interactable, true);
+        if (elementObj && elementObj.text.length > 0) {
           elementObj.purgeable = false;
         }
       }
@@ -3514,7 +3523,10 @@ if (window.globalParsedElementCounter === undefined) {
 // page can outlive a rolling deploy, so a running observer created by another bundle carries no
 // stamp or a different one; the current bundle compares this value exactly and stays compatible
 // with the older contract instead of retiring the observer mid-callback.
-const INCREMENTAL_OBSERVER_VERSION = 1;
+const INCREMENTAL_OBSERVER_VERSION = 2;
+
+// Element objects plus select options one observation may retain.
+const INCREMENTAL_MAX_PARSED_ELEMENTS = 3000;
 
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
@@ -3543,10 +3555,13 @@ function asyncSleepFor(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function addIncrementalNodeToMap(parentNode, childrenNode) {
-  const maxParsedElement = 3000;
+async function addIncrementalNodeToMap(
+  parentNode,
+  childrenNode,
+  session = window.globalIncrementalSession,
+) {
   const maxElementToWait = 100;
-  if ((await window.globalParsedElementCounter.get()) > maxParsedElement) {
+  if (!session || session.remaining <= 0) {
     _jsConsoleWarn(
       "Too many elements parsed, stopping the observer to parse the elements",
     );
@@ -3556,13 +3571,10 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
 
   // make the dom parser async
   await waitForNextFrame();
-  if (window.globalListnerFlag) {
+  if (session.open) {
     // calculate the depth of targetNode element for sorting
     const depth = getElementDomDepth(parentNode);
-    let newNodesTreeList = [];
-    if (window.globalDomDepthMap.has(depth)) {
-      newNodesTreeList = window.globalDomDepthMap.get(depth);
-    }
+    const newNodesTreeList = [];
 
     try {
       for (const child of childrenNode) {
@@ -3578,6 +3590,9 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
           "",
           true,
           window.globalHoverStylesMap,
+          0,
+          [],
+          session,
         );
         if (newNodeTree.length > 0) {
           newNodesTreeList.push(...newNodeTree);
@@ -3586,19 +3601,42 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
     } catch (error) {
       _jsConsoleError("Error building incremental element node:", error);
     }
-    window.globalDomDepthMap.set(depth, newNodesTreeList);
+    // A stop (or a newer start) closed this session during the awaits; its output must not land.
+    if (session.open && newNodesTreeList.length > 0) {
+      const existing = session.depthMap.get(depth) ?? [];
+      existing.push(...newNodesTreeList);
+      session.depthMap.set(depth, existing);
+    }
   }
   await window.globalParsedElementCounter.add();
 }
 
-async function processIncrementalNode(parentNode, childrenNode) {
+function closeIncrementalSession() {
+  const session = window.globalIncrementalSession;
+  if (session) {
+    session.open = false;
+    session.remaining = 0;
+    session.depthMap.clear();
+  }
+  window.globalIncrementalSession = null;
+  window.globalDomDepthMap = new Map();
+}
+
+async function processIncrementalNode(
+  parentNode,
+  childrenNode,
+  session = window.globalIncrementalSession,
+) {
+  if (!session?.open || session !== window.globalIncrementalSession) {
+    return;
+  }
   // A listener restart can replace the global array while this job is parsing.
   const pendingEntries = window.globalOneTimeIncrementElements;
   const entry = { targetNode: parentNode, newNodes: childrenNode };
   pendingEntries.push(entry);
   window.globalIncrementalJobCount += 1;
   try {
-    await addIncrementalNodeToMap(parentNode, childrenNode);
+    await addIncrementalNodeToMap(parentNode, childrenNode, session);
   } finally {
     const index = pendingEntries.indexOf(entry);
     if (index !== -1) {
@@ -3612,6 +3650,10 @@ function createIncrementalObserver() {
     mutationsList,
     observer,
   ) {
+    // Pin the callback to the observation it was delivered for, so a stop/start cannot redirect it.
+    const session = window.globalIncrementalSession;
+    // Populating a dropdown emits one record per change; one parse per batch already sees them all.
+    const parsedDropdowns = new Set();
     // TODO: how to detect duplicated recreate element?
     for (const mutation of mutationsList) {
       const node = mutation.target;
@@ -3627,7 +3669,10 @@ function createIncrementalObserver() {
         isDropdownRelatedElement(node) &&
         getElementComputedStyle(node)?.display !== "none"
       ) {
-        await processIncrementalNode(node, [node]);
+        if (!parsedDropdowns.has(node)) {
+          parsedDropdowns.add(node);
+          await processIncrementalNode(node, [node], session);
+        }
         continue;
       }
 
@@ -3638,7 +3683,7 @@ function createIncrementalObserver() {
           switch (mutation.attributeName) {
             case "hidden": {
               if (!node.hidden) {
-                await processIncrementalNode(node, [node]);
+                await processIncrementalNode(node, [node], session);
               }
               break;
             }
@@ -3646,7 +3691,7 @@ function createIncrementalObserver() {
               // TODO: need to confirm that elemnent is hidden previously
               if (tagName === "body") continue;
               if (getElementComputedStyle(node)?.display !== "none") {
-                await processIncrementalNode(node, [node]);
+                await processIncrementalNode(node, [node], session);
               }
               break;
             }
@@ -3668,7 +3713,7 @@ function createIncrementalObserver() {
               )
                 continue;
               if (getElementComputedStyle(node)?.display !== "none") {
-                await processIncrementalNode(node, [node]);
+                await processIncrementalNode(node, [node], session);
               }
               break;
             }
@@ -3695,7 +3740,7 @@ function createIncrementalObserver() {
           }
 
           if (newNodes.length > 0) {
-            await processIncrementalNode(node, newNodes);
+            await processIncrementalNode(node, newNodes, session);
           }
           break;
         }
@@ -3749,7 +3794,12 @@ async function waitForIncrementalDrain() {
 
 async function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
-  window.globalDomDepthMap = new Map();
+  closeIncrementalSession();
+  window.globalIncrementalSession = {
+    open: true,
+    remaining: INCREMENTAL_MAX_PARSED_ELEMENTS,
+    depthMap: window.globalDomDepthMap,
+  };
   window.globalOneTimeIncrementElements = [];
   window.globalIncrementalJobCount = 0;
   await getHoverStylesMap();
@@ -3784,10 +3834,21 @@ async function stopGlobalIncrementalObserver() {
   );
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
+  // Release retained output before draining: the drain is not bounded and the caller may time out.
+  closeIncrementalSession();
+  const pendingEntries = window.globalOneTimeIncrementElements;
   await waitForIncrementalDrain();
+  // A start that ran while this stop was draining owns the globals now.
+  if (
+    window.globalIncrementalSession ||
+    window.globalOneTimeIncrementElements !== pendingEntries
+  ) {
+    return;
+  }
   window.globalOneTimeIncrementElements = [];
   window.globalIncrementalJobCount = 0;
   window.globalDomDepthMap = new Map();
+  window.globalParsedElementCounter = new SafeCounter();
   // A never-navigating page adopts the memory-safe callback here: replace a drained older observer
   // with a current one so the next action's parsing splices and counts under the current contract.
   if (needsReplacement) {
@@ -3806,6 +3867,31 @@ async function getIncrementElements(wait_until_finished = true) {
   // search starting from the shallowest node:
   // 1. if deeper, the node could only be the children of the shallower one or no related one.
   // 2. if depth is same, the node could only be duplicated one or no related one.
+  // A rebuild refunds what its cached copy was charged and re-charges the live size to the open
+  // observation, so options loaded after capture are returned while the observation cap still holds.
+  const rebuildBudget = (cached) => {
+    const units = 1 + (cached.options?.length ?? 0);
+    const session = window.globalIncrementalSession;
+    if (!session?.open) return { remaining: units };
+    session.remaining += units;
+    return session;
+  };
+  // Refund and rebuild each cached object at most once per read: a child merged under two parents
+  // then shares one rebuilt copy instead of being refunded twice.
+  const rebuiltThisRead = new WeakMap();
+  const rebuild = async (cached, domElement) => {
+    if (rebuiltThisRead.has(cached)) return rebuiltThisRead.get(cached);
+    const fresh = await buildElementObject(
+      "",
+      domElement,
+      cached.interactable,
+      cached.purgeable,
+      rebuildBudget(cached),
+    );
+    fresh.children = cached.children;
+    rebuiltThisRead.set(cached, fresh).set(fresh, fresh);
+    return fresh;
+  };
   const idToElement = new Map();
   const cleanedTreeList = [];
   const sortedDepth = Array.from(window.globalDomDepthMap.keys()).sort(
@@ -3837,14 +3923,7 @@ async function getIncrementElements(wait_until_finished = true) {
         const domElement = document.querySelector(`[unique_id="${child.id}"]`);
         // if the element is still on the page, we rebuild the element to update the information
         if (domElement) {
-          let newChild = await buildElementObject(
-            "",
-            domElement,
-            child.interactable,
-            child.purgeable,
-          );
-          newChild.children = child.children;
-          children[i] = newChild;
+          children[i] = await rebuild(child, domElement);
         } else {
           children[i].interactable = false;
         }
@@ -3866,7 +3945,8 @@ async function getIncrementElements(wait_until_finished = true) {
       }
     };
 
-    for (let treeHeadElement of treeList) {
+    for (let headIdx = 0; headIdx < treeList.length; headIdx++) {
+      let treeHeadElement = treeList[headIdx];
       // FIXME: skip to update the element if it is in shadow DOM, since document.querySelector will not work
       if (!treeHeadElement.shadowHost) {
         const domElement = document.querySelector(
@@ -3874,14 +3954,12 @@ async function getIncrementElements(wait_until_finished = true) {
         );
         // if the element is still on the page, we rebuild the element to update the information
         if (domElement) {
-          let newHead = await buildElementObject(
-            "",
-            domElement,
-            treeHeadElement.interactable,
-            treeHeadElement.purgeable,
-          );
-          newHead.children = treeHeadElement.children;
-          treeHeadElement = newHead;
+          // A head already registered is a duplicate discarded below; rebuilding would only regrow it.
+          if (!idToElement.has(treeHeadElement.id)) {
+            treeHeadElement = await rebuild(treeHeadElement, domElement);
+            // Persist like rebuilt children so the next read refunds what this copy now holds.
+            treeList[headIdx] = treeHeadElement;
+          }
         } else {
           treeHeadElement.interactable = false;
         }

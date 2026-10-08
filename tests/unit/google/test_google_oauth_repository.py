@@ -1,14 +1,21 @@
 import datetime
+from types import SimpleNamespace
 from typing import AsyncGenerator
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import Base, GoogleOAuthCredentialModel  # noqa: F401 - registers model on Base
 from skyvern.forge.sdk.db.repositories.google_oauth import (
+    DISPATCH_FAILED,
     STATE_ACTIVE,
     STATE_ERROR,
     STATE_PENDING_CONSENT,
@@ -16,7 +23,13 @@ from skyvern.forge.sdk.db.repositories.google_oauth import (
     GoogleOAuthRepository,
 )
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
-from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
+from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
+from skyvern.forge.sdk.schemas.google_oauth import (
+    CreateGoogleOAuthAuthorizeRequest,
+    CreateGoogleOAuthCallbackRequest,
+    GoogleOAuthCredentialBase,
+)
+from skyvern.forge.sdk.services import google_oauth_service
 
 
 @pytest_asyncio.fixture
@@ -1047,3 +1060,328 @@ async def test_post_rotation_version_allows_email_backfill(
     assert email_updated is True
     assert stored.email_address == "account@example.test"
     assert stored.modified_at == rotated_at
+
+
+GMAIL_SEND_SCOPE = google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE
+GMAIL_READONLY_SCOPE = google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE
+IDENTITY_GRANT = ["openid", "https://www.googleapis.com/auth/userinfo.email"]
+SEND_GRANT = [GMAIL_SEND_SCOPE, *IDENTITY_GRANT]
+READ_SEND_GRANT = [GMAIL_READONLY_SCOPE, *SEND_GRANT]
+
+
+async def _seed_gmail_connection(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+    scopes: list[str],
+    *,
+    email: str | None = "sender@example.test",
+    subject: str | None = None,
+) -> None:
+    await _seed_active_credential(repo, "goac_gmail", "seed-nonce", scopes=scopes)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.update().values(email_address=email, google_subject=subject)
+        )
+
+
+async def _stored_connection(engine: AsyncEngine, credential_id: str = "goac_gmail") -> GoogleOAuthCredentialModel:
+    async with engine.connect() as conn:
+        return (
+            await conn.execute(select(GoogleOAuthCredentialModel).where(GoogleOAuthCredentialModel.id == credential_id))
+        ).one()
+
+
+@pytest.fixture
+def gmail_send_oauth(monkeypatch: pytest.MonkeyPatch, repo: GoogleOAuthRepository) -> SimpleNamespace:
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "DATABASE", SimpleNamespace(google_oauth=repo, organizations=organizations))
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    env = SimpleNamespace(
+        claims={"sub": "subject-1", "email": "Sender@Example.Test", "email_verified": True},
+        exchange=AsyncMock(),
+        refresh=AsyncMock(return_value=google_oauth_service.GoogleRefreshResult("access-token", None)),
+        fetch_profile_email=AsyncMock(return_value="profile@example.test"),
+    )
+
+    def verify_oauth2_token(id_token: str, request: object, audience: str, **_: object) -> dict[str, object]:
+        assert audience == "cid"
+        return env.claims
+
+    monkeypatch.setattr(google_oauth_service.google_id_token, "verify_oauth2_token", verify_oauth2_token)
+    encryptor = SimpleNamespace(encrypt=AsyncMock(return_value="enc-new"), decrypt=AsyncMock(return_value="old"))
+    monkeypatch.setattr(google_oauth_service, "encryptor", encryptor)
+    monkeypatch.setattr(google_oauth_service, "invalidate_google_access_token_cache", AsyncMock())
+    monkeypatch.setattr(google_oauth_service, "exchange_code_for_tokens", env.exchange)
+    monkeypatch.setattr(google_oauth_service, "refresh_and_rotate", env.refresh)
+    monkeypatch.setattr(google_oauth_routes, "record_request_audit_event", AsyncMock())
+    monkeypatch.setattr(google_oauth_routes.google_gmail_service, "fetch_profile_email", env.fetch_profile_email)
+    monkeypatch.setattr(AgentFunction, "on_integration_connected", AsyncMock())
+    return env
+
+
+async def _start_consent(
+    *, credential_id: str | None = None, scope_profile: str | None = "gmail_send"
+) -> tuple[str, list[str]]:
+    start = await google_oauth_service.start_authorization(
+        organization_id="o_test",
+        redirect_uri="https://x/cb",
+        credential_id=credential_id,
+        scope_profile=scope_profile,
+        initiator_id="user_1",
+    )
+    return start.state, parse_qs(urlparse(start.authorize_url).query)["scope"][0].split()
+
+
+async def _finish_consent(
+    env: SimpleNamespace, state: str, granted: list[str], *, with_id_token: bool = True
+) -> GoogleOAuthCredentialBase:
+    env.exchange.return_value = {
+        "refresh_token": "refresh-new",
+        "access_token": "access-new",
+        "scope": " ".join(granted),
+        **({"id_token": "id-token"} if with_id_token else {}),
+    }
+    response = await google_oauth_routes.google_oauth_callback(
+        CreateGoogleOAuthCallbackRequest(code="code", state=state),
+        current_org=SimpleNamespace(organization_id="o_test"),
+        current_user_id="user_1",
+    )
+    return response.credential
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_profile", "asked", "granted"),
+    [
+        ("gmail_send", [GMAIL_SEND_SCOPE, "openid", "email"], SEND_GRANT),
+        ("gmail_read_send", [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE, "openid", "email"], READ_SEND_GRANT),
+    ],
+)
+async def test_gmail_send_new_connection_asks_for_its_profile_and_records_the_verified_account(
+    gmail_send_oauth: SimpleNamespace, engine: AsyncEngine, scope_profile: str, asked: list[str], granted: list[str]
+) -> None:
+    state, requested = await _start_consent(scope_profile=scope_profile)
+    credential = await _finish_consent(gmail_send_oauth, state, granted)
+
+    stored = await _stored_connection(engine, credential.id)
+    assert requested == asked
+    assert credential.gmail_send_ready is True
+    assert (GMAIL_READONLY_SCOPE in credential.scopes_granted) == (scope_profile == "gmail_read_send")
+    assert (stored.email_address, stored.google_subject) == ("sender@example.test", "subject-1")
+    gmail_send_oauth.fetch_profile_email.assert_not_awaited()
+    assert "google_subject" not in credential.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_upgrade_keeps_the_connection_id_and_prior_grants(
+    gmail_send_oauth: SimpleNamespace, repo: GoogleOAuthRepository, engine: AsyncEngine
+) -> None:
+    await _seed_gmail_connection(repo, engine, [GMAIL_READONLY_SCOPE])
+
+    state, requested = await _start_consent(credential_id="goac_gmail")
+    credential = await _finish_consent(gmail_send_oauth, state, READ_SEND_GRANT)
+
+    stored = await _stored_connection(engine)
+    assert requested == [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE, "openid", "email"]
+    assert (credential.id, credential.gmail_send_ready) == ("goac_gmail", True)
+    assert {GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE} <= set(stored.scopes_granted)
+    assert (stored.encrypted_refresh_token, stored.google_subject) == ("enc-new", "subject-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("granted", "claims", "with_id_token", "stored_subject"),
+    [
+        pytest.param([GMAIL_READONLY_SCOPE, *IDENTITY_GRANT], {}, True, None, id="send-denied"),
+        pytest.param(READ_SEND_GRANT, {"email": "other@example.test"}, True, None, id="account-switch"),
+        pytest.param(READ_SEND_GRANT, {"sub": "subject-2"}, True, "subject-1", id="same-address-other-account"),
+        pytest.param(READ_SEND_GRANT, {"email_verified": False}, True, None, id="unverified"),
+        pytest.param(READ_SEND_GRANT, {}, False, None, id="no-id-token"),
+    ],
+)
+async def test_gmail_send_rejected_upgrade_leaves_the_connection_as_it_was(
+    gmail_send_oauth: SimpleNamespace,
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+    granted: list[str],
+    claims: dict[str, object],
+    with_id_token: bool,
+    stored_subject: str | None,
+) -> None:
+    await _seed_gmail_connection(repo, engine, [GMAIL_READONLY_SCOPE], subject=stored_subject)
+    before = await _stored_connection(engine)
+    gmail_send_oauth.claims.update(claims)
+
+    state, _ = await _start_consent(credential_id="goac_gmail")
+    with pytest.raises(HTTPException) as rejected:
+        await _finish_consent(gmail_send_oauth, state, granted, with_id_token=with_id_token)
+
+    after = await _stored_connection(engine)
+    assert rejected.value.status_code == 409
+    assert (after.state, after.scopes_granted, after.email_address, after.google_subject) == (
+        before.state,
+        before.scopes_granted,
+        before.email_address,
+        before.google_subject,
+    )
+    assert after.encrypted_refresh_token == before.encrypted_refresh_token
+    authorization = await google_oauth_service.resolve_gmail_send_authorization("o_test", "goac_gmail")
+    assert authorization.status == google_oauth_service.GmailSendAuthorizationStatus.MISSING_SCOPE
+    gmail_send_oauth.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gmail_read_send_new_connection_saves_nothing_when_send_is_not_approved(
+    gmail_send_oauth: SimpleNamespace, repo: GoogleOAuthRepository
+) -> None:
+    state, _ = await _start_consent(scope_profile="gmail_read_send")
+
+    with pytest.raises(HTTPException) as rejected:
+        await _finish_consent(gmail_send_oauth, state, [GMAIL_READONLY_SCOPE, *IDENTITY_GRANT])
+
+    assert rejected.value.status_code == 409
+    assert await repo.list_visible_for_org("o_test") == []
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_cancelled_upgrade_is_not_requested_again_by_a_plain_reconnect(
+    gmail_send_oauth: SimpleNamespace, repo: GoogleOAuthRepository, engine: AsyncEngine
+) -> None:
+    await _seed_gmail_connection(repo, engine, [GMAIL_READONLY_SCOPE])
+    await _start_consent(credential_id="goac_gmail")
+    assert GMAIL_SEND_SCOPE in (await _stored_connection(engine)).scopes_requested
+
+    _, requested = await _start_consent(credential_id="goac_gmail", scope_profile=None)
+
+    assert requested == [GMAIL_READONLY_SCOPE]
+    assert (await _stored_connection(engine)).scopes_granted == [GMAIL_READONLY_SCOPE]
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_connection_keeps_send_when_reconnected_with_the_read_profile(
+    gmail_send_oauth: SimpleNamespace, repo: GoogleOAuthRepository, engine: AsyncEngine
+) -> None:
+    await _seed_gmail_connection(repo, engine, SEND_GRANT, subject="subject-1")
+
+    _, requested = await _start_consent(credential_id="goac_gmail", scope_profile="gmail")
+
+    assert requested == [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE, "openid", "email"]
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_upgrade_is_refused_for_a_connection_with_no_stored_identity(
+    gmail_send_oauth: SimpleNamespace, repo: GoogleOAuthRepository, engine: AsyncEngine
+) -> None:
+    sheets_scopes = list(google_oauth_service.GOOGLE_SHEETS_SCOPES)
+    await _seed_gmail_connection(repo, engine, sheets_scopes, email=None)
+
+    with pytest.raises(HTTPException) as refused:
+        await google_oauth_routes.google_oauth_authorize(
+            CreateGoogleOAuthAuthorizeRequest(
+                redirect_uri="https://x/cb", credential_id="goac_gmail", scope_profile="gmail_send"
+            ),
+            current_org=SimpleNamespace(organization_id="o_test"),
+            current_user_id="user_1",
+        )
+
+    stored = await _stored_connection(engine)
+    assert refused.value.status_code == 409
+    assert (stored.consent_nonce, stored.scopes_requested) == (None, sheets_scopes)
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_authorization_reconnects_when_the_connection_changes_between_its_two_reads(
+    gmail_send_oauth: SimpleNamespace,
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _seed_gmail_connection(repo, engine, SEND_GRANT, subject="subject-1")
+    load_active_ciphertext = repo.load_active_ciphertext
+
+    async def reconnect_then_load(organization_id: str, credential_id: str) -> object:
+        await repo.update_active_refresh_token(
+            organization_id=organization_id,
+            credential_id=credential_id,
+            encrypted_refresh_token="enc-other-account",
+            encrypted_method=EncryptMethod.AES,
+            now=datetime.datetime.now(datetime.UTC).replace(tzinfo=None) + datetime.timedelta(seconds=5),
+            expected_encrypted_refresh_token="cipher-goac_gmail",
+        )
+        return await load_active_ciphertext(organization_id=organization_id, credential_id=credential_id)
+
+    monkeypatch.setattr(repo, "load_active_ciphertext", reconnect_then_load)
+
+    authorization = await google_oauth_service.resolve_gmail_send_authorization("o_test", "goac_gmail")
+
+    assert authorization.status == google_oauth_service.GmailSendAuthorizationStatus.RECONNECT
+    gmail_send_oauth.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refresh_error", "expected", "state_after"),
+    [
+        (google_oauth_service.ExpiredRefreshTokenError("revoked"), "reconnect", STATE_ERROR),
+        (google_oauth_service.MissingAccessTokenError("token endpoint timed out"), "unavailable", STATE_ACTIVE),
+        (google_oauth_service.ClientConfigMismatchError("configuration changed"), "reconnect", STATE_ACTIVE),
+    ],
+    ids=["rejected-token", "temporary-failure", "oauth-client-changed"],
+)
+async def test_gmail_send_authorization_asks_for_a_reconnect_only_when_reconnecting_fixes_it(
+    gmail_send_oauth: SimpleNamespace,
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+    refresh_error: Exception,
+    expected: str,
+    state_after: str,
+) -> None:
+    await _seed_gmail_connection(repo, engine, SEND_GRANT, subject="subject-1")
+    gmail_send_oauth.refresh.side_effect = refresh_error
+
+    authorization = await google_oauth_service.resolve_gmail_send_authorization("o_test", "goac_gmail")
+
+    assert (authorization.status.value, authorization.access_token) == (expected, None)
+    assert (await _stored_connection(engine)).state == state_after
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_dispatch_rejected_attempt_is_reclaimed_once_per_reading(repo: GoogleOAuthRepository) -> None:
+    claim = await repo.claim_gmail_send_dispatch(
+        organization_id="o_test",
+        workflow_run_id="wr_1",
+        execution_key="key",
+        block_label="send",
+        credential_id="goac_gmail",
+    )
+    assert claim is not None
+
+    async def reclaim(observed_modified_at: datetime.datetime) -> bool:
+        return await repo.reclaim_failed_gmail_send_dispatch(
+            gmail_send_dispatch_id=claim.gmail_send_dispatch_id,
+            observed_modified_at=observed_modified_at,
+            credential_id="goac_gmail",
+        )
+
+    async def reject() -> None:
+        await repo.finalize_gmail_send_dispatch(
+            gmail_send_dispatch_id=claim.gmail_send_dispatch_id, status=DISPATCH_FAILED
+        )
+
+    while_the_send_is_in_flight = await reclaim(claim.modified_at)
+    await reject()
+    read_by_two_executions = await repo.get_gmail_send_dispatch("wr_1", "key")
+    assert read_by_two_executions is not None
+    first_reader = await reclaim(read_by_two_executions.modified_at)
+    await reject()
+    stale_reader = await reclaim(read_by_two_executions.modified_at)
+
+    assert (while_the_send_is_in_flight, first_reader, stale_reader) == (False, True, False)

@@ -5871,6 +5871,7 @@ workflow_definition:
         fact = result["data"]["google_connection_resolution"][0]
         assert fact["status"] == "not_found"
         assert fact["canonicalized"] is False
+        assert fact["detail"]
         assert [row["connection_id"] for row in fact["eligible_connections"]] == ["goac_eligible_row"]
         assert "Quarterly Revenue Connection" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
         assert "Quarterly Revenue Connection" in ctx.staged_workflow_yaml
@@ -9342,7 +9343,7 @@ class TestToolFactOwnership:
             ("console_messages", "read-only"),
             ("inspect_page_for_composition", "navigates the targeted browser there"),
             ("get_block_schema", "task_v2"),
-            ("evaluate", "record a scouted interaction"),
+            ("evaluate", "records no scouted interaction"),
             ("inspect_page_for_composition", "bounded read of known or current page state"),
             ("update_and_run_blocks", "higher latency than a bounded page read"),
         ],

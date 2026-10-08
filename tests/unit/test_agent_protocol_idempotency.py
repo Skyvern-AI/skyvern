@@ -25,8 +25,8 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotApplyProposedWorkflowRequest
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, NonTerminalFinallyBlock
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import WorkflowRequest, WorkflowStatus
 from tests.unit.force_stub_app import start_forge_stub_app
@@ -171,6 +171,28 @@ async def test_create_workflow_rejects_malformed_idempotency_key_before_any_work
             assert key not in response.text
         assert await lab.count_workflows() == 0
         assert lab.calls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"yaml_definition": None, "json_definition": None}, {"yaml_definition": ""}],
+    ids=["empty_body", "explicit_nulls", "empty_yaml"],
+)
+async def test_create_workflow_without_definition_returns_422(
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async with idempotency_lab(monkeypatch, tmp_path / "missing-definition.db") as lab:
+        response = await lab.client.post("/v1/agents", json=payload)
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": "Invalid workflow definition. Workflow should be provided in either yaml or json format."
+        }
+        assert await lab.count_workflows() == 0
+        assert set(lab.calls) == {"analytics"}
 
 
 def test_validate_idempotency_key_rejects_multibyte_by_encoded_length() -> None:
@@ -690,6 +712,217 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
         assert workflow_count == 0
         assert output_parameter_count == 0
         assert hook_scheduled is False
+    finally:
+        await database.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_workflow_save_publishes_no_version_before_its_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An ordinary save must not publish its new version row before the definition fills it.
+
+    The row is inserted empty because the definition is keyed by its ``workflow_id``. While that
+    row is the visible latest version, ``GET /workflows/{id}`` serves an empty workflow, a
+    concurrent save inherits its settings, and the save precondition rejects valid drafts against
+    a version that validation is about to discard.
+    """
+    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'save-version-visibility.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    organization = await database.organizations.create_organization(
+        organization_name="Test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(app, "DATABASE", database)
+    workflow_service = WorkflowService()
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+
+    try:
+        request = WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD).json_definition
+        assert request is not None
+        saved = await workflow_service.create_workflow_from_request(organization=organization, request=request)
+
+        async def latest_visible_version() -> tuple[int, int]:
+            # A separate task gets its own session, so this read sees exactly what a concurrent
+            # reader of the live database would — the ambient transaction is task-scoped.
+            visible = await workflow_service.get_workflow_by_permanent_id(
+                workflow_permanent_id=saved.workflow_permanent_id,
+                organization_id=organization.organization_id,
+            )
+            return visible.version, len(visible.workflow_definition.blocks)
+
+        build_definition = workflow_service.make_workflow_definition
+        observed_mid_save: list[tuple[int, int]] = []
+
+        async def observe_then_fail(workflow_id: str, workflow_definition_yaml: Any) -> Any:
+            await build_definition(workflow_id, workflow_definition_yaml)
+            observed_mid_save.append(await asyncio.create_task(latest_visible_version()))
+            raise RuntimeError("definition build failed")
+
+        monkeypatch.setattr(workflow_service, "make_workflow_definition", observe_then_fail)
+
+        with pytest.raises(RuntimeError, match="definition build failed"):
+            await workflow_service.create_workflow_from_request(
+                organization=organization,
+                request=request,
+                workflow_permanent_id=saved.workflow_permanent_id,
+                expected_version=saved.version,
+            )
+
+        assert observed_mid_save == [(saved.version, 1)]
+        async with database.Session() as session:
+            # Unfiltered: a row committed and then soft-deleted still reserves its version, so this
+            # fails if the empty row reached the database at all.
+            persisted_versions = (
+                await session.scalars(
+                    select(WorkflowModel.version).filter_by(workflow_permanent_id=saved.workflow_permanent_id)
+                )
+            ).all()
+            orphan_output_parameters = await session.scalar(
+                select(func.count())
+                .select_from(OutputParameterModel)
+                .where(OutputParameterModel.workflow_id != saved.workflow_id)
+            )
+        assert sorted(persisted_versions) == [saved.version]
+        assert orphan_output_parameters == 0
+    finally:
+        await database.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_finally_validation_rolls_back_before_version_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'save-finally-validation.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    organization = await database.organizations.create_organization(
+        organization_name="Test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(app, "DATABASE", database)
+    workflow_service = WorkflowService()
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+
+    transaction_open = False
+    validation_transaction_states: list[bool] = []
+    saved_hooks: list[dict[str, Any]] = []
+    original_version_write_transaction = database.workflows.version_write_transaction
+    original_validate = WorkflowDefinition.validate
+
+    @asynccontextmanager
+    async def track_version_write_transaction() -> AsyncIterator[None]:
+        nonlocal transaction_open
+        async with original_version_write_transaction():
+            transaction_open = True
+            try:
+                yield
+            finally:
+                transaction_open = False
+
+    def track_finally_validation(definition: WorkflowDefinition) -> None:
+        if definition.finally_block_label:
+            validation_transaction_states.append(transaction_open)
+        original_validate(definition)
+
+    def record_saved_hook(**kwargs: Any) -> None:
+        saved_hooks.append(kwargs)
+
+    monkeypatch.setattr(database.workflows, "version_write_transaction", track_version_write_transaction)
+    monkeypatch.setattr(WorkflowDefinition, "validate", track_finally_validation)
+    monkeypatch.setattr(workflow_service, "schedule_workflow_saved_hook", record_saved_hook)
+
+    try:
+        valid_request = WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD).json_definition
+        assert valid_request is not None
+        saved = await workflow_service.create_workflow_from_request(organization=organization, request=valid_request)
+        saved_hooks.clear()
+
+        invalid_request = WorkflowRequest.model_validate(
+            {
+                "json_definition": {
+                    "title": "Replay test agent",
+                    "workflow_definition": {
+                        "version": 2,
+                        "parameters": [],
+                        "finally_block_label": "cleanup",
+                        "blocks": [
+                            {"label": "main", "block_type": "task", "url": "https://example.com"},
+                            {
+                                "label": "cleanup",
+                                "block_type": "task",
+                                "url": "https://example.com",
+                                "next_block_label": "main",
+                            },
+                        ],
+                    },
+                }
+            }
+        ).json_definition
+        assert invalid_request is not None
+
+        with pytest.raises(NonTerminalFinallyBlock):
+            await workflow_service.create_workflow_from_request(
+                organization=organization,
+                request=invalid_request,
+                workflow_permanent_id=saved.workflow_permanent_id,
+                expected_version=saved.version,
+            )
+
+        assert validation_transaction_states == [True]
+        assert saved_hooks == []
+        async with database.Session() as session:
+            persisted_versions = (
+                await session.scalars(
+                    select(WorkflowModel.version).filter_by(workflow_permanent_id=saved.workflow_permanent_id)
+                )
+            ).all()
+        assert persisted_versions == [saved.version]
+    finally:
+        await database.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_workflow_save_does_not_schedule_saved_hook_before_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'save-hook-rollback.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    organization = await database.organizations.create_organization(
+        organization_name="Test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(app, "DATABASE", database)
+    workflow_service = WorkflowService()
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
+    saved_hooks: list[dict[str, Any]] = []
+    original_update_workflow_definition = workflow_service.update_workflow_definition
+
+    async def update_then_fail(*args: Any, **kwargs: Any) -> Workflow:
+        await original_update_workflow_definition(*args, **kwargs)
+        raise RuntimeError("simulated failure before transaction commit")
+
+    def record_saved_hook(**kwargs: Any) -> None:
+        saved_hooks.append(kwargs)
+
+    monkeypatch.setattr(workflow_service, "update_workflow_definition", update_then_fail)
+    monkeypatch.setattr(workflow_service, "schedule_workflow_saved_hook", record_saved_hook)
+
+    try:
+        request = WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD).json_definition
+        assert request is not None
+        with pytest.raises(RuntimeError, match="before transaction commit"):
+            await workflow_service.create_workflow_from_request(organization=organization, request=request)
+
+        assert saved_hooks == []
+        async with database.Session() as session:
+            workflow_count = await session.scalar(select(func.count()).select_from(WorkflowModel))
+        assert workflow_count == 0
     finally:
         await database.engine.dispose()
 

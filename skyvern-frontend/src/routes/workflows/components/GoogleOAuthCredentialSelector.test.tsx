@@ -281,3 +281,38 @@ test("does not resurrect an unblurred template after switching back to the accou
   expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   expect(screen.getByTestId("saved-credential").textContent).toBe("");
 });
+
+test("for Gmail sending, offers only accounts the server says can send and flags a saved one that cannot", () => {
+  const sendScope = "https://www.googleapis.com/auth/gmail.send";
+  const account = (id: string, name: string, canSend: boolean) => ({
+    ...googleCredential(id),
+    credential_name: name,
+    scopes_granted: [sendScope],
+    gmail_send_ready: canSend,
+  });
+  mocks.useGoogleOAuthCredentials.mockReturnValue({
+    credentials: [
+      account("goac-send", "Reports sender", true),
+      account("goac-saved", "Unverified sender", false),
+    ],
+    isLoading: false,
+    isFetching: false,
+    error: null,
+  });
+  const onChange = vi.fn();
+  render(
+    <GoogleOAuthCredentialSelector
+      nodeId="d1"
+      value="goac-saved"
+      onChange={onChange}
+      requiredScopes={[sendScope]}
+      gmailSendOnly
+    />,
+  );
+
+  expect(screen.getByText(/cannot send email/)).toBeDefined();
+  fireEvent.click(screen.getByRole("combobox"));
+  expect(screen.getByText("Reports sender")).toBeDefined();
+  expect(screen.queryByText("Unverified sender")).toBeNull();
+  expect(onChange).not.toHaveBeenCalled();
+});

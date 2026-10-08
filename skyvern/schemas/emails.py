@@ -8,6 +8,33 @@ class EmailBodyFormat(StrEnum):
     HTML = "html"
 
 
+class EmailTransport(StrEnum):
+    SMTP = "smtp"
+    GMAIL = "gmail"
+
+
+class GmailSendOutcome(StrEnum):
+    ACCEPTED = "accepted"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class GmailSendErrorCode(StrEnum):
+    CONFIGURATION = "configuration"
+    MISSING_SCOPE = "missing_scope"
+    RECONNECT = "reconnect"
+    NO_RECIPIENTS = "no_recipients"
+    INVALID_RECIPIENT = "invalid_recipient"
+    INVALID_HEADER = "invalid_header"
+    ATTACHMENT_INVALID = "attachment_invalid"
+    ATTACHMENT_TOO_LARGE = "attachment_too_large"
+    TEMPLATE_ERROR = "template_error"
+    PROVIDER_REJECTED = "provider_rejected"
+    RATE_LIMITED = "rate_limited"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+    INTERNAL_ERROR = "internal_error"
+
+
 class EmailAttachment(BaseModel):
     name: str
     mime_type: str | None = None

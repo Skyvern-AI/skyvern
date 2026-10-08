@@ -1742,6 +1742,45 @@ async def test_tool_error_stops_batch_and_skips_remaining() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["unconfirmed", "confirmed"])
+async def test_a_field_entry_that_could_not_confirm_its_value_holds_back_a_submit_in_the_batch(
+    unconfirmed: bool,
+) -> None:
+    # The value is not known to be in the field, so a click queued behind it must not submit the form; an ordinary
+    # entry, and a later entry into another field, still run.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    later_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        return ToolResult("ok", "typed into #a", entry_unconfirmed=unconfirmed)
+
+    typer = ToolSpec(
+        name="type", description="type", parameters={"type": "object"}, handler=type_handler, billable=True
+    )
+    tools = [typer, _recording_tool("click", click_calls, billable=True), _recording_tool("select_option", later_calls)]
+    script = [
+        [
+            ("type", {"selector": "#a"}),
+            ("select_option", {"selector": "#b"}),
+            ("click", {"selector": "#submit"}),
+            ("finish", {"status": "completed", "reason": "submitted"}),
+        ],
+        [("finish", {"status": "completed", "reason": "checked first"})],
+    ]
+    outcome, _ = await _run(script, [*tools, make_finish_tool()])
+
+    assert len(type_calls) == 1 and len(later_calls) == 1
+    assert len(click_calls) == (0 if unconfirmed else 1)
+    # A verdict queued behind the unconfirmed field was written before the model saw it.
+    assert outcome.reason == ("checked first" if unconfirmed else "submitted")
+    if unconfirmed:
+        [skip] = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        assert "could not confirm" in skip["content"]
+
+
+@pytest.mark.asyncio
 async def test_non_mutating_tool_error_lets_independent_batch_calls_run() -> None:
     # A `type` failure that leaves the page unchanged (no page-transition data, probe reads
     # unchanged) must not block unrelated select_option calls later in the same batch -- only a
@@ -11189,7 +11228,7 @@ def test_tools_error_sites_without_a_class_only_go_down() -> None:
             and len(node.args) < 5
         ):
             unlabelled.append(node.lineno)
-    assert len(unlabelled) == 31, sorted(unlabelled)
+    assert len(unlabelled) == 29, sorted(unlabelled)
 
 
 @pytest.mark.parametrize(

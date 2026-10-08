@@ -77,6 +77,18 @@ async def test_timeout_rescues_once_without_animation_retry_and_preserves_file(
 
 
 @pytest.mark.asyncio
+async def test_persistent_context_timeout_is_rescued_over_raw_cdp() -> None:
+    # launch_persistent_context exposes no owning Browser, yet CDP still attaches through the context.
+    page = _page()
+    page.context.browser = None
+    result = await _current_viewpoint_screenshot_helper(page)
+    with Image.open(BytesIO(result)) as image:
+        assert image.size == (80, 60)
+    page.screenshot.assert_awaited_once()
+    page.context.new_cdp_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "geometry",
     [

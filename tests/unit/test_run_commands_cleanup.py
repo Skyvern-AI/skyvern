@@ -29,24 +29,6 @@ def _reset_cleanup_state() -> None:
     run_commands._mcp_shutdown_exit_code = None
 
 
-@pytest.fixture(params=["poll", "peek"])
-def stdin_eof_reader(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Exercise both stdin EOF detectors without relying on host-specific select APIs."""
-    reader = MagicMock()
-    if request.param == "poll":
-        reader.return_value = [(123, 1)]
-        poller = SimpleNamespace(register=MagicMock(), poll=reader)
-        select_api = SimpleNamespace(poll=lambda: poller, POLLHUP=1, POLLERR=2, POLLNVAL=4)
-    else:
-        reader.return_value = b""
-        select_api = SimpleNamespace()
-    monkeypatch.setattr(run_commands, "select", select_api)
-    monkeypatch.setattr(
-        run_commands.sys, "stdin", SimpleNamespace(fileno=lambda: 123, buffer=SimpleNamespace(peek=reader))
-    )
-    return reader
-
-
 @pytest.mark.asyncio
 async def test_cleanup_mcp_resources_closes_auth_db(monkeypatch: pytest.MonkeyPatch) -> None:
     order: list[str] = []
@@ -197,7 +179,10 @@ def test_cleanup_mcp_resources_sync_preserves_explicit_user_data_dir(
     rmtree.assert_not_called()
 
 
-def test_stdin_eof_watcher_allows_native_clean_return(stdin_eof_reader: MagicMock) -> None:
+def test_stdin_eof_watcher_allows_native_clean_return(monkeypatch: pytest.MonkeyPatch) -> None:
+    poller = MagicMock()
+    poller.poll.return_value = [(123, run_commands.select.POLLHUP)]
+    monkeypatch.setattr(run_commands.select, "poll", lambda: poller)
     request_shutdown, force_exit = MagicMock(), MagicMock()
     stop = MagicMock(**{"is_set.side_effect": [False, False, True]})
 
@@ -209,7 +194,6 @@ def test_stdin_eof_watcher_allows_native_clean_return(stdin_eof_reader: MagicMoc
         force_exit=force_exit,
     )
 
-    stdin_eof_reader.assert_called_once()
     request_shutdown.assert_not_called()
     force_exit.assert_not_called()
 
@@ -218,14 +202,16 @@ def test_stdin_eof_watcher_allows_native_clean_return(stdin_eof_reader: MagicMoc
 def test_stdin_eof_watcher_force_exits_after_shared_profile_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     deleted: bool,
-    stdin_eof_reader: MagicMock,
 ) -> None:
     events: list[str] = []
+    poller = MagicMock()
+    poller.poll.return_value = [(123, run_commands.select.POLLHUP)]
     profile = MagicMock(name="profile")
     profile_cleanup = MagicMock(side_effect=lambda _profile: events.append("cleanup") or deleted)
     terminate = MagicMock()
     rmtree = MagicMock(side_effect=AssertionError("run_commands must not delete profiles directly"))
     force_exit = MagicMock(side_effect=lambda _code: events.append("exit"))
+    monkeypatch.setattr(run_commands.select, "poll", lambda: poller)
     monkeypatch.setattr(
         run_commands,
         "_current_local_browser_identity",
@@ -382,13 +368,12 @@ def test_run_mcp_restores_signal_handlers_after_cleanup(monkeypatch: pytest.Monk
     assert events[-3:] == ["cleanup", "restore", "restore"]
 
 
-def test_run_mcp_stdin_eof_invokes_original_loop_cleanup(
-    monkeypatch: pytest.MonkeyPatch, stdin_eof_reader: MagicMock
-) -> None:
+def test_run_mcp_stdin_eof_invokes_original_loop_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     cleanup = AsyncMock()
     request_shutdown, force_exit = MagicMock(), MagicMock()
     eof_detected = threading.Event()
-    stdin_eof_reader.side_effect = lambda _size: (eof_detected.set(), stdin_eof_reader.return_value)[1]
+    poller = MagicMock()
+    poller.poll.side_effect = lambda _timeout: (eof_detected.set(), [(123, run_commands.select.POLLHUP)])[1]
 
     async def return_on_eof(**_kwargs: object) -> None:
         assert await asyncio.to_thread(eof_detected.wait, 1)
@@ -396,6 +381,9 @@ def test_run_mcp_stdin_eof_invokes_original_loop_cleanup(
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
     monkeypatch.setattr(run_commands._thread, "interrupt_main", request_shutdown)
     monkeypatch.setattr(run_commands.os, "_exit", force_exit)
+    monkeypatch.setattr(run_commands.select, "poll", lambda: poller)
+    # pytest's captured stdin raises on fileno(); the poller is mocked, so any fd stands in.
+    monkeypatch.setattr(run_commands.sys, "stdin", SimpleNamespace(fileno=lambda: 123))
     monkeypatch.setattr(run_commands.atexit, "register", MagicMock())
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", return_on_eof)
 

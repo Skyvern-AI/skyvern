@@ -1983,8 +1983,46 @@ def _build_navigate_statement(
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_gmail_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    # Only the label and the connection are emitted: the cached call is logged, and the helper reads the
+    # recipients, subject and body from the workflow definition by label.
+    fields: list[tuple[str, Any]] = [("transport", "gmail")]
+    if block.get("credential_id"):
+        fields.append(("credential_id", block["credential_id"]))
+    args = [
+        cst.Arg(
+            keyword=cst.Name(field),
+            value=_value(value),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        )
+        for field, value in fields
+    ]
+    args.append(
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
+            comma=cst.Comma(),
+        )
+    )
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("send_email")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
 def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.send_email statement."""
+    if block.get("transport") == "gmail":
+        return _build_gmail_send_email_statement(block)
     args = [
         cst.Arg(
             keyword=cst.Name("sender"),

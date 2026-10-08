@@ -48,6 +48,8 @@ const mocks = vi.hoisted(() => ({
       blocks: [{ block_type: "navigation", label: "block_1" }] as Array<{
         block_type: string;
         label: string;
+        url?: string | null;
+        parameters?: Array<unknown> | null;
       }>,
       parameters: [],
     },
@@ -401,6 +403,63 @@ describe("RunWorkflowForm empty agent", () => {
     const runButton = await screen.findByRole("button", { name: "Run agent" });
     expect(runButton.hasAttribute("disabled")).toBe(false);
     expect(screen.queryByText("This agent has no blocks yet")).toBeNull();
+  });
+});
+
+describe("RunWorkflowForm login parameter bindings", () => {
+  test("a login with plain string parameters is runnable", async () => {
+    const blocks = mocks.workflow.workflow_definition.blocks;
+    mocks.workflow.workflow_definition.blocks = [
+      {
+        block_type: "login",
+        label: "login",
+        url: "https://example.com/login",
+        parameters: [
+          {
+            key: "username",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+          },
+          {
+            key: "password",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+          },
+        ],
+      },
+    ];
+    try {
+      renderRunWorkflowForm();
+      const runButton = await screen.findByRole("button", {
+        name: "Run agent",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(false);
+    } finally {
+      mocks.workflow.workflow_definition.blocks = blocks;
+    }
+  });
+
+  test("a login with no bound parameters remains blocked", async () => {
+    const blocks = mocks.workflow.workflow_definition.blocks;
+    mocks.workflow.workflow_definition.blocks = [
+      {
+        block_type: "login",
+        label: "login",
+        url: "https://example.com/login",
+        parameters: [],
+      },
+    ];
+    try {
+      renderRunWorkflowForm();
+      const runButton = await screen.findByRole("button", {
+        name: "Run agent",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(true);
+      fireEvent.click(runButton);
+      expect(mocks.post).not.toHaveBeenCalled();
+    } finally {
+      mocks.workflow.workflow_definition.blocks = blocks;
+    }
   });
 });
 

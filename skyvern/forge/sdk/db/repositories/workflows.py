@@ -195,6 +195,18 @@ class WorkflowsRepository(BaseRepository):
                 async with self.Session.bind_connection(connection):
                     yield
 
+    @asynccontextmanager
+    async def version_write_transaction(self) -> AsyncIterator[None]:
+        """Bind every write in the block to one transaction.
+
+        A save allocates its version row before it can build the definition that fills it (the
+        definition is keyed by the new ``workflow_id``). Committing the row first publishes an
+        empty workflow as the latest version, so every write between entering and leaving this
+        block becomes visible at once instead.
+        """
+        async with self._workflow_creation_transaction():
+            yield
+
     async def _latest_version_definition(
         self, session: Any, workflow_permanent_id: str, organization_id: str | None
     ) -> object | None:

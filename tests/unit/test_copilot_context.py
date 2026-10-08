@@ -10,6 +10,9 @@ import pytest
 import structlog.testing
 
 from skyvern.forge.sdk.copilot.context import (
+    OBSERVED_CONTEXT_FIELDS,
+    TOOL_ACTIVITY_CONTEXT_FIELDS,
+    TRUSTED_CONTEXT_FIELDS,
     ApprovedCredential,
     ObservedPage,
     StructuredContext,
@@ -79,6 +82,28 @@ def test_browser_code_summary_records_the_page_and_the_decision() -> None:
         "run_browser_code: Ran browser code (3 operation(s)) at https://example.com/a",
         "run_browser_code: Failed: locator timed out at line 2",
     ]
+
+
+def test_tool_activity_fields_are_the_ones_the_turn_summary_writes() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary(
+        [
+            {"tool": "navigate_browser", "summary": "Navigated to https://site.test"},
+            {"tool": "list_credentials", "summary": "Found 1 credential(s)"},
+            {"tool": "type_text", "summary": "Typed into '#name'"},
+            {"tool": "update_workflow", "summary": "2 blocks"},
+            {"tool": "click", "summary": "Clicked #go"},
+        ]
+    )
+
+    untouched = StructuredContext().model_dump()
+    written = {name for name, value in ctx.model_dump().items() if value != untouched[name]}
+    assert written == set(TOOL_ACTIVITY_CONTEXT_FIELDS)
+
+
+def test_user_goal_is_the_only_field_no_turn_end_writer_sets() -> None:
+    server_written = {*TRUSTED_CONTEXT_FIELDS, *OBSERVED_CONTEXT_FIELDS, *TOOL_ACTIVITY_CONTEXT_FIELDS}
+    assert set(StructuredContext.model_fields) - server_written == {"user_goal"}
 
 
 def test_merge_turn_summary_records_resolved_credential_ids() -> None:
@@ -454,6 +479,18 @@ def test_malformed_structured_context_fallback_logs_a_fingerprint() -> None:
     assert len(events) == 1
     assert events[0]["raw_length"] == len(broken)
     assert broken not in str(events[0].values())
+
+
+def test_a_rejected_model_context_update_logs_the_field_that_failed() -> None:
+    trusted = StructuredContext(user_goal="kept").to_json_str()
+
+    with structlog.testing.capture_logs() as logs:
+        adopted = adopt_model_authored_context(trusted, {"user_goal": "new", "urls_visited": ["https://a.test"]})
+
+    assert adopted.user_goal == "kept"
+    events = [entry for entry in logs if entry.get("event") == "structured_context_model_update_rejected"]
+    assert [event["rejected_fields"] for event in events] == [["urls_visited"]]
+    assert "a.test" not in str(events[0].values())
 
 
 def test_a_live_page_grant_does_not_carry_into_a_later_turn() -> None:

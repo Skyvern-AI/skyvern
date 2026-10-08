@@ -49,23 +49,12 @@ from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_extraction_plan import _exact_path, _value_witness_bindings
 from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     bound_call_browser_session,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
-    clear_sensitive_origin_page_taint_after_navigation,
+    browser_session_turn,
     effective_browser_session_id,
-    live_working_page_url,
-    navigation_replaced_document,
-    pending_taint_source_url,
     resolve_browser_state_for_context,
-    sensitive_origin_multi_tab_error,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
-    stage_pending_taint_source,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -80,7 +69,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     screenshot_result_facts,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    register_matching_origin_run_redaction_values,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -1149,10 +1137,7 @@ async def _inspect_page_for_composition_impl(
     target_url: str,
     requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> dict[str, Any]:
-    # Named navigation is the only route that may release sensitive-page custody. Keep navigation,
-    # release, capture, and evidence admission atomic with sensitive-run registration so this call
-    # cannot clear a newer run's taint after its navigation returns.
-    async with browser_page_custody_lock(copilot_ctx):
+    async with browser_session_turn(copilot_ctx):
         async with browser_evidence_commit_lock(copilot_ctx):
             return await _inspect_page_for_composition_under_custody(copilot_ctx, target_url, requested_reads)
 
@@ -1235,8 +1220,6 @@ async def _inspect_page_for_composition_under_custody(
     authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
     if authority_error:
         return {"ok": False, "error": authority_error}
-    if sensitive_origin_page_has_active_run(copilot_ctx):
-        return {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     capture_session_id = effective_browser_session_id(copilot_ctx) if isinstance(copilot_ctx, AgentContext) else None
     capture_tracks_debug_session = (
         isinstance(copilot_ctx, AgentContext) and capture_session_id == copilot_ctx.browser_session_id
@@ -1247,7 +1230,6 @@ async def _inspect_page_for_composition_under_custody(
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
-    sensitive_same_turn_run = register_matching_origin_run_redaction_values(copilot_ctx, run_id)
     if not use_current_page:
         _clear_pending_browser_interaction_observation(copilot_ctx)
     bypass_budget_for_post_run_current_page = _allows_post_run_current_page_inspection_budget_bypass(
@@ -1277,11 +1259,6 @@ async def _inspect_page_for_composition_under_custody(
     if use_current_page:
         inspect_target_url = current_url
         on_target_page = True
-    elif sensitive_same_turn_run:
-        # Do not inspect the sensitive run page merely to decide whether navigation can be skipped.
-        # A named URL is the legitimate route: navigate first, then inspect the resulting page.
-        inspect_target_url = entry_url
-        on_target_page = False
     else:
         live_url, _ = await _fallback_page_info(copilot_ctx)
         on_target_page = _same_inspect_target(live_url, entry_url)
@@ -1309,11 +1286,6 @@ async def _inspect_page_for_composition_under_custody(
             )
             evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
         else:
-            # Read and compared, never part of the evidence: a withheld page's URL decides whether the
-            # navigation left it.
-            tainted = sensitive_origin_page_is_tainted(copilot_ctx)
-            if tainted:
-                await stage_pending_taint_source(copilot_ctx)
             nav_result = await _discovery_navigate(
                 copilot_ctx,
                 entry_url,
@@ -1322,14 +1294,6 @@ async def _inspect_page_for_composition_under_custody(
             )
             if not nav_result.get("ok"):
                 nav_error = str(nav_result.get("error") or "unknown")
-                if sensitive_same_turn_run:
-                    # Navigation failure may leave the browser on the sensitive origin page.
-                    # Do not inspect that page through the ordinary failure fallback.
-                    return {
-                        "ok": False,
-                        "data": None,
-                        "error": f"inspect_page_for_composition could not navigate: {nav_error}",
-                    }
                 failure_capture = await _composition_evidence_after_navigation_failure(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -1346,14 +1310,6 @@ async def _inspect_page_for_composition_under_custody(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
-                if tainted:
-                    # Raw against raw: the navigate result's URL is secret-scrubbed, the before-URL is not.
-                    taint_source_url = pending_taint_source_url(copilot_ctx)
-                    navigated_url = await live_working_page_url(copilot_ctx)
-                    if not await clear_sensitive_origin_page_taint_after_navigation(
-                        copilot_ctx, source_url=taint_source_url, result_url=navigated_url
-                    ) and navigation_replaced_document(taint_source_url, navigated_url):
-                        return {"ok": False, "data": None, "error": await sensitive_origin_multi_tab_error(copilot_ctx)}
                 capture = await _capture_composition_evidence(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -1361,9 +1317,6 @@ async def _inspect_page_for_composition_under_custody(
                     requested_reads=requested_reads,
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
-
-    if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
-        return {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
 
     if (
         isinstance(copilot_ctx, AgentContext)
@@ -1399,10 +1352,7 @@ async def _inspect_page_for_composition_under_custody(
             "error": "inspect_page_for_composition could not capture page evidence.",
         }
 
-    if sensitive_same_turn_run:
-        evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
-        # Exact-value scrubbing applies to structured evidence, not pixels.
-        visual_fallback_frame = None
+    evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
 
     if isinstance(run_id, str) and run_id:
         session_provenance = evidence.get("browser_session_provenance")
@@ -1543,9 +1493,7 @@ filter results or expand result rows, and after a run to read the page that run 
 browser used by the most recent test run. The packet describes the page only as it is at that
 moment.
 
-Returns observed page evidence: current URL, title, navigation targets, form fields with labels and
-selectors, submit/search controls, result containers, compact visible text excerpts, anti-bot
-indicators, and bounded visual challenge evidence when DOM evidence shows challenge state. The
+Returns observed page evidence. The
 returned `observation_step` is the side-channel id to pass in `block_observation_refs` when a newly
 authored block acts on this observed page. Do NOT paste the evidence into workflow YAML; use it to
 ground concise block prompts. If a select reports `options_omitted=true`, `option_count` is the

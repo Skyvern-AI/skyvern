@@ -267,6 +267,29 @@ async def test_resolve_local_file_enforces_max_size(tmp_path: Path, monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_download_file_limits_a_managed_file_size_only_when_the_caller_asks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oversized = b"x" * (11 * 1024 * 1024)
+    storage = SimpleNamespace(
+        assert_managed_file_access=MagicMock(),
+        managed_file_size=AsyncMock(return_value=len(oversized)),
+        download_managed_file=AsyncMock(return_value=oversized),
+    )
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    uri = "s3://bucket/org-1/big.bin"
+
+    path = await files.download_file(uri, max_size_mb=10, organization_id="org-1")
+    downloaded_bytes = os.path.getsize(path)
+    os.remove(path)
+    with pytest.raises(DownloadFileMaxSizeExceeded):
+        await files.download_file(uri, max_size_mb=10, organization_id="org-1", limit_managed_file_size=True)
+
+    assert downloaded_bytes == len(oversized)
+    storage.download_managed_file.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_resolve_remote_url_downloads_file(monkeypatch: pytest.MonkeyPatch) -> None:
     download_mock = AsyncMock(return_value="/tmp/downloaded.pdf")
     monkeypatch.setattr(files, "download_file", download_mock)

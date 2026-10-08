@@ -6,7 +6,6 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from itertools import count
@@ -43,8 +42,6 @@ from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    record_sensitive_origin_run_taint,
-    register_sensitive_origin_run_lease,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
@@ -955,13 +952,6 @@ def redact_parameter_values(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, 
     monkeypatch.setattr(forge_app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact)
 
 
-def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | None) -> None:
-    patch_browser_tabs(
-        monkeypatch,
-        None if open_tabs is None else FakeTabbedBrowserState(*(["https://tab.example.test/"] * open_tabs)),
-    )
-
-
 def origin_run_input(
     key: str,
     value: bool | float | str | dict | list,
@@ -1295,54 +1285,6 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
     monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
-
-
-SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS = [
-    "registry_missing",
-    "registry_incomplete",
-    "registry_other_run",
-    "run_still_active",
-    "run_id_unclaimed",
-    "second_browser_run_replaced_registry",
-    "same_session_earlier_run_unbound",
-]
-
-
-def taint_by_terminal_run(ctx: Any, *, workflow_run_id: str, session_id: str) -> None:
-    """Mark ``session_id`` as the page a finished credential run left, attributed to that run."""
-    record_sensitive_origin_run_taint(ctx, workflow_run_id=workflow_run_id, session_id=session_id)
-
-
-def remove_sensitive_disclosure_prerequisite(ctx: Any, arm: str) -> None:
-    """Drop exactly one prerequisite of the terminal-matching-registry disclosure route."""
-    registry = ctx.origin_run_redaction_registry
-    if arm == "registry_missing":
-        ctx.origin_run_redaction_registry = None
-    elif arm == "registry_incomplete":
-        ctx.origin_run_redaction_registry = replace(registry, contains_all_sensitive_values=False)
-    elif arm == "registry_other_run":
-        ctx.origin_run_redaction_registry = replace(registry, workflow_run_id="wr_unrelated")
-    elif arm == "run_still_active":
-        register_sensitive_origin_run_lease(
-            ctx, workflow_run_id=registry.workflow_run_id, session_id=ctx.browser_session_id
-        )
-    elif arm == "run_id_unclaimed":
-        ctx.last_run_blocks_workflow_run_id = None
-    elif arm == "second_browser_run_replaced_registry":
-        # A later run on another browser finished with a complete registry and is the run the
-        # model now claims; the page under inspection was tainted by the earlier run, whose
-        # values were never bound. The complete registry must not unlock that page.
-        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_second", session_id="pbs_second_browser")
-        ctx.last_run_blocks_workflow_run_id = "wr_second"
-        ctx.origin_run_redaction_registry = replace(
-            registry, workflow_run_id="wr_second", contains_all_sensitive_values=True
-        )
-    elif arm == "same_session_earlier_run_unbound":
-        # An earlier run on this same page ended without completing its registry, so a value
-        # it entered may be on the page while the claimed run's complete registry knows nothing of it.
-        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_earlier", session_id=ctx.browser_session_id)
-    else:
-        raise AssertionError(f"unknown arm {arm}")
 
 
 TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")

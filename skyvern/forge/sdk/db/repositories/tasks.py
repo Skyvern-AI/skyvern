@@ -960,10 +960,14 @@ class TasksRepository(BaseRepository):
 
             results = (await session.execute(query)).all()
 
-            return [
+        # A large page is seconds of pure-Python model building; on the event loop it stalls every other request.
+        # The query loads every column, so the thread only reads loaded attributes and never uses the session.
+        return await asyncio.to_thread(
+            lambda: [
                 convert_to_task(task, debug_enabled=self.debug_enabled, workflow_permanent_id=workflow_permanent_id)
                 for task, workflow_permanent_id in results
             ]
+        )
 
     @db_operation("get_tasks_count")
     async def get_tasks_count(

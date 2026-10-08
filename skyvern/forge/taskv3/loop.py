@@ -81,6 +81,8 @@ ToolErrorClass = Literal[
     "date_sibling_unverified",
     # `type`: the date segment written did not hold its value afterwards.
     "date_segment_not_committed",
+    # `type`: a date input stores year-month-day and the text could be read as more than one date, so nothing was typed.
+    "date_format_refused",
     # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
     # one-character-per-box code field whose boxes did not all keep their character.
     "text_not_held",
@@ -185,6 +187,11 @@ ToolOkClass = Literal[
     "loaded",
     "document_ready",
     "committed_not_loaded",
+    # A field-entry read-back (field_commit): the field shows the value in its own format, holds something other
+    # than what was entered, or could not be read at all.
+    "held_as",
+    "held_differs",
+    "unverified",
 ]
 
 # Which `covered` message the model actually got. They are one `tool_error_class`, so without this
@@ -254,6 +261,9 @@ class ToolResult:
     # A refused call that still dispatched input to the page first, to release a previous field's
     # suggestion list. It is charged and the page may have changed, though the requested action never ran.
     touched_page: bool = False
+    # An ok field entry whose value the field could not confirm (unreadable, or holding something else). The loop
+    # skips a later submit-shaped call in the same batch, so the model sees the field before anything submits it.
+    entry_unconfirmed: bool = False
 
     @classmethod
     def ok(
@@ -335,6 +345,8 @@ _COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_l
 _TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach", default=None)
 # A click that raised after the page received it (a slow submit whose navigation had not committed).
 _CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
+# Which field shape a field-entry read-back judged (field_commit), so an unconfirmed entry is countable per variant.
+_ENTRY_RECORD: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_entry_record", default=None)
 # The text-delta read's cost and yield for the one tool call this context covers.
 _TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | None] = ContextVar(
     "taskv3_text_delta", default=None
@@ -435,6 +447,14 @@ def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_docu
 
 def record_click_dispatched() -> None:
     _CLICK_DISPATCHED.set(True)
+
+
+def record_entry_variant(variant: str) -> None:
+    _ENTRY_RECORD.set({"entry_variant": variant})
+
+
+def record_entry_enter_withheld() -> None:
+    _ENTRY_RECORD.set({**(_ENTRY_RECORD.get() or {}), "entry_enter_withheld": True})
 
 
 # What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
@@ -2052,6 +2072,8 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "selector_kind",
         "tool_error_class",
         "tool_ok_class",
+        "entry_variant",
+        "entry_enter_withheld",
         "resolve_seconds",
         "billable",
         "turn",
@@ -3986,6 +4008,7 @@ async def run_agent_tool_loop(
         batch_had_failure = False
         # A refusal leaves its value in the field, so no click after it -- toggle or not -- may run.
         batch_had_refusal = False
+        batch_entry_unconfirmed = False
         marks_stale = False
         # Loop events minted this batch, emitted only after every progress signal the batch can
         # produce has been absorbed (see the end-of-batch emission below).
@@ -4074,7 +4097,7 @@ async def run_agent_tool_loop(
                     }
                 )
                 continue
-            if batch_had_failure and _is_finish(tool_name):
+            if (batch_had_failure or batch_entry_unconfirmed) and _is_finish(tool_name):
                 # Any verdict queued behind the failure was written before the model saw it: a completed
                 # one may be false, and a failed/terminated one carries a reason that predates the error.
                 st.messages.append(
@@ -4085,6 +4108,9 @@ async def run_agent_tool_loop(
                         "content": (
                             "skipped: a field in this batch failed before this verdict was reached; "
                             "re-observe, then finish with a status that reflects the failure"
+                            if batch_had_failure
+                            else "skipped: a field in this batch could not confirm the value it was given before this "
+                            "verdict was reached; check that field, then finish"
                         ),
                     }
                 )
@@ -4162,9 +4188,10 @@ async def run_agent_tool_loop(
                 )
                 continue
             toggle_exempted = False
-            if batch_had_failure and not batch_had_refusal and _may_submit(tool_name, args):
+            held_back = batch_had_failure or batch_entry_unconfirmed
+            if held_back and not batch_had_refusal and _may_submit(tool_name, args):
                 toggle_exempted = await _is_toggle_click(tool_name, spec, args)
-            if batch_had_failure and _may_submit(tool_name, args) and not toggle_exempted:
+            if held_back and _may_submit(tool_name, args) and not toggle_exempted:
                 st.messages.append(
                     {
                         "role": "tool",
@@ -4173,6 +4200,9 @@ async def run_agent_tool_loop(
                         "content": (
                             "skipped: a field in this batch failed and this call may submit the form; "
                             "fix the field, then re-queue it"
+                            if batch_had_failure
+                            else "skipped: a field in this batch could not confirm the value it was given and this "
+                            "call may submit the form; check that field, then re-queue it"
                         ),
                     }
                 )
@@ -4478,6 +4508,7 @@ async def run_agent_tool_loop(
             _COVERED_LAYER.set(None)
             _TYPE_REACH.set(None)
             _CLICK_DISPATCHED.set(False)
+            _ENTRY_RECORD.set(None)
             _TEXT_DELTA.set(None)
             _TOOL_CALL_SEQ.set(st.total_tool_calls)
             dispatch_ctx = skyvern_context.current()
@@ -4542,7 +4573,8 @@ async def run_agent_tool_loop(
             # arguments themselves being logged.
             navigate_fields = _navigate_record_fields(tool_name, args, result)
             menu_note_fields = _menu_note_record_fields(tool_name, result)
-            reach_fields = _TYPE_REACH.get() or {}
+            reach_fields: dict[str, Any] = dict(_TYPE_REACH.get() or {})
+            reach_fields.update(_ENTRY_RECORD.get() or {})
             # The stall counter is the zero-read signal for "solved, page unchanged, solved again", since a solve-only
             # batch takes no fingerprint. Its 0 is unjudged until a batch is judged, flagged because a null is dropped.
             stall_judged = st.page_state_ever_judged
@@ -4790,6 +4822,7 @@ async def run_agent_tool_loop(
             if result.screenshots:
                 st.pending_screenshots = list(result.screenshots)
             result_data = result.data or {}
+            batch_entry_unconfirmed = batch_entry_unconfirmed or (result.status == "ok" and result.entry_unconfirmed)
             # The page-state stall detector (SKY-15265) re-baselines on these flags. Keeps the FIRST
             # qualifying signal this batch -- the reason field is diagnostic (telemetry), not the
             # decision itself, so a later call's signal never overwrites it.

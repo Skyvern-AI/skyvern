@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import hashlib
 import json
@@ -48,26 +47,19 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
     bound_call_browser_session,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
     browser_session_recovery,
-    clear_sensitive_origin_page_taint,
+    browser_session_turn,
     effective_browser_session_id,
     mcp_browser_context,
-    navigation_replaced_document,
-    sensitive_origin_multi_tab_error,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.webeye.browser_errors import BrowserAutomationError
 
+from .errors import reporting_withheld_browser
 from .guardrails import _authority_tool_error
 from .scouting import _mark_pending_browser_interaction_observation, _record_scouted_interaction
 
@@ -84,7 +76,7 @@ MAX_VALUE_CHARS = 32_000
 SESSION_LIFETIME_SECONDS = float(TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS)
 
 TOOL_DESCRIPTION = (
-    """Run Python against the live browser in a persistent interpreter.
+    f"""Run Python against the live browser in a persistent interpreter.
 
 `target` names the browser: 'debug' (default) is the one this chat drives; 'last_run' is the one the
 most recent test run executed in, when that run minted its own. A continuation on the page a run
@@ -108,12 +100,12 @@ Browser API (async, Playwright-shaped):
 - Navigation: `page.goto(url)`, `page.go_back()`, `page.reload()`. Internal, private-network, and
   non-web destinations are refused.
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
-- After a sensitive sign-in on this page, screenshots, `page.evaluate` and `search_web` are refused for the rest of
-  the turn. Reading text still works; that is the way to inspect such a page.
+- After a test run that used a saved secret in this browser, screenshots, `page.evaluate` and `search_web` are
+  refused here for the rest of the turn. Reading text still works; that is the way to inspect such a page.
 - Tabs and popups: each call starts on the browser's current tab.
   `await tabs()` lists open tabs; `await switch_tab(index)` makes that tab `page` for the rest of the call;
   `await click_and_wait_for_popup(selector)` clicks and returns the new tab's `index` and `url`.
-- Downloads and files: `await click_and_download(selector)` clicks and returns `{file_id, name, size}`
+- Downloads and files: `await click_and_download(selector)` clicks and returns `{{file_id, name, size}}`
   for the downloaded file; `await files.read(file_id)` returns its bytes; `await files.write(name, data)`
   stores text or bytes as a new file (at most 1 MiB of text or 768 KiB of bytes per call);
   `await files.upload(selector, [file_id, ...])` sets files on a file input (at most 50 MiB in total).
@@ -122,7 +114,7 @@ Browser API (async, Playwright-shaped):
   with the same `target`; every call starts on the tab that tool acts on.
 - `await solve_captcha(page)` runs the platform CAPTCHA solver on the current `page`, as in a saved block,
   and raises when the CAPTCHA stays unsolved. A solve can take up to about two minutes, longer than the
-  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. For a
+  {DEFAULT_TIMEOUT_SECONDS:g}-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. For a
   distorted-text image CAPTCHA, `await solve_captcha(page, image=<selector>, input=<selector>)` reads the
   image with the same OCR a saved block uses and types the text into the answer field, raising with
   nothing typed when no text is read. It requires image OCR enabled for the organization; otherwise it
@@ -133,7 +125,7 @@ Browser API (async, Playwright-shaped):
   `click_and_download`, and `files`. A saved block claims a download with
   `"""
     + DownloadClaimHelperContract().call
-    + """`, which is not available here;
+    + f"""`, which is not available here;
   `get_block_schema` for block type `code` returns its parameters.
 
 Not available: imports, names starting with `_`, event listeners (`page.on`, `expect_*`), cookies,
@@ -141,7 +133,7 @@ request interception, and new browser contexts. Using one returns an error that 
 
 Every result lists the browser operations the call sent, in order. A failed call returns the error,
 the failing line, and the operations that already ran; nothing is retried. A call that exceeds
-`timeout_seconds` (default 60, at most 300) or is cancelled stops the interpreter; when an operation
+`timeout_seconds` (default {DEFAULT_TIMEOUT_SECONDS:g}, at most {MAX_TIMEOUT_SECONDS:g}) or is cancelled stops the interpreter; when an operation
 reached the browser without a reply, the result names it and the page must be read again before
 acting on its state. Every executed cell also returns an opaque `executed_source_reference` for the
 exact submitted bytes and observed outcome. Save a cell you ran as a block by passing its reference
@@ -151,7 +143,7 @@ does not mean the code is correct, and the saved workflow run remains the final 
 that value, exactly as it ends a saved CodeBlock, so a complete candidate can be written the way the
 block should read and promoted unchanged.
 
-Limits: code up to 20,000 characters; `value` up to 32,000 characters of JSON and `stdout` up to 16 KB,
+Limits: code up to {MAX_CODE_CHARS:,} characters; `value` up to {MAX_VALUE_CHARS:,} characters of JSON and `stdout` up to 16 KB,
 cut beyond that, so return or print a summary; the first 50 operations are listed; a chat turn holds at
 most 32 files of 16 MB each."""
 )
@@ -263,57 +255,6 @@ def resolve_executed_browser_code_source(
 def expire_executed_browser_code_sources(host: BrowserCodeHost) -> None:
     host.expired_source_references.update(host.executed_sources)
     host.executed_sources.clear()
-
-
-SENSITIVE_ORIGIN_RECOVERY_HINT = (
-    ' On this surface that navigation is a cell containing only `await page.goto("<url>")`; it returns the'
-    " resulting URL and nothing else."
-)
-
-
-def _navigation_only_cell_url(code: str) -> str | None:
-    """The URL when the cell is exactly one ``await page.goto("<literal>")``, else None.
-
-    This is the one cell shape a withheld page accepts: it can carry nothing off the page, and a
-    successful fresh navigation is what lifts the withholding, as it does for the direct tool.
-    """
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return None
-    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr) or not isinstance(tree.body[0].value, ast.Await):
-        return None
-    call = tree.body[0].value.value
-    if not (
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "goto"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "page"
-        and not call.keywords
-        and len(call.args) == 1
-        and isinstance(call.args[0], ast.Constant)
-        and isinstance(call.args[0].value, str)
-    ):
-        return None
-    return call.args[0].value
-
-
-def _recovery_navigated(cell: BrowserCodeCellResult) -> str | None:
-    """The URL a tainted page was replaced by, from the worker's own record, else None.
-
-    The cell's text proves nothing: a persisted rebinding of `page.goto` runs no operation at all.
-    Only the broker's record of exactly one successful `goto` whose document differs from the one it
-    started on shows that the sensitive document is gone.
-    """
-    if not cell.ok or cell.operations_omitted or len(cell.operations) != 1:
-        return None
-    op = cell.operations[0]
-    if op.operation != "goto" or op.succeeded is not True or not op.source_url or not op.result_url:
-        return None
-    if not navigation_replaced_document(op.source_url, op.result_url):
-        return None
-    return op.result_url
 
 
 def _timeout_seconds(value: object) -> float | None:
@@ -594,27 +535,12 @@ async def _run_bound_cell(
     # on" a fact rather than the usual case.
     async with (
         copilot_ctx.credential_fill_lock,
-        browser_page_custody_lock(copilot_ctx),
+        browser_session_turn(copilot_ctx),
         browser_evidence_commit_lock(copilot_ctx),
         browser_session_recovery(copilot_ctx),
     ):
         notes = _take_interruption_note(host)
         session_to_reset = host.session if fresh_namespace else None
-        run_id = copilot_ctx.last_run_blocks_workflow_run_id
-        recovering = False
-        if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
-            if sensitive_origin_page_has_active_run(copilot_ctx):
-                return finish({"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR, **notes})
-            if _navigation_only_cell_url(code) is None:
-                return finish(
-                    {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR + SENSITIVE_ORIGIN_RECOVERY_HINT, **notes}
-                )
-            # The recovery runs in a fresh interpreter: a `page.goto` rebound before the page turned
-            # sensitive could otherwise read the withheld page's URL, which the recorder does not log,
-            # navigate once so the recovery passes, and hand the value to a later cell.
-            await _discard_session(host)
-            notes["session_ended"] = "the interpreter stopped; values and functions from earlier calls are gone"
-            recovering = True
         browser_session_id = effective_browser_session_id(copilot_ctx)
         # The continuity generation counts re-establishments of the chat's own browser. A cell pinned to
         # another browser does not follow it, so a debug re-establishment must not rebind that cell's
@@ -651,10 +577,9 @@ async def _run_bound_cell(
                         raise
                 if fresh_namespace:
                     notes["fresh_namespace"] = "this call started a new interpreter; earlier Python values are absent"
-                # A page this turn visited a sensitive origin on stays tainted after its facts stop
-                # being withheld. Scrubbing works on values, and pixels are not values, so a cell that
-                # can screenshot it can carry the page out of here a chunk at a time.
-                pixels_denied = sensitive_origin_page_is_tainted(copilot_ctx)
+                # Scrubbing works on values returned to the model; a screenshot, script or fetch can carry
+                # what a secret-carrying run left on the page somewhere else, so code cannot use those here.
+                pixels_denied = browser_session_id in copilot_ctx.secret_run_browser_session_ids
                 cell = await _run_cell(host, session, code, timeout, deny_pixels=pixels_denied)
         except BrowserCodeSessionUnavailableError as exc:
             if exc.session_ended:
@@ -737,32 +662,6 @@ async def _run_bound_cell(
                     ended["page_after_call"] = "unknown: that operation reached the browser without a reply"
                 notes["session_ended_during_call"] = ended
             await _discard_session(host)
-        if recovering:
-            replaced_by = _recovery_navigated(cell)
-            # A failed recovery leaves the page on the sensitive origin, so not even its URL is returned;
-            # a successful one returns only the new document's URL, never a value or stdout.
-            if replaced_by is None:
-                return finish(
-                    {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR + SENSITIVE_ORIGIN_RECOVERY_HINT, **notes}
-                )
-            if not await clear_sensitive_origin_page_taint(copilot_ctx):
-                return finish({"ok": False, "error": await sensitive_origin_multi_tab_error(copilot_ctx), **notes})
-            return finish({"ok": True, "current_url": replaced_by, **notes})
-        if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
-            operations_sent = len(cell.operations) + cell.operations_omitted
-            return finish(
-                {
-                    "ok": False,
-                    "error": SENSITIVE_ORIGIN_PAGE_ERROR + SENSITIVE_ORIGIN_RECOVERY_HINT,
-                    "operations_sent": operations_sent,
-                    "executed_source_reference": source_reference,
-                    **notes,
-                }
-            )
-        if pixels_denied and _recovery_navigated(cell) is not None:
-            # On the replace surface no other tool navigates, so without this a finished run's taint
-            # denies pixels on this browser for the rest of the chat.
-            await clear_sensitive_origin_page_taint(copilot_ctx)
         result = finish(
             {**_cell_payload(cell), "executed_source_reference": source_reference, **notes, **binding.provenance()}
         )
@@ -799,6 +698,6 @@ run_browser_code_tool = FunctionTool(
     name=TOOL_NAME,
     description=TOOL_DESCRIPTION,
     params_json_schema=TOOL_SCHEMA,
-    on_invoke_tool=_run_browser_code_invoke,
+    on_invoke_tool=reporting_withheld_browser(_run_browser_code_invoke),
     strict_json_schema=False,
 )

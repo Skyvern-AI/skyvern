@@ -47,6 +47,12 @@ Skyvern requests a scope profile for the integration the user connects.
 | Scope | Purpose |
 |-------|---------|
 | `https://www.googleapis.com/auth/gmail.readonly` | Read messages for verification codes and magic links |
+| `https://www.googleapis.com/auth/gmail.send` | Send email from the connected account |
+| `openid`, `email` | Verify which Google account was connected, so mail is only sent from that account |
+
+The **Gmail** card has two checkboxes, **Read inbox** and **Send email**. Read inbox is ticked by default and Send email is not. Google is asked only for what is ticked: `gmail.readonly` for reading, and `gmail.send`, `openid` and `email` for sending. A consent that includes sending must be approved in full; otherwise nothing is saved and an existing connection stays as it was.
+
+Under **Connected Google Accounts**, each Gmail connection shows which of the two it has. Click the one it lacks to add it; the connection keeps its ID and current access. `gmail.send` is a sensitive scope, so add it to your OAuth consent screen before users connect.
 
 ### Google Drive
 

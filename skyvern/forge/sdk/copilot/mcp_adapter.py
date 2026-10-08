@@ -50,14 +50,14 @@ from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
     RAW_SECRET_BROWSER_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
+    RunSecretsNotRegistered,
     bound_call_browser_session,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
     browser_session_recovery,
+    browser_session_turn,
     close_browser_session_quietly,
     current_call_browser_session_override,
     ensure_browser_session,
@@ -65,8 +65,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
     raw_secret_browser_denied,
     retire_browser_session_id,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -512,6 +510,8 @@ class SchemaOverlay:
     # Params the copilot offers on top of the MCP tool's own schema. A hook consumes them; they are
     # stripped before the call, so the underlying tool never sees an argument it cannot accept.
     copilot_params: dict[str, Any] = field(default_factory=dict)
+    # Merged over an MCP param's own schema (an enum, a description) while the argument still reaches the tool.
+    param_patches: dict[str, dict[str, Any]] = field(default_factory=dict)
     requires_browser: bool = False
     # Dispatch overwrites binds_chat_workflow_param with the chat's own workflow, so the model cannot
     # aim the call at any other workflow. Pair it with hiding that param from the schema.
@@ -520,7 +520,6 @@ class SchemaOverlay:
     # Creates or changes future runs, so a turn without browser authority, which may not start a
     # run either, does not see it.
     requires_run_authority: bool = False
-    redacts_sensitive_origin_structured_result: bool = False
     # Set when the post-hook is what keeps stored values from the model: a crash then withholds the
     # result instead of falling back to the unfiltered one.
     post_hook_fails_closed: bool = False
@@ -1391,6 +1390,10 @@ def _apply_schema_overlay(
             required.remove(mcp_param)
             required.append(copilot_param)
 
+    for param, patch in overlay.param_patches.items():
+        if param in props:
+            props[param] = {**props[param], **patch}
+
     props.update(overlay.copilot_params)
 
     if overlay.required_overrides is not None:
@@ -1613,7 +1616,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         owning_call_id = (meta or {}).get(_TOOL_CALL_ID_META_KEY)
         try:
             if overlay.requires_browser:
-                async with browser_page_custody_lock(
+                async with browser_session_turn(
                     copilot_ctx, session_id=call_binding.session_id_for(copilot_ctx) if call_binding else None
                 ):
                     with (
@@ -1629,6 +1632,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                     capturing_tool_call(owning_call_id),
                 ):
                     return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
+        except RunSecretsNotRegistered as exc:
+            return _copilot_to_call_tool_result({"ok": False, "error": str(exc)}, tool_name)
         except BaseException as exc:
             if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 LOG.warning("MCP tool dispatch failed")
@@ -1963,25 +1968,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                             }
                         else:
                             copilot_result = base_copilot_result
-                    # The last disclosure boundary, so it also runs after a crashed post-hook. It fails
-                    # closed when an unexpected producer marks the exact session while an enrichment awaits.
-                    sensitive_result_is_scrubbable = (
-                        overlay.redacts_sensitive_origin_structured_result
-                        and not sensitive_origin_page_facts_withheld(
-                            copilot_ctx, getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
-                        )
-                    )
-                    if (
-                        overlay.requires_browser
-                        and sensitive_origin_page_is_tainted(copilot_ctx)
-                        and not sensitive_result_is_scrubbable
-                    ):
-                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                        copilot_result = {
-                            "ok": False,
-                            "error": SENSITIVE_ORIGIN_PAGE_ERROR,
-                            **binding.provenance(),
-                        }
 
             if isinstance(copilot_result, dict):
                 await _stamp_page_state(copilot_result)

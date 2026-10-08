@@ -23,7 +23,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, OriginRunRedactionRegistry
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
     MIN_PERSISTED_REDACTION_LENGTH,
     REDACTED_SECRET_PLACEHOLDER,
@@ -510,25 +510,6 @@ class TestPersistenceSeam:
 
 
 class TestOriginRunBinding:
-    def test_binding_a_complete_registry_marks_the_run_bound(self) -> None:
-        ctx = _agent_ctx()
-        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-            "wr_1", {"password": _FAKE_PASSWORD}, contains_sensitive_values=True, contains_all_sensitive_values=True
-        )
-
-        assert secret_scrub.register_matching_origin_run_redaction_values(ctx, "wr_1") is True
-        assert secret_scrub.origin_runs_bound_to_scrubber(ctx) == {"wr_1"}
-        assert _FAKE_PASSWORD in registered_scrub_values(ctx)
-
-    def test_an_incomplete_registry_binds_nothing(self) -> None:
-        ctx = _agent_ctx()
-        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-            "wr_1", {"password": _FAKE_PASSWORD}, contains_sensitive_values=True, contains_all_sensitive_values=False
-        )
-
-        assert secret_scrub.register_matching_origin_run_redaction_values(ctx, "wr_1") is False
-        assert secret_scrub.origin_runs_bound_to_scrubber(ctx) == set()
-
     def test_importing_this_module_stays_cheap(self) -> None:
         """This module sits on the logging and span-exception paths.
 

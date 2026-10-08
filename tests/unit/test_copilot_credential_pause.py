@@ -2435,6 +2435,22 @@ async def test_the_update_card_after_a_pick_waits_for_its_own_answer(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_a_pick_card_carries_the_one_login_the_user_named_and_an_update_card_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
+    ctx.request_policy.current_turn_named_credential_ids = {"cred_1"}
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("connected", "cred_1"), ("skip", None)]))
+
+    await _call_ask_tool(ctx)
+    await _call_ask_tool(ctx, credential_id="cred_1")
+
+    assert [card.named_credential_id for card in _sent_cards(ctx)] == ["cred_1", None]
+
+
+@pytest.mark.asyncio
 async def test_an_update_ask_leaves_the_pick_budget_for_a_later_card(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _FakeCache()
     ctx = _tool_ctx(monkeypatch, cache)
@@ -2536,7 +2552,12 @@ async def test_an_authenticator_code_method_names_the_fill_tool_only_when_the_tu
         results.append(await _call_ask_tool(ctx, credential_id="cred_1"))
     with_tool, without_tool = results
 
-    assert without_tool == {"ok": True, "status": "has_code_method", "method": "authenticator"}
+    assert (without_tool["ok"], without_tool["status"], without_tool["method"]) == (
+        True,
+        "has_code_method",
+        "authenticator",
+    )
+    assert without_tool["detail"]
     assert {key: value for key, value in with_tool.items() if key != "next"} == without_tool
     assert with_tool["next"]
 
@@ -2927,6 +2948,26 @@ async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_
     assert ctx.credential_pause_outcome == "signed_in"
     assert _turn_credential_prompt_reason(ctx) is None
     assert await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config) is None
+
+
+@pytest.mark.asyncio
+async def test_a_card_answered_by_signing_in_tells_the_tool_what_happened(monkeypatch: pytest.MonkeyPatch) -> None:
+    signed_in = credential_pause_module.SignedInProfile(
+        browser_profile_id="bp_signed_in",
+        profile_name="Sign-in for portal.example.com",
+        site="portal.example.com",
+        cookie_count=2,
+    )
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
+        "signed_in", None, "tok-1", signed_in=signed_in
+    )
+    ctx = _tool_ctx(monkeypatch, cache)
+
+    result = await _call_ask_tool(ctx)
+
+    assert (result["status"], result["browser_profile_id"]) == ("signed_in", "bp_signed_in")
+    assert result["detail"]
 
 
 _REGISTRATION = {

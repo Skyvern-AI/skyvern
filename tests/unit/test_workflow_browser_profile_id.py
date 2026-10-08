@@ -16,7 +16,7 @@ from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService, _workflow_save_fingerprint
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowStatus
 
 
 def _make_workflow(browser_profile_id: str | None = None) -> Workflow:
@@ -725,7 +725,13 @@ def _make_workflow_update_service(
         created_by=existing_created_by,
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
-    updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")
+    updated_workflow = SimpleNamespace(
+        workflow_id="wf_new",
+        organization_id="org_1",
+        workflow_permanent_id="wpid_test",
+        version=3,
+        status=WorkflowStatus.published,
+    )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=existing_workflow)  # type: ignore[method-assign]
     service.create_workflow = AsyncMock(return_value=potential_workflow)  # type: ignore[method-assign]
@@ -734,6 +740,7 @@ def _make_workflow_update_service(
     )
     service.validate_workflow_block_graph = Mock()  # type: ignore[method-assign]
     service._validate_payload_templates = Mock()  # type: ignore[method-assign]
+    service.schedule_workflow_saved_hook = Mock()  # type: ignore[method-assign]
     service.update_workflow_definition = AsyncMock(return_value=updated_workflow)  # type: ignore[method-assign]
     service.maybe_delete_cached_code = AsyncMock()  # type: ignore[method-assign]
     service._refresh_workflow_schedule_runtime_limits = AsyncMock()  # type: ignore[method-assign]

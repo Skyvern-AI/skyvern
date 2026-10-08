@@ -777,7 +777,8 @@ class WorkflowRunContext:
         if label in self.blocks_metadata:
             self.blocks_metadata[label].update(metadata)
             return
-        self.blocks_metadata[label] = metadata
+        # Stored as a copy: a caller's dict kept by reference would be rewritten by a later update for this label.
+        self.blocks_metadata[label] = metadata.copy()
 
     def get_block_metadata(self, label: str | None) -> BlockMetadata:
         if label is None:

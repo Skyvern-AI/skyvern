@@ -1067,6 +1067,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
     credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
+    named_credential_id: str | None = Field(
+        None, description="The one credential the user named this turn, offered for a one-click confirmation"
+    )
     timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
     expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
     anchor_tool_call_id: str | None = Field(
