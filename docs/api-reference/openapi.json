@@ -4783,10 +4783,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
