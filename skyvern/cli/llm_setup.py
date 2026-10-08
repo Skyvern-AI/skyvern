@@ -13,6 +13,22 @@ from .masked_prompt import ask_secret
 
 DEFAULT_POSTGRES_DATABASE_STRING = "postgresql+psycopg://skyvern@localhost:5432/skyvern"
 
+# Keys whose values get quote-stripped before being persisted, since a value copy-pasted
+# with surrounding quotes (e.g. from a shell export or another .env) breaks the provider SDKs.
+SENSITIVE_ENV_KEYS = {
+    "SKYVERN_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_API_KEY",
+    "AZURE_GPT4O_MINI_API_KEY",
+    "GEMINI_API_KEY",
+    "YUTORI_API_KEY",
+    "NOVITA_API_KEY",
+    "VOLCENGINE_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+}
+
 
 def capture_setup_event(
     event_name: str,
@@ -80,6 +96,11 @@ def update_or_add_env_var(
         }
         for k, v in defaults.items():
             set_key(resolved_env_path, k, v)
+
+    if key in SENSITIVE_ENV_KEYS:
+        from skyvern.cli.utils import strip_quotes  # noqa: PLC0415
+
+        value = strip_quotes(value)
 
     load_dotenv(resolved_env_path)
     set_key(resolved_env_path, key, value)
