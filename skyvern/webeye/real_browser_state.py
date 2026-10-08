@@ -24,6 +24,7 @@ from skyvern.constants import (
 from skyvern.exceptions import (
     BrowserStateDiagnostic,
     EmptyBrowserContext,
+    ExternalBrowserUnavailable,
     FailedToNavigateToUrl,
     FailedToReloadPage,
     FailedToStopLoadingPage,
@@ -197,7 +198,10 @@ class RealBrowserState(BrowserState):
         browser_context_route_policy_url: str | None = None,
         runtime_event_context: BrowserRuntimeLogContext | None = None,
         defer_runtime_events: bool = False,
+        external_browser: bool = False,
     ):
+        # A browser the caller owns: this state never closes its pages, context or browser, and never rebuilds it.
+        self.external_browser = external_browser
         self._runtime_event_context = runtime_event_context or BrowserRuntimeLogContext.current()
         self._run_released = False
         if engine_selection is not None:
@@ -403,7 +407,7 @@ class RealBrowserState(BrowserState):
         # A tab can die on its own (a download-turned-navigation, a renderer crash) while the
         # context survives. Recover here rather than in each consumer: every caller that needs a
         # page treats "no page" as fatal, so one of them recovering only relocates the failure.
-        if self.browser_context is None or not self.is_connected():
+        if self.browser_context is None or self.external_browser or not self.is_connected():
             return None
         async with self._reopen_working_page_lock:
             already_reopened = await self.get_working_page()
@@ -443,6 +447,8 @@ class RealBrowserState(BrowserState):
             return page
 
     async def _close_all_other_pages(self, discard_orphaned_videos: bool = False) -> None:
+        if self.external_browser:
+            return
         cur_page = await self.get_working_page()
         if not self.browser_context or not cur_page:
             return
@@ -533,6 +539,8 @@ class RealBrowserState(BrowserState):
         sessionless_init_script_registrations: Collection[Any] = (),
     ) -> None:
         if self.browser_context is None:
+            if self.external_browser:
+                raise ExternalBrowserUnavailable("the connection to the browser was lost")
             LOG.info("creating browser context")
             context = skyvern_context.current()
             effective_route_policy_url = (
@@ -608,7 +616,9 @@ class RealBrowserState(BrowserState):
             has_remote_browser_session = bool(
                 self.browser_artifacts and self.browser_artifacts.remote_browser_session_id
             )
-            if (browser_address or has_remote_browser_session) and len(self.browser_context.pages) > 0:
+            if (browser_address or has_remote_browser_session or self.external_browser) and len(
+                self.browser_context.pages
+            ) > 0:
                 pages = await self.list_valid_pages()
                 if pages:
                     page = pages[-1]
@@ -738,7 +748,7 @@ class RealBrowserState(BrowserState):
             )
         ]
 
-        if max_pages <= 0 or len(pages) <= max_pages:
+        if max_pages <= 0 or self.external_browser or len(pages) <= max_pages:
             return pages
 
         # Oldest first, skipping the selected tab: a code block can switch to an older tab, and
@@ -967,6 +977,8 @@ class RealBrowserState(BrowserState):
         # Recorded before the close is scheduled: the close is a detached task, and until it lands the
         # crashed page is still in context.pages. Callers in that window must not be handed it.
         self._crashed_pages.add(page)
+        if self.external_browser:
+            return
         try:
             task = asyncio.get_running_loop().create_task(self._close_crashed_page(page))
         except RuntimeError:
@@ -1586,6 +1598,8 @@ class RealBrowserState(BrowserState):
         )
 
     async def close_current_open_page(self) -> bool:
+        if self.external_browser:
+            return False
         context = None
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
@@ -1717,6 +1731,12 @@ class RealBrowserState(BrowserState):
         )
 
     async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
+        if self.external_browser:
+            if close_browser_on_completion:
+                await self._run_on_close_callbacks()
+            if release_driver is not False:
+                await self.detach_remote_driver()
+            return False
         # ``release_driver`` decouples the local Playwright driver's lifetime
         # from the remote browser's: callers that retain this state for reuse
         # (persistent sessions, parent/child sharing) must pass False; None

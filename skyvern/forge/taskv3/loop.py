@@ -333,6 +333,8 @@ _HIT_CLASS: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_hit_class", d
 _COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_layer", default=None)
 # Where a typing call's reach probe ran and whether it scrolled first; set only by that probe.
 _TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach", default=None)
+# A click that raised after the page received it (a slow submit whose navigation had not committed).
+_CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
 # The text-delta read's cost and yield for the one tool call this context covers.
 _TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | None] = ContextVar(
     "taskv3_text_delta", default=None
@@ -429,6 +431,10 @@ def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_docu
         "hit_on_document_root": hit_on_document_root,
     }
     _TYPE_REACH.set({key: value or seen.get(key, False) for key, value in new.items()})
+
+
+def record_click_dispatched() -> None:
+    _CLICK_DISPATCHED.set(True)
 
 
 # What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
@@ -770,6 +776,13 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # Refusals left uncharged in a row before a refusal is charged like any failed call. The repeat guard cannot
 # bound them (a stale address resets it), so this does.
 UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
+# Rounds a single-action block may spend past its cap before its own action has landed. The step engine
+# completes such a block on one SUCCESSFUL step after retrying failed ones, and lets that step batch a
+# precursor; a v3 cap of 1 is spent by a hover, a precursor, or a click that failed without moving the page.
+ACTION_BLOCK_TARGET_ACTION_RESERVE = 2
+# Set on a click result once the driver's click returned, so a later verification error still reads as dispatched.
+CLICK_DISPATCHED_DATA_KEY = "click_dispatched"
+TARGET_ACTION_ROUND_EVENT = "taskv3 loop target action round"
 # Facetable event names — both the grant and the refusal are queryable so the gate's decision
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
@@ -3173,6 +3186,11 @@ class LoopState:
     block_completion_offered: bool = False
     # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
     block_action_transitioned: bool = False
+    # A billable call that succeeded and did more than reveal state, as a hover or a menu-opening click does. One that
+    # may have submitted, or a failed call that may have moved the page, also sets the second flag: no round follows it.
+    block_action_committed: bool = False
+    block_action_may_have_landed: bool = False
+    target_action_rounds_granted: int = 0
 
 
 async def run_agent_tool_loop(
@@ -3251,6 +3269,8 @@ async def run_agent_tool_loop(
     # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
     # finish(completed) instead of failing the block, as the step engine completes it after that step.
     single_action_block: bool = False,
+    # Rounds such a block may add, one per cap trip, while its own action has not landed.
+    target_action_reserve: int = 0,
     # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
     block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
 ) -> LoopOutcome:
@@ -3621,6 +3641,47 @@ async def run_agent_tool_loop(
     # gone the turn after).
     started_at = time.monotonic()
     deadline_at = started_at + deadline_seconds if deadline_seconds is not None else None
+
+    async def _reserve_target_action_round(tool_name: str) -> bool:
+        if (
+            not single_action_block
+            or st.target_action_rounds_granted >= target_action_reserve
+            or st.block_action_transitioned
+            or st.final_turn_granted
+        ):
+            return False
+        verdict: str | None = None
+        if st.block_action_may_have_landed:
+            # A click or Enter may have submitted without moving the URL, and a failed call that moved the page left
+            # it; another round could submit twice or act on the next page.
+            reason = "may_have_landed"
+        elif not st.block_action_committed:
+            reason = "nothing_committed"
+        elif block_completion_check is None:
+            reason = "no_judge"
+        else:
+            try:
+                judged = await block_completion_check()
+                verdict = judged.verdict if judged.skipped_reason is None else None
+                reason = f"judge_{judged.skipped_reason or judged.verdict}"
+            except Exception:
+                LOG.warning("taskv3 target action judge raised", exc_info=True)
+                reason = "judge_error"
+        granted = reason == "nothing_committed" or verdict == "not_achieved"
+        if granted:
+            st.target_action_rounds_granted += 1
+            st.max_action_steps = (st.max_action_steps or 0) + 1
+        LOG.info(
+            TARGET_ACTION_ROUND_EVENT,
+            granted=granted,
+            reason=reason,
+            rounds_granted=st.target_action_rounds_granted,
+            max_action_steps=st.max_action_steps,
+            action_steps=st.action_steps,
+            tool=tool_name,
+            turn=st.turns,
+        )
+        return granted
 
     def _extension_gate(extension: int, headroom_gain: tuple[int, int, int]) -> tuple[bool, str]:
         refresh_ctx = skyvern_context.current()
@@ -4131,6 +4192,7 @@ async def run_agent_tool_loop(
                 and spec.billable
                 and st.max_action_steps is not None
                 and st.action_steps >= st.max_action_steps
+                and not await _reserve_target_action_round(tool_name)
             ):
                 base_cap = st.original_action_steps if st.original_action_steps else st.max_action_steps
                 raw_extension = base_cap // 2
@@ -4173,7 +4235,7 @@ async def run_agent_tool_loop(
                         and next_tokens <= backstops_for_cap(st.max_action_steps)[2]
                         and grant_max_turns > st.max_turns
                     )
-                if st.max_action_steps >= extension_limit:
+                if st.max_action_steps - st.target_action_rounds_granted >= extension_limit:
                     allowed, gate_reason = False, "extension_limit_reached"
                 elif raw_extension <= 0:
                     allowed, gate_reason = False, "cap_too_small"
@@ -4313,7 +4375,7 @@ async def run_agent_tool_loop(
                         )
                         if judged is not None and judged.verdict == "achieved":
                             block_reason = (
-                                f"performed the block's action ({st.billable_actions[0]}); "
+                                f"performed the block's action ({st.billable_actions[-1]}); "
                                 "a further action was past the block's step limit"
                             )
                             # Through the real handler, so every guard on a completed verdict still applies.
@@ -4415,6 +4477,7 @@ async def run_agent_tool_loop(
             _HIT_CLASS.set(None)
             _COVERED_LAYER.set(None)
             _TYPE_REACH.set(None)
+            _CLICK_DISPATCHED.set(False)
             _TEXT_DELTA.set(None)
             _TOOL_CALL_SEQ.set(st.total_tool_calls)
             dispatch_ctx = skyvern_context.current()
@@ -4696,6 +4759,16 @@ async def run_agent_tool_loop(
             st.messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": transcript_content}
             )
+            # The two ways a secret reaches the page: a credential placeholder typed by an entry tool, and a value a
+            # tool registered as secret (a delivered verification code) for the model to type next. `navigate`
+            # resolves placeholders in a URL too.
+            call_entered_secret = (
+                (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
+                and bool(_credential_placeholders(args))
+            ) or (dispatch_ctx is not None and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before)
+            if call_entered_secret and (result.touched_page or not result.refused):
+                # A second round after a secret, ok or failed, could submit it again and spend a lockout attempt.
+                st.block_action_may_have_landed = True
             if tool_trail is not None and spec is not None and not spec.terminal:
                 tool_trail.record(
                     TrailEntry(
@@ -4704,18 +4777,7 @@ async def run_agent_tool_loop(
                         content=model_facing_content,
                         perception=spec.compactable,
                         page_changing=spec.touches_page and (result.touched_page or not result.refused),
-                        # The two ways a secret reaches the page: a credential placeholder typed by an
-                        # entry tool, and a value a tool registered as secret (a delivered verification
-                        # code) for the model to type next.
-                        # `navigate` resolves placeholders in a URL too.
-                        secret_entered=(
-                            (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
-                            and bool(_credential_placeholders(args))
-                        )
-                        or (
-                            dispatch_ctx is not None
-                            and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before
-                        ),
+                        secret_entered=call_entered_secret,
                         entered=entered_values(tool_name, args),
                         # Masked like the content, so an unchanged URL compares equal to the one observe prints.
                         url_before=_trail_url_before(result, skyvern_ctx),
@@ -4871,6 +4933,9 @@ async def run_agent_tool_loop(
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
+                    if not (tool_name == "hover" or (tool_name == "click" and result_data.get("menu_note"))):
+                        st.block_action_committed = True
+                        st.block_action_may_have_landed |= _may_submit(tool_name, args)
                     # click reports it at the top level, navigate inside its action outcome. A navigation that
                     # landed on an error page moved the URL without doing the block's action.
                     if not _outcome_reports_failure(round_outcome) and (
@@ -4987,6 +5052,18 @@ async def run_agent_tool_loop(
                         # document, and the fingerprint may render identically on the new one (a
                         # same-template step) — absorb it here or the rung survives that blindness.
                         st.canonical.progress(_ProgressEvidence.PROBE_MISMATCH)
+                # Only a click reports whether the page received it; a failed Enter or code call may have submitted.
+                may_have_submitted = (
+                    _CLICK_DISPATCHED.get()
+                    or bool(result_data.get(CLICK_DISPATCHED_DATA_KEY))
+                    or (tool_name != "click" and _may_submit(tool_name, args))
+                )
+                if spec is not None and spec.billable and (poisoned or may_have_submitted) and not list_left_open:
+                    st.block_action_may_have_landed = True
+                elif tool_name in FILL_TOOLS and (result.touched_page or not result.refused):
+                    # A failed entry may still have written the field (a partial or other value); only the judge,
+                    # which also skips after a typed secret, can say another round is safe.
+                    st.block_action_committed = True
                 if poisoned:
                     if tool_calls[idx + 1 :]:
                         if list_left_open:

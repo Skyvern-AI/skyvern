@@ -72,6 +72,7 @@ from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
     NAV_DEAD_END_GUARD,
     TOKEN_BUDGET_EXTENDED_EVENT,
@@ -2901,6 +2902,37 @@ async def test_execute_task_v3_atomic_block_ceiling_pinned_to_its_own_cap(monkey
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == 5
     assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pool", "reserve"),
+    [
+        (None, ACTION_BLOCK_TARGET_ACTION_RESERVE),
+        ((40, 50), ACTION_BLOCK_TARGET_ACTION_RESERVE),
+        ((49, 50), 1),
+        ((50, 50), 0),
+    ],
+    ids=["no_pool", "pool_funds_it", "pool_cuts_it", "pool_spent"],
+)
+async def test_execute_task_v3_action_block_target_reserve_answers_to_the_run_pool_not_the_pinned_ceiling(
+    monkeypatch: pytest.MonkeyPatch, pool: tuple[int, int] | None, reserve: int
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=pool))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock, navigation_goal="Click Next"),
+        workflow_run_id="wr_action_reserve",
+        max_steps_per_run=1,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    kwargs = loop_mock.await_args.kwargs
+    assert kwargs["max_action_steps"] == 1
+    assert kwargs["max_action_steps_ceiling"] == 1
+    assert kwargs["target_action_reserve"] == reserve
 
 
 class _AdvancingFormPage(_FakePage):

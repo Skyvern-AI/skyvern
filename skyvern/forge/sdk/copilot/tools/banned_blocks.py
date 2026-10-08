@@ -11,6 +11,7 @@ import yaml
 
 from skyvern.forge.sdk.copilot.author_time_block import BANNED_BLOCKS_BLOCK_ID, AuthorTimeBlock
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.code_block_security import DENIED_PAGE_MEMBERS
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -383,16 +384,10 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
         "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
         WRAPPER_SCOPE_RUNTIME_FACT,
-        (
-            "When a scouting tool offers a SYNTHESIZED CODE BLOCK it already encodes the interactions you scouted as "
-            "deterministic Playwright: persist it verbatim and hand-author only the steps it does not cover. A "
-            "persisted code block must not use page.evaluate, page.evaluate_handle, page.request, or page.context. "
-            "Use locators and locator DOM-reading methods such as inner_text, text_content, get_attribute, count, "
-            "and is_visible instead."
-        ),
+        f"A persisted code block must not use {' or '.join(f'page.{member}' for member in DENIED_PAGE_MEMBERS)}.",
         "For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.",
         availability,
-        "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
+        "Use concrete selectors and text anchors found during exploration.",
         "A saved run executes this block against a page it loads itself, without the interactions performed while scouting. Whatever the page requires before the target is reachable is part of what the block does, not a condition it inherits.",
         _code_only_browser_validation_guidance(agent_blocks=agent_blocks),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",

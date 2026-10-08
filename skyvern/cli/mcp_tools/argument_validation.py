@@ -18,9 +18,9 @@ model receives a clear message naming the unsupported and expected arguments
 with no ``arguments`` at all also falls through: pydantic handles it,
 rejecting only when the tool has required parameters.
 
-Type-level mismatches the repair step doesn't cover (an out-of-range int, a
-still-malformed list) still reach FastMCP's own pydantic validation inside
-``call_next``. Those are deliberately not silently coerced — an ambiguous
+Type-level mismatches the repair step doesn't cover (an out-of-range number with
+no unit to infer, a still-malformed list) still reach FastMCP's own pydantic
+validation inside ``call_next``. Those are deliberately not silently coerced — an ambiguous
 shape should fail rather than be guessed at — but the resulting
 ``fastmcp.exceptions.ValidationError`` is caught here too and wrapped in the
 same structured envelope, so the model always gets an actionable message
@@ -46,6 +46,7 @@ _MAX_REPAIR_LIST_ITEMS = 100
 # Repair only production-observed fields whose comma-delimited meaning is known;
 # the schema check below prevents this policy from outliving a signature change.
 _COMMA_SEPARATED_LIST_ARGUMENTS = frozenset({("skyvern_workflow_run_list", "status")})
+_MILLISECOND_FLOOR = 1000
 # Same policy for production-observed fields documented as a JSON string that callers send as
 # the object that string is supposed to encode.
 _JSON_STRING_OBJECT_ARGUMENTS = frozenset({("skyvern_workflow_run", "parameters")})
@@ -75,6 +76,63 @@ def _split_comma_separated_list(value: Any) -> Any:
     if len(items) > _MAX_REPAIR_LIST_ITEMS or any(not item for item in items):
         return value
     return items
+
+
+def _millisecond_bounds(schema: Any, *, minimum_floor: float) -> tuple[float, float | None] | None:
+    """Return ``(minimum, maximum)`` when ``schema`` describes a millisecond duration.
+
+    The floor is 1000 for ambiguous ``timeout`` names; an explicit ``_ms`` suffix can use
+    the schema's lower bound directly. This avoids inferring units from unrelated parameters.
+    """
+    if not isinstance(schema, dict):
+        return None
+    for alternatives in (schema.get("anyOf"), schema.get("oneOf")):
+        if isinstance(alternatives, list):
+            for option in alternatives:
+                bounds = _millisecond_bounds(option, minimum_floor=minimum_floor)
+                if bounds is not None:
+                    return bounds
+    schema_type = schema.get("type")
+    types = schema_type if isinstance(schema_type, list) else [schema_type]
+    if not any(entry in ("integer", "number") for entry in types):
+        return None
+    minimum = schema.get("minimum")
+    if not isinstance(minimum, (int, float)) or isinstance(minimum, bool) or minimum < minimum_floor:
+        return None
+    maximum = schema.get("maximum")
+    if not isinstance(maximum, (int, float)) or isinstance(maximum, bool):
+        return minimum, None
+    return minimum, maximum
+
+
+def _rescale_seconds_to_milliseconds(name: str, schema: Any, value: Any) -> Any:
+    """Scale a sub-floor value on a millisecond parameter, which callers undershoot in seconds.
+
+    The name gate matters as much as the bound: a non-duration parameter could legitimately
+    carry a 1000 minimum, and multiplying its value by 1000 would be silent corruption.
+    """
+    if name == "timeout":
+        minimum_floor = _MILLISECOND_FLOOR
+    elif name.endswith("_ms"):
+        # An explicit unit suffix identifies milliseconds even when the schema floor is < 1s.
+        minimum_floor = 0
+    else:
+        return value
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    bounds = _millisecond_bounds(schema, minimum_floor=minimum_floor)
+    if bounds is None:
+        return value
+    minimum, maximum = bounds
+    if not 0 < value < minimum:
+        return value
+    rescaled = value * 1000
+    if rescaled < minimum:
+        return value
+    # Rescaling past the ceiling would swap one validation failure for a less recognizable one.
+    if maximum is not None and rescaled > maximum:
+        return value
+    return int(rescaled) if isinstance(rescaled, float) and rescaled.is_integer() else rescaled
 
 
 def _encode_json_object(value: Any) -> Any:
@@ -108,18 +166,8 @@ def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any])
             and not _schema_accepts_type(schema, "object")
         ):
             arguments[name] = _encode_json_object(value)
-
-    timeout = arguments.get("timeout")
-    if (
-        tool_name == "skyvern_navigate"
-        and isinstance(timeout, (int, float))
-        and not isinstance(timeout, bool)
-        and 0 < timeout < 1000
-    ):
-        timeout_ms = timeout * 1000
-        arguments["timeout"] = (
-            int(timeout_ms) if isinstance(timeout_ms, float) and timeout_ms.is_integer() else timeout_ms
-        )
+        else:
+            arguments[name] = _rescale_seconds_to_milliseconds(name, schema, value)
 
 
 def _argument_contract(tool: Any) -> tuple[set[str], set[str]] | None:

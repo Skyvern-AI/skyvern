@@ -36,6 +36,7 @@ from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTIO
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_MAX_FACTOR,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
@@ -43,6 +44,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
+    CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -65,6 +67,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    TARGET_ACTION_ROUND_EVENT,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
     UNCHARGED_REFUSAL_GRACE,
@@ -90,6 +93,7 @@ from skyvern.forge.taskv3.loop import (
     _RevisitMemory,
     current_tool_call_seq,
     make_finish_tool,
+    record_click_dispatched,
     record_covered_layer,
     record_hit_class,
     record_resolve_seconds,
@@ -1252,6 +1256,287 @@ async def test_step_cap_block_completion_evidence_log_carries_the_verdict_not_th
     [evidence] = [entry for entry in logs if entry["event"] == "taskv3 block completion evidence"]
     assert evidence["judge_verdict"] == "not_achieved"
     assert "482913" not in repr(evidence)
+
+
+def _flaky_click(sink: list[dict[str, Any]], fail_first: int, landed: dict[str, Any] | None = None) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(args)
+        if len(sink) <= fail_first:
+            return ToolResult.error("click timed out: element is not stable")
+        return ToolResult.ok("clicked button 'Next'", data=landed if landed is not None else _REACHED_TARGET)
+
+    return ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+
+
+def _scripted_block_check(*verdicts: GoalVerdict) -> tuple[Callable[[], Awaitable[GoalVerdict]], list[GoalVerdict]]:
+    asked: list[GoalVerdict] = []
+
+    async def check() -> GoalVerdict:
+        verdict = verdicts[min(len(asked), len(verdicts) - 1)]
+        asked.append(verdict)
+        return verdict
+
+    return check, asked
+
+
+_NOT_ACHIEVED = GoalVerdict("not_achieved", "Next", "the next page", None, 0.1)
+_ACHIEVED = GoalVerdict("achieved", "", "", None, 0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserve", [0, ACTION_BLOCK_TARGET_ACTION_RESERVE], ids=["no_reserve", "reserve"])
+async def test_a_one_click_block_lands_its_click_after_a_hover_and_a_failed_click(reserve: int) -> None:
+    # Cap 1 is the action block's default. The hover and the click that failed without moving the page did not
+    # do the block's action, so they must not leave the click it asked for unspent (the step engine retries a
+    # failed step and completes on the one that succeeds).
+    hovers: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    script = [[("hover", {})], [("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=1), make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        target_action_reserve=reserve,
+    )
+
+    if reserve:
+        assert outcome.status == "completed"
+        assert "(click)" in outcome.reason
+        assert len(clicks) == 2  # the failed click and the one that landed; the follow-up got the completion
+    else:
+        assert outcome.status == "budget_exhausted"
+        assert clicks == []
+
+
+@pytest.mark.asyncio
+async def test_a_menu_opening_click_is_a_precursor_like_a_hover() -> None:
+    clicks: list[dict[str, Any]] = []
+    opener = {"menu_note": "listed"}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(args)
+        return ToolResult.ok("clicked", data=opener if len(clicks) == 1 else _REACHED_TARGET)
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+    check, asked = _scripted_block_check(_ACHIEVED)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "completed"
+    assert len(clicks) == 2
+    assert len(asked) == 1  # only the completion offer after the landed click; the menu open needed no judge
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "granted"),
+    [
+        (_NOT_ACHIEVED, True),
+        (_ACHIEVED, False),
+        (GoalVerdict("impossible", "", "", None, 0.1), False),
+        (GoalVerdict("achieved", "", "", "secret_entered", 0.0), False),
+        (None, False),
+    ],
+    ids=["not_achieved", "achieved", "impossible", "judge_skipped", "judge_raises"],
+)
+@pytest.mark.parametrize("entry", ["typed", "type_failed"])
+async def test_a_precursor_that_committed_needs_the_judges_not_achieved_for_another_round(
+    verdict: GoalVerdict | None, granted: bool, entry: str
+) -> None:
+    # A typed value can be the block's whole action, and a type that errored may still have written part of it (a
+    # partial credential); only the block judge saying it is not done yet earns a round.
+    types: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+
+    async def check() -> GoalVerdict:
+        if verdict is None:
+            raise RuntimeError("judge down")
+        return verdict
+
+    script = [[("type", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [
+            _recording_tool("type", types, billable=True)
+            if entry == "typed"
+            else _erroring_tool("type", types, billable=True),
+            _flaky_click(clicks, fail_first=0),
+            make_finish_tool(),
+        ],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert len(clicks) == (1 if granted else 0)
+    if not granted:
+        assert outcome.status == "budget_exhausted"
+        assert outcome.cap_trip == "Reached the maximum steps (1)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "landed", ["ok_url_unchanged", "failed_page_moved", "failed_select_moved_url", "failed_enter", "click_unverified"]
+)
+async def test_no_round_is_reserved_after_a_call_that_may_have_submitted_or_left_the_page(landed: str) -> None:
+    # A click that did not move the URL may have submitted, and a failed call that moved the page left it; another
+    # round could submit twice or act on the next page, so the judge is not even asked.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tool_name = {"failed_select_moved_url": "select_option", "failed_enter": "press_key"}.get(landed, "click")
+    call_args = {"key": "Enter"} if landed == "failed_enter" else {}
+    if landed == "ok_url_unchanged":
+        click = _recording_tool("click", clicks, billable=True, ok_data={"page_transitioned": False})
+    elif landed == "failed_page_moved":
+        click = _erroring_tool("click", clicks, billable=True, error_data={"page_state_changed": True})
+    elif landed == "click_unverified":
+        click = _erroring_tool("click", clicks, billable=True, error_data={CLICK_DISPATCHED_DATA_KEY: True})
+    elif landed == "failed_select_moved_url":
+        click = _erroring_tool("select_option", clicks, billable=True, error_data={"page_transitioned": True})
+    else:
+        click = _erroring_tool("press_key", clicks, billable=True)
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[(tool_name, call_args)], [(tool_name, call_args)], [(tool_name, call_args)]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1
+    assert asked == []
+    [decision] = [entry for entry in logs if entry["event"] == TARGET_ACTION_ROUND_EVENT]
+    assert decision["granted"] is False and decision["reason"] == "may_have_landed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["typed", "type_failed"])
+async def test_no_reserve_round_follows_a_typed_secret_even_on_a_not_done_verdict(entry: str) -> None:
+    # A partial or full credential is on the page; a second round could submit it and spend a lockout attempt.
+    types: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    secret = {"selector": "#password", "text": "placeholder_TlK9_password"}
+    typer = (
+        _recording_tool("type", types, billable=True)
+        if entry == "typed"
+        else _erroring_tool("type", types, billable=True)
+    )
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[("type", secret)], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [typer, _flaky_click(clicks, fail_first=0), make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert clicks == [] and asked == []
+    [decision] = [log for log in logs if log["event"] == TARGET_ACTION_ROUND_EVENT]
+    assert decision["reason"] == "may_have_landed"
+
+
+@pytest.mark.asyncio
+async def test_an_action_that_moved_the_page_goes_to_the_completion_offer_not_the_reserve() -> None:
+    # A select that navigated landed the block's action; a not-done verdict fails the block as before rather than
+    # granting a round on the page it moved to.
+    selects: list[tuple[str, dict[str, Any]]] = []
+    select = _recording_tool("select_option", selects, billable=True, ok_data=_REACHED_TARGET)
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[("select_option", {})], [("select_option", {})], [("select_option", {})]]
+    outcome, _ = await _run(
+        script,
+        [select, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(selects) == 1
+    assert len(asked) == 1  # the completion offer's judge only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [True, False], ids=["page_received_it", "never_dispatched"])
+async def test_a_click_that_raised_after_the_page_received_it_gets_no_reserve_round(dispatched: bool) -> None:
+    # A slow submit: the click raised while its navigation had not committed, so the probe reads the same page. A
+    # second click could post the form twice; a click that never reached the page is the retry v1 also makes.
+    clicks: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(args)
+        if dispatched:
+            record_click_dispatched()
+        raise TimeoutError("click timed out")
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=_achieved_block_check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    [first] = [entry for entry in logs if entry["event"] == TARGET_ACTION_ROUND_EVENT][:1]
+    assert first["granted"] is (not dispatched)
+    assert len(clicks) == (1 if dispatched else 3)
+
+
+@pytest.mark.asyncio
+async def test_the_target_action_reserve_is_bounded() -> None:
+    clicks: list[dict[str, Any]] = []
+    script = [[("click", {})] for _ in range(8)]
+    outcome, _ = await _run(
+        script,
+        [_flaky_click(clicks, fail_first=99), make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1 + ACTION_BLOCK_TARGET_ACTION_RESERVE
+
+
+@pytest.mark.asyncio
+async def test_a_multi_action_block_gets_no_target_action_reserve() -> None:
+    hovers: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    script = [[("hover", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=0), make_finish_tool()],
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert clicks == []
 
 
 @pytest.mark.asyncio

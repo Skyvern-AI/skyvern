@@ -204,6 +204,11 @@ def is_allowed_local_browser_host(host: str) -> bool:
         return normalized in _LOCAL_BROWSER_HOSTNAMES
 
 
+def is_tls_or_local_browser_address(address: str) -> bool:
+    parts = urlsplit(address)
+    return parts.scheme in ("https", "wss") or is_allowed_local_browser_host(parts.hostname or "")
+
+
 def validate_browser_host(host: str, *, resolve_dns: bool = False) -> None:
     if not is_allowed_local_browser_host(host) and is_blocked_host(host, resolve_dns=resolve_dns):
         raise BlockedHost(host=host)
