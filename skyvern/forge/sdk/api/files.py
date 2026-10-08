@@ -66,6 +66,8 @@ LOG = structlog.get_logger()
 
 # Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
 _UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
+_ORIGINAL_FILENAME_MARKER = "__skyvern_original_filename__"
+_ORIGINAL_FILENAME_TEMPLATE_RE = re.compile(r"\{\{\s*original_filename\s*\}\}")
 _LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
 
 
@@ -1396,8 +1398,13 @@ def recover_download_extension(file_path: str | Path, download_suffix: str | Non
     Returns "" when ``download_suffix`` already carries its own extension, so the final
     ``download_suffix + extension`` name is not doubled (e.g. invoice.pdf + .pdf).
     """
-    if download_suffix and Path(download_suffix).suffix:
-        return ""
+    if download_suffix:
+        suffix_for_extension = _ORIGINAL_FILENAME_TEMPLATE_RE.sub(_ORIGINAL_FILENAME_MARKER, download_suffix)
+        if _ORIGINAL_FILENAME_MARKER in suffix_for_extension:
+            # Dots before the site-name placeholder are part of the prefix, not an explicit extension.
+            suffix_for_extension = suffix_for_extension.rsplit(_ORIGINAL_FILENAME_MARKER, 1)[1]
+        if Path(suffix_for_extension).suffix:
+            return ""
     return guess_extension_from_file(file_path)
 
 

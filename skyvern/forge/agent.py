@@ -1685,8 +1685,8 @@ class ForgeAgent:
                 with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
                     f.write(file_data)
 
-            file_extension = Path(local_file_name).suffix
-            if file_extension == BROWSER_DOWNLOADING_SUFFIX:
+            local_basename = Path(local_file_name).name
+            if Path(local_basename).suffix == BROWSER_DOWNLOADING_SUFFIX:
                 LOG.warning(
                     "Detecting incompleted download file, skip the rename",
                     file=local_file_name,
@@ -1695,6 +1695,8 @@ class ForgeAgent:
                 )
                 continue
 
+            applied_download = context.download_suffix_applied_files.get(local_basename) if context else None
+            file_extension = Path(applied_download[0] if applied_download else local_basename).suffix
             if not file_extension:
                 file_extension = recover_download_extension(
                     os.path.join(workflow_download_directory, local_file_name), download_suffix
@@ -1712,13 +1714,17 @@ class ForgeAgent:
                 # local_file_name is a bare basename for session (s3/gs) files but an absolute path for
                 # run-dir files; compare on basenames so a file already named by download_suffix is not
                 # treated as its own collision and bumped to ``<name>_1``.
-                local_basename = Path(local_file_name).name
                 existing_names = {
                     Path(f).name
                     for f in list_files_in_directory(workflow_download_directory)
                     if Path(f).name != local_basename
                 }
-                desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                desired_name = download_filename_from_suffix(
+                    download_suffix,
+                    file_extension,
+                    existing_names,
+                    original_filename=applied_download[0] if applied_download else local_basename,
+                )
                 # finalize_* keys avoid the forge_log processor, which overwrites bare task_id/
                 # workflow_run_id with the ambient context's values; under a stale/shared context those
                 # would otherwise mask the task actually being finalized (the divergence to diagnose).
@@ -3498,6 +3504,8 @@ class ForgeAgent:
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
+        if download_baseline_files is None:
+            context.download_suffix_applied_files = {}
         context.download_suffix = task_block.download_suffix if task_block else None
 
         # do not need to do complete verification when it's a CUA task

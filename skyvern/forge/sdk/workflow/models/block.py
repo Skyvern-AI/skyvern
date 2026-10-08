@@ -336,7 +336,7 @@ from skyvern.utils.secret_redaction import (
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_available_keys, get_missing_variables
+from skyvern.utils.templating import get_available_keys, get_missing_variables, reject_jinja_transformations_on_variable
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -351,7 +351,12 @@ from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
-from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    ORIGINAL_FILENAME_MARKER,
+    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    normalize_download_filename,
+    settle_browser_downloads_for_context,
+)
 from skyvern.webeye.navigation import (
     default_navigation_settle,
     driver_nav_error_code,
@@ -949,6 +954,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         if field not in type(self).model_fields:
             raise ValueError(f"{type(self).__name__} has no field named {field!r}")
@@ -964,6 +970,7 @@ class Block(BaseModel, abc.ABC):
                 env=env,
                 skip_missing_variable_preflight=skip_missing_variable_preflight,
                 page_derived_capture=page_derived_capture,
+                extra_template_data=extra_template_data,
             )
         except Exception as exc:
             if field not in ("totp_identifier", "totp_verification_url"):
@@ -1411,6 +1418,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -1430,6 +1438,10 @@ class Block(BaseModel, abc.ABC):
         template_data = self._build_block_parameter_template_data(
             workflow_run_context, force_include_secrets=force_include_secrets
         )
+        if extra_template_data:
+            # A field-specific binding only fills a gap: a workflow that already has a parameter
+            # under the same key keeps rendering its own value.
+            template_data = {**extra_template_data, **template_data}
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
@@ -2130,8 +2142,17 @@ class BaseTaskBlock(Block):
             )
 
         if self.download_suffix:
+            if ORIGINAL_FILENAME_TEMPLATE_VARIABLE not in workflow_run_context.values:
+                reject_jinja_transformations_on_variable(
+                    self.download_suffix,
+                    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+                    jinja_sandbox_env,
+                )
             self.download_suffix = self.render_templatable_field(
-                "download_suffix", self.download_suffix, workflow_run_context
+                "download_suffix",
+                self.download_suffix,
+                workflow_run_context,
+                extra_template_data={ORIGINAL_FILENAME_TEMPLATE_VARIABLE: ORIGINAL_FILENAME_MARKER},
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")

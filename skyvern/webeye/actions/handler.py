@@ -1267,7 +1267,9 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
         # Name the file by the block-configured download_suffix so the watcher syncs the
         # request-based name instead of the site's suggested name.
         existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
-        target_name = download_filename_from_suffix(download_suffix, suffix, existing)
+        target_name = download_filename_from_suffix(download_suffix, suffix, existing, original_filename=filename)
+        if context:
+            context.download_suffix_applied_files[target_name] = (filename, download_suffix)
         LOG.info(
             "download_suffix_target_named",
             context_task_id=context.task_id if context else None,

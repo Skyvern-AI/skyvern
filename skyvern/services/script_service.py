@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Sequence, cast
+from urllib.parse import quote
 
 import libcst as cst
 import structlog
@@ -119,10 +120,15 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
+from skyvern.utils.templating import reject_jinja_transformations_on_variable
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction, reasoning_is_turn_scoped
-from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
+from skyvern.webeye.cdp_download_interceptor import (
+    ORIGINAL_FILENAME_MARKER,
+    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    download_filename_from_suffix,
+)
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -2512,6 +2518,40 @@ async def download(
         )
         navigation_prompt = _render_template_with_label(navigation_prompt, cache_key)
         context = skyvern_context.ensure_context()
+        context.download_suffix_applied_files.clear()
+        if download_suffix:
+            workflow_values = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id).values
+                if context.workflow_run_id
+                else {}
+            )
+            script_parameters = context.script_run_parameters
+            if not (
+                isinstance(workflow_values, dict)
+                and ORIGINAL_FILENAME_TEMPLATE_VARIABLE in workflow_values
+                or isinstance(script_parameters, dict)
+                and ORIGINAL_FILENAME_TEMPLATE_VARIABLE in script_parameters
+            ):
+                reject_jinja_transformations_on_variable(
+                    download_suffix,
+                    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+                    jinja_sandbox_env,
+                )
+        cached_download_suffix = (
+            quote(
+                _render_template_with_label(
+                    download_suffix,
+                    cache_key,
+                    extra_template_data={ORIGINAL_FILENAME_TEMPLATE_VARIABLE: ORIGINAL_FILENAME_MARKER},
+                ),
+                safe="",
+            )
+            if download_suffix
+            else None
+        )
+        previous_download_suffix = context.download_suffix
+        # Cached downloads use the CDP target-path hook too, so stamp the suffix before the click for provenance.
+        context.download_suffix = cached_download_suffix
         file_download_block: FileDownloadBlock | None = None
         storage_type: FileStorageType | None = None
         destination_delivery_started = False
@@ -2745,30 +2785,36 @@ async def download(
             # Rename runs BEFORE S3 upload so that remote storage receives the
             # correctly-named file and subsequent blocks get the right URLs.
             # This matches the agent path ordering in agent.py.
-            if download_suffix and local_download_dir.exists():
+            if cached_download_suffix and local_download_dir.exists():
                 local_files_after = current_attempt_local_files(local_download_dir)
                 files_to_rename = [file_path for file_path in newly_downloaded_files if file_path in local_files_after]
                 newly_downloaded_files = []
                 for file_path in files_to_rename:
-                    file_extension = Path(file_path).suffix
+                    local_basename = Path(file_path).name
                     # Skip incomplete downloads
-                    if file_extension == BROWSER_DOWNLOADING_SUFFIX:
+                    if Path(local_basename).suffix == BROWSER_DOWNLOADING_SUFFIX:
                         continue
+                    applied_download = context.download_suffix_applied_files.get(local_basename)
+                    file_extension = Path(applied_download[0] if applied_download else local_basename).suffix
                     if not file_extension:
-                        file_extension = recover_download_extension(file_path, download_suffix)
+                        file_extension = recover_download_extension(file_path, cached_download_suffix)
                         if file_extension:
                             LOG.info(
                                 "Recovered missing download file extension from file content",
                                 file=file_path,
                                 extension=file_extension,
                             )
-                    local_basename = Path(file_path).name
                     existing_names = {
                         Path(f).name
                         for f in list_files_in_directory(local_download_dir)
                         if Path(f).name != local_basename
                     }
-                    desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    desired_name = download_filename_from_suffix(
+                        cached_download_suffix,
+                        file_extension,
+                        existing_names,
+                        original_filename=applied_download[0] if applied_download else local_basename,
+                    )
                     # context suffix fields are omitted: cached-script mode bakes the suffix into the
                     # generated script (no per-step contextvar stamping), so there is no task_block-vs-
                     # context divergence to attribute; task_id/block_label give per-download attribution.
@@ -2781,7 +2827,7 @@ async def download(
                         finalize_task_id=task_id,
                         block_label=cache_key,
                         pre_rename_filename_fp=diagnostic_fingerprint(local_basename),
-                        passed_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+                        passed_download_suffix_fp=diagnostic_fingerprint(cached_download_suffix),
                         desired_name_fp=diagnostic_fingerprint(desired_name),
                         will_rename=local_basename != desired_name,
                     )
@@ -2911,7 +2957,7 @@ async def download(
                 url=url,
                 max_steps=max_steps,
                 complete_on_download=complete_on_download,
-                download_suffix=download_suffix,
+                download_suffix=cached_download_suffix,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
@@ -2967,6 +3013,7 @@ async def download(
                     raise
         finally:
             context.prompt = None
+            context.download_suffix = previous_download_suffix
             _clear_cached_block_overrides(cache_key)
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
@@ -3525,7 +3572,9 @@ async def run_script(
                 LOG.warning("Failed to clean up script browser resources", script_id=script_id, exc_info=True)
 
 
-def _render_template_with_label(template: str, label: str | None = None) -> str:
+def _render_template_with_label(
+    template: str, label: str | None = None, *, extra_template_data: dict[str, Any] | None = None
+) -> str:
     template_data = {}
     context = skyvern_context.current()
     if context and context.workflow_run_id:
@@ -3563,6 +3612,8 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
             template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
         if "browser_session_id" not in template_data:
             template_data["browser_session_id"] = workflow_run_context.browser_session_id or ""
+    if extra_template_data:
+        template_data = {**extra_template_data, **template_data}
     return render_template(template, data=template_data)
 
 
