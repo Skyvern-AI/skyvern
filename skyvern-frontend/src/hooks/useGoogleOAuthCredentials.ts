@@ -10,6 +10,10 @@ import {
   GoogleOAuthCredentialResponse,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import {
+  GOOGLE_GMAIL_REQUIRED_SCOPES,
+  GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
+} from "@/util/googleScopes";
 
 const BROADCAST_CHANNEL_NAME = "skyvern:google-oauth-credentials";
 
@@ -100,6 +104,35 @@ export function attemptedGoogleOAuthIntegrationScopes(
     return requiredScopes.every((scope) => requestedSet.has(scope));
   }
   return hasGoogleOAuthCredentialScopes(credential, capabilityScopes);
+}
+
+export type GmailCapability = "read" | "send";
+
+export function googleCredentialGmailCapabilities(
+  credential: GoogleOAuthCredential,
+): Record<GmailCapability, boolean> {
+  return {
+    read: hasGoogleOAuthCredentialScopes(
+      credential,
+      GOOGLE_GMAIL_REQUIRED_SCOPES,
+    ),
+    send: credential.gmail_send_ready === true,
+  };
+}
+
+// A cancelled send upgrade leaves the send scope requested but not granted;
+// that connection still belongs with the Gmail ones.
+export function googleCredentialHasGmailCapability(
+  credential: GoogleOAuthCredential,
+): boolean {
+  const scopes = new Set([
+    ...getGoogleOAuthCredentialScopesGranted(credential),
+    ...getGoogleOAuthCredentialScopesRequested(credential),
+  ]);
+  return (
+    hasGoogleOAuthCredentialScopes(credential, GOOGLE_GMAIL_REQUIRED_SCOPES) ||
+    GOOGLE_GMAIL_SEND_REQUIRED_SCOPES.some((scope) => scopes.has(scope))
+  );
 }
 
 // Falls back to the first credential even when none are active, so a single

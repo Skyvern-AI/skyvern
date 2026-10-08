@@ -1278,7 +1278,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       if (pause === "credential") {
         await act(async () => fireEvent.click(screen.getByRole("combobox")));
         await act(async () =>
-          fireEvent.click(screen.getByRole("button", { name: "Test login" })),
+          fireEvent.click(screen.getByRole("button", { name: /^Test login/ })),
         );
         expect(credentialResponsePosts()).toHaveLength(1);
         historyResponse.data.pending_credential_requests = [];
@@ -1451,7 +1451,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(resolveLookup).toBeDefined();
     await act(async () => fireEvent.click(screen.getByRole("combobox")));
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Test login" })),
+      fireEvent.click(screen.getByRole("button", { name: /^Test login/ })),
     );
     expect(credentialResponsePosts()).toHaveLength(1);
     historyResponse.data.pending_credential_requests = [];
@@ -1619,7 +1619,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await submit("start a different turn");
     expect(postStreaming).not.toHaveBeenCalled();
     fireEvent.click(recoveredCredentialPicker);
-    fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^HN Login/ }));
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
     expect(credentialResponsePosts()[0]![1]).toMatchObject({
       turn_id: "turn-1",
@@ -1766,7 +1766,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       });
       await act(async () => {
         fireEvent.click(
-          await screen.findByRole("button", { name: "HN Login" }),
+          await screen.findByRole("button", { name: /^HN Login/ }),
         );
       });
       await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
@@ -2112,7 +2112,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await act(async () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
-    const useButton = await screen.findByRole("button", { name: "HN Login" });
+    const useButton = await screen.findByRole("button", { name: /^HN Login/ });
     await act(async () => {
       fireEvent.click(useButton);
     });
@@ -2183,7 +2183,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN Login/ }));
     });
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
     expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
@@ -2215,7 +2215,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       });
       await act(async () => {
         fireEvent.click(
-          await screen.findByRole("button", { name: "HN Login" }),
+          await screen.findByRole("button", { name: /^HN Login/ }),
         );
       });
       await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
@@ -2301,11 +2301,11 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     // including the credential NOT in credential_refs — stays below to override.
     expect(await screen.findByText("Suggested")).toBeTruthy();
     expect(screen.getByText("All credentials")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "abc" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "spare-portal" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "unrelated" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^abc/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^spare-portal/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^unrelated/ })).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "spare-portal" }));
+      fireEvent.click(screen.getByRole("button", { name: /^spare-portal/ }));
     });
     // The pick answers through the typed resume POST (which origin-binds), not a chat message.
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
@@ -2339,13 +2339,13 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "first" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^first/ }));
     });
     await act(async () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "second" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^second/ }));
     });
     expect(credentialResponsePosts()).toHaveLength(1);
     expect(credentialResponsePosts()[0]![1]).toMatchObject({
@@ -2556,7 +2556,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
 
     // The fence blocked the continuation, so the card must not show a success-shaped receipt
@@ -2585,7 +2585,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
@@ -2605,7 +2605,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
   });
@@ -2626,7 +2626,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
@@ -2768,7 +2768,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     });
     await act(async () => {
       fireEvent.click(
-        await screen.findByRole("button", { name: "Personal login" }),
+        await screen.findByRole("button", { name: /^Personal login/ }),
       );
     });
     // A fresh turn fires referencing the picked credential by id (the deterministic continue path),

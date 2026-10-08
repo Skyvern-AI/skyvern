@@ -86,7 +86,11 @@ import {
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
-import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
+import {
+  EMAIL_BLOCK_SENDER,
+  REACT_FLOW_EDGE_Z_INDEX,
+  SKYVERN_DOWNLOAD_DIRECTORY,
+} from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import {
@@ -682,6 +686,13 @@ function layout(
   };
 }
 
+// A comma inside {{ }} or {% %} belongs to the template, as in {{ addresses | join(",") }}.
+function splitEmailList(value: string): Array<string> {
+  return (value.match(/(?:\{\{.*?\}\}|\{%.*?%\}|[^,])+/gs) ?? [])
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 // Keep this sentinel aligned with skyvern/forge/sdk/workflow/models/parameter.py.
 const UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY = "UNUSED_CUSTOM_SMTP_PLACEHOLDER";
 
@@ -1151,6 +1162,10 @@ function convertToNode(
               : null,
           customSmtpUsername: block.custom_smtp_username ?? null,
           customSmtpPassword: block.custom_smtp_password ?? null,
+          transport: block.transport ?? "smtp",
+          credentialId: block.credential_id ?? "",
+          cc: (block.cc ?? []).join(", "),
+          bcc: (block.bcc ?? []).join(", "),
         },
       };
     }
@@ -3596,6 +3611,26 @@ function getWorkflowBlock(
       };
     }
     case "sendEmail": {
+      if (node.data.transport === "gmail") {
+        // Gmail sends from the connected account and never carries a sender,
+        // SMTP settings or the download-directory attachment default.
+        return {
+          ...base,
+          block_type: "send_email",
+          transport: "gmail",
+          credential_id: node.data.credentialId || null,
+          sender: "",
+          recipients: splitEmailList(node.data.recipients),
+          cc: splitEmailList(node.data.cc),
+          bcc: splitEmailList(node.data.bcc),
+          subject: node.data.subject,
+          body: node.data.body,
+          body_format: node.data.bodyFormat,
+          file_attachments: splitEmailList(node.data.fileAttachments).filter(
+            (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
+          ),
+        };
+      }
       return {
         ...base,
         block_type: "send_email",
@@ -5335,6 +5370,14 @@ function convertBlocksToBlockYAML(
           body: block.body,
           body_format: block.body_format,
           file_attachments: block.file_attachments,
+          ...(block.transport === "gmail"
+            ? {
+                transport: block.transport,
+                credential_id: block.credential_id ?? null,
+                cc: block.cc ?? [],
+                bcc: block.bcc ?? [],
+              }
+            : {}),
         };
         return blockYaml;
       }
