@@ -680,6 +680,10 @@ _LLM_STEP_EXCEPTIONS = frozenset(
     }
 )
 
+# Typed step failures that are an expected outcome: step_exception carries them to the run record and the failure
+# summary, so agent_step logs them at warning instead of paging as an unexpected error.
+_EXPECTED_STEP_FAILURES = (FailedToReloadPage, LLMResponseMissingActionsError)
+
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": FailureCategory.LLM_ERROR.value, "confidence_float": 0.9, "reasoning": reasoning}]
@@ -4882,11 +4886,20 @@ class ForgeAgent:
             raise
 
         except Exception as e:
-            LOG.exception(
-                "Unexpected exception in agent_step, marking step as failed",
-                step_order=step.order,
-                step_retry=step.retry_index,
-            )
+            if isinstance(e, _EXPECTED_STEP_FAILURES):
+                LOG.warning(
+                    "Expected exception in agent_step, marking step as failed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    error_type=e.__class__.__name__,
+                    exc_info=True,
+                )
+            else:
+                LOG.exception(
+                    "Unexpected exception in agent_step, marking step as failed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                )
             detailed_agent_step_output.step_exception = e.__class__.__name__
             failed_step = await self.update_step(
                 step=step,
