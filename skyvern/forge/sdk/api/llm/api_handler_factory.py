@@ -338,6 +338,19 @@ _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
 _OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
+# litellm 1.89.1 drops `*_above_100k_tokens` price keys, so a long Haiku 5.5 prompt prices at the base rate.
+# Every Haiku 5.5 rate above 100k prompt tokens is 5x its base rate.
+_CLAUDE_HAIKU_5_5_MODEL_SUFFIX = "claude-haiku-5-5"
+_CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD = 100_000
+_CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER = 5.0
+
+
+def _long_prompt_cost_multiplier(model_name: str | None, prompt_tokens: int | None) -> float:
+    if model_name and model_name.endswith(_CLAUDE_HAIKU_5_5_MODEL_SUFFIX):
+        if prompt_tokens and prompt_tokens > _CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD:
+            return _CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER
+    return 1.0
+
 
 # Kept in `_hidden_params` rather than on the response: `_hidden_params` is excluded from the
 # model dump persisted as the LLM_RESPONSE artifact, so a tier we derived can never be read back
@@ -1380,7 +1393,7 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def _get_cost_model_override(requested_model: str | None) -> tuple[str, str] | None:
         # Bedrock returns the bare Claude name, which otherwise selects direct Anthropic prices.
-        if requested_model == "bedrock/us.anthropic.claude-opus-5-5":
+        if requested_model in {"bedrock/us.anthropic.claude-opus-5-5", "bedrock/us.anthropic.claude-haiku-5-5"}:
             return requested_model, "bedrock"
         return None
 
@@ -1411,14 +1424,13 @@ class LLMAPIHandlerFactory:
         try:
             if cost_model_override := LLMAPIHandlerFactory._get_cost_model_override(requested_model):
                 model, provider = cost_model_override
-                return litellm.completion_cost(
+                cost = litellm.completion_cost(
                     completion_response=response, base_model=model, custom_llm_provider=provider
                 )
-            cost = (
-                litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
-                if recovered_tier is not None
-                else litellm.completion_cost(completion_response=response)
-            )
+            elif recovered_tier is not None:
+                cost = litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
+            else:
+                cost = litellm.completion_cost(completion_response=response)
         except Exception as e:
             LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
             return None
@@ -1427,7 +1439,10 @@ class LLMAPIHandlerFactory:
             return cost * _VERTEX_FLEX_COST_MULTIPLIER
         if LLMAPIHandlerFactory._is_openai_direct_gpt5_6_long_context_flex(response, hidden_params):
             return cost * _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER
-        return cost
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        model_name = requested_model if isinstance(requested_model, str) else None
+        return cost * _long_prompt_cost_multiplier(model_name, prompt_tokens)
 
     @staticmethod
     def _is_openai_direct_gpt5_6_long_context_flex(
@@ -1551,6 +1566,8 @@ class LLMAPIHandlerFactory:
             "bedrock/us.anthropic.claude-opus-5-5",
             "anthropic/claude-sonnet-5-5",
             "bedrock/global.anthropic.claude-sonnet-5-5",
+            "anthropic/claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
             "anthropic-claude-fable-5-1",
@@ -3837,7 +3854,9 @@ class LLMCaller:
             _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
-            if "ANTHROPIC" in self.llm_key:
+            # Only the raw Anthropic SDK branch of _dispatch takes Anthropic-native image blocks; router
+            # keys reach litellm, which rejects them, whatever the key's name.
+            if self._router is None and "ANTHROPIC" in self.llm_key:
                 message_pattern = "anthropic"
 
             if use_message_history:
@@ -4540,16 +4559,17 @@ class LLMCaller:
                 pricing = litellm.model_cost.get(model_info.get("key"), {})
                 if pricing.get("input_cost_per_token") is not None and pricing.get("output_cost_per_token") is not None:
                     cache_creation_tokens = usage.cache_creation_input_tokens or 0
+                    # LiteLLM's prompt total includes both cache reads and writes.
+                    prompt_tokens = usage.input_tokens + cached_tokens + cache_creation_tokens
                     input_cost, output_cost = litellm.cost_per_token(
                         model=model,
                         custom_llm_provider=provider,
-                        # LiteLLM's prompt total includes both cache reads and writes.
-                        prompt_tokens=usage.input_tokens + cached_tokens + cache_creation_tokens,
+                        prompt_tokens=prompt_tokens,
                         completion_tokens=usage.output_tokens,
                         cache_read_input_tokens=cached_tokens,
                         cache_creation_input_tokens=cache_creation_tokens,
                     )
-                    llm_cost = input_cost + output_cost
+                    llm_cost = (input_cost + output_cost) * _long_prompt_cost_multiplier(model, prompt_tokens)
             except Exception as exc:
                 # LiteLLM 1.89.1 wraps its missing-model ValueError in a plain Exception.
                 if isinstance(exc.__context__, ValueError) and str(exc.__context__).startswith(
