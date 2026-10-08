@@ -74,7 +74,7 @@ await browser.close();
 |-----------|------|----------|-------------|
 | `prompt` | `str` / `string` | Yes | Describe what to download. The agent navigates the page to find and click the download link. |
 | `url` | `str` / `string` | No | URL to navigate to before downloading. Defaults to the current page URL. |
-| `download_suffix` | `str` / `string` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). **Not a validator**; mismatched extensions don't fail the run. Omit this to get a system-generated filename like `download-<timestamp>-<random>.pdf`. |
+| `download_suffix` | `str` / `string` | No | Filename hint prepended to the saved file (e.g., `"invoice"` → `invoice.pdf`). Supports `{{ original_filename }}` to keep the site's own name (e.g., `"fund-a_{{ original_filename }}"` → `fund-a_Q4 Report.pdf`). **Not a validator**; mismatched extensions don't fail the run. Omit this to get a system-generated filename like `download-<timestamp>-<random>.pdf`. |
 | `download_timeout` | `float` / `number` | No | Soft hint (seconds) for how long to wait for a download to start. Not a hard cap; the overall `timeout` below governs failure. |
 | `max_steps_per_run` | `int` / `number` | No | Cap AI steps for the download navigation. |
 | `timeout` | `float` / `number` | No | Total timeout in seconds (default: 1800). |
@@ -150,6 +150,16 @@ for (const file of result.downloadedFiles ?? []) {
 ## Tips
 
 **Set `download_suffix`** to get a predictable filename (e.g., `"invoice-q4"` → `invoice-q4.pdf`). Without it, files are saved with a system-generated name like `download-<timestamp>-<random>.pdf`. It does **not** validate or filter by extension.
+
+**Keep the site's filename with `{{ original_filename }}`.** When a portal serves documents whose names you need to preserve, reference `{{ original_filename }}` in `download_suffix` and Skyvern substitutes the name the site gave the file. Use it alone to keep that name as-is, or combine it with other parameters to disambiguate files that would otherwise collide:
+
+```
+download_suffix = "{{ fund }}_{{ original_filename }}"   # Fund%20A_Q4 Report.pdf
+download_suffix = "{{ original_filename }}_archived"     # Q4 Report_archived.pdf
+```
+
+The source extension is used unless the configured filename includes an extension, which overrides it. Files that still collide get a `_1`, `_2` counter as usual.
+Use `{{ original_filename }}` as a standalone interpolation without filters or other transformations; Skyvern substitutes the site's name after the download response is available.
 
 **Raise the overall `timeout`** for large files. `download_timeout` is a soft hint; `timeout` is what actually fails the run.
 

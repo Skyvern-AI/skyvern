@@ -14337,7 +14337,7 @@
               }
             ],
             "title": "Download Suffix",
-            "description": "Suffix or complete filename for the downloaded file"
+            "description": "Complete filename for the downloaded file. Supports {{ original_filename }}, which keeps the name the site gave the file, so {{ original_filename }} alone preserves it and prefix_{{ original_filename }} prefixes it. The source extension is used unless the configured filename includes an extension, which overrides it. {{ original_filename }} must be a standalone interpolation without filters or other transformations."
           },
           "download_timeout": {
             "anyOf": [

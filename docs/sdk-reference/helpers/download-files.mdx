@@ -51,7 +51,7 @@ for (const f of result.downloaded_files ?? []) {
 | `browser_profile_id` | `str` | No | `None` | Load a browser profile. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route through a geographic proxy. |
 | `webhook_url` | `str` | No | `None` | URL to receive a POST when the download finishes. |
-| `download_suffix` | `str` | No | `None` | Expected file extension to wait for (e.g., `".pdf"`). |
+| `download_suffix` | `str` | No | `None` | Filename for the saved file, keeping the source extension. Supports `{{ original_filename }}` to keep the site's own name (e.g., `"fund-a_{{ original_filename }}"`). |
 | `download_timeout` | `float` | No | `None` | Max time to wait for the download in seconds. |
 | `max_steps_per_run` | `int` | No | `None` | Cap AI steps. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers. |
