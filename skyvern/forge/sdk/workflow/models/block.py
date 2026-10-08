@@ -2078,8 +2078,8 @@ class BaseTaskBlock(Block):
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
 
-        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
-        the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
+        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this; when the
+        dispatch falls back to the step engine, execute_step corrects the row to the engine that ran. A block pinned to a non-default
         engine is honored as-authored, and a block the eligibility check never saw is left alone;
         neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
         chosen engine or on a block whose skyvern_v1 a person pinned.
@@ -2462,6 +2462,8 @@ class BaseTaskBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
+                # A retry reuses this row, which a step-engine fallback on the previous attempt relabeled.
+                engine=self.resolve_engine(workflow_run_id).value,
             )
             current_running_task = task
             organization = await app.DATABASE.organizations.get_organization(
@@ -8184,6 +8186,8 @@ async def wrapper({default_args}):
                 attempt_number=workflow_run_context.attempt_number,
                 label="Self-heal recovery",
                 block_type=BlockType.TASK,
+                # Dispatched on v3 below; script generation reads this column to keep v3 actions out.
+                engine=RunEngine.skyvern_v3,
             )
             recovery_block_id = recovery_block.workflow_run_block_id
 
@@ -19824,13 +19828,14 @@ class V3AbIneligibleReason(StrEnum):
     eligible" but not "why not."
     """
 
-    script_run = "script_run"
     pinned_engine = "pinned_engine"
+    # An explicit request to generate code from this run; v3 actions cannot produce a usable script.
+    code_generation_requested = "code_generation_requested"
     unsupported_block = "unsupported_block"
     no_reroutable_blocks = "no_reroutable_blocks"
 
 
-def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: bool) -> V3AbIneligibleReason | None:
+def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReason | None:
     """Why a whole workflow run may not be rerouted onto v3 by the A/B, or None if it may.
 
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
@@ -19847,12 +19852,9 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     mixed-arm run this predicate exists to prevent -- and a partial re-run is not comparable to a
     full run in the cohort anyway.
 
-    Script runs are excluded: their blocks execute as cached code and never reach engine dispatch,
-    so treatment would land only on the ai_fallback subset -- the blocks that already failed cached
-    execution.
+    A run headed for a cached script is eligible: treatment runs it as a v3 agent without the script
+    (see ``code_mode_displaced``), so the arm covers every block rather than only the ai_fallback ones.
     """
-    if is_script_run:
-        return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
         if isinstance(block, ConditionalBlock):
@@ -19919,9 +19921,9 @@ def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:
     return False if has_engine_block else None
 
 
-def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar]) -> bool:
     """Whether a whole workflow run may be rerouted onto v3 by the A/B; see v3_ab_ineligibility_reason."""
-    return v3_ab_ineligibility_reason(blocks, is_script_run=is_script_run) is None
+    return v3_ab_ineligibility_reason(blocks) is None
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
