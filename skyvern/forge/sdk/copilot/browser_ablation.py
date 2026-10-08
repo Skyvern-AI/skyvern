@@ -78,6 +78,7 @@ BROWSER_ABLATION_NATIVE_TOOLS = (
     "inspect_locator_matches",
     "fill_credential_field",
     "request_credential",
+    "reply",
 )
 # Browser ablation keeps the production Copilot browser aliases, then projects the missing
 # multi-page capabilities from the app registry. This avoids both a second handwritten browser

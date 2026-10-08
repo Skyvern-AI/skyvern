@@ -33,6 +33,7 @@ import structlog
 import yaml
 from agents.items import ToolCallItem
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from openai.types.responses import ResponseFunctionToolCall
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
@@ -97,6 +98,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
+    REPLY_TOOL_NAME,
     SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP,
     AgentResult,
     CodeAuthoringRepairContext,
@@ -233,6 +235,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
+from skyvern.forge.sdk.copilot.tools import reply_ends_turn
 from skyvern.forge.sdk.copilot.tools._shared import (
     EDIT_BLOCK_TOOL_NAME,
     UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
@@ -4135,6 +4138,15 @@ def _model_attempt_source_revision() -> str | None:
     return result.stdout.strip() or None
 
 
+def _work_tool_call_count(result: RunResultStreaming) -> int:
+    """Tool calls the run made, leaving out `reply`: it is the turn's answer, like a text reply."""
+    return sum(
+        isinstance(item, ToolCallItem)
+        and not (isinstance(item.raw_item, ResponseFunctionToolCall) and item.raw_item.name == REPLY_TOOL_NAME)
+        for item in result.new_items
+    )
+
+
 def _empty_completion_error(
     result: RunResultStreaming,
     *,
@@ -4147,9 +4159,7 @@ def _empty_completion_error(
         return None
     if extract_final_text(result).strip():
         return None
-    tool_calls_observed = ctx.tool_calls_this_turn > tool_call_count_start or any(
-        isinstance(item, ToolCallItem) for item in result.new_items
-    )
+    tool_calls_observed = ctx.tool_calls_this_turn > tool_call_count_start or _work_tool_call_count(result) > 0
     return CopilotEmptyCompletionError(
         llm_key=llm_key,
         stop_metadata=stop_metadata,
@@ -4314,6 +4324,7 @@ async def _run_agent_loop_with_surface(
         mcp_servers=[mcp_server],
         model=model_name,
         output_guardrails=output_guardrails,
+        tool_use_behavior=reply_ends_turn,
     )
     owns_session = session is None
     if session is None:
@@ -4384,7 +4395,7 @@ async def _run_agent_loop_with_surface(
                 attempt_outcome = empty_error.reason if empty_error is not None else "success"
                 attempt_tool_call_count = max(
                     ctx.tool_calls_this_turn - tool_call_count_start,
-                    sum(isinstance(item, ToolCallItem) for item in result.new_items),
+                    _work_tool_call_count(result),
                 )
                 if not final_reply:
                     _dump_model_attempt_packet(

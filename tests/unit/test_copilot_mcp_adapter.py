@@ -3001,7 +3001,7 @@ async def test_profile_create_needs_run_authority_and_takes_exactly_the_shared_s
             "browser_session_id",
             "workflow_run_id",
         }
-        assert schema["required"] == ["name"]
+        assert schema["required"] == ["name", USER_FACING_REASON_PARAM]
 
 
 @pytest.mark.asyncio
@@ -3566,8 +3566,8 @@ async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> No
         advertised = await server.list_tools()
         assert [tool.name for tool in advertised] == [name]
         schema = advertised[0].inputSchema
-        assert "user_facing_reason" in schema["properties"]
-        assert "user_facing_reason" not in schema.get("required", [])
+        assert schema["properties"]["user_facing_reason"]["type"] == ["string", "null"]
+        assert "user_facing_reason" in schema["required"]
         tool = MCPUtil.to_function_tool(advertised[0], server, convert_schemas_to_strict=False)
         assert serialize_tool_surface([tool]).payload["tools"][0]["params_json_schema"] == schema
         tc = ToolContext(context=ctx, tool_name=name, tool_call_id="schema-call", tool_arguments="{}")
@@ -3575,6 +3575,9 @@ async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> No
             result = await tool.on_invoke_tool(tc, json.dumps({"block_type": "code", "user_facing_reason": reason}))
             assert "input validation error" not in str(result).lower()
             assert "code" in str(result)
+        omitted = await tool.on_invoke_tool(tc, json.dumps({"block_type": "code"}))
+        assert "input validation error" not in str(omitted).lower()
+        assert "code" in str(omitted)
         original = _transform_args(
             {"block_type": "code", "user_facing_reason": "Explain"}, _build_skyvern_mcp_overlays()[name]
         )

@@ -8,17 +8,18 @@ import json
 import re
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
-from agents.exceptions import MaxTurnsExceeded
+from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
 from agents.items import TResponseInputItem
 from agents.memory.session import Session
-from agents.model_settings import ModelSettings
 from agents.run import Runner
 from agents.run_config import RunConfig
+from agents.run_context import RunContextWrapper
+from openai.types.responses import ResponseFunctionToolCall
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.copilot.config import (
     DEFAULT_TOKEN_BUDGET,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.context import REPLY_TOOL_NAME
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
@@ -137,8 +139,8 @@ PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 FINAL_REPLY_OBSERVATION = (
-    NUDGE_SENTINEL + "Your last response was empty. Tools are unavailable for this one response; "
-    "reply to the user now with your final response for this turn."
+    NUDGE_SENTINEL + "Your last response was empty. Call `reply` now with your final response for this turn; "
+    "any other tool call will not run."
 )
 
 
@@ -146,8 +148,8 @@ def raw_secret_reply_withheld_observation(label: str | None) -> str:
     flagged = f" The flagged value was the one given for `{label}`." if label else ""
     return (
         NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it read the "
-        f"reply as containing a raw secret value.{flagged} Tools are unavailable for this one response; reply to the user now with your "
-        "final response for this turn."
+        f"reply as containing a raw secret value.{flagged} Call `reply` now with your final response for this turn; "
+        "any other tool call will not run."
     )
 
 
@@ -1379,6 +1381,93 @@ async def _run_streamed_with_deadline(
     return result
 
 
+async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, str] | None:
+    """Results by call id when the response in progress names a tool the request did not offer, else None.
+    The SDK rejects such a response before running any of its calls, so every call gets a result."""
+    response = ctx.last_model_response
+    if response is None:
+        return None
+    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
+    offered = {tool.name for tool in await agent.get_all_tools(RunContextWrapper(ctx))}
+    unknown = sorted({call.name for call in calls if call.name not in offered})
+    if not unknown:
+        return None
+    LOG.warning("copilot_unknown_tool_call", tool_names=unknown, call_count=len(calls))
+    return {
+        call.call_id: json.dumps(
+            {
+                "ok": False,
+                "error": (
+                    "Not run: this response also called a tool that does not exist, so none of its calls ran."
+                    if call.name in offered
+                    else f"No tool named {call.name[:64]} exists. Call only the tools provided in this request."
+                ),
+            }
+        )
+        for call in calls
+    }
+
+
+async def _save_unrun_call_results(
+    agent: Agent, ctx: CopilotContext, session: Session | None, stream: EventSourceStream
+) -> bool:
+    """Save the response the SDK rejected, with a result per call. False when that response named no unoffered tool."""
+    response = ctx.last_model_response
+    outputs = await _unrun_call_outputs(agent, ctx) if session is not None else None
+    ctx.last_model_response = None
+    if response is None or outputs is None or session is None:
+        return False
+    # The rejected response never reached the session, and a drain sends only session history.
+    await session.add_items(
+        [
+            *response.to_input_items(),
+            *(
+                {"type": "function_call_output", "call_id": call_id, "output": output}
+                for call_id, output in outputs.items()
+            ),
+        ]
+    )
+    await streaming_adapter.close_unrun_tool_calls(stream, ctx, outputs)
+    return True
+
+
+async def _run_drain(
+    agent: Agent,
+    observation: str,
+    ctx: CopilotContext,
+    session: Session | None,
+    stream: EventSourceStream,
+    runner_kwargs: dict[str, Any],
+    start_time: float,
+    iteration: int,
+    *,
+    total_turns: int,
+) -> RunResultStreaming:
+    """One drain run. A response naming a tool that was not offered gets its results and one more run, within
+    ``total_turns`` model calls across both runs."""
+    calls_before = ctx.model_calls_this_turn
+    try:
+        return await _run_streamed_with_deadline(
+            agent, observation, ctx, session, _SendTrackingStream(stream), runner_kwargs, start_time, iteration
+        )
+    except ModelBehaviorError:
+        if not await _save_unrun_call_results(agent, ctx, session, stream):
+            raise
+    remaining_turns = total_turns - (ctx.model_calls_this_turn - calls_before)
+    if remaining_turns < 1:
+        raise MaxTurnsExceeded("Drain turns spent before a tool that was not offered")
+    return await _run_streamed_with_deadline(
+        agent,
+        [],
+        ctx,
+        session,
+        _SendTrackingStream(stream),
+        {**runner_kwargs, "max_turns": remaining_turns},
+        start_time,
+        iteration,
+    )
+
+
 def _mark_budget_expiry(ctx: CopilotContext, source: BudgetExpirySource) -> None:
     state = ctx.budget_expiry_state
     if state.source is None:
@@ -1420,15 +1509,16 @@ async def _run_budget_drain(
         staged_draft_id=state.staged_draft_id,
     )
     try:
-        result = await _run_streamed_with_deadline(
+        result = await _run_drain(
             agent,
             observation,
             ctx,
             session,
-            _SendTrackingStream(stream),
+            stream,
             drain_kwargs,
             start_time,
             iteration,
+            total_turns=BUDGET_DRAIN_HEADROOM,
         )
     finally:
         state.drain_active = False
@@ -1445,23 +1535,22 @@ async def run_final_reply_drain(
     run_config: RunConfig,
     observation: str = FINAL_REPLY_OBSERVATION,
 ) -> RunResultStreaming:
-    reply_run_config = replace(
-        run_config,
-        model_settings=(run_config.model_settings or ModelSettings()).resolve(ModelSettings(tool_choice="none")),
-    )
     state = ctx.budget_expiry_state
     expiry_snapshot = (state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded)
     LOG.info("copilot_final_reply_drain_started")
+    # Only `reply` is offered: any other call is rejected before its input checks run, and gets a result.
+    reply_only = agent.clone(tools=[tool for tool in agent.tools if tool.name == REPLY_TOOL_NAME], mcp_servers=[])
     try:
-        return await _run_streamed_with_deadline(
-            agent,
+        return await _run_drain(
+            reply_only,
             observation,
             ctx,
             session,
-            _SendTrackingStream(stream),
-            {"max_turns": 1, "hooks": hooks, "run_config": reply_run_config},
+            stream,
+            {"max_turns": 1, "hooks": hooks, "run_config": run_config},
             ctx.copilot_run_start_monotonic or time.monotonic(),
             0,
+            total_turns=2,
         )
     except CopilotTotalTimeoutError:
         # The hard backstop marks the turn budget-expired; this call is not a budget drain.
@@ -1991,6 +2080,7 @@ async def run_with_enforcement(
     install_pending_operation_slot(ctx)
     iteration = 0
     pending_recovery_nudge: str | None = None
+    remaining_turns: int | None = None
 
     while True:
         # Client disconnect is no longer treated as a stop signal. The
@@ -2030,7 +2120,11 @@ async def run_with_enforcement(
             "enforcement_iteration",
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
-            current_runner_kwargs = runner_kwargs
+            current_runner_kwargs = (
+                runner_kwargs if remaining_turns is None else {**runner_kwargs, "max_turns": remaining_turns}
+            )
+            remaining_turns = None
+            unknown_tool_error: ModelBehaviorError | None = None
             try:
                 result = await _run_streamed_with_deadline(
                     agent,
@@ -2057,6 +2151,8 @@ async def run_with_enforcement(
                     iteration,
                     "max_turns",
                 )
+            except ModelBehaviorError as e:
+                unknown_tool_error = e
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -2113,6 +2209,8 @@ async def run_with_enforcement(
                         iteration,
                         "max_turns",
                     )
+                except ModelBehaviorError as retry_error:
+                    unknown_tool_error = retry_error
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
@@ -2122,6 +2220,26 @@ async def run_with_enforcement(
                         has_session=session is not None,
                     )
                     raise
+
+        if unknown_tool_error is not None:
+            if not await _save_unrun_call_results(agent, ctx, session, stream):
+                raise unknown_tool_error
+            # The counter spans the whole chat turn and the cap is per run, so this can only tighten the cap.
+            remaining_turns = runner_kwargs.get("max_turns", copilot_config.max_turns) - ctx.model_calls_this_turn
+            if remaining_turns < 1:
+                return await _run_budget_drain(
+                    agent,
+                    ctx,
+                    session,
+                    stream,
+                    runner_kwargs,
+                    start_time,
+                    iteration,
+                    "max_turns",
+                )
+            current_input = await take_steer_input(ctx)
+            iteration += 1
+            continue
 
         elapsed = _elapsed_run_seconds(ctx, start_time)
         if elapsed >= TOTAL_TIMEOUT_SECONDS:

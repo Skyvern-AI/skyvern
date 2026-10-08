@@ -147,6 +147,42 @@ class TestFirstTurnCompaction:
             assert notice["tool_name"] == "get_run_results" and notice["arguments"] == "{}"
             assert notice["already_ran"] is True
 
+    def test_an_over_budget_batch_keeps_a_short_not_run_result_verbatim(self) -> None:
+        not_run = json.dumps({"ok": False, "error": "Not run: another call in this response was rejected."})
+        batch = _unread_run_results_batch()
+        batch[-1] = {**batch[-1], "output": not_run}
+        items = [{"role": "user", "content": "please build me a workflow"}, *batch]
+        budget = estimate_tokens(items) - 100
+
+        result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items))
+
+        sent = [it["output"] for it in result.input if it.get("type") == "function_call_output"]
+        assert sent[-1] == not_run
+        assert any("already_ran" in output for output in sent[:-1])
+
+    def test_an_over_budget_batch_defers_a_short_result_that_costs_more_tokens_than_its_notice(self) -> None:
+        dense = json.dumps(
+            {"ok": True, "data": "".join(chr(0x4E00 + index) for index in range(150))}, ensure_ascii=False
+        )
+        batch = _unread_run_results_batch()
+        first_call, second_call = batch[1], batch[2]
+        first_output = batch[6]
+        second_output = {**batch[7], "output": dense}
+        items = [
+            {"role": "user", "content": "please build me a workflow"},
+            first_call,
+            second_call,
+            first_output,
+            second_output,
+        ]
+        budget = estimate_tokens(items) - 50
+
+        result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items))
+
+        sent = [it["output"] for it in result.input if it.get("type") == "function_call_output"]
+        assert sent[0] == first_output["output"]
+        assert json.loads(sent[1])["already_ran"] is True
+
     def test_recent_code_sized_output_survives_session_compaction(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
         from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter

@@ -10,6 +10,7 @@ import re
 import subprocess
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
+    REPLY_TOOL_NAME,
     USER_FACING_REASON_PARAM,
     CopilotContext,
     InFlightStreamToolCall,
@@ -411,6 +413,9 @@ async def stream_to_sse(
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
                 call_id_to_name[call_id] = tool_name
+                # The reply is shown as the assistant message, so it never becomes an action row or activity.
+                if tool_name == REPLY_TOOL_NAME:
+                    continue
 
                 raw_args = _get_raw_field(raw, "arguments")
                 tool_input: dict[str, Any] = {}
@@ -486,9 +491,11 @@ async def stream_to_sse(
                     )
 
             elif event.name == "tool_output":
-                await _drain_chat_screenshots(stream, ctx, client_gone=client_gone)
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
+                if call_id_to_name.get(call_id) == REPLY_TOOL_NAME:
+                    continue
+                await _drain_chat_screenshots(stream, ctx, client_gone=client_gone)
                 presentation = ctx.stream_tool_calls.get(call_id)
                 tool_name = presentation.tool_name if presentation else call_id_to_name.get(call_id, "unknown")
                 ctx.pending_stream_tool_call_ids.discard(call_id)
@@ -678,12 +685,36 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     parsed = ctx.goal_satisfied_tool_output
     if pending is None or parsed is None or call_id not in ctx.pending_stream_tool_call_ids:
         return
-    ctx.pending_stream_tool_call_ids.discard(call_id)
-    if ctx.in_flight_stream_tool_call is not None and ctx.in_flight_stream_tool_call.call_id == call_id:
-        ctx.in_flight_stream_tool_call = None
     ctx.goal_satisfied_tool_output = None
     ctx.goal_satisfied_tool_name = None
     ctx.goal_satisfied_tool_call_id = None
+    await _send_pending_tool_result(stream, ctx, pending, parsed, client_gone=client_gone)
+
+
+async def close_unrun_tool_calls(stream: EventSourceStream, ctx: CopilotContext, call_ids: Iterable[str]) -> None:
+    """Emit the TOOL_RESULT frame for calls the SDK rejected before running any of them.
+    Their ``tool_called`` frames may already be on screen, and no ``tool_output`` event follows."""
+    client_gone = await stream.is_disconnected()
+    for call_id in call_ids:
+        pending = ctx.stream_tool_calls.get(call_id)
+        if pending is not None and call_id in ctx.pending_stream_tool_call_ids:
+            # The result the model gets steers the model, so the panel row carries its own wording.
+            await _send_pending_tool_result(
+                stream, ctx, pending, {"ok": False, "error": "This step did not run."}, client_gone=client_gone
+            )
+
+
+async def _send_pending_tool_result(
+    stream: EventSourceStream,
+    ctx: CopilotContext,
+    pending: InFlightStreamToolCall,
+    parsed: dict[str, Any],
+    *,
+    client_gone: bool,
+) -> None:
+    ctx.pending_stream_tool_call_ids.discard(pending.call_id)
+    if ctx.in_flight_stream_tool_call is not None and ctx.in_flight_stream_tool_call.call_id == pending.call_id:
+        ctx.in_flight_stream_tool_call = None
     blocker_signals = _tool_blocker_signal_candidates(ctx)
     summary = format_tool_result_for_user(pending.tool_name, parsed, blocker_signal=blocker_signals)
     success = user_facing_success(parsed, blocker_signal=blocker_signals)

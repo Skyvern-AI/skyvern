@@ -18,7 +18,12 @@ from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_TOOL_NAME,
 )
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ActivityBucket, NarrativeBlockAttempt, upsert_narrative_block_attempt
+from skyvern.forge.sdk.copilot.context import (
+    REPLY_TOOL_NAME,
+    ActivityBucket,
+    NarrativeBlockAttempt,
+    upsert_narrative_block_attempt,
+)
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
@@ -33,7 +38,7 @@ LOG = structlog.get_logger()
 MIN_BLOCK_STATUS_POLL_GAP_SECONDS = 1.0
 MAX_BLOCK_ACTIVITY_ENTRIES = 30
 MAX_DESIGN_ACTIVITY_ENTRIES = 50
-ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot"})
+ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot", REPLY_TOOL_NAME})
 CODE_REPAIR_PROGRESS_SURFACE_KIND = "code_repair_progress"
 CODE_REPAIR_PROGRESS_TEXT = "Refining the workflow's code"
 
